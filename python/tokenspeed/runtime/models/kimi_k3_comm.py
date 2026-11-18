@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_all_reduce_staged,
     multimem_prealloc,
     multimem_stage,
+    multimem_view,
 )
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
@@ -73,8 +74,9 @@ _MULTIMEM_AR_MIN_TOKENS = 1024
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
-# Through 64 rows the replicated mix and gather tail beat row sharding (8x MI350X).
-_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 72
+# Stays above the Iris K3 fused decode rows: a sharded prefix turns off the
+# replicated mix and gather tail.
+_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 200
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -138,6 +140,9 @@ class K3AttnComm:
     attn_ar_fusion_ok: ClassVar[bool] = False
     dummy_norm: ClassVar[RMSNorm | None] = None
     cute_ar: ClassVar[Callable | None] = None
+    # The multimem staging group and row capacity of an o-projection past
+    # _MULTIMEM_AR_MIN_TOKENS rows (NVIDIA), or None.
+    staged_projection: ClassVar[tuple[str, int] | None] = None
     # Target and draft execute sequentially and share each group's fixed buffers.
     iris_states: ClassVar[dict[tuple[int, ...], K3IrisState]] = {}
 
@@ -197,6 +202,33 @@ class K3AttnComm:
         )
         logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
 
+    def prepare_staged_projection(self, max_num_tokens: int) -> bool:
+        """Reserve the multimem buffer a wide o-projection writes its partial into.
+
+        Collective: every rank calls it once, before KV sizing and graph
+        capture. The buffer is the MoE tail's when both use one group.
+        """
+        if (
+            not current_platform().is_nvidia
+            or self.mapping.attn.tp_size == 1
+            or max_num_tokens <= _MULTIMEM_AR_MIN_TOKENS
+            or global_server_args_dict.get("force_deterministic_rsag", False)
+            or global_server_args_dict.get("batch_invariant_collectives", False)
+        ):
+            return False
+        if self.staged_projection is not None:
+            if max_num_tokens > self.staged_projection[1]:
+                raise RuntimeError("Cannot grow a prepared K3 o-projection buffer")
+            return True
+        group = _get_process_group(self.mapping.attn.tp_group)
+        if not multimem_prealloc(max_num_tokens, (self.hidden_size,), group.group_name):
+            return False
+        K3AttnComm.staged_projection = (group.group_name, max_num_tokens)
+        logger.info(
+            f"K3 o-projection multimem staging prepared through M={max_num_tokens}"
+        )
+        return True
+
     def acquire_projection_output(
         self,
         like: torch.Tensor,
@@ -205,9 +237,25 @@ class K3AttnComm:
         """Return prepared storage for an eligible attention producer, or None."""
         from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 
+        if not current_platform().is_cdna4:
+            # Prepared on NVIDIA only (prepare_staged_projection).
+            staged = self.staged_projection
+            if (
+                staged is None
+                or like.ndim != 2
+                or not _MULTIMEM_AR_MIN_TOKENS < like.shape[0] <= staged[1]
+                or like.dtype != torch.bfloat16
+                or type(projection.quant_method) is not UnquantizedLinearMethod
+                or projection.weight.dtype != torch.bfloat16
+                or projection.weight.shape[0] != self.hidden_size
+                or projection.bias is not None
+                or projection.reduce_results
+                or not projection.input_is_parallel
+            ):
+                return None
+            return multimem_view(like.shape[0], self.hidden_size, staged[0])
         if (
-            not current_platform().is_cdna4
-            or like.ndim != 2
+            like.ndim != 2
             or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
             <= like.shape[0]
             <= _IRIS_MAX_TOKENS
@@ -265,6 +313,11 @@ class K3AttnComm:
             and not global_server_args_dict.get("batch_invariant_collectives", False)
             else None
         )
+        if reduced is None and producer_direct and self.staged_projection is not None:
+            # The MoE tail restages the buffer; AttnRes keeps the sum past it.
+            reduced = multimem_all_reduce_staged(
+                partial, self.staged_projection[0]
+            ).clone()
         if reduced is None:
             if producer_direct:
                 reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]
@@ -468,9 +521,11 @@ class K3MoeTailComm:
         the join, up-project the routed latent, add the reduced shared shard,
         and all-gather the output.
 
-    Stage 2 -- up_proj_inject_ar, for 33 or more tokens:
-        After the join, accumulate this rank's up-projection block into the
-        full shared-expert partial, then all-reduce the combined output.
+    Stage 2 -- inject_residual + up_proj_inject_ar, for 33 or more tokens:
+        Add the attention residual to this rank's block of the full
+        shared-expert partial in the shared-expert branch. After the join,
+        accumulate this rank's up-projection block into it, then all-reduce
+        the combined output.
 
     Both stage-2 patterns add the attention residual exactly once. Token count
     selects the pattern; the model controls stream scheduling independently.
@@ -645,18 +700,38 @@ class K3MoeTailComm:
             routed_latent, self.up_proj.weight, shared_shard, prefix_sum
         )
 
+    def inject_residual(
+        self, shared_partial: torch.Tensor, prefix_sum: torch.Tensor
+    ) -> None:
+        """Add the residual to this rank's shared block, in the shared branch.
+
+        Args:
+            shared_partial: Unreduced rank-local BF16 [M,H] shared-expert
+                output of a group of more than one rank, updated in place.
+            prefix_sum: Replicated BF16 [M,H] attention residual.
+        """
+        if self.mapping.moe.tp_ep_size == 1:
+            raise ValueError("A one-rank K3 MoE tail adds the residual in add3")
+        num_tokens = shared_partial.shape[0]
+        start, width = self.up_proj.shard_slice
+        target = shared_partial.view(num_tokens, self.hidden_size)
+        target[:, start : start + width] += prefix_sum.view(
+            num_tokens, self.hidden_size
+        )[:, start : start + width]
+
     def up_proj_inject_ar(
         self,
         routed_latent: torch.Tensor,
         shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
     ) -> torch.Tensor:
         """Inject the projection block and residual, then all-reduce after the join.
 
         Args:
             routed_latent: Replicated normalized BF16 [M,L].
             shared_partial: Unreduced rank-local BF16 [M,H] shared-expert output.
-            prefix_sum: Replicated BF16 [M,H] attention residual.
+            prefix_sum: Replicated BF16 [M,H] attention residual, or None
+                when inject_residual already added it to ``shared_partial``.
 
         Returns:
             BF16 [M,H] combined output on every rank. M33..1024 uses ordinary
@@ -664,6 +739,8 @@ class K3MoeTailComm:
         """
         num_tokens = routed_latent.shape[0]
         if self.mapping.moe.tp_ep_size == 1:
+            if prefix_sum is None:
+                raise ValueError("A one-rank K3 MoE tail adds the residual in add3")
             return self.up_proj.forward_add3(routed_latent, prefix_sum, shared_partial)
         capacity = self._stage2_capacity
         if capacity is None:
@@ -677,11 +754,10 @@ class K3MoeTailComm:
             )
             if shared_partial is None:
                 raise RuntimeError("K3 Multimem staging was not prepared")
+        if prefix_sum is not None:
+            self.inject_residual(shared_partial, prefix_sum)
         start, width = self.up_proj.shard_slice
         target = shared_partial[:, start : start + width]
-        target += prefix_sum.view(num_tokens, self.hidden_size)[
-            :, start : start + width
-        ]
         target.addmm_(routed_latent, self.up_proj.weight.t())
         if num_tokens > _MULTIMEM_AR_MIN_TOKENS:
             # The next layer reuses the symmetric staging buffer.
@@ -691,8 +767,31 @@ class K3MoeTailComm:
         return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
 
 
+def draft_all_reduce(hidden_states: torch.Tensor, tp_group) -> torch.Tensor:
+    """Sum a draft layer's row-parallel ``[rows, hidden]`` output across
+    ``tp_group``.
+
+    Rows within the target's Lamport windows reduce through its prepared
+    Iris state, which target and draft share in stream order; other widths,
+    groups without a K3 target, and the deterministic-collective modes take
+    the ordinary all-reduce.
+    """
+    state = K3AttnComm.iris_states.get(tp_group)
+    if (
+        state is not None
+        and hidden_states.shape[0] > 0
+        and not global_server_args_dict.get("force_deterministic_rsag", False)
+        and not global_server_args_dict.get("batch_invariant_collectives", False)
+    ):
+        reduced = state.reduce_attention(hidden_states)
+        if reduced is not None:
+            return reduced
+    return all_reduce(hidden_states, tp_group)
+
+
 __all__ = [
     "K3_SHARED_RS_MAX_TOKENS",
     "K3AttnComm",
     "K3MoeTailComm",
+    "draft_all_reduce",
 ]

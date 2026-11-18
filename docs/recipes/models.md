@@ -724,8 +724,8 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
-  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  and on the aggregated role, mixed rounds included; elsewhere prefill runs
+  eager. `--disable-prefill-graph` turns them off. On the
   aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
@@ -736,11 +736,24 @@ Notes:
   concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
   GPU and 2 to 3 more minutes of startup.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
-  proposes 7 tokens per step, so it takes
-  `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
-  causally within its block (its config sets `dflash_config.causal`).
-  `--drafter-attention-backend tokenspeed_mla` runs causal blocks; the other
+  proposes up to 7 tokens per step: its checkpoint sets 7 drafts with
+  `--speculative-num-draft-tokens 8` by default, and explicit widths draft
+  fewer (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`).
+  Unlike Kimi-K3's draft, it attends causally within its block (its config
+  sets `dflash_config.causal`). `--drafter-attention-backend tokenspeed_mla`,
+  `mla` and `gluon` run causal blocks, the last two under KVP too; the other
   MLA drafter backends refuse the draft at startup.
+- The released Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark`) is
+  saved by the `speculators` library. TokenSpeed converts its config to the
+  DFlash layout at load time: draft layers from `transformer_layer_config`,
+  target taps one below each `aux_hidden_state_layer_ids` entry, and the mask
+  token, whose trained embedding row replaces the target's. Its five GQA
+  layers slide over a 2048-token window and attend causally within the block,
+  so serve it with `--drafter-attention-backend mha`, which also runs it
+  under KVP. Its `block_size` of 7 is
+  the number of drafted tokens, so the verify window is one larger
+  (`--speculative-num-draft-tokens 8`). Other `speculators` DSpark drafts
+  load the same way.
 - A checkpoint with a Python XTML encoder and no Jinja chat template needs
   its tokenizer's `apply_chat_template` to encode messages. Pass the token
   IDs as `input_ids` to the native `/generate` endpoint.
@@ -784,7 +797,7 @@ step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
 of 50K input and 500 output tokens run at once.
 
 ```bash
-tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
   --max-model-len 65536 \
@@ -796,6 +809,9 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --drafter-attention-backend gluon \
   --max-num-seqs 64 \
   --disable-kvstore \
+  --enable-startup-requests \
+  --prefill-graph-max-tokens 3072 \
+  --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -808,8 +824,26 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
 - `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
   kernels and fails fast where none is registered; leaving it unset lets the
   `mla` backend select the kernels.
-- Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
-  NVIDIA only.
+- Prefill CUDA graphs replay under KV parallelism too, with the DSA attention
+  and the KV history gather at eager breaks. `--prefill-graph-max-tokens 3072`
+  captures only chunks of up to 3072 new tokens; longer chunks run faster eager.
+  `--prefill-graph-capture-token-sizes` captures 6 buckets instead of the
+  default ladder's 44, which reserves about 10 GB per GPU at startup and
+  leaves too few KV cache blocks with KV parallelism at a 1M-token context.
+- `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
+  compute pipe. With ROCm's default of 4, two queues share a pipe, so
+  prefill's high-priority side kernels can wait behind the forward's GEMMs.
+- `--enable-startup-requests` has the engine serve a few requests of its own
+  before it reports ready, so eager prefill and the request bookkeeping are
+  compiled before the first client request instead of during it.
+- Optionally, add `--kv-parallel-size 8 --decode-context-parallel-size 8` for
+  long contexts or many concurrent requests. Each GPU then stores one eighth of
+  every request's full-attention pages, so about 55 requests of 50K input and
+  500 output tokens run at once, and decode attends each GPU's share of the
+  selected keys. See
+  [KV parallelism](../serving/parallelism.md#kv-parallelism).
+  With KV parallelism, also add `--enable-mixed-batch`: decode rows then ride
+  in a prefill chunk's forward instead of waiting for it.
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2
@@ -1198,6 +1232,40 @@ ts serve \
     --speculative-num-steps 3
 ```
 
+On SM107, also set `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` (FlashInfer
+0.7.4) in the server's environment. It changes which routing kernels FlashInfer
+runs for this model's routes (512 experts, top-10, softmax). By default, from
+32 to 256 tokens per MoE call, FlashInfer splits routing into a
+block-per-token top-k kernel and a permutation kernel; with the variable set,
+it runs one fused single-cluster kernel. With the variable set, from 257 to
+1024 tokens it uses the warp-per-token top-k kernel instead of the
+block-per-token one. Calls below 32
+or above 1024 tokens are unchanged, and the routed experts and weights are
+bit-identical either way. With MTP 3 steps, the target's MoE calls route 4
+tokens per request, so a batch of 8 requests makes 32-token calls.
+
+FlashInfer's default for this route comes from a routing-only sweep that
+covered SM100 and SM103 as well, and FlashInfer labels the variable a
+benchmarking override. The timings below were measured only on SM107, with the
+NVFP4 checkpoint at TP1 (BF16 router logits), so they are not a measurement of
+the FP8 command above; the token ranges, which depend only on the expert count,
+top-k and token count, are the same for it. FlashInfer reads the variable once
+per process for all of its custom (non-grouped) routing, whose default was
+tuned across expert counts and top-k, so set it only for this model.
+
+Routing per MoE layer below runs from the end of the hyper-connection mix to
+the start of FC1:
+
+| decode batch | routing per MoE layer | decode step |
+|---|---|---|
+| 1 | 4.4 -> 4.4 us | -0.6% (noise) |
+| 8 | 13.3 -> 9.2 us | -3.5% (median of 3 runs) |
+| 32 | 15.7 -> 12.0 us | -2.9% |
+| 64 | 18.3 -> 15.3 us | -1.3% |
+| 128 | 21.0 -> 20.7 us | -0.1% |
+
+A 16k-token prefill chunk is unchanged.
+
 ### AMD
 
 On AMD MI350X/MI355X (gfx950), serve the
@@ -1534,6 +1602,10 @@ path, with no flag. Use these supported Hub revisions:
 | BF16 | `f40a3a29` |
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
+
+Each sandwich all-reduce boundary (the all-reduce, the sandwich norm, and the
+next pre-norm) runs as one MNNVL launch per 2048-row slice where the workspace
+serves it, so prefill chunks above 2048 tokens fuse too.
 
 For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
 per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or

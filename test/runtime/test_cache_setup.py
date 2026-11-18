@@ -157,7 +157,7 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
     draft_backend = Mock(spec=AttentionBackend)
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=3),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
         backend=backend,
         draft_backend=draft_backend,
         uses_paged_state_verify=uses_paged_state_verify,
@@ -185,7 +185,7 @@ def _model_wide_kwargs(**overrides) -> dict:
         max_bs=2,
     )
     kwargs.update(overrides)
-    return kwargs
+    return {"max_resident_requests": kwargs["max_bs"], **kwargs}
 
 
 def _mha_config() -> AttnConfig:
@@ -204,8 +204,9 @@ def _mha_config() -> AttnConfig:
     "is_draft,width,num_layers,layerwise,ring_rows",
     [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
 )
+@pytest.mark.parametrize("resident_requests", [2, 5])
 def test_inkling_construction_matches_ring_reservation(
-    is_draft, width, num_layers, layerwise, ring_rows
+    is_draft, width, num_layers, layerwise, ring_rows, resident_requests
 ):
     from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
         InklingAttnBackend,
@@ -225,6 +226,7 @@ def test_inkling_construction_matches_ring_reservation(
         config,
         components=(spec,),
         is_draft=is_draft,
+        max_resident_requests=resident_requests,
         speculative_num_draft_tokens=width,
     )
     text = SimpleNamespace(
@@ -242,7 +244,12 @@ def test_inkling_construction_matches_ring_reservation(
         is_draft=is_draft,
         enable_layerwise_cache_ready=layerwise,
     )
-    assert backend.conv_pool.conv_state.shape == (num_layers, 4, ring_rows, 24)
+    assert backend.conv_pool.conv_state.shape == (
+        num_layers,
+        resident_requests + 2,
+        ring_rows,
+        24,
+    )
     assert backend.conv_spec_num_tokens == width
     assert backend.enable_layerwise_cache_ready is layerwise
     assert backend.fixed_workspace_bytes() == _conv_ring_bytes(
@@ -1409,12 +1416,17 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family("mla", "mha", draft_family_declared=False)
         == "mha"
     )
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", draft_family_declared=False
+    for draft_family in ("mla", "mha"):
+        assert (
+            _resolve_heterogeneous_draft_family(
+                "kimi_k3", draft_family, draft_family_declared=False
+            )
+            == draft_family
         )
-        == "mla"
-    )
+    with pytest.raises(RuntimeError, match="hosts MLA or MHA draft views"):
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "dsa", draft_family_declared=False
+        )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
         _resolve_heterogeneous_draft_family("mha", "mla", draft_family_declared=False)
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
@@ -1777,6 +1789,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
         (None, "flashmla", None),
+        (None, "gluon", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
@@ -2019,6 +2032,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     budget, rows = sized.value.args

@@ -52,7 +52,7 @@ def test_default_is_off_and_the_flags_travel_by_config_not_global_dict():
     assert "spec_reject_draft_prob_threshold" not in global_server_args_dict
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE3", "MTP"])
+@pytest.mark.parametrize("algorithm", ["EAGLE3", "MTP", "DSPARK"])
 @pytest.mark.parametrize("backend", ["flashinfer", "flashinfer_full"])
 def test_chain_drafters_with_a_draft_prob_verifier_resolve(algorithm, backend):
     args = _args(
@@ -81,11 +81,10 @@ def test_refuses_without_speculative_decoding():
         ServerArgs(model="x", enable_speculative_sampling=True)
 
 
-@pytest.mark.parametrize("backend", ["flashinfer", "triton"])
-def test_refuses_dspark(backend):
-    with pytest.raises(ValueError, match="whole block greedily") as error:
-        _args(speculative_algorithm="DSPARK", sampling_backend=backend)
-    assert "pass --speculative-rejection-sample-method block" in str(error.value)
+def test_dspark_token_wise_rejection_refuses_the_triton_verifier():
+    # Triton reads the dense q only under block verification.
+    with pytest.raises(ValueError, match="draft-prob chain kernel"):
+        _args(speculative_algorithm="DSPARK", sampling_backend="triton")
 
 
 def test_dflash_resolves_with_the_triton_verifier():
@@ -118,6 +117,35 @@ def test_block_verification_requires_sampled_drafts(algorithm):
         )
 
 
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
+def test_block_verification_resolves_on_the_triton_verifier(algorithm):
+    # The triton verifier runs block verification over the dense recorded q.
+    args = _args(
+        speculative_algorithm=algorithm,
+        sampling_backend="triton",
+        speculative_rejection_sample_method="block",
+    )
+    assert args.speculative_rejection_sample_method == "block"
+    assert args.enable_speculative_sampling and args.sampling_backend == "triton"
+
+
+def test_triton_refuses_the_other_sampled_draft_rules():
+    with pytest.raises(
+        ValueError,
+        match="synthetic-acceptance-length requires --sampling-backend greedy",
+    ):
+        _args(
+            speculative_algorithm="DSPARK",
+            sampling_backend="triton",
+            synthetic_acceptance_length=3.0,
+        )
+    with pytest.raises(ValueError, match="target-sampled exact match"):
+        _args(
+            sampling_backend="triton",
+            speculative_rejection_sample_method="standard",
+        )
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -131,6 +159,7 @@ def test_block_verification_requires_sampled_drafts(algorithm):
             "speculative_num_draft_tokens": 8,
         },
         {"sampling_backend": "flashinfer_full"},
+        {"sampling_backend": "triton_full"},
         {"sampling_backend": "greedy"},
         {"disaggregation_mode": "decode"},
     ],

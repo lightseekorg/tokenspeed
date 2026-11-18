@@ -16,7 +16,7 @@
 # SOFTWARE.
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -26,9 +26,6 @@ from tokenspeed_kernel.signature import (
     dense_tensor_format,
     format_signature,
 )
-
-if TYPE_CHECKING:
-    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 __all__ = [
     "quantize_fp8",
@@ -844,7 +841,6 @@ def rmsnorm_nvfp4_quant(
     global_scale: torch.Tensor,
     mailbox_sentinel: int | None,
     enable_pdl: bool,
-    mailbox_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm a BF16 row and quantize it to NVFP4 in one launch.
 
@@ -853,14 +849,16 @@ def rmsnorm_nvfp4_quant(
     result feeds the TRT-LLM FP4 MoE kernels directly.
 
     With ``mailbox_sentinel`` the rows are this rank's Lamport mailbox, still
-    being filled by the sharded projection's multicast stores: each program
-    polls its row until no BF16 element still holds the sentinel's half, then
-    re-arms the row, so no gather launch stands between the projection and
-    the experts.
+    being filled by the sharded projection's multicast stores, one block per
+    rank: each program polls its row until no BF16 element still holds the
+    sentinel's half, then re-arms the row, so no gather launch stands between
+    the projection and the experts.
 
     Args:
         x: BF16 rows ``[rows, width]`` with ``width`` a multiple of 16; with
-            a sentinel, the contiguous mailbox rows and a power-of-two width.
+            a sentinel, a ``[blocks, rows, block_width]`` view of each block's
+            first ``rows``, read as the blocks' rows side by side; the block
+            width and the side-by-side row width are powers of two.
         weight: Learned affine norm weight ``[width]``.
         eps: Epsilon added to the variance.
         weight_offset: Center added to the checkpoint weight.
@@ -869,8 +867,6 @@ def rmsnorm_nvfp4_quant(
         mailbox_sentinel: The 32-bit word ``x`` is armed with, whose 16-bit
             halves agree, or None for an ordinary tensor.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
-        mailbox_publish: This rank's block for the kernel to store into the
-            mailbox before it polls, or None when the producer stored it.
 
     Returns:
         ``(packed, scales)``: E2M1 pairs as ``uint8 [rows, width // 2]`` and
@@ -889,7 +885,6 @@ def rmsnorm_nvfp4_quant(
         global_scale,
         mailbox_sentinel,
         enable_pdl,
-        mailbox_publish,
     )
 
 

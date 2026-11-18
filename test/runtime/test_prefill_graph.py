@@ -164,15 +164,21 @@ class TestPrefillCaptureArgsTest:
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,
-            enable_drafter_prefill_graph=False,
+            enable_dp_local_cuda_graph=False,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
 
-        for sizes, expected in ((None, [1]), ([1, 2, 4], [1, 2, 4])):
-            with subtests.test(capture_batch_sizes=sizes):
+        # Unset captures 4 requests, never more than max_num_seqs.
+        for sizes, max_num_seqs, expected in (
+            (None, 4, [4]),
+            (None, 2, [2]),
+            ([1, 2, 4], 4, [1, 2, 4]),
+        ):
+            with subtests.test(capture_batch_sizes=sizes, max_num_seqs=max_num_seqs):
                 config = ModelExecutorConfig(
-                    **config_args, prefill_graph_capture_batch_sizes=sizes
+                    **{**config_args, "max_num_seqs": max_num_seqs},
+                    prefill_graph_capture_batch_sizes=sizes,
                 )
                 assert (config.prefill_graph_capture_batch_sizes) is (sizes)
                 assert (resolve_prefill_capture_batch_sizes(config, 1024)) == (expected)
@@ -1450,11 +1456,11 @@ class TestPrefillRoleGraphsTest:
             decode_only_attention=False,
             prefill_graph_capture_batch_sizes=None,
             enable_speculative_sampling=False,
+            enable_dp_local_cuda_graph=False,
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,
             prefill_graph_max_tokens=256,
-            enable_drafter_prefill_graph=False,
         )
 
     def _decode_runner(self, config):

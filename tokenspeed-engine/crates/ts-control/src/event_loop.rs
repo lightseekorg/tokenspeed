@@ -497,6 +497,24 @@ pub struct PrefillDelay {
     /// `attempt_interval`, otherwise the ALL points could never be reached
     /// consecutively.
     pub any_interval: u64,
+    /// `--prefill-single-round`: one prefill round per window. The round
+    /// after a prefill round is not an ALL point while any rank would
+    /// decode, so a backlog does not drain in consecutive prefill rounds;
+    /// the next ALL point is `attempt_interval` rounds later. An idle engine
+    /// still admits at once.
+    pub single_round: bool,
+}
+
+impl PrefillDelay {
+    /// Whether round `rounds` since the last prefill round is an ANY point
+    /// and whether it is an ALL point; `decoding` says whether any rank
+    /// would decode this round.
+    fn attempt_points(&self, rounds: u64, decoding: bool) -> (bool, bool) {
+        let any_point = rounds != 0 && rounds % self.any_interval == 0;
+        let all_point =
+            rounds % self.attempt_interval == 0 && !(self.single_round && rounds == 0 && decoding);
+        (any_point, all_point)
+    }
 }
 
 /// The optional subsystems a loop coordinates; each is `None` on an engine
@@ -652,6 +670,51 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
+    /// Serve `phases` of the engine's own requests before a frontend is
+    /// attached: each phase on its own, until every rank is idle, then the
+    /// prefix caches it filled are dropped. The requests take the serving
+    /// path -- admission, planning, the data plane and the commits -- so the
+    /// first requests a client sends find that path prepared. Every rank
+    /// calls this with the same phases; the replica's first member submits
+    /// them, as it does a frontend's requests. Their outputs go to the
+    /// frontend, which drops them while none is attached.
+    ///
+    /// Returns whether a stop was agreed meanwhile; the loop must not
+    /// [`Self::run`] then.
+    pub fn warm_up(
+        &mut self,
+        phases: Vec<Vec<EngineRequest>>,
+        stop: &AtomicBool,
+    ) -> Result<bool, LoopError> {
+        for requests in phases {
+            let mut submitted = if self.owns_frontend() {
+                requests
+            } else {
+                Vec::new()
+            };
+            loop {
+                let received = std::mem::take(&mut submitted);
+                if self.round_with(stop.load(Ordering::Relaxed), received)? {
+                    return Ok(true);
+                }
+                if self.converge(self.idle() && self.dp_idle)? {
+                    break;
+                }
+            }
+            while !self.clear_cache()? {
+                if self.round(stop.load(Ordering::Relaxed))? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The frontend, for attaching one after [`Self::warm_up`].
+    pub fn frontend_mut(&mut self) -> &mut F {
+        &mut self.frontend
+    }
+
     fn owns_frontend(&self) -> bool {
         self.ranks.replica.index() == 0
     }
@@ -684,6 +747,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// One round, with this rank's stop request. Returns whether the ranks
     /// agreed to stop after it.
     pub fn round(&mut self, stop_requested: bool) -> Result<bool, LoopError> {
+        self.round_with(stop_requested, Vec::new())
+    }
+
+    /// A round whose replica-first member also receives `submitted`, the
+    /// engine's own requests, ahead of the frontend's.
+    fn round_with(
+        &mut self,
+        stop_requested: bool,
+        submitted: Vec<EngineRequest>,
+    ) -> Result<bool, LoopError> {
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
         let held_spans = profile::hold();
@@ -692,9 +765,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut released: Vec<String> = Vec::new();
 
         let received = if self.owns_frontend() {
-            let wait = (self.idle() && self.dp_idle).then_some(IDLE_WAIT);
+            let wait = (submitted.is_empty() && self.idle() && self.dp_idle).then_some(IDLE_WAIT);
             let _span = profile::span("Frontend::receive");
-            self.frontend.receive(wait)
+            let mut received = submitted;
+            received.extend(self.frontend.receive(wait));
+            received
         } else {
             Vec::new()
         };
@@ -808,7 +883,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if self.config.kv_events {
             let drained = self.scheduler.drain_kv_events();
             if let Some(publisher) = &self.kv_events {
-                publisher.publish(&drained);
+                publisher.publish(drained);
             }
         }
         // A storage operation's outcome is an acknowledgment too.
@@ -872,10 +947,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        let sample_ttft = self.outputs.ttft_sampling_enabled();
+        let debug = tracing::enabled!(tracing::Level::DEBUG);
+        // Reading the batch crosses FFI and copies its arrays.
+        if sample_ttft || debug {
             if let Some(batch) = plan.remote_prefill() {
-                tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
+                if sample_ttft {
+                    self.outputs.mark_planned(&batch.request_ids, true);
+                }
+                if debug {
+                    tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
+                }
             }
+        }
+        if debug {
             if let Some(batch) = plan.remote_decode() {
                 tracing::debug!(rids = ?batch.request_ids, "remote decode planned");
             }
@@ -897,6 +982,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
+        if sample_ttft {
+            if let Some(batch) = &forward {
+                self.outputs.mark_planned(&batch.request_ids, false);
+            }
+        }
         // The scheduler's counts as this round planned, for the metrics and
         // the batch line: nothing between the two mutates the scheduler, so
         // they are taken once, and only for a reader.
@@ -931,6 +1021,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 i64::from(active_pages),
                 self.config.kv_total_pages,
                 iteration_tokens,
+            );
+            metrics.record_decode_slot_usage(
+                sizes.allocated_request_slots as i64,
+                sizes.active_decode_slots as i64,
+                sizes.ready_waiting as i64,
             );
             let total_pages = self.config.kv_total_pages;
             metrics.record_cache_occupancy(
@@ -1032,6 +1127,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             for rid in &batch.request_ids {
                 if let Some(at) = self.outputs.take_submitted_at(rid) {
                     metrics.observe_request_queue_time(at.elapsed().as_secs_f64());
+                }
+                if let Some(at) = self.outputs.take_decode_ready_at(rid) {
+                    metrics.observe_decode_ready_wait(at.elapsed().as_secs_f64());
                 }
             }
         }
@@ -2384,8 +2482,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return true;
         }
         let rounds = self.rounds_since_prefill;
-        let any_point = rounds != 0 && rounds % delay.any_interval == 0;
-        let all_point = rounds % delay.attempt_interval == 0;
+        let (any_point, all_point) =
+            delay.attempt_points(rounds, self.dp_has_decode_work.iter().any(|d| *d));
         if !any_point && !all_point {
             return false;
         }
@@ -2595,6 +2693,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 let resident = kv_total_pages - i64::from(sizes.empty_lcm_blocks);
                 RoundStats {
                     queued: sizes.waiting,
+                    allocated_request_slots: sizes.allocated_request_slots,
+                    active_decode_slots: sizes.active_decode_slots,
+                    ready_waiting: sizes.ready_waiting,
                     active_pages: active,
                     cached_pages: (resident - active).max(0),
                     pd: [
@@ -2738,7 +2839,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// paused (registered, so an abort still reaches them).
     fn register(
         &mut self,
-        admissions: Vec<Admission>,
+        mut admissions: Vec<Admission>,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
@@ -2747,6 +2848,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let _span = profile::span("EventLoop::register");
         tracing::debug!(admitted = admissions.len(), "requests admitted");
+        for admission in &mut admissions {
+            self.outputs.assign_admission(&mut admission.state);
+        }
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;
         let mut submissions = Vec::with_capacity(admissions.len());
@@ -2850,5 +2954,30 @@ mod tests {
             5
         );
         assert_eq!(walks, 4);
+    }
+
+    #[test]
+    fn single_round_windows_close_the_round_after_a_prefill_while_ranks_decode() {
+        let delay = |single_round| PrefillDelay {
+            attempt_interval: 3,
+            any_interval: 6,
+            single_round,
+        };
+        let all_points = |single_round, decoding| -> Vec<u64> {
+            (0..7)
+                .filter(|&r| delay(single_round).attempt_points(r, decoding).1)
+                .collect()
+        };
+        // Draining: the round after a prefill round is an ALL point.
+        assert_eq!(all_points(false, true), [0, 3, 6]);
+        // One round per window while anything decodes.
+        assert_eq!(all_points(true, true), [3, 6]);
+        // An idle engine admits at once.
+        assert_eq!(all_points(true, false), [0, 3, 6]);
+        // ANY points are unchanged.
+        let any_points: Vec<u64> = (0..13)
+            .filter(|&r| delay(true).attempt_points(r, true).0)
+            .collect();
+        assert_eq!(any_points, [6, 12]);
     }
 }

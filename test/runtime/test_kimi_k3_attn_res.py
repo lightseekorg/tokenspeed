@@ -735,6 +735,7 @@ class TestAttnResTests:
         attention = mock.Mock(side_effect=lambda **_kwargs: events.append("attention"))
         attention.return_value = object()
         layer = SimpleNamespace(
+            _premixed_input=None,
             _fused_attnres_graph_available=mock.Mock(return_value=False),
             _mix_into_attention=mock.Mock(return_value=(h, prefix)),
             prev_valid_blocks=1,
@@ -873,6 +874,161 @@ class TestAttnResTests:
                         assert (args[1]) is (attn_weight)
                         assert (args[2]) == (_EPS)
                         assert (args[3]) is (attn_scratch)
+
+    def test_attention_premix_carries_the_fast_mix_operands(self):
+        hidden_states = SimpleNamespace(shape=(4, _HIDDEN), is_cuda=True)
+        block_residual = object()
+        scratch = (object(), object(), object())
+        layer = SimpleNamespace(
+            _attn_split=True,
+            prev_valid_blocks=2,
+            _attn_wp=object(),
+            input_layernorm=SimpleNamespace(weight=object()),
+            self_attention_res_norm=SimpleNamespace(variance_epsilon=_EPS),
+            _fused_attnres_graph_available=mock.Mock(return_value=False),
+        )
+        layer._fast_attention_mix = lambda hidden: (
+            kimi_k3.KimiLinearDecoderLayer._fast_attention_mix(layer, hidden)
+        )
+        premix = kimi_k3.KimiLinearDecoderLayer._attention_premix
+
+        with mock.patch.object(kimi_k3, "_sliced_scratch", return_value=scratch):
+            assert (premix(layer, hidden_states, block_residual)) == (
+                kimi_k3._AttentionPremix(
+                    layer._attn_wp, layer.input_layernorm.weight, _EPS, scratch
+                )
+            )
+            # Wherever we would not run the fast-path combine, nothing fuses it.
+            wide = SimpleNamespace(shape=(33, _HIDDEN), is_cuda=True)
+            assert premix(layer, wide, block_residual) is None
+            layer._fused_attnres_graph_available.return_value = True
+            assert premix(layer, hidden_states, block_residual) is None
+            layer._fused_attnres_graph_available.return_value = False
+            layer._attn_split = False
+            assert premix(layer, hidden_states, block_residual) is None
+
+    def test_premixed_attention_input_replaces_the_combine(self):
+        prefix = torch.zeros(4, _HIDDEN, dtype=torch.bfloat16)
+        premixed = torch.ones_like(prefix)
+        layer = SimpleNamespace(
+            _fast_attention_mix=lambda _hidden: True,
+            is_block_write_layer=False,
+            _attn_wp=object(),
+            input_layernorm=SimpleNamespace(weight=object()),
+            self_attention_res_norm=SimpleNamespace(variance_epsilon=_EPS),
+        )
+        mix = kimi_k3.KimiLinearDecoderLayer._mix_into_attention
+
+        with (
+            mock.patch.object(kimi_k3, "attnres_combine") as combine,
+            mock.patch.object(kimi_k3, "_sliced_scratch", return_value=object()),
+        ):
+            h, prefix_sum = mix(layer, prefix, object(), premixed)
+            assert (h) is (premixed)
+            assert (prefix_sum) is (prefix)
+            combine.assert_not_called()
+            h, _ = mix(layer, prefix, object())
+            combine.assert_called_once()
+            assert (h) is (combine.return_value)
+
+    def test_moe_layer_hands_the_next_attention_mix_to_its_tail(self, subtests):
+        class Fork:
+            @contextmanager
+            def scope(self, *, enable):
+                yield self
+
+            @contextmanager
+            def branch(self):
+                yield
+
+        positions, hidden_states, ctx = object(), object(), object()
+        block_residual = [object()]
+        h = SimpleNamespace(shape=(16, _HIDDEN), is_cuda=True)
+        prefix = torch.zeros(16, _HIDDEN, dtype=torch.bfloat16)
+        hidden = torch.ones_like(prefix)
+        output = torch.full_like(prefix, 2)
+        mixed = torch.full_like(prefix, 3)
+        weight = mock.Mock()
+        weight.reshape.return_value = weight
+
+        def moe(*_args, attention_mix=None, **_kwargs):
+            if attention_mix is not None:
+                attention_mix.out = mixed
+            return output
+
+        for tail_mixes in (True, False):
+            with subtests.test(tail_mixes=tail_mixes):
+                premix = (
+                    kimi_k3._AttentionPremix(object(), object(), _EPS, (object(),) * 3)
+                    if tail_mixes
+                    else None
+                )
+                next_layer = SimpleNamespace(
+                    _attn_wp=object(),
+                    _premixed_input=None,
+                    _attention_premix=mock.Mock(return_value=premix),
+                )
+                premixed = object()
+                layer = SimpleNamespace(
+                    _premixed_input=premixed,
+                    _fused_attnres_graph_available=mock.Mock(return_value=False),
+                    _mix_into_attention=mock.Mock(return_value=(h, prefix)),
+                    prev_valid_blocks=1,
+                    is_block_write_layer=False,
+                    _mlp_slot=3,
+                    _mlp_split=False,
+                    _next_attn_mix=(next_layer, 1),
+                    _hoist_next_mlp=False,
+                    _mlp_wp=object(),
+                    mlp_res_proj=SimpleNamespace(weight=weight),
+                    mlp_res_norm=SimpleNamespace(
+                        weight=object(), variance_epsilon=_EPS
+                    ),
+                    post_attention_layernorm=SimpleNamespace(weight=object()),
+                    self_attn=mock.Mock(return_value=object()),
+                    comm_manager=SimpleNamespace(
+                        get_num_tokens=mock.Mock(return_value=(16, 16))
+                    ),
+                    k3_comm=SimpleNamespace(
+                        attn_ar_fusion_ok=False,
+                        acquire_projection_output=mock.Mock(return_value=None),
+                        fused_attnres_reduce_available=mock.Mock(return_value=True),
+                    ),
+                    attn_fork=Fork(),
+                    _reduce_attn_accumulate=mock.Mock(return_value=(prefix, hidden)),
+                    is_moe_layer=True,
+                    block_sparse_moe=mock.Mock(side_effect=moe),
+                )
+                with (
+                    mock.patch.object(
+                        kimi_k3, "get_is_capture_mode", return_value=False
+                    ),
+                    mock.patch.object(
+                        kimi_k3, "_sliced_scratch", return_value=object()
+                    ),
+                    mock.patch.object(kimi_k3, "attnres_partial"),
+                ):
+                    result, residual = kimi_k3.KimiLinearDecoderLayer.forward(
+                        layer, positions, hidden_states, ctx, block_residual
+                    )
+
+                assert (result) is (output)
+                assert (residual) is (block_residual)
+                # Our own premixed input is consumed once.
+                layer._mix_into_attention.assert_called_once_with(
+                    hidden_states, block_residual, premixed
+                )
+                assert layer._premixed_input is None
+                next_layer._attention_premix.assert_called_once_with(
+                    prefix, block_residual
+                )
+                moe_kwargs = layer.block_sparse_moe.call_args.kwargs
+                if tail_mixes:
+                    assert (moe_kwargs["attention_mix"]) is (premix)
+                    assert (next_layer._premixed_input) is (mixed)
+                else:
+                    assert "attention_mix" not in moe_kwargs
+                    assert next_layer._premixed_input is None
 
     def test_cuda_kernel_matches_torch_fallback(self):
         # Only runs where the Blackwell attn_res build is present (e.g. B300 CI).

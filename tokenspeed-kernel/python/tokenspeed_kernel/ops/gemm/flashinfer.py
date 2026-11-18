@@ -789,26 +789,7 @@ if has_flashinfer_cute_dsl_nvfp4_a16():
 _mm_bf16 = error_fn
 _fi_gemm = None
 # Automatic dispatch scope, not a TGV capability limit.
-BF16_GEMM_MAX_M = 4 if platform.arch_version == ArchVersion(10, 7) else 32
-
-# SM107 admits only the projection shapes with a measured CuTe DSL win over
-# cuBLAS nvjet on vr200 (fi 0.7.2/0.7.3 microbenchmarks; full-N >= 13312
-# projections and the LM head lose and stay on nvjet). (N, K) of the TP4
-# per-rank projections plus the existing TP1 o_proj admission.
-_SM107_BF16_GEMM_SHAPES = frozenset(
-    {
-        (2560, 6144),  # attention o_proj, TP1 (existing admission)
-        (3584, 2560),  # attention qkv gated proj, TP4
-        (4096, 2560),  # GDN in_proj, TP4
-        (4120, 2560),  # GDN in_proj (padded variant), TP4
-        (4160, 2560),  # GDN in_proj (padded variant), TP4
-        (2560, 1536),  # attention o_proj, TP4
-        (1280, 2560),  # MoE shared-expert gate_up, TP4
-        (2560, 640),  # MoE shared-expert down, TP4
-        (320, 2560),  # small-N router-class proj, TP4
-        (512, 2560),  # small-N gate-up proj, TP4
-    }
-)
+BF16_GEMM_MAX_M = 32
 
 if platform.is_nvidia and platform.arch_version in (
     *_CUTE_DSL_SM100_ARCHS,
@@ -848,16 +829,27 @@ def has_flashinfer_cute_dsl_bf16() -> bool:
     return _mm_bf16 is not error_fn and _declares_cute_dsl_backend(_mm_bf16)
 
 
+def _sm107_cute_dsl_bf16_admits(n: int, k: int, weight_bytes: int) -> bool:
+    """Whether SM107 runs an ``[n, k]`` BF16 weight on the CuTe DSL GEMM.
+
+    Microbenchmark on vr200 (FlashInfer 0.7.4, CUDA graphs, weights cold in L2,
+    N 256 to 248320, K 640 to 8192, M 1 to 32): CuTe DSL wins or ties cuBLASLt up
+    to N = 8192. Wider weights lose at 16 to 32 rows when K <= 1792 or when they
+    exceed 96 MiB (32768 x 2048 = 128 MiB and larger, such as an LM head). The
+    benchmark understates the in-situ win (cold L2, no PDL overlap), so the
+    bounds were confirmed by serving A/B.
+    """
+    return n <= 8192 or (k >= 2048 and weight_bytes <= 96 << 20)
+
+
 def _bf16_gemm_runner_names(k: int) -> list[str]:
     """Admit each backend by its own K contract, not their intersection."""
     if k <= 0:
         return []
     if platform.arch_version == ArchVersion(10, 7):
-        # SM107: pin CuTe DSL, the measured winner on every admitted shape
-        # (microbenchmarks; the AutoTuner joint pick chose TGV for
-        # (2560, 1536) in production, so the joint ranking is not trusted
-        # here). Only consulted for shapes in _SM107_BF16_GEMM_SHAPES, so the
-        # pin's effective scope is exactly that set.
+        # SM107: pin CuTe DSL, the measured winner on the weights
+        # _sm107_cute_dsl_bf16_admits admits (the AutoTuner joint pick chose
+        # TGV for (2560, 1536) in production, so its ranking is not trusted).
         return ["cute-dsl"] if k % 128 == 0 else []
     # TGV handles partial K tiles; its TMA rows need 16-byte (8 BF16) strides.
     runners = ["tgv"] if k % 8 == 0 else []
@@ -881,11 +873,13 @@ def flashinfer_joint_bf16_supported(
         and x.is_cuda
         and x.device == weight.device
         and x.ndim == weight.ndim == 2
-        # Limit SM107 dispatch to the measured projection set. Other dense
-        # projections keep their existing implementation.
         and (
             platform.arch_version != ArchVersion(10, 7)
-            or tuple(weight.shape) in _SM107_BF16_GEMM_SHAPES
+            or _sm107_cute_dsl_bf16_admits(
+                weight.shape[0],
+                weight.shape[1],
+                weight.numel() * weight.element_size(),
+            )
         )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.shape[0] > 0
@@ -960,13 +954,102 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 
     FI skips cached profiles. Scratch inputs/output never alias the model output;
     this function does nothing outside the startup autotune window. The scratch
-    row count exposes native profiles up to the dispatch bound: 1/2/4 on
-    SM107, and 1/2/4/8/16/32 on SM100/103.
+    row count exposes native profiles up to the dispatch bound: 1/2/4/8/16/32.
     """
     if is_autotuning() and flashinfer_joint_bf16_supported(x, weight, None):
         with torch.no_grad():
             sample = x.new_zeros((BF16_GEMM_MAX_M, weight.shape[1]))
             flashinfer_bf16_gemm(sample, weight, None)
+
+
+# This is an admission policy, not a kernel shape limit. The four-row,
+# small-N projection measured a win with this tile; other shapes retain their
+# existing GEMM ranking until they have comparable performance evidence.
+def _prefer_small_n_splitk(m: int, n: int, k: int) -> bool:
+    return (m, n, k) == (4, 640, 2560)
+
+
+_bf16_splitk = None
+if platform.is_nvidia and platform.arch_version == ArchVersion(10, 7):
+    try:
+        from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as _bf16_splitk
+    except ImportError:
+        # Older optional FlashInfer builds keep the existing registered GEMM.
+        pass
+
+
+if _bf16_splitk is not None:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_bf16_small_n_splitk",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        traits={
+            "mnk_problem_filter": frozenset({_prefer_small_n_splitk}),
+            "a_contiguous": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "b_layout": frozenset({"NK"}),
+            "has_alpha": frozenset({False}),
+            "operands_aligned_32": frozenset({True}),
+            "out_aligned_32": frozenset({True}),
+            "out_contiguous": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "pdl_enabled": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+    )
+    def flashinfer_mm_bf16_small_n_splitk(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        enable_pdl: bool,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute BF16 ``A[M,K] @ B[N,K].T`` with a pinned Split-K tile.
+
+        Scales, alpha and block_size must be absent. ``out`` is preserved when
+        supplied. The provider validates layouts, alignment and tile bounds;
+        its compiled function uses runtime row counts. Registry admission is
+        narrower than this callable's supported shapes.
+        """
+        if (
+            A.dtype != torch.bfloat16
+            or B.dtype != A.dtype
+            or out_dtype != A.dtype
+            or any(
+                value is not None for value in (A_scales, B_scales, alpha, block_size)
+            )
+        ):
+            raise ValueError("Split-K BF16 GEMM requires unscaled BF16 operands")
+        if A.ndim != 2 or B.ndim != 2 or not A.is_contiguous() or not B.is_contiguous():
+            raise ValueError("Split-K BF16 GEMM requires contiguous 2D operands")
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], B.shape[0]), device=A.device, dtype=out_dtype
+            )
+        if out.ndim != 2 or not out.is_contiguous():
+            raise ValueError("Split-K BF16 GEMM requires a contiguous 2D output")
+        _bf16_splitk.run_splitk_dense(
+            _canonical_bf16_view(A),
+            B.t(),
+            None,
+            _canonical_bf16_view(out),
+            enable_pdl,
+            _bf16_splitk.SplitKTactic(64, 8, 4, 6),
+        )
+        return out
 
 
 # ===-----------------------------------------------------------------------===#
@@ -992,9 +1075,8 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
 # kernels.
 
 # The policy routes rows above TGV_DECODE_MIN_M, the joint FlashInfer path's
-# bound on SM100 and SM103 (BF16_GEMM_MAX_M there; the GPU tests check that
-# they agree). BF16_GEMM_MAX_M itself follows the host GPU, 4 on SM107, so the
-# policy keeps its own bound and depends only on its arguments.
+# bound (BF16_GEMM_MAX_M; the GPU tests check that they agree). The policy
+# keeps its own bound and depends only on its arguments.
 TGV_DECODE_MIN_M = 32
 TGV_DECODE_MAX_M = 512
 TGV_DECODE_MAX_WEIGHT_BYTES = 16 << 20

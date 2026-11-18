@@ -32,6 +32,11 @@ from tokenspeed_kernel.benchmark.harness import (
     BenchmarkStatus,
     PreparedBenchmark,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    encode_index_k_scale,
+    index_k_scale_dtype,
+    round_index_k_scale,
+)
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -267,7 +272,7 @@ def _packed_index_cache(
     )
     scales = (
         cache[:, value_bytes:]
-        .view(torch.float32)
+        .view(index_k_scale_dtype())
         .view(pages, config.index_rows_per_page, config.index_scale_groups)
     )
     source = _randn(
@@ -283,13 +288,13 @@ def _packed_index_cache(
     )
     scale_values = source_groups.abs().amax(dim=-1).clamp_min(1e-4)
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    scale_values.div_(fp8_max)
+    scale_values = round_index_k_scale(scale_values / fp8_max)
     values.copy_(
         (source_groups / scale_values.unsqueeze(-1))
         .clamp(-fp8_max, fp8_max)
         .view_as(source)
     )
-    scales.copy_(scale_values)
+    scales.copy_(encode_index_k_scale(scale_values))
     return cache, values, scales
 
 

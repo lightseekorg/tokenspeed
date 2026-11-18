@@ -56,7 +56,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -75,6 +75,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.models.dflash import DFlashDecoderLayer
 from tokenspeed.runtime.models.dspark import VanillaMarkov
+from tokenspeed.runtime.models.kimi_k3_comm import draft_all_reduce
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 
@@ -107,6 +108,11 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
     MLA backend supplies it by giving every block row the same block-end
     ``seq_len``, so each query sees the whole block including its own future.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
+        self.absorbed_weights_k_major = self.absorption_kernel_plan is None
 
     def _attn(
         self,
@@ -309,16 +315,9 @@ class K3DSparkDecoderLayer(DFlashDecoderLayer):
         ctx: ForwardContext,
         group,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reduce the preceding row-parallel output, then norm.
-
-        Deliberately the unfused path. The fused variant reduces through Iris
-        symmetric-heap buffers sized from the target's shapes, and the draft's
-        block forward is a different width; until that is verified the plain
-        all-reduce is the correct default. It costs one extra pass over an
-        8-row tensor.
-        """
+        """Reduce the preceding row-parallel output, then norm."""
         del ctx
-        hidden_states = all_reduce(hidden_states, group.tp_group)
+        hidden_states = draft_all_reduce(hidden_states, group.tp_group)
         return norm(hidden_states, residual)
 
 
@@ -556,7 +555,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor:
         """Reduce the last row-parallel MLP output before final normalization."""
-        hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+        hidden_states = draft_all_reduce(hidden_states, self.mapping.dense.tp_group)
         hidden_states, _ = self.final_norm(hidden_states, residual)
         return hidden_states
 

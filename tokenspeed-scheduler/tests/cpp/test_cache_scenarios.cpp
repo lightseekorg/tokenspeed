@@ -147,6 +147,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;  // 4 tokens = 2 pages per chunk
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -232,6 +233,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -292,6 +294,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -372,6 +375,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -426,6 +430,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -615,6 +620,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -730,6 +736,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -803,6 +810,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -869,6 +877,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;  // 4-token prefill chunks
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -1087,6 +1096,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -1350,6 +1360,7 @@ protected:
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 8192;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1024;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
@@ -1434,6 +1445,7 @@ protected:
         cfg.device_allocator.total_pages = 8;
         cfg.max_scheduled_tokens = 16384;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
@@ -1674,6 +1686,7 @@ protected:
         // headroom block each.
         cfg.device_allocator.total_pages = 21;
         cfg.max_batch_size = 10;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
@@ -2770,6 +2783,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -2969,6 +2983,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.max_retracted_requests = 1;
         return cfg;
     }
@@ -3428,6 +3443,7 @@ protected:
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 65536;  // every prompt is one chunk
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
         cfg.cache_groups = {
@@ -3938,7 +3954,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
     ASSERT_EQ(request.GeneratedTokens(), 1000);
 
@@ -3960,14 +3976,13 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     ASSERT_TRUE(coordinator.Restore(request.GetIf<fsm::Retracted>()->image, demands,
-                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1,
-                                    /*drop_claims_if_unfit=*/false));
+                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/7});
     ASSERT_TRUE(request.Is<fsm::Restoring>());
     EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 5000) << "what the readmission saw as open";
     EXPECT_TRUE(request.ReserveCoversGeneration(kSafeSteps)) << "two windows cover it: the readmission is exempt";
-    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
+    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate(), DecodeSlotIndex{}});
     EXPECT_TRUE(request.Is<fsm::Decoding>());
     EXPECT_EQ(request.TokenSize(), 1004) << "the same tokens, resumed where they stopped";
 }
@@ -4003,7 +4018,7 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     request.Apply(fsm::ExtendResultEvent{{42}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
     request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
     ASSERT_EQ(request.GeneratedTokens(), 4097);
 
@@ -4524,6 +4539,7 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     cfg.host_allocator.total_pages = 0;
     cfg.max_scheduled_tokens = 16;
     cfg.max_batch_size = 1;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.decode_input_tokens = 1;
     cfg.role = Role::kD;
     cfg.disable_l2_cache = true;
@@ -4784,8 +4800,7 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    const std::optional<AdmissionResult> admission = AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
@@ -4881,6 +4896,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
@@ -5001,7 +5017,7 @@ TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "six KV pages and state@12";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
     // The clear evicts the six pages and state@12; Host holds all seven.
-    const CacheCoordinator::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
+    const CacheEvictor::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
     EXPECT_EQ(flushed.blocks, 7u);
     EXPECT_EQ(flushed.host_resident, 7u);
 
@@ -5077,7 +5093,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
+    const std::optional<AdmissionResult> admission =
         AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
@@ -5129,7 +5145,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
         /*awaits_result=*/false,
     });
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
     coordinator.ConsumeReservedTokens(request.BlockTablesRef(), 1);
     ASSERT_TRUE(request.Is<fsm::Decoding>());
     ASSERT_EQ(request.TokenSize(), 5);
@@ -5151,8 +5167,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     const auto restore =
-        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch,
-                            /*drop_claims_if_unfit=*/false);
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch);
     ASSERT_TRUE(restore);
     ASSERT_EQ(restore->snapshot_pairs.size(), 2u) << "the 4 computed prompt tokens; the decode input has no KV yet";
     request.Apply(
@@ -5163,7 +5178,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     EXPECT_EQ(request.GetIf<fsm::Restoring>()->restore_op, 3u);
     EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 12 - 2) << "the image lives until the ACK";
 
-    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
+    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate(), DecodeSlotIndex{}});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
     EXPECT_EQ(request.TokenSize(), 5);
     EXPECT_EQ(request.NumComputedTokens(), 4);
@@ -5171,7 +5186,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     EXPECT_EQ(request.BlockTablesRef()[0].NumBlocks(), 3) << "the imaged pages plus the re-reserved decode slot";
     EXPECT_EQ(slots.AvailableSlots(), 4) << "the blob slot returns with the image";
     EXPECT_TRUE(request.ResumedByRestore()) << "the first decode must carry its token: the new slot has no capture";
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
     EXPECT_FALSE(request.ResumedByRestore()) << "consumed by the first decode";
     // The restore op's pairs (held by the transfer manager in production) are
     // the last owners of the image blocks.
@@ -5199,8 +5214,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    const std::optional<AdmissionResult> admission = AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
@@ -5236,11 +5250,11 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
         GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1},
         GroupDemand{.table = &restored[1], .extent = DenseGrowth{0}, .reserve_tokens = 1},
     };
-    ASSERT_TRUE(coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch,
-                                    /*drop_claims_if_unfit=*/false));
+    ASSERT_TRUE(
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/1});
-    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
+    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate(), DecodeSlotIndex{}});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.NumComputedTokens(), 4);
     EXPECT_EQ(request.LastToken(), 42) << "the bootstrap token for its first decode is still there";
@@ -5261,6 +5275,7 @@ TEST_F(ChunkedPrefillSuite, AbortMidPrefillRestoresPoolBaseline) {
     EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     SendAbort(*scheduler_, "r1");
+    DrainForwardResults("r1");
     PlanOnce();  // reap the aborted request
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
@@ -5411,6 +5426,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -5475,6 +5491,7 @@ TEST_F(PhysicalReserveSuite, AbortWithOutstandingReservationLeavesNoPhantom) {
 
     // Abort before the reserve is consumed: RAII must release it too.
     SendAbort(*scheduler_, "a");
+    DrainForwardResults("a");
     PlanOnce();  // reap
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
@@ -5511,6 +5528,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = DisablePrefixCache();
@@ -5641,7 +5659,7 @@ TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
     EXPECT_NE(log.find("flush L1 cache completed"), std::string::npos);
     // r1 published 9 computed tokens: four pages and a one-token tail in each
     // of the two groups. No Host pool holds anything.
-    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
     EXPECT_EQ(evictions.flush.blocks, 10u);
     EXPECT_EQ(evictions.flush.host_resident, 0u);
     EXPECT_EQ(evictions.admission.blocks + evictions.restore.blocks + evictions.tail_cap.blocks, 0u);
@@ -5843,6 +5861,7 @@ protected:
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
@@ -5967,6 +5986,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
@@ -6078,6 +6098,7 @@ TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
     cfg.device_allocator.total_pages = 8;
     cfg.max_scheduled_tokens = 8;
     cfg.max_batch_size = 1;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.prefix_replay_tokens = -1;
     cfg.cache_groups = {
         MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
@@ -6601,6 +6622,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = false;
         // Pages are published, and so streamed to Host, only with prefix caching.
@@ -7115,6 +7137,7 @@ TEST_F(SchedulerTestSuite, AHostWinOverADeviceTailLoadsMoreThanItGains) {
 // once, when it is admitted.
 TEST_F(SchedulerTestSuite, AFirstAdmissionWaitingForASlotCountsItsHitOnce) {
     config_.max_batch_size = 1;
+    config_.max_resident_requests = config_.max_batch_size;
     scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     Submit(MakeRequestSpec("r0", /*num_pages=*/2));
     ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r0"});
@@ -7144,9 +7167,12 @@ TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
     ASSERT_EQ(lb->dst_pages.at(0).size(), 6u);
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
 
-    // Abort while the H2D copy is in flight: the reap returns only the 4 fresh pages;
-    // the 6 load destinations must stay off the free list until LoadBackDone.
+    // Both the queued forward and H2D destinations keep their resources
+    // after cancellation. Reporting the forward first releases only the
+    // four fresh pages; the six load destinations still await LoadBackDone.
     SendAbort(*scheduler_, "r2");
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
+    SendForwardDone("r2");
     PlanOnce();  // reap
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
         << "in-flight load destinations must not be reusable";
@@ -7170,6 +7196,7 @@ TEST_F(HostHitSuite, CapacityBlockWaitsForInFlightLoads) {
     auto lb = FindLoadBack(plan);
     ASSERT_TRUE(lb.has_value());
     SendAbort(*scheduler_, "r2");
+    SendForwardDone("r2");
     PlanOnce();  // reap
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6);
 
@@ -7247,6 +7274,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
@@ -7434,6 +7462,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = MaxScheduledTokens();
         cfg.max_batch_size = MaxBatchSize();
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.enable_mixed_prefill_decode = MixedPrefillDecode();

@@ -40,6 +40,7 @@ use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -66,6 +67,7 @@ pub type ForwardId = u64;
 
 /// One round's plan and what its forward needs besides.
 struct Execution {
+    queued_at: Option<Instant>,
     plan: ExecutionPlan,
     forward: Option<ForwardId>,
     dp: Option<DpRound>,
@@ -177,6 +179,7 @@ type ExpertLoad = (Vec<Vec<i64>>, Vec<Vec<i32>>);
 
 struct AdmitRow {
     rid: String,
+    admission_id: u64,
     sampling_params: Bytes,
     stop_token_ids: Vec<i32>,
     token_limit: i64,
@@ -415,6 +418,7 @@ impl DataPlane for PythonDataPlane {
             let stop = request.state.stop_criteria();
             rows.push(AdmitRow {
                 rid: request.rid.clone(),
+                admission_id: request.state.admission,
                 sampling_params,
                 stop_token_ids: stop.stop_token_ids,
                 token_limit: stop.token_limit,
@@ -439,6 +443,7 @@ impl DataPlane for PythonDataPlane {
         });
         let idle_forward = dispatch.dp.is_some_and(|dp| dp.idle_forward);
         self.queue(Op::Execute(Box::new(Execution {
+            queued_at: tracing::enabled!(tracing::Level::DEBUG).then(Instant::now),
             plan,
             forward,
             dp: dispatch.dp.cloned(),
@@ -722,6 +727,7 @@ fn run(
                         py,
                         [
                             row.rid.into_pyobject(py)?.into_any(),
+                            row.admission_id.into_pyobject(py)?.into_any(),
                             PyBytes::new(py, &row.sampling_params).into_any(),
                             PyList::new(py, row.stop_token_ids)?.into_any(),
                             row.token_limit.into_pyobject(py)?.into_any(),
@@ -742,6 +748,7 @@ fn run(
         }
         Op::Execute(execution) => {
             let Execution {
+                queued_at,
                 plan,
                 forward,
                 dp,
@@ -750,6 +757,19 @@ fn run(
                 logprobs,
                 history,
             } = *execution;
+            if let Some(queued_at) = queued_at {
+                let batches = plan.forward_batches();
+                let forward_rids: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| batch.request_ids.iter())
+                    .collect();
+                tracing::debug!(
+                    queue_ms = queued_at.elapsed().as_secs_f64() * 1000.0,
+                    forward_rids = ?forward_rids,
+                    remote_prefill_rids = ?plan.remote_prefill().map(|batch| batch.request_ids),
+                    "event=ts_data_plane_execute_started"
+                );
+            }
             // The plan's remote stream goes out from the data plane's
             // execution, once its device prerequisites are met.
             if let Some(streams) = streams {

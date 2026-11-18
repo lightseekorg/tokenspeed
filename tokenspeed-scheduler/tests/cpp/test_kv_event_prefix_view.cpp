@@ -19,6 +19,9 @@
 // SOFTWARE.
 
 #include "scheduler/kv_cache_events.h"
+#include "integration_test_helper.h"
+#include <array>
+#include <limits>
 
 #include <gtest/gtest.h>
 #include <optional>
@@ -123,4 +126,78 @@ TEST(KvEventPrefixView, RandomBatchesMatchResidentAncestorClosure) {
         EXPECT_EQ(visible, expected) << "batch " << step;
     }
 }
+TEST(KvEventBatch, PreservesMultiHashPayloadsParentZeroAndEmptyBatches) {
+    const std::vector<KvCacheEvent> original{
+        KvBlockStoredEvent{.block_hashes = {0, std::numeric_limits<std::uint64_t>::max()},
+                           .parent_block_hash = 0,
+                           .token_ids = {0, 2147483647},
+                           .block_size = 2},
+        KvBlockRemovedEvent{.block_hashes = {17, 29}}};
+    const auto batch = KvEventBatch::FromEvents(original);
+    const auto restored = batch.ToEvents();
+    ASSERT_EQ(restored.size(), 2u);
+    const auto& stored = std::get<KvBlockStoredEvent>(restored[0]);
+    EXPECT_EQ(stored.block_hashes, (std::vector<std::uint64_t>{0, std::numeric_limits<std::uint64_t>::max()}));
+    EXPECT_EQ(stored.parent_block_hash, 0u);
+    EXPECT_EQ(stored.token_ids, (std::vector<std::int32_t>{0, 2147483647}));
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(restored[1]).block_hashes, (std::vector<std::uint64_t>{17, 29}));
+    EXPECT_TRUE(KvEventBatch{}.ToEvents().empty());
+    KvEventBatch empty;
+    EXPECT_THROW(empty.Reserve(std::numeric_limits<std::size_t>::max(), 0, 0), std::length_error);
+    EXPECT_TRUE(empty.Empty());
+}
+
+TEST(KvEventPrefixView, SnapshotsSurviveFurtherMutationsAndTheRoutingView) {
+    KvEventBatch snapshot;
+    {
+        KvEventPrefixView view;
+        const auto parent = std::make_shared<const KvEventDescriptor>(KvEventDescriptor{1, {}, {1, 2}, 2});
+        const auto child = std::make_shared<const KvEventDescriptor>(KvEventDescriptor{2, 1, {3}, 2});
+        const std::array initial{KvEventMutation{2, child}, KvEventMutation{1, parent}};
+        snapshot = view.ApplyMutations(initial);
+        const std::array removed{KvEventMutation{1, {}}, KvEventMutation{2, {}}};
+        EXPECT_EQ(Hashes(view.ApplyMutations(removed).ToEvents(), false), (std::vector<std::uint64_t>{2, 1}));
+    }
+    const auto events = snapshot.ToEvents();
+    EXPECT_EQ(Hashes(events, true), (std::vector<std::uint64_t>{1, 2}));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[1]).token_ids, (std::vector<std::int32_t>{3}));
+}
+
+class KvEventSnapshotTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto config = SchedulerTestSuite::MakeConfig();
+        config.disable_l2_cache = true;
+        config.enable_l3_storage = false;
+        config.enable_kv_cache_events = true;
+        return config;
+    }
+};
+
+TEST_F(KvEventSnapshotTestSuite, ADrainedBatchOwnsNoCacheOrRequestResources) {
+    Submit(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4}});
+    PlanOnce();
+    SendForwardDone("r", {5});
+    SendFinish("r");
+    PlanOnce();
+    const auto snapshot = scheduler_->DrainKvEventBatch();
+    ASSERT_EQ(snapshot.Size(), 2u);
+    EXPECT_TRUE(scheduler_->ClearCache());
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    const auto removed = scheduler_->DrainKvEventBatch().ToEvents();
+    ASSERT_EQ(removed.size(), 2u);
+
+    Submit(RequestSpec{.request_id = "r", .tokens = {11, 12, 13, 14}});
+    PlanOnce();
+    SendForwardDone("r", {15});
+    SendFinish("r");
+    PlanOnce();
+    scheduler_->DrainKvEventBatch();
+    EXPECT_TRUE(scheduler_->ClearCache());
+    const auto before = snapshot.ToEvents();
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(before[0]).token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(before[1]).token_ids, (std::vector<std::int32_t>{3, 4}));
+}
+
 }  // namespace tokenspeed::test

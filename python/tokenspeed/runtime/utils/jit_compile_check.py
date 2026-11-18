@@ -40,6 +40,10 @@ from tokenspeed_kernel.compile_monitor import (
     install_compile_monitor,
     mark_serving,
 )
+from tokenspeed_kernel.cute_compile_cache import (
+    cute_compile_cache_stats,
+    install_cute_compile_cache,
+)
 
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
@@ -48,7 +52,12 @@ logger = get_colorful_logger(__name__)
 
 
 def install_jit_compile_check() -> None:
-    """Record this process's JIT compilations as the env var selects."""
+    """Cache CuTe DSL binaries on disk and record JIT compilations.
+
+    The CuTe DSL compile cache is installed whatever the check mode; its
+    switches are cutlass-dsl's own (``CUTE_DSL_DISABLE_FILE_CACHING``).
+    """
+    install_cute_compile_cache()
     mode = envs.TOKENSPEED_JIT_COMPILE_CHECK.get()
     if mode == "off":
         return
@@ -62,6 +71,12 @@ def install_jit_compile_check() -> None:
 def mark_jit_compile_serving() -> None:
     """End startup: from here on a compilation is a serving stall."""
     mark_serving()
+    cached = cute_compile_cache_stats()
+    if cached is not None:
+        logger.info(
+            f"CuTe DSL compile cache: {cached.hits:d} of {cached.keyed:d} "
+            "startup compilations loaded from disk"
+        )
     stats = compile_stats()
     if stats is None:
         return

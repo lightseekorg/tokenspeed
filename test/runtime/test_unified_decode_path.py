@@ -87,6 +87,7 @@ class _RouterCase(_TorchCase):
         leaf.spec_num_tokens = 1
         leaf.is_draft = False
         leaf.draft_block_decode = False
+        leaf.draft_block_causal = False
         leaf.max_num_pages = MAX_NUM_PAGES
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
@@ -435,6 +436,7 @@ class TestInklingConvTablesRefreshTest(_RouterCase):
             kernel_page_size=2,
             context_len=MAX_NUM_PAGES * 2,
             max_bs=MAX_DECODE_BS,
+            max_resident_requests=MAX_DECODE_BS,
         )
         text = InklingModelConfig(
             hidden_size=8,

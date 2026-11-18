@@ -78,7 +78,7 @@ def _backend(
         params.append(sp)
     pool = [2, 5, 7]
     backend.prepare_step(
-        request_ids=[f"tree_{i}" for i in range(BS)],
+        admission_ids=[i + 1 for i in range(BS)],
         request_pool_indices=pool,
         sampling_params_list=params,
         num_tokens_per_req=N,

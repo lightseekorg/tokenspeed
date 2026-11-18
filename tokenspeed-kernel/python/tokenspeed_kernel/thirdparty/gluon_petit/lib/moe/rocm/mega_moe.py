@@ -51,6 +51,9 @@ class MegaMoEParams:
     w2_bias: object
     workspace: object
     rank: int
+    # If False, the combine copies each token's routes unsummed into out's
+    # [topk, hidden] rows.
+    reduce_routes: bool
     stream: object = None
 
 
@@ -118,16 +121,27 @@ def _MegaMoESolutions():
         3072,
         (P.kCta56, P.kCta192),
     )
-    for experts, topk in ((384, 6), (128, 3)):
-        register(
-            kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
-            8,
-            experts,
-            topk,
-            5120,
-            2560,
-            (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
-        )
+    register(
+        kMegaMoETwoStageMxFp4SiluSolutionId,
+        8,
+        256,
+        8,
+        4096,
+        4096,
+        (P.kCta56, P.kCta128, P.kCta192),
+    )
+    # The config selector does not key tiles on rank count: EP4 reuses EP8 tiles.
+    for ranks in (4, 8):
+        for experts, topk in ((384, 6), (128, 3)):
+            register(
+                kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
+                ranks,
+                experts,
+                topk,
+                5120,
+                2560,
+                (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
+            )
     return dict(entries)
 
 
@@ -137,7 +151,7 @@ class MegaMoESolutionAdapter:
         self.Workspace = MegaMoEWorkspace(self.Config)
 
     @cache
-    def Kernels(self, external, m64, w8):
+    def Kernels(self, external, m64, w8, reduce_routes):
         Config = self.Config
         SelectedStage1 = (
             MegaMoEStage1M64W8Config(Config)
@@ -147,7 +161,7 @@ class MegaMoESolutionAdapter:
         return (
             MegaMoETwoStageCommComputeKernel(SelectedStage1, external),
             MegaMoETwoStageCommComputeKernel(Config, external),
-            MegaMoECombineKernel(Config),
+            MegaMoECombineKernel(Config, reduce_routes),
         )
 
     def GetWorkspaceInfo(self, rank):
@@ -194,6 +208,7 @@ class MegaMoESolutionAdapter:
             external_input_count == 3,
             p.num_tokens >= kM64MinTokens,
             p.num_tokens >= kM64W8MinTokens,
+            p.reduce_routes,
         )
         import torch
         from lib.streams import native_stream

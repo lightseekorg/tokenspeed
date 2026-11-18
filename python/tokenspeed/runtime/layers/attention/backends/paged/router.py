@@ -764,7 +764,7 @@ class CacheGroupRouter(AttentionBackend):
                     if sharded
                     or (
                         gid in self._page_sharded_groups
-                        and (extend_with_prefix or forward_mode.is_extend())
+                        and (extend_with_prefix or forward_mode.is_extend_or_mixed())
                     )
                     or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None
@@ -794,39 +794,26 @@ class CacheGroupRouter(AttentionBackend):
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
             )
         self._check_live_delivery(actual_bs, block_tables)
-        self.stacks.fill(bs, actual_bs, block_tables)
-        # The window covers every request; DECODE reads skip the extend
-        # requests a MIXED round's draft refresh carries (num_extends is 0 on
-        # targets).
-        self._decode_request_offset = num_extends
-        self._refresh_decode_locations(bs, seq_lens)
-        if num_extends and self._extend_write_locations is not None:
-            self._append_decode_rows(bs, num_extends)
         targets = {
             gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
         }
-        batched = [gid for gid, pair in targets.items() if pair is not None]
-        if batched:
-            # One launch fills every such leaf (plus one clamp per seq_lens
-            # floor); two stream copies per leaf cost ~4 us each at bs=1.
-            floored = {}
-            for gid in batched:
-                floor = self.leaves[gid].decode_seq_lens_floor
-                if floor not in floored:
-                    floored[floor] = (
-                        seq_lens[:bs] if floor <= 1 else seq_lens[:bs].clamp_min(floor)
-                    )
-            torch._foreach_copy_(
-                [buf for gid in batched for buf in targets[gid]],
-                [
-                    src
-                    for gid in batched
-                    for src in (
-                        floored[self.leaves[gid].decode_seq_lens_floor],
-                        self.stacks.table(gid, bs),
-                    )
-                ],
-            )
+        self.stacks.fill_decode(
+            bs,
+            actual_bs,
+            block_tables,
+            seq_lens,
+            self._decode_tokens_per_req,
+            targets={
+                gid: (*pair, self.leaves[gid].decode_seq_lens_floor)
+                for gid, pair in targets.items()
+                if pair is not None
+            },
+        )
+        # Draft refreshes after mixed rounds still publish only their decode tail.
+        self._decode_request_offset = num_extends
+        self._publish_decode_locations(bs, self._decode_tokens_per_req)
+        if num_extends and self._extend_write_locations is not None:
+            self._append_decode_rows(bs, num_extends)
         for gid, leaf in self.leaves.items():
             if targets[gid] is None:
                 leaf.refresh_decode_metadata(
@@ -1011,6 +998,19 @@ class CacheGroupRouter(AttentionBackend):
 
     def cache_placement(self, layer):
         return self._leaf_for(layer).cache_placement(layer)
+
+    def takes_owned_decode_topk(self, layer):
+        # Offloaded layers read prepared hot rows of the scheduler slots.
+        if self._offload_adapter is not None and self._offload_adapter.offloads_layer(
+            layer.layer_id
+        ):
+            return False
+        return self._leaf_for(layer).takes_owned_decode_topk(layer)
+
+    def dcp_decode_query_rider(self, layer, q):
+        if not self.takes_owned_decode_topk(layer):
+            return None
+        return self._leaf_for(layer).dcp_decode_query_rider(layer, q)
 
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
@@ -1209,6 +1209,14 @@ class CacheGroupRouter(AttentionBackend):
         return self._sole_leaf("gather_history_index_k").gather_history_index_k(
             layer_id, token_to_kv_pool, group
         )
+
+    def gather_history_index_k_pages(self, layer_id: int, token_to_kv_pool, group):
+        return self._sole_leaf(
+            "gather_history_index_k_pages"
+        ).gather_history_index_k_pages(layer_id, token_to_kv_pool, group)
+
+    def history_prefill_plan(self):
+        return self._sole_leaf("history_prefill_plan").history_prefill_plan()
 
     # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
 

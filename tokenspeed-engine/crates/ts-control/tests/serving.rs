@@ -53,6 +53,7 @@ use ts_control::{
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role, StreamedOutput},
+    startup,
     transport::EngineTransport,
 };
 use ts_l3::{
@@ -83,10 +84,15 @@ fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"
@@ -184,6 +190,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
 cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
@@ -280,6 +287,8 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// Every data-plane admission must already have a fresh identity.
+    last_admission: u64,
     /// This rank; PD names it as a sender of a request's KV.
     rank: usize,
     /// Tokens generated per request so far.
@@ -571,9 +580,9 @@ impl TransferPeer for FakePeer {
     }
 }
 
-/// EPD: a `lost-*` request's receive fails at its second poll, a `slow-*`
-/// one's lands after a hundred; the others' land after three polls, one more
-/// on each later rank. Each landed item takes one slot of eight.
+/// EPD: a `lost-*` request's receive fails at its second poll. Other
+/// requests land after three polls, one more on each later rank. Each
+/// landed item takes one slot of eight.
 struct FakeReceiver {
     rank: usize,
     staged: Vec<(String, Vec<EmbeddingItem>, usize)>,
@@ -595,8 +604,6 @@ impl EmbeddingReceiver for FakeReceiver {
                 *polls += 1;
                 let landed_at = if rid.starts_with("lost") {
                     return i64::from(*polls < 2);
-                } else if rid.starts_with("slow") {
-                    100
                 } else {
                     3 + rank
                 };
@@ -658,6 +665,8 @@ impl DataPlane for FakeDevice {
 
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
         for request in requests {
+            assert!(request.state.admission > self.last_admission);
+            self.last_admission = request.state.admission;
             self.generated.insert(request.rid.clone(), 0);
             if let Some(bootstrap) = &request.bootstrap {
                 self.rooms.insert(request.rid.clone(), bootstrap.room);
@@ -1287,7 +1296,12 @@ struct Setup {
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// The requests each engine serves itself before its frontend attaches,
+    /// [`STARTUP_OUTPUT_TOKENS`] each.
+    startup: Vec<startup::Phase>,
 }
+
+const STARTUP_OUTPUT_TOKENS: usize = 3;
 
 impl Layout {
     /// Ranks, attention-TP ranks per replica, and engines.
@@ -1401,7 +1415,6 @@ fn run_rank<F: Frontend>(
     let tp_first = rank / tp_size * tp_size;
     let replica = Group::new(1, (tp_first..tp_first + tp_size).collect(), rank).unwrap();
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
-    let frontend = frontend();
     let Setup {
         device_pages,
         pd,
@@ -1409,6 +1422,7 @@ fn run_rank<F: Frontend>(
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
+        startup,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1450,10 +1464,11 @@ fn run_rank<F: Frontend>(
         Layout::TpKvp(_, shards) => shards,
         _ => 1,
     };
+    // Attached once the startup requests ran, as the host does.
     let mut event_loop = EventLoop::new(
         new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
         device,
-        frontend,
+        None,
         outputs,
         config,
         ranks,
@@ -1485,6 +1500,10 @@ fn run_rank<F: Frontend>(
             l3: store.map(|store| l3_executor(store, rank)),
         },
     );
+    if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {
+        return Ok(());
+    }
+    *event_loop.frontend_mut() = Some(frontend());
     event_loop.run(stop)
 }
 
@@ -1492,6 +1511,7 @@ fn run_rank<F: Frontend>(
 fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
     let (world, _, _) = layout.sizes();
     FakeDevice {
+        last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {
@@ -1837,6 +1857,70 @@ fn assert_scripted_tokens(rank: &ScriptedRank, rid: &str, count: i32) {
     );
     assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
     assert_eq!(outputs.last().unwrap().completion_tokens, i64::from(count));
+}
+
+#[test]
+fn startup_requests_run_on_every_rank_and_leave_nothing_behind() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2)] {
+        let (_, _, num_engines) = layout.sizes();
+        // The client's prompt is the first startup prompt of each phase.
+        let prompt = |rid| {
+            EngineRequest::Add(Box::new(TokenizedGenerateReqInput {
+                input_ids: Some(vec![1; 48]),
+                ..request(rid, 0, budget(3))
+            }))
+        };
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(prompt("client"));
+        script[15].push(prompt("again"));
+        let setup = Setup {
+            startup: vec![
+                startup::Phase {
+                    batch: 1,
+                    prompt_len: 48,
+                },
+                startup::Phase {
+                    batch: 2,
+                    prompt_len: 48,
+                },
+            ],
+            ..Setup::default()
+        };
+        let ranks = run_scripted(
+            layout,
+            1,
+            Tiers::DeviceOnly,
+            setup,
+            vec![script; num_engines],
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert_eq!(rank.outcome, Ok(()), "{layout:?}");
+            let started: Vec<_> = rank
+                .released
+                .iter()
+                .filter(|(rid, _)| rid.starts_with(startup::RID_PREFIX))
+                .collect();
+            assert_eq!(started.len(), 3, "{layout:?}");
+            assert!(rank
+                .outputs
+                .iter()
+                .all(|output| !output.rid.starts_with(startup::RID_PREFIX)));
+        }
+        for engine in ranks.iter().filter(|rank| !rank.outputs.is_empty()) {
+            let cached = |rid: &str| {
+                engine
+                    .outputs
+                    .iter()
+                    .rfind(|output| output.rid == rid)
+                    .unwrap()
+                    .cached_tokens
+            };
+            // Startup dropped its prefixes; serving still caches.
+            assert_eq!(cached("client"), 0, "{layout:?}");
+            assert!(cached("again") > 0, "{layout:?}");
+        }
+    }
 }
 
 #[test]
@@ -2209,7 +2293,11 @@ async fn a_long_prompt_is_prefilled_in_chunks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delayed_long_prefill_completes_above_the_watermark() {
-    for layout in [Layout::Single, Layout::Dp(2)] {
+    for (layout, single_round) in [
+        (Layout::Single, false),
+        (Layout::Dp(2), false),
+        (Layout::Dp(2), true),
+    ] {
         for depth in [0, 1] {
             let engine = start_ranks_with(
                 layout,
@@ -2220,6 +2308,7 @@ async fn delayed_long_prefill_completes_above_the_watermark() {
                     prefill_delay: Some(PrefillDelay {
                         attempt_interval: 2,
                         any_interval: 4,
+                        single_round,
                     }),
                     ..Setup::default()
                 },
@@ -5279,8 +5368,8 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
+#[test]
+fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
     let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
         rid: None,
         http_worker_ipc: None,
@@ -5292,7 +5381,16 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
         tags: None,
     });
     for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
-        let engine = start_ranks_with(
+        let tag = drain.reply_tag();
+        let undo_tag = undo.reply_tag();
+        let mut script = vec![Vec::new(); 16];
+        script[0].push(EngineRequest::Add(Box::new(epd_request("pending"))));
+        // The receive lands on the third poll. Drain on the second round
+        // while it is pending, then resume once the receive has settled.
+        script[1].push(EngineRequest::Control(Box::new(drain)));
+        script[3].push(EngineRequest::Control(Box::new(undo)));
+        script[4].push(EngineRequest::Add(Box::new(epd_request("img-1"))));
+        let ranks = run_scripted(
             Layout::Single,
             1,
             Tiers::DeviceOnly,
@@ -5300,34 +5398,36 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
                 epd_receive_enabled: true,
                 ..Setup::default()
             },
-        )
-        .await;
-        // The drain arrives while the request waits for its image's
-        // embeddings: it is not in the scheduler, so the drain must end it
-        // rather than answer with it staged until the resume.
-        let stream = engine.client.generate(epd_request("slow-0")).await.unwrap();
-        let tag = drain.tag();
-        let drained = control(&engine, drain).await;
-        assert_eq!(drained.len(), 1);
-        assert!(drained[0].1, "{tag}");
-        let chunks = tokio::time::timeout(Duration::from_secs(1), collect(stream))
-            .await
-            .unwrap_or_else(|_| panic!("{tag} answered while the request still waits"));
-        let last = chunks.last().unwrap();
-        assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{tag}");
-        let details = &last.finish_details.as_ref().unwrap().0;
+            vec![script],
+            no_reaction,
+        );
+        let rank = &ranks[0];
+        assert_eq!(rank.outcome, Ok(()), "{tag}");
+        assert_eq!(
+            outcome(rank.replies.clone()),
+            [(tag, true), (undo_tag, true)]
+        );
+        let aborted = rank
+            .outputs
+            .iter()
+            .find(|output| output.rid == "pending")
+            .unwrap();
+        assert_eq!(aborted.finish_reason, Some("abort"), "{tag}");
+        assert!(aborted.output_ids.is_empty(), "{tag}");
+        let details = &aborted.finish_details.as_ref().unwrap().0;
         assert!(
             details
                 .iter()
                 .any(|(k, v)| k == "message" && *v == Value::from("Aborted by pause")),
             "{tag}: {details:?}"
         );
-        assert!(control(&engine, undo).await[0].1);
-        // The engine serves on.
-        assert_eq!(
-            tokens(&run(&engine.client, epd_request("img-1")).await),
-            [1000, 1001, 1002]
-        );
+        let recovered: Vec<_> = rank
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "img-1")
+            .flat_map(|output| output.output_ids.iter().copied())
+            .collect();
+        assert_eq!(recovered, [1000, 1001, 1002], "{tag}");
     }
 }
 

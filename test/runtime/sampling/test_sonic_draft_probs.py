@@ -107,7 +107,7 @@ def _prepare(backend: SonicSamplingBackend) -> torch.Tensor:
         params.append(sp)
     slots = list(range(1, BS + 1))
     backend.prepare_step(
-        request_ids=[f"d{i}" for i in range(BS)],
+        admission_ids=list(range(1, BS + 1)),
         request_pool_indices=slots,
         sampling_params_list=params,
         num_tokens_per_req=N,

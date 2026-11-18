@@ -69,7 +69,7 @@ public:
     std::vector<CacheKey> QueryHits(std::uint64_t id);
     std::uint64_t QueryHitTokens() const { return query_hit_tokens_; }
     // Returns an empty lease when nothing was started.
-    StorageLease StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
+    StorageLease StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits);
     void Complete(const cache::StorageDone& event);
     void QueueBackups(std::span<const CacheKey> keys);
     void StartBackups();

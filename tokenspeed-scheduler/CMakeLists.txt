@@ -47,12 +47,14 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/fsm/forward_events.cpp
     csrc/fsm/pd_events.cpp
 
+    csrc/scheduler/operations/admission.cpp
     csrc/scheduler/operations/forward.cpp
     csrc/scheduler/operations/group_demands.cpp
     csrc/scheduler/operations/prefill_chunk.cpp
 
     csrc/scheduler/capacity_model.cpp
     csrc/scheduler/kv_cache_events.cpp
+    csrc/scheduler/lone_request_recovery.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/types.cpp
     csrc/scheduler/outside_event_handler.cpp
@@ -60,6 +62,14 @@ add_library(tokenspeed_scheduler_core STATIC
 
     csrc/cache/core/cache_config.cpp
     csrc/cache/coordinator/cache_admission.cpp
+    csrc/cache/coordinator/session_registry.cpp
+    csrc/cache/coordinator/cache_store.cpp
+    csrc/cache/coordinator/cache_evictor.cpp
+    csrc/cache/coordinator/admission_history.cpp
+    csrc/cache/coordinator/host_cache.cpp
+    csrc/cache/coordinator/prefix_prober.cpp
+    csrc/cache/coordinator/storage_queries.cpp
+    csrc/cache/coordinator/lone_request_admission.cpp
     csrc/cache/coordinator/cache_coordinator.cpp
     csrc/cache/coordinator/host_segments.cpp
     csrc/cache/core/cache_block_ref.cpp
@@ -103,7 +113,10 @@ if(TOKENSPEED_SCHEDULER_SANITIZE)
 endif()
 
 if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
+    find_package(Python COMPONENTS Interpreter Development.Module
+        OPTIONAL_COMPONENTS Development.SABIModule REQUIRED)
     nanobind_add_module(tokenspeed_scheduler_ext
+        STABLE_ABI
         bindings/python_module.cpp
     )
 

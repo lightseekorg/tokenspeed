@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel.compile_monitor as compile_monitor
+import tokenspeed_kernel.cute_compile_cache as cute_compile_cache
 from prometheus_client import CollectorRegistry
 from tokenspeed_kernel.compile_monitor import CompileStats
 
@@ -32,11 +33,15 @@ from tokenspeed.runtime.utils import jit_compile_check
 
 
 @pytest.fixture
-def uninstall(monkeypatch):
+def uninstall(monkeypatch, tmp_path):
     # Marking serving closes the process-wide compile switch; reopen it afterwards.
     monkeypatch.setattr(compile_monitor, "_serving", False)
+    # Installing also installs the CuTe DSL compile cache; keep it off the
+    # user's cache directory and out of later tests.
+    monkeypatch.setenv("CUTE_DSL_CACHE_DIR", str(tmp_path / "cute-dsl"))
     yield
     compile_monitor.uninstall_compile_monitor()
+    cute_compile_cache.uninstall_cute_compile_cache()
 
 
 @pytest.mark.parametrize("mode", ["warn", "error"])
@@ -57,6 +62,16 @@ def test_off_leaves_the_monitor_uninstalled(monkeypatch, uninstall):
     # Without a monitor, marking serving still closes the compile switch.
     jit_compile_check.mark_jit_compile_serving()
     assert compile_monitor.is_serving()
+
+
+def test_off_still_installs_the_cute_dsl_compile_cache(
+    monkeypatch, uninstall, tmp_path
+):
+    pytest.importorskip("cutlass")
+    monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", "off")
+    jit_compile_check.install_jit_compile_check()
+    assert cute_compile_cache.cute_compile_cache_stats() is not None
+    assert (tmp_path / "cute-dsl").is_dir()
 
 
 def test_install_rejects_unknown_modes(monkeypatch, uninstall):

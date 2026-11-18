@@ -24,9 +24,7 @@ The CTAs exchange per-CTA variance partials through distributed shared memory
 and sum them in fixed rank order. The branch may be this rank's Lamport
 mailbox, polled per word and re-armed in place; a mailbox holding one partial
 per rank is reduced in place too, in BF16 in rank order, the bits the one-shot
-all-reduce kernel would have handed the boundary. The kernel may also store
-this rank's own block into every peer's mailbox before it polls, in place of a
-separate copy launch.
+all-reduce kernel would have handed the boundary.
 """
 
 from __future__ import annotations
@@ -196,13 +194,14 @@ class ClusterBoundaryKernel:
             16-bit halves agree, or None for an ordinary branch tensor.
         mailbox_ranks: Partials per mailbox row, side by side; 1 reads the
             row as it stands, more sums them in BF16 in rank order.
-        publish: Whether the kernel first stores this rank's block, given at
-            the call, into the mailbox through its multicast address.
+        mailbox_capacity: Rows each mailbox block holds.
+        mailbox_block_width: Columns of one mailbox block. The mailbox is
+            ``[blocks, mailbox_capacity, mailbox_block_width]``, one block per
+            producing rank, and a row's ``width * mailbox_ranks`` columns are
+            the blocks' rows side by side.
 
-    The call takes the boundary's tensors, the block to publish (its BF16
-    rows, the multicast address of its first element, its first mailbox
-    column and its width), then ``rows`` and the stream; an absent weight,
-    pre-norm output or block takes any tensor of its dtype, never read.
+    The call takes the boundary's tensors, then ``rows`` and the stream; an
+    absent weight or pre-norm output takes any tensor of its dtype, never read.
     """
 
     def __init__(
@@ -217,10 +216,9 @@ class ClusterBoundaryKernel:
         use_pdl: bool,
         mailbox_sentinel: int | None,
         mailbox_ranks: int,
-        publish: bool,
+        mailbox_capacity: int,
+        mailbox_block_width: int,
     ) -> None:
-        if publish and mailbox_sentinel is None:
-            raise ValueError("only a mailbox branch takes a block to publish")
         if mailbox_sentinel is not None and (
             not 0 <= mailbox_sentinel <= 0xFFFFFFFF
             or (mailbox_sentinel & 0xFFFF) != (mailbox_sentinel >> 16)
@@ -230,6 +228,14 @@ class ClusterBoundaryKernel:
             raise ValueError("partials are reduced from a mailbox, one or more per row")
         self.width = width
         self.per_thread = width // (CLUSTER_CTAS * CTA_THREADS)
+        if mailbox_sentinel is not None and (
+            mailbox_capacity < 1
+            or mailbox_block_width % self.per_thread
+            or (width * mailbox_ranks) % mailbox_block_width
+        ):
+            raise ValueError("a thread's columns must lie within one mailbox block")
+        self.mailbox_capacity = mailbox_capacity
+        self.mailbox_block_width = mailbox_block_width
         self.mailbox_sentinel = mailbox_sentinel
         self.mailbox_ranks = mailbox_ranks
         self.post_has_weight = post_has_weight
@@ -239,7 +245,6 @@ class ClusterBoundaryKernel:
         self.pre_eps = pre_eps
         self.pre_weight_offset = pre_weight_offset
         self.use_pdl = use_pdl
-        self.publish = publish
 
     @cute.jit
     def __call__(
@@ -253,10 +258,6 @@ class ClusterBoundaryKernel:
         out_stream: cute.Tensor,
         out_pre_fp32: cute.Tensor,
         out_pre_bf16: cute.Tensor,
-        publish_block: cute.Tensor,
-        publish_destination: Int64,
-        publish_column: Int32,
-        publish_width: Int32,
         rows: Int32,
         cu_stream: cuda.CUstream,
     ):
@@ -272,10 +273,6 @@ class ClusterBoundaryKernel:
             out_stream,
             out_pre_fp32,
             out_pre_bf16,
-            publish_block,
-            publish_destination,
-            publish_column,
-            publish_width,
         ).launch(
             grid=[rows, CLUSTER_CTAS, 1],
             block=[CTA_THREADS, 1, 1],
@@ -330,10 +327,6 @@ class ClusterBoundaryKernel:
         out_stream: cute.Tensor,
         out_pre_fp32: cute.Tensor,
         out_pre_bf16: cute.Tensor,
-        publish_block: cute.Tensor,
-        publish_destination: Int64,
-        publish_column: Int32,
-        publish_width: Int32,
     ):
         """One CTA's slice of one row."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -378,32 +371,24 @@ class ClusterBoundaryKernel:
         beta_v = cute.make_rmem_tensor((per_thread,), Float32)
         post_w = cute.make_rmem_tensor((per_thread,), Float32)
         pre_w = cute.make_rmem_tensor((per_thread,), Float32)
-        if const_expr(self.publish):
-            # Each thread stores the words of its own columns that this rank's block covers.
-            for r in cutlass.range_constexpr(self.mailbox_ranks):
-                column = r * width + col0
-                if (column >= publish_column) & (
-                    column < publish_column + publish_width
-                ):
-                    offset = column - publish_column
-                    source = publish_block.iterator + row * publish_width + offset
-                    for w in cutlass.range_constexpr(per_thread // 2):
-                        target = publish_destination + (
-                            Int64(row) * Int64(width * self.mailbox_ranks)
-                            + Int64(offset + 2 * w)
-                        ) * Int64(2)
-                        store_global_u32(target, load_volatile_u32(source + 2 * w))
         if const_expr(self.mailbox_sentinel is not None):
             # Spin per word until both halves have arrived, then re-arm it. One
             # partial per rank sits side by side in the row; they sum in BF16
             # in rank order, each input stripped of -0.0 first, exactly as the
             # one-shot all-reduce kernel sums the same partials.
             ranks = self.mailbox_ranks
-            word_ptr = branch.iterator + row * (width * ranks) + col0
+            block_width: cutlass.Constexpr = self.mailbox_block_width
+            block_rows: cutlass.Constexpr = self.mailbox_capacity * block_width
             for w in cutlass.range_constexpr(per_thread // 2):
                 acc = Uint32(0)
                 for r in cutlass.range_constexpr(ranks):
-                    word_at = word_ptr + (r * width + 2 * w)
+                    column = r * width + col0
+                    word_at = branch.iterator + (
+                        (column // block_width) * block_rows
+                        + row * block_width
+                        + column % block_width
+                        + 2 * w
+                    )
                     word = load_volatile_u32(word_at)
                     while word_is_dirty(word, self.mailbox_sentinel):
                         word = load_volatile_u32(word_at)

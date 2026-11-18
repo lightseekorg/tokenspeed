@@ -132,7 +132,9 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     }
     assert "NEG_ZERO_F32_BITS" in tail_imports
     down = (package / "ops/moe/_cute_dsl/latent_down.py").read_text()
-    assert "sentinel: int = _DOWN_SENTINEL" in down
+    assert (
+        "sentinel = _DOWN_SENTINEL if fused_producer else HALF_POLLED_SENTINEL" in down
+    )
     assert "_DOWN_SENTINEL = 0x80008000" in down
     # Only the NaN-payload sentinel may poll halves; -0 arming keeps word compares.
     assert "HALF_POLLED_SENTINEL = 0xFFFFFFFF" in down

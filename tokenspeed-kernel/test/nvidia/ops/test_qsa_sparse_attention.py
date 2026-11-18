@@ -1583,11 +1583,8 @@ def test_qsa_sparse_attention_blackwell_fp8_prefix_ends_at_last_valid_tile(
             bf16_kv: bool,
             sm_count: int,
             wide_cluster_capacity: int,
-            *,
-            fp8_wave_sizing: bool,
         ) -> tuple[int, int, int, bool]:
             del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
-            del fp8_wave_sizing
             return launch[0], launch[1], 1, False
 
         monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
@@ -1991,11 +1988,8 @@ def test_qsa_sparse_attention_blackwell_changed_kv_replay(
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
-        *,
-        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
-        del fp8_wave_sizing
         return query_rows_per_cta, splits, bf16_smem_slots, bf16_async_ready
 
     monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
@@ -2094,11 +2088,8 @@ def test_qsa_sparse_attention_blackwell_large_kv_offsets(
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
-        *,
-        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
-        del fp8_wave_sizing
         # Two BF16 buffers keep lookahead prefetch active at the large addresses.
         slots = 2 if cache_dtype is torch.bfloat16 else 3
         return 1, splits, slots, cache_dtype is torch.bfloat16
@@ -2191,36 +2182,45 @@ def test_qsa_sparse_attention_blackwell_output_tiling(
     sm_count: int,
     expected: tuple[int, int, int, bool],
 ) -> None:
-    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
-        pytest.skip("CTA tiling requires NVIDIA SM100 or SM103")
+    if current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+        ArchVersion(10, 7),
+    ):
+        pytest.skip("CTA tiling requires NVIDIA SM100, SM103 or SM107")
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _select_launch_config
 
-    assert (
-        _select_launch_config(rows, head_tiles, bf16, sm_count, 7, fp8_wave_sizing=True)
-        == expected
-    )
+    assert _select_launch_config(rows, head_tiles, bf16, sm_count, 7) == expected
 
 
 @pytest.mark.parametrize(
-    ("sm107", "sm_count", "rows", "expected"),
+    ("sm_count", "rows", "expected"),
     [
-        # SM107 keeps tile8 below one tile per SM, and four KV splits.
-        (True, 212, 105, (8, 4, 1)),
-        (True, 212, 106, (16, 4, 1)),
-        # SM100/SM103 use tile16 at every size and size large grids by waves.
-        (False, 152, 8, (16, 4, 1)),
-        (False, 152, 72, (16, 1, 1)),
-        (False, 152, 288, (16, 1, 1)),
+        # 212 SMs (SM107). At 32, 64, 128, 256 and 512 rows these are the
+        # fastest of tile 8/16, splits 1/2/4/8 and rows/CTA 1/2 measured with
+        # 2048 selected slots per row; 105/106 rows straddle the former
+        # one-tile-per-SM threshold. 8 rows takes the shared small-grid split
+        # (4), 0.9 us behind the former tile 8 with four splits.
+        (212, 8, (16, 4, 1)),
+        (212, 32, (16, 2, 1)),
+        (212, 64, (16, 1, 1)),
+        (212, 105, (16, 1, 1)),
+        (212, 106, (16, 1, 1)),
+        (212, 128, (16, 2, 1)),
+        (212, 256, (16, 1, 1)),
+        (212, 512, (16, 1, 1)),
+        # 152 SMs (SM100/SM103): tile16 at every size, large grids by waves.
+        (152, 8, (16, 4, 1)),
+        (152, 72, (16, 1, 1)),
+        (152, 288, (16, 1, 1)),
     ],
 )
-def test_qsa_sparse_attention_blackwell_fp8_tile_and_grid_by_arch(
-    monkeypatch: pytest.MonkeyPatch,
-    sm107: bool,
+def test_qsa_sparse_attention_blackwell_fp8_tile_and_grid(
     sm_count: int,
     rows: int,
     expected: tuple[int, int, int],
 ) -> None:
-    """24q/2kv FP8 decode picks its head tile, KV splits and rows/CTA per arch."""
+    """24q/2kv FP8 decode picks its head tile, KV splits and rows/CTA by grid size."""
     if current_platform().arch_version not in (
         ArchVersion(10, 0),
         ArchVersion(10, 3),
@@ -2229,8 +2229,6 @@ def test_qsa_sparse_attention_blackwell_fp8_tile_and_grid_by_arch(
         pytest.skip("CTA tiling requires NVIDIA SM100, SM103 or SM107")
     import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
 
-    # Stand in for the other architecture; the real selectors run unchanged.
-    monkeypatch.setattr(sparse_module, "_is_sm107", lambda device: sm107)
     head_tile, _, kv_splits, query_rows_per_cta = sparse_module._configuration(
         rows, 24, 2, 1, False, sm_count, torch.cuda.current_device()
     )[:4]

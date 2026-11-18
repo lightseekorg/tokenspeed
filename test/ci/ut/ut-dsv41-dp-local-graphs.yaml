@@ -1,0 +1,28 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-dsv41-dp-local-graphs
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+changed_paths: true
+runner:
+  labels:
+    - b200-2gpu
+    - gb200-2gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - >-
+      python3 -m torch.distributed.run --standalone --nproc_per_node=2
+      -m pytest -q --import-mode=importlib --disable-warnings --maxfail=1
+      test/runtime/test_adaptive_dspark_dp_runtime.py
+    - >-
+      python3 -m torch.distributed.run --standalone --nproc_per_node=2
+      -m pytest -q --import-mode=importlib --disable-warnings --maxfail=1
+      tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py::test_heterogeneous_dp_graph_replay_with_shared_expert
+report:
+  github_step_summary: true

@@ -49,7 +49,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     AttnKind,
     CacheGroupConfig,
     ExecutionEvent,
@@ -83,7 +83,13 @@ register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
 
 def _execute(handle, plan, planned):
-    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
+    return handle.execute(
+        plan,
+        planned,
+        cache_ops=cache_ops_from_plan(
+            plan, request_admission={f"r{i}": i for i in range(1, 10)}.__getitem__
+        ).device,
+    )
 
 
 @pytest.mark.parametrize(
@@ -257,6 +263,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             overlap_schedule_depth=0,
             decode_input_tokens=16,
             max_batch_size=16,
+            max_resident_requests=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
@@ -428,6 +435,7 @@ def _planned(*, num_extends, label=None):
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
 
 
@@ -437,6 +445,7 @@ def _profile_batch(mode):
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 8
     config.max_batch_size = 4
+    config.max_resident_requests = 4
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.enable_mixed_prefill_decode = True
@@ -1419,7 +1428,7 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             return ()
 
     plan = Plan()
-    prepared = cache_ops_from_plan(plan)
+    prepared = cache_ops_from_plan(plan, request_admission={}.__getitem__)
     trace = []
     handle = _handle(trace)
     handle.execute(plan, None, cache_ops=prepared.device)

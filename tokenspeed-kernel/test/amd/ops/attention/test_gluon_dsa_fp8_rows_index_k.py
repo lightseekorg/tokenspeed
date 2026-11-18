@@ -248,7 +248,7 @@ def _expected_prefill(q, weights, keys, workspace):
     )
 
 
-@pytest.mark.parametrize("q_len", (1, 4))
+@pytest.mark.parametrize("q_len", (1, 4, 7, 8))
 @pytest.mark.parametrize(
     ("heads", "weight_dtype", "page_pad"),
     (
@@ -385,7 +385,7 @@ def test_fp8_pages_prefill_selection_is_independent_of_row_blocking(
     )
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 5, 6))
+@pytest.mark.parametrize("q_len", (1, 2, 3, 5, 6, 7, 8))
 def test_fp8_pages_decode_selection_is_independent_of_batching(q_len: int) -> None:
     """Every q_len_per_req selects per request what the batch selects."""
     generator = _generator(300 + q_len)

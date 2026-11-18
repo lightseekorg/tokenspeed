@@ -75,6 +75,7 @@ def _scheduler(ts, make_config):
             num_device_pages=65,
             max_scheduled_tokens=256,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,
@@ -85,6 +86,7 @@ def _scheduler(ts, make_config):
             max_retracted_requests=0,
             host_write_policy="write_through",
             prefill_decode_interval=0,
+            prefill_decode_min_interval=0,
             storage_config=None,
             cache_groups=groups,
         )
@@ -104,7 +106,7 @@ class TestGdnTokenLevelHitResumeTest:
                 make_extend_result_event,
             )
 
-            import tokenspeed_scheduler as ts
+            import tokenspeed_engine.scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn.triton import (
                 triton_gdn_chunk_prefill,
             )
@@ -113,7 +115,7 @@ class TestGdnTokenLevelHitResumeTest:
             from tokenspeed.runtime.engine.scheduler_utils import make_config
             from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_engine.scheduler + tokenspeed_kernel: {exc}")
         self.ts = ts
         self.mamba = mamba
         self.ForwardMode = ForwardMode
