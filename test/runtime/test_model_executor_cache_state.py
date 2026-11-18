@@ -29,6 +29,10 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+    HybridLinearAttnBackend,
+)
+from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 
 
@@ -149,6 +153,48 @@ def test_remote_slot_preparation_orders_behind_the_default_stream(monkeypatch):
         ("on", executor.execution_stream),
         ("prepare", [3, 5]),
     ]
+
+
+def test_hybrid_lands_each_childs_admitted_blocks():
+    # The transfer peer supplies the block contents between prepare and ready.
+    class ReceivingBackend:
+        device = "cpu"
+
+        def __init__(self, group):
+            self.group = group
+            self.pending = {}
+            self.blocks = {}
+            self.ready = {}
+
+        def prepare_remote_cache_slots(self, slots, *, admissions):
+            self.pending.update((slot, admissions[slot]) for slot in slots)
+
+        def mark_remote_cache_ready(self, slot):
+            admission = self.pending.pop(slot)
+            (block,) = admission.block_tables[self.group]
+            if self.blocks[block] != admission.position:
+                raise ValueError("received block has the wrong position")
+            self.ready[slot] = admission.request_id
+
+    full = ReceivingBackend("history")
+    linear = ReceivingBackend("state")
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device_module = torch.cpu
+    executor.default_stream = torch.cpu.current_stream()
+    executor.execution_stream = torch.cpu.Stream()
+    executor.attn_backend = HybridLinearAttnBackend(full, linear, [0])
+    row = RemoteCacheAdmission("incoming", 10, {"history": (2,), "state": (7,)})
+    executor.prepare_remote_cache_slots([3], admissions={3: row})
+    assert not full.ready and not linear.ready
+    full.blocks[2] = linear.blocks[7] = 10
+    executor.mark_remote_cache_ready(3)
+    assert full.ready == linear.ready == {3: "incoming"}
+
+    row = RemoteCacheAdmission("next", 12, {"history": (4,), "state": (7,)})
+    executor.prepare_remote_cache_slots([3], admissions={3: row})
+    full.blocks[4] = 12
+    with pytest.raises(ValueError, match="wrong position"):
+        executor.mark_remote_cache_ready(3)
 
 
 def test_draft_final_step_follows_the_complete_drafter_run():
