@@ -59,6 +59,7 @@ def _runner(
     # Avoid constructing model/cache/GPU resources; exercise the real routing
     # methods with the runner state those methods read.
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.segmented_decode = None
     runner.disable = False
     runner.dp_size = 4
     runner.disable_padding = disable_padding

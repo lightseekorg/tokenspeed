@@ -59,14 +59,9 @@ class DSpark(DFlash):
     spec_algorithm = "DSPARK"
     supports_speculative_sampling = True
 
-    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
-        if self.qwen4_adaptive_verify:
-            return tuple(range(bs, bs * self.spec_num_tokens + 1, bs))
-        return super().decode_graph_query_capacities(bs)
-
     def prepare_target_forward(self, ctx) -> None:
         if ctx.verify_queries is not None:
-            # Packed target rows need their original request layout. Project the
+            # Target graphs are shared across request counts. Project the
             # request-shaped draft context after their compact taps return.
             self._incremental_kv_write_done = False
             ctx.target_capture_sink = None

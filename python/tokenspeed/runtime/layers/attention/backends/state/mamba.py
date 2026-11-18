@@ -298,6 +298,7 @@ class MambaAttnBackend(AttentionBackend):
         self.pad_slot_id = -1
         self.forward_metadata: MambaForwardMetadata | None = None
         self._mixed_forward_metadata: _MixedStateMetadata | None = None
+        self._verify_commit_tables: dict[str, torch.Tensor] = {}
         self._reset_graph_state()
         self.speculative_num_draft_tokens = self.spec_num_tokens
         self.state_paging_active = False
@@ -339,6 +340,9 @@ class MambaAttnBackend(AttentionBackend):
         # and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
+        # Commit graphs read these copies rather than each round's delivered
+        # tables. They are batch metadata, not persistent request state.
+        self._verify_commit_tables = {}
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -534,6 +538,12 @@ class MambaAttnBackend(AttentionBackend):
             ),
             pad_page=self.pad_slot_id,
         )
+        for group_id in groups:
+            rows = tables[group_id]
+            commit_rows = self._verify_commit_tables[group_id]
+            commit_rows[bs:].zero_()
+            commit_rows[:bs].copy_(rows[:bs, :STATE_TABLE_SLOTS])
+            tables[group_id] = commit_rows
         return tables
 
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
@@ -1241,11 +1251,36 @@ class MambaAttnBackend(AttentionBackend):
         self.commit_verified_state(accepted_lengths, accepted_path=accepted_path)
         self._mixed_forward_metadata = None
 
+    def prepare_state_commit_capture(self) -> None:
+        metadata = self.forward_metadata
+        if (
+            not self.state_paging_active
+            or not self.deferred_state_commit
+            or metadata is None
+        ):
+            return
+        reads = metadata.state_in_blocks_by_group
+        if reads is None:
+            raise RuntimeError("state commit capture requires decode state metadata")
+        batch = metadata.query_start_loc.numel() - 1
+        tables = {}
+        for group_id in self._state_groups():
+            rows = self._verify_commit_tables[group_id]
+            rows.zero_()
+            tables[group_id] = rows[:batch]
+        self._verify_commit_ctx = (tables, self.speculative_num_draft_tokens, reads)
+
     # ---- CUDA graph state ----
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
         """Rebuild the index buffers before any graph that reads them is captured."""
         self._reset_graph_state()
+        self._verify_commit_tables = {
+            gid: torch.zeros(
+                (max_bs, STATE_TABLE_SLOTS), dtype=torch.int32, device=self.device
+            )
+            for gid in self._state_group_ids
+        }
         for i in range(max_bs):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)

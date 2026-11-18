@@ -71,6 +71,8 @@ def _runner(
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
     wrapper.confidence_feedback = None
+    wrapper.segmented_decode = None
+    wrapper.update_runtime_state = None
     wrapper.dp_local_graph = False
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False, spec_topk=1
@@ -458,7 +460,8 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
     )
     runner = ForwardStepRunner(
         forward_func=lambda *args, **kwargs: None,
-        confidence_inputs_supported=None,
+        decode_stages=None,
+        update_runtime_state=None,
         attn_backend=Backend(),
         token_to_kv_pool=SimpleNamespace(
             arena=SimpleNamespace(cache_group_specs=(), cache_group_page_counts={})

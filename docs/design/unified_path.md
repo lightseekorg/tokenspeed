@@ -2895,25 +2895,35 @@ to allocate the selected budget across requests.
 
 `VerifyBudgetPlanner` shares prefix rewards with `VerifyBudgetPolicy` and chooses
 the largest expected output per measured time, preferring smaller Q on ties.
-Startup costs measure complete decode graphs. Missing measurements use the
+Startup costs add target and draft graph timings. Missing measurements use the
 full-width budget. Rank zero selects Q and agrees it over a separate host group.
 
-Qwen4 uses the existing decode graph variants with keys (B, Q), where B is
-the padded request bucket and Q is one to the maximum window width times B.
-One graph records target execution, verification, and drafting. The runner
-refreshes metadata before replay and commits accepted state afterwards.
-Explicit forward inputs that differ from the captured inputs use eager
-execution with the same compact layout and commit path.
+Target execution and verification are captured by Q, and draft execution plus
+accepted-state commit by B. Q is the union of capture batch sizes times 1..width;
+for `[1,2,4,8,16]` and width 8, that means 24 target and 5 draft graphs.
+Warmup, ordinary capture and stage capture share the runner's context, sampling
+and grammar setup. Eager forwards run the same executor stages.
 
 `VerifyQueryLayout` owns persistent lengths, offsets and row maps. Inactive
 requests have zero lengths. The fused prefix allocator shares sorting and
 CSR generation with V4.1. Qwen4 uses live and candidate-ready masks and
 conditional probabilities. CPU and batches above the fused allocator's limit
 use the PyTorch implementation.
+Q determines the target request capacity, `min(max_capture_bs,Q)`.
 The target body processes Q rows. It expands hidden states and draft taps
 before projecting scores so the sampler sees the ordinary fixed-width layout.
 Verification caps acceptance at each request's computed prefix. Draft context
 writes and cache admission retain the maximum window.
+
+The B graph reads those buffers at fixed addresses and performs context
+projection, KV writes, drafting, confidence publication, state commit and
+frontier advance. Commits run once, after drafting. GDN and PLE copy scheduler
+state tables into persistent buffers during refresh; `prepare_state_commit_capture`
+arms null destinations before capture. Target metadata is refreshed for Q and
+then B. Metadata delivery, input/output transfers, host budget selection and
+feedback remain outside both graphs. Explicit temporary inputs run the same
+stages eagerly. Filler rows have null destinations and zero acceptance and
+never contribute to expert-load accounting.
 
 The prologue gathers selected write slots. QSA stages keys by original
 request/column; MHA and TRT-LLM use causal lengths per compact row. Unsupported

@@ -1327,8 +1327,8 @@ choose the query budget. The latest device scores assign request prefixes.
 Confidence verification keeps selected rows compact through the target body,
 including attention, GDN, PLE and MLP. The LM head and sampler use the
 full-width request layout. Cache reservations also retain the maximum window.
-Decode graphs use a request bucket and a query budget. A graph runs the
-target, verifier and draft, with accepted-state commit outside replay.
+Target and verification graphs are keyed by total query capacity. Draft
+and accepted-state commit graphs are keyed by request capacity.
 Full-budget and adaptive output parity against fixed verification have not
 passed acceptance; distributed performance and multimodal validation remain
 outstanding. Attention DP and PP must equal one. PD, tree speculation and

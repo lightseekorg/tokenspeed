@@ -437,3 +437,62 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
             torch.testing.assert_close(field, expected, rtol=0, atol=0)
         assert torch.all(backend._ple_commit_rows[:, 4:] == -99)
     assert backend._verify_commit_ctx is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph commit")
+def test_ple_commit_captured_from_idle_reads_fresh_tables_and_padding():
+    backend = _make_backend(3, False, "cuda")
+    accepted = torch.zeros(4, dtype=torch.int32, device="cuda")
+
+    def prepare():
+        backend.init_forward_metadata_capture_cuda_graph(
+            4,
+            torch.arange(4, device="cuda"),
+            torch.ones(4, dtype=torch.int32, device="cuda"),
+            ForwardMode.DECODE,
+            block_tables={},
+        )
+        backend.prepare_state_commit_capture()
+
+    for _ in range(2):
+        prepare()
+        backend.commit_verified_state(accepted)
+    prepare()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.commit_verified_state(accepted)
+    for step, (rows, lengths) in enumerate(
+        [([[1, 2], [4, 5]], [2, 3]), ([[0, 7]], [1]), ([[3, 8], [1, 9]], [3, 2])]
+    ):
+        batch = len(rows)
+        for scratch in backend._ple_verify_scratch.values():
+            scratch.copy_(
+                torch.arange(scratch.numel(), device="cuda").reshape(scratch.shape)
+                + step * 100
+            )
+        accepted.zero_()
+        accepted[:batch] = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        backend.refresh_decode_metadata(
+            4,
+            batch,
+            torch.arange(4, device="cuda"),
+            torch.full((4,), 8, dtype=torch.int32, device="cuda"),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={
+                QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
+                    rows, dtype=torch.int32, device="cuda"
+                )
+            },
+        )
+        for field_id in backend._ple_verify_scratch:
+            backend.cache_pool.arena.field(field_id).fill_(-77)
+        graph.replay()
+        for field_id, scratch in backend._ple_verify_scratch.items():
+            expected = torch.full_like(backend.cache_pool.arena.field(field_id), -77)
+            for request, ((_, page), length) in enumerate(
+                zip(rows, lengths, strict=True)
+            ):
+                expected[page] = scratch[request * 4 + length]
+            torch.testing.assert_close(
+                backend.cache_pool.arena.field(field_id), expected, atol=0, rtol=0
+            )

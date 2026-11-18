@@ -34,13 +34,16 @@ import tqdm
 from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
+from tokenspeed.runtime.execution.confidence_graph import (
+    ConfidenceDecodeGraphs,
+    DecodeStages,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
     probe_positions,
 )
 from tokenspeed.runtime.execution.drafter.verify_feedback import ConfidenceFeedback
-from tokenspeed.runtime.execution.drafter.verify_startup import measure_startup_graph
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -93,6 +96,18 @@ def get_is_capture_mode() -> bool:
 
 def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
+
+
+@contextmanager
+def decode_graph_capture():
+    """Expose the same capture-only stream forks for either graph layout."""
+    global _is_capture_mode
+    previous = _is_capture_mode
+    _is_capture_mode = True
+    try:
+        yield
+    finally:
+        _is_capture_mode = previous
 
 
 @contextmanager
@@ -401,7 +416,8 @@ class ForwardStepRunner:
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
         *,
-        confidence_inputs_supported: Callable[[ForwardContext], bool] | None,
+        decode_stages: DecodeStages | None,
+        update_runtime_state: Callable | None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -421,8 +437,8 @@ class ForwardStepRunner:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
-        self.confidence_inputs_supported = confidence_inputs_supported
-        self._confidence_sampling_info: dict[int, SamplingBatchInfo] = {}
+        self.decode_stages = decode_stages
+        self.update_runtime_state = update_runtime_state
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
@@ -462,8 +478,6 @@ class ForwardStepRunner:
         self.confidence_round_prepared = False
         self._confidence_host_group = None
         if drafter is not None and drafter.qwen4_adaptive_verify:
-            if confidence_inputs_supported is None:
-                raise ValueError("adaptive DSpark graphs require live input validation")
             self.confidence_feedback = ConfidenceFeedback(
                 self.max_tokens_per_req,
                 max(2, config.overlap_schedule_depth + 2),
@@ -594,6 +608,13 @@ class ForwardStepRunner:
         # decode_graph=False while leaving the prefill graph on — decode
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
+        self.segmented_decode: ConfidenceDecodeGraphs | None = None
+        if self.confidence_feedback is not None:
+            if decode_stages is None:
+                raise ValueError(
+                    "confidence graphs require the forward's decode stages"
+                )
+            self.segmented_decode = ConfidenceDecodeGraphs(self, decode_stages)
         self.draft_overlap: DecodeGraphOverlap | None = None
         overlap = os.environ.get("TOKENSPEED_DRAFT_GRAPH_OVERLAP")
         if overlap not in (None, "0", "1"):
@@ -667,6 +688,16 @@ class ForwardStepRunner:
                 it. None captures the whole ladder.
             observer: Measured around each capture, for the same caller.
         """
+        if self.segmented_decode is not None:
+            global _is_cuda_graph_phase
+            old_phase = _is_cuda_graph_phase
+            _is_cuda_graph_phase = True
+            try:
+                with freeze_gc(self.enable_cudagraph_gc):
+                    self.segmented_decode.capture(entries=entries, observer=observer)
+            finally:
+                _is_cuda_graph_phase = old_phase
+            return
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             # Capture backend-declared sampler variants explicitly.
@@ -711,6 +742,8 @@ class ForwardStepRunner:
         if self.disable:
             return {}
         ladder = sorted(self.capture_bs, reverse=True)
+        if self.segmented_decode is not None:
+            return self.segmented_decode.capture_plan
         plan: dict[str, list[int]] = {}
         for bs in ladder:
             for variant in self._cuda_graph_capture_variants(bs):
@@ -744,8 +777,8 @@ class ForwardStepRunner:
         if self.draft_overlap is not None:
             self.draft_overlap.release()
         self.graphs.clear()
-        if self.confidence_feedback is not None:
-            self._confidence_sampling_info.clear()
+        if self.segmented_decode is not None:
+            self.segmented_decode.release()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
         self._reported_query_graphs.clear()
@@ -849,6 +882,10 @@ class ForwardStepRunner:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs)
 
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
+        if self.segmented_decode is not None:
+            return bs in self.segmented_decode.drafts and bool(
+                self.segmented_decode.targets
+            )
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
     def _verify_graph_metadata(self, graph_key: DecodeGraphKey) -> None:
@@ -895,7 +932,7 @@ class ForwardStepRunner:
     def _capture_context(
         self, bs: int, *, queries: VerifyQueryLayout | None
     ) -> ForwardContext:
-        """One dummy decode layout for eager warmup and round graphs."""
+        """One dummy decode layout for warmup, round graphs and stage graphs."""
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -958,23 +995,12 @@ class ForwardStepRunner:
         graph = graph_cls()
         self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
 
-        _, query_tokens = self._split_query_variant(variant, bs)
-        confidence = self.confidence_feedback
-        if confidence is not None:
-            self.input_buffers.fill_dummy_decode_buffers(
-                batch_size=bs, total_tokens=bs * self.max_tokens_per_req
-            )
-        ctx = self._capture_context(
-            bs,
-            queries=(
-                self.query_layout(bs, query_tokens) if confidence is not None else None
-            ),
-        )
+        ctx = self._capture_context(bs, queries=None)
         sampling_info = self._capture_sampling_info(bs)
+
+        _, query_tokens = self._split_query_variant(variant, bs)
         adaptive_layout = (
-            confidence is None
-            and self.drafter is not None
-            and query_tokens < bs * self.max_tokens_per_req
+            self.drafter is not None and query_tokens < bs * self.max_tokens_per_req
         )
         if adaptive_layout:
             # Select the layout outside the graph. Runtime replay updates the
@@ -1089,21 +1115,6 @@ class ForwardStepRunner:
 
         if self.drafter is not None:
             self.drafter.set_decode_graph_query_extent(None)
-        if confidence is not None:
-            self._confidence_sampling_info[bs] = sampling_info
-            with torch.cuda.stream(self.stream):
-                self.deepep_adapter.replay()
-                samples = measure_startup_graph(
-                    graph.replay,
-                    lambda: self._queue_capture_grammar(ctx),
-                    device=torch.device(self.device),
-                    host_group=self._confidence_host_group,
-                    warmup=0,
-                    samples=3,
-                )
-            confidence.planner.set_baseline(bs, query_tokens, sorted(samples)[1])
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.reset_state()
         return graph, out
 
     def warmup_decode_path(
@@ -1128,7 +1139,7 @@ class ForwardStepRunner:
                     bs,
                     queries=(
                         self.query_layout(bs, bs * self.max_tokens_per_req)
-                        if self.confidence_feedback is not None
+                        if self.segmented_decode is not None
                         else None
                     ),
                 )
@@ -1452,18 +1463,15 @@ class ForwardStepRunner:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        confidence_round = (
-            self.confidence_feedback is not None and ctx.forward_mode.is_decode()
-        )
-        if confidence_round:
+        if self.confidence_feedback is not None and ctx.forward_mode.is_decode():
             budget = [
                 (
                     self.confidence_feedback.select(
                         padded_bs,
                         self.confidence_request_ids,
                         capacities=(
-                            self.drafter.decode_graph_query_capacities(padded_bs)
-                            if use_graph
+                            self.segmented_decode.targets
+                            if use_graph and self.segmented_decode is not None
                             else None
                         ),
                     )
@@ -1476,7 +1484,12 @@ class ForwardStepRunner:
                     budget, src=0, group=self._confidence_host_group
                 )
             queries = budget[0]
-            ctx.verify_queries = self.query_layout(padded_bs, queries)
+            maximum = self.max_capture_bs if use_graph else self.max_decode_bs
+            ctx.verify_queries = self.query_layout(min(maximum, queries), queries)
+            # Stage graphs handle their padding. The outer forward retains the
+            # real request count for feedback and output delivery.
+            if self.segmented_decode is not None:
+                padded_bs = bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         live_output_layout = ctx.output_layout
@@ -1563,39 +1576,20 @@ class ForwardStepRunner:
             )
 
         self._decode_query_tokens = None
-        if use_graph and confidence_round:
-            captured = self._confidence_sampling_info[padded_bs]
-            if not self.confidence_inputs_supported(
-                ctx
-            ) or not same_confidence_sampling_inputs(sampling_info, captured):
-                # settle has bound the live sampling inputs. Reuse the regular
-                # metadata refresh at the unpadded extent for an eager forward.
-                use_graph = False
-                padded_bs = bs
-                ctx.bs = bs
-                ctx.output_layout = live_output_layout
-                queries = min(
-                    ctx.verify_queries.query_capacity, bs * self.max_tokens_per_req
-                )
-                ctx.verify_queries = self.query_layout(bs, queries)
-                self._prepare_decode_metadata(
-                    bs,
-                    bs,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    forward_mode=ctx.forward_mode,
-                    use_graph=False,
-                    settle=lambda: None,
-                    block_tables=block_tables,
-                )
-            else:
-                self._decode_query_tokens = ctx.verify_queries.query_capacity
-        elif use_graph and self.drafter is not None:
+        if use_graph and self.drafter is not None:
             self._decode_query_tokens = self.drafter.prepare_decode_graph_token_layout(
                 ctx, actual_bs=bs, padded_bs=padded_bs
             )
 
-        if use_graph:
+        if self.segmented_decode is not None and ctx.verify_queries is not None:
+            self.segmented_decode.bind_round(
+                ctx,
+                actual_bs=bs,
+                block_tables=block_tables,
+                use_graph=use_graph,
+            )
+            result = self.segmented_decode.run_round(ctx, sampling_info)
+        elif use_graph:
             # Runtime prepare() is called by ModelExecutor with per-request rids
             # BEFORE self.forward_step — we don't refill here to avoid clobbering
             # the per-request generators with the capture-stub generator.
@@ -1639,9 +1633,7 @@ class ForwardStepRunner:
             query_tokens = (
                 self._decode_query_tokens or padded_bs * self.max_tokens_per_req
             )
-            packed = (
-                confidence_round or query_tokens != padded_bs * self.max_tokens_per_req
-            )
+            packed = query_tokens != padded_bs * self.max_tokens_per_req
             if self._expert_load_rows is not None:
                 if self.dp_local_graph:
                     # This graph's MoE input contains only its local rows.
@@ -1700,16 +1692,8 @@ class ForwardStepRunner:
             ctx.bs = bs
             ctx.output_layout = live_output_layout
 
-        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
-            self.attn_backend.commit_state_after_acceptance(
-                result[1],
-                num_extends=ctx.num_extends,
-                accepted_path=(
-                    self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
-                    if self.config.spec_draft_tree and ctx.num_extends == 0
-                    else None
-                ),
-            )
+        if not (self.segmented_decode is not None and ctx.verify_queries is not None):
+            self.commit_forward(ctx, result)
 
         if self.confidence_feedback is not None and self.confidence_round_prepared:
             slots = self.input_buffers.req_pool_indices_buf[:bs]
@@ -1731,3 +1715,21 @@ class ForwardStepRunner:
 
         self.last_graph_bs = padded_bs if use_graph else None
         return result
+
+    def commit_forward(self, ctx: ForwardContext, result: tuple) -> None:
+        """Commit accepted state and advance the frontier once, after drafting."""
+        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            self.attn_backend.commit_state_after_acceptance(
+                result[1],
+                num_extends=ctx.num_extends,
+                accepted_path=(
+                    self.sampling_backend.accepted_path(
+                        ctx.bs, self.config.spec_num_tokens
+                    )
+                    if self.config.spec_draft_tree and ctx.num_extends == 0
+                    else None
+                ),
+            )
+
+        if self.update_runtime_state is not None:
+            self.update_runtime_state(ctx, result)
