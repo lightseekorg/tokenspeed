@@ -206,6 +206,9 @@ public:
         std::uint64_t failed_landings{0};
     };
     PeerStats GetPeerStats() const;
+    std::vector<PeerExports::PinSample> TakePeerPinSamples() {
+        return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
+    }
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;

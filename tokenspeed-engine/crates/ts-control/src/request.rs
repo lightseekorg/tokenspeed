@@ -218,9 +218,27 @@ impl ReasoningTokens {
     }
 }
 
+/// Remote interval confirmed for this request and its first committed use.
+#[derive(Clone, Debug, Default)]
+pub struct PeerUsage {
+    /// Prediction absent for older clients.
+    pub expected: Option<u64>,
+    /// Landing interval beyond the reader's local prefix.
+    pub window: Option<(i32, i32)>,
+    /// First successful prefill commit resolves this exactly once.
+    pub actual: Option<u64>,
+    /// Last authoritative peer lifecycle result observed by this request.
+    pub disposition: &'static str,
+    /// First lookup dispatch and last successful lookup response.
+    pub lookup_at: Option<std::time::Instant>,
+    pub admission_at: Option<std::time::Instant>,
+}
+
 /// One admitted request.
 #[derive(Debug, Clone)]
 pub struct RequestState {
+    /// Present on requests dispatched with a peer hint.
+    pub peer_usage: Option<PeerUsage>,
     /// Prompt token ids.
     pub prompt_ids: Vec<i32>,
     /// Prompt length.
@@ -371,6 +389,7 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            peer_usage: None,
             session_id: None,
             spec_verify_ct: 0,
             decode_reserve: None,

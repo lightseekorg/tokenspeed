@@ -1098,6 +1098,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
             metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
             let request = self.outputs.take_request_metrics();
+            for (rid, lookup, admission, aborted) in request.peer_stops {
+                let outcome = if aborted { "cancelled" } else { "no_gain" };
+                if let Some(start) = admission {
+                    metrics
+                        .peer
+                        .stage("admission", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(start) = lookup {
+                    metrics
+                        .peer
+                        .stage("lookup_to_ready", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(peer) = &mut self.peer {
+                    peer.end_lookup(&rid, outcome);
+                }
+            }
+            for (expected, actual, outcome) in request.peer_usage {
+                metrics.peer.usage(expected, actual, outcome);
+            }
             for seconds in request.ttft_seconds {
                 metrics.observe_time_to_first_token(seconds);
             }
@@ -2455,6 +2474,34 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         let round = peer.agree(reports)?;
         self.peer_now_us = round.now_us;
+        if let Some(metrics) = &self.metrics {
+            for (rid, result) in round.decisions {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.disposition = result;
+                    if result == "admission" {
+                        usage.admission_at = Some(Instant::now());
+                    } else if let Some(start) = usage.lookup_at.take() {
+                        metrics.peer.stage(
+                            "lookup_to_ready",
+                            "fallback",
+                            start.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+            }
+            for (rid, begin, end) in round.landed {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.window = Some((begin, end));
+                    usage.disposition = "unused_after_landing";
+                    if let Some(start) = usage.lookup_at.take() {
+                        metrics
+                            .peer
+                            .stage("lookup_to_ready", "ok", start.elapsed().as_secs_f64());
+                    }
+                }
+            }
+        }
+        peer.sample_scheduler(&mut self.scheduler, round.now_us);
         self.scheduler
             .advance_peer(round.now_us, &round.events)
             .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
@@ -2466,11 +2513,30 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// sent.
     fn dispatch_peer(&mut self, plan: &ExecutionPlan) {
         if let Some(peer) = self.peer.as_mut() {
-            peer.dispatch(
-                plan.peer_fetches(),
-                self.scheduler.take_peer_lookups(),
-                self.peer_now_us,
-            );
+            let fetches = plan.peer_fetches();
+            let lookups = self.scheduler.take_peer_lookups();
+            if let Some(metrics) = &self.metrics {
+                let now = Instant::now();
+                for lookup in &lookups {
+                    if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
+                        usage.lookup_at = Some(now);
+                        usage.disposition = "lookup";
+                    }
+                }
+                for fetch in &fetches {
+                    if let Some(usage) = self.outputs.peer_usage(&fetch.request_id) {
+                        if let Some(start) = usage.admission_at.take() {
+                            metrics.peer.stage(
+                                "admission",
+                                "ok",
+                                now.duration_since(start).as_secs_f64(),
+                            );
+                        }
+                        usage.disposition = "landing";
+                    }
+                }
+            }
+            peer.dispatch(fetches, lookups, self.peer_now_us);
         }
     }
 

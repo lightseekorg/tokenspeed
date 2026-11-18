@@ -180,6 +180,10 @@ pub struct PeerRound {
     pub now_us: i64,
     /// The holder's changes first, then the reader's answers and landings.
     pub events: Vec<PeerEventView>,
+    /// Confirmed remote intervals for per-request usage attribution.
+    pub landed: Vec<(String, i32, i32)>,
+    /// Attribution for lookup decisions and failed landings on the reporting owner.
+    pub decisions: Vec<(String, &'static str)>,
 }
 
 /// A holder's layout, as a reader knows it.
@@ -237,6 +241,12 @@ pub struct Peer {
     /// Landings this member started reading.
     reading: HashSet<String>,
     reads: Reads,
+    metrics: Option<Arc<ts_metrics::PeerMetrics>>,
+    // Only the endpoint owner measures logical attempts.
+    lookup_times: HashMap<u64, (String, Instant, i64)>,
+    decisions: Vec<(String, &'static str)>,
+    next_sample_us: i64,
+    previous_totals: [u64; 2],
     /// Reads that could not be placed, to report as failed.
     unplaced: Vec<(String, bool)>,
 }
@@ -277,9 +287,60 @@ impl Peer {
             fenced_plans,
             fenced: HashSet::new(),
             reading: HashSet::new(),
+            metrics: None,
+            lookup_times: HashMap::new(),
+            decisions: Vec::new(),
+            next_sample_us: 0,
+            previous_totals: [0; 2],
             reads: Reads::start(reader, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
         })
+    }
+
+    /// Enable logical measurements on member zero and physical measurements on every member.
+    pub fn set_metrics(&mut self, metrics: Arc<ts_metrics::PeerMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// The native counters survive gaps between scrapes; gauges are sampled once per second.
+    pub fn sample_scheduler(&mut self, scheduler: &mut Scheduler, now_us: i64) {
+        let Some(metrics) = self.metrics.as_ref().filter(|_| self.member == 0) else {
+            return;
+        };
+        for sample in scheduler.take_peer_pin_samples() {
+            metrics.pin(sample.held_us, sample.remaining_us, sample.expired);
+        }
+        if now_us < self.next_sample_us {
+            return;
+        }
+        self.next_sample_us = now_us.saturating_add(1_000_000);
+        let stats = scheduler.peer_stats();
+        for (name, n) in [
+            ("leases", stats.leases),
+            ("pinned_blocks", stats.pinned_blocks),
+            ("looking_requests", stats.looking_requests),
+            ("landing_requests", stats.landing_requests),
+        ] {
+            metrics.snapshot(name, n);
+        }
+        let totals = [stats.landed_tokens, stats.failed_landings];
+        for (i, name) in ["landed_tokens", "failed_landings"].iter().enumerate() {
+            metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
+        }
+        self.previous_totals = totals;
+    }
+
+    /// Drop an unanswered lookup when its owning request terminates.
+    pub fn end_lookup(&mut self, rid: &str, outcome: &str) {
+        if let Some(metrics) = &self.metrics {
+            self.lookup_times.retain(|_, (owner, start, _)| {
+                if owner != rid {
+                    return true;
+                }
+                metrics.stage("lookup", outcome, start.elapsed().as_secs_f64());
+                false
+            });
+        }
     }
 
     /// The bound port of the first member's endpoint.
@@ -319,6 +380,16 @@ impl Peer {
         for reply in &first.replies {
             self.take_reply(reply, now_us, &mut events, &mut actions);
         }
+        if let Some(metrics) = &self.metrics {
+            self.lookup_times.retain(|_, (rid, start, deadline)| {
+                if now_us < *deadline {
+                    return true;
+                }
+                self.decisions.push((rid.clone(), "lookup_timeout"));
+                metrics.stage("lookup", "timeout", start.elapsed().as_secs_f64());
+                false
+            });
+        }
         for (member, report) in reports.iter().enumerate() {
             for (request, ok) in &report.outcomes {
                 if let Some(landing) = self.landings.get_mut(request) {
@@ -342,8 +413,17 @@ impl Peer {
             .iter()
             .filter_map(|(request, landing)| landing.done().map(|tokens| (request.clone(), tokens)))
             .collect();
+        let mut landed = Vec::new();
         for (request, num_tokens) in done {
-            self.landings.remove(&request);
+            let landing = self.landings.remove(&request).expect("finished landing");
+            if self.metrics.is_some()
+                && self.member == 0
+                && num_tokens == landing.fetch().end_tokens
+            {
+                landed.push((request.clone(), landing.fetch().begin_tokens, num_tokens));
+            } else if let Some(stage) = landing.failure() {
+                self.decisions.push((request.clone(), stage));
+            }
             self.fenced.remove(&request);
             self.reading.remove(&request);
             events.push(PeerEventView {
@@ -358,8 +438,13 @@ impl Peer {
                 self.fenced.extend(requests);
             }
         }
-        self.start_reads();
-        Ok(PeerRound { now_us, events })
+        self.start_reads(now_us);
+        Ok(PeerRound {
+            now_us,
+            events,
+            landed,
+            decisions: std::mem::take(&mut self.decisions),
+        })
     }
 
     /// A plan's landings and lookups: the landings start, and the first
@@ -382,14 +467,23 @@ impl Peer {
         for fetch in fetches {
             let known = self.layouts.contains_key(&fetch.holder);
             let request = fetch.request_id.clone();
-            let (landing, action) =
+            let (mut landing, action) =
                 Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
+            if self.member == 0 {
+                landing.observe_with(self.metrics.clone());
+            }
             self.landings.insert(request.clone(), landing);
             actions.push((request, action));
         }
         self.send(actions, now_us);
         if let Some(endpoint) = &self.endpoint {
             for lookup in lookups {
+                if self.metrics.is_some() {
+                    self.lookup_times.insert(
+                        lookup.lease.id,
+                        (lookup.request_id, Instant::now(), lookup.deadline_us),
+                    );
+                }
                 let request = Request::Lookup {
                     lease: lookup.lease,
                     prompt: Prompt {
@@ -459,17 +553,37 @@ impl Peer {
             Reply::Answer { stamp, answer } => {
                 let trusted = self.trust(stamp);
                 match answer.kind {
-                    PeerAnswerKind::Lookup => events.push(PeerEventView {
-                        kind: PeerEventKind::LookupAnswered,
-                        lease: answer.lease.clone(),
-                        // A holder of another namespace holds nothing of ours.
-                        num_tokens: if stamp.identity == self.identity {
-                            answer.num_tokens
-                        } else {
-                            0
-                        },
-                        ..empty_event()
-                    }),
+                    PeerAnswerKind::Lookup => {
+                        if let (Some(metrics), Some((rid, start, _))) =
+                            (&self.metrics, self.lookup_times.remove(&answer.lease.id))
+                        {
+                            let outcome = if stamp.identity != self.identity {
+                                "incompatible"
+                            } else if answer.num_tokens == 0 {
+                                "miss"
+                            } else {
+                                "ok"
+                            };
+                            let decision = match outcome {
+                                "ok" => "admission",
+                                "miss" => "lookup_miss",
+                                _ => "incompatible",
+                            };
+                            self.decisions.push((rid, decision));
+                            metrics.stage("lookup", outcome, start.elapsed().as_secs_f64());
+                        }
+                        events.push(PeerEventView {
+                            kind: PeerEventKind::LookupAnswered,
+                            lease: answer.lease.clone(),
+                            // A holder of another namespace holds nothing of ours.
+                            num_tokens: if stamp.identity == self.identity {
+                                answer.num_tokens
+                            } else {
+                                0
+                            },
+                            ..empty_event()
+                        });
+                    }
                     PeerAnswerKind::Pin => {
                         if let Some((request, landing)) = self
                             .landings
@@ -550,7 +664,7 @@ impl Peer {
 
     /// Start this member's reads of the landings that are pinned and whose
     /// plan's device work has run here.
-    fn start_reads(&mut self) {
+    fn start_reads(&mut self, now_us: i64) {
         for (request, landing) in &self.landings {
             if self.reading.contains(request) || !self.fenced.contains(request) {
                 continue;
@@ -559,6 +673,13 @@ impl Peer {
                 continue;
             };
             let fetch = landing.fetch();
+            if let Some(metrics) = &self.metrics {
+                metrics.fence(
+                    &fetch.holder,
+                    self.member,
+                    (now_us - landing.phase_started_us()) as f64 / 1e6,
+                );
+            }
             let holder = self
                 .layouts
                 .get(&fetch.holder)
@@ -585,11 +706,23 @@ impl Peer {
                 });
             self.reading.insert(request.clone());
             match job {
-                Ok((session, spans)) => self.reads.submit(ReadJob {
-                    request_id: request.clone(),
-                    session,
-                    spans,
-                }),
+                Ok((session, spans)) => {
+                    let observation = self.metrics.as_ref().map(|metrics| read::ReadObservation {
+                        metrics: Arc::clone(metrics),
+                        holder: fetch.holder.clone(),
+                        member: self.member,
+                        bytes: spans.lengths.iter().sum(),
+                        queued: Instant::now(),
+                    });
+                    self.reads.submit_observed(
+                        ReadJob {
+                            request_id: request.clone(),
+                            session,
+                            spans,
+                        },
+                        observation,
+                    );
+                }
                 Err(error) => {
                     // Nothing was posted: a failed read with no late writes,
                     // reported with the next round.

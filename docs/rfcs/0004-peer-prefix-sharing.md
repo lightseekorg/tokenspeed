@@ -406,3 +406,27 @@ leases held by tier, demoted and dropped blocks and their returns.
 1. Soft-pin and hard-pin deadlines.
 2. Whether a landing should keep a shorter confirmed prefix for groups whose
    tables do not depend on the boundary (full history only).
+
+### Observing peer reuse
+
+With engine metrics enabled, the attention-DP owner records one
+`tokenspeed:peer_consumed_tokens` sample per finished hinted request. Consumption
+is the intersection of the confirmed remote interval with the prefix skipped by
+the first committed prefill. Local prefix tokens and replayed tokens are excluded.
+If the router supplied `peer_expected_tokens`, the same request also contributes
+`expected - consumed` to `tokenspeed:peer_estimation_error_tokens`, labeled by
+outcome. An older hint with no estimate still contributes consumption.
+
+`tokenspeed:peer_stage_seconds_count` counts visits by stage and outcome.
+Inspect lookup, admission, layout, pin, read_agreement and release separately.
+The lookup_to_ready and landing timers span multiple stages. hard_pin uses the
+holder's clock, from PIN application until actual release or expiry.
+`tokenspeed:peer_hard_pin_remaining_seconds` measures deadline minus that time.
+`tokenspeed:peer_shard_seconds` measures device-fence wait, read queue delay and
+transport service on each rank. Sum `tokenspeed:peer_outstanding_read_bytes`
+over reader ranks for bytes queued or executing against a holder; count distinct
+reader replicas with a positive sum to obtain concurrency at scrape time.
+Use `tokenspeed:peer_read_bytes_total` for successful physical payload.
+Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
+A reader process that dies before terminal observation cannot report a completed
+sample; frontend failures and holder expiry remain independently observable.

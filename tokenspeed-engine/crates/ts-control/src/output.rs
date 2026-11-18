@@ -482,6 +482,10 @@ pub struct FinishLog {
 /// Per-request latency samples and token totals since the last drain.
 #[derive(Debug, Default)]
 pub struct RequestMetrics {
+    /// Expected and actually consumed remote tokens per finished hinted request.
+    pub peer_usage: Vec<(Option<u64>, u64, &'static str)>,
+    /// Unfinished lookup/admission intervals closed by request completion.
+    pub peer_stops: Vec<(String, Option<Instant>, Option<Instant>, bool)>,
     /// Time from request creation to its first output token.
     pub ttft_seconds: Vec<f64>,
     /// Time from request creation to its end (role-specific end boundary).
@@ -513,6 +517,8 @@ pub struct OutputProcessor {
     admissions: u64,
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
+    peer_stops: Vec<(String, Option<Instant>, Option<Instant>, bool)>,
+    peer_samples: Vec<(Option<u64>, u64, &'static str)>,
     generated_tokens: u64,
     prompt_tokens: u64,
     cache_hit_tokens: u64,
@@ -551,6 +557,8 @@ impl OutputProcessor {
             admissions: 0,
             metrics_enabled,
             trace,
+            peer_stops: Vec::new(),
+            peer_samples: Vec::new(),
             generated_tokens: 0,
             prompt_tokens: 0,
             cache_hit_tokens: 0,
@@ -565,6 +573,8 @@ impl OutputProcessor {
     /// Per-request latency samples and token totals since the last drain.
     pub fn take_request_metrics(&mut self) -> RequestMetrics {
         RequestMetrics {
+            peer_stops: std::mem::take(&mut self.peer_stops),
+            peer_usage: std::mem::take(&mut self.peer_samples),
             ttft_seconds: std::mem::take(&mut self.ttft_seconds),
             request_seconds: std::mem::take(&mut self.request_seconds),
             decode_seconds: std::mem::take(&mut self.decode_seconds),
@@ -619,6 +629,25 @@ impl OutputProcessor {
     fn log_end(&mut self, rid: &str, state: &RequestState) {
         self.log_finished(rid, state);
         if self.metrics_enabled {
+            if let Some(usage) = &state.peer_usage {
+                if usage.lookup_at.is_some() || usage.admission_at.is_some() {
+                    self.peer_stops.push((
+                        rid.to_owned(),
+                        usage.lookup_at,
+                        usage.admission_at,
+                        state.to_abort,
+                    ));
+                }
+                let actual = usage.actual.unwrap_or(0);
+                let outcome = if actual > 0 {
+                    "used"
+                } else if state.to_abort {
+                    "aborted"
+                } else {
+                    usage.disposition
+                };
+                self.peer_samples.push((usage.expected, actual, outcome));
+            }
             // Cache and prompt totals feed the derived cache metrics.
             self.prompt_tokens += state.prompt_len.max(0) as u64;
             self.cache_hit_tokens += state.cached_tokens.max(0) as u64;
@@ -796,6 +825,11 @@ impl OutputProcessor {
     /// Requests admitted and not ended.
     pub fn num_running(&self) -> usize {
         self.states.len()
+    }
+
+    /// Usage attribution for a running peer-hinted request.
+    pub(crate) fn peer_usage(&mut self, rid: &str) -> Option<&mut crate::request::PeerUsage> {
+        self.states.get_mut(rid)?.peer_usage.as_mut()
     }
 
     /// A running request's state.
@@ -1346,6 +1380,18 @@ impl OutputProcessor {
         for i in 0..batch.num_extends {
             if let Some(state) = self.states.get_mut(&batch.request_ids[i]) {
                 let hit = i64::from(batch.extend_prefix_lens[i] + batch.extend_replay_lens[i]);
+                if let Some(usage) = &mut state.peer_usage {
+                    // Replayed positions execute again. Count only the remote interval
+                    // below the first committed forward's actual starting position.
+                    usage.actual.get_or_insert_with(|| {
+                        usage.window.map_or(0, |(begin, end)| {
+                            batch.extend_prefix_lens[i]
+                                .min(end)
+                                .saturating_sub(begin)
+                                .max(0) as u64
+                        })
+                    });
+                }
                 state.cached_tokens += (hit - state.computed_length).max(0);
             }
         }
@@ -2288,6 +2334,27 @@ mod tests {
         assert!(samples.request_seconds.is_empty());
         assert!(samples.decode_seconds.is_empty());
         assert!(samples.tpot_seconds.is_empty());
+    }
+
+    #[test]
+    fn peer_usage_counts_only_the_remote_prefix_used_at_the_first_commit() {
+        let mut p = processor(None);
+        register(&mut p, "r", 12, 1, &[]);
+        p.states.get_mut("r").unwrap().peer_usage = Some(crate::request::PeerUsage {
+            expected: Some(8),
+            window: Some((4, 10)),
+            disposition: "unused_after_landing",
+            ..Default::default()
+        });
+        p.commit(&batch(&[("r", 2, 8, 12)], 1), None, &result(&[0], &[1]))
+            .unwrap();
+        p.commit(&batch(&[("r", 2, 10, 12)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        assert_eq!(
+            p.take_request_metrics().peer_usage,
+            vec![(Some(8), 4, "used")]
+        );
+        assert!(p.take_request_metrics().peer_usage.is_empty());
     }
 
     #[test]

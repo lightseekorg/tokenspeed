@@ -72,6 +72,10 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct Landing {
     fetch: PeerFetchView,
+    metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    started_us: i64,
+    failure: Option<&'static str>,
+    phase_us: i64,
     phase: Phase,
     deadline_us: i64,
     timeouts: Timeouts,
@@ -98,6 +102,10 @@ impl Landing {
         (
             Self {
                 fetch,
+                metrics: None,
+                started_us: now_us,
+                failure: None,
+                phase_us: now_us,
                 phase,
                 deadline_us: deadline(now_us, timeouts.answer_us),
                 timeouts,
@@ -106,6 +114,51 @@ impl Landing {
             },
             action,
         )
+    }
+
+    pub(super) fn observe_with(
+        &mut self,
+        metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    ) {
+        self.metrics = metrics;
+    }
+
+    fn transition(&mut self, next: Phase, outcome: &str, now_us: i64) {
+        if let Some(metrics) = &self.metrics {
+            let stage = match self.phase {
+                Phase::Layout => "layout",
+                Phase::Pin => "pin",
+                Phase::Read => "read_agreement",
+                Phase::Release { .. } => "release",
+                Phase::Quarantine { .. } => "quarantine",
+                Phase::Done(_) => return,
+            };
+            if outcome != "ok" && self.failure.is_none() {
+                self.failure = Some(stage);
+            }
+            metrics.stage(stage, outcome, (now_us - self.phase_us) as f64 / 1e6);
+            if let Phase::Done(end) = next {
+                metrics.stage(
+                    "landing",
+                    if end == self.fetch.end_tokens {
+                        "ok"
+                    } else {
+                        "fallback"
+                    },
+                    (now_us - self.started_us) as f64 / 1e6,
+                );
+            }
+        }
+        self.phase_us = now_us;
+        self.phase = next;
+    }
+
+    pub(super) fn failure(&self) -> Option<&'static str> {
+        self.failure
+    }
+
+    pub(super) fn phase_started_us(&self) -> i64 {
+        self.phase_us
     }
 
     /// The fetch.
@@ -123,7 +176,7 @@ impl Landing {
         if self.phase != Phase::Layout {
             return None;
         }
-        self.phase = Phase::Pin;
+        self.transition(Phase::Pin, "ok", now_us);
         self.deadline_us = deadline(now_us, self.timeouts.answer_us);
         Some(Action::SendPin)
     }
@@ -141,7 +194,7 @@ impl Landing {
                 .any(|page| page.group_id == destination.group_id && page.slot == destination.slot)
         });
         if trusted && answer.held && answer.num_tokens == self.fetch.end_tokens && covers {
-            self.phase = Phase::Read;
+            self.transition(Phase::Read, "ok", now_us);
             self.pinned = Some(answer);
             None
         } else {
@@ -174,7 +227,16 @@ impl Landing {
     /// The release's answer.
     pub fn released(&mut self, answer: &PeerAnswerView, trusted: bool, now_us: i64) {
         if let Phase::Release { read } = self.phase {
-            self.settle(read, trusted && answer.held, now_us);
+            self.settle(
+                read,
+                trusted && answer.held,
+                if trusted && answer.held {
+                    "ok"
+                } else {
+                    "rejected"
+                },
+                now_us,
+            );
         }
     }
 
@@ -183,14 +245,14 @@ impl Landing {
         match self.phase {
             // No read started: nothing can still write the destinations.
             Phase::Layout | Phase::Pin if now_us >= self.deadline_us => {
-                self.phase = Phase::Done(self.fetch.begin_tokens);
+                self.transition(Phase::Done(self.fetch.begin_tokens), "timeout", now_us);
             }
             // An unanswered release vouches for nothing.
             Phase::Release { read } if now_us >= self.deadline_us => {
-                self.settle(read, false, now_us)
+                self.settle(read, false, "timeout", now_us)
             }
             Phase::Quarantine { until_us } if now_us >= until_us => {
-                self.phase = Phase::Done(self.fetch.begin_tokens);
+                self.transition(Phase::Done(self.fetch.begin_tokens), "ok", now_us);
             }
             _ => {}
         }
@@ -205,14 +267,18 @@ impl Landing {
     }
 
     fn release(&mut self, read: bool, now_us: i64) -> Option<Action> {
-        self.phase = Phase::Release { read };
+        self.transition(
+            Phase::Release { read },
+            if read { "ok" } else { "failed" },
+            now_us,
+        );
         self.deadline_us = deadline(now_us, self.timeouts.answer_us);
         Some(Action::SendRelease { demote: read })
     }
 
-    fn settle(&mut self, read: bool, vouched: bool, now_us: i64) {
+    fn settle(&mut self, read: bool, vouched: bool, outcome: &str, now_us: i64) {
         let failed_read = self.pinned.is_some() && !read;
-        self.phase = if failed_read {
+        let next = if failed_read {
             Phase::Quarantine {
                 until_us: deadline(now_us, self.timeouts.quarantine_us),
             }
@@ -221,6 +287,7 @@ impl Landing {
         } else {
             Phase::Done(self.fetch.begin_tokens)
         };
+        self.transition(next, outcome, now_us);
     }
 }
 

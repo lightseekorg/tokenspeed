@@ -33,6 +33,8 @@
 //!
 //! Metrics never fail serving: an output that errors is logged and skipped.
 
+mod peer;
+pub use peer::PeerMetrics;
 mod prom;
 mod relay;
 
@@ -392,6 +394,8 @@ const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 /// group's first rank.
 #[derive(Debug)]
 pub struct EngineMetrics {
+    /// Logical peer metrics for this DP owner.
+    pub peer: Arc<PeerMetrics>,
     labels: [String; 3],
     num_requests_running: Metric,
     num_requests_inflight: Metric,
@@ -451,6 +455,7 @@ impl EngineMetrics {
     pub fn new(exporter: &Arc<Exporter>, labels: &EngineLabels) -> Self {
         let names = &ENGINE_LABELS;
         Self {
+            peer: Arc::new(PeerMetrics::new(exporter, labels)),
             labels: [
                 labels.model_name.clone(),
                 labels.app_key.clone(),
