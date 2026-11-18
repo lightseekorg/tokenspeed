@@ -173,10 +173,18 @@ class MHAAttnBackend(PagedAttentionBackend):
             return_lse=False,
             solution=self.kernel_solution,
         )
-        # DFLASH draft: the whole block in one decode forward, with one
-        # decode metadata entry per block position and uniform non-causal
-        # seq_lens (block_decode_expansion).
+        # DFLASH draft: the whole block in one decode forward. A non-causal
+        # block keeps one decode metadata entry per block position, all at the
+        # block-end seq_len (block_decode_expansion). A causal block keeps one
+        # entry per request and decodes its positions as packed causal query
+        # rows, as a verify does, so each request's keys are read once.
         self.draft_block_decode = bool(config.draft_block_decode)
+        self.draft_block_causal = bool(config.draft_block_causal)
+        # The block_draft kernel trait selects non-causal block attention; a
+        # causal block's packed rows decode as a verify does.
+        self.noncausal_block_draft = (
+            self.draft_block_decode and not self.draft_block_causal
+        )
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
@@ -353,6 +361,12 @@ class MHAAttnBackend(PagedAttentionBackend):
             self._decode_views_by_bs[bs] = metadata
         return metadata
 
+    @property
+    def block_decode_expansion(self) -> int:
+        if self.draft_block_causal:
+            return 1
+        return super().block_decode_expansion
+
     def refresh_decode_metadata(
         self,
         bs: int,
@@ -366,14 +380,14 @@ class MHAAttnBackend(PagedAttentionBackend):
         del num_extends
         if self.block_decode_active:
             # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block positions. Under replay the block-end
+            # block_decode_expansion entries. Under replay the block-end
             # seq_lens are re-derived inside the captured graph
             # (fill_block_decode_seq_lens); eager has no in-graph writer, and
             # the capture seeding needs the same safe baseline.
-            spec = self.spec_num_tokens
-            self.page_table_buf[: bs * spec].view(bs, spec, self.max_num_pages).copy_(
-                page_table[:bs, None, :]
-            )
+            expansion = self.block_decode_expansion
+            self.page_table_buf[: bs * expansion].view(
+                bs, expansion, self.max_num_pages
+            ).copy_(page_table[:bs, None, :])
             if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
         else:
@@ -440,7 +454,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     logit_cap=layer.logit_cap,
                     sinks=sinks,
-                    block_draft=self.draft_block_decode,
+                    block_draft=self.noncausal_block_draft,
                     solution=self.kernel_solution,
                     **scale_kwargs,
                 )
@@ -458,7 +472,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 logit_cap=layer.logit_cap,
                 sinks=sinks,
                 out=self.decode_schedule_buf,
-                block_draft=self.draft_block_decode,
+                block_draft=self.noncausal_block_draft,
                 solution=self.kernel_solution,
                 **scale_kwargs,
             )
@@ -536,7 +550,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
-            block_draft=self.draft_block_decode,
+            block_draft=self.noncausal_block_draft,
             solution=self.kernel_solution,
             **scale_kwargs,
         )

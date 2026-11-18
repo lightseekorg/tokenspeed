@@ -743,6 +743,17 @@ Notes:
   sets `dflash_config.causal`). `--drafter-attention-backend tokenspeed_mla`,
   `mla` and `gluon` run causal blocks, the last two under KVP too; the other
   MLA drafter backends refuse the draft at startup.
+- The released Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark`) is
+  saved by the `speculators` library. TokenSpeed converts its config to the
+  DFlash layout at load time: draft layers from `transformer_layer_config`,
+  target taps one below each `aux_hidden_state_layer_ids` entry, and the mask
+  token, whose trained embedding row replaces the target's. Its five GQA
+  layers slide over a 2048-token window and attend causally within the block,
+  so serve it with `--drafter-attention-backend mha`, which also runs it
+  under KVP. Its `block_size` of 7 is
+  the number of drafted tokens, so the verify window is one larger
+  (`--speculative-num-draft-tokens 8`). Other `speculators` DSpark drafts
+  load the same way.
 - A checkpoint with a Python XTML encoder and no Jinja chat template needs
   its tokenizer's `apply_chat_template` to encode messages. Pass the token
   IDs as `input_ids` to the native `/generate` endpoint.

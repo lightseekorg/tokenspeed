@@ -29,6 +29,11 @@ Kimi-K3.1 (a DSA target config) adds one index-K plane per MLA target layer
 in the full-attention group, beside its latent plane: the index keys share
 the latent rows' pages, prefix matches, transfers and lifetime. Index-K
 planes hold no KDA state, so they do not change the packing.
+
+A draft's layers join the full-attention group: MLA latent planes for an MLA
+draft, K and V planes for a GQA (MHA) block draft. A GQA block draft whose
+every layer slides owns a sliding-window group instead, which retains only its
+window and which KVP leaves unsharded.
 """
 
 from __future__ import annotations
@@ -40,12 +45,14 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_history_gather_workspace_bytes,
     dsa_kvp_history_prefill,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
@@ -60,6 +67,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     index_k_field,
+    mha_layer_fields,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -71,7 +79,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
     CacheGroupDeclaration,
+    SlidingWindowTokens,
 )
+
+_SLIDING_ATTENTION = "sliding_attention"
+DRAFT_SLIDING_ATTENTION = "draft_sliding_attention"
 
 _KIMI_K3_LAYERS = 93
 _KIMI_K3_KDA_LAYERS = 69
@@ -96,8 +108,11 @@ def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, .
 class KimiK3Recipe(CacheRecipe):
     """Kimi-K3: MLA full-attention layers plus three KDA state groups.
 
-    Draft MLA layers are continuation layers of the one big model and join the
-    target's full-attention group, sharing its packing and page-id space.
+    Draft layers are continuation layers of the one big model and join the
+    target's full-attention group, sharing its packing and page-id space:
+    an MLA draft as latent planes, a GQA block draft as K and V planes. A GQA
+    block draft that only reads a sliding window keeps its K and V planes in
+    a sliding-window group of its own (:attr:`draft_window_tokens`).
     """
 
     family = "kimi_k3"
@@ -176,15 +191,73 @@ class KimiK3Recipe(CacheRecipe):
         return len(self.target_group_ids)
 
     @cached_property
+    def draft_window_tokens(self) -> int | None:
+        """The window a GQA block draft whose every layer slides retains, or
+        None when the draft joins the full-attention group.
+
+        Such a draft owns a sliding-window group: its layers read nothing
+        older than the window, so the group keeps that window rather than the
+        whole history. KVP leaves it unsharded, since PD cannot transfer K/V
+        head rows out of a page-sharded group.
+        """
+        config = self.draft_attn_config
+        if (
+            not self.num_draft_layers
+            or not config.draft_block_decode
+            or not isinstance(config.component(SoftmaxAttnConfig), MHAConfig)
+        ):
+            return None
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if hf_config is None:
+            return None
+        from tokenspeed.runtime.models.dflash import (
+            get_dflash_attention_sliding_window_size,
+            get_dflash_attention_window_sink,
+            get_dflash_layer_types,
+        )
+
+        layer_types = get_dflash_layer_types(hf_config)
+        if (
+            layer_types is None
+            or len(layer_types) != self.num_draft_layers
+            or any(layer_type != _SLIDING_ATTENTION for layer_type in layer_types)
+            or get_dflash_attention_window_sink(hf_config)
+        ):
+            return None
+        return get_dflash_attention_sliding_window_size(hf_config) + 1
+
+    @cached_property
     def group_ids(self) -> tuple[str, ...]:
-        return self.target_group_ids + (FULL_ATTENTION,) * self.num_draft_layers
+        draft_group = (
+            FULL_ATTENTION
+            if self.draft_window_tokens is None
+            else DRAFT_SLIDING_ATTENTION
+        )
+        return self.target_group_ids + (draft_group,) * self.num_draft_layers
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
         return tuple(
-            FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
+            (
+                FULL_ATTENTION
+                if group_id == FULL_ATTENTION
+                else (
+                    _SLIDING_ATTENTION
+                    if group_id == DRAFT_SLIDING_ATTENTION
+                    else LINEAR_ATTENTION
+                )
+            )
             for group_id in self.group_ids
         )
+
+    @property
+    @override
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        if self.draft_window_tokens is None:
+            return None
+        return (None,) * self.num_target_layers + (
+            self.draft_window_tokens,
+        ) * self.num_draft_layers
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
@@ -258,12 +331,22 @@ class KimiK3Recipe(CacheRecipe):
         self, layer_id: int, group_id: str, occurrence: int
     ) -> tuple[CacheFieldSpec, ...]:
         plane_id = f"slot.{occurrence}"
+        if group_id == DRAFT_SLIDING_ATTENTION:
+            return mha_layer_fields(
+                self.draft_attn_config, self.prefix_granularity, layer_id, occurrence
+            )
         if group_id == FULL_ATTENTION:
             config = (
                 self.attn_config
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
+            if isinstance(config.component(SoftmaxAttnConfig), MHAConfig):
+                # A GQA block draft (the target's layers are always MLA): K
+                # and V pages in planes of their own, at this plan's page size.
+                return mha_layer_fields(
+                    config, self.prefix_granularity, layer_id, occurrence
+                )
             spec = config.component(MLAConfig)
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             latent = CacheFieldSpec(
@@ -321,9 +404,15 @@ class KimiK3Recipe(CacheRecipe):
         # while larger tp shrinks the state and the parent with it.
         mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
         linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
+        # A sliding draft group keeps one block beside each physical MLA block:
+        # the bytes its planes took inside the MLA group. KVP does not shard
+        # it, so a sharded arena holds 1/kvp_size as many window tokens as
+        # history tokens.
         return {
             spec.group_id: (
-                mla_packing if spec.group_id == FULL_ATTENTION else linear_packing
+                mla_packing
+                if spec.group_id in (FULL_ATTENTION, DRAFT_SLIDING_ATTENTION)
+                else linear_packing
             )
             for spec, _ in groups
         }
