@@ -151,6 +151,23 @@ plans, so every plan starts with fresh tables and occupancy state. No array
 proportional to a sparse Host pool's theoretical slot count is initialized for
 planning.
 
+Emptying parents is where eviction gets expensive. A demand an uncached group
+(a replayable window) cannot place in its holes needs empty parents, and a
+parent of a cached group empties only once the walk reaches its newest entry:
+when placement has mixed access epochs inside parents, that is most of the
+cache, and `Minimize` hands nearly all of it back. In a model without State
+groups, each cached group's Device index therefore keeps, per LCM parent, its
+entry count and newest access epoch (`PrefixCacheIndex::ParentEntries`), and
+the planner first builds the walk's
+selection through the demand's first fit from those parents
+(`AdmissionPlanner::candidatesThroughParentFit`), leaving out the cached
+entries that only add holes no group still needs. This is not a second
+policy: it selects and keeps exactly what the walk would, in the same order,
+and it applies only where that holds by construction -- without segment
+eviction, without State groups, and when the holes the cached groups lack
+come from entries older than the fit. Anywhere else the walk runs.
+`test_parent_fit_eviction.cpp` holds the two to the same plans.
+
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host
 block to count it. Sharded groups count destinations by their Host sources'
