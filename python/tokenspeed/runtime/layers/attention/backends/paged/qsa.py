@@ -72,6 +72,16 @@ class QSAAttnBackend(MHAAttnBackend):
     indexing; the root backend's side state owns verify commits outside this leaf.
     """
 
+    @classmethod
+    def resolve_kernel_page_size(
+        cls, config: AttnConfig, block_granularity: int
+    ) -> int:
+        """The block's own grain, which the QSA recipe plans its pages and
+        scratch at, not the gfx950 MHA decode page."""
+        return super(MHAAttnBackend, cls).resolve_kernel_page_size(
+            config, block_granularity
+        )
+
     def __init__(
         self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int
     ) -> None:
