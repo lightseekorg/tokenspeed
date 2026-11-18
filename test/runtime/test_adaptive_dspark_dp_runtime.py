@@ -35,7 +35,10 @@ from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolic
 from tokenspeed.runtime.execution.drafter.verify_calibration import (
     VerifyCalibration,
 )
-from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
+from tokenspeed.runtime.execution.drafter.verify_feedback import (
+    FeedbackQueue,
+    VerifyFeedback,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
@@ -52,7 +55,7 @@ def _make_drafter(mapping):
     drafter.draft_model = DraftModel(mapping)
     drafter.tp_group = mapping.attn.tp_group
     drafter.verify_feedback = VerifyFeedback(draft_width=5)
-    drafter._pending_verify_feedback = []
+    drafter._verify_feedback_queue = FeedbackQueue(max_pending=3)
     drafter._verify_cache_initialized = True
     drafter._verify_cache = None
     drafter._cached_verify_profiles = ()

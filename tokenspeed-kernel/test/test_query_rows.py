@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.metadata import verify_query_prefixes
 from tokenspeed_kernel.ops.metadata.query_rows import (
     _gather_query_rows_kernel,
     gather_query_rows,
@@ -74,3 +75,80 @@ def test_query_row_count_and_source_stride_do_not_compile():
     with assert_no_triton_compile(_gather_query_rows_kernel):
         for rows, selected, padding in ((9, 5, 3), (16, 16, 16), (32, 7, 7)):
             launch(rows, selected, padding)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_packed_probabilities_replay_masks_and_limit_prefixes():
+    rates = torch.tensor(
+        [[float("nan"), 1, 1], [1, 1, 1], [1, 1, 1], [0.5, float("inf"), 1]],
+        device="cuda",
+    )
+    active = torch.tensor([True, False, True, True], device="cuda")
+    ready = torch.tensor([True, True, False, True], device="cuda")
+    rows = torch.empty(7, device="cuda", dtype=torch.int64)
+    offsets = torch.empty(5, device="cuda", dtype=torch.int32)
+    lengths = torch.empty(4, device="cuda", dtype=torch.int32)
+
+    def run():
+        verify_query_prefixes(
+            rates,
+            active,
+            ready,
+            rows_out=rows,
+            offsets_out=offsets,
+            lengths_out=lengths,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    assert lengths.tolist() == [4, 0, 1, 2]
+    assert offsets.tolist() == [0, 4, 4, 5, 7]
+    assert rows.tolist() == [0, 1, 2, 3, 8, 12, 13]
+
+    active.copy_(torch.tensor([False, True, False, True], device="cuda"))
+    ready[1] = False
+    graph.replay()
+    assert lengths.tolist() == [0, 1, 0, 4]
+    assert offsets.tolist() == [0, 0, 1, 1, 5]
+    assert rows.tolist() == [4, 12, 13, 14, 15, -1, -1]
+
+    active.zero_()
+    graph.replay()
+    assert lengths.tolist() == [0] * 4
+    assert offsets.tolist() == [0] * 5
+    assert rows.tolist() == [-1] * 7
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_packed_layout_runtime_capacities_do_not_compile():
+    from tokenspeed_kernel.ops.metadata.query_rows import _verify_layout_kernel
+    from utils import assert_no_triton_compile
+
+    rates = torch.full((32, 5), 0.5, device="cuda")
+    active = torch.ones(32, dtype=torch.bool, device="cuda")
+
+    def run(batch, capacity):
+        rows = torch.empty(capacity, device="cuda", dtype=torch.int64)
+        offsets = torch.empty(batch + 1, device="cuda", dtype=torch.int32)
+        lengths = torch.empty(batch, device="cuda", dtype=torch.int32)
+        verify_query_prefixes(
+            rates[:batch],
+            active[:batch],
+            active[:batch],
+            rows_out=rows,
+            offsets_out=offsets,
+            lengths_out=lengths,
+        )
+        assert offsets[-1].item() == capacity
+
+    run(32, 128)
+    with assert_no_triton_compile(_verify_layout_kernel):
+        run(24, 72)
+        run(25, 100)

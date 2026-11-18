@@ -241,10 +241,8 @@ def test_layout_matches_torch_reference(bs):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_triton_layout_runtime_capacities_do_not_compile():
-    from tokenspeed_kernel.ops.attention.dsv41.triton import (
-        _verify_layout_kernel,
-        triton_dsv41_verify_layout,
-    )
+    from tokenspeed_kernel.ops.attention.dsv41.triton import triton_dsv41_verify_layout
+    from tokenspeed_kernel.ops.metadata.query_rows import _verify_layout_kernel
     from utils import assert_no_triton_compile
 
     scores = torch.randn(32, 5, device="cuda")
@@ -302,7 +300,7 @@ def test_fused_latest_scores_replay_and_history_fallback():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_latest_layout_runtime_shapes_do_not_compile():
-    from tokenspeed_kernel.ops.attention.dsv41.triton import _verify_layout_kernel
+    from tokenspeed_kernel.ops.metadata.query_rows import _verify_layout_kernel
     from utils import assert_no_triton_compile
 
     history = torch.randn(32, 5, device="cuda")
@@ -364,7 +362,7 @@ def test_cpu_layout_rejected():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_padded_layout_replay_tracks_live_count_without_compiling():
-    from tokenspeed_kernel.ops.attention.dsv41.triton import _verify_layout_kernel
+    from tokenspeed_kernel.ops.metadata.query_rows import _verify_layout_kernel
     from utils import assert_no_triton_compile
 
     history = torch.randn(8, 5, device="cuda")

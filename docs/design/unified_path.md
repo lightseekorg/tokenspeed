@@ -2862,7 +2862,8 @@ states and the previous-token Markov latent.
 leaves the unseen tail unknown. Model confidence extrapolates that tail, so a
 short budget can grow when predicted output pays for the extra time.
 
-Host feedback is expendable. It keys request lifetimes by scheduler admission
+Both adaptive DSpark paths share the host feedback store and nonblocking event
+queue. Host feedback is expendable. It keys request lifetimes by scheduler admission
 ID and checks a device generation published with candidate scores. Generation
 N uses only completed N-2 feedback, without waiting for N-1. Acceptance in a
 packet describes its predecessor, so history can be older. Slot reuse and
@@ -2887,7 +2888,11 @@ and grammar setup. Eager forwards run the same executor stages.
 
 `VerifyQueryLayout` owns persistent lengths, offsets and row maps. Q determines
 the target request capacity, `min(max_capture_bs,Q)`; inactive requests have
-zero lengths. The target keeps Q rows through its body, LM head and argmax.
+zero lengths. The fused prefix allocator shares sorting and CSR generation
+with V4.1, which reserves physical anchors for padded requests. Qwen4 passes
+live and candidate-ready masks and allocates from probabilities. CPU and
+batches beyond the fused allocator's capacity use the same layout via PyTorch.
+The target keeps Q rows through its body, LM head and argmax.
 The shared packed verifier reads prefix offsets and emits ordinary maximum-width
 token buffers. Grammar, NaN attribution and scalar diagnostics use the same maps.
 Only target taps, tokens and lengths cross the stage boundary; handoff buffers

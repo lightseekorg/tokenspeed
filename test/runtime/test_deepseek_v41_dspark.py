@@ -1862,7 +1862,10 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     from tokenspeed.runtime.execution.drafter.verify_calibration import (
         VerifyCalibration,
     )
-    from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
+    from tokenspeed.runtime.execution.drafter.verify_feedback import (
+        FeedbackQueue,
+        VerifyFeedback,
+    )
     from tokenspeed.runtime.execution.model_runner import ModelRunner
 
     tp = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1886,7 +1889,7 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter.draft_model.mapping = mapping
     drafter.tp_group = mapping.attn.tp_group
     drafter.verify_feedback = VerifyFeedback(draft_width=5)
-    drafter._pending_verify_feedback = []
+    drafter._verify_feedback_queue = FeedbackQueue(max_pending=3)
     drafter._verify_cache_initialized = True
     drafter._verify_cache = None
     drafter._cached_verify_profiles = ()
@@ -2000,7 +2003,7 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
         drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=8) == 48
     )
     drafter.finish_round(ctx, graph_bs=8)
-    assert not drafter._pending_verify_feedback
+    assert not drafter._verify_feedback_queue.pending
     # Startup-installed costs survive cache reload; no request-side profiling.
     automatic = VerifyCalibration(
         4,

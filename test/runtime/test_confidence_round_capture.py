@@ -43,6 +43,7 @@ from tokenspeed.runtime.execution.confidence_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.verify_feedback import ConfidenceFeedback
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -56,7 +57,6 @@ from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.verify_layout import ConfidenceFeedback
 from tokenspeed.runtime.grammar.capturable_grammar import (
     CapturableGrammarExecutor,
     EagerGrammarBuffers,

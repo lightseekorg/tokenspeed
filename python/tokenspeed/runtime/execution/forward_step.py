@@ -41,6 +41,7 @@ from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
     probe_positions,
 )
+from tokenspeed.runtime.execution.drafter.verify_feedback import ConfidenceFeedback
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -54,10 +55,7 @@ from tokenspeed.runtime.execution.memory_delta import (
     MemoryDeltaObserver,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.execution.verify_layout import (
-    ConfidenceFeedback,
-    VerifyQueryLayout,
-)
+from tokenspeed.runtime.execution.verify_layout import VerifyQueryLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )

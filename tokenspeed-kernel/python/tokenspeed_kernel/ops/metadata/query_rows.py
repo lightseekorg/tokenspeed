@@ -18,14 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Gather several row-aligned model tensors and zero query padding together."""
+"""Build packed query layouts and gather row-aligned model tensors."""
 
 from __future__ import annotations
 
 import math
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit(
@@ -122,3 +126,241 @@ def gather_query_rows(
             256,
         )
     return outputs
+
+
+VERIFY_LAYOUT_MAX_TOKENS = 4096
+
+
+@triton.jit(
+    do_not_specialize=["BS", "CAPACITY", "STRIDE", "LATEST_STRIDE", "LATEST_ROWS"]
+)
+def _verify_layout_kernel(
+    Scores,
+    Latest,
+    Slots,
+    ActiveCount,
+    Active,
+    Ready,
+    Rows,
+    Indptr,
+    Counts,
+    Valid,
+    BS,
+    CAPACITY,
+    STRIDE,
+    LATEST_STRIDE,
+    LATEST_ROWS,
+    DRAFT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_LATEST: tl.constexpr,
+    HAS_ACTIVE_COUNT: tl.constexpr,
+    PACKED: tl.constexpr,
+):
+    index = tl.arange(0, BLOCK).to(tl.int64)
+    request = index // DRAFT
+    column = index % DRAFT
+    if PACKED:
+        live = tl.load(Active + request, request < BS, False)
+        eligible = live & tl.load(Ready + request, request < BS, False)
+    else:
+        active_bs = tl.load(ActiveCount).to(tl.int32) if HAS_ACTIVE_COUNT else BS
+        live = request < active_bs
+        eligible = live
+    if USE_LATEST:
+        slot = tl.load(Slots + request, request < BS, 0).to(tl.int64)
+        slot_valid = live & (slot >= 0) & (slot < LATEST_ROWS)
+        latest_finite = slot_valid
+        for j in tl.static_range(DRAFT):
+            value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
+            latest_finite = latest_finite & (tl.abs(value) < float("inf"))
+    finite = tl.full((BLOCK,), True, tl.int1)
+    survival = tl.full((BLOCK,), 1.0, tl.float32)
+    for j in tl.static_range(DRAFT):
+        score = tl.load(Scores + request * STRIDE + j, request < BS, 0)
+        if USE_LATEST:
+            value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
+            score = tl.where(latest_finite, value, score)
+        if PACKED:
+            probability = tl.where(
+                tl.abs(score) < float("inf"),
+                tl.minimum(tl.maximum(score, 0.0), 1.0),
+                0.0,
+            )
+        else:
+            finite = finite & (tl.abs(score) < float("inf"))
+            score = tl.minimum(tl.maximum(score, -60.0), 60.0)
+            probability = tl.div_rn(1.0, 1.0 + libdevice.exp(-score))
+        survival = survival * tl.where(j <= column, probability, 1.0)
+    if PACKED:
+        gain = tl.abs(survival)  # Treat signed zeros as the same score.
+    else:
+        gain = tl.where(finite, survival, float("inf"))
+    # Positive IEEE float bits sort in numeric order. The low word makes
+    # ties deterministic in request/token order, preserving each prefix.
+    key = (gain.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | (
+        0xFFFFFFFF - index.to(tl.uint64)
+    )
+    key = tl.where(eligible, key, 0)
+    ordered = tl.sort(key, descending=True)
+    if PACKED:
+        anchors = tl.load(Active + index, index < BS, False)
+        extra = CAPACITY - tl.sum(anchors.to(tl.int32), 0)
+    else:
+        anchors = index < BS
+        extra = CAPACITY - BS
+    cutoff = tl.sum(tl.where(index == extra - 1, ordered, 0), 0)
+    selected = eligible & (extra > 0) & (key >= cutoff)
+    if not PACKED:
+        unknown = tl.sum((live & ~finite & (column == 0)).to(tl.int32), 0)
+        valid = unknown * DRAFT <= extra
+    counts = tl.full((BLOCK,), 1, tl.int32)
+    for j in tl.static_range(DRAFT):
+        selected_index = tl.minimum(index * DRAFT + j, BLOCK - 1).to(tl.int32)
+        counts += tl.gather(selected.to(tl.int32), selected_index, axis=0)
+    if PACKED:
+        counts = tl.where(anchors, counts, 0)
+    else:
+        counts = tl.where(anchors, tl.where(valid, counts, 1), 0)
+    ends = tl.cumsum(counts, 0)
+    tl.store(Counts + index, counts.to(tl.int64), index < BS)
+    tl.store(Indptr + index + 1, ends.to(tl.int64), index < BS)
+    tl.store(Indptr, 0)
+    if not PACKED:
+        tl.store(Valid, valid)
+    # Upper bound over cumulative lengths maps each packed output to its owner.
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), BS, tl.int32)
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+        mid = (lo + hi) // 2
+        end = tl.gather(ends, tl.minimum(mid, BLOCK - 1), axis=0)
+        active = lo < hi
+        right = end <= index
+        lo = tl.where(active & right, mid + 1, lo)
+        hi = tl.where(active & ~right, mid, hi)
+    owner = tl.minimum(lo, BS - 1)
+    before = tl.gather(ends, tl.maximum(owner - 1, 0), axis=0)
+    before = tl.where(owner == 0, 0, before)
+    total = tl.sum(counts, 0)
+    rows = owner.to(tl.int64) * (DRAFT + 1) + index - before
+    tl.store(
+        Rows + index,
+        tl.where(index < total, rows, -1 if PACKED else 0),
+        index < CAPACITY,
+    )
+
+
+def launch_verify_layout(
+    scores,
+    query_capacity,
+    rows_out,
+    indptr_out,
+    counts_out,
+    valid_out,
+    *,
+    latest_scores,
+    request_slots,
+    active_count,
+    active,
+    ready,
+):
+    bs, draft = scores.shape
+    block = triton.next_power_of_2(bs * (draft + 1))
+    _verify_layout_kernel[(1,)](
+        scores,
+        latest_scores,
+        request_slots,
+        active_count,
+        active,
+        ready,
+        rows_out,
+        indptr_out,
+        counts_out,
+        valid_out,
+        bs,
+        query_capacity,
+        scores.stride(0),
+        latest_scores.stride(0) if latest_scores is not None else 0,
+        latest_scores.shape[0] if latest_scores is not None else 0,
+        DRAFT=draft,
+        BLOCK=block,
+        USE_LATEST=latest_scores is not None,
+        HAS_ACTIVE_COUNT=active_count is not None,
+        PACKED=active is not None,
+        num_warps=4,
+    )
+
+
+def verify_query_prefixes(
+    rates: torch.Tensor,
+    active: torch.Tensor,
+    ready: torch.Tensor,
+    *,
+    rows_out: torch.Tensor,
+    offsets_out: torch.Tensor,
+    lengths_out: torch.Tensor,
+) -> None:
+    """Allocate GPU query prefixes from conditional probabilities in place.
+
+    The FP32 rates have shape [B, W-1]. Boolean masks [B] identify active
+    requests and whether they have draft candidates. Each active request gets
+    its anchor; only ready requests compete for extra queries. Non-finite
+    probabilities contribute zero. The capacity is the length of rows_out.
+
+    Outputs are contiguous int64 source rows (with -1 for filler), int32 CSR
+    offsets [B+1], and int32 prefix lengths [B]. All tensors share a GPU.
+    """
+    batch, draft = rates.shape
+    capacity = rows_out.numel()
+    if (
+        not rates.is_cuda
+        or rates.dtype != torch.float32
+        or rates.stride(1) != 1
+        or min(batch, draft) < 1
+        or not batch <= capacity <= batch * (draft + 1) <= VERIFY_LAYOUT_MAX_TOKENS
+    ):
+        raise ValueError("unsupported packed verification layout")
+    for tensor, shape, dtype in (
+        (active, (batch,), torch.bool),
+        (ready, (batch,), torch.bool),
+        (rows_out, (capacity,), torch.int64),
+        (offsets_out, (batch + 1,), torch.int32),
+        (lengths_out, (batch,), torch.int32),
+    ):
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or tensor.device != rates.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("packed verification buffers must match the layout")
+    kernel = select_kernel(
+        "metadata",
+        "verify_query_prefixes",
+        format_signature(x=dense_tensor_format(rates.dtype)),
+    )
+    kernel(rates, active, ready, rows_out, offsets_out, lengths_out)
+
+
+@register_kernel(
+    "metadata",
+    "verify_query_prefixes",
+    name="triton_verify_query_prefixes",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=[format_signature(x=dense_tensor_format(torch.float32))],
+    priority=Priority.PORTABLE,
+)
+def triton_verify_query_prefixes(rates, active, ready, rows, offsets, lengths):
+    launch_verify_layout(
+        rates,
+        rows.numel(),
+        rows,
+        offsets,
+        lengths,
+        None,
+        latest_scores=None,
+        request_slots=None,
+        active_count=None,
+        active=active,
+        ready=ready,
+    )

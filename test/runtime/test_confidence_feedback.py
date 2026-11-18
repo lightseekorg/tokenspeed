@@ -31,9 +31,9 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.drafter.verify_feedback import ConfidenceFeedback
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.verify_layout import ConfidenceFeedback
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA feedback")
 
