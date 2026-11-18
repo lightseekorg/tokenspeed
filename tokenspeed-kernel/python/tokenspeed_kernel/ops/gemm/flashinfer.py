@@ -370,12 +370,14 @@ def _aligned_copy(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return copy.copy_(tensor)
 
 
-def _assert_fp8_alignment(tensor: torch.Tensor, name: str) -> None:
+def validate_tensor_alignment(tensor: torch.Tensor, name: str) -> None:
+    """Validate the 16-byte pointer contract of per-tensor FP8 GEMM buffers."""
     remainder = tensor.data_ptr() % 16
     if remainder:
         raise ValueError(
             f"per-tensor FP8 GEMM requires {name} to be 16-byte aligned; "
-            f"got address % 16 = {remainder}, storage_offset = {tensor.storage_offset()}"
+            f"got address % 16 = {remainder} bytes, "
+            f"storage_offset = {tensor.storage_offset()} elements"
         )
 
 
@@ -419,14 +421,17 @@ if cublas_fp8_gemm is not error_fn:
         """Per-tensor scaled FP8 GEMM on FlashInfer's cuBLASLt backend.
 
         Args:
-            A: ``[M, K]`` row-major FP8 activations.
-            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
+            A: ``[M, K]`` row-major FP8 activations; dense views must be
+                16-byte aligned. Padded rows are normalized.
+            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``);
+                dense views must be 16-byte aligned. Padded rows are normalized.
             A_scales: One-element FP32 activation dequant scale.
             B_scales: One-element FP32 weight dequant scale.
             out_dtype: BF16 or FP16 output dtype.
             alpha: Must be None; the per-tensor scales carry the dequant.
             block_size: Must be None; the scales are per tensor.
-            out: Optional ``[M, N]`` output buffer.
+            out: Optional ``[M, N]`` output buffer; contiguous views must be
+                16-byte aligned. Strided views receive a copy of the result.
 
         Returns:
             ``[M, N]`` output, ``out`` when given.
@@ -438,11 +443,13 @@ if cublas_fp8_gemm is not error_fn:
                 f"per-tensor FP8 GEMM writes BF16 or FP16, not {out_dtype}"
             )
         # cuBLASLt reads dense operands: row-major A and column-major B.
-        # Validate the caller's buffers before layout normalization can hide offsets.
-        _assert_fp8_alignment(A, "A")
-        _assert_fp8_alignment(B, "B")
-        if out is not None:
-            _assert_fp8_alignment(out, "out")
+        # Only dense buffers retain their pointers through layout normalization.
+        if A.is_contiguous():
+            validate_tensor_alignment(A, "A")
+        if B.t().is_contiguous():
+            validate_tensor_alignment(B, "B")
+        if out is not None and out.is_contiguous():
+            validate_tensor_alignment(out, "out")
         A = A.contiguous()
         B = B.t().contiguous().t()
         direct = out is not None and out.is_contiguous()

@@ -166,7 +166,7 @@ def test_alignment_contract_through_mm_and_warmed_graph(offset):
         argument = "B" if offset == "weight" else "A"
         with pytest.raises(
             ValueError,
-            match=rf"{argument} to be 16-byte aligned; got address % 16 = 1, storage_offset = 1",
+            match=rf"{argument} to be 16-byte aligned; got address % 16 = 1 bytes, storage_offset = 1 elements",
         ):
             run()
         assert torch.all(storage == 42)
@@ -195,3 +195,59 @@ def test_alignment_contract_through_mm_and_warmed_graph(offset):
     torch.cuda.synchronize()
     torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=3e-5)
     assert storage[0] == 42 and storage[-1] == 42
+
+
+def test_cold_capture_rejects_unaligned_output_then_warmed_capture_accepts_it():
+    # A distinct shape keeps this regression independent of earlier warmups.
+    a, b, a_scale, b_scale = _operands(1, 132, 2048)
+    key = (a.device.index or 0, b.shape[1], a.shape[1])
+    cute_dsl_ops._fp8_skinny_warmed.discard(key)
+    storage = torch.full((134,), 42, device="cuda", dtype=torch.bfloat16)
+    out = storage[1:-1].view(1, 132)
+    assert out.is_contiguous() and out.data_ptr() % 16 != 0
+
+    def run():
+        return kernel_mm(
+            a,
+            b,
+            A_scales=a_scale,
+            B_scales=b_scale,
+            out_dtype=torch.bfloat16,
+            quant="fp8",
+            out=out,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(ValueError, match="out to be 16-byte aligned"):
+        with torch.cuda.graph(graph):
+            run()
+    assert torch.all(storage == 42)
+    assert run() is out
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    a.copy_((a.float() * 0.5).to(a.dtype))
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = (a.float() * a_scale) @ (b.float() * b_scale)
+    torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=3e-5)
+    assert storage[0] == 42 and storage[-1] == 42
+
+
+def test_unaligned_padded_weights_are_normalized_before_skinny_gemv():
+    a, b, a_scale, b_scale = _operands(1, 128, 2048)
+    storage = torch.empty(128 * 2064 + 1, device="cuda", dtype=b.dtype)
+    weight = storage[1:].view(128, 2064)[:, :2048]
+    weight.copy_(b.t())
+    assert not weight.is_contiguous() and weight.data_ptr() % 16 != 0
+    result = kernel_mm(
+        a,
+        weight.t(),
+        A_scales=a_scale,
+        B_scales=b_scale,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+    )
+    expected = (a.float() * a_scale) @ (b.float() * b_scale)
+    torch.testing.assert_close(result.float(), expected, rtol=1e-2, atol=3e-5)

@@ -177,3 +177,42 @@ def test_aligned_offset_views_through_mm_and_cuda_graph(out_dtype):
     graph.replay()
     torch.cuda.synchronize()
     assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2
+
+
+@pytest.mark.parametrize("offset_operand", ["A", "B", "out"])
+def test_unaligned_padded_rows_keep_existing_layout_support(offset_operand):
+    a, b, a_scale, b_scale, expected = _operands(7, 512, 384)
+
+    def padded_view(tensor):
+        rows, cols = tensor.shape
+        storage = torch.full(
+            (rows * (cols + 16) + 2,), 42, device="cuda", dtype=torch.float32
+        ).to(tensor.dtype)
+        view = storage[1:-1].view(rows, cols + 16)[:, :cols]
+        view.copy_(tensor)
+        assert not view.is_contiguous() and view.data_ptr() % 16 != 0
+        return view, storage
+
+    if offset_operand == "A":
+        a, storage = padded_view(a)
+    elif offset_operand == "B":
+        weight, storage = padded_view(b.t())
+        b = weight.t()
+    out = torch.empty((7, 384), dtype=torch.bfloat16, device="cuda")
+    if offset_operand == "out":
+        out, storage = padded_view(out)
+    result = kernel_mm(
+        a,
+        b,
+        A_scales=a_scale,
+        B_scales=b_scale,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+        out=out,
+    )
+    assert result is out
+    assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2
+    sentinel = torch.tensor(42.0, device="cuda").to(storage.dtype).float()
+    assert storage[0].float() == sentinel and storage[-1].float() == sentinel
+    if offset_operand == "out":
+        assert torch.all(storage[1:-1].view(7, 400)[:, 384:] == 42)

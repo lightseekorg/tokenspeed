@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
-from tokenspeed_kernel.ops.gemm.flashinfer import _assert_fp8_alignment, cublas_fp8_gemm
+from tokenspeed_kernel.ops.gemm.flashinfer import (
+    cublas_fp8_gemm,
+    validate_tensor_alignment,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
@@ -92,27 +95,34 @@ if cublas_fp8_gemm is not error_fn:
         higher fraction of HBM bandwidth than cuBLASLt's FP8 tiles.
 
         Args:
-            A: ``[1, K]`` row-major FP8 activations.
-            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
+            A: ``[1, K]`` row-major FP8 activations; dense views must be
+                16-byte aligned.
+            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``);
+                dense views must be 16-byte aligned. Padded rows are normalized.
             A_scales: One-element FP32 activation dequant scale.
             B_scales: One-element FP32 weight dequant scale.
             out_dtype: BF16.
             alpha: Must be None; the per-tensor scales carry the dequant.
             block_size: Must be None; the scales are per tensor.
-            out: Optional ``[1, N]`` output buffer.
+            out: Optional ``[1, N]`` output buffer. Unaligned views work eagerly
+                and in warmed graph capture. Capture before eager warmup uses
+                cuBLASLt, which requires contiguous output to be 16-byte aligned.
 
         Returns:
             ``[1, N]`` BF16 output, ``out`` when given.
         """
         if alpha is not None or block_size is not None:
             raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
-        _assert_fp8_alignment(A, "A")
-        _assert_fp8_alignment(B, "B")
+        if A.is_contiguous():
+            validate_tensor_alignment(A, "A")
+        if B.t().is_contiguous():
+            validate_tensor_alignment(B, "B")
         n, k = B.shape[1], A.shape[1]
         key = (A.device.index or 0, n, k)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and key not in _fp8_skinny_warmed:
             # Compiling inside a capture is unsafe; eager warmup compiles first.
+            # The fallback retains cuBLASLt's stricter dense-output alignment contract.
             return flashinfer_mm_fp8_tensor_scaled(
                 A, B, A_scales, B_scales, out_dtype, out=out
             )
