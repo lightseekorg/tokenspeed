@@ -132,6 +132,12 @@ CacheStore::CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granu
         }
         group.Index().TrackBoundaries(boundary_tree_, pool_, host_pool_, spec.attn_kind == AttnKind::kState,
                                       group.Matcher().IsPrefixClosed());
+        // Only admissions without State groups read them
+        // (AdmissionPlanner::candidatesThroughParentFit), and a replayable
+        // group publishes nothing for its parents to hold.
+        if (metadata_.num_state_groups == 0 && !spec.replayable) {
+            group.Index().TrackParentEntries(pool_);
+        }
     }
 }
 

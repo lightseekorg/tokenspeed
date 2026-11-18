@@ -29,6 +29,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <memory_resource>
 #include <optional>
@@ -226,6 +227,12 @@ protected:
 
         const AdmissionCandidateConstraints constraints = BuildAdmissionCandidateConstraints(
             store_, demands_, num_computed_tokens_, prefix_, planned_claim_locations_, &selection.scratch);
+        if (const std::optional<std::vector<VictimCandidate>> through_fit =
+                candidatesThroughParentFit(block_demands, constraints)) {
+            selectThroughParentFit(*through_fit, block_demands, constraints, selection);
+            selection.victims = selection.eviction_plan.Minimize(std::move(selection.victims), block_demands);
+            return true;
+        }
         CacheEvictionCandidates candidates{groups_, pool_, device_aging_};
         if (!couldFitAfterReleasingCandidates(candidates, constraints, block_demands)) {
             return false;
@@ -313,54 +320,8 @@ protected:
                 if (!expanded) {
                     continue;
                 }
-                auto& [set, num_taken_over_members, taken_over_set_index, segment_top] = *expanded;
-                const CacheBlockLocation location = candidate->location;
-                _assert(
-                    std::ranges::find(set.members.begin() + static_cast<std::ptrdiff_t>(num_taken_over_members),
-                                      set.members.end(), location, &VictimSet::Member::location) != set.members.end(),
-                    "a victim set holds the candidate it was chosen for");
-                // An earlier set this one contains moves into it whole, each block
-                // keeping why it left; the rest leave the shadow now. The lists
-                // taken over in place are there already.
-                const std::size_t set_index = selection.victims.size();
-                std::vector<std::size_t> absorbed;
-                std::size_t absorbed_members = 0;
-                for (std::size_t j = num_taken_over_members; j < set.members.size(); ++j) {
-                    VictimSet::Member& member = set.members[j];
-                    const auto [joined, inserted] =
-                        selection.set_member_by_location.TryEmplace(member.location, std::pair{set_index, j});
-                    if (inserted) {
-                        selection.eviction_plan.Remove(member.group_id, member.location);
-                        reclaim_selection_changed = reclaim_selection_changed || member.is_request_reclaim;
-                        continue;
-                    }
-                    // The set holding the block now, through the sets that took
-                    // lists over.
-                    std::size_t earlier = joined->first;
-                    while (selection.taken_by[earlier] != earlier) {
-                        earlier = selection.taken_by[earlier] = selection.taken_by[selection.taken_by[earlier]];
-                    }
-                    const std::size_t position = joined->second;
-                    member = selection.victims[earlier].members[position];
-                    if (std::ranges::find(absorbed, earlier) == absorbed.end()) {
-                        absorbed.push_back(earlier);
-                    }
-                    ++absorbed_members;
-                    *joined = std::pair{set_index, j};
-                }
-                for (const std::size_t earlier : absorbed) {
-                    absorbed_members -= selection.victims[earlier].members.size();
-                    selection.victims[earlier] = VictimSet{selection.member_resource};
-                }
-                _assert(absorbed_members == 0, "an earlier victim set lies whole inside the set that takes it");
-                if (taken_over_set_index) {
-                    selection.taken_by[*taken_over_set_index] = set_index;
-                }
-                selection.victims.push_back(std::move(set));
-                selection.taken_by.push_back(set_index);
-                if (segment_top != nullptr) {
-                    selection.segment_at[segment_top] = set_index;
-                }
+                reclaim_selection_changed =
+                    takeVictimSet(std::move(*expanded), candidate->location, selection) || reclaim_selection_changed;
                 return true;
             }
         });
@@ -380,6 +341,60 @@ protected:
         std::optional<std::size_t> taken_over_set_index;
         const BoundaryTree::Node* segment_top{nullptr};
     };
+
+    // Takes the set chosen for the candidate at `candidate` into the
+    // selection. An earlier set it contains moves into it whole, each block
+    // keeping why it left; the rest leave the shadow now. The lists taken
+    // over in place are there already. True when a request's own reclaim
+    // left with it.
+    bool takeVictimSet(ExpandedVictimSet&& expanded, CacheBlockLocation candidate,
+                       AdmissionSelectionState& selection) const {
+        auto& [set, num_taken_over_members, taken_over_set_index, segment_top] = expanded;
+        _assert(std::ranges::find(set.members.begin() + static_cast<std::ptrdiff_t>(num_taken_over_members),
+                                  set.members.end(), candidate, &VictimSet::Member::location) != set.members.end(),
+                "a victim set holds the candidate it was chosen for");
+        bool takes_request_reclaim = false;
+        const std::size_t set_index = selection.victims.size();
+        std::vector<std::size_t> absorbed;
+        std::size_t absorbed_members = 0;
+        for (std::size_t j = num_taken_over_members; j < set.members.size(); ++j) {
+            VictimSet::Member& member = set.members[j];
+            const auto [joined, inserted] =
+                selection.set_member_by_location.TryEmplace(member.location, std::pair{set_index, j});
+            if (inserted) {
+                selection.eviction_plan.Remove(member.group_id, member.location);
+                takes_request_reclaim = takes_request_reclaim || member.is_request_reclaim;
+                continue;
+            }
+            // The set holding the block now, through the sets that took
+            // lists over.
+            std::size_t earlier = joined->first;
+            while (selection.taken_by[earlier] != earlier) {
+                earlier = selection.taken_by[earlier] = selection.taken_by[selection.taken_by[earlier]];
+            }
+            const std::size_t position = joined->second;
+            member = selection.victims[earlier].members[position];
+            if (std::ranges::find(absorbed, earlier) == absorbed.end()) {
+                absorbed.push_back(earlier);
+            }
+            ++absorbed_members;
+            *joined = std::pair{set_index, j};
+        }
+        for (const std::size_t earlier : absorbed) {
+            absorbed_members -= selection.victims[earlier].members.size();
+            selection.victims[earlier] = VictimSet{selection.member_resource};
+        }
+        _assert(absorbed_members == 0, "an earlier victim set lies whole inside the set that takes it");
+        if (taken_over_set_index) {
+            selection.taken_by[*taken_over_set_index] = set_index;
+        }
+        selection.victims.push_back(std::move(set));
+        selection.taken_by.push_back(set_index);
+        if (segment_top != nullptr) {
+            selection.segment_at[segment_top] = set_index;
+        }
+        return takes_request_reclaim;
+    }
 
     // Once the segment rules and their retries have nothing left to offer, a
     // subclass may go on with candidates of its own, expanded its own way
@@ -1022,6 +1037,226 @@ protected:
                 }
                 return removals_until_fit == 0;
             });
+    }
+
+    // The candidates the walk in fitWithEviction would select up to the
+    // demand's first fit, less those that cannot change what it keeps; or
+    // nullopt where that is not shown here, and the walk runs instead.
+    //
+    // A demand some uncached group (a replayable window, say) cannot place in
+    // its holes needs empty parents, and a parent of a cached group empties
+    // only once the walk reaches its newest entry: with the epochs mixed in
+    // every parent, that is most of the cache. Each tracked parent's newest
+    // epoch (PrefixCacheIndex::ParentEntries) gives that point directly. The
+    // walk's fit holds first at the event F where the demand fits with every
+    // cached group's own holes taken as enough -- a parent emptying, or a
+    // request reclaim -- once each cached group's oldest candidates outside
+    // the parents emptied by F (Q) give it the holes it lacks, all before F.
+    // Then the walk selects exactly what this returns plus cached entries
+    // outside those parents and newer than Q, which only add holes no group
+    // still needs: no fit and no Minimize decision changes with them, and
+    // Minimize restores every one. Without segments every candidate leaves
+    // alone; State groups rank by checkpoint aging, which a parent's epoch
+    // does not give, so either keeps the walk.
+    //
+    // Virtual so that a test can compare the selection with the walk.
+    virtual std::optional<std::vector<VictimCandidate>> candidatesThroughParentFit(
+        std::span<const BlockPlacementDemand> block_demands, const AdmissionCandidateConstraints& constraints) const {
+        ProfileSpan profile_span{"AdmissionPlanner::candidatesThroughParentFit"};
+        if (evicts_segments_ || store_.NumStateGroups() > 0) {
+            return std::nullopt;
+        }
+        // The demand with the cached groups' share dropped: what must fit
+        // when their holes are taken as enough.
+        std::vector<bool> cached(groups_.size(), false);
+        std::vector<BlockPlacementDemand> uncached_demands(block_demands.begin(), block_demands.end());
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            const PrefixCacheIndex& index = groups_[i].Index();
+            if (index.NumEntries(pool_) == 0) {
+                continue;
+            }
+            if (index.EntriesByParent(pool_).empty()) {
+                return std::nullopt;
+            }
+            cached[i] = true;
+            uncached_demands[i] = BlockPlacementDemand{
+                .blocks_by_bucket = std::vector<std::int64_t>(block_demands[i].blocks_by_bucket.size(), 0)};
+        }
+        // A reclaim in a cached group would take holes from it as Minimize
+        // restores it.
+        if (std::ranges::any_of(constraints.request_reclaim_candidates,
+                                [&](const VictimCandidate& candidate) { return cached[candidate.group_id]; })) {
+            return std::nullopt;
+        }
+        ShadowOccupancy shadow{pool_, groups_};
+        if (shadow.Fits(uncached_demands)) {
+            // Only cached holes are short: the walk ends within the oldest entries.
+            return std::nullopt;
+        }
+
+        // Every cached parent whose occupants are all entries, earliest
+        // emptied first: by its newest epoch, then, once its children are
+        // read, by its newest child as the walk ranks it.
+        struct Parent {
+            std::uint64_t newest_access_epoch;
+            std::int32_t lcm_block_id;
+            std::uint32_t group_id;
+            // Its children in walk order, once read (children_of).
+            std::size_t children{0};
+            bool read{false};
+        };
+        std::vector<std::vector<VictimCandidate>> children_of;
+        const auto later = [&](const Parent& lhs, const Parent& rhs) {
+            if (lhs.newest_access_epoch != rhs.newest_access_epoch) {
+                return lhs.newest_access_epoch > rhs.newest_access_epoch;
+            }
+            if (lhs.read != rhs.read) {
+                return lhs.read;
+            }
+            return lhs.read &&
+                   CacheEvictionCandidates::Before(children_of[rhs.children].back(), children_of[lhs.children].back());
+        };
+        std::vector<Parent> parents;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (!cached[i]) {
+                continue;
+            }
+            const std::span<const PrefixCacheIndex::ParentEntries> entries = groups_[i].Index().EntriesByParent(pool_);
+            for (std::size_t id = 1; id < entries.size(); ++id) {
+                const auto lcm_block_id = static_cast<std::int32_t>(id);
+                if (entries[id].count > 0 && entries[id].count == pool_.OccupiedCount(lcm_block_id)) {
+                    parents.push_back(Parent{.newest_access_epoch = entries[id].newest_access_epoch,
+                                             .lcm_block_id = lcm_block_id,
+                                             .group_id = static_cast<std::uint32_t>(i)});
+                }
+            }
+        }
+        std::ranges::make_heap(parents, later);
+        // Reads the earliest parent's children until the earliest is read,
+        // dropping a parent with one the walk never offers (in use or kept).
+        const auto read_earliest = [&] {
+            while (!parents.empty() && !parents.front().read) {
+                std::ranges::pop_heap(parents, later);
+                Parent parent = parents.back();
+                parents.pop_back();
+                std::vector<VictimCandidate> children;
+                bool offered = true;
+                for (std::int32_t slot = 0; offered && slot < pool_.Packing(parent.group_id); ++slot) {
+                    const CacheBlockLocation location{.lcm_block_id = parent.lcm_block_id, .slot_index = slot};
+                    if (!pool_.IsOccupied(location)) {
+                        continue;
+                    }
+                    const auto entry = groups_[parent.group_id].Index().UnpinnedCandidateAt(pool_, location);
+                    offered = entry && !constraints.protected_locations.contains(location);
+                    if (offered) {
+                        children.push_back(CacheEvictionCandidates::MakeCandidate(groups_[parent.group_id], *entry));
+                    }
+                }
+                if (!offered) {
+                    continue;
+                }
+                CacheEvictionCandidates::Sort(children);
+                _assert(children.back().rank_epoch == parent.newest_access_epoch,
+                        "a parent's newest child ranks at the parent's newest epoch");
+                parent.read = true;
+                parent.children = children_of.size();
+                children_of.push_back(std::move(children));
+                parents.push_back(parent);
+                std::ranges::push_heap(parents, later);
+            }
+        };
+
+        // Events in walk order until the demand fits on the uncached groups.
+        std::vector<VictimCandidate> through_fit;
+        // By LCM block id: the parents the events emptied.
+        std::vector<bool> emptied(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, false);
+        std::size_t next_reclaim = 0;
+        std::optional<VictimCandidate> fit;
+        while (!fit) {
+            read_earliest();
+            const VictimCandidate* reclaim = next_reclaim < constraints.request_reclaim_candidates.size()
+                                                 ? &constraints.request_reclaim_candidates[next_reclaim]
+                                                 : nullptr;
+            if (!parents.empty() &&
+                (reclaim == nullptr ||
+                 CacheEvictionCandidates::Before(children_of[parents.front().children].back(), *reclaim))) {
+                std::ranges::pop_heap(parents, later);
+                const Parent parent = parents.back();
+                parents.pop_back();
+                for (const VictimCandidate& child : children_of[parent.children]) {
+                    shadow.Remove(child.group_id, child.location);
+                    through_fit.push_back(child);
+                }
+                emptied[static_cast<std::size_t>(parent.lcm_block_id)] = true;
+                if (shadow.Fits(uncached_demands)) {
+                    fit = children_of[parent.children].back();
+                }
+            } else if (reclaim != nullptr) {
+                shadow.Remove(reclaim->group_id, reclaim->location);
+                through_fit.push_back(*reclaim);
+                ++next_reclaim;
+                if (shadow.Fits(uncached_demands)) {
+                    fit = *reclaim;
+                }
+            } else {
+                return std::nullopt;
+            }
+        }
+
+        // Q: each cached group's oldest candidates outside the emptied
+        // parents, until its holes are enough; all must precede the fit.
+        std::vector<std::int64_t> pair_scratch;
+        const auto short_of_holes = [&](std::uint32_t i) {
+            const std::span<const std::int64_t> holes = shadow.HolesByBucket(i);
+            pair_scratch.assign(holes.size(), 0);
+            return ParentsNeededForBucketsAndPairs(block_demands[i], holes, pool_.Packing(i), pair_scratch) > 0;
+        };
+        std::size_t num_short = 0;
+        for (std::uint32_t i = 0; i < groups_.size(); ++i) {
+            num_short += cached[i] && short_of_holes(i) ? 1 : 0;
+        }
+        CacheEvictionCandidates oldest{groups_, pool_, device_aging_};
+        // Selection only matters to checkpoint aging, which needs a State group.
+        const auto not_selected = [](CacheBlockLocation) { return false; };
+        while (num_short > 0) {
+            const std::optional<VictimCandidate> candidate =
+                oldest.Next(std::span<const VictimCandidate>{}, constraints.protected_locations,
+                            constraints.request_reclaim_locations, not_selected);
+            if (!candidate || !CacheEvictionCandidates::Before(*candidate, *fit)) {
+                return std::nullopt;
+            }
+            if (emptied[static_cast<std::size_t>(candidate->location.lcm_block_id)] ||
+                !short_of_holes(candidate->group_id)) {
+                continue;
+            }
+            shadow.Remove(candidate->group_id, candidate->location);
+            through_fit.push_back(*candidate);
+            num_short -= short_of_holes(candidate->group_id) ? 0 : 1;
+        }
+        CacheEvictionCandidates::Sort(through_fit);
+        return through_fit;
+    }
+
+    // Selects `candidates`, each alone as the walk takes it; the demand first
+    // fits after the last (candidatesThroughParentFit).
+    void selectThroughParentFit(std::span<const VictimCandidate> candidates,
+                                std::span<const BlockPlacementDemand> block_demands,
+                                const AdmissionCandidateConstraints& constraints,
+                                AdmissionSelectionState& selection) const {
+        selection.set_member_by_location.reserve(candidates.size());
+        std::size_t next = 0;
+        const bool fits = selection.eviction_plan.SelectUntilFits(block_demands, [&] {
+            if (next == candidates.size()) {
+                return false;
+            }
+            const VictimCandidate& candidate = candidates[next++];
+            std::optional<ExpandedVictimSet> expanded =
+                expandVictimSet(candidate, /*candidates_ran_out=*/false, constraints, selection);
+            _assert(expanded.has_value(), "a candidate without segments leaves alone");
+            takeVictimSet(std::move(*expanded), candidate.location, selection);
+            return true;
+        });
+        _assert(fits && next == candidates.size(), "the demand first fits after the last candidate through the fit");
     }
 
     // The store planned on, read through its public views (NodeEntries,
