@@ -189,6 +189,7 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
 @pytest.mark.parametrize(
     "rows",
     [
+        16,
         17,
         24,
         31,
@@ -682,6 +683,19 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     assert all(
         cute_fused._WORKSPACES[key] is value for key, value in workspaces.items()
     )
+
+
+@pytest.mark.parametrize("row_counts", [(17, 20, 31), (33, 40, 63)])
+def test_rows_of_one_tile_bucket_trace_no_kernel(row_counts, monkeypatch):
+    from utils import assert_no_cute_compile
+
+    _reset_caches(monkeypatch)
+    values = [inputs(rows, torch.bfloat16, True) for rows in row_counts]
+    pdl_enabled(True)
+    mix(values[0], 0.25, True)
+    with assert_no_cute_compile():
+        for value in values[1:]:
+            check(mix(value, 0.25, True), reference(value, 0.25), torch.bfloat16)
 
 
 def test_startup_warms_full_tail_tiles_and_rounds(monkeypatch):

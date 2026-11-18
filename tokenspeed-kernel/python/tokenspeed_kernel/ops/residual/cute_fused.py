@@ -230,14 +230,14 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
     return _checked(cuda_driver.cuOccupancyMaxActiveClusters(function, config))
 
 
-# (first row, last row, generic tactic, tiles once S8 needs two rounds or None)
+# (first row, last row, generic tactic, one-round tiles, two-round tiles or None)
 _SM107_HC_ROW_TILES = (
-    (65, 96, (4, 64, 16, 1, 1, 5, 32), None),
-    (97, 192, (4, 64, 32, 1, 1, 5, 32), None),
-    (193, None, (4, 128, 32, 1, 1, 4, 32), (4, 64, 64, 5)),
+    (17, 32, (8, 64, 32, 1, 1, 5, 32), (16, 64, 32, 5), None),
+    (33, 64, (8, 64, 32, 1, 1, 5, 32), (16, 64, 64, 5), None),
+    (65, 96, (4, 64, 16, 1, 1, 5, 32), (8, 64, 64, 5), None),
+    (97, 192, (4, 64, 32, 1, 1, 5, 32), (8, 64, 64, 5), None),
+    (193, None, (4, 128, 32, 1, 1, 4, 32), (8, 64, 64, 5), (4, 64, 64, 5)),
 )
-# (split_k, M_proj, B_mma, stages) of the one-round SM107 tiles.
-_SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
 
 
 def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
@@ -730,13 +730,12 @@ def _model_tactic(
     measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
     if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
         # Only the generic tactic of a range is replaced, not a forced one.
-        for first, last, generic, otherwise in _SM107_HC_ROW_TILES:
+        for first, last, generic, one_round, otherwise in _SM107_HC_ROW_TILES:
             if (
                 first <= rows
                 and (last is None or rows <= last)
                 and (split_k, m, n, lp, lb, stages, f) == generic
             ):
-                one_round = _SM107_HC_ONE_ROUND_TILES
                 if rows <= _one_round_rows(projection_rows, *one_round[:3]):
                     split_k, m, n, stages = one_round
                 elif otherwise is not None:
