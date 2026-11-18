@@ -38,16 +38,16 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA feedback")
 
 
-def _owners(width, *, budget_policy):
+def _owners(width):
     states = RuntimeStates(8, 16, 16, width, device="cuda")
     states.init_draft_confidence(width - 1)
-    feedback = ConfidenceFeedback(width, 4, 4, budget_policy=budget_policy)
+    feedback = ConfidenceFeedback(width, 4, 4)
     for queries in range(1, width + 1):
         feedback.planner.set_baseline(1, queries, 0.8 + queries * 0.2)
     return states, feedback
 
 
-def _round(states, feedback, key, slot, rates, *, prefill, accepted, queries=None):
+def _round(states, feedback, key, slot, rates, *, prefill):
     layout = (
         ForwardOutputLayout(1, 1, 0, states.future_input_map.shape[1])
         if prefill
@@ -60,41 +60,34 @@ def _round(states, feedback, key, slot, rates, *, prefill, accepted, queries=Non
     states.publish_draft_confidence(
         slots, torch.tensor([rates], device="cuda"), group=None
     )
-    queries = 0 if prefill else len(rates) + 1 if queries is None else queries
     feedback.record(
         states.draft_confidence[slots],
         states.draft_confidence_generation[slots],
-        states.previous_draft_confidence[slots],
-        torch.tensor([queries], dtype=torch.int32, device="cuda"),
-        torch.tensor([accepted], dtype=torch.int32, device="cuda"),
-        None,
-        None,
-        None,
     )
     torch.cuda.synchronize()
     feedback.poll()
 
 
 def test_missing_scores_do_not_assume_perfect_acceptance():
-    _, feedback = _owners(8, budget_policy="confidence")
+    _, feedback = _owners(8)
     assert feedback.select(1, ["new"]) == 2
     assert feedback.summary()["fallback_fraction"] == 1
 
 
 def test_request_scores_survive_unrelated_prefill_batches():
-    states, feedback = _owners(3, budget_policy="confidence")
-    _round(states, feedback, "decode", 1, [0.1, 0.1], prefill=True, accepted=0)
-    _round(states, feedback, "decode", 1, [0.1, 0.1], prefill=False, accepted=1)
-    _round(states, feedback, "prefill", 2, [0.9, 0.9], prefill=True, accepted=0)
+    states, feedback = _owners(3)
+    _round(states, feedback, "decode", 1, [0.1, 0.1], prefill=True)
+    _round(states, feedback, "decode", 1, [0.1, 0.1], prefill=False)
+    _round(states, feedback, "prefill", 2, [0.9, 0.9], prefill=True)
     feedback.prepare(["decode"], [1], ForwardOutputLayout(0, 0, 1, 3))
     assert feedback.select(1, ["decode"]) == 1
     assert feedback.summary()["fallback_fraction"] == 0
 
 
 def test_stale_scores_cannot_substitute_for_generation_n_minus_two():
-    states, feedback = _owners(3, budget_policy="confidence")
-    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=True, accepted=0)
-    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=False, accepted=1)
+    states, feedback = _owners(3)
+    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=True)
+    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=False)
     feedback.prepare(["request"], [1], ForwardOutputLayout(0, 0, 1, 3))
     assert feedback.select(1, ["request"]) == 1
     # Launch another draft without a feedback sample, as a full feedback
@@ -117,8 +110,8 @@ def test_stale_scores_cannot_substitute_for_generation_n_minus_two():
 
 
 def test_budget_uses_n_minus_two_without_waiting_for_n_minus_one_feedback():
-    states, feedback = _owners(3, budget_policy="confidence")
-    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=True, accepted=0)
+    states, feedback = _owners(3)
+    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=True)
     feedback.prepare(["request"], [1], ForwardOutputLayout(0, 0, 1, 3))
     states.publish_draft_confidence(
         torch.tensor([1], device="cuda"),
@@ -133,8 +126,8 @@ def test_budget_uses_n_minus_two_without_waiting_for_n_minus_one_feedback():
 
 
 def test_device_generation_mismatch_is_rejected():
-    states, feedback = _owners(3, budget_policy="confidence")
-    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=True, accepted=0)
+    states, feedback = _owners(3)
+    _round(states, feedback, "request", 1, [0.1, 0.1], prefill=True)
     feedback.prepare(["request"], [1], ForwardOutputLayout(0, 0, 1, 3))
     slots = torch.tensor([1], device="cuda")
     states.publish_draft_confidence(
@@ -144,12 +137,6 @@ def test_device_generation_mismatch_is_rejected():
     feedback.record(
         states.draft_confidence[slots],
         states.draft_confidence_generation[slots] + 1,
-        states.previous_draft_confidence[slots],
-        torch.tensor([3], dtype=torch.int32, device="cuda"),
-        torch.tensor([1], dtype=torch.int32, device="cuda"),
-        None,
-        None,
-        None,
     )
     torch.cuda.synchronize()
     feedback.poll()
@@ -164,12 +151,12 @@ def test_device_generation_mismatch_is_rejected():
 
 
 def test_recompute_and_slot_reuse_discard_old_request_scores():
-    states, feedback = _owners(3, budget_policy="confidence")
-    _round(states, feedback, "old", 1, [0.1, 0.1], prefill=True, accepted=0)
-    _round(states, feedback, "old", 1, [0.1, 0.1], prefill=False, accepted=1)
-    _round(states, feedback, "new", 1, [0.9, 0.9], prefill=True, accepted=0)
-    _round(states, feedback, "new", 1, [0.9, 0.9], prefill=False, accepted=3)
-    _round(states, feedback, "new", 1, [0.2, 0.2], prefill=True, accepted=0)
+    states, feedback = _owners(3)
+    _round(states, feedback, "old", 1, [0.1, 0.1], prefill=True)
+    _round(states, feedback, "old", 1, [0.1, 0.1], prefill=False)
+    _round(states, feedback, "new", 1, [0.9, 0.9], prefill=True)
+    _round(states, feedback, "new", 1, [0.9, 0.9], prefill=False)
+    _round(states, feedback, "new", 1, [0.2, 0.2], prefill=True)
     feedback.prepare(["new"], [1], ForwardOutputLayout(0, 0, 1, 3))
     feedback.select(1, ["new"])
     assert feedback.summary()["fallback_fraction"] == 1
@@ -177,93 +164,29 @@ def test_recompute_and_slot_reuse_discard_old_request_scores():
 
 
 def test_restored_device_generation_rebases_a_new_host_owner():
-    states, feedback = _owners(3, budget_policy="confidence")
-    _round(states, feedback, "restored", 1, [0.1, 0.1], prefill=True, accepted=0)
-    _round(states, feedback, "restored", 1, [0.1, 0.1], prefill=False, accepted=1)
+    states, feedback = _owners(3)
+    _round(states, feedback, "restored", 1, [0.1, 0.1], prefill=True)
+    _round(states, feedback, "restored", 1, [0.1, 0.1], prefill=False)
     image = torch.empty(states.slot_state_bytes(), dtype=torch.uint8, device="cuda")
     states.export_slot_state(1, image, None, admission_id=1)
-    _round(states, feedback, "replacement", 1, [0.9, 0.9], prefill=True, accepted=0)
+    _round(states, feedback, "replacement", 1, [0.9, 0.9], prefill=True)
     states.import_slot_state(2, image, None, admission_id=1)
     for _ in range(2):
-        _round(states, feedback, "restored", 2, [0.1, 0.1], prefill=False, accepted=1)
+        _round(states, feedback, "restored", 2, [0.1, 0.1], prefill=False)
     feedback.prepare(["restored"], [2], ForwardOutputLayout(0, 0, 1, 3))
     assert feedback.select(1, ["restored"]) == 1
     assert feedback.summary()["rejected_generations"] == 0
     assert feedback.summary()["fallback_fraction"] == 0
 
 
-def test_confidence_error_censors_positions_after_first_rejection():
-    states, feedback = _owners(4, budget_policy="confidence")
-    _round(states, feedback, "request", 1, [0.5] * 3, prefill=True, accepted=0)
-    _round(states, feedback, "request", 1, [0.9] * 3, prefill=False, accepted=2)
-    summary = feedback.summary()
-    assert summary["predicted_length"] == 1.875
-    assert summary["accepted_length"] == 2
-    assert summary["confidence_mae"] == 0.5
-    assert feedback.confidence_observations == 2
-
-
-@pytest.mark.parametrize("budget_policy,expected", [("confidence", 4), ("history", 1)])
-def test_actual_rejection_controls_history_budget(budget_policy, expected):
-    states, feedback = _owners(4, budget_policy=budget_policy)
-    _round(states, feedback, "request", 1, [0.99] * 3, prefill=True, accepted=0)
-    _round(states, feedback, "request", 1, [0.99] * 3, prefill=False, accepted=1)
-    feedback.prepare(["request"], [1], ForwardOutputLayout(0, 0, 1, 4))
-    assert feedback.select(1, ["request"]) == expected
-    if budget_policy == "history":
-        assert feedback.summary()["history_fraction"] == 1
-        assert feedback.summary()["history_generation_lag"] == 2
-
-
-@pytest.mark.parametrize("large_graph_ms,expected", [(1.6, 4), (10.0, 2)])
-def test_full_budget_grows_only_when_predicted_gain_pays_for_cost(
-    large_graph_ms, expected
-):
-    states, feedback = _owners(4, budget_policy="history")
-    feedback.planner.set_baseline(1, 3, large_graph_ms)
-    feedback.planner.set_baseline(1, 4, large_graph_ms)
-    _round(states, feedback, "request", 1, [0.99] * 3, prefill=True, accepted=0)
-    _round(
-        states, feedback, "request", 1, [0.99] * 3, prefill=False, accepted=2, queries=2
-    )
-    feedback.prepare(["request"], [1], ForwardOutputLayout(0, 0, 1, 4))
-    assert feedback.select(1, ["request"]) == expected
-    assert feedback.summary()["history_censored_fraction"] == 1
-    assert feedback.summary()["history_growth_rounds"] == int(expected > 2)
-
-
-def test_history_does_not_use_acceptance_newer_than_n_minus_two():
-    states, feedback = _owners(4, budget_policy="history")
-    _round(states, feedback, "request", 1, [0.99] * 3, prefill=True, accepted=0)
-    _round(states, feedback, "request", 1, [0.99] * 3, prefill=False, accepted=1)
-    _round(states, feedback, "request", 1, [0.99] * 3, prefill=False, accepted=4)
-    # Generation 2's acceptance is already copied, but this budget may use
-    # only generation 1. Its actual rejection must still win over high scores.
-    assert feedback.select(1, ["request"]) == 1
-
-
-@pytest.mark.parametrize("recompute", [False, True])
-def test_history_is_reset_when_request_lifetime_changes(recompute):
-    states, feedback = _owners(4, budget_policy="history")
-    _round(states, feedback, "old", 1, [0.99] * 3, prefill=True, accepted=0)
-    _round(states, feedback, "old", 1, [0.99] * 3, prefill=False, accepted=1)
-    feedback.prepare(["old"], [1], ForwardOutputLayout(0, 0, 1, 4))
-    assert feedback.select(1, ["old"]) == 1
-    key = "old" if recompute else "new"
-    _round(states, feedback, key, 1, [0.99] * 3, prefill=True, accepted=0)
-    _round(states, feedback, key, 1, [0.99] * 3, prefill=False, accepted=4)
-    feedback.prepare([key], [1], ForwardOutputLayout(0, 0, 1, 4))
-    assert feedback.select(1, [key]) == 4
-    assert feedback.summary()["rejected_generations"] == 0
-
-
 def test_new_admission_in_the_same_slot_does_not_inherit_feedback():
-    states, feedback = _owners(3, budget_policy="confidence")
+    states, feedback = _owners(3)
     feedback.planner.set_baseline(1, 2, 1.4)
     feedback.planner.set_baseline(1, 3, 1.8)
-    _round(states, feedback, 101, 1, [0.99, 0.99], prefill=True, accepted=0)
-    _round(states, feedback, 101, 1, [0.99, 0.99], prefill=False, accepted=1)
+    _round(states, feedback, 101, 1, [0.99, 0.99], prefill=True)
+    _round(states, feedback, 101, 1, [0.99, 0.99], prefill=False)
     feedback.prepare([101], [1], ForwardOutputLayout(0, 0, 1, 3))
     assert feedback.select(1, [101]) == 3
     feedback.prepare([102], [1], ForwardOutputLayout(0, 0, 1, 3))
-    assert feedback.select(1, [102]) == 1
+    assert feedback.select(1, [102]) == 2
+    assert feedback.summary()["fallback_fraction"] == 0.5

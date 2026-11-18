@@ -28,7 +28,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 NAN = float("nan")
 

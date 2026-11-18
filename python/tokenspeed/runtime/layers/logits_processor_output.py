@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.verify_layout import VerifyQueryLayout
     from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
@@ -77,5 +76,3 @@ class LogitsProcessorOutput:
     # values and int64 ids, most likely first.  shape: [#rows, k]
     input_top_logprobs_val: torch.Tensor | None = None
     input_top_logprobs_idx: torch.Tensor | None = None
-    # Compact score/prediction rows, with request-major output destinations.
-    query_layout: VerifyQueryLayout | None = None

@@ -165,8 +165,6 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     output_layout: ForwardOutputLayout
     verify_queries: VerifyQueryLayout | None = None
-    # The sampler's score rows; None retains maximum-window logits.
-    logits_queries: VerifyQueryLayout | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None

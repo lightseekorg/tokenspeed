@@ -25,13 +25,10 @@ or distributed operations belong in this policy.
 """
 
 import math
-from bisect import bisect_left, insort
-from collections import defaultdict, deque
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import accumulate
 from operator import mul
-from statistics import median_high
 
 
 def expected_prefix_tokens(rates: Sequence[Sequence[float]]) -> list[float]:
@@ -41,49 +38,22 @@ def expected_prefix_tokens(rates: Sequence[Sequence[float]]) -> list[float]:
 
 
 class VerifyBudgetPlanner:
-    """Query costs shared by confidence and acceptance-history policies.
-
-    Baselines combine the Q and B graph timings. Completed live rounds add a
-    bounded correction to the whole curve, including unvisited query buckets.
-    Keep nine samples per bucket; each Q with ten samples in the last 5,000
-    rounds contributes its median to a nonnegative per-query correction.
-    """
+    """Select Q from startup graph costs and expected accepted tokens."""
 
     def __init__(self, width: int):
         if width < 2:
             raise ValueError("confidence requires a draft window")
         self.width = width
         self.baselines: dict[tuple[int, int], float] = {}
-        self.timings: dict[tuple[int, int], deque[float]] = defaultdict(
-            lambda: deque(maxlen=9)
-        )
-        self.corrections: deque[tuple[int, float]] = deque(maxlen=5000)
-        self.corrections_by_query: dict[int, list[float]] = defaultdict(list)
 
-    def _validate_timing(self, batch: int, queries: int, milliseconds: float) -> None:
+    def set_baseline(self, batch: int, queries: int, milliseconds: float) -> None:
         if (
-            not batch <= queries <= batch * self.width
-            or batch < 1
+            batch < 1
+            or not batch <= queries <= batch * self.width
             or not (math.isfinite(milliseconds) and milliseconds > 0)
         ):
             raise ValueError("invalid confidence timing sample")
-
-    def set_baseline(self, batch: int, queries: int, milliseconds: float) -> None:
-        self._validate_timing(batch, queries, milliseconds)
         self.baselines[batch, queries] = milliseconds
-
-    def observe(self, batch: int, queries: int, milliseconds: float) -> None:
-        self._validate_timing(batch, queries, milliseconds)
-        self.timings[batch, queries].append(milliseconds)
-        if (batch, queries) in self.baselines:
-            # Keep the bounded window sorted per Q, so selection only reads medians.
-            if len(self.corrections) == self.corrections.maxlen:
-                old_q, old_value = self.corrections[0]
-                old = self.corrections_by_query[old_q]
-                old.pop(bisect_left(old, old_value))
-            value = (milliseconds - self.baselines[batch, queries]) / queries
-            self.corrections.append((queries, value))
-            insort(self.corrections_by_query[queries], value)
 
     def select(
         self,
@@ -102,18 +72,11 @@ class VerifyBudgetPlanner:
                 for row in rates
             ]
         )
-        medians = [
-            v[len(v) // 2] for v in self.corrections_by_query.values() if len(v) >= 10
-        ]
-        correction = max(0, median_high(medians)) if medians else 0
-        best_q, best_rate = batch, -1
-        for key in sorted(self.baselines.keys() | self.timings.keys()):
-            b, q = key
+        # An unprofiled batch (e.g. above the capture ladder) keeps full width.
+        best_q, best_rate = batch * self.width, -1
+        for (b, q), cost in sorted(self.baselines.items()):
             if b != batch or (capacities is not None and q not in capacities):
                 continue
-            cost = self.baselines[key] + correction * q if key in self.baselines else 0
-            if key in self.timings:
-                cost = max(cost, median_high(self.timings[key]))
             rate = rewards[min(q - len(rates), len(rewards) - 1)] / cost
             if rate > best_rate:
                 best_q, best_rate = q, rate

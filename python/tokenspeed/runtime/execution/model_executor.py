@@ -751,14 +751,14 @@ class ModelExecutor:
             if (
                 draft_model_runner is not None
                 and draft_model_runner.server_args.speculative_verify_policy
-                in ("confidence", "history")
+                == "confidence"
                 and self.drafter.verify_policy
                 != draft_model_runner.server_args.speculative_verify_policy
             ):
                 raise ValueError(
                     "This DSpark drafter does not implement confidence verification"
                 )
-            if self.drafter.verify_policy in ("confidence", "history"):
+            if self.drafter.verify_policy == "confidence":
                 from tokenspeed.runtime.models.qwen4_exp import (
                     Qwen4ExpForCausalLM,
                     Qwen4ExpForConditionalGeneration,
@@ -1804,9 +1804,6 @@ class ModelExecutor:
                     ctx.verify_queries.query_lengths[: accept_lengths.shape[0]],
                 )
             )
-            ctx.verify_queries.accept_lengths[: accept_lengths.shape[0]].copy_(
-                accept_lengths
-            )
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -2083,7 +2080,6 @@ class ModelExecutor:
             stream=self.device_module.current_stream(),
         )
         ctx.dspark_context_producer = self.dspark_context_producer
-        ctx.logits_queries = None
         if ctx.verify_queries is not None:
             slots = self.input_buffers.state_write_req_pool_indices_buf[
                 : ctx.verify_queries.batch_size
@@ -2096,12 +2092,6 @@ class ModelExecutor:
                 states.spec_candidates_ready[slots],
                 active,
             )
-            if (
-                self.sampling_backend.supports_packed_verify
-                and self.sampling_backend.config.synthetic_acceptance_length is None
-                and self._simulated_accept_length is None
-            ):
-                ctx.logits_queries = ctx.verify_queries
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 

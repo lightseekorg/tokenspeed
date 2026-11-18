@@ -59,7 +59,6 @@ class VerifyQueryLayout:
         self.query_offsets = torch.zeros(
             batch_size + 1, dtype=torch.int32, device=device
         )
-        self.accept_lengths = torch.zeros(batch_size, dtype=torch.int32, device=device)
         self.packed_rows = torch.zeros(query_capacity, dtype=torch.int64, device=device)
         self.packed_valid = torch.zeros(query_capacity, dtype=torch.bool, device=device)
         self.request_indices = torch.zeros(
@@ -169,10 +168,6 @@ class VerifyQueryLayout:
         shape = [1] * result.ndim
         shape[token_dim] = count * self.width
         return torch.where(valid.view(shape), result, torch.zeros_like(result))
-
-    def mask_compact_rows(self, values: torch.Tensor) -> torch.Tensor:
-        """Zero bucket filler without reading its unspecified activations."""
-        return gather_query_rows((values,), self._queries, self.packed_valid)[0]
 
     def causal_metadata(
         self, seq_lens: torch.Tensor, page_table: torch.Tensor

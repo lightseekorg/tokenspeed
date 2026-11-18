@@ -161,9 +161,9 @@ def verify_packed_chain_greedy(
     Live intervals contain 1..proposal_width rows; an empty interval is an
     inactive request. Returned lengths include the target bonus token.
 
-    Reuses the ordinary chain verifier with device offsets, including for
-    confidence query layouts. Acceptance is capped at the number of computed
-    query rows; a match at the last computed prediction
+    Reuses the ordinary chain verifier. Only the small token-ID matrix is
+    expanded, never the logits or target activations. Acceptance is capped at
+    the number of computed query rows; a match at the last computed prediction
     is emitted as the bonus and must not advance beyond its input KV row.
     The caller retains ownership of TP output agreement and stop conditions.
     """
@@ -195,18 +195,6 @@ def verify_packed_chain_greedy(
         predicts.zero_()
         accept_index.fill_(-1)
         accept_length.zero_()
-        return
-    if candidates.is_cuda:
-        verify_chain_target_sampled(
-            predicts,
-            accept_index,
-            accept_length,
-            candidates,
-            target_predict,
-            write_rejected_targets=True,
-            query_start_loc=query_start_loc,
-        )
-        accept_length += 1
         return
     columns = torch.arange(width, device=candidates.device)[None, :]
     rows = query_start_loc[:-1, None].to(torch.int64) + columns
@@ -306,22 +294,7 @@ class GreedySamplingBackend(SamplingBackend):
         tree: TreeVerifyBatch | None,
         query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        bs, num_tokens_per_req = candidates.shape
-        query_layout = logits_output.query_layout
-        if query_layout is not None:
-            if query_start_loc is not None:
-                raise ValueError("packed verification requires one query layout")
-            if (
-                tree is not None
-                or query_layout.width != num_tokens_per_req
-                or query_layout.batch_size < bs
-                or self.config.synthetic_acceptance_length is not None
-            ):
-                raise ValueError(
-                    "compact greedy verification requires matching chain prefixes"
-                )
-            query_start_loc = query_layout.query_offsets[: bs + 1]
-        elif query_start_loc is not None and (
+        if query_start_loc is not None and (
             tree is not None
             or sampling_info.vocab_mask is not None
             or self.config.synthetic_acceptance_length is not None
@@ -329,6 +302,8 @@ class GreedySamplingBackend(SamplingBackend):
             or self.config.enable_output_cumulative_probs
         ):
             raise ValueError("packed greedy verification requires plain chain sampling")
+        bs = candidates.shape[0]
+        num_tokens_per_req = candidates.shape[1]
 
         predict = self._predict_buf[: bs * num_tokens_per_req]
         accept_index = self._accept_index_buf[: bs * num_tokens_per_req].view(
@@ -341,17 +316,13 @@ class GreedySamplingBackend(SamplingBackend):
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
         if sampling_info.vocab_mask is not None:
-            vocab_mask = sampling_info.vocab_mask
-            if query_layout is not None:
-                vocab_mask = query_layout.pack(vocab_mask, token_dim=0)
             sampling_info.apply_vocab_mask(
                 logits=logits,
-                vocab_mask=vocab_mask,
+                vocab_mask=sampling_info.vocab_mask,
             )
         target_predict = (
             logits_output.next_token_ids
             if logits_output.next_token_ids is not None
-            and not (query_layout is not None and sampling_info.vocab_mask is not None)
             else sampling_argmax(logits)
         )
         if query_start_loc is None:
@@ -410,18 +381,8 @@ class GreedySamplingBackend(SamplingBackend):
             if tree is not None:
                 # predict is packed along the path; score it against the path's own rows.
                 logits = logits.index_select(0, accepted_path_rows(accept_index))
-            scored_tokens = (
-                predict
-                if query_layout is None
-                else query_layout.pack(predict, token_dim=0)
-            )
-            logprobs = gather_token_logprobs(
-                logits, scored_tokens, logprob_order=self.config.logprob_order
-            )
-            logits_output.next_token_logprobs = (
-                logprobs
-                if query_layout is None
-                else query_layout.expand(logprobs, token_dim=0, request_count=bs)
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
             )
 
         return predict, accept_length

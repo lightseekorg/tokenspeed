@@ -388,8 +388,7 @@ class ConfidenceDecodeGraphs:
                 with observer.measure(f"decode:{name}"):
                     entry = self._capture(run, prepare, before_run, backends, info)
                 (self.targets if name == "target" else self.drafts)[size] = entry
-        # The startup curve composes both captured stages. Completed whole-round
-        # feedback additionally includes metadata refresh and graph submission.
+        # Compose the startup costs for the independently captured stages.
         for batch, draft in self.drafts.items():
             for queries, target in self.targets.items():
                 if batch <= queries <= batch * self.width:

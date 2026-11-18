@@ -2881,29 +2881,21 @@ the target materializes deferred residuals and captures the FP32 mean of its
 four HC branches. The confidence head consumes final-normalized draft hidden
 states and the previous-token Markov latent.
 
-`--speculative-verify-policy confidence` chooses Q from completed probabilities.
-`history` uses the same planner with a per-request EMA of prefix survival
-(weight 0.25). Rejection marks longer prefixes unsuccessful; full acceptance
-leaves the unseen tail unknown. Model confidence extrapolates that tail, so a
-short budget can grow when predicted output pays for the extra time.
+`--speculative-verify-policy confidence` chooses Q from completed checkpoint
+probabilities and startup costs. `fixed` remains the default.
 
-Both adaptive DSpark paths share the host feedback store and nonblocking event
-queue. Host feedback is expendable. It keys request lifetimes by scheduler admission
-ID and checks a device generation published with candidate scores. Generation
-N uses only completed N-2 feedback, without waiting for N-1. Acceptance in a
-packet describes its predecessor, so history can be older. Slot reuse and
-recompute invalidate feedback; restoration can rebase its generation. Both
-score generations and the device counter live in `RuntimeStates` and are
-imaged by `SlotStateExporter`. The latest GPU scores allocate this round's
-prefixes; missing host scores use observed conditional acceptance with a
-Beta(1, 1) cold prior.
+Both adaptive DSpark paths share the host feedback store and nonblocking
+event queue. Admission identity and device generation isolate request lifetimes.
+The host uses exact N-2 scores, or a 0.5 conditional prior for a request whose
+feedback is missing. Slot reuse and recompute invalidate feedback. Restoration
+can rebase the generation. The current score row and device counter live in
+`RuntimeStates` and are included in slot snapshots. The GPU uses current scores
+to allocate the selected budget across requests.
 
-`VerifyBudgetPlanner` shares prefix rewards with the ordinary `VerifyBudgetPolicy`.
-It chooses expected committed tokens per time, preferring smaller Q on ties.
-Startup costs compose target and draft timings; completed whole-round timings
-correct those costs, including unvisited Q buckets. Budget keys `(B,Q)` are
-cost keys, not graph keys. Rank zero chooses and agrees the budget over a
-separate host group; the event loop holds no confidence tensors.
+`VerifyBudgetPlanner` shares prefix rewards with `VerifyBudgetPolicy` and chooses
+the largest expected output per measured time, preferring smaller Q on ties.
+Startup costs add target and draft graph timings. Missing measurements use the
+full-width budget. Rank zero selects Q and agrees it over a separate host group.
 
 Target execution and verification are captured by Q, and draft execution plus
 accepted-state commit by B. Q is the union of capture batch sizes times 1..width;
@@ -2911,17 +2903,16 @@ for `[1,2,4,8,16]` and width 8, that means 24 target and 5 draft graphs.
 Warmup, ordinary capture and stage capture share the runner's context, sampling
 and grammar setup. Eager forwards run the same executor stages.
 
-`VerifyQueryLayout` owns persistent lengths, offsets and row maps. Q determines
-the target request capacity, `min(max_capture_bs,Q)`; inactive requests have
-zero lengths. The fused prefix allocator shares sorting and CSR generation
-with V4.1, which reserves physical anchors for padded requests. Qwen4 passes
-live and candidate-ready masks and allocates from probabilities. CPU and
-batches beyond the fused allocator's capacity use the same layout via PyTorch.
-The target keeps Q rows through its body, LM head and argmax.
-The shared packed verifier reads prefix offsets and emits ordinary maximum-width
-token buffers. Grammar, NaN attribution and scalar diagnostics use the same maps.
-Only target taps, tokens and lengths cross the stage boundary; handoff buffers
-have no vocabulary dimension or request-slot ownership.
+`VerifyQueryLayout` owns persistent lengths, offsets and row maps. Inactive
+requests have zero lengths. The fused prefix allocator shares sorting and
+CSR generation with V4.1. Qwen4 uses live and candidate-ready masks and
+conditional probabilities. CPU and batches above the fused allocator's limit
+use the PyTorch implementation.
+Q determines the target request capacity, `min(max_capture_bs,Q)`.
+The target body processes Q rows. It expands hidden states and draft taps
+before projecting scores so the sampler sees the ordinary fixed-width layout.
+Verification caps acceptance at each request's computed prefix. Draft context
+writes and cache admission retain the maximum window.
 
 The B graph reads those buffers at fixed addresses and performs context
 projection, KV writes, drafting, confidence publication, state commit and
