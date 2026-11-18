@@ -36,6 +36,23 @@
 #include "scheduler/scheduler.h"
 
 namespace tokenspeed {
+
+bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
+                               std::span<const PeerPage> pages) const {
+    if (!PeerExports::Matches(coordinator_, lookup, num_tokens, pages)) {
+        return false;
+    }
+    if (!tier_transfers_.HasLoadBacksInFlight()) {
+        return true;
+    }
+    // Local forwards wait on layerwise H2D fences; a remote reader cannot.
+    // A PIN may export a load's Device destinations only after every rank
+    // acknowledged it. Other Device pages and Host sources remain readable.
+    const auto loading = tier_transfers_.LoadBackDestinations();
+    return std::ranges::none_of(pages, [&](const PeerPage& page) {
+        return page.tier == CacheTier::kDevice && loading[page.group_id].contains(page.block_id);
+    });
+}
 namespace {
 
 std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {

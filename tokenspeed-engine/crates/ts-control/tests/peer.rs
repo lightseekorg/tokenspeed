@@ -24,7 +24,7 @@
 
 use std::{
     ffi::CString,
-    sync::{Arc, Once},
+    sync::{mpsc, Arc, Once},
     time::{Duration, Instant},
 };
 
@@ -33,7 +33,9 @@ use pyo3::{prelude::*, types::PyDict};
 use ts_control::peer::{
     geometry::{DeviceField, RankGeometry},
     landing::Timeouts,
+    net::{Inbound, PeerNet},
     read::Arena,
+    wire::Request,
     Peer, PeerSettings,
 };
 use ts_scheduler::{ForwardEvent, ForwardEventKind, PeerFetchView, RequestSpec, Scheduler};
@@ -152,10 +154,20 @@ impl Replica {
     }
 
     fn start_as(name: &str, weight_version: &str, base: u64, arena: &Arena, role: &str) -> Self {
-        let scheduler = Arc::new(Mutex::new(scheduler(name, 1, role)));
         let port = name.rsplit(':').next().unwrap().parse().unwrap();
+        Self::with_settings(settings(name, weight_version), port, base, arena, role)
+    }
+
+    fn with_settings(
+        settings: PeerSettings,
+        port: u16,
+        base: u64,
+        arena: &Arena,
+        role: &str,
+    ) -> Self {
+        let scheduler = Arc::new(Mutex::new(scheduler(&settings.name, 1, role)));
         let peer = Peer::start(
-            settings(name, weight_version),
+            settings,
             0,
             vec![geometry(base)],
             port,
@@ -395,6 +407,77 @@ fn a_holder_that_never_answers_leaves_the_reader_to_compute() {
         .unwrap();
     let (prefix, landings) = rounds_until_prefill(&mut reader, None, "r");
     assert_eq!((prefix, landings.len()), (0, 0));
+}
+
+#[test]
+fn a_lost_layout_query_does_not_disable_later_landings() {
+    let arena = Arena::new(200_000);
+    let (incoming, received) = mpsc::channel();
+    let proxy = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let holder_name = format!("127.0.0.1:{}", proxy.port());
+    let holder_port = free_port();
+    let holder_endpoint = format!("127.0.0.1:{holder_port}");
+    let mut holder = Replica::with_settings(
+        settings(&holder_name, "v1"),
+        holder_port,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+    let reader_port = free_port();
+    let reader_name = format!("127.0.0.1:{reader_port}");
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
+    let prefixes: Vec<Vec<i32>> = [1, 1001]
+        .into_iter()
+        .map(|first| (first..first + 6 * PAGE).collect())
+        .collect();
+    for tokens in &prefixes {
+        holder_computes(&mut holder, tokens, &arena);
+    }
+    let mut dropped_layout = false;
+    for (index, tokens) in prefixes.into_iter().enumerate() {
+        let request = format!("r{index}");
+        let mut longer = tokens;
+        longer.extend(2001..2001 + PAGE);
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&request, longer, &holder_name)])
+            .unwrap();
+        let start = Instant::now();
+        let (prefix, landings) = loop {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            for frames in received.try_iter() {
+                let Inbound::Request(message) = Inbound::decode(&frames).unwrap() else {
+                    panic!("the proxy only receives requests");
+                };
+                // Drop one real message, then restore the network path.
+                if matches!(message, Request::Layout { .. }) && !dropped_layout {
+                    dropped_layout = true;
+                } else {
+                    proxy.request(&holder_endpoint, &message).unwrap();
+                }
+            }
+            holder.round();
+            let (rows, _) = reader.round();
+            if let Some((_, prefix)) = rows.into_iter().find(|(id, _)| id == &request) {
+                break (prefix, reader.scheduler.lock().peer_stats().landed_tokens);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        if index == 0 {
+            assert!(dropped_layout);
+            assert_eq!((prefix, landings), (0, 0));
+        } else {
+            assert!(prefix >= 5 * PAGE, "the recovered holder must be reusable");
+            assert_eq!(landings, prefix as u64);
+        }
+        reader.advance(&[
+            event(ForwardEventKind::ExtendResult, &request, vec![7]),
+            event(ForwardEventKind::Finish, &request, Vec::new()),
+        ]);
+        reader.round();
+    }
 }
 
 #[test]

@@ -193,9 +193,7 @@ public:
         return PeerExports::AnswerLookup(coordinator_, lookup);
     }
     bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
-                        std::span<const PeerPage> pages) const {
-        return PeerExports::Matches(coordinator_, lookup, num_tokens, pages);
-    }
+                        std::span<const PeerPage> pages) const;
     bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
     // Plans built so far: no cache entry leaves between two plans.
     std::int64_t PlanCalls() const { return plan_calls_; }

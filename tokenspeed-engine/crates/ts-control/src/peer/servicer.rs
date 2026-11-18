@@ -43,7 +43,7 @@ pub trait HolderCache {
     /// A lookup's answer.
     fn answer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView;
     /// Whether the lookup's prompt, up to `num_tokens`, still resolves to
-    /// exactly `pages`.
+    /// exactly `pages`, and every page is ready for an unordered remote read.
     fn pages_match(&self, lookup: &PeerEventView, num_tokens: i32, pages: &[PeerPageView]) -> bool;
     /// Whether the lease's pin holds its pages now.
     fn lease_held(&self, lease: &PeerLeaseView) -> bool;

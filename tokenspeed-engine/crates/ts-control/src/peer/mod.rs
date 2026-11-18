@@ -41,6 +41,7 @@ pub mod wire;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    num::NonZeroUsize,
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -63,6 +64,8 @@ use crate::{
         wire::{read_change, write_change, Prompt, Reply, Request, Stamp},
     },
 };
+
+const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// What a replica's peer sharing runs with.
 #[derive(Debug, Clone)]
@@ -221,8 +224,8 @@ pub struct Peer {
     endpoint: Option<Endpoint>,
     origin: Instant,
     layouts: HashMap<String, Layout>,
-    /// Holders whose layout was asked for and has not arrived.
-    asked: HashSet<String>,
+    /// Outstanding layout queries and their deadlines on the agreed clock.
+    asked: HashMap<String, i64>,
     landings: BTreeMap<String, Landing>,
     /// This member's plans with landings, oldest first, whose device work
     /// has not reported done.
@@ -267,14 +270,14 @@ impl Peer {
             endpoint,
             origin: Instant::now(),
             layouts: HashMap::new(),
-            asked: HashSet::new(),
+            asked: HashMap::new(),
             landings: BTreeMap::new(),
             fences: VecDeque::new(),
             fence: PeerFence(fence),
             fenced_plans,
             fenced: HashSet::new(),
             reading: HashSet::new(),
-            reads: Reads::start(reader)?,
+            reads: Reads::start(reader, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
         })
     }
@@ -310,6 +313,7 @@ impl Peer {
             .collect::<Result<Vec<_>, _>>()?;
         let first = reports.first().ok_or(PeerError::Report)?;
         let now_us = first.now_us;
+        self.asked.retain(|_, deadline_us| now_us < *deadline_us);
         let mut events = first.changes.clone();
         let mut actions = Vec::new();
         for reply in &first.replies {
@@ -332,7 +336,7 @@ impl Peer {
                 }
             }
         }
-        self.send(actions);
+        self.send(actions, now_us);
         let done: Vec<(String, i32)> = self
             .landings
             .iter()
@@ -383,7 +387,7 @@ impl Peer {
             self.landings.insert(request.clone(), landing);
             actions.push((request, action));
         }
-        self.send(actions);
+        self.send(actions, now_us);
         if let Some(endpoint) = &self.endpoint {
             for lookup in lookups {
                 let request = Request::Lookup {
@@ -416,6 +420,7 @@ impl Peer {
         self.settings.weight_version = weight_version.to_owned();
         self.identity = self.settings.identity();
         self.layouts.clear();
+        self.asked.clear();
         if let Some(endpoint) = &self.endpoint {
             endpoint.holder.lock().set_identity(self.identity.clone());
         }
@@ -507,7 +512,7 @@ impl Peer {
     }
 
     /// The first member sends what the steps asked for.
-    fn send(&mut self, actions: Vec<(String, Action)>) {
+    fn send(&mut self, actions: Vec<(String, Action)>, now_us: i64) {
         let Some(endpoint) = &self.endpoint else {
             return;
         };
@@ -519,9 +524,13 @@ impl Peer {
             let lease = landing.lease().clone();
             let message = match action {
                 Action::SendLayout => {
-                    if !self.asked.insert(holder.clone()) {
+                    if self.asked.contains_key(holder) {
                         continue;
                     }
+                    self.asked.insert(
+                        holder.clone(),
+                        now_us.saturating_add(self.settings.timeouts.answer_us),
+                    );
                     Request::Layout {
                         reply_to: self.settings.name.clone(),
                     }
@@ -530,6 +539,9 @@ impl Peer {
                 Action::SendRelease { demote } => Request::Release { lease, demote },
             };
             if let Err(error) = endpoint.net.request(holder, &message) {
+                if matches!(message, Request::Layout { .. }) {
+                    self.asked.remove(holder);
+                }
                 // The landing's wait ends at its deadline.
                 tracing::warn!(holder, %error, "peer request not sent");
             }

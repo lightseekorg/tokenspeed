@@ -87,6 +87,19 @@ ExecutionPlan Plan(Scheduler& scheduler) {
     return scheduler.NextExecutionPlan(Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
 }
 
+template <typename Batch>
+std::vector<std::uint32_t> CacheOpIds(const ExecutionPlan& plan) {
+    std::vector<std::uint32_t> ids;
+    for (const Operation& op : plan.Operations()) {
+        if (const auto* cache = std::get_if<CacheOperation>(&op)) {
+            if (const auto* batch = std::get_if<Batch>(cache)) {
+                ids.insert(ids.end(), batch->op_ids.begin(), batch->op_ids.end());
+            }
+        }
+    }
+    return ids;
+}
+
 template <typename Event>
 void Send(Scheduler& scheduler, Event event) {
     ExecutionEvent execution_event;
@@ -166,13 +179,13 @@ private:
 class PeerSchedulerTest : public ::testing::TestWithParam<bool> {
 protected:
     // The holder prefills `tokens` and finishes, publishing them.
-    void HolderComputes(const std::vector<std::int32_t>& tokens) {
+    ExecutionPlan HolderComputes(const std::vector<std::int32_t>& tokens) {
         holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
         const ExecutionPlan plan = Plan(holder_);
-        ASSERT_EQ(PrefillRows(plan).size(), 1u);
+        EXPECT_EQ(PrefillRows(plan).size(), 1u);
         Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
         Send(holder_, forward::Finish{.request_id = "h"});
-        Plan(holder_);
+        return Plan(holder_);
     }
 
     // Relays the reader's lookups to the holder and the answers back.
@@ -423,6 +436,52 @@ TEST_P(PeerSchedulerTest, AReleaseAfterAPlanThePinMissedIsNotHeld) {
     servicer_.Head(/*now_us=*/1'000'000);
     Plan(holder_);
     EXPECT_FALSE(servicer_.Release(lease, /*demote=*/true).held);
+}
+
+TEST_P(PeerSchedulerTest, AHolderPinsLoadedDevicePagesOnlyAfterTheirLoadAcknowledgment) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(4, kP);
+    const ExecutionPlan stored = HolderComputes(tokens);
+    const auto stores = CacheOpIds<WriteBackBatch>(stored);
+    ASSERT_FALSE(stores.empty());
+    for (const std::uint32_t id : stores) {
+        Send(holder_, cache::WriteBackDone{.op_id = id});
+    }
+    ASSERT_TRUE(holder_.ClearL1Cache());
+
+    // An unrelated Device prefix stays readable while this prefix loads.
+    const std::vector<std::int32_t> ready_tokens = MakeAlignedTokens(2, kP, 501);
+    HolderComputes(ready_tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    holder_.SubmitRequests({RequestSpec{.request_id = "load", .tokens = longer}});
+    const ExecutionPlan loading = Plan(holder_);
+    const auto loads = CacheOpIds<LoadBackBatch>(loading);
+    ASSERT_FALSE(loads.empty());
+    ASSERT_EQ(PrefillRows(loading),
+              (std::vector<std::pair<std::string, std::int32_t>>{{"load", static_cast<std::int32_t>(tokens.size())}}));
+
+    std::vector<std::int32_t> ready_longer = ready_tokens;
+    ready_longer.insert(ready_longer.end(), {903, 904});
+    reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer},
+                            RequestSpec{.request_id = "ready", .peer_holder = "holder", .tokens = ready_longer}});
+    Plan(reader_);
+    const auto lookups = reader_.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 2u);
+    for (const PeerLookupRequest& lookup : lookups) {
+        const PeerAnswer answer = servicer_.Lookup(lookup);
+        ASSERT_GT(answer.num_tokens, 0);
+        ASSERT_TRUE(
+            std::ranges::any_of(answer.pages, [](const PeerPage& page) { return page.tier == CacheTier::kDevice; }));
+        const bool ready = lookup.tokens.front() == ready_tokens.front();
+        EXPECT_EQ(servicer_.Pin(lookup.lease).held, ready)
+            << "the Device index alone does not establish that H2D has completed";
+    }
+    for (const std::uint32_t id : loads) {
+        Send(holder_, cache::LoadBackDone{.op_id = id});
+    }
+    for (const PeerLookupRequest& lookup : lookups) {
+        EXPECT_TRUE(servicer_.Pin(lookup.lease).held);
+    }
 }
 
 // A local hit that ends inside a page (a tail) ends inside a block, which a
