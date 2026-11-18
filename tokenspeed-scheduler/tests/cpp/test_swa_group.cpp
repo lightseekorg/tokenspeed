@@ -118,11 +118,11 @@ TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
     CacheOnePage(mgr, pool, h4);
     std::vector<CacheKey> hashes{h0, h1, h2, h3, h4};
 
-    PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/5);
+    PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*end_block=*/5);
     EXPECT_EQ(unbounded.blocks.size(), 5u);
     EXPECT_EQ(unbounded.NumHitBlocks(), 3);
 
-    PrefixMatch bounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/4);
+    PrefixMatch bounded = mgr.Match(pool, hashes, 0, /*end_block=*/4);
     EXPECT_TRUE(bounded.blocks.empty());
     EXPECT_EQ(bounded.NumHitBlocks(), 0);
 }
@@ -424,19 +424,20 @@ TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
             cached_pin.reset();
             uncached_pin.reset();
         }
-        for (const std::int32_t expired : {0, 1, 2, 3, 4, 5, 6, 10}) {
-            SCOPED_TRACE(expired);
+        for (const std::int32_t expired_block_end : {0, 1, 2, 3, 4, 5, 6, 10}) {
+            SCOPED_TRACE(expired_block_end);
             std::vector<CacheBlockLocation> expected;
             std::int32_t cached = 0;
-            for (std::int32_t slot = pinned ? 4 : 2; slot < std::min(expired, 6); ++slot) {
+            for (std::int32_t slot = pinned ? 4 : 2; slot < std::min(expired_block_end, 6); ++slot) {
                 expected.push_back(table.Blocks()[slot]->Location());
                 cached += slot == 2 || slot == 4;
             }
-            EXPECT_EQ(allocator.ReclaimableBlockLocationsAt(index, table, expired), expected);
-            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired, /*count_uncached=*/true), expected.size());
-            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired, /*count_uncached=*/false), cached);
-            const auto slots = allocator.ExpiredBlockSlotsAt(table, expired);
-            EXPECT_EQ(slots.size(), std::max(std::min(expired, 6) - 1, 0));
+            EXPECT_EQ(allocator.ReclaimableBlockLocationsAt(index, table, expired_block_end), expected);
+            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired_block_end, /*count_uncached=*/true),
+                      expected.size());
+            EXPECT_EQ(allocator.BlocksReclaimableAt(index, table, expired_block_end, /*count_uncached=*/false), cached);
+            const auto slots = allocator.ExpiredBlockSlotsAt(table, expired_block_end);
+            EXPECT_EQ(slots.size(), std::max(std::min(expired_block_end, 6) - 1, 0));
             EXPECT_GE(slots.size(), expected.size());
         }
     }

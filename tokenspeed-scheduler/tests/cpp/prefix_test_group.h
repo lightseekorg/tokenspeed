@@ -83,37 +83,37 @@ public:
 
     // --- retention (token API, policy converted through GroupGeometry) ---
     void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) {
-        allocator_.ReclaimExpired(pool, table, expiredBlocksAt(num_computed_tokens));
+        allocator_.ReclaimExpired(pool, table, expiredBlockEndAt(num_computed_tokens));
     }
     std::int32_t BlocksReclaimableAt(const BlockTable& table, std::int32_t num_computed_tokens,
                                      bool count_uncached) const {
-        return allocator_.BlocksReclaimableAt(index_, table, expiredBlocksAt(num_computed_tokens), count_uncached);
+        return allocator_.BlocksReclaimableAt(index_, table, expiredBlockEndAt(num_computed_tokens), count_uncached);
     }
     std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& table,
                                                                 std::int32_t num_computed_tokens) const {
-        return allocator_.ReclaimableBlockLocationsAt(index_, table, expiredBlocksAt(num_computed_tokens));
+        return allocator_.ReclaimableBlockLocationsAt(index_, table, expiredBlockEndAt(num_computed_tokens));
     }
 
     // --- prefix matching / index (pre-split convenience API) ---
     bool MatchIsPrefixClosed() const { return sliding_window_ == 0; }
 
-    GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                           std::int32_t max_blocks) const {
+    GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_block,
+                           std::int32_t end_block) const {
         if (sliding_window_ > 0) {
             return SwaMatcher(geometry_.BlockGranularity(), sliding_window_, /*sink_tokens=*/0)
-                .Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
+                .Probe(index_, pool, keys, begin_block, end_block, /*extra_hits=*/nullptr);
         }
-        return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
+        return FullAttnMatcher{}.Probe(index_, pool, keys, begin_block, end_block, /*extra_hits=*/nullptr);
     }
 
-    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks) {
-        return index_.AcquireMatched(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
+    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_block,
+                      std::int32_t end_block) {
+        return index_.AcquireMatched(pool, keys, begin_block, Probe(pool, keys, begin_block, end_block),
                                      ++next_access_epoch_, /*session=*/nullptr);
     }
-    PrefixMatch AcquireMatchedBlocks(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
+    PrefixMatch AcquireMatchedBlocks(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_block,
                                      const GroupPrefixProbe& probe, std::uint64_t access_epoch) {
-        return index_.AcquireMatched(pool, keys, begin_blocks, probe, access_epoch, /*session=*/nullptr);
+        return index_.AcquireMatched(pool, keys, begin_block, probe, access_epoch, /*session=*/nullptr);
     }
 
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
@@ -161,14 +161,14 @@ public:
     }
 
 private:
-    std::int32_t expiredBlocksAt(std::int32_t num_computed_tokens) const {
+    std::int32_t expiredBlockEndAt(std::int32_t num_computed_tokens) const {
         if (sliding_window_ == 0) {
             return 0;
         }
         const CacheGroupSpec spec{.attn_kind = AttnKind::kSlidingWindow,
                                   .sliding_window = sliding_window_,
                                   .block_granularity = geometry_.BlockGranularity()};
-        return geometry_.ExpiredBlocksAt(spec, num_computed_tokens);
+        return geometry_.ExpiredBlockEndAt(spec, num_computed_tokens);
     }
 
     GroupGeometry geometry_;

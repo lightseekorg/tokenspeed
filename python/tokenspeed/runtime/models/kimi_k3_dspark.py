@@ -44,6 +44,7 @@ from collections.abc import Iterable
 import torch
 from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 from tokenspeed_kernel.ops.embedding import apply_k_rope
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     mla_latent_norm_rope_scatter,
@@ -405,6 +406,9 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # context write; refreshed in place after each weight load.
         self.register_buffer("_kv_norm_weight", None, persistent=False)
         self.register_buffer("_kv_norm_eps", None, persistent=False)
+        # Every layer's KV rows of the fused down-projection, stacked so the
+        # context write projects all layers in one GEMM.
+        self.register_buffer("_kv_a_weight", None, persistent=False)
         # The draft cache planes the context write stores into, and the plane
         # addresses they were built for.
         self._latent_planes: LatentPlanes | None = None
@@ -583,10 +587,11 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     ) -> None:
         """Project target-derived context into each draft layer's latent cache.
 
-        One row per token per layer, laid out ``[c_KV_norm | k_PE_RoPE]``. Each
-        layer's KV half of the fused down-projection runs as its own GEMM, then
-        one launch normalizes, rotates and stores every layer's rows with the
-        bytes of the per-layer norm, RoPE and store chain.
+        One row per token per layer, laid out ``[c_KV_norm | k_PE_RoPE]``. The
+        layers' KV halves of the fused down-projection run as one GEMM over
+        their stacked rows (one GEMM per layer when the weights do not stack),
+        then one launch normalizes, rotates and stores every layer's rows with
+        the bytes of the per-layer norm, RoPE and store chain.
         """
         rows = ctx_hidden.shape[0]
         if rows == 0:
@@ -594,12 +599,20 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         attns = [layer.self_attn for layer in self.layers]
         first = attns[0]
         width = first.kv_lora_rank + first.qk_rope_head_dim
-        # Each layer's rows start 512-byte aligned like a fresh allocation, so
-        # cuBLAS gets the problem the per-layer F.linear gave it.
-        layer_stride = -(-rows * width // 256) * 256
-        latent = ctx_hidden.new_empty((len(attns), layer_stride))[:, : rows * width]
-        for index, attn in enumerate(attns):
-            attn.project_latent_rows(ctx_hidden, latent[index].view(rows, width))
+        stacked = self._kv_a_weight
+        if stacked is not None and stacked.dtype == ctx_hidden.dtype:
+            latent = kernel_mm(ctx_hidden.contiguous(), stacked).view(
+                rows, len(attns), width
+            )
+        else:
+            # Each layer's rows start 512-byte aligned like a fresh allocation,
+            # so cuBLAS gets the problem the per-layer F.linear gave it.
+            layer_stride = -(-rows * width // 256) * 256
+            latent = ctx_hidden.new_empty((len(attns), layer_stride))
+            latent = latent[:, : rows * width]
+            for index, attn in enumerate(attns):
+                attn.project_latent_rows(ctx_hidden, latent[index].view(rows, width))
+            latent = latent.view(len(attns), rows, width).transpose(0, 1)
         # Context injection writes the same sharded cache as attention:
         # the backend's placement (None for a replicated group) decides
         # which rows this rank stores and where.
@@ -617,7 +630,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # Called directly: the kvcache family's one portable Triton solution
         # has no registry entry.
         mla_latent_norm_rope_scatter(
-            latent.view(len(attns), rows, width).transpose(0, 1),
+            latent,
             self._kv_norm_weight,
             self._kv_norm_eps,
             rotary.cos_sin_cache,
@@ -815,7 +828,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        """Precompute the absorbed decode factors and the stacked context norms."""
+        """Precompute the absorbed decode factors and the stacked context norms
+        and KV rows."""
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
         if self.fc_norm is not None:
@@ -824,6 +838,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             ).contiguous()
         if self.layers:
             self._stack_latent_norms()
+            self._stack_latent_kv_rows()
 
     def _stack_latent_norms(self) -> None:
         """Stack every layer's kv_a_layernorm for the one-launch context write.
@@ -851,6 +866,36 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             return
         self._kv_norm_weight.copy_(weight)
         self._kv_norm_eps.copy_(eps)
+
+    def _stack_latent_kv_rows(self) -> None:
+        """Stack every layer's KV rows of the fused down-projection for the
+        one-GEMM context write.
+
+        Only unquantized fused weights stack; other layouts keep the per-layer
+        projection. A reload copies into the existing buffer, which captured
+        graphs read.
+        """
+        attns = [layer.self_attn for layer in self.layers]
+        weights = [
+            getattr(attn.fused_qkv_a_proj_with_mqa, "weight", None) for attn in attns
+        ]
+        if any(
+            weight is None or weight.dtype not in (torch.bfloat16, torch.float16)
+            for weight in weights
+        ):
+            self._kv_a_weight = None
+            return
+        width = attns[0].kv_lora_rank + attns[0].qk_rope_head_dim
+        stacked = torch.cat(
+            [
+                weight.detach()[attn.q_lora_rank : attn.q_lora_rank + width]
+                for attn, weight in zip(attns, weights, strict=True)
+            ]
+        )
+        if self._kv_a_weight is None or self._kv_a_weight.shape != stacked.shape:
+            self._kv_a_weight = stacked
+            return
+        self._kv_a_weight.copy_(stacked)
 
 
 EntryClass = [K3DSparkModel]

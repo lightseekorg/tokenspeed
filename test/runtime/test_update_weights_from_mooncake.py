@@ -23,6 +23,8 @@ to the SDK call.
 
 The Model Updater SDK is not a dependency: the adapter is exercised against a
 fake module installed in ``sys.modules`` under the configured import path.
+The host bootstrap test sends real ``ServerArgs`` over the control pipe to
+exercise the weight-update protocol check before device initialization.
 """
 
 from __future__ import annotations
@@ -672,8 +674,10 @@ def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
     monkeypatch.setattr(rust_host, "HostBootstrap", build)
     receiver, sender = Pipe(duplex=False)
     try:
-        args = SimpleNamespace(
-            enable_memory_saver=memory_saver, disaggregation_mode=None
+        args = ServerArgs(
+            model="model-x",
+            enable_memory_saver=memory_saver,
+            weight_memory_policy="cpu_backup" if memory_saver else None,
         )
         sender.send((args, None, None))
         call_args = (os.dup(receiver.fileno()), None)

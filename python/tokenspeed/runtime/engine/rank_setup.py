@@ -23,7 +23,7 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_engine.scheduler import SchedulerConfig, StorageConfig
+from tokenspeed_engine.scheduler import PeerConfig, SchedulerConfig, StorageConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -260,6 +260,7 @@ def scheduler_config_from_args(
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
+    peer_config: PeerConfig | None,
 ):
     """Build scheduler config from Device facts and separate Host-storage limits.
 
@@ -276,10 +277,12 @@ def scheduler_config_from_args(
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
+        peer_config: Peer prefix sharing's limits (``cache/peer.py``), or
+            None without peer sharing.
     """
     geometry = specs.cache_geometry
     has_l3 = server_args.kvstore_storage_backend is not None
-    return make_config(
+    config = make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
         max_kv_page_num=(
@@ -324,3 +327,5 @@ def scheduler_config_from_args(
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
         prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )
+    config.peer_config = peer_config
+    return config

@@ -612,6 +612,7 @@ for the online variant.
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--enable-qsa-prefill-bf16-scratch` | Opt-in for QSA sparse-attention models (Qwen4-Exp) with `--kv-cache-dtype fp8_e4m3` (or `fp8`) on SM100 to SM107. A target prefill call of at least 2048 query rows copies the FP8 KV pages it can read into a BF16 scratch and attends there with the CuTe QSA kernel's BF16 path instead of the FP8 prefill kernel (FlashInfer FA2 by default, or the CuTe kernel's FP8 path under a kernel override); smaller or mixed calls, calls whose context exceeds the scratch or 128 cache tokens per query row, decode, verify and drafts keep the FP8 path, and the cache stays FP8. The scratch holds one maximum-length context plus one `--chunked-prefill-size` chunk of pages, with that chunk's remapped slots and attention output; it is reserved from the KV cache budget before the pool is sized, so the pool shrinks by its size (logged at startup). Startup fails for a model without QSA layers, another KV cache dtype (`mxfp8` included), `--chunked-prefill-size` below 2048 or disabled, or a GPU without the CuTe QSA kernel. The decode role, which runs no prefill, reserves no scratch. Part of the L3 storage identity when set. Off by default. |
+| `--qwen4-exp-flat-kv` / `--no-qwen4-exp-flat-kv` | Qwen4-Exp layout: target/draft KV, GDN, PLE and QSA share one physical plane. All GDN layers use one state group; PLE and QSA retain their own groups. Full-history tables translate scheduler blocks to contiguous atom pages; state and recent windows retain explicit strides. Requires PP=1, uniform per-view K/V heads and non-MXFP8 KV. On by default; use `--no-qwen4-exp-flat-kv` for the plane-based layout. L3 identity follows the actual cache layout. |
 | `--moe-backend` | MoE backend. |
 | `--moe-cutlass-fused-finalize` / `--no-moe-cutlass-fused-finalize` | GEMM2 atomic expert combine for unquantized FP16/BF16 MoE on `flashinfer_cutlass`, for both target and draft models. On by default and forced off by `--numerics rl-bitwise`. The fused reduction order is nondeterministic. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -1403,15 +1404,21 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 
 ### KV cache events
 
-KV cache events publish reusable device prefix-cache mutations from the live
-C++ scheduler path. This initial stream does not publish Host/L2 loadback
-events. The scheduler caches block hash lineage on prefix-cache nodes, so
-publishing a stored block uses the parent node's cached hash instead of
-rebuilding the full ancestor prefix.
+KV cache events publish reusable prefix-cache mutations from the live C++
+scheduler path, on two media: the GPU cache (no medium) and, with Host L2
+(`--enable-kvstore`), the pinned Host cache (medium `CPU_PINNED`). The
+scheduler caches block hash lineage on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
 
-Host L2 entries publish no events. Under `--kvstore-write-policy write_back`,
-a block the GPU evicts is reported `BlockRemoved` even when it is written
-back to the Host.
+Each medium's stream is prefix-closed for a router that continues a GPU match
+into the Host tier: a GPU block is stored once its parent is stored on the
+GPU, and a Host block once its parent is stored on either medium. A block on
+both media is stored on each. Under `--kvstore-write-policy write_back`, a
+block the GPU evicts is reported `BlockRemoved` on the GPU and, once its copy
+lands, `BlockStored` on the Host. A Host block read from L3 for a prefix this
+engine never published carries no tokens to describe it and publishes
+nothing.
 
 Example:
 
@@ -1423,9 +1430,12 @@ The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
 number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
 
 ```python
-[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
-[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size, None, medium]], attn_dp_rank]
+[timestamp, [["BlockRemoved", [block_hash], medium]], attn_dp_rank]
 ```
+
+This is vLLM's layout: the `None` is `lora_id`, and `medium` is `None` for
+the GPU cache or `"CPU_PINNED"` for the Host cache.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
@@ -1866,6 +1876,35 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Peer prefix sharing
+
+`--peer-prefix-port PORT` lets replicas reuse each other's cached prefixes
+(design: [RFC 0004](../rfcs/0004-peer-prefix-sharing.md)). A request the
+router sends with a holder (`peer_holder`, the holder's `host:port`) asks
+that replica how much of its prompt it caches, in its GPU or Host cache, and
+reads those pages over RDMA (Mooncake TransferEngine, one-sided READ) into
+its own GPU cache instead of computing them. Every replica serves its own
+cache the same way. If the holder does not answer, or a read fails, the
+request computes the prefix itself.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
+| `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
+| `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
+| `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
+
+Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
+It is refused with `--disaggregation-mode decode`,
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
+`--query-context-parallel-size > 1`; the
+scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
+groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
+each other only within one namespace: the same checkpoints, cache layout,
+numerics and parallel layout (the L3 deployment id), and the same
+`--weight-version`. A flushed weight update must name its `weight_version`,
+which moves the namespace, as it does for L3.
 
 ### Block verification (experimental)
 

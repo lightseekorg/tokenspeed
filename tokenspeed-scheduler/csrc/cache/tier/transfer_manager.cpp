@@ -400,6 +400,17 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
     load_backs_.erase(op_id);
 }
 
+std::vector<std::unordered_set<std::int32_t>> TierTransferManager::LoadBackDestinations() const {
+    std::vector<std::unordered_set<std::int32_t>> destinations(static_cast<std::size_t>(coordinator_.NumGroups()));
+    for (const auto& [op_id, transfers] : load_backs_) {
+        for (const BlockTransfer& transfer : transfers) {
+            const GroupAllocator& allocator = coordinator_.Allocator(static_cast<std::int32_t>(transfer.group_id));
+            destinations[transfer.group_id].insert(allocator.ResolveCacheBlockId(*transfer.destination));
+        }
+    }
+    return destinations;
+}
+
 TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks() const {
     InFlightHostBlocks by_key;
     for (const auto& [op_id, write_back] : write_backs_) {

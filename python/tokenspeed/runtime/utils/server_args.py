@@ -626,6 +626,15 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
+    # this replica's endpoint binds (attention-DP rank r binds port + r);
+    # None turns it off.
+    peer_prefix_port: int | None = None
+    # The host other replicas and the router reach this replica's endpoint at;
+    # its name is host:port. None takes this host's detected address.
+    peer_prefix_host: str | None = None
+    peer_prefix_answer_timeout_ms: int = 50
+    peer_prefix_min_fetch_tokens: int = 256
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -664,6 +673,8 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    # Pack Qwen4-Exp target and draft cache fields into one physical plane.
+    qwen4_exp_flat_kv: bool = True
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
@@ -1034,18 +1045,20 @@ class ServerArgs:
             raise ValueError(
                 "adaptive DSpark requires head and vocabulary groups to follow attention TP"
             )
+        if self.enable_output_cumulative_probs:
+            raise ValueError(
+                "V4.1 adaptive verification does not support "
+                "--enable-output-cumulative-probs"
+            )
         if (
-            self.grammar_backend != "none"
-            or self.enable_output_logprobs
-            or self.enable_output_cumulative_probs
-            or (self.enable_speculative_sampling and self.sampling_backend == "greedy")
+            (self.enable_speculative_sampling and self.sampling_backend == "greedy")
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires chain sampling, "
-                "grammar none, and TP synchronization"
+                "V4.1 adaptive verification requires chain sampling "
+                "and TP synchronization"
             )
 
     def validate_output_cumulative_probs(self):
@@ -2563,7 +2576,52 @@ class ServerArgs:
                 "--kvstore-storage-backend"
             )
 
+    def validate_peer_prefix_options(self):
+        """``--peer-prefix-port`` and its settings: what peer prefix sharing
+        runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
+        if self.peer_prefix_port is None:
+            return
+        unsupported = [
+            setting
+            for setting, refused in (
+                (
+                    "--disaggregation-mode decode",
+                    self.disaggregation_mode == "decode",
+                ),
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+                (
+                    "--query-context-parallel-size > 1",
+                    self.query_context_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--peer-prefix-port is not supported with " + ", ".join(unsupported)
+            )
+        last_port = self.peer_prefix_port + self.mapping.attn.dp_size - 1
+        if self.peer_prefix_port < 1 or last_port > 65535:
+            raise ValueError(
+                "--peer-prefix-port and one port per attention-DP rank after "
+                f"it must be valid ports; got {self.peer_prefix_port}"
+            )
+        if self.peer_prefix_answer_timeout_ms <= 0:
+            raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
+        if self.peer_prefix_min_fetch_tokens <= 0:
+            raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
+
     def validate_cache_options(self):
+        self.validate_peer_prefix_options()
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -3535,6 +3593,45 @@ class ServerArgs:
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
         )
+        parser.add_argument(
+            "--peer-prefix-port",
+            type=int,
+            default=ServerArgs.peer_prefix_port,
+            help="Share prefix caches with other replicas: a request the router "
+            "sends with a peer holder reads the prefix that replica caches, in "
+            "its Device or Host cache, over RDMA, instead of computing it, and "
+            "this replica serves its own cache the same way. Its endpoint binds "
+            "this port (attention-DP rank r binds this port + r). Needs the Host "
+            "tier (--enable-kvstore) and prefix caching; refused with "
+            "--disaggregation-mode decode, --kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
+            "Replicas share only with replicas of "
+            "the same model, cache layout, weights and parallel layout. RDMA "
+            "devices come from --disaggregation-ib-device. See "
+            "docs/rfcs/0004-peer-prefix-sharing.md.",
+        )
+        parser.add_argument(
+            "--peer-prefix-host",
+            type=str,
+            default=ServerArgs.peer_prefix_host,
+            help="The host other replicas and the router reach this replica's peer "
+            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "must name it exactly so. Defaults to this host's detected address.",
+        )
+        parser.add_argument(
+            "--peer-prefix-answer-timeout-ms",
+            type=int,
+            default=ServerArgs.peer_prefix_answer_timeout_ms,
+            help="How long a request waits for the peer holder's answer to each "
+            "step (lookup, pin, release) before it computes the prefix itself.",
+        )
+        parser.add_argument(
+            "--peer-prefix-min-fetch-tokens",
+            type=int,
+            default=ServerArgs.peer_prefix_min_fetch_tokens,
+            help="The fewest tokens past the local prefix hit worth reading from "
+            "a peer holder; a shorter peer hit is computed instead.",
+        )
         # Retraction snapshot pool
         parser.add_argument(
             "--retraction-snapshot-host-gb",
@@ -4128,6 +4225,17 @@ class ServerArgs:
             "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
             "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
             "which runs no prefill, reserves no scratch.",
+        )
+        parser.add_argument(
+            "--qwen4-exp-flat-kv",
+            action=argparse.BooleanOptionalAction,
+            dest="qwen4_exp_flat_kv",
+            default=ServerArgs.qwen4_exp_flat_kv,
+            help="Qwen4-Exp layout (on by default): target/draft KV, recurrent, PLE "
+            "and QSA caches share one plane, preserving logical groups. "
+            "Full-history block IDs translate to contiguous atom pages; state "
+            "and recent windows use explicit strides. Requires PP=1 and non-MXFP8 KV. "
+            "Use --no-qwen4-exp-flat-kv for the plane-based layout.",
         )
         parser.add_argument(
             "--sampling-backend",

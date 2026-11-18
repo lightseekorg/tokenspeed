@@ -24,7 +24,7 @@ import contextlib
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -77,7 +77,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner, freeze_gc
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -1101,34 +1101,39 @@ class ModelExecutor:
         captures every graph.
         """
         workspace_pool(self.device).freeze()
+        # Enforce-eager boots capture nothing and skip freeze_gc's collections.
+        if self.forward_step.disable and self.prefill_graph.disable:
+            return
 
-        if not self.forward_step.disable:
-            self.forward_step.capture(entries=entries, observer=observer)
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(
-                self.forward_step, entries=entries, observer=observer
-            )
-            # Only a drafter that declared the ladder gets a window to fill.
-            if self.captures_drafter_prefill_graph:
-                self.drafter.capture_prefill_graph(
-                    self.forward_step.stream, observer.measure("prefill:drafter")
+        # Freeze once for all captures; prefill and drafter captures collect on entry.
+        with freeze_gc(self.config.enable_cudagraph_gc):
+            if not self.forward_step.disable:
+                self.forward_step.capture(entries=entries, observer=observer)
+            if not self.prefill_graph.disable:
+                self.prefill_graph.capture(
+                    self.forward_step, entries=entries, observer=observer
                 )
-            # The drafter's extend graphs: the entries the projection prices.
-            plan = self._drafter_extend_plan()
-            if plan:
-                width, dtype = self.prefill_graph.captured_hidden_spec()
-                self.drafter.capture_extend_graphs(
-                    DrafterExtendCapture(
-                        plan=plan,
-                        ladders=self.drafter_extend_ladders(entries),
-                        stream=self.forward_step.stream,
-                        num_warmup=self.prefill_graph.num_warmup,
-                        target_hidden_width=width,
-                        target_hidden_dtype=dtype,
-                        prepare_batch=self._prepare_drafter_capture_batch,
-                    ),
-                    observer=observer,
-                )
+                # Only a drafter that declared the ladder gets a window to fill.
+                if self.captures_drafter_prefill_graph:
+                    self.drafter.capture_prefill_graph(
+                        self.forward_step.stream, observer.measure("prefill:drafter")
+                    )
+                # The drafter's extend graphs: the entries the projection prices.
+                plan = self._drafter_extend_plan()
+                if plan:
+                    width, dtype = self.prefill_graph.captured_hidden_spec()
+                    self.drafter.capture_extend_graphs(
+                        DrafterExtendCapture(
+                            plan=plan,
+                            ladders=self.drafter_extend_ladders(entries),
+                            stream=self.forward_step.stream,
+                            num_warmup=self.prefill_graph.num_warmup,
+                            target_hidden_width=width,
+                            target_hidden_dtype=dtype,
+                            prepare_batch=self._prepare_drafter_capture_batch,
+                        ),
+                        observer=observer,
+                    )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:
@@ -2026,6 +2031,17 @@ class ModelExecutor:
 
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
+
+        if ctx.decode_query_indptr is not None and sampling_info.vocab_mask is not None:
+            if self.drafter is None:
+                raise ValueError("packed grammar masks require a drafter")
+            sampling_info = replace(
+                sampling_info,
+                vocab_mask=self.drafter.pack_grammar_vocab_mask(
+                    sampling_info.vocab_mask,
+                    num_tokens=logits_output.next_token_logits.shape[0],
+                ),
+            )
 
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates

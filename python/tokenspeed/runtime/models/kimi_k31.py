@@ -57,7 +57,12 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_dcp_records_workspace_bytes,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
-from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_mla_gate_projection,
+    mm,
+    mv_rmsnorm,
+    mv_rmsnorm_supported,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -750,18 +755,21 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             return attn_output, None if fuse_value_gate else gate
         # Normalizes the latent in place and the q latent into q_norm.
         q_norm = torch.empty_like(q_a)
-        self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
         projected_q = index_query = None
         # Decode rounds only: a prefill projects wq_b for its rank's top-k share of rows.
         if self.q_b_wq_b_weight is not None and ctx.num_extends == 0:
             # Token-shaped, so it may run before the eager break.
-            projected_q, index_query = mm(q_norm, self.q_b_wq_b_weight).split(
+            projected_q, index_query = self._normalize_project_query(
+                q_a, kv_a, q_norm
+            ).split(
                 (self.q_b_proj.weight.shape[0], self.indexer.wq_b.weight.shape[0]),
                 dim=-1,
             )
             index_query = index_query.view(
                 -1, self.indexer.index_n_heads, self.indexer.index_head_dim
             )
+        else:
+            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
         attn_output = self._sparse_attention(
             positions,
             hidden_states,
@@ -776,6 +784,28 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             normalized=True,
         )
         return attn_output, None if fuse_value_gate else gate
+
+    def _normalize_project_query(
+        self, q_a: torch.Tensor, kv_a: torch.Tensor, q_norm: torch.Tensor
+    ) -> torch.Tensor:
+        """``fused_qk_layernorm`` into ``q_norm`` (``kv_a`` in place), then
+        ``q_norm``'s stacked [q_b; wq_b] projection; one launch, bit for bit,
+        where ``mv_rmsnorm`` serves the rows."""
+        norms = self.fused_qk_layernorm
+        weight = self.q_b_wq_b_weight
+        if mv_rmsnorm_supported(q_a, norms.weight_q_a, weight, kv_a, norms.weight_kv_a):
+            return mv_rmsnorm(
+                q_a,
+                norms.weight_q_a,
+                weight,
+                norms.q_a_norm.variance_epsilon,
+                q_a.new_empty((q_a.shape[0], weight.shape[0])),
+                q_norm,
+                kv_a,
+                norms.weight_kv_a,
+            )
+        norms(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
+        return mm(q_norm, weight)
 
     def _takes_decode_front(
         self,

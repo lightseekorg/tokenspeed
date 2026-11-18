@@ -230,6 +230,24 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
     return _checked(cuda_driver.cuOccupancyMaxActiveClusters(function, config))
 
 
+# (first row, last row, generic tactic, tiles once S8 needs two rounds or None)
+_SM107_HC_ROW_TILES = (
+    (65, 96, (4, 64, 16, 1, 1, 5, 32), None),
+    (97, 192, (4, 64, 32, 1, 1, 5, 32), None),
+    (193, None, (4, 128, 32, 1, 1, 4, 32), (4, 64, 64, 5)),
+)
+# (split_k, M_proj, B_mma, stages) of the one-round SM107 tiles.
+_SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
+
+
+def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
+    """Rows one resident round of a split_k x (m, n) plan covers on this stream."""
+    index = torch.cuda.current_device()
+    stream = int(torch.cuda.current_stream(index).cuda_stream)
+    clusters = (projection_rows + m - 1) // m
+    return n * (_cluster_capacity_hint(index, stream, split_k) // clusters)
+
+
 def _tactic(rows: int, projection_rows: int):
     # S, M_proj, B_mma, L_proj, L_batch, stages, F_mma. The single
     # parameterized kernel also supports S=1 and cluster-local projection loops.
@@ -709,6 +727,21 @@ def _model_tactic(
     ):
         # S8/N32 keeps this model's token groups in one resident round.
         split_k, n = 8, 32
+    measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
+    if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
+        # Only the generic tactic of a range is replaced, not a forced one.
+        for first, last, generic, otherwise in _SM107_HC_ROW_TILES:
+            if (
+                first <= rows
+                and (last is None or rows <= last)
+                and (split_k, m, n, lp, lb, stages, f) == generic
+            ):
+                one_round = _SM107_HC_ONE_ROUND_TILES
+                if rows <= _one_round_rows(projection_rows, *one_round[:3]):
+                    split_k, m, n, stages = one_round
+                elif otherwise is not None:
+                    split_k, m, n, stages = otherwise
+                break
     if projection_rows > 6 * m:
         # Four-CTA clusters expose more Up output work at the resident limit.
         # Keep enough independent projection tiles while buffering their K loop.

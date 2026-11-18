@@ -91,16 +91,26 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     m.doc() = "TokenSpeed scheduler bindings";
 
     nb::module_ kv_event = m.def_submodule("KVEvent");
+    // The memory an event concerns, as vLLM's events name it: None for the
+    // GPU cache, "CPU_PINNED" for the pinned Host cache.
+    const auto medium_name = [](tokenspeed::KvEventMedium medium) -> nb::object {
+        if (medium == tokenspeed::KvEventMedium::kDevice) return nb::none();
+        return nb::str("CPU_PINNED");
+    };
     nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockStoredEvent&) { return "BlockStored"; })
         .def_ro("block_hashes", &tokenspeed::KvBlockStoredEvent::block_hashes)
         .def_ro("parent_block_hash", &tokenspeed::KvBlockStoredEvent::parent_block_hash)
         .def_ro("token_ids", &tokenspeed::KvBlockStoredEvent::token_ids)
-        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size);
+        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size)
+        .def_prop_ro("medium",
+                     [medium_name](const tokenspeed::KvBlockStoredEvent& event) { return medium_name(event.medium); });
 
     nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
-        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
+        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes)
+        .def_prop_ro("medium",
+                     [medium_name](const tokenspeed::KvBlockRemovedEvent& event) { return medium_name(event.medium); });
 
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
@@ -234,6 +244,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
         .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
         .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
+        .def_rw("peer_holder", &tokenspeed::RequestSpec::peer_holder)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
         .def_rw("max_cached_prefix_tokens", &tokenspeed::RequestSpec::max_cached_prefix_tokens);
@@ -282,6 +293,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
+        .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t,
+                      std::int32_t>(),
+             nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
+             nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"))
+        .def_ro("name", &tokenspeed::PeerConfig::name)
+        .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
+        .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
+        .def_ro("soft_pin_us", &tokenspeed::PeerConfig::soft_pin_us)
+        .def_ro("hard_pin_us", &tokenspeed::PeerConfig::hard_pin_us)
+        .def_ro("lookup_timeout_us", &tokenspeed::PeerConfig::lookup_timeout_us)
+        .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens);
+    scheduler_config.def_rw("peer_config", &tokenspeed::SchedulerConfig::peer_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
         .value("Get", tokenspeed::StorageKind::kGet)
@@ -658,6 +682,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          }
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
+        // Peer landings this plan starts: the host READs them into their
+        // destination blocks once the plan's device work before them ran (the
+        // runtime reports that through its peer outbox).
+        .def_prop_ro("has_peer_fetches",
+                     [](const tokenspeed::ExecutionPlan& plan) { return !plan.peer_fetches.empty(); })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
         .def("pages_to_zero_arrays",
              [](nb::handle self) {

@@ -105,8 +105,14 @@ def test_admitted_projection_eager_and_graph(n, k, m):
     assert fi.flashinfer_joint_bf16_supported(x, w, out)
     assert mm(x, w, out=out) is out
     check_result(out, x, w)
-    # mm() took the CuTe DSL path, not cuBLASLt.
-    assert torch.equal(fi.flashinfer_bf16_gemm(x, w, None), out)
+    # The measured small-N projection uses the pinned CuTe DSL tile under PDL.
+    if fi.prefer_bf16_small_n_splitk(m, n, k, enable_pdl=pdl_enabled()):
+        expected = fi.flashinfer_mm_bf16_small_n_splitk(
+            x, w, None, None, x.dtype, enable_pdl=True
+        )
+    else:
+        expected = fi.flashinfer_bf16_gemm(x, w, None)
+    assert torch.equal(expected, out)
     # The graph replay contract needs a deterministic runner.
     assert torch.equal(mm(x, w), out)
     stream = torch.cuda.Stream()
@@ -129,12 +135,28 @@ def test_admitted_projection_eager_and_graph(n, k, m):
 
 @pytest.mark.parametrize("n,k", SHAPES)
 @pytest.mark.parametrize("m", [33, 64])
-def test_larger_rows_keep_original_gemm(n, k, m):
+def test_larger_rows_leave_the_joint_gemm(n, k, m):
     x, w = inputs(m, n, k, 99)
     out = torch.empty(m, n, dtype=x.dtype, device=x.device)
     with pytest.raises(ValueError, match="Unsupported input"):
         fi.flashinfer_bf16_gemm(x, w, out)
-    assert torch.equal(mm(x, w, out=out), x @ w.T)
+    # Rows the TGV policy admits under PDL take its tile.
+    tactic = fi.flashinfer_tgv_decode_tactic(x, w, out)
+    tile = fi.select_tgv_decode_tile(
+        m=m,
+        n=n,
+        k=k,
+        weight_bytes=w.numel() * w.element_size(),
+        arch=fi.platform.arch_version,
+        sm_count=fi.platform.sm_count,
+        pdl=pdl_enabled(),
+    )
+    assert (tactic is None) == (tile is None)
+    expected = (
+        x @ w.T if tactic is None else fi.flashinfer_tgv_decode_gemm(x, w, None, tactic)
+    )
+    assert torch.equal(mm(x, w, out=out), expected)
+    check_result(out, x, w)
 
 
 @pytest.mark.parametrize("n,k", NON_ADMITTED)

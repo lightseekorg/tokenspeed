@@ -81,9 +81,11 @@ public:
     }
     // The live tag of a session or a cache group, a fresh one when the last
     // ended or none exists; a demoted live tag is promoted again.
-    SessionCacheOwner SessionOwner(const std::string& session_id) { return ownerTag(session_id, session_tags_); }
-    SessionCacheOwner CacheGroupOwner(const std::string& cache_group_id) {
-        return ownerTag(cache_group_id, cache_group_tags_);
+    SessionCacheOwner AcquireSessionOwner(const std::string& session_id) {
+        return acquireOwnerTag(session_id, session_tags_);
+    }
+    SessionCacheOwner AcquireCacheGroupOwner(const std::string& cache_group_id) {
+        return acquireOwnerTag(cache_group_id, cache_group_tags_);
     }
     // Marks the live tags of the given sessions or cache groups demoted, and
     // ended too when `ended`.
@@ -100,7 +102,7 @@ public:
 private:
     using OwnerTags = std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>>;
 
-    SessionCacheOwner ownerTag(const std::string& id, OwnerTags& tags);
+    SessionCacheOwner acquireOwnerTag(const std::string& id, OwnerTags& tags);
     static DemotedOwners demote(const std::vector<std::string>& ids, bool ended, OwnerTags& tags);
 
     std::unordered_map<std::uint64_t, SessionCacheOwner> access_;

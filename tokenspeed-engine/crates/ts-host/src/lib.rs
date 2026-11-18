@@ -29,6 +29,7 @@ mod encode;
 mod host_spans;
 mod logging;
 mod pd;
+mod peer;
 
 use std::{
     collections::HashSet,
@@ -111,6 +112,8 @@ enum HostError {
     Sender(#[from] ts_pd::StartError),
     #[error("the encode loop: {0}")]
     Encode(#[from] ts_control::encode::EncodeError),
+    #[error("peer prefix sharing: {0}")]
+    Peer(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -526,8 +529,9 @@ impl HostConfig {
             controls: ControlConfig {
                 memory_saver: config.getattr("memory_saver")?.extract()?,
                 memory_regions: config.getattr("memory_regions")?.extract()?,
-                // With L3, the namespace's weight version.
-                l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
+                // With L3, its namespace's weight version; peer sharing,
+                // which excludes L3, sets its own in `serve`.
+                shared_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
                 allow_reload_forward: config.getattr("allow_reload_forward")?.extract()?,
             },
             l3,
@@ -649,18 +653,30 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, outbox, mode) = Python::attach(|py| {
+    let (bootstrap, outbox, peer_outbox, mode) = Python::attach(|py| {
         let built = (|| {
             let outbox = Bound::new(py, pd::Outbox::new())?;
+            let peer_outbox = Bound::new(py, peer::Outbox::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
                 .call_method1(
                     "bootstrap",
-                    (args.control_fd, outbox.clone(), 2_u32, host_spans),
+                    (
+                        args.control_fd,
+                        outbox.clone(),
+                        2_u32,
+                        host_spans,
+                        peer_outbox.clone(),
+                    ),
                 )?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
-            Ok((bootstrap.unbind(), outbox.unbind(), mode))
+            Ok((
+                bootstrap.unbind(),
+                outbox.unbind(),
+                peer_outbox.unbind(),
+                mode,
+            ))
         })();
         built.map_err(|error| python_error(py, error))
     })?;
@@ -668,48 +684,57 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         return encode::serve(bootstrap, &stop);
     }
 
-    let (bootstrap, scheduler, config, data_plane, role, peers, exporter) = Python::attach(|py| {
-        let built = (|| {
-            let bootstrap = bootstrap.into_bound(py);
-            let outbox = outbox.into_bound(py);
-            let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
-            let python_config = bootstrap.getattr("config")?;
-            let metrics = Metrics::from_python(&python_config)?;
-            let exporter = metrics
-                .exporter()
-                .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
-            let transfer_metrics = exporter
-                .as_ref()
-                .filter(|_| metrics.transfer)
-                .map(|exporter| {
-                    Arc::new(KvTransferMetrics::new(
-                        exporter,
-                        &metrics.labels.model_name,
-                        &metrics.labels.app_key,
-                    ))
-                });
-            let peers = pd::start(
-                py,
-                bootstrap.getattr("transfer_peer")?,
-                bootstrap.getattr("epd_receive")?,
-                outbox.get(),
-                transfer_metrics,
-            )?;
-            let role = peers.role;
-            let config = HostConfig::from_python(&python_config, peers.transfer.is_some(), role)?;
-            let data_plane = bootstrap.getattr("data_plane")?.unbind();
-            Ok((
-                bootstrap.unbind(),
-                scheduler,
-                config,
-                data_plane,
-                role,
-                peers,
-                exporter,
-            ))
-        })();
-        built.map_err(|error| python_error(py, error))
-    })?;
+    let (bootstrap, scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
+        Python::attach(|py| {
+            let built = (|| {
+                let bootstrap = bootstrap.into_bound(py);
+                let outbox = outbox.into_bound(py);
+                let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
+                let peer_sharing =
+                    peer::Settings::from_python(&bootstrap.getattr("peer_sharing")?)?;
+                let python_config = bootstrap.getattr("config")?;
+                let metrics = Metrics::from_python(&python_config)?;
+                let exporter = metrics.exporter().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+                })?;
+                let transfer_metrics =
+                    exporter
+                        .as_ref()
+                        .filter(|_| metrics.transfer)
+                        .map(|exporter| {
+                            Arc::new(KvTransferMetrics::new(
+                                exporter,
+                                &metrics.labels.model_name,
+                                &metrics.labels.app_key,
+                            ))
+                        });
+                let peers = pd::start(
+                    py,
+                    bootstrap.getattr("transfer_peer")?,
+                    bootstrap.getattr("epd_receive")?,
+                    outbox.get(),
+                    transfer_metrics,
+                )?;
+                let role = peers.role;
+                let mut config =
+                    HostConfig::from_python(&python_config, peers.transfer.is_some(), role)?;
+                if let Some(peer) = &peer_sharing {
+                    config.controls.shared_weight_version = Some(peer.weight_version().to_owned());
+                }
+                let data_plane = bootstrap.getattr("data_plane")?.unbind();
+                Ok((
+                    bootstrap.unbind(),
+                    scheduler,
+                    config,
+                    data_plane,
+                    role,
+                    peers,
+                    peer_sharing,
+                    exporter,
+                ))
+            })();
+            built.map_err(|error| python_error(py, error))
+        })?;
 
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
@@ -722,7 +747,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             .map_err(|error| python_error(py, error))
     })?;
     let mesh = Mesh::connect(config.rank, listener, &addresses, HANDSHAKE_TIMEOUT)?;
-    let ranks = Ranks {
+    let mut ranks = Ranks {
         mesh,
         replica: Group::new(REPLICA_GROUP, config.replica_ranks.clone(), config.rank)?,
         pp: config
@@ -846,6 +871,20 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         .as_ref()
         .map(|publisher| KvEventPublisher::start(publisher, config.metrics.labels.dp_rank))
         .transpose()?;
+    // Its endpoint serves the scheduler between the loop's rounds.
+    let scheduler = Arc::new(parking_lot::Mutex::new(scheduler));
+    let peer = peer_sharing
+        .map(|settings| {
+            peer::start(
+                settings,
+                &mut ranks.mesh,
+                &ranks.replica,
+                scheduler.clone(),
+                peer_outbox.get(),
+            )
+        })
+        .transpose()
+        .map_err(HostError::Peer)?;
     let mut event_loop = EventLoop::new(
         scheduler,
         data_plane,
@@ -862,6 +901,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
+            peer,
         },
     );
     // The engine registers only once its own requests ran: no client

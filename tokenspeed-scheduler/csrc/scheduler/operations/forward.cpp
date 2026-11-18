@@ -343,6 +343,10 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 }  // namespace
 
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
+    return matchPrefixAtAdmission(request, std::numeric_limits<std::int32_t>::max());
+}
+
+Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens) {
     ProfileSpan profile_span{"Scheduler::matchPrefixAtAdmission"};
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
@@ -369,8 +373,8 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // the positions it needs logits for are recomputed rather than matched.
     // The bound is in tokens: a hit may end at it exactly.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
+    const std::int32_t max_cacheable_tokens = std::max(
+        std::min({request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens(), max_probe_tokens}), 0);
     // The last token is recomputed, so a page the prompt fills exactly can
     // never be hit -- except on the D role, whose prompt-end state check
     // needs the prompt's last page hashed when the prompt ends on it.
@@ -506,26 +510,50 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens,
                                                                   std::int64_t kv_token_limit,
-                                                                  std::int32_t yield_tokens, bool must_complete) {
+                                                                  std::int32_t yield_tokens, bool must_complete,
+                                                                  std::int32_t peer_landing_tokens) {
     ProfileSpan profile_span{"Scheduler::schedulePrefillFirstChunk"};
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
+    // The D role's prompts are the peer's work, a peer landing's prefix the
+    // holder's; every other first chunk is local.
+    const fsm::PrefillSource source = config_.role == Role::kD  ? fsm::PrefillSource::kRemote
+                                      : peer_landing_tokens > 0 ? fsm::PrefillSource::kPeer
+                                                                : fsm::PrefillSource::kLocal;
+    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     AdmissionMatch match = matchPrefixAtAdmission(request);
+    // A peer landing resumes its local hit only at a page boundary, a block
+    // boundary of every group: the block holding a tail hit's end would be
+    // filled by the admission's copy or load as well as by the landing, and
+    // the device's writes are not ordered with the reads'. A shorter probe
+    // cuts the hit to the page boundary below, or further.
+    if (source == fsm::PrefillSource::kPeer) {
+        for (std::int32_t hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+             hit % prefix_granularity != 0 && !match.waits_for_eviction_store;
+             hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens)) {
+            match = matchPrefixAtAdmission(request, hit / prefix_granularity * prefix_granularity);
+        }
+    }
     if (match.waits_for_eviction_store) {
         // The ACK makes the segment visible. Re-probe then, without taking
         // pages or reporting a capacity failure while the copy is pending.
         return FirstChunkOutcome{};
     }
 
-    // The D role's prompts are the peer's work; every other first chunk is local.
-    const fsm::PrefillSource source =
-        config_.role == Role::kD ? fsm::PrefillSource::kRemote : fsm::PrefillSource::kLocal;
-    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
-
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    // Where a landing ends: the whole prompt from the PD peer, a prefix from
+    // a holder. A local hit that already reaches the holder's leaves nothing
+    // to land.
+    const std::int32_t landing_end = source == fsm::PrefillSource::kRemote ? request->PrefillSize()
+                                     : source == fsm::PrefillSource::kPeer ? peer_landing_tokens
+                                                                           : 0;
+    if (source == fsm::PrefillSource::kPeer &&
+        (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens || landing_end > kv_token_limit)) {
+        return FirstChunkOutcome{};
+    }
     // KV coverage beyond the state checkpoint the hit resumes from is the
     // junction: the first chunk is cut there so its natural checkpoint lands
     // where the KV is already cached.
@@ -544,10 +572,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     }
     remaining = static_cast<std::int32_t>(
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
-    // A remote landing completes the prompt in one transfer; no junction cut
-    // can shorten it.
-    std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                         ? unscheduled
+    // A landing fills its span in one transfer; no junction cut can shorten
+    // it.
+    std::int32_t tokens_this_round = source != fsm::PrefillSource::kLocal
+                                         ? landing_end - hit_tokens
                                          : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
                                                               unscheduled, remaining, junction_tokens);
     if (tokens_this_round == 0) {
@@ -571,7 +599,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const auto chunk_demands = [&](std::int32_t tokens, bool checkpoint) {
         // Sliding-window prepay (docs/design/scheduler.md §1). A remote
         // landing has no later local chunk: the peer fills the whole prompt.
-        const std::int32_t later_chunk_tokens = source == fsm::PrefillSource::kLocal ? unscheduled - tokens : 0;
+        const std::int32_t later_chunk_tokens = source != fsm::PrefillSource::kRemote ? unscheduled - tokens : 0;
         // Only beside another page holder. Any holder, not only one sharing
         // the hit: hit pages may become shared after this admission.
         const bool prepays = (hit_tokens > 0 || later_chunk_tokens > 0) && others_hold_pages;
@@ -584,32 +612,33 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             .swa_prompt_after_hit_tokens = unscheduled,
         };
         // Every State table starts as [checkpoint or zero state, fresh] for a
-        // local chunk, which reads slot 0 and writes slot 1; the peer's
+        // local chunk, which reads slot 0 and writes slot 1; the PD peer's
         // landing fills slot 1 and reads nothing, so it leaves slot 0 null
-        // unless the prompt-end checkpoint was claimed.
+        // unless the prompt-end checkpoint was claimed. A holder's landing
+        // fills slot 1 as a local chunk's forward would, and the next chunk
+        // rotates it in.
         std::vector<GroupDemand> demands = MakeGroupDemands(
             tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{tokens}},
             StateStep{.kind = source == fsm::PrefillSource::kRemote ? StateStep::Kind::kLand : StateStep::Kind::kRotate,
                       .checkpoint = checkpoint});
         ReservePrefillDemands(demands, config_.cache_groups, reserve);
-        if (source == fsm::PrefillSource::kRemote) {
-            // A full-history group's blocks up to the prompt end land whole
-            // and are not zeroed (GroupDemand::landed_tokens). Cached windows
-            // already own the hit's blocks, including a fresh partial tail
-            // block. Replayable windows own no hit blocks: the peer must fill
-            // their whole retained suffix.
+        if (source != fsm::PrefillSource::kLocal) {
+            // A full-history group's blocks up to the landing's end land
+            // whole and are not zeroed (GroupDemand::landed_tokens). Cached
+            // windows already own the hit's blocks, including a fresh partial
+            // tail block. Replayable windows own no hit blocks: the peer must
+            // fill their whole retained suffix.
             for (std::size_t i = 0; i < demands.size(); ++i) {
                 const CacheGroupConfig& group = config_.cache_groups[i];
                 if (group.attn_kind == AttnKind::kFull) {
-                    demands[i].landed_tokens = request->PrefillSize();
+                    demands[i].landed_tokens = landing_end;
                 } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
                     const std::int32_t hit_blocks = group.replayable ? 0 : CeilDiv(hit_tokens, block_granularity);
-                    const std::int32_t retained_begin =
-                        std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
+                    const std::int32_t retained_begin = std::max(0, landing_end - *group.sliding_window_tokens + 1);
                     demands[i].extent = SparseSuffix{
-                        .extent_tokens = request->PrefillSize(),
+                        .extent_tokens = landing_end,
                         .first_block = std::max(hit_blocks, retained_begin / block_granularity),
                         .head_blocks =
                             group.sink_tokens / block_granularity + (group.sink_tokens % block_granularity != 0),
@@ -643,11 +672,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // chunk's admission publishes its live slot there, at the cost of a
     // round (a cache this full keeps no spare block). That optional block
     // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
-    // A local prompt reserves the copy-in blocks of its prompt end with the
-    // blocks they serve, unless the prompt end is dead for a request resuming
-    // at the hit; a remote landing computes no prompt here.
+    // A prompt computed here reserves the copy-in blocks of its prompt end with
+    // the blocks they serve, unless the prompt end is dead for a request
+    // resuming at the hit. That includes a holder's landing: the rest of the
+    // prompt computes here and its first decode publishes the prompt end, and
+    // the landing's admission may prepay the tail's block. The PD peer's
+    // landing computes no prompt here.
     const std::optional<CopyInPoint> copy_in_point =
-        source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
+        source != fsm::PrefillSource::kRemote ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     // Read before the lone-request hand-over below may take the probe.
     const std::int32_t probed_device_full_page_tokens = match.probe.device.full_page_tokens;
     std::optional<AdmissionResult> admission;
@@ -690,6 +722,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
+    // A landing fills its destinations whole, unordered with the plan's
+    // device work: none is zeroed, and none is a copy or load destination.
+    std::vector<PeerPage> peer_destinations;
+    if (source == fsm::PrefillSource::kPeer) {
+        peer_destinations = peerLandingDestinations(tables, hit_tokens, landing_end);
+        excludeLandedPages(*admission, peer_destinations);
+    }
     recordAdmittedPages(plan, *admission);
     // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
     // the Device's prefix (0 when only checkpoints come from Host), and
@@ -710,11 +749,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         // already; publish them on the Device now (the layer-wise load makes
         // the bytes available before any forward reads them). A Host tail is
         // loaded into the hitter's private page and stays unpublished.
-        const std::int32_t first_extension_slot = probed_device_full_page_tokens / prefix_granularity;
+        const std::int32_t first_extension_prefix_page = probed_device_full_page_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
-            coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
-                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
-                                         CacheBoundaryKind::kChunk);
+            coordinator_.CacheFullBlocks(
+                tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1), admission->access_epoch,
+                first_extension_prefix_page + static_cast<std::int32_t>(i), CacheBoundaryKind::kChunk);
         }
     }
     fsm::CacheProgress cache_progress{
@@ -744,21 +783,23 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
     return FirstChunkOutcome{.state_prefix_cached = admission->state_prefix_cached,
-                             .event = fsm::SchedulePrefillFirstChunkEvent{
-                                 tokens_this_round,
-                                 decode_reserve,
-                                 &req_pool_allocator_,
-                                 source,
-                                 &coordinator_,
-                                 std::move(tables),
-                                 hit_tokens,
-                                 std::move(cache_progress),
-                                 std::move(admission->copy_in_blocks),
-                                 std::move(admission->load_pairs),
-                                 // The P role holds a completed prompt until its result lands: the
-                                 // remote decode that hands it off carries the bootstrap token.
-                                 config_.role == Role::kP,
-                             }};
+                             .event =
+                                 fsm::SchedulePrefillFirstChunkEvent{
+                                     tokens_this_round,
+                                     decode_reserve,
+                                     &req_pool_allocator_,
+                                     source,
+                                     &coordinator_,
+                                     std::move(tables),
+                                     hit_tokens,
+                                     std::move(cache_progress),
+                                     std::move(admission->copy_in_blocks),
+                                     std::move(admission->load_pairs),
+                                     // The P role holds a completed prompt until its result lands: the
+                                     // remote decode that hands it off carries the bootstrap token.
+                                     config_.role == Role::kP,
+                                 },
+                             .peer_destinations = std::move(peer_destinations)};
 }
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
@@ -1036,7 +1077,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
         return std::nullopt;
     }
     FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve,
-                                                          kv_token_limit, yield_tokens, must_complete);
+                                                          kv_token_limit, yield_tokens, must_complete,
+                                                          /*peer_landing_tokens=*/0);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
@@ -1993,6 +2035,10 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 build.Scheduled(*request)) {
                 continue;
             }
+            // A prompt whose peer landing waits for room is admitted only as one.
+            if (!resident && request->GetIf<fsm::Submitted>()->admission.peer_hit) {
+                continue;
+            }
             if (!prefillAllowed(*request, build)) {
                 // Recheck after every admission: a resident's final chunk or
                 // an earlier newcomer may have crossed the watermark.
@@ -2107,6 +2153,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
+    schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
     scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
 }
 
@@ -2222,6 +2269,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // the prefills into rounds is meant to avoid. The next open round
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
+        schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }
 

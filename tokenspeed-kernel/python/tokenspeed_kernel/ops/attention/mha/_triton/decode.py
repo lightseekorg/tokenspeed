@@ -339,12 +339,10 @@ def _fwd_grouped_kernel_stage1(
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
 
-    if BLOCK_H < kv_group_num:
-        VALID_BLOCK_H: tl.constexpr = BLOCK_H
-    else:
-        VALID_BLOCK_H: tl.constexpr = kv_group_num
-    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    # Each tile stays inside one KV group, including a partial final tile.
+    group_tile = cur_head_id % tl.cdiv(kv_group_num, BLOCK_H)
+    cur_head = cur_kv_head * kv_group_num + group_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_kv_head + 1) * kv_group_num
     mask_h = mask_h & (cur_head < q_head_num)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -527,7 +525,7 @@ def _decode_grouped_att_m_fwd(
     MAX_KV_SPLITS = max_kv_splits
     grid = (
         total_q,
-        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
+        k_buffer.shape[-2] * triton.cdiv(kv_group_num, BLOCK_H),
         MAX_KV_SPLITS,
     )
 

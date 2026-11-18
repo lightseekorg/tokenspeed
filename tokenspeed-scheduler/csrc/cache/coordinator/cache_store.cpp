@@ -58,6 +58,50 @@ BoundaryTree::Config boundaryTreeConfig(const std::vector<CacheGroup>& groups, s
 
 }  // namespace
 
+CacheStore::GroupMetadata CacheStore::buildGroupMetadata(std::span<const CacheGroup> groups,
+                                                         std::int32_t prefix_granularity) {
+    _assert(prefix_granularity > 0, "coordinator needs positive prefix_granularity");
+    GroupMetadata metadata;
+    metadata.geometry.reserve(groups.size());
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        const CacheGroup& group = groups[i];
+        const CacheGroupSpec& spec = group.Spec();
+        _assert(group.Id() == static_cast<std::uint32_t>(i), "cache group id must equal its group index");
+        if (spec.attn_kind == AttnKind::kState) {
+            _assert(spec.block_granularity == 0, "a State group has no token span");
+            ++metadata.num_state_groups;
+        } else {
+            _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
+                    "group block_granularity must be a positive divisor of the prefix granularity");
+        }
+        _assert(group.Allocator().CacheBlocksPerLcmBlock() == spec.cache_blocks_per_lcm_block,
+                "group allocator packing must match its group spec");
+        _assert(group.Allocator().ShardCount() == spec.shard_count,
+                "group allocator shard count must match its group spec");
+        _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
+        if (spec.checkpoint_granularity > 1) {
+            _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
+            _assert(
+                metadata.checkpoint_granularity == 1 || metadata.checkpoint_granularity == spec.checkpoint_granularity,
+                "restricted State groups must use the same checkpoint grain");
+            metadata.checkpoint_granularity = spec.checkpoint_granularity;
+        }
+        metadata.geometry.emplace_back(spec.block_granularity);
+        if (spec.replayable) {
+            _assert(spec.attn_kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
+            metadata.replay_window_tokens = std::max(metadata.replay_window_tokens, spec.sliding_window);
+        }
+        if (group.Matcher().IsPrefixClosed()) {
+            metadata.routing_history_groups.push_back(i);
+            metadata.match_order.push_back(i);
+        }
+    }
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        if (!groups[i].Matcher().IsPrefixClosed() && !groups[i].Spec().replayable) metadata.match_order.push_back(i);
+    }
+    return metadata;
+}
+
 CacheStore::CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                        BlockPool* host_pool, BlockPool* snapshot_pool, bool write_back_evictions,
                        std::int32_t checkpoint_retention_leaf_distance)
@@ -69,69 +113,37 @@ CacheStore::CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granu
       boundary_tree_{boundaryTreeConfig(groups, prefix_granularity, write_back_evictions, host_pool != nullptr),
                      &checkpoints_},
       groups_{std::move(groups)},
+      metadata_{buildGroupMetadata(groups_, prefix_granularity)},
       active_parents_{pool} {
-    _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
-    // BoundaryTree::Node::written_back_group_bits keeps one bit per group.
+    // These bindings change pool/index state only after all group metadata is valid.
     _assert(!write_back_evictions || groups_.size() <= 64, "writing evictions back supports up to 64 cache groups");
-    geometry_.reserve(groups_.size());
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        _assert(groups_[i].Id() == static_cast<std::uint32_t>(i), "cache group id must equal its group index");
-        const std::int32_t group_block_granularity = groups_[i].Spec().block_granularity;
-        if (groups_[i].Spec().attn_kind == AttnKind::kState) {
-            _assert(group_block_granularity == 0, "a State group has no token span");
-            ++num_state_groups_;
-        } else {
-            _assert(group_block_granularity > 0 && prefix_granularity_ % group_block_granularity == 0,
-                    "group block_granularity must be a positive divisor of the prefix granularity");
-        }
-        _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
-                "group allocator packing must match its group spec");
-        _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
-                "group allocator shard count must match its group spec");
-        const auto& spec = groups_[i].Spec();
-        if (groups_[i].Matcher().IsPrefixClosed()) {
-            routing_history_groups_.push_back(i);
-        }
-        _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
-        if (spec.checkpoint_granularity > 1) {
-            _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
-            _assert(checkpoint_granularity_ == 1 || checkpoint_granularity_ == spec.checkpoint_granularity,
-                    "restricted State groups must use the same checkpoint grain");
-            checkpoint_granularity_ = spec.checkpoint_granularity;
-        }
-        pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+    for (CacheGroup& group : groups_) {
+        const CacheGroupSpec& spec = group.Spec();
+        pool_.RegisterGroup(group.Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {
-            host_pool_->RegisterGroup(groups_[i].Id(), host_pool_->Packing(groups_[i].Id()), spec.shard_count);
+            host_pool_->RegisterGroup(group.Id(), host_pool_->Packing(group.Id()), spec.shard_count);
         }
-        // Packing belongs to the pool. Cyclic owner count stays the same on
-        // both tiers, so a snapshot keeps the Device block's owner bucket.
+        // Packing belongs to the pool; cyclic owner count stays the same across tiers.
         if (snapshot_pool_ != nullptr) {
-            snapshot_pool_->RegisterGroup(groups_[i].Id(), snapshot_pool_->Packing(groups_[i].Id()), spec.shard_count);
+            snapshot_pool_->RegisterGroup(group.Id(), snapshot_pool_->Packing(group.Id()), spec.shard_count);
         }
-        geometry_.emplace_back(group_block_granularity);
-        if (spec.replayable) {
-            _assert(spec.attn_kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
-            replay_window_tokens_ = std::max(replay_window_tokens_, spec.sliding_window);
+        if (group.Matcher().IsPrefixClosed() && host_pool_ != nullptr) {
+            group.Index().TrackCommonEntries(pool_, *host_pool_);
         }
-        if (groups_[i].Matcher().IsPrefixClosed()) {
-            match_order_.push_back(i);
-            if (host_pool_ != nullptr) {
-                groups_[i].Index().TrackCommonEntries(pool_, *host_pool_);
-            }
-        }
-        groups_[i].Index().TrackBoundaries(boundary_tree_, pool_, host_pool_, GroupIsState(i),
-                                           groups_[i].Matcher().IsPrefixClosed());
-    }
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (!groups_[i].Matcher().IsPrefixClosed() && !GroupIsReplayable(static_cast<std::int32_t>(i))) {
-            match_order_.push_back(i);
+        group.Index().TrackBoundaries(boundary_tree_, pool_, host_pool_, spec.attn_kind == AttnKind::kState,
+                                      group.Matcher().IsPrefixClosed());
+        // Only admissions without State groups read them
+        // (AdmissionPlanner::candidatesThroughParentFit), and a replayable
+        // group publishes nothing for its parents to hold.
+        if (metadata_.num_state_groups == 0 && !spec.replayable) {
+            group.Index().TrackParentEntries(pool_);
         }
     }
 }
 
 std::int32_t CacheStore::BlocksPerBoundary(std::int32_t i) const {
     const auto index = static_cast<std::size_t>(i);
-    return GroupIsState(index) ? 1 : prefix_granularity_ / geometry_[index].BlockGranularity();
+    return GroupIsState(index) ? 1 : prefix_granularity_ / metadata_.geometry[index].BlockGranularity();
 }
 
 std::int32_t CacheStore::TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const {
@@ -139,14 +151,14 @@ std::int32_t CacheStore::TailBlocksFor(std::int32_t i, std::int32_t tail_tokens)
     if (GroupIsState(static_cast<std::size_t>(i))) {
         return 1;
     }
-    const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
+    const std::int32_t block_granularity = metadata_.geometry[static_cast<std::size_t>(i)].BlockGranularity();
     return (tail_tokens + block_granularity - 1) / block_granularity;
 }
 
 CacheStore::BlockRange CacheStore::SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const {
     const CacheGroupSpec& spec = groups_[static_cast<std::size_t>(i)].Spec();
     _assert(spec.attn_kind == AttnKind::kSlidingWindow, "only a sliding group has a window behind a boundary");
-    const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
+    const std::int32_t block_granularity = metadata_.geometry[static_cast<std::size_t>(i)].BlockGranularity();
     const std::int32_t past_end = CeilDiv(boundary_tokens, block_granularity);
     const std::int32_t first_row = std::max(0, boundary_tokens - spec.sliding_window + 1);
     if (first_row >= boundary_tokens) {
@@ -168,7 +180,7 @@ CacheStore::BlockRange CacheStore::CopyInSlots(std::size_t i, std::int32_t token
         return BlockRange{};
     }
     // The tail's page starts on a block edge: a page is whole blocks.
-    const std::int32_t page_first = (tokens - tail_tokens) / geometry_[i].BlockGranularity();
+    const std::int32_t page_first = (tokens - tail_tokens) / metadata_.geometry[i].BlockGranularity();
     const std::int32_t past_end = page_first + TailBlocksFor(group, tail_tokens);
     if (groups_[i].Matcher().IsPrefixClosed()) {
         return BlockRange{.first = page_first, .past_end = past_end};
@@ -221,7 +233,7 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
     if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
         return ranges;
     }
-    const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
+    const std::int32_t blocks_per_boundary = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
     const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     // A tail the owner keeps publishes no KV block: only the State groups
     // publish there, under its hash.
@@ -238,8 +250,8 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
     };
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
         // The new full pages and the tail's blocks are one contiguous run.
-        const std::int32_t first_block = completed.first_new_prefix_page * pages_per_prefix_hash;
-        const std::int32_t past_end_block = hashed_prefix_pages * pages_per_prefix_hash + tail_blocks;
+        const std::int32_t first_block = completed.first_new_prefix_page * blocks_per_boundary;
+        const std::int32_t past_end_block = hashed_prefix_pages * blocks_per_boundary + tail_blocks;
         if (past_end_block > first_block) {
             ranges.push_back(history_range(first_block, past_end_block));
         }
@@ -308,14 +320,13 @@ std::vector<CacheStore::PublishedRange> CacheStore::CompletedBlockRanges(std::si
 
 CacheKey CacheStore::historyBlockKey(std::size_t group_index, const CompletedPages& completed,
                                      std::int32_t block) const {
-    const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
-    const std::int32_t full_blocks = static_cast<std::int32_t>(completed.prefix_hashes.size()) * pages_per_prefix_hash;
+    const std::int32_t blocks_per_boundary = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
+    const std::int32_t full_blocks = static_cast<std::int32_t>(completed.prefix_hashes.size()) * blocks_per_boundary;
     if (block < full_blocks) {
         return CacheKey{
             .group_id = groups_[group_index].Id(),
-            .content_hash =
-                ContentHash{completed.prefix_hashes[static_cast<std::size_t>(block / pages_per_prefix_hash)]},
-            .page_offset = block % pages_per_prefix_hash};
+            .content_hash = ContentHash{completed.prefix_hashes[static_cast<std::size_t>(block / blocks_per_boundary)]},
+            .page_offset = block % blocks_per_boundary};
     }
     _assert(completed.tail.has_value() && block - full_blocks < TailBlocksFor(static_cast<std::int32_t>(group_index),
                                                                               completed.tail->tail_tokens),
@@ -369,7 +380,7 @@ std::vector<GroupDemand> CacheStore::ReplayedDemands(const PrefixProbe& prefix,
     // tail) and is left alone: nothing is regenerated here.
     std::vector<GroupDemand> replayed;
     const std::int32_t hit_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
-    if (replay_window_tokens_ > 0 && hit_tokens > 0) {
+    if (metadata_.replay_window_tokens > 0 && hit_tokens > 0) {
         const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
         replayed.assign(demands.begin(), demands.end());
         for (std::size_t i = 0; i < replayed.size(); ++i) {
@@ -382,7 +393,7 @@ std::vector<GroupDemand> CacheStore::ReplayedDemands(const PrefixProbe& prefix,
             // the growth is the absolute extent.
             replayed[i].extent = SparseSuffix{
                 .extent_tokens = hit_tokens + dense->num_tokens,
-                .first_block = replay_begin / geometry_[i].BlockGranularity(),
+                .first_block = replay_begin / metadata_.geometry[i].BlockGranularity(),
             };
         }
     }
@@ -392,14 +403,14 @@ std::vector<GroupDemand> CacheStore::ReplayedDemands(const PrefixProbe& prefix,
 std::vector<CacheKey> CacheStore::KeysForGroup(std::span<const std::string> content_hashes,
                                                std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
-    const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_id));
+    const std::int32_t blocks_per_boundary = BlocksPerBoundary(static_cast<std::int32_t>(group_id));
     _assert(content_hashes.size() <=
-                std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(pages_per_prefix_hash),
+                std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(blocks_per_boundary),
             "expanded cache key count exceeds size_t range");
     std::vector<CacheKey> keys;
-    keys.reserve(content_hashes.size() * static_cast<std::size_t>(pages_per_prefix_hash));
+    keys.reserve(content_hashes.size() * static_cast<std::size_t>(blocks_per_boundary));
     for (const std::string& content_hash : content_hashes) {
-        for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
+        for (std::int32_t offset = 0; offset < blocks_per_boundary; ++offset) {
             keys.push_back(CacheKey{
                 .group_id = group_id,
                 .content_hash = ContentHash{content_hash},
@@ -459,6 +470,17 @@ std::vector<CacheKey> CacheStore::ExpandPrefixKeys(std::span<const std::string> 
         keys.insert(keys.end(), std::make_move_iterator(group_keys.begin()), std::make_move_iterator(group_keys.end()));
     }
     return keys;
+}
+
+void CacheStore::SetMutationSink(CacheMutationSink sink) {
+    mutation_sink_ = std::move(sink);
+    if (!mutation_sink_) {
+        boundary_tree_.SetHostEntriesObserver(nullptr);
+        return;
+    }
+    boundary_tree_.SetHostEntriesObserver([this](const ContentHash& hash) {
+        mutation_sink_(CacheKey{.content_hash = hash}, CacheMutation::kHostResidency);
+    });
 }
 
 }  // namespace tokenspeed

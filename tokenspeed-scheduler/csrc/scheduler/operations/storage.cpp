@@ -200,7 +200,7 @@ void Scheduler::prepareStorage(Request& request) {
             return;
         }
         if (!storage_transfers_->Completed(operation) || !storage_allowed_) return;
-        const auto hits = storage_transfers_->QueryHits(operation);
+        const auto hits = storage_transfers_->RecordQueryHits(operation);
         // The finished query retires before the GET starts: CanStart counts
         // its ticket.
         state->lease.reset();
