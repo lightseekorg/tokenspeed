@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import os
 import socket
+import struct
 import uuid
-from contextlib import ExitStack
+from collections.abc import Generator, Iterable
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 
 import torch
@@ -69,22 +71,37 @@ _FDS_PER_MESSAGE = 250
 _FD_EXCHANGE_TIMEOUT_S = 300.0
 
 
-def _send_fds(server: socket.socket, fds: list[int], peers: int) -> None:
+def _check_peer_uid(connection: socket.socket, uid: int) -> None:
+    _, peer_uid, _ = struct.unpack(
+        "iII",
+        connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII")
+        ),
+    )
+    if peer_uid != uid:
+        raise PermissionError(
+            f"Peer descriptor exchange UID {peer_uid} differs from {uid}"
+        )
+
+
+def _send_fds(server: socket.socket, fds: list[int], peers: int, *, uid: int) -> None:
     for _ in range(peers):
         connection, _ = server.accept()
         with connection:
             connection.settimeout(_FD_EXCHANGE_TIMEOUT_S)
+            _check_peer_uid(connection, uid)
             for begin in range(0, len(fds), _FDS_PER_MESSAGE):
                 chunk = fds[begin : begin + _FDS_PER_MESSAGE]
                 socket.send_fds(connection, [len(chunk).to_bytes(4, "little")], chunk)
 
 
-def _receive_fds(address: str, count: int) -> list[int]:
+def _receive_fds(address: str, count: int, *, uid: int) -> list[int]:
     received: list[int] = []
     with ExitStack() as cleanup:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(_FD_EXCHANGE_TIMEOUT_S)
             client.connect(address)
+            _check_peer_uid(client, uid)
             while len(received) < count:
                 _, fds, flags, _ = socket.recv_fds(client, 4, _FDS_PER_MESSAGE)
                 for fd in fds:
@@ -93,7 +110,7 @@ def _receive_fds(address: str, count: int) -> list[int]:
                 if flags & socket.MSG_CTRUNC:
                     raise RuntimeError("Peer descriptor message was truncated")
                 if not fds:
-                    raise RuntimeError("Peer closed the descriptor exchange early")
+                    raise ConnectionError("Peer closed the descriptor exchange early")
         if len(received) != count:
             raise RuntimeError("Peer sent an unexpected number of descriptors")
         cleanup.pop_all()
@@ -310,27 +327,28 @@ class CudaPeerWeightStore:
         exported: dict[tuple[int, str], int],
         addresses: list[str],
         server: socket.socket,
-    ) -> list[dict[tuple[int, str], int]]:
-        """Send this owner's descriptors to every peer and receive theirs."""
-        received: list[dict[tuple[int, str], int]] = [{} for _ in addresses]
-        with ExitStack() as cleanup:
-            # Startup visits owners in rank order. Each owner sends to every
-            # peer before advancing, so exported FDs need no background reader.
-            for owner, address in enumerate(addresses):
-                if owner == self.partition.rank:
-                    _send_fds(
-                        server, [exported[key] for key in keys], len(addresses) - 1
-                    )
-                else:
-                    fds = _receive_fds(address, len(keys))
+    ) -> Generator[dict[tuple[int, str], int], None, None]:
+        """Yield each owner's descriptors, valid until the iterator advances."""
+        # Startup visits owners in rank order. Import one owner's handles before
+        # advancing, so received FDs never accumulate across owners.
+        for owner, address in enumerate(addresses):
+            if owner == self.partition.rank:
+                _send_fds(
+                    server,
+                    [exported[key] for key in keys],
+                    len(addresses) - 1,
+                    uid=os.geteuid(),
+                )
+                yield {}
+            else:
+                with ExitStack() as cleanup:
+                    fds = _receive_fds(address, len(keys), uid=os.geteuid())
                     for fd in fds:
                         cleanup.callback(os.close, fd)
-                    received[owner] = dict(zip(keys, fds, strict=True))
-            cleanup.pop_all()
-            return received
+                    yield dict(zip(keys, fds, strict=True))
 
     def _peer_sources(
-        self, handles: list[dict[tuple[int, str], bytes | int]]
+        self, handles: Iterable[dict[tuple[int, str], bytes | int]]
     ) -> dict[tuple[int, int, str], int]:
         addresses = {}
         for peer, peer_handles in enumerate(handles):
@@ -443,12 +461,13 @@ class CudaPeerWeightStore:
             if self.handle_type == "fabric":
                 peer_handles = [p["handles"] for p in payloads]
             else:
-                peer_handles = self._exchange_descriptors(
-                    keys, exported, [p["address"] for p in payloads], server
+                peer_handles = cleanup.enter_context(
+                    closing(
+                        self._exchange_descriptors(
+                            keys, exported, [p["address"] for p in payloads], server
+                        )
+                    )
                 )
-                for fields in peer_handles:
-                    for fd in fields.values():
-                        cleanup.callback(os.close, fd)
             # Imported CUDA handles hold their own allocation references.
             peers = self._peer_sources(peer_handles)
         stream = torch.cuda.current_stream(self.device)

@@ -38,8 +38,11 @@ arena, reducing fabric access-region use.
 
 The shareable-handle type is explicit. Fabric handles require an IMEX channel;
 POSIX file descriptors support owners in one Linux socket namespace, including
-SM90 systems without IMEX. Descriptor exchange is startup-only: owners send in
-rank order, and each receiver retains its descriptors until CUDA import finishes.
+SM90 systems without IMEX. POSIX peers must have the same effective user ID;
+both ends check Linux socket peer credentials before exchanging descriptors.
+Descriptor exchange is startup-only: owners send in rank order, and each receiver
+imports one owner's handles and closes its descriptors before receiving the next
+owner's. The receiver holds at most one owner's descriptors beside its exports.
 Partial exchanges and failed imports close every descriptor they acquired.
 
 Physical source storage, both staging pools, full per-expert metadata, kernel
@@ -104,6 +107,8 @@ unmapping source storage. A model exposing peer weights implements
 
 The initial integration supports K3 NVFP4 SiTU on a fabric-connected NVIDIA
 prefill instance with local execution groups, PP1, and a fixed token budget.
+This K3 path selects fabric handles explicitly. POSIX support is exposed through
+the storage API for compatible model integrations, not as a K3 transport option.
 Eager execution and ordinary breakable prefill graphs use the same weight
 ordering. Idle forwards skip weight reads. Kernel tuning and other graph
 consumers can use stable weight views with acquisition/release outside capture.

@@ -111,7 +111,9 @@ def test_failed_import_closes_all_received_fds(
     def fail_second_import(shared, *, handle_type):
         nonlocal imports
         imports += 1
-        if imports == 2:
+        # The first receiving owner fails before it broadcasts its own FDs;
+        # other owners must report peer loss instead of a local CUDA error.
+        if partition.rank == 1 and imports == 2:
             raise RuntimeError("injected CUDA import failure")
         return import_handle(shared, handle_type=handle_type)
 
@@ -137,9 +139,13 @@ def test_failed_import_closes_all_received_fds(
             ),
             layout="import-failure-test",
         )
-        with pytest.raises(RuntimeError, match="injected CUDA import failure"):
-            store.finalize()
-        assert received
+        if partition.rank == 1:
+            with pytest.raises(RuntimeError, match="injected CUDA import failure"):
+                store.finalize()
+            assert received
+        else:
+            with pytest.raises(ConnectionError):
+                store.finalize()
         for fd in received:
             with pytest.raises(OSError):
                 os.fstat(fd)
