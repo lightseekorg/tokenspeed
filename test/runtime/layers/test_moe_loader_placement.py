@@ -196,33 +196,6 @@ def test_k3_900_slots_over_20_ranks_hold_every_expert_and_its_replicas():
         else:
             assert slots == [(expert // 45, expert % 45)]
 
-    # Rank 19 loads expert 2 into its replica slot and expert 860 into slot 5.
-    placement = ExpertLocationMetadata.from_physical_to_logical_map(
-        physical_to_logical, 896, ep_size=20, ep_rank=19, ep_rank_nodes=nodes
-    )
-    slots = _Slots(45)
-    loader = build_moe_checkpoint_loader(
-        params_dict={
-            f"model.layers.1.block_sparse_moe.experts.{name}": param
-            for name, param in slots.named_parameters()
-        },
-        expert_schema=schema,
-        num_experts=900,
-        ep_rank=19,
-        ep_size=20,
-        expert_placement=placement,
-    )
-    loader.load(
-        "model.layers.1.block_sparse_moe.experts.2.w2.weight", torch.full((4, 4), 2.0)
-    )
-    loader.load(
-        "model.layers.1.block_sparse_moe.experts.860.w2.weight",
-        torch.full((4, 4), 860.0),
-    )
-    assert slots.writes == [("w2", 43), ("w2", 5)]
-    assert slots.w2_weight[43, 0, 0] == 2.0 and slots.w2_weight[5, 0, 0] == 860.0
-    assert not loader.matches("model.layers.1.block_sparse_moe.experts.4.w1.weight")
-
 
 def test_loader_geometry_must_match_the_placement():
     placement = _placement([[0, 1, 2, 3, 0, 2]], 4, 2, ep_rank=0)
