@@ -29,8 +29,17 @@ from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
 from tokenspeed_kernel.ops.conv import causal_conv1d_fn, causal_conv1d_qkv_fn
+from tokenspeed_kernel.ops.conv import cute_dsl as conv_cute_dsl
+from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_cute_compile
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+_cute = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform().is_nvidia
+    or current_platform().arch_version.major < 9,
+    reason="the CuTe DSL convolution needs an NVIDIA GPU from Hopper on",
+)
 
 HEAD = 128
 
@@ -129,3 +138,82 @@ def test_qkv_conv_rejects_widths_off_the_channel_block(key_heads, value_heads):
             prefill_metadata=metadata,
             key_dim=key_dim,
         )
+
+
+def _qkv(x, weight, states, boundaries, slots, initial, metadata, key_dim):
+    return causal_conv1d_qkv_fn(
+        x,
+        weight,
+        None,
+        conv_states=states,
+        query_start_loc=boundaries,
+        cache_indices=slots,
+        has_initial_state=torch.tensor(initial, device="cuda"),
+        activation="silu",
+        prefill_metadata=metadata,
+        key_dim=key_dim,
+    )
+
+
+@_cute
+def test_nvidia_selects_the_cute_qkv_conv(monkeypatch):
+    x, weight, boundaries, metadata, slots, states, key_dim = _inputs(
+        [40], 2, 4, row_pad=0
+    )
+    launches = []
+    launch = conv_cute_dsl.launch_causal_conv1d_prefill
+
+    def spy(*args, **kwargs):
+        launches.append(kwargs["split_out"] is not None)
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(conv_cute_dsl, "launch_causal_conv1d_prefill", spy)
+    _qkv(x, weight, states, boundaries, slots, [True], metadata, key_dim)
+    assert launches == [True]
+
+
+@pytest.mark.parametrize("first", [3, 8, 13])
+def test_qkv_conv_carries_the_window_across_prefill_chunks(first):
+    """A request split into two prefill chunks reads the first chunk's last three
+    inputs from the state, and leaves the rows and state of one whole chunk."""
+    length = first + 21
+    x, weight, boundaries, metadata, slots, states, key_dim = _inputs(
+        [length], 2, 4, row_pad=64
+    )
+    whole_states, chunk_states = states.clone(), states.clone()
+    whole = _qkv(x, weight, whole_states, boundaries, slots, [True], metadata, key_dim)
+    for lo, hi in ((0, first), (first, length)):
+        bounds = torch.tensor([0, hi - lo], dtype=torch.int32, device="cuda")
+        chunk_metadata = build_causal_conv1d_prefill_metadata(
+            bounds, torch.tensor([hi - lo]), 8
+        )
+        rows = _qkv(
+            x[:, lo:hi],
+            weight,
+            chunk_states,
+            bounds,
+            slots,
+            [True],
+            chunk_metadata,
+            key_dim,
+        )
+        for actual, expected in zip(rows, whole, strict=True):
+            assert torch.equal(actual, expected[lo:hi])
+    assert torch.equal(chunk_states, whole_states)
+
+
+@_cute
+def test_cute_qkv_conv_compiles_once_across_prefill_shapes():
+    """Token totals, request counts and chunk maps vary per prefill; none keys a binary."""
+
+    def run(lengths):
+        x, weight, boundaries, metadata, slots, states, key_dim = _inputs(
+            lengths, 2, 4, row_pad=64
+        )
+        initial = [index % 2 == 0 for index in range(len(lengths))]
+        _qkv(x, weight, states, boundaries, slots, initial, metadata, key_dim)
+
+    run([9, 7])
+    with assert_no_cute_compile():
+        for lengths in ([1], [16], [17], [1, 1], [33, 15], [64] * 3, [5, 1, 300]):
+            run(lengths)
