@@ -2372,6 +2372,13 @@ num_valid_ids)`, and the wrapper checks the buffers' shapes and dtypes against
 The stage GEMMs do not depend on the order of routes inside an expert's
 blocks, so either sort gives the same output bit for bit.
 
+### N16 expert banks for the gfx950 A8W4 SiTU experts
+
+The A8W4 SiTU tensor-parallel experts on gfx950 also read MXFP4 banks in the
+N16 layout when a plan asks for it (`moe_plan(expert_layout="n16")`). Their
+results are bit-identical to the default gdot128 layout. The N16 prefill
+takes E2M1 activations only.
+
 ### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
 
 `gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts

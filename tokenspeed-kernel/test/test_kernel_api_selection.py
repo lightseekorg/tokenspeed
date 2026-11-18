@@ -4310,18 +4310,28 @@ def test_triton_mxfp4_supports_input_activation_dtype(
 
 
 @pytest.mark.parametrize(
-    "ep_size,ispp,solution,kernel_name,preprocessor",
+    "ep_size,ispp,solution,expert_layout,kernel_name,preprocessor",
     [
         (
             1,
             384,
             None,
+            None,
             "gluon_mxfp4_a8w4_situ_precomputed_moe_apply",
             "gluon_mxfp4_gfx950_moe_weights",
         ),
         (
+            1,
+            384,
+            None,
+            "n16",
+            "gluon_mxfp4_a8w4_situ_precomputed_n16_moe_apply",
+            "gluon_mxfp4_gfx950_n16_moe_weights",
+        ),
+        (
             8,
             3072,
+            None,
             None,
             "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
             "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
@@ -4330,6 +4340,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             "gluon",
+            None,
             "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
             "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
@@ -4340,6 +4351,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     ep_size: int,
     ispp: int,
     solution: str | None,
+    expert_layout: str | None,
     kernel_name: str,
     preprocessor: str,
 ) -> None:
@@ -4358,6 +4370,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             ep_size=ep_size,
             ispp=ispp,
             internal_activation_dtype="input",
+            expert_layout=expert_layout,
             solution=solution,
             hidden=None,
             swiglu_form=None,
@@ -4374,7 +4387,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
-    # Only the TP apply reads the fused router's expert sort, at the decode
+    # Only the TP applies read the fused router's expert sort, at the decode
     # widths it sorts itself.
     if ep_size == 1:
         assert plan["sorted_route_rows"] == frozenset(range(8, 193))
@@ -4382,6 +4395,46 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     else:
         assert plan["sorted_route_rows"] == frozenset()
         assert plan["sorted_route_block_size"] is None
+
+
+def test_kimi3_mxfp4_situ_n16_needs_a_kernel_that_reads_it(
+    mi350_platform: PlatformInfo,
+) -> None:
+    # The EP8 apply declares no bank layout: an N16 request there fails when
+    # the plan is built, never during a request.
+    if (
+        KernelRegistry.get().get_by_name(
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+        )
+        is None
+    ):
+        pytest.skip("the gfx950 EP8 apply is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(ValueError, match="'n16' expert layout"):
+            kernel_moe_plan(
+                "mxfp4",
+                input_dtype=torch.bfloat16,
+                activation="situ",
+                routing_mode="precomputed_topk",
+                ep_size=8,
+                ispp=3072,
+                internal_activation_dtype="fp8",
+                expert_layout="n16",
+                solution=None,
+                hidden=None,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+                combine_order="rank",
+                features=frozenset(),
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
 
 
 @pytest.mark.parametrize(
