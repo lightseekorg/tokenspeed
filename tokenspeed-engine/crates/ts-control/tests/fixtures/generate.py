@@ -47,7 +47,12 @@ import torch
 from tokenspeed.runtime.moe.eplb_algorithms import EplbAlgorithm
 from tokenspeed.runtime.moe.expert_rebalance import plan_slot_moves
 from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
-from tokenspeed.runtime.pd.kv_events import BlockRemoved, BlockStored, KVEventBatch
+from tokenspeed.runtime.pd.kv_events import (
+    MEDIUM_HOST,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 FIXTURE_DIR = Path(__file__).resolve().parent
@@ -132,6 +137,14 @@ _KV_EVENT_BATCH = KVEventBatch(
             block_size=4,
         ),
         BlockRemoved(block_hashes=[11, 3]),
+        BlockStored(
+            block_hashes=[13],
+            parent_block_hash=11,
+            token_ids=[5, 6, 7, 8],
+            block_size=4,
+            medium=MEDIUM_HOST,
+        ),
+        BlockRemoved(block_hashes=[13], medium=MEDIUM_HOST),
     ],
     attn_dp_rank=1,
 )

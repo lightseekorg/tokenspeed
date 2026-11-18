@@ -49,6 +49,7 @@ public:
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
     const std::string& CacheGroupId() const { return cache_group_id_; }
+    const std::string& PeerHolder() const { return peer_holder_; }
     std::span<const std::int32_t> SharedPrefixTokens() const { return shared_prefix_tokens_; }
     // The registration of its group/session owner under the access epoch that
     // its first admission returned: held for the request's whole life, which
@@ -346,8 +347,10 @@ public:
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
                               [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
+                              [](const fsm::PeerLooking&) -> std::string { return "PeerLooking"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                              [](const fsm::PeerLanding&) -> std::string { return "PeerLanding"; },
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
@@ -373,6 +376,7 @@ private:
     std::string id_;
     std::string session_id_;
     std::string cache_group_id_;
+    std::string peer_holder_;
     std::vector<std::int32_t> shared_prefix_tokens_;
     SessionAccess session_access_;
     TokenContainer token_container_;

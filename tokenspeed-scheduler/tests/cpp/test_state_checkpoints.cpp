@@ -3116,17 +3116,19 @@ protected:
         return cfg;
     }
 
-    // Applies the feed to the boundaries it reports stored: a removal names
-    // one stored before, and none is stored twice.
+    // Applies the Device stream to the boundaries it reports stored: a
+    // removal names one stored before, and none is stored twice.
     void Drain() {
         for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                if (removed->medium != KvEventMedium::kDevice) continue;
                 for (const std::uint64_t hash : removed->block_hashes) {
                     EXPECT_EQ(stored_.erase(hash), 1u) << "a removal names a boundary never stored";
                 }
                 continue;
             }
             const auto& stored = std::get<KvBlockStoredEvent>(event);
+            if (stored.medium != KvEventMedium::kDevice) continue;
             EXPECT_TRUE(stored_.emplace(stored.block_hashes.front(), stored.token_ids).second)
                 << "a boundary is stored twice";
         }
@@ -4834,9 +4836,10 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASessionResumedFromHostIsNotCopiedA
     AckWriteBacks(plan);
 }
 
-// KV events keep the Device's view: a written-back boundary is removed when it
-// leaves the Device, and its Host publication reports nothing.
-TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsKeepDeviceSemantics) {
+// KV events follow each medium: a written-back boundary leaves the Device's
+// stream when it leaves the Device, and joins the Host's once its write-back
+// lands there.
+TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsFollowEachMedium) {
     kv_events_ = true;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     CompleteSession("s1", MakeTokens(22));
@@ -4845,22 +4848,31 @@ TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsKeepDeviceSemantics) {
     ASSERT_EQ(stored.size(), 6u);
     std::set<std::uint64_t> stored_hashes;
     for (const auto& event : stored) {
-        const auto& hashes = std::get<KvBlockStoredEvent>(event).block_hashes;
-        stored_hashes.insert(hashes.begin(), hashes.end());
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.medium, KvEventMedium::kDevice);
+        stored_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
     }
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     SendBootstrapped("f1");
     const ExecutionPlan plan = PlanOnce();
     ASSERT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(plan).size(), 1u);
     const std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
-    ASSERT_EQ(removed.size(), stored.size());
+    ASSERT_EQ(removed.size(), stored.size()) << "the Host copies are not there yet";
     std::set<std::uint64_t> removed_hashes;
     for (const auto& event : removed) {
         const auto& block = std::get<KvBlockRemovedEvent>(event);
+        EXPECT_EQ(block.medium, KvEventMedium::kDevice);
         removed_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
     }
     EXPECT_EQ(removed_hashes, stored_hashes);
     AckWriteBacks(plan);
+    std::set<std::uint64_t> host_hashes;
+    for (const auto& event : scheduler_->DrainKvEvents()) {
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.medium, KvEventMedium::kHost);
+        host_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
+    }
+    EXPECT_EQ(host_hashes, stored_hashes);
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
