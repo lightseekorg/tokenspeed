@@ -1144,10 +1144,11 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
     target = _history_backend(0)
     staged = []
     linear = SimpleNamespace(
+        preallocate_prefill_workspace=lambda: 0,
         preallocate_verify_workspace=lambda max_bs, width: staged.append(
             (max_bs, width)
         )
-        or 64
+        or 64,
     )
     _prepare_fixed_workspaces(
         server_args=SimpleNamespace(speculative_num_draft_tokens=2),
