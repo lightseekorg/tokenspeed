@@ -194,6 +194,27 @@ def test_admission_follows_the_selected_scan():
     assert not backend.admits_prefill_graph(512, 1, ForwardMode.MIXED)
 
 
+def test_hybrid_propagates_layerwise_counter_to_gdn():
+    """The state child sees producer readiness even without a capturable scan."""
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.pd.utils import StepCounter
+
+    config, spec = _config()
+    full = AttentionBackend(config, spec)
+    gdn = _backend(writes_state_checkpoints_in_forward=False)
+    root = HybridLinearAttnBackend(full, gdn, [])
+    counter = StepCounter("cuda", torch.cuda.current_device())
+    root.register_step_counter(counter)
+    assert root.step_counter is counter
+    assert full.step_counter is counter
+    assert gdn.step_counter is counter
+    assert not gdn.admits_prefill_graph(512, 1, ForwardMode.EXTEND)
+    assert not root.admits_prefill_graph(512, 1, ForwardMode.EXTEND)
+
+
 def test_uncaptured_shapes_keep_the_scheduler_metadata():
     """Eager forwards of shapes without a graph skip the capacity layout."""
     backend = _backend(writes_state_checkpoints_in_forward=False)
@@ -702,6 +723,8 @@ def test_qwen4_exp_composite_captures_gdn_inline_around_full_attention():
     counter = StepCounter("cuda", torch.cuda.current_device())
     root.register_step_counter(counter)
     assert root.step_counter is counter
+    assert gdn.step_counter is counter
+    assert not gdn.admits_prefill_graph(bucket, 1, ForwardMode.EXTEND)
     assert not root.admits_prefill_graph(bucket, 1, ForwardMode.EXTEND)
     assert not root.prepare_prefill_metadata(
         bucket, 1, ForwardMode.EXTEND, capture=False
