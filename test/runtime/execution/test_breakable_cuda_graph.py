@@ -1068,6 +1068,8 @@ class TestWeakRefTensor:
         assert (weak_ref_tensor(None)) is None
         cpu = torch.ones(2)
         assert (weak_ref_tensor(cpu)) is (cpu)
+        with pytest.raises(RuntimeError, match="weak_ref_tensor expects a CUDA tensor"):
+            weak_ref.weak_ref_tensor(cpu)
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))

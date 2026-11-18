@@ -96,6 +96,8 @@ def weak_ref_tensor(t: torch.Tensor) -> torch.Tensor:
     Returns:
         A tensor sharing ``t``'s memory without owning its storage.
     """
+    if not t.is_cuda:
+        raise RuntimeError("weak_ref_tensor expects a CUDA tensor")
     mod = _load()
     if mod is not None:
         return mod.weak_ref_tensor(t)

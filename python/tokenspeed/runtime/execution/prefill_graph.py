@@ -315,11 +315,12 @@ class RowStateViews(NarrowedRowState, Protocol):
 class DecoderStateBuffers:
     """One widest backing for decoder buckets that replay serially."""
 
-    def __init__(self, allocate):
+    def __init__(self, allocate: Callable[[int], NarrowedRowState]) -> None:
         self._allocate = allocate
         self._shared: RowStateViews | None = None
 
     def for_rows(self, rows: int) -> NarrowedRowState:
+        """Reused storage retains prior values. Fill it with ``land_into`` before use."""
         if self._shared is not None and rows <= self._shared.rows:
             return self._shared.leading(rows)
         state = self._allocate(rows)
