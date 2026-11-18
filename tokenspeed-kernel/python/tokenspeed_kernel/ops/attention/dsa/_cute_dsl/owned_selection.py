@@ -130,6 +130,14 @@ class OwnedSelect:
 
     @cute.kernel
     def kernel(self, scores, positions, table, requests, out, lens, rank):
+        """Select rank ``rank``'s share of one row's merged top-k.
+
+        Reads the row's scores of every rank, finds the threshold key in three
+        radix digits, then keeps this rank's candidates above it and the ties
+        at it its quota allows (lower ranks' ties first, then candidate
+        order). Writes their local slots through ``positions`` and ``table``
+        to ``out`` in candidate order, ``-1`` after, and the count to ``lens``.
+        """
         W = self.width
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()

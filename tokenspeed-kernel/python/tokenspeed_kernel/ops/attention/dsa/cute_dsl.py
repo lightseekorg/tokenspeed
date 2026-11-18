@@ -838,6 +838,25 @@ if _fused_indexer is not None:
         """Run ``dsa_select_owned_candidates`` in one launch.
 
         Serves the sizes ``dsa_select_owned_candidates_supported`` admits.
+
+        Args:
+            scores: FP32 ``[ranks, rows, topk]`` every rank's gathered
+                candidate scores (``-inf`` invalid), rows contiguous; the rank
+                stride may be wider.
+            positions: Int32 ``[rows, topk]`` logical positions of this
+                rank's candidates, rows contiguous.
+            local_page_table: Int32 ``[requests, pages]`` this rank's local
+                pages (``-1`` where not owned), rows contiguous.
+            query_requests: Int32 ``[rows]`` request of every row.
+            rank: This rank's index in ``scores``.
+            topk: Entries selected per row over all ranks.
+            page_size: Tokens per page of ``local_page_table``.
+            out: Optional contiguous int32 ``[rows, topk]`` output.
+            lens_out: Optional contiguous int32 ``[rows]`` output.
+
+        Returns:
+            ``(out, lens_out)``: this rank's kept candidates as local slots
+            in candidate order, ``-1`` after, and their count per row.
         """
         degree, rows, width = scores.shape
         if (
