@@ -92,4 +92,4 @@ report:
 perf_threshold: 0.95
 # Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
 perf_reference:
-  32: [24.7, 9400]
+  32: [24.8, 9400]

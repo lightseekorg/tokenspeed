@@ -448,7 +448,7 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
             assert task["score_threshold"] == 0.90
         elif is_recipe:
             assert task["perf_threshold"] == 0.95
-            assert task["perf_reference"] == {32: [24.7, 9400]}
+            assert task["perf_reference"] == {32: [24.8, 9400]}
         else:
             assert "perf_reference" not in task
             assert "perf_threshold" not in task
