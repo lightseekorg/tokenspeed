@@ -21,7 +21,8 @@
 """Check the one-hop LL all-gather and all-to-all against NCCL.
 
 On node-local SM100 or SM103 GPUs: every byte value at sizes from one unit to
-the capacity, many calls through both parity slots, graph replays with fresh
+the capacity, many calls through both parity slots, calls past the point a
+32-bit epoch would wrap to the zeroed workspace's, graph replays with fresh
 inputs, the refusal vote and argument errors.
 """
 
@@ -36,7 +37,7 @@ from tokenspeed_kernel.ops.communication.cute_dsl import (
     cute_dsl_ll_all_gather,
     cute_dsl_ll_all_to_all,
 )
-from utils import kernel_supported
+from utils import assert_no_cute_compile, kernel_supported
 
 CAP_BYTES = 1 << 20
 TIMEOUT_NS = 60_000_000_000
@@ -71,22 +72,24 @@ def _exchange_matches_nccl(rank, size, rendezvous):
     )
     assert state is not None
     generator = torch.Generator(device=device).manual_seed(1000 + rank)
-    for payload in SIZES:
-        for _ in range(3):
-            gather_in = _bytes(payload, generator, device)
-            a2a_in = _bytes(size * payload, generator, device)
-            expected_gather = torch.empty(size * payload, dtype=torch.uint8, device=device)  # fmt: skip
-            expected_a2a = torch.empty_like(expected_gather)
-            dist.all_gather_into_tensor(expected_gather, gather_in)
-            dist.all_to_all_single(expected_a2a, a2a_in)
-            got_gather = cute_dsl_ll_all_gather(
-                state, gather_in, torch.empty_like(expected_gather)
-            )
-            got_a2a = cute_dsl_ll_all_to_all(
-                state, a2a_in, torch.empty_like(expected_a2a)
-            )
-            assert torch.equal(got_gather, expected_gather), payload
-            assert torch.equal(got_a2a, expected_a2a), payload
+    # The state compiled both calls: no payload size compiles another.
+    with assert_no_cute_compile():
+        for payload in SIZES:
+            for _ in range(3):
+                gather_in = _bytes(payload, generator, device)
+                a2a_in = _bytes(size * payload, generator, device)
+                expected_gather = torch.empty(size * payload, dtype=torch.uint8, device=device)  # fmt: skip
+                expected_a2a = torch.empty_like(expected_gather)
+                dist.all_gather_into_tensor(expected_gather, gather_in)
+                dist.all_to_all_single(expected_a2a, a2a_in)
+                got_gather = cute_dsl_ll_all_gather(
+                    state, gather_in, torch.empty_like(expected_gather)
+                )
+                got_a2a = cute_dsl_ll_all_to_all(
+                    state, a2a_in, torch.empty_like(expected_a2a)
+                )
+                assert torch.equal(got_gather, expected_gather), payload
+                assert torch.equal(got_a2a, expected_a2a), payload
     # Other dtypes travel as their bytes.
     words = torch.randn(size * 1024, device=device).view(torch.int32)
     got = cute_dsl_ll_all_to_all(state, words, torch.empty_like(words))
@@ -127,6 +130,31 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
             assert torch.equal(gather_out[i], expected)
             dist.all_to_all_single(expected, a2a_in[i])
             assert torch.equal(a2a_out[i], expected)
+    dist.destroy_process_group()
+
+
+def _epochs_skip_zero(rank, size, rendezvous):
+    device, group = _init(rank, size, rendezvous)
+    state = create_ll_exchange_state(
+        group, device, cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+    )
+    # Three calls before a 32-bit epoch would wrap to the zeroed slots' 0: the
+    # calls past it must still wait for their peers' stores.
+    start = 2**32 - 4
+    state.ctrl[0] = start
+    generator = torch.Generator(device=device).manual_seed(3000 + rank)
+    payloads = (4096, 65536, 16, 4096, 262144, 48)
+    for payload in payloads:
+        gather_in = _bytes(payload, generator, device) | 1
+        a2a_in = _bytes(size * payload, generator, device) | 1
+        expected = torch.empty(size * payload, dtype=torch.uint8, device=device)
+        dist.all_gather_into_tensor(expected, gather_in)
+        got = cute_dsl_ll_all_gather(state, gather_in, torch.empty_like(expected))
+        assert torch.equal(got, expected), payload
+        dist.all_to_all_single(expected, a2a_in)
+        got = cute_dsl_ll_all_to_all(state, a2a_in, torch.empty_like(expected))
+        assert torch.equal(got, expected), payload
+    assert int(state.ctrl[0]) == start + 2 * len(payloads)
     dist.destroy_process_group()
 
 
@@ -180,6 +208,10 @@ def test_exchange_matches_nccl(tmp_path):
 
 def test_graph_replays_fresh_inputs(tmp_path):
     _spawn(_graph_replays_fresh_inputs, tmp_path)
+
+
+def test_epochs_skip_the_zeroed_workspace_past_32_bits(tmp_path):
+    _spawn(_epochs_skip_zero, tmp_path)
 
 
 def test_refusals_and_argument_errors(tmp_path):

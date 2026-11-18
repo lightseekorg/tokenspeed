@@ -30,12 +30,16 @@ elements until each carries the epoch, then stores the words. An aligned
 64-bit element is single-copy atomic, so a matching epoch proves its word is
 this call's: no flag, fence or sentinel, and any payload bits pass.
 
-Calls alternate the two parity slots. A rank writes parity ``p`` of call
-``e + 2`` only after receiving its peers' call ``e + 1``, which each peer
-sends after finishing call ``e``, so no slot is overwritten while it is read.
-The epoch lives in device memory: the last CTA of a call publishes it, so
-graph replays need no host state. Every wait is bounded by ``%globaltimer``;
-a timeout traps, as a hung NCCL kernel would end the group.
+Calls alternate the two parity slots by a 64-bit call count. A rank writes
+parity ``p`` of call ``n + 2`` only after receiving its peers' call ``n + 1``,
+which each peer sends after finishing call ``n``, so no slot is overwritten
+while it is read. Call ``n``'s epoch is ``(n - 1) mod (2**32 - 1) + 1``: never
+0, the zeroed workspace's, so an element no call wrote never matches. A stale
+element matches only where the slot's last write came a multiple of
+``2 * (2**32 - 1)`` calls earlier and the read beats the call's own store. The
+count lives in device memory: the last CTA of a call publishes it, so graph
+replays need no host state. Every wait is bounded by ``%globaltimer``; a
+timeout traps, as a hung NCCL kernel would end the group.
 """
 
 from __future__ import annotations
@@ -48,7 +52,7 @@ import cutlass.cute as cute
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from cutlass import Int32, Int64, Uint32
+from cutlass import Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -93,20 +97,20 @@ def _poll_unit(slot, out, epoch, deadline, *, loc=None, ip=None):
     code = (
         "{ .reg .b64 a, b, c, d, now; .reg .b32 l0, h0, l1, h1, l2, h2, l3, h3;\n"
         ".reg .pred p;\n"
-        "LL_WAIT:\n"
+        "LL_WAIT${:uid}:\n"
         "ld.relaxed.sys.global.v4.b64 {a, b, c, d}, [$0];\n"
         "mov.b64 {l0, h0}, a; mov.b64 {l1, h1}, b;\n"
         "mov.b64 {l2, h2}, c; mov.b64 {l3, h3}, d;\n"
-        "setp.ne.u32 p, h0, $2; @p bra LL_LATE;\n"
-        "setp.ne.u32 p, h1, $2; @p bra LL_LATE;\n"
-        "setp.ne.u32 p, h2, $2; @p bra LL_LATE;\n"
-        "setp.ne.u32 p, h3, $2; @p bra LL_LATE;\n"
-        "bra.uni LL_DONE;\n"
-        "LL_LATE:\n"
+        "setp.ne.u32 p, h0, $2; @p bra LL_LATE${:uid};\n"
+        "setp.ne.u32 p, h1, $2; @p bra LL_LATE${:uid};\n"
+        "setp.ne.u32 p, h2, $2; @p bra LL_LATE${:uid};\n"
+        "setp.ne.u32 p, h3, $2; @p bra LL_LATE${:uid};\n"
+        "bra.uni LL_DONE${:uid};\n"
+        "LL_LATE${:uid}:\n"
         "mov.u64 now, %globaltimer;\n"
-        "setp.lt.u64 p, now, $3; @p bra LL_WAIT;\n"
+        "setp.lt.u64 p, now, $3; @p bra LL_WAIT${:uid};\n"
         "trap;\n"
-        "LL_DONE:\n"
+        "LL_DONE${:uid}:\n"
         "st.global.v4.b32 [$1], {l0, l1, l2, l3}; }"
     )
     _asm(code, "l,l,r,l", [slot, out, epoch, deadline], loc, ip)
@@ -129,33 +133,33 @@ def _globaltimer(*, loc=None, ip=None):
 
 
 @dsl_user_op
-def _load_epoch(ctrl, *, loc=None, ip=None):
+def _load_count(ctrl, *, loc=None, ip=None):
     value = llvm.inline_asm(
-        T.i32(),
+        T.i64(),
         [ctrl.ir_value(loc=loc, ip=ip)],
-        "ld.relaxed.gpu.global.u32 $0, [$1];",
-        "=r,l",
+        "ld.relaxed.gpu.global.u64 $0, [$1];",
+        "=l,l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
-    return Uint32(value)
+    return Uint64(value)
 
 
 @dsl_user_op
-def _finish(ctrl, grid, epoch, *, loc=None, ip=None):
-    """Count this CTA in; the last one resets the ticket and publishes ``epoch``."""
+def _finish(ctrl, grid, count, *, loc=None, ip=None):
+    """Count this CTA in; the last one resets the ticket and publishes ``count``."""
     code = (
         "{ .reg .u32 seen; .reg .pred last;\n"
-        "atom.add.acq_rel.gpu.global.u32 seen, [$0+4], 1;\n"
+        "atom.add.acq_rel.gpu.global.u32 seen, [$0+8], 1;\n"
         "add.u32 seen, seen, 1;\n"
         "setp.eq.u32 last, seen, $1;\n"
-        "@last st.relaxed.gpu.global.u32 [$0+4], 0;\n"
-        "@last st.relaxed.gpu.global.u32 [$0], $2; }"
+        "@last st.relaxed.gpu.global.u32 [$0+8], 0;\n"
+        "@last st.relaxed.gpu.global.u64 [$0], $2; }"
     )
-    _asm(code, "l,r,r", [ctrl, grid, epoch], loc, ip)
+    _asm(code, "l,r,l", [ctrl, grid, count], loc, ip)
 
 
 class LLExchange:
@@ -179,8 +183,10 @@ class LLExchange:
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         deadline = _globaltimer() + timeout
-        epoch = _load_epoch(ctrl) + Uint32(1)
-        sender_row = (Int64(epoch & Uint32(1)) * self.ranks + Int64(rank)) * Int64(cap)
+        count = _load_count(ctrl) + Uint64(1)
+        epoch = Uint32((count - Uint64(1)) % Uint64(0xFFFFFFFF) + Uint64(1))
+        parity = Int64(count & Uint64(1))
+        sender_row = (parity * self.ranks + Int64(rank)) * Int64(cap)
         total = Int64(self.ranks) * Int64(units)
         start = Int64(block) * THREADS + Int64(tid)
         stride = Int64(grid) * THREADS
@@ -199,7 +205,7 @@ class LLExchange:
                 i = i + stride
         # Receive: unit j of rank s from this rank's slot [parity][s][j].
         mine = peers[rank]
-        parity_row = Int64(epoch & Uint32(1)) * self.ranks
+        parity_row = parity * self.ranks
         i = start
         while i < total:
             s = i // Int64(units)
@@ -209,7 +215,7 @@ class LLExchange:
             i = i + stride
         cute.arch.sync_threads()
         if tid == 0:
-            _finish(ctrl, Uint32(grid), epoch)
+            _finish(ctrl, Uint32(grid), count)
 
 
 @functools.cache
@@ -244,7 +250,7 @@ class LLExchangeState:
             self.workspace = symm_mem.empty(
                 (slot_bytes,), dtype=torch.uint8, device=device
             )
-            # Epoch 0 marks every element unwritten; the first call's is 1.
+            # Epoch 0 marks every element unwritten; no call's epoch is 0.
             self.workspace.zero_()
             handle = symm_mem.rendezvous(self.workspace, group=group)
             self.handle = handle
@@ -252,7 +258,8 @@ class LLExchangeState:
                 list(handle.buffer_ptrs), dtype=torch.int64, device=device
             )
             self.multicast_ptr = int(handle.multicast_ptr) if multicast else 0
-            self.ctrl = torch.zeros(2, dtype=torch.int32, device=device)
+            # The call count, then the CTA ticket in the low half of word 1.
+            self.ctrl = torch.zeros(2, dtype=torch.int64, device=device)
             self.peers_view = from_dlpack(self.peers, assumed_align=8)
             self.sms = torch.cuda.get_device_properties(device).multi_processor_count
             for gather in (True, False):

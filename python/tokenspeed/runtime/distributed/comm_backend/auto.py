@@ -115,6 +115,12 @@ class Route(enum.Enum):
     TIERED = "tiered"
 
 
+def _aligned(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` contiguous at a 16-byte aligned address: itself, or a copy."""
+    tensor = tensor.contiguous()
+    return tensor.clone() if tensor.data_ptr() % 16 else tensor
+
+
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
@@ -674,17 +680,15 @@ class AutoBackend(CommBackend):
         Returns None where the exchange does not serve ``tensor``.
         """
         state = self._small_exchanges.get(group)
-        if (
-            state is None
-            or not state.serves(tensor.numel() * tensor.element_size())
-            or not tensor.is_contiguous()
-            or tensor.data_ptr() % 16
-        ):
+        # Only the size decides, which every rank of a call shares.
+        if state is None or not state.serves(tensor.numel() * tensor.element_size()):
             return None
+        from tokenspeed_kernel.ops.communication.cute_dsl import cute_dsl_ll_all_gather
+
         # NCCL's layout: rank blocks gathered along dim 0, then moved to ``dim``.
         world = len(group)
         gathered = tensor.new_empty((world * tensor.shape[0], *tensor.shape[1:]))
-        self.all_gather_single(gathered, tensor, group)
+        cute_dsl_ll_all_gather(state, _aligned(tensor), gathered)
         dim = dim + tensor.dim() if dim < 0 else dim
         if dim == 0:
             return gathered
@@ -746,7 +750,12 @@ class AutoBackend(CommBackend):
     def _small_exchange(
         self, output: torch.Tensor, input: torch.Tensor, group: Group, gather: bool
     ):
-        """The group's prepared LL exchange when it serves this call, else None."""
+        """The group's prepared LL exchange when it serves this call, else None.
+
+        Only sizes and the group decide, which every rank of a call shares;
+        a rank's unaligned or strided operands are staged locally
+        (``_run_small_exchange``).
+        """
         state = self._small_exchanges.get(group)
         if state is None:
             return None
@@ -755,33 +764,38 @@ class AutoBackend(CommBackend):
             if payload % len(group):
                 return None
             payload //= len(group)
-        # Only sizes and the group decide, which every rank of a call shares.
-        if (
-            not state.serves(payload)
-            or output.numel() * output.element_size() != payload * len(group)
-            or not input.is_contiguous()
-            or not output.is_contiguous()
-            or input.data_ptr() % 16
-            or output.data_ptr() % 16
-        ):
+        received = output.numel() * output.element_size()
+        if not state.serves(payload) or received != payload * len(group):
             return None
         return state
+
+    @staticmethod
+    def _run_small_exchange(
+        state, output: torch.Tensor, input: torch.Tensor, gather: bool
+    ) -> None:
+        """Run one LL call into ``output``, staging operands it cannot address."""
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_ll_all_gather,
+            cute_dsl_ll_all_to_all,
+        )
+
+        exchange = cute_dsl_ll_all_gather if gather else cute_dsl_ll_all_to_all
+        target = _aligned(output)
+        exchange(state, _aligned(input), target)
+        if target.data_ptr() != output.data_ptr():
+            output.copy_(target)
 
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         # Pure data movement: an input borrowed from Iris's pull exchange is
-        # pulled in place, every bit preserved.
-        if self._iris_reaches(group):
-            return self._iris.all_gather_single(output, input, group)
+        # pulled in place, every bit preserved. Only NVIDIA prepares the
+        # one-hop exchange, and Iris is AMD's.
         state = self._small_exchange(output, input, group, gather=True)
         if state is not None:
-            from tokenspeed_kernel.ops.communication.cute_dsl import (
-                cute_dsl_ll_all_gather,
-            )
-
-            cute_dsl_ll_all_gather(state, input, output)
-            return None
+            return self._run_small_exchange(state, output, input, gather=True)
+        if self._iris_reaches(group):
+            return self._iris.all_gather_single(output, input, group)
         return self._nccl.all_gather_single(output, input, group)
 
     def all_gather_single_async(
@@ -860,6 +874,12 @@ class AutoBackend(CommBackend):
     ) -> None:
         # Pure data movement: no reduction, so nothing to fold for the
         # batch-invariant envelope and no symmetric-memory path to veto.
+        even = output_split_sizes is None and input_split_sizes is None
+        state = (
+            self._small_exchange(output, input, group, gather=False) if even else None
+        )
+        if state is not None:
+            return self._run_small_exchange(state, output, input, gather=False)
         if self._iris_reaches(group):
             return self._iris.all_to_all_single(
                 output,
@@ -868,17 +888,6 @@ class AutoBackend(CommBackend):
                 output_split_sizes=output_split_sizes,
                 input_split_sizes=input_split_sizes,
             )
-        even = output_split_sizes is None and input_split_sizes is None
-        state = (
-            self._small_exchange(output, input, group, gather=False) if even else None
-        )
-        if state is not None:
-            from tokenspeed_kernel.ops.communication.cute_dsl import (
-                cute_dsl_ll_all_to_all,
-            )
-
-            cute_dsl_ll_all_to_all(state, input, output)
-            return None
         return self._nccl.all_to_all_single(
             output,
             input,

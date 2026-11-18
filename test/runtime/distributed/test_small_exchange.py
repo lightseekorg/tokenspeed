@@ -21,10 +21,10 @@
 """Prepared one-hop exchanges of small payloads (``prepare_small_exchange``).
 
 ``all_gather_single``, ``all_gather`` and equal-split ``all_to_all_single``
-calls that fit the prepared capacity run the backend's LL exchange; larger,
-unaligned and uneven calls keep NCCL. Both must move every bit unchanged,
-eager and under CUDA graph replay with new inputs; the NCCL-only switch keeps
-NCCL.
+calls that fit the prepared capacity run the backend's LL exchange, a rank's
+unaligned or strided operands staged locally; larger and uneven calls keep
+NCCL. Both must move every bit unchanged, eager and under CUDA graph replay
+with new inputs; the NCCL-only switch keeps NCCL.
 """
 
 import gc
@@ -98,20 +98,30 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
         assert prepare_small_exchange(group, _CAP, _TIMEOUT_NS)
         # A second caller of no larger capacity shares it.
         assert prepare_small_exchange(group, _CAP // 2, _TIMEOUT_NS)
+        state = backend._small_exchanges[group]
 
-        def gather(words: int, seed: int, offset: int = 0) -> None:
+        def calls() -> int:
+            """The exchange's device call count: which calls it ran."""
+            torch.cuda.synchronize()
+            return int(state.ctrl[0])
+
+        def gather(words: int, seed: int, offset: int = 0, *, ll: bool) -> None:
             payload = _bits(words + offset, seed + rank, device)[offset:]
             out = torch.empty(degree * words, dtype=torch.int32, device=device)
             expected = torch.empty_like(out)
+            before = calls()
             all_gather_single(out, payload, group)
+            assert calls() == before + ll
             nccl.all_gather_single(expected, payload, group)
             assert torch.equal(out, expected)
 
-        def exchange(words: int, seed: int) -> None:
+        def exchange(words: int, seed: int, *, ll: bool) -> None:
             payload = _bits(degree * words, seed + rank, device)
             out = torch.empty_like(payload)
             expected = torch.empty_like(payload)
+            before = calls()
             all_to_all_single(out, payload, group)
+            assert calls() == before + ll
             nccl.all_to_all_single(expected, payload, group)
             assert torch.equal(out, expected)
 
@@ -121,9 +131,16 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
             torch.empty(degree * 4096, dtype=torch.int32, device=device), fits, group, True  # fmt: skip
         )
         for words, seed in ((4, 10), (4096, 20), (_CAP // 4, 30)):
-            gather(words, seed)
-            exchange(words, seed + 1)
-        # ... oversized, unaligned and uneven calls keep NCCL.
+            gather(words, seed, ll=True)
+            exchange(words, seed + 1, ll=True)
+        # ... only sizes decide, so an unaligned operand takes it too ...
+        assert backend._small_exchange(
+            torch.empty(degree * 8, dtype=torch.int32, device=device),
+            torch.empty(9, dtype=torch.int32, device=device)[1:],
+            group,
+            True,
+        )
+        # ... oversized calls and payloads of partial units keep NCCL.
         assert not backend._small_exchange(
             torch.empty(degree * (_CAP // 4 + 4), dtype=torch.int32, device=device),
             torch.empty(_CAP // 4 + 4, dtype=torch.int32, device=device),
@@ -136,16 +153,30 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
             group,
             True,
         )
-        gather(_CAP // 4 + 4, 40)
-        gather(6, 50)
-        gather(8, 60, offset=1)
-        exchange(_CAP // 4 + 4, 70)
+        gather(_CAP // 4 + 4, 40, ll=False)
+        gather(6, 50, ll=False)
+        gather(8, 60, offset=1, ll=True)
+        exchange(_CAP // 4 + 4, 70, ll=False)
+        # Unaligned and strided outputs are staged and land in place.
+        payload = _bits(degree * 64, 72 + rank, device)
+        expected = torch.empty_like(payload)
+        nccl.all_to_all_single(expected, payload, group)
+        before = calls()
+        unaligned = torch.zeros(degree * 64 + 1, dtype=torch.int32, device=device)
+        all_to_all_single(unaligned[1:], payload, group)
+        assert torch.equal(unaligned[1:], expected) and int(unaligned[0]) == 0
+        strided = torch.zeros(degree * 64, 2, dtype=torch.int32, device=device)
+        assert not strided[:, 0].is_contiguous()
+        all_to_all_single(strided[:, 0], payload, group)
+        assert torch.equal(strided[:, 0], expected) and not strided[:, 1].any()
+        assert calls() == before + 2
         # A gather along an inner dim lays the rank blocks out as NCCL's does.
         rows = _bits(3 * 256, 75 + rank, device).view(3, 256)
         for dim in (0, -1):
-            assert torch.equal(
-                all_gather(rows, group, dim=dim), nccl.all_gather(rows, group, dim)
-            )
+            before = calls()
+            gathered = all_gather(rows, group, dim=dim)
+            assert calls() == before + 1
+            assert torch.equal(gathered, nccl.all_gather(rows, group, dim))
 
         # Graph replays of the exchange with new inputs.
         payload = _bits(1024, 80 + rank, device)

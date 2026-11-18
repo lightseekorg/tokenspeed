@@ -224,8 +224,10 @@ one store per peer otherwise; the receiver loads the elements until each
 carries the epoch. An aligned 64-bit element is single-copy atomic, so any
 payload bits pass and the output is byte-identical to NCCL's. Two parity slots
 alternate between calls: a rank writes a slot again only after receiving its
-peers' next call, which each sends after finishing the previous one. The epoch
-lives in device memory, so CUDA graph replays need no host state.
+peers' next call, which each sends after finishing the previous one. A 64-bit
+call count in device memory picks the parity and derives each call's 32-bit
+epoch, which skips 0, the zeroed workspace's, so an element no call wrote never
+matches; CUDA graph replays need no host state.
 
 `create_ll_exchange_state` is collective, votes every refusal (SM100 or SM103,
 2, 4 or 8 ranks, a capacity that is a multiple of 16, a reachable fabric) and
