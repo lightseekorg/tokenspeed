@@ -918,7 +918,17 @@ def test_shared_plane_ple_and_qsa_verify_commit(graph):
     context_id = qwen4_exp_ple_context_field(1)
     context, conv = ple.ple_verify_scratch(context_id, 1, 2)
     context.copy_(torch.arange(len(context), device="cuda")[:, None].expand_as(context))
-    conv.copy_(torch.arange(len(conv), device="cuda")[:, None, None].expand_as(conv))
+    batch, width = 2, 4
+    _, channels, state = conv.shape
+    history = (
+        torch.arange(batch * channels * (state + width), device=conv.device)
+        .reshape(batch, channels, state + width)
+        .remainder(127)
+        .to(conv.dtype)
+    )
+    scratch = conv.view(batch, width + 1, channels * state)
+    scratch[:, 0].copy_(history[:, :, :state].flatten(1))
+    scratch[:, 1:, :channels].copy_(history[:, :, state:].transpose(1, 2))
     qsa = QSAVerifyState(recipe.attn_config, pool)
     qsa.preallocate_verify_workspace(2, 4)
     recent_packing = arena.plan.group(
@@ -967,7 +977,10 @@ def test_shared_plane_ple_and_qsa_verify_commit(graph):
             arena.field(context_id)[page], context[source], atol=0, rtol=0
         )
         torch.testing.assert_close(
-            arena.field(qwen4_exp_ple_conv_field(1))[page], conv[source], atol=0, rtol=0
+            arena.field(qwen4_exp_ple_conv_field(1))[page],
+            history[request, :, steps : steps + state],
+            atol=0,
+            rtol=0,
         )
         for layer in (7, 8):
             raw = arena.field(qsa_raw_key_field(layer))[recent_blocks[request].item()]
