@@ -256,7 +256,11 @@ class EngineMetrics:
         self.time_to_first_token_seconds = factory.histogram(
             name="tokenspeed:time_to_first_token_seconds",
             documentation=(
-                "Wall time from request creation to its first output token, on this role."
+                "Wall time from request creation to this role's first output token. "
+                "On a decode role this is the first local decode output; a remote "
+                "prefill's bootstrap token alone does not end it, except when that "
+                "token ends the request, so the wait for a decode execution permit "
+                "is included."
             ),
             labelnames=labelnames,
             buckets=[
@@ -302,7 +306,10 @@ class EngineMetrics:
         )
         self.decode_time_seconds = factory.histogram(
             name="tokenspeed:decode_time_seconds",
-            documentation="Wall time from the first token to the request's end.",
+            documentation=(
+                "Wall time from this role's first output token to the request's end. "
+                "On a decode role this starts at the first local decode output."
+            ),
             labelnames=labelnames,
             buckets=[
                 0.001,
@@ -324,7 +331,12 @@ class EngineMetrics:
         )
         self.time_per_output_token_seconds = factory.histogram(
             name="tokenspeed:time_per_output_token_seconds",
-            documentation="Decode time divided by generated tokens after the first one.",
+            documentation=(
+                "Decode time divided by generated tokens after the first one. On a "
+                "decode role the decode time starts at the first local decode output, "
+                "so a wait for a decode execution permit is in time-to-first-token, "
+                "not here."
+            ),
             labelnames=labelnames,
             buckets=[
                 0.001,

@@ -19,6 +19,9 @@ first decode hold a request row and KV pages but no execution permit. All
 these requests share one pool; extra rows are not a dedicated transfer pool.
 
 On a D role, the first local decode acquires a move-only permit and keeps it across rounds.
+The wait for that first permit is a time-to-first-token cost: the first-token
+boundary is the first local decode output, so `decode_ready_wait_seconds`
+lies inside TTFT and outside TPOT.
 Permit admission for a newly completed prefill does not displace an
 already streaming request; KV-capacity recovery follows the victim policy below.
 Restoring a Decoding request reserves a permit before issuing the restore;

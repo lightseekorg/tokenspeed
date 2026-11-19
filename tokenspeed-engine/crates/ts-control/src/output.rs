@@ -888,10 +888,15 @@ impl OutputProcessor {
         }
         state.finished_output = false;
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+            )
+            .into_iter()
+            .collect();
         }
         self.log_end(rid, &state);
         self.trace_end(rid, &state);
@@ -899,8 +904,11 @@ impl OutputProcessor {
         committed
     }
 
-    /// D role: the prefill node's KV landed. Its first token joins the
-    /// output, which streams with the next commit.
+    /// D role: the prefill node's KV landed. Its bootstrap token joins the
+    /// output, which streams with the next local commit. The landing closes
+    /// the queue/prefill boundary but does not start the decode window: the
+    /// first local decode output is the role's first token, so a wait for a
+    /// decode permit stays in TTFT rather than TPOT.
     pub fn remote_prefill_done(
         &mut self,
         rid: &str,
@@ -922,14 +930,12 @@ impl OutputProcessor {
         if let Some(tokens) = &mut state.reasoning_tokens {
             tokens.push([bootstrap_token]);
         }
-        if (self.metrics_enabled || state.timings.is_some()) && state.first_token_time == 0.0 {
-            // The decode node never samples this token; its arrival is the
-            // decode role's first-token boundary.
-            state.first_token_time = wall_seconds();
-            if let Some(timings) = state.timings.as_mut() {
-                timings.mark_prefill_done(state.first_token_time);
-                timings.mark_first_token(state.first_token_time);
-            }
+        if let Some(timings) = state.timings.as_mut() {
+            // The remote bootstrap token is not this role's first output.
+            // Its landing closes the prefill/queue boundary; the first
+            // local decode commit stamps `first_token_time`, so the wait for
+            // a decode permit is TTFT, not decode time.
+            timings.mark_prefill_done(wall_seconds());
         }
         if state.return_logprob {
             match bootstrap_logprob {
@@ -973,10 +979,15 @@ impl OutputProcessor {
         }
         let mut state = self.states.remove(rid).expect("present above");
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+            )
+            .into_iter()
+            .collect();
         }
         let kind = if state.to_abort {
             ForwardEventKind::Abort
@@ -1002,10 +1013,15 @@ impl OutputProcessor {
             state.abort("PD/EPD remote transfer failed or timed out", true, None);
         }
         if state.abort_notify_client {
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+            )
+            .into_iter()
+            .collect();
         }
         self.log_finished(rid, &state);
         self.trace_end(rid, &state);
@@ -1057,9 +1073,15 @@ impl OutputProcessor {
         }
         state.finished_output = false;
         self.log_finished(rid, &state);
-        Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-            .into_iter()
-            .collect()
+        Self::stream_state(
+            rid,
+            &mut state,
+            self.stream_interval,
+            self.spec_num_tokens,
+            self.metrics_enabled,
+        )
+        .into_iter()
+        .collect()
     }
 
     /// The ids of the requests registered and not ended.
@@ -1077,10 +1099,15 @@ impl OutputProcessor {
         };
         if state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+            )
+            .into_iter()
+            .collect();
         }
         self.log_finished(rid, &state);
         committed.released.push(rid.to_owned());
@@ -1105,10 +1132,15 @@ impl OutputProcessor {
         }
         if !state.to_abort || state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+            )
+            .into_iter()
+            .collect();
         }
         self.log_end(rid, &state);
         self.trace_end(rid, &state);
@@ -1135,6 +1167,7 @@ impl OutputProcessor {
                     &mut state,
                     self.stream_interval,
                     self.spec_num_tokens,
+                    self.metrics_enabled,
                 ));
             } else if state.abort_notify_client {
                 committed.outputs.extend(Self::stream_state(
@@ -1142,6 +1175,7 @@ impl OutputProcessor {
                     &mut state,
                     self.stream_interval,
                     self.spec_num_tokens,
+                    self.metrics_enabled,
                 ));
             }
             self.log_end(&abort.request_id, &state);
@@ -1586,6 +1620,9 @@ impl OutputProcessor {
             if is_decode && self.metrics_enabled {
                 self.generated_tokens += (state.output_ids.len() - before) as u64;
             }
+            // The role's first output token. On a decode role this is the
+            // first local decode commit, after any wait for a decode permit;
+            // a remote prefill's bootstrap token alone does not stamp it.
             if (self.metrics_enabled || state.timings.is_some())
                 && state.first_token_time == 0.0
                 && !state.output_ids.is_empty()
@@ -1683,9 +1720,25 @@ impl OutputProcessor {
         state: &mut RequestState,
         stream_interval: i64,
         spec_num_tokens: Option<usize>,
+        metrics_enabled: bool,
     ) -> Option<StreamedOutput> {
         if !state.output_due(stream_interval) {
             return None;
+        }
+        // The normal path stamps `first_token_time` at the first local decode
+        // commit. A decode request that finishes at landing has no such
+        // commit: its bootstrap token is the only output. This fallback
+        // covers that case (and any terminal stream before a commit) without
+        // making a non-streaming request wait for its forced flush.
+        if (metrics_enabled || state.timings.is_some())
+            && state.first_token_time == 0.0
+            && !state.output_ids.is_empty()
+        {
+            let first = wall_seconds();
+            state.first_token_time = first;
+            if let Some(timings) = state.timings.as_mut() {
+                timings.mark_first_token(first);
+            }
         }
         if state.finished() {
             state.finished_output = true;
@@ -1763,12 +1816,13 @@ impl OutputProcessor {
     fn stream(&mut self, rids: &[&str], released: &mut Vec<String>) -> Vec<StreamedOutput> {
         let interval = self.stream_interval;
         let spec = self.spec_num_tokens;
+        let metrics_enabled = self.metrics_enabled;
         let mut outputs = Vec::with_capacity(rids.len());
         for &rid in rids {
             let Some(state) = self.states.get_mut(rid) else {
                 continue;
             };
-            if let Some(output) = Self::stream_state(rid, state, interval, spec) {
+            if let Some(output) = Self::stream_state(rid, state, interval, spec, metrics_enabled) {
                 outputs.push(output);
             }
             if state.finished() {
@@ -2224,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn a_decode_landing_sets_the_first_token_boundary_and_reasoning_usage() {
+    fn a_decode_landing_seeds_the_bootstrap_without_starting_the_decode_window() {
         let mut p =
             OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
         register(&mut p, "a", 4, 8, &[]);
@@ -2243,13 +2297,13 @@ mod tests {
         ));
         p.remote_prefill_done("a", 7, 0, None);
         let state = p.state("a").expect("still registered");
-        assert!(state.first_token_time > 0.0);
+        assert_eq!(state.first_token_time, 0.0);
         assert_eq!(state.output_ids, vec![7]);
         assert_eq!(state.reasoning_tokens.unwrap().count(), 1);
     }
 
     #[test]
-    fn decode_request_stats_use_the_bootstrap_arrival_without_an_exporter() {
+    fn decode_request_stats_start_at_the_first_local_output_without_an_exporter() {
         let mut p = OutputProcessor::new(
             None,
             1,
@@ -2265,9 +2319,11 @@ mod tests {
         );
         register(&mut p, "r", 3, 8, &[]);
         p.remote_prefill_done("r", 9, 0, None);
-        let first = p.state("r").unwrap().first_token_time;
+        assert_eq!(p.state("r").unwrap().first_token_time, 0.0);
         p.commit(&batch(&[("r", 1, 0, 3)], 0), None, &result(&[10], &[1]))
             .unwrap();
+        let first = p.state("r").unwrap().first_token_time;
+        assert!(first > 0.0);
         let state = p.states.get_mut("r").unwrap();
         state.created_time = first - 1.0;
         let line = request_stats::stats_line(
@@ -2887,7 +2943,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_trace_starts_at_the_remote_token_before_local_dispatch() {
+    fn decode_trace_starts_at_the_first_local_output() {
         for (max_new, metrics_enabled) in [(1, false), (1, true), (2, false), (2, true)] {
             let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
             let mut p = OutputProcessor::new(
@@ -2909,8 +2965,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .trace_points();
-            assert!(first_token > 0.0, "stamp arrival before any local decode");
-            assert_eq!(prefill_done, first_token);
+            assert!(prefill_done > 0.0, "stamp KV landing");
+            assert_eq!(first_token, 0.0, "the remote token does not start decode");
             if max_new == 1 {
                 assert_eq!(p.finish_remote_prefill_only("r").released, ["r"]);
             } else {
@@ -2923,17 +2979,18 @@ mod tests {
             }
             let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(record.role, Role::Decode);
-            assert_eq!(record.first_token, first_token);
+            assert!(record.first_token > 0.0, "stamp the first local output");
+            assert!(record.first_token >= prefill_done);
             assert_eq!(record.prefill_done, prefill_done);
             assert_eq!(record.output_tokens, max_new);
             if max_new == 1 {
                 assert_eq!(record.scheduled, 0.0);
             } else {
-                assert!(record.scheduled >= first_token);
+                assert!(record.scheduled <= record.first_token);
             }
             let metrics = p.take_request_metrics();
             if metrics_enabled {
-                assert_eq!(metrics.ttft_seconds, [first_token - record.created]);
+                assert_eq!(metrics.ttft_seconds, [record.first_token - record.created]);
                 assert_eq!(metrics.request_seconds.len(), 1);
                 assert_eq!(metrics.decode_seconds.len(), 1);
                 assert_eq!(metrics.tpot_seconds.len(), usize::from(max_new > 1));
