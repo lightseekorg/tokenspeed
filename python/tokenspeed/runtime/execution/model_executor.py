@@ -157,6 +157,7 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -323,6 +324,12 @@ def select_dspark_context_producer(
             "pipeline stages."
         )
     return None
+
+
+@runtime_checkable
+class MoESourceRowsModel(Protocol):
+    @property
+    def moe_source_rows(self) -> MoESourceRows | None: ...
 
 
 @runtime_checkable
@@ -1051,6 +1058,13 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            moe_source_rows=tuple(
+                rows
+                for runner in (self.model_runner, self._draft_model_runner)
+                if runner is not None
+                and isinstance(runner.model, MoESourceRowsModel)
+                and (rows := runner.model.moe_source_rows) is not None
+            ),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the

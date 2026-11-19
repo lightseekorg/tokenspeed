@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlatQuant INT4 preparation and explicitly selected expert implementations."""
+"""FlatQuant INT4 weight preparation and composed Prefill experts."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -66,11 +66,14 @@ class FlatQuantStage:
 class W4A4MoePlan:
     w13: torch.Tensor
     w2: torch.Tensor
-    scale13: torch.Tensor
-    scale2: torch.Tensor
+    # FP32 Decode scales are omitted from a Prefill-only grouped view.
+    scale13: torch.Tensor | None
+    scale2: torch.Tensor | None
     first: FlatQuantStage
     second: FlatQuantStage
     transposed: bool
+    # Decode keeps its checkpoint packing; official GMM needs NN/N-packed INT4.
+    prefill_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -80,14 +83,27 @@ class W4A4GroupedPlan:
     scale2: torch.Tensor
 
 
-def prepare_w4a4_grouped_plan(weights: W4A4MoePlan) -> W4A4GroupedPlan:
-    """Encode official GMM scales once; share the fused path's NZ weights."""
+def prepare_w4a4_grouped_plan(
+    weights: W4A4MoePlan, *, prefill_only: bool
+) -> W4A4GroupedPlan:
+    """Select the Prefill NZ weights and encode the official GMM scales."""
 
     def encode(scale):
         bits = scale.cpu().contiguous().view(torch.int32).to(torch.int64)
         return (bits & 0xFFFFFFFF).view(torch.uint64).unsqueeze(1).to(scale.device)
 
-    return W4A4GroupedPlan(weights, encode(weights.scale13), encode(weights.scale2))
+    if weights.prefill_weights is not None:
+        weights = replace(
+            weights,
+            w13=weights.prefill_weights[0],
+            w2=weights.prefill_weights[1],
+            transposed=False,
+            prefill_weights=None,
+        )
+    scale13, scale2 = encode(weights.scale13), encode(weights.scale2)
+    if prefill_only:
+        weights = replace(weights, scale13=None, scale2=None)
+    return W4A4GroupedPlan(weights, scale13, scale2)
 
 
 def w4a4_grouped_experts(
@@ -192,14 +208,13 @@ def w4a4_grouped_experts(
     )
 
 
-def prepare_flatquant_stage(left, right, clip, *, width: int) -> FlatQuantStage:
+def prepare_flatquant_stage(left, right, clip) -> FlatQuantStage:
     """Validate and prepare constants once, before graph capture."""
     if (
         left.ndim != 2
         or right.ndim != 2
         or left.shape[0] != left.shape[1]
         or right.shape[0] != right.shape[1]
-        or left.shape[0] * right.shape[0] != width
         or left.dtype != torch.bfloat16
         or right.dtype != torch.bfloat16
         or left.device != right.device
@@ -217,15 +232,18 @@ def prepare_flatquant_stage(left, right, clip, *, width: int) -> FlatQuantStage:
 
 
 def prepare_w4a4_moe_weights(
-    w13, w2, scale13, scale2, first, second, *, transposed: bool
+    w13, w2, scale13, scale2, first, second, *, transposed: bool, role: str
 ) -> W4A4MoePlan:
     """Convert checkpoint INT32 tensors to NZ without changing their INT4 layout.
 
     Input checkpoint shapes are [E,N,K/8] (transposed) or [E,N/8,K].
-    Returned non-transposed weights are [E,K,N/8]; transposed weights remain
-    [E,N,K/8]. The consumer must honor ``transposed`` for BOTH GEMMs.
-    Scales remain FP32 [E,N] for fused DSQ, not official-GMM packed UINT64.
+    Fused Decode uses [E,K,N/8] or [E,N,K/8] according to ``transposed``.
+    Prefill needs the eight packed output channels contiguous in each word.
+    The unified role ("null") retains both layouts for NT checkpoints. Scales
+    remain FP32 [E,N] until the grouped plan encodes them for official GMM.
     """
+    if role not in ("prefill", "decode", "null"):
+        raise ValueError(f"Unsupported W4A4 service role {role!r}")
     if type(transposed) is not bool:
         raise ValueError("W4A4 transpose selection must be a boolean")
     if (
@@ -276,23 +294,19 @@ def prepare_w4a4_moe_weights(
         raise ValueError("FlatQuant transforms do not match the GEMM input widths")
     import torch_npu
 
-    def to_nz(weight):
-        if torch_npu.get_npu_format(weight) == 29:
-            raise ValueError(
-                "W4A4 checkpoint weights are already NZ; do not prepare twice"
-            )
-        if not transposed:
-            weight = weight.transpose(1, 2)
-        # 910B uses the dedicated INT4 converter: customize_dtype=3 is not
-        # supported there. Merge experts along NZ's outer (column-tile) axis
-        # so each expert occupies one contiguous physical NZ block.
-        values = unpack_int4(weight)
+    def values_to_nz(values):
         experts, rows, cols = values.shape
         if rows % 16 or cols % 64:
             raise ValueError(
                 "910B INT4 NZ requires storage rows/columns aligned to 16/64"
             )
-        merged = values.permute(1, 0, 2).reshape(rows, experts * cols).to(torch.int32)
+        # Expert blocks remain contiguous on NZ's outer column-tile axis.
+        merged = (
+            values.permute(1, 0, 2)
+            .reshape(rows, experts * cols)
+            .to(torch.int32)
+            .contiguous()
+        )
         from tokenspeed_kernel_npu.ops.gemm import prepare_weight_nz
 
         nz = prepare_weight_nz(merged)
@@ -305,125 +319,36 @@ def prepare_w4a4_moe_weights(
             config.allow_internal_format = previous
         return packed.view(experts, rows, cols // 8)
 
+    def to_nz(weight):
+        if torch_npu.get_npu_format(weight) == 29:
+            raise ValueError(
+                "W4A4 checkpoint weights are already NZ; do not prepare twice"
+            )
+        if not transposed:
+            weight = weight.transpose(1, 2)
+        values = unpack_int4(weight)
+        if transposed and role == "prefill":
+            return values_to_nz(values.transpose(1, 2)), None
+        base = values_to_nz(values)
+        # Transposing packed words leaves the nibbles on K. Repack logical
+        # INT4 values so official Prefill GMM gets [E,K,N/8]; preserve the
+        # original NT packing and flag used by the fused Decode operation.
+        prefill = (
+            values_to_nz(values.transpose(1, 2))
+            if transposed and role == "null"
+            else None
+        )
+        return base, prefill
+
+    base13, prefill13 = to_nz(w13)
+    base2, prefill2 = to_nz(w2)
     return W4A4MoePlan(
-        to_nz(w13),
-        to_nz(w2),
+        base13,
+        base2,
         scale13.contiguous(),
         scale2.contiguous(),
         first,
         second,
-        transposed,
-    )
-
-
-def require_fused_flatquant(op) -> None:
-    """Refuse the old smooth-only ABI rather than silently miscompute W4A4."""
-    required = {
-        "quant_mode": "str",
-        "flatquant13_left": "Optional[Tensor]",
-        "flatquant13_right": "Optional[Tensor]",
-        "flatquant2_left": "Optional[Tensor]",
-        "flatquant2_right": "Optional[Tensor]",
-        "clip13": "float",
-        "clip2": "float",
-        "weight_transposed": "bool",
-    }
-    arguments = {arg.name: str(arg.type) for arg in op._schema.arguments}
-    if any(arguments.get(name) != dtype for name, dtype in required.items()):
-        raise RuntimeError(
-            "fused_mm13_mm2 lacks the FlatQuant W4A4/NZ-transpose ABI; "
-            "rebuild the operator with transform/clip/layout inputs. "
-            "The smooth-only INT4 ABI is not compatible; split fallback is disabled."
-        )
-
-
-def ascend_int4_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
-    """Prepare constants for the explicitly selected fused FlatQuant solution."""
-    import flash_ops  # noqa: F401
-
-    op = torch.ops.custom.fused_mm13_mm2.default
-    require_fused_flatquant(op)
-    if w._int4_plan is not None:
-        return
-    if len(w._int4_loaded) != 6 * w.num_local_experts:
-        raise ValueError("Missing W4A4 expert weights/scales")
-    for module in (w.w1_trans, w.w2_trans, w.act_quantizer_w1, w.act_quantizer_w2):
-        module.validate_loaded()
-    first = prepare_flatquant_stage(
-        w.w1_trans.matrix_left,
-        w.w1_trans.matrix_right,
-        w.act_quantizer_w1.clip_factor_a,
-        width=w.hidden_size,
-    )
-    second = prepare_flatquant_stage(
-        w.w2_trans.matrix_left,
-        w.w2_trans.matrix_right,
-        w.act_quantizer_w2.clip_factor_a,
-        width=w.intermediate_size,
-    )
-    w._int4_plan = prepare_w4a4_moe_weights(
-        w.w13_weight,
-        w.w2_weight,
-        w.w13_weight_scale,
-        w.w2_weight_scale,
-        first,
-        second,
-        transposed=w.w4a4_gmm_is_transposed,
-    )
-    w.w13_weight.data = w._int4_plan.w13
-    w.w2_weight.data = w._int4_plan.w2
-    plan["routed_chain_op"] = op
-    plan.setdefault("expert_start", w.ep_rank * w.num_local_experts)
-    plan["routed_chain_boundary"] = torch.zeros(
-        25, dtype=torch.int32, device=w.w13_weight.device
-    )
-
-
-def ascend_int4_precomputed_moe_apply(
-    *,
-    plan,
-    x,
-    w,
-    router_logits,
-    topk_weights=None,
-    topk_ids=None,
-    num_tokens_global=None,
-    max_num_tokens_per_gpu=None,
-    do_finalize=True,
-    enable_pdl=False,
-):
-    """Invoke only the fused operator; dispatch and EP combine remain external."""
-    if (
-        not do_finalize
-        or enable_pdl
-        or plan.get("activation") not in {"silu", "swiglu"}
-    ):
-        raise ValueError("FlatQuant fused MoE requires finalized SwiGLU without PDL")
-    if topk_ids is None or topk_weights is None or topk_ids.shape != topk_weights.shape:
-        raise ValueError("FlatQuant fused MoE requires matching precomputed TopK")
-    if w._int4_plan is None:
-        raise RuntimeError("FlatQuant fused MoE weights were not prepared")
-    state = w._int4_plan
-    boundary = plan["routed_chain_boundary"]
-    return plan["routed_chain_op"](
-        x.contiguous(),
-        topk_ids.to(torch.int32).contiguous(),
-        state.w13,
-        state.scale13,
-        state.w2,
-        state.scale2,
-        topk_weights.contiguous(),
-        boundary,
-        boundary,
-        boundary,
-        expert_start=plan["expert_start"],
-        quant_bits=4,
-        quant_mode="flatquant",
-        flatquant13_left=state.first.left,
-        flatquant13_right=state.first.right,
-        flatquant2_left=state.second.left,
-        flatquant2_right=state.second.right,
-        clip13=state.first.clip,
-        clip2=state.second.clip,
-        weight_transposed=state.transposed,
+        transposed and role != "prefill",
+        (prefill13, prefill2) if prefill13 is not None else None,
     )

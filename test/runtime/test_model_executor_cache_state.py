@@ -176,6 +176,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
 
     executor.attn_backend = CachePoolBinding()
     executor.device_module = SimpleNamespace(current_stream=lambda: None)
+    executor.forward_step = SimpleNamespace(draft_overlap=None)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([0]),
         state_write_req_pool_indices_buf=torch.tensor([0]),
@@ -255,10 +256,12 @@ def test_non_spec_decode_routes_through_verify():
     executor.sampling_backend = SimpleNamespace(
         supports_packed_verify=False,
         sample=lambda *_a, **_k: calls.append("sample") or (None, None),
-        verify=lambda _lo, _si, cand, tree: calls.append(("verify", tuple(cand.shape)))
-        or (
-            torch.zeros(cand.shape[0], dtype=torch.int32),
-            torch.ones(cand.shape[0], dtype=torch.int32),
+        verify=lambda _lo, _si, cand, tree: (
+            calls.append(("verify", tuple(cand.shape)))
+            or (
+                torch.zeros(cand.shape[0], dtype=torch.int32),
+                torch.ones(cand.shape[0], dtype=torch.int32),
+            )
         ),
     )
 

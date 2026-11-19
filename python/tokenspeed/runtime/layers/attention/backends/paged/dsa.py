@@ -303,6 +303,9 @@ class DSABackend(PagedAttentionBackend):
     slots through the same page table.
     """
 
+    # Subclasses owning both numerical forwards reuse metadata, not these plans.
+    _uses_builtin_attention = True
+
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
     _make_dense_leaf = staticmethod(_make_dense_leaf)
 
@@ -409,7 +412,7 @@ class DSABackend(PagedAttentionBackend):
         self.kernel_solution: str | None = None
         self.prefill_kernel_plan = None
         self.decode_kernel_plan = None
-        if self.batch_invariant:
+        if self.batch_invariant and self._uses_builtin_attention:
             signature = format_signature(q=dense_tensor_format(self.q_data_type))
             traits = {
                 "qk_nope_head_dim": self.qk_nope_head_dim,
@@ -525,7 +528,8 @@ class DSABackend(PagedAttentionBackend):
             # eager attention break; a captured prefill would replay the
             # dummy's gather. Overrides the KPool consumer's declaration too.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
-            self._probe_history_gather_topk_leaf(spec)
+            if self._uses_builtin_attention:
+                self._probe_history_gather_topk_leaf(spec)
         # A pure KVP extend over gathered histories attends each request
         # group's history in the eager attention break, as the sharded extend
         # arm does, so prefill capture is off here too -- except under K3.1's
@@ -594,6 +598,8 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA cache geometry does not match KVP topology")
         self.kvp_block_granularity = block_granularity
         self.kvp_virtual_block_count = virtual_block_count
+        if not self._uses_builtin_attention:
+            return
         # Probed here: a router's solution pin lands after construction.
         self._kvp_decode_solution = self._probe_kvp_decode_solution()
         self._dcp_records_core = self._probe_dcp_records_core()
