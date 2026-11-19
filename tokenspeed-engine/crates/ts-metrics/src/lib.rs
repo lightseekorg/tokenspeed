@@ -706,7 +706,10 @@ impl EngineMetrics {
                 "tokenspeed:time_per_output_token_seconds",
                 "Decode time divided by generated tokens after the first one. On a decode \
                  role the decode time starts at the first local decode output, so a wait \
-                 for a decode execution permit is in time-to-first-token, not here.",
+                 for a decode execution permit is in time-to-first-token, not here. The \
+                 bootstrap token and the first local token are delivered together, so the \
+                 first interval is zero; this is the client-observed average, not the local \
+                 step rate.",
                 names,
                 &[
                     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,

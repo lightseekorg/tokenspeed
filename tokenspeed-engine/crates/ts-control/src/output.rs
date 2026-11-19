@@ -666,8 +666,9 @@ impl OutputProcessor {
     ///
     /// A prefill role's request ends when its KV transfer completes, so its
     /// request time includes the transfer; a decode role's request ends
-    /// after generation, and its decode time starts when the bootstrap token
-    /// landed. Both report the role-local views fluentllm's P/D servers do.
+    /// after generation, and its decode time starts at its first local
+    /// decode output, after the bootstrap token landed. Both report the
+    /// role-local views fluentllm's P/D servers do.
     fn collect_request_latencies(&mut self, state: &RequestState) {
         let created = state.created_time;
         if created <= 0.0 {

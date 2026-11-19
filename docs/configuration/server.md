@@ -1411,7 +1411,7 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `ttft_ms` | Request-supplied `created_time` → this role's first output token. On a decode node the endpoint is the first local decode output, or the bootstrap token when that token ends the request; the remote bootstrap token's landing only starts `decode_wait_ms`, so a wait for a decode execution permit is included. |
 | `total_ms` | Request-supplied `created_time` → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
-| `decode_tps` | Decode throughput (generated tokens / decode window). On a decode node the window starts at the first local decode output, so queue, prefill and the decode admission wait are excluded. |
+| `decode_tps` | Decode throughput (generated tokens / decode window). On a decode node the window starts at the first local decode output, so queue, prefill and the decode admission wait are excluded. The bootstrap token and the first local token are delivered together, so the metric counts one zero interval: it is the client-observed average, not the local decode step rate. |
 | `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
 | `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for request-supplied creation / first dispatch / finish. `recv_ts` is copied from `created_time`, not stamped by the Rust transport. |
 

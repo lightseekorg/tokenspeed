@@ -36,7 +36,7 @@
 # HELP tokenspeed:spec_decode_num_accepted_tokens_total Accepted speculative draft tokens (excludes the bonus token sampled after verify).
 # HELP tokenspeed:spec_decode_num_draft_tokens_total Draft tokens proposed across verify steps.
 # HELP tokenspeed:spec_decode_num_drafts_total Number of speculative verify rounds (per request-slot).
-# HELP tokenspeed:time_per_output_token_seconds Decode time divided by generated tokens after the first one. On a decode role the decode time starts at the first local decode output, so a wait for a decode execution permit is in time-to-first-token, not here.
+# HELP tokenspeed:time_per_output_token_seconds Decode time divided by generated tokens after the first one. On a decode role the decode time starts at the first local decode output, so a wait for a decode execution permit is in time-to-first-token, not here. The bootstrap token and the first local token are delivered together, so the first interval is zero; this is the client-observed average, not the local step rate.
 # HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to this role's first output token. On a decode role this is the first local decode output; a remote prefill's bootstrap token alone does not end it, except when that token ends the request, so the wait for a decode execution permit is included.
 # TYPE tokenspeed:cache_hit_tokens_total counter
 # TYPE tokenspeed:completion_tokens_total counter
