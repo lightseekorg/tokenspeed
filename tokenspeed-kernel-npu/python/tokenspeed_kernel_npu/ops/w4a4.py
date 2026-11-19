@@ -20,7 +20,7 @@
 
 """FlatQuant INT4 weight preparation and composed Prefill experts."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -70,6 +70,8 @@ class W4A4MoePlan:
     first: FlatQuantStage
     second: FlatQuantStage
     transposed: bool
+    # Decode keeps its checkpoint packing; official GMM needs NN/N-packed INT4.
+    prefill_weights: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -80,12 +82,20 @@ class W4A4GroupedPlan:
 
 
 def prepare_w4a4_grouped_plan(weights: W4A4MoePlan) -> W4A4GroupedPlan:
-    """Encode official GMM scales once; share the fused path's NZ weights."""
+    """Select the Prefill NZ weights and encode the official GMM scales."""
 
     def encode(scale):
         bits = scale.cpu().contiguous().view(torch.int32).to(torch.int64)
         return (bits & 0xFFFFFFFF).view(torch.uint64).unsqueeze(1).to(scale.device)
 
+    if weights.prefill_weights is not None:
+        weights = replace(
+            weights,
+            w13=weights.prefill_weights[0],
+            w2=weights.prefill_weights[1],
+            transposed=False,
+            prefill_weights=None,
+        )
     return W4A4GroupedPlan(weights, encode(weights.scale13), encode(weights.scale2))
 
 
@@ -202,9 +212,10 @@ def prepare_w4a4_moe_weights(
     """Convert checkpoint INT32 tensors to NZ without changing their INT4 layout.
 
     Input checkpoint shapes are [E,N,K/8] (transposed) or [E,N/8,K].
-    Returned non-transposed weights are [E,K,N/8]; transposed weights remain
-    [E,N,K/8]. The consumer must honor ``transposed`` for BOTH GEMMs.
-    Scales remain FP32 [E,N] for fused DSQ, not official-GMM packed UINT64.
+    Fused Decode uses [E,K,N/8] or [E,N,K/8] according to ``transposed``.
+    Prefill needs the eight packed output channels contiguous in each word.
+    NT checkpoints therefore also get an [E,K,N/8] representation. Scales
+    remain FP32 [E,N] until the grouped plan encodes them for official GMM.
     """
     if type(transposed) is not bool:
         raise ValueError("W4A4 transpose selection must be a boolean")
@@ -256,23 +267,19 @@ def prepare_w4a4_moe_weights(
         raise ValueError("FlatQuant transforms do not match the GEMM input widths")
     import torch_npu
 
-    def to_nz(weight):
-        if torch_npu.get_npu_format(weight) == 29:
-            raise ValueError(
-                "W4A4 checkpoint weights are already NZ; do not prepare twice"
-            )
-        if not transposed:
-            weight = weight.transpose(1, 2)
-        # 910B uses the dedicated INT4 converter: customize_dtype=3 is not
-        # supported there. Merge experts along NZ's outer (column-tile) axis
-        # so each expert occupies one contiguous physical NZ block.
-        values = unpack_int4(weight)
+    def values_to_nz(values):
         experts, rows, cols = values.shape
         if rows % 16 or cols % 64:
             raise ValueError(
                 "910B INT4 NZ requires storage rows/columns aligned to 16/64"
             )
-        merged = values.permute(1, 0, 2).reshape(rows, experts * cols).to(torch.int32)
+        # Expert blocks remain contiguous on NZ's outer column-tile axis.
+        merged = (
+            values.permute(1, 0, 2)
+            .reshape(rows, experts * cols)
+            .to(torch.int32)
+            .contiguous()
+        )
         from tokenspeed_kernel_npu.ops.gemm import prepare_weight_nz
 
         nz = prepare_weight_nz(merged)
@@ -285,12 +292,30 @@ def prepare_w4a4_moe_weights(
             config.allow_internal_format = previous
         return packed.view(experts, rows, cols // 8)
 
+    def to_nz(weight):
+        if torch_npu.get_npu_format(weight) == 29:
+            raise ValueError(
+                "W4A4 checkpoint weights are already NZ; do not prepare twice"
+            )
+        if not transposed:
+            weight = weight.transpose(1, 2)
+        values = unpack_int4(weight)
+        base = values_to_nz(values)
+        # Transposing packed words leaves the nibbles on K. Repack logical
+        # INT4 values so official Prefill GMM gets [E,K,N/8]; preserve the
+        # original NT packing and flag used by the fused Decode operation.
+        prefill = values_to_nz(values.transpose(1, 2)) if transposed else None
+        return base, prefill
+
+    base13, prefill13 = to_nz(w13)
+    base2, prefill2 = to_nz(w2)
     return W4A4MoePlan(
-        to_nz(w13),
-        to_nz(w2),
+        base13,
+        base2,
         scale13.contiguous(),
         scale2.contiguous(),
         first,
         second,
         transposed,
+        (prefill13, prefill2) if transposed else None,
     )

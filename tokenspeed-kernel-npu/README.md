@@ -44,10 +44,11 @@ RMSNorm accepts FP32 checkpoint scales with BF16 activations. It promotes mixed
 inputs for the CANN operation and returns the activation dtype, preserving the
 caller's output buffer and residual storage.
 
-The Ascend plugin's explicit prefill composition can prepare a
-`W4A4GroupedPlan` from the prepared W4A4 weights. The standalone INT4
-`moe/apply` chain is removed; complete Decode owns its fused execution. Prefill shares NZ
-weights, encodes official GMM scales once, and executes Cube FlatQuant before
+The Ascend plugin prepares a `W4A4GroupedPlan` for Prefill. Fused Decode and
+Prefill share the weights for NN checkpoints. For an NT checkpoint the loader
+keeps Decode's NZ layout and also packs the output channels into INT4 words
+for Prefill GMM.
+Prefill encodes official GMM scales once and executes Cube FlatQuant before
 official InitRouting, GMM13, SwiGLU, Cube FlatQuant, GMM2, and FinalizeRouting.
 The caller supplies token-major expert IDs, route weights, and its local
 expert interval. InitRouting copies packed INT4 bytes and FP32 scales with

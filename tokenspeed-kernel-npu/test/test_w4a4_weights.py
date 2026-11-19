@@ -88,11 +88,10 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
         torch.randn(8, 8).bfloat16(),
         torch.tensor([0.9]),
     )
-    calls = []
 
     def cast(tensor, fmt):
         assert tensor.is_contiguous()
-        calls.append(fmt)
+        assert fmt == 29
         return tensor.clone()
 
     def convert(tensor):
@@ -125,12 +124,17 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
     plan = prepare_w4a4_moe_weights(
         w13, w2, s13, s2, first, second, transposed=transposed
     )
-    assert calls == [29, 29]
     result13, result2 = unpack_int4(plan.w13), unpack_int4(plan.w2)
     if transposed:
         result13, result2 = result13.transpose(1, 2), result2.transpose(1, 2)
     assert torch.equal(result13, logical13)
     assert torch.equal(result2, logical2)
+    grouped = prepare_w4a4_grouped_plan(plan)
+    assert not grouped.weights.transposed
+    assert torch.equal(unpack_int4(grouped.weights.w13), logical13)
+    assert torch.equal(unpack_int4(grouped.weights.w2), logical2)
+    if not transposed:
+        assert grouped.weights is plan
     assert torch.equal(plan.first.left, left.t())
     assert torch.equal(plan.scale13, s13)
     assert torch.equal(plan.scale2, s2)
@@ -172,10 +176,10 @@ def test_real_nz_weights_match_integer_gmm(transposed, h, i, activation_range):
         stage(i),
         transposed=transposed,
     )
-    # Official GMM is a test oracle only, never a production fallback.
+    grouped = prepare_w4a4_grouped_plan(plan)
     for nz, weight, scale in (
-        (plan.w13, w13, plan.scale13),
-        (plan.w2, w2, plan.scale2),
+        (grouped.weights.w13, w13, grouped.scale13),
+        (grouped.weights.w2, w2, grouped.scale2),
     ):
         x = torch.randint(
             -activation_range,
@@ -185,13 +189,10 @@ def test_real_nz_weights_match_integer_gmm(transposed, h, i, activation_range):
         )
         packed_x = pack_int4(x).npu()
         assert torch_npu.get_npu_format(nz) == 29
-        gmm_weight = nz.transpose(1, 2) if transposed else nz
-        encoded = scale.cpu().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-        encoded = encoded.view(torch.uint64).unsqueeze(1).npu()
         actual = torch_npu.npu_grouped_matmul(
             [packed_x],
-            [gmm_weight],
-            scale=[encoded],
+            [nz],
+            scale=[scale],
             per_token_scale=[torch.ones(8).npu()],
             group_list=torch.tensor([3, 5], dtype=torch.int64).npu(),
             split_item=3,
