@@ -673,11 +673,14 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    # Pack Qwen4-Exp target and draft cache fields into one physical plane.
+    qwen4_exp_flat_kv: bool = True
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
     # draw depends on its co-batch; "per-request" keys it by (request seed,
-    # position) through the Gumbel-max pool kernels. See
+    # position) through the Gumbel-max pool kernels and keys chain verify
+    # coins by the request seed and verify round's first position. See
     # docs/design/numerics.md, sampling.deterministic.
     sampling_stream: str = "batch"
     dp_sampling: bool = False
@@ -4226,6 +4229,17 @@ class ServerArgs:
             "which runs no prefill, reserves no scratch.",
         )
         parser.add_argument(
+            "--qwen4-exp-flat-kv",
+            action=argparse.BooleanOptionalAction,
+            dest="qwen4_exp_flat_kv",
+            default=ServerArgs.qwen4_exp_flat_kv,
+            help="Qwen4-Exp layout (on by default): target/draft KV, recurrent, PLE "
+            "and QSA caches share one plane, preserving logical groups. "
+            "Full-history block IDs translate to contiguous atom pages; state "
+            "and recent windows use explicit strides. Requires PP=1 and non-MXFP8 KV. "
+            "Use --no-qwen4-exp-flat-kv for the plane-based layout.",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=[
@@ -4274,9 +4288,9 @@ class ServerArgs:
             "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
             "by the batch row, so a request's draw depends on its co-batch. "
             "'per-request': the Gumbel-max pool kernels keyed by the request's "
-            "seed and position, so a request samples the same tokens alone and "
-            "inside any batch (finite top_k is capped at 128). Folded to "
-            "per-request by --numerics rl-bitwise.",
+            "seed and position (finite top_k is capped at 128). Chain verify "
+            "coins are keyed by the request's seed and the round's first "
+            "target position. Folded to per-request by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--dp-sampling",

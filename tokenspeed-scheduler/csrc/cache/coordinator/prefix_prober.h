@@ -140,6 +140,8 @@ public:
 
 private:
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
+    // Whether match_order has a State group, which a junction past a missing window needs.
+    bool probesStateGroup(std::span<const std::size_t> match_order) const;
     // Aligned matching over token-spanned groups; no State checkpoint hits.
     // extra_hits counts additional assumed hits beside the tier's entries.
     template <CacheTier Tier>

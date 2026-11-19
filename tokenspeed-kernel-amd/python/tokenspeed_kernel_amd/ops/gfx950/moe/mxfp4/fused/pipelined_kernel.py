@@ -793,6 +793,7 @@ def _pipelined_moe_tile_compute(
         W_PREFETCH=W_PREFETCH,
         X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
         W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
+        W_SCALE_N16_GATE_UP=False,
     )
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W

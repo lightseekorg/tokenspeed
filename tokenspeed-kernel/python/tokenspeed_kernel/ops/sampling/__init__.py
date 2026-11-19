@@ -39,6 +39,7 @@ __all__ = [
     "eagle4_candidate_tail",
     "eagle4_shard_topk",
     "blockwise_logprobs",
+    "chain_verify_coins",
     "prepare_sampling_offsets",
     "VOCAB_SHARD_DRAFT_BLOCK",
     "VOCAB_SHARD_DRAFT_FIELDS",
@@ -55,6 +56,66 @@ __all__ = [
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
 _SUPPORTED_OUT_DTYPES = (_torch.int32, _torch.int64)
+
+
+def chain_verify_coins(
+    slots: _torch.Tensor,
+    seed_pool: _torch.Tensor,
+    offsets_pool: _torch.Tensor,
+    *,
+    coins: _torch.Tensor,
+    final_coins: _torch.Tensor,
+) -> None:
+    """Fill the verifier's accept and residual/bonus coins in (0, 1).
+
+    Args:
+        slots: Int32 or int64 [B] pool indices in verify row order.
+        seed_pool: Contiguous int64 request seeds, indexed by slot.
+        offsets_pool: Contiguous int64 first target positions, indexed by slot.
+            Positions must be in ``[0, 2**31)`` for the Philox counter layout.
+            Runtime requests are bounded by the scheduler's
+            ``CapacityModel::MaxRequestTokenLimit``, which reserves headroom
+            for verify windows, overlapping steps, and block rounding.
+        coins: Contiguous fp32 [B, N] accept coin output.
+        final_coins: Contiguous fp32 [B] residual/bonus coin output.
+
+    Returns:
+        None. Both output buffers are written in place.
+    """
+    if coins.ndim != 2 or coins.dtype != _torch.float32 or not coins.is_contiguous():
+        raise ValueError("chain verify needs contiguous fp32 [B, N] accept coins")
+    rows, width = coins.shape
+    if not 0 < width < 2**32:
+        raise ValueError("chain verify width must fit a positive uint32")
+    if (
+        final_coins.shape != (rows,)
+        or final_coins.dtype != _torch.float32
+        or not final_coins.is_contiguous()
+    ):
+        raise ValueError("chain verify needs contiguous fp32 [B] final coins")
+    if slots.shape != (rows,) or slots.dtype not in (_torch.int32, _torch.int64):
+        raise ValueError("chain verify needs int32/int64 [B] request slots")
+    if (
+        seed_pool.ndim != 1
+        or offsets_pool.shape != seed_pool.shape
+        or any(
+            t.dtype != _torch.int64 or not t.is_contiguous()
+            for t in (seed_pool, offsets_pool)
+        )
+    ):
+        raise ValueError("chain verify needs contiguous int64 seed and position pools")
+    if any(
+        t.device != coins.device for t in (slots, seed_pool, offsets_pool, final_coins)
+    ):
+        raise ValueError("chain verify coin tensors must share a device")
+    if rows == 0:
+        return
+    kernel = select_kernel(
+        "sampling",
+        "chain_verify_coins",
+        format_signature(coins=dense_tensor_format(coins.dtype)),
+    )
+    kernel(slots, seed_pool, offsets_pool, coins=coins, final_coins=final_coins)
 
 
 def _validate_argmax_out(logits: _torch.Tensor, out: _torch.Tensor) -> None:
@@ -506,5 +567,6 @@ import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401

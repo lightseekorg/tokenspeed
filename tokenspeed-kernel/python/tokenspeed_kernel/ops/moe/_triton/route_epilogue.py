@@ -90,34 +90,6 @@ _PIN_SEED = 913
 _PIN_RANDOM_ROWS = 128
 
 
-@triton.jit
-def _add_rn(left, right):
-    """One correctly rounded FP32 add (``add.rn.f32``) that the compiler can
-    neither reassociate nor fuse."""
-    return tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[left, right],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _mul_rn(left, right):
-    """One correctly rounded FP32 multiply (``mul.rn.f32``, non-FTZ) that the
-    compiler cannot fuse."""
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[left, right],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
 def route_scale_fp32(scale: float) -> float:
     """``scale`` rounded to FP32 the way Torch rounds a Python scalar operand of an
     FP32 multiply (one round-to-nearest conversion), as a Python float."""

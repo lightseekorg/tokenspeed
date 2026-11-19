@@ -396,6 +396,8 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
         .prepared_keys = prepared_keys,
     };
     match.probe = probe(prompt);
+    request->GetIf<fsm::Submitted>()->admission.cached_prefix_tokens =
+        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     if (config_.role != Role::kD && coordinator_.Prober().EvictionStoresExtendPrefix(prompt, match.probe)) {
         match.waits_for_eviction_store = true;
         return match;
