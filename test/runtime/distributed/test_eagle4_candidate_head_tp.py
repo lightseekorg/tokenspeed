@@ -176,11 +176,16 @@ def _worker(rank, world_size, rendezvous):
         world_size=world_size,
         device_id=device,
     )
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
     )
 
     pg_manager.init_process_group(tuple(range(world_size)))
+    # A Torch NCCL group does not select TokenSpeed's collective backend.
+    # This candidate-head test exercises NCCL; Auto can lazily allocate RSAG.
+    set_global_backend(NcclBackend())
     _check_greedy_candidate(rank, world_size, device)
     dist.destroy_process_group()
 
