@@ -27,6 +27,11 @@
 //! are ready, and polls. A landed item's rows stay in its slot until the
 //! data plane copied them onto the item; a failed item's slot sits out a
 //! quarantine first.
+//!
+//! The connect thread's cached resolutions (a node's parallel sizes, an
+//! encode rank's control address) carry a TTL and are dropped when a room
+//! through them fails: an encode node restart binds new control ports, and
+//! the next room must resolve it again from the bootstrap server.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -54,6 +59,12 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a failed item's slot waits before another receive: longer than
 /// any write the encode node may still have in flight.
 const QUARANTINE: Duration = Duration::from_secs(10);
+
+/// How long a cached bootstrap resolution (a node's parallel sizes, an
+/// encode rank's control address) stays trusted: an encode node restart
+/// binds new control ports, so a resolution older than this is fetched
+/// again from the bootstrap server even without a failure.
+const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 
 /// How often an idle socket thread checks for shutdown.
 const SOCKET_POLL: Duration = Duration::from_millis(100);
@@ -97,7 +108,7 @@ pub struct ReceiverConfig {
 }
 
 /// An encode node's parallel sizes, from its bootstrap server.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Parallel {
     tp_size: i64,
     dp_size: i64,
@@ -109,6 +120,9 @@ struct Room {
     status: TransferPoll,
     /// The encode rank's control address, once connected.
     target: Option<(String, u16)>,
+    /// The connections-cache key this room resolved through, for the
+    /// failure eviction.
+    key: Option<(String, i64, i64)>,
     /// The prefill ranks its encode rank serves.
     fanout: i64,
     failure: Option<String>,
@@ -117,11 +131,13 @@ struct Room {
 #[derive(Default)]
 struct State {
     rooms: HashMap<u64, Room>,
-    /// Bootstrap address -> its node's parallel sizes.
-    parallel: HashMap<String, Parallel>,
+    /// Bootstrap address -> its node's parallel sizes, with the time they
+    /// were fetched; fetched again past RESOLUTION_TTL.
+    parallel: HashMap<String, (Parallel, Instant)>,
     /// (bootstrap address, DP group, encode rank) -> the encode rank's
-    /// control address; registered with once.
-    connections: HashMap<(String, i64, i64), (String, u16)>,
+    /// control address and the time it was resolved; re-resolved past
+    /// RESOLUTION_TTL, and dropped when a room through it fails.
+    connections: HashMap<(String, i64, i64), ((String, u16), Instant)>,
 }
 
 impl State {
@@ -131,6 +147,52 @@ impl State {
             entry.failure.get_or_insert_with(|| reason.into());
         }
     }
+
+    /// The cached parallel sizes when still fresh, None otherwise.
+    fn cached_parallel(&self, addr: &str) -> Option<Parallel> {
+        let (parallel, at) = self.parallel.get(addr)?;
+        (at.elapsed() < RESOLUTION_TTL).then_some(*parallel)
+    }
+
+    fn cache_parallel(&mut self, addr: &str, parallel: Parallel) {
+        self.parallel
+            .insert(addr.to_owned(), (parallel, Instant::now()));
+    }
+
+    /// The cached control address of an encode rank when still fresh, None
+    /// otherwise.
+    fn cached_connection(&self, key: &(String, i64, i64)) -> Option<(String, u16)> {
+        let ((host, port), at) = self.connections.get(key)?;
+        (at.elapsed() < RESOLUTION_TTL).then(|| (host.clone(), *port))
+    }
+
+    fn cache_connection(&mut self, key: (String, i64, i64), target: (String, u16)) {
+        self.connections.insert(key, (target, Instant::now()));
+    }
+
+    /// The connections-cache key a room resolves through, so a failure can
+    /// evict it. A no-op once the room is gone.
+    fn record_key(&mut self, room: u64, key: (String, i64, i64)) {
+        if let Some(entry) = self.rooms.get_mut(&room) {
+            entry.key = Some(key);
+        }
+    }
+
+    /// Drop the resolution a failed room went through: the encode node may
+    /// have restarted onto new ports, and the next room must resolve it
+    /// again from the bootstrap server.
+    fn evict(&mut self, key: &(String, i64, i64)) {
+        self.connections.remove(key);
+        self.parallel.remove(&key.0);
+    }
+}
+
+/// What the receiver asks its connect thread to do.
+enum Connect {
+    /// Connect a room to its encode rank through a bootstrap address.
+    Room(u64, String),
+    /// Drop the cached resolution a failed room went through.
+    Evict((String, i64, i64)),
 }
 
 struct Shared {
@@ -164,7 +226,7 @@ impl Shared {
     /// The encode node's parallel sizes, fetched once a complete answer
     /// comes (`/route` may answer before the encode ranks registered).
     fn parallel(&self, addr: &str) -> Result<Parallel, String> {
-        if let Some(parallel) = self.state().parallel.get(addr).copied() {
+        if let Some(parallel) = self.state().cached_parallel(addr) {
             return Ok(parallel);
         }
         let incomplete = || "no (complete) parallel info from bootstrap".to_owned();
@@ -184,7 +246,7 @@ impl Shared {
         if parallel.tp_size <= 0 || parallel.dp_size <= 0 {
             return Err(incomplete());
         }
-        self.state().parallel.insert(addr.to_owned(), parallel);
+        self.state().cache_parallel(addr, parallel);
         Ok(parallel)
     }
 
@@ -204,7 +266,10 @@ impl Shared {
         let encode_rank = self.tp_rank / fanout;
         let dp_group = (room % parallel.dp_size as u64) as i64;
         let key = (addr.to_owned(), dp_group, encode_rank);
-        if let Some(target) = self.state().connections.get(&key).cloned() {
+        // The failure eviction drops this key when the room fails, so record
+        // it whether the cache answers or the bootstrap does.
+        self.state().record_key(room, key.clone());
+        if let Some(target) = self.state().cached_connection(&key) {
             return Ok((target, fanout));
         }
         let missing = || "no encode rank info from bootstrap".to_owned();
@@ -236,7 +301,7 @@ impl Shared {
                 ),
             )
             .map_err(|error| error.to_string())?;
-        self.state().connections.insert(key, (host.clone(), port));
+        self.state().cache_connection(key, (host.clone(), port));
         Ok(((host, port), fanout))
     }
 
@@ -287,7 +352,7 @@ struct Staged {
 /// A prefill rank's receiver of the encode nodes' embeddings.
 pub struct Receiver {
     shared: Arc<Shared>,
-    connect: mpsc::Sender<(u64, String)>,
+    connect: mpsc::Sender<Connect>,
     stop: Arc<AtomicBool>,
     config: ReceiverConfig,
     pool: Option<SlotPool>,
@@ -345,25 +410,28 @@ impl Receiver {
                     }
                 })?;
         }
-        let (connect, rooms) = mpsc::channel::<(u64, String)>();
+        let (connect, messages) = mpsc::channel::<Connect>();
         {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("ts-epd-connect".to_owned())
                 .spawn(move || {
-                    while let Ok((room, addr)) = rooms.recv() {
-                        match shared.connect(room, &addr) {
-                            Ok((target, fanout)) => {
-                                let mut state = shared.state();
-                                if let Some(entry) = state.rooms.get_mut(&room) {
-                                    if entry.status == TransferPoll::Bootstrapping {
-                                        entry.status = TransferPoll::Bootstrapped;
+                    while let Ok(message) = messages.recv() {
+                        match message {
+                            Connect::Room(room, addr) => match shared.connect(room, &addr) {
+                                Ok((target, fanout)) => {
+                                    let mut state = shared.state();
+                                    if let Some(entry) = state.rooms.get_mut(&room) {
+                                        if entry.status == TransferPoll::Bootstrapping {
+                                            entry.status = TransferPoll::Bootstrapped;
+                                        }
+                                        entry.target = Some(target);
+                                        entry.fanout = fanout;
                                     }
-                                    entry.target = Some(target);
-                                    entry.fanout = fanout;
                                 }
-                            }
-                            Err(reason) => shared.state().fail(room, reason),
+                                Err(reason) => shared.state().fail(room, reason),
+                            },
+                            Connect::Evict(key) => shared.state().evict(&key),
                         }
                     }
                 })?;
@@ -491,13 +559,26 @@ impl Receiver {
     }
 
     /// Return a settled request's slots: a landed one's await their copy, a
-    /// failed one's sit out the quarantine.
+    /// failed one's sit out the quarantine. A failed request also evicts the
+    /// resolution each of its rooms went through: the encode node may have
+    /// restarted onto new ports, and the next room must resolve it again
+    /// from the bootstrap server.
     fn forget(&mut self, staged: &Staged, landed: bool, now: Instant) {
         let mut state = self.shared.state();
+        let mut failed_keys = Vec::new();
         for item in &staged.items {
+            let entry = state.rooms.get(&item.item.room);
+            if !landed {
+                if let Some(key) = entry.and_then(|entry| entry.key.clone()) {
+                    failed_keys.push(key);
+                }
+            }
             state.rooms.remove(&item.item.room);
         }
         drop(state);
+        for key in failed_keys {
+            let _ = self.connect.send(Connect::Evict(key));
+        }
         for slot in staged.items.iter().filter_map(|item| item.slot) {
             if landed {
                 self.awaiting.insert(slot);
@@ -529,13 +610,17 @@ impl EmbeddingReceiver for Receiver {
                 Room {
                     status: TransferPoll::Bootstrapping,
                     target: None,
+                    key: None,
                     fanout: 0,
                     failure: None,
                 },
             );
             if self
                 .connect
-                .send((item.room, join_host_port(&item.host, item.port)))
+                .send(Connect::Room(
+                    item.room,
+                    join_host_port(&item.host, item.port),
+                ))
                 .is_err()
             {
                 self.shared
@@ -648,5 +733,101 @@ impl EmbeddingReceiver for Receiver {
 
     fn awaiting_release(&self) -> bool {
         !self.awaiting.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parallel(tp_size: i64, dp_size: i64) -> Parallel {
+        Parallel { tp_size, dp_size }
+    }
+
+    fn key(addr: &str, dp_group: i64, encode_rank: i64) -> (String, i64, i64) {
+        (addr.to_owned(), dp_group, encode_rank)
+    }
+
+    /// An instant older than the resolution TTL, as the tests' stale entries
+    /// carry.
+    fn stale() -> Instant {
+        Instant::now()
+            .checked_sub(RESOLUTION_TTL + Duration::from_secs(1))
+            .unwrap()
+    }
+
+    #[test]
+    fn cached_resolutions_expire() {
+        let mut state = State::default();
+        let addr = "10.0.0.9:8998";
+        state.cache_parallel(addr, parallel(2, 1));
+        assert_eq!(state.cached_parallel(addr), Some(parallel(2, 1)));
+        // A stale entry reads as a miss, so the next room re-resolves.
+        state
+            .parallel
+            .insert(addr.to_owned(), (parallel(2, 1), stale()));
+        assert_eq!(state.cached_parallel(addr), None);
+
+        let rank = key(addr, 0, 0);
+        state.cache_connection(rank.clone(), ("10.0.0.9".to_owned(), 20001));
+        assert_eq!(
+            state.cached_connection(&rank),
+            Some(("10.0.0.9".to_owned(), 20001))
+        );
+        state
+            .connections
+            .insert(rank.clone(), (("10.0.0.9".to_owned(), 20001), stale()));
+        assert_eq!(state.cached_connection(&rank), None);
+    }
+
+    #[test]
+    fn an_eviction_drops_only_its_own_resolution() {
+        let mut state = State::default();
+        let node_a = key("10.0.0.9:8998", 0, 0);
+        let node_b = key("10.0.0.8:8998", 1, 1);
+        state.cache_parallel(&node_a.0, parallel(2, 1));
+        state.cache_parallel(&node_b.0, parallel(4, 2));
+        state.cache_connection(node_a.clone(), ("10.0.0.9".to_owned(), 20001));
+        state.cache_connection(node_b.clone(), ("10.0.0.8".to_owned(), 20002));
+
+        state.evict(&node_a);
+        assert_eq!(state.cached_connection(&node_a), None);
+        assert_eq!(state.cached_parallel(&node_a.0), None);
+        // Another node's resolution survives.
+        assert_eq!(
+            state.cached_connection(&node_b),
+            Some(("10.0.0.8".to_owned(), 20002))
+        );
+        assert_eq!(state.cached_parallel(&node_b.0), Some(parallel(4, 2)));
+    }
+
+    #[test]
+    fn rooms_remember_the_key_their_failure_evicts() {
+        let mut state = State::default();
+        state.rooms.insert(
+            7,
+            Room {
+                status: TransferPoll::Bootstrapping,
+                target: None,
+                key: None,
+                fanout: 0,
+                failure: None,
+            },
+        );
+        let room = key("10.0.0.9:8998", 1, 2);
+        state.record_key(7, room.clone());
+        assert_eq!(state.rooms[&7].key, Some(room.clone()));
+        // Evicting the key clears the caches but leaves the room alone; the
+        // room's failure handler removed it already.
+        state.cache_connection(room.clone(), ("10.0.0.9".to_owned(), 20001));
+        state.cache_parallel(&room.0, parallel(2, 1));
+        state.evict(&room);
+        assert_eq!(state.cached_connection(&room), None);
+        assert_eq!(state.cached_parallel(&room.0), None);
+        assert_eq!(state.rooms[&7].key, Some(room));
+        // Recording for a room that settled before its connect completed is
+        // a no-op.
+        state.record_key(99, key("10.0.0.9:8998", 0, 0));
+        assert!(!state.rooms.contains_key(&99));
     }
 }
