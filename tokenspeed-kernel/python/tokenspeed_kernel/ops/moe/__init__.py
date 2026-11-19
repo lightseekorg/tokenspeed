@@ -1653,6 +1653,7 @@ def _build_traits(
     expert_id_repeats: bool,
     fp8_scale_block_shape: tuple[int, int] | None,
     internal_activation_dtype: str | None,
+    expert_layout: str | None,
     with_bias: bool,
     combine_order: str,
 ) -> dict[str, Any]:
@@ -1660,6 +1661,9 @@ def _build_traits(
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    if expert_layout is not None:
+        # Seller-declared: excludes kernels declaring another bank layout.
+        traits["expert_layout"] = expert_layout
     # Unknown counts must not admit a kernel restricted to particular counts.
     traits["num_experts"] = num_experts
     traits["top_k"] = top_k
@@ -1721,10 +1725,14 @@ def _select_moe_apply(
             static_traits=traits,
             variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
             solution=solution,
-            declared_traits=(
-                frozenset({"combine_order"})
-                if traits["combine_order"] == "slot"
-                else frozenset()
+            # A kernel serves these requests only when it declares them.
+            declared_traits=frozenset(
+                name
+                for name, requested in (
+                    ("combine_order", traits["combine_order"] == "slot"),
+                    ("expert_layout", "expert_layout" in traits),
+                )
+                if requested
             ),
             ignore_layout=True,
         )
@@ -2025,6 +2033,7 @@ def moe_plan(
     top_k: int | None = None,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
+    expert_layout: str | None = None,
     with_bias: bool = False,
     process_group: object | None = None,
     deepep_mode: str | None = None,
@@ -2084,6 +2093,11 @@ def moe_plan(
             "input" is a special value that uses the whatever dtype the input
             activations have. "mxfp4" requests dynamic MXFP4 activation
             quantization. Defaults to "input" if not set.
+        expert_layout: Optional storage layout the selected kernel must read
+            the routed-expert banks in (for example "gdot128" or "n16" for the
+            gfx950 MXFP4 SiTU kernels). The selected kernel must declare it, or
+            planning raises ValueError. None leaves the layout to selection,
+            which keeps the default.
         with_bias: Whether the selected kernel must support expert bias tensors.
         process_group: Runtime-created process group for DeepEP or MegaMoE
             communication. Defaults to None for backends that do not use it.
@@ -2166,6 +2180,7 @@ def moe_plan(
         expert_id_repeats=expert_id_repeats,
         fp8_scale_block_shape=fp8_scale_block_shape,
         internal_activation_dtype=internal_activation_dtype,
+        expert_layout=expert_layout,
         with_bias=with_bias,
         combine_order=combine_order,
     )
@@ -2201,6 +2216,14 @@ def moe_plan(
     ):
         raise ValueError(
             f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
+        )
+    # Selection drops only kernels declaring another layout; one declaring none
+    # still matches, so a requested layout is checked on the selected kernel.
+    declared_layouts = apply_spec.traits.get("expert_layout", frozenset())
+    if expert_layout is not None and expert_layout not in declared_layouts:
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not read the requested "
+            f"{expert_layout!r} expert layout"
         )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())

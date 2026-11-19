@@ -133,6 +133,10 @@ def _selection_case(
 
     from tokenspeed_kernel.platform import current_platform
 
+    from tokenspeed.runtime.layers.attention.dcp.placement import (
+        compact_owned_cache_slots,
+    )
+
     sharded = _sharded_layer(
         rank, kv_cache_dtype=kv_cache_dtype, spec_width=spec_width, index_topk=512
     )
@@ -168,16 +172,25 @@ def _selection_case(
         *whole, hidden, **run
     )
     if sharded[2].takes_owned_decode_topk(sharded[0].attn_mqa):
-        # Each rank keeps the selected keys it owns.
-        dist.all_reduce(counts)
-    assert torch.equal(counts, expected_counts)
-    assert (counts == 512).all()
+        # Each rank keeps the selected keys it owns, as local slots.
+        expected_slots, expected_counts = compact_owned_cache_slots(
+            expected_slots,
+            expected_counts,
+            sharded[2].cache_placement(sharded[0].attn_mqa),
+        )
+        total = counts.clone()
+        dist.all_reduce(total)
+        assert (total == 512).all()
+    else:
+        assert (counts == 512).all()
     # gfx950 scores KVP candidates with the Triton leaf and one rank with Gluon's.
     if current_platform().is_amd:
         return
+    assert torch.equal(counts, expected_counts)
     for row in range(spec_width):
-        assert sorted(slots[row, :512].tolist()) == sorted(
-            expected_slots[row, :512].tolist()
+        live = int(counts[row])
+        assert sorted(slots[row, :live].tolist()) == sorted(
+            expected_slots[row, :live].tolist()
         )
     for got, reference in zip(outputs, expected, strict=True):
         _assert_close_to_reference(got, reference.float(), fraction)
