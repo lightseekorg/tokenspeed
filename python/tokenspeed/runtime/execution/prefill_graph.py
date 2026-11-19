@@ -90,7 +90,7 @@ from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
-    CacheBatchMetadata,
+    build_managed_cache_metadata,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LIVE_SLOT,
@@ -1326,8 +1326,9 @@ class PrefillGraph:
                 },
                 block_table_spans=lambda: spans,
             )
-            cache_metadata = CacheBatchMetadata.from_forward_op(
+            cache_metadata = build_managed_cache_metadata(
                 dummy_forward_op,
+                memory_saver_adapter=self.memory_saver_adapter,
                 device=self.config.device,
                 contract=self.token_to_kv_pool.arena.runtime_contract,
                 num_requests=bs,

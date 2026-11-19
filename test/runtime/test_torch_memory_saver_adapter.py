@@ -20,10 +20,14 @@
 
 """CPU checks for managed versus resident native allocation scopes."""
 
+import subprocess
+import sys
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -339,9 +343,12 @@ def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
             torch.testing.assert_close(tensor, reference, rtol=0, atol=0)
 
 
-def test_cache_arena_geometry_survives_sleep_with_its_original_address(
-    memory, buffers, monkeypatch
-):
+def _check_managed_metadata_on_cuda():
+    """Check managed allocations, retained views and zero ordinary bytes on CUDA."""
+    from tokenspeed.runtime.execution.forward_step import prepare_capture_metadata
+    from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+        build_managed_cache_metadata,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
         CacheFieldSpec,
@@ -369,39 +376,121 @@ def test_cache_arena_geometry_survives_sleep_with_its_original_address(
         alignment=256,
         max_padding_fraction=0.25,
     )
-    real_tensor = torch.tensor
-
-    def allocate(*args, **kwargs):
-        tensor = real_tensor(*args, **kwargs)
-        if buffers.active:
-            buffers.allocations.append((buffers.tag, tensor, buffers.cpu_backup))
-        return tensor
-
-    # Only the unavailable pausable CUDA allocator is replaced. Arena ownership,
-    # geometry construction, Torch storage and adapter dispatch remain real.
-    monkeypatch.setattr(torch, "tensor", allocate)
     arena = CacheArena(
-        layout.bind(2), "cpu", cache_group_specs=(group,), enable_memory_saver=True
+        layout.bind(2), "cuda", cache_group_specs=(group,), enable_memory_saver=True
     )
     table = arena._zero_field_tables[group.group_id][1]
     address = table.data_ptr()
-    expected = table.clone()
-    assert any(
-        t.data_ptr() == address and backup for _, t, backup in buffers.allocations
-    )
-    for _ in range(2):
-        arena.memory_saver_adapter.pause(tag="weights")
-        assert not table.count_nonzero()
-        arena.memory_saver_adapter.resume(tag="weights")
-        assert table.data_ptr() == address
-        torch.testing.assert_close(table, expected)
+    expected = table.cpu()
+    segments = [
+        segment
+        for segment in torch.cuda.memory_snapshot()
+        if segment["address"] <= address < segment["address"] + segment["total_size"]
+    ]
+    assert len(segments) == 1
+    assert tuple(segments[0]["segment_pool_id"]) != (0, 0)
+
+    class ModelMetadata:
+        """Replace model-specific metadata; its CUDA allocations stay native."""
+
+        def __init__(self):
+            self.tensor = None
+
+        def init_forward_metadata_capture_cuda_graph(self, batch_size, *args, **kwargs):
+            self.tensor = torch.full(
+                (batch_size,), batch_size, dtype=torch.int32, device="cuda"
+            )
+
+    saver = arena.memory_saver_adapter
+    target, draft = ModelMetadata(), ModelMetadata()
+    retained = [(table, address, expected)]
+    for count, host_tables in ((1, False), (257, True), (3, False)):
+        arrays = np.ones((count, 2), dtype=np.int32)
+        spans = np.tile(np.array([0, 2], dtype=np.int32), (count, 1))
+        forward_op = SimpleNamespace(
+            block_table_windows=lambda arrays=arrays: {
+                group.group_id: (arrays, arrays.shape[1])
+            },
+            block_table_spans=lambda spans=spans: {group.group_id: spans},
+        )
+        metadata = build_managed_cache_metadata(
+            forward_op,
+            memory_saver_adapter=saver,
+            device="cuda",
+            contract=arena.runtime_contract,
+            num_requests=count,
+            validate_page_ids=True,
+            host_tables=host_tables,
+        )
+        packed = dict(metadata.tables(active_forward_op=forward_op))
+        with saver.named_region("executor_inputs"):
+            indices = torch.arange(count, dtype=torch.int32, device="cuda")
+            lengths = torch.ones(count, dtype=torch.int32, device="cuda")
+        prepare_capture_metadata(
+            target,
+            draft,
+            memory_saver_adapter=saver,
+            batch_size=count,
+            req_pool_indices=indices,
+            seq_lens=lengths,
+            block_tables=packed,
+            num_tokens=count,
+        )
+        # Keep old views alive as backends do between forwards and captures.
+        retained.extend(
+            (tensor, tensor.data_ptr(), tensor.cpu())
+            for tensor in (
+                packed[group.group_id],
+                target.tensor,
+                draft.tensor,
+                indices,
+                lengths,
+            )
+        )
+        for _ in range(3):
+            torch.cuda.synchronize()
+            saver.pause(tag="weights")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            ordinary_bytes = sum(
+                segment["total_size"]
+                for segment in torch.cuda.memory_snapshot()
+                if segment["device"] == torch.cuda.current_device()
+                and tuple(segment["segment_pool_id"]) == (0, 0)
+            )
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            for tensor, pointer, reference in retained:
+                assert tensor.data_ptr() == pointer
+                torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    # Preload hooks must be installed before CUDA initializes in the child.
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_managed_metadata_on_cuda; _check_managed_metadata_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )
 
 
 @pytest.mark.parametrize("with_draft", [False, True])
 def test_capture_metadata_survives_sleep_for_target_and_draft(
     memory, buffers, with_draft
 ):
-    from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+    from tokenspeed.runtime.execution.forward_step import prepare_capture_metadata
 
     class CpuAttentionMetadata:
         """Replace GPU metadata construction, retaining the allocated Tensor owner."""
@@ -412,60 +501,57 @@ def test_capture_metadata_survives_sleep_for_target_and_draft(
         def init_forward_metadata_capture_cuda_graph(self, batch_size, *args, **kwargs):
             self.tensor = buffers.allocate(batch_size)
 
-    # The capture runner's allocation scope stays real; GPU inputs/backends are
-    # replaced because this test verifies CPU allocator ownership and recovery.
-    runner = object.__new__(ForwardStepRunner)
-    runner.memory_saver_adapter = adapter.TorchMemorySaverAdapter.create(enable=True)
-    runner.attn_backend = CpuAttentionMetadata()
-    runner.draft_attn_backend = CpuAttentionMetadata() if with_draft else None
-    runner.input_buffers = SimpleNamespace(
-        req_pool_indices_buf=torch.arange(2),
-        seq_lens_buf=torch.ones(2, dtype=torch.int32),
+    target = CpuAttentionMetadata()
+    draft = CpuAttentionMetadata() if with_draft else None
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    prepare_capture_metadata(
+        target,
+        draft,
+        memory_saver_adapter=saver,
+        batch_size=2,
+        req_pool_indices=torch.arange(2),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        block_tables={},
+        num_tokens=2,
     )
-    runner._placeholder_tables = {}
-    runner.max_tokens_per_req = 1
-    runner.drafter = SimpleNamespace(round_block_tables=None) if with_draft else None
-    runner._init_capture_metadata(2)
-    tensors = [runner.attn_backend.tensor]
-    if with_draft:
-        tensors.append(runner.draft_attn_backend.tensor)
-        assert runner.drafter.round_block_tables == {}
+    tensors = [target.tensor]
+    if draft is not None:
+        tensors.append(draft.tensor)
     addresses = [tensor.data_ptr() for tensor in tensors]
     for _ in range(2):
-        runner.memory_saver_adapter.pause(tag="weights")
+        saver.pause(tag="weights")
         assert all(tensor.item() == 0 for tensor in tensors)
-        runner.memory_saver_adapter.resume(tag="weights")
+        saver.resume(tag="weights")
         assert [tensor.data_ptr() for tensor in tensors] == addresses
         assert all(tensor.item() == 2 for tensor in tensors)
 
 
 @pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("host_tables", [True, False])
 def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
-    memory, buffers, monkeypatch, enabled
+    memory, buffers, monkeypatch, enabled, host_tables
 ):
-    from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.backends import cache_metadata
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
         CacheRuntimeContract,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
-    class ForwardInputsUnavailable(Exception):
-        """Stop at the GPU input-fill boundary after real metadata construction."""
-
     tensors = []
 
     def pack(op, device, **kwargs):
-        # Replace only the GPU table-packing boundary. The executor, metadata
-        # validation, shared-storage views and pool dispatch stay real.
+        # Replace only GPU packing; metadata validation, shared-storage views
+        # and pool dispatch stay real.
         tensor = buffers.allocate(len(op.request_ids))
         tensors.append(tensor)
         return SimpleNamespace(
-            tables={"full": tensor.expand(len(op.request_ids), 1)}, tables_cpu={}
+            tables={"full": tensor.expand(len(op.request_ids), 1)},
+            tables_cpu=(
+                {"full": tensor.expand(len(op.request_ids), 1).clone()}
+                if kwargs["host_tables"]
+                else {}
+            ),
         )
-
-    def fill_inputs(**kwargs):
-        raise ForwardInputsUnavailable
 
     monkeypatch.setattr(cache_metadata, "packed_block_tables_from_forward_op", pack)
     group = CacheGroupSpec(
@@ -476,23 +562,8 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
         transfer_policy="full_suffix",
         replayable=False,
     )
-    # The full executor needs GPU model construction; retain its real forward
-    # prologue and replace the unavailable device/stream and input-fill boundary.
-    executor = object.__new__(ModelExecutor)
-    executor.log_step = 0
-    executor.forward_step = SimpleNamespace(draft_overlap=None)
-    executor.device = torch.device("cpu")
-    executor.execution_stream = SimpleNamespace(wait_stream=lambda stream: None)
-    executor.default_stream = object()
-    executor.device_module = SimpleNamespace(stream=lambda stream: nullcontext())
-    executor.nan_guard = SimpleNamespace(reset=lambda count: None)
-    executor.runtime_states = SimpleNamespace(bind_stop_criteria=lambda *args: None)
-    executor.input_buffers = SimpleNamespace(fill_input_buffers=fill_inputs)
-    executor.memory_saver_adapter = adapter.TorchMemorySaverAdapter.create(
-        enable=enabled
-    )
-    executor._validate_page_ids = True
-    executor._cache_runtime_contract = CacheRuntimeContract(
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    contract = CacheRuntimeContract(
         prefix_granularity=1,
         num_lcm_blocks=4,
         token_capacity=4,
@@ -501,29 +572,30 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
         group_packing={"full": 1},
     )
     for count in (1, 3):
-        op = SimpleNamespace(
-            num_extends=lambda: 0,
-            input_lengths=[1] * count,
-            request_ids=list(range(count)),
-            request_pool_indices=list(range(count)),
+        op = SimpleNamespace(request_ids=list(range(count)))
+        metadata = cache_metadata.build_managed_cache_metadata(
+            op,
+            memory_saver_adapter=saver,
+            device="cpu",
+            contract=contract,
+            num_requests=count,
+            validate_page_ids=True,
+            host_tables=host_tables,
         )
-        with pytest.raises(ForwardInputsUnavailable):
-            executor.execute_forward_op(
-                op,
-                [],
-                ngram_inputs=None,
-                request_history_seeds=None,
-                input_logprob_plan=None,
-                sampled_top_k=0,
-                stop_criteria=[],
-                admission_ids=list(range(count)),
-            )
+        table = metadata.tables(active_forward_op=op)["full"]
         tensor = tensors[-1]
         address = tensor.data_ptr()
         allocation = next(row for row in buffers.allocations if row[1] is tensor)
         assert allocation[0] == ("weights" if enabled else None)
-        executor.memory_saver_adapter.pause(tag="weights")
+        saver.pause(tag="weights")
         assert tensor.item() == (0 if enabled else count)
-        executor.memory_saver_adapter.resume(tag="weights")
+        saver.resume(tag="weights")
         assert tensor.data_ptr() == address
         assert tensor.item() == count
+        assert table.data_ptr() == address
+        assert table.tolist() == [[count]] * count
+        if host_tables:
+            assert (
+                metadata.tables_cpu(active_forward_op=op)["full"].tolist()
+                == [[count]] * count
+            )

@@ -111,7 +111,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     resolve_cuda_graph_support,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
-    CacheBatchMetadata,
+    build_managed_cache_metadata,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeVerifyInputs,
@@ -2612,7 +2612,7 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
-        """Run a scheduled forward with cache tables in the restorable metadata pool."""
+        """Execute one scheduled forward operation."""
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2659,16 +2659,16 @@ class ModelExecutor:
             if bs > 0:
                 # Check the per-group tables' structure and pack them once for
                 # this batch; the page IDs only under the diagnostic.
-                with self.memory_saver_adapter.named_region("attention_state"):
-                    cache_metadata = CacheBatchMetadata.from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        contract=self._cache_runtime_contract,
-                        num_requests=bs,
-                        validate_page_ids=self._validate_page_ids,
-                        # Only an extend plans from host tables.
-                        host_tables=num_extends > 0,
-                    )
+                cache_metadata = build_managed_cache_metadata(
+                    forward_op,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    device=self.device,
+                    contract=self._cache_runtime_contract,
+                    num_requests=bs,
+                    validate_page_ids=self._validate_page_ids,
+                    # Only an extend plans from host tables.
+                    host_tables=num_extends > 0,
+                )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
                 if num_extends > 0:
                     block_tables_cpu = dict(

@@ -80,7 +80,6 @@ class _SyntheticPool:
         if arena is None:
             arena = _synthetic_arena(layout)
         self.arena = arena
-        self.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
 
     def cache_transfer_layout(self):
         return self._layout
@@ -2323,7 +2322,9 @@ class TestCompactLayoutRoundTripTest:
             token_capacity=4,
         )
         arena = SimpleNamespace(
-            cache_group_specs=contract.group_specs, runtime_contract=contract
+            cache_group_specs=contract.group_specs,
+            runtime_contract=contract,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
         )
 
         class WriteBackOp:

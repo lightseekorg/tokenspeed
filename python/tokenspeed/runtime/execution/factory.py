@@ -300,7 +300,7 @@ def create_model_executor(
     draft_attn_backend: AttentionBackend | None = None,
     draft_token_to_kv_pool: CachePool | None = None,
 ) -> ModelExecutor:
-    """Create the executor with CPU-backed, address-stable sampler buffers."""
+    """Create the model executor with its sampler configuration."""
     if server_args.enable_nvtx:
         set_nvtx_enabled(True)
 
