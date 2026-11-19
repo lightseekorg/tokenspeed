@@ -132,6 +132,11 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
     lengths = torch.full((rows,), 2048, device="cuda", dtype=torch.int32)
     if rows > 2:
         lengths[2] = 65
+    empty = [0]
+    if with_lengths and rows > 3:
+        # A KVP rank's row owning no key: length 0.
+        lengths[3] = 0
+        empty.append(3)
     lengths = lengths if with_lengths else None
     out = torch.empty((*shape[:-1], 512), device="cuda", dtype=torch.bfloat16)
 
@@ -154,13 +159,9 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
         assert output is out
         _check_fp8_output(output.reshape(rows, heads, 512), reference, bound)
         torch.testing.assert_close(lse.double(), ref_lse, rtol=1e-4, atol=2e-4)
-        torch.testing.assert_close(
-            output.reshape(rows, heads, 512)[0],
-            torch.zeros_like(output.reshape(rows, heads, 512)[0]),
-            rtol=0,
-            atol=0,
-        )
-        assert torch.isneginf(lse[0]).all()
+        for row in empty:
+            assert not output.reshape(rows, heads, 512)[row].any()
+            assert torch.isneginf(lse.reshape(rows, heads)[row]).all()
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

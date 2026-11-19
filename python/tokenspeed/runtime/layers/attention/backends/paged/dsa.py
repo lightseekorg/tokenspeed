@@ -494,6 +494,8 @@ class DSABackend(PagedAttentionBackend):
         self._dcp_records_core: bool = False
         # Whether that selection runs the trtllm-gen core, which takes a padded query.
         self._dcp_padded_query: bool = False
+        # The head-sharded KVP decode's solution pin, probed with the prefill's.
+        self._kvp_decode_solution: str | None = None
         # Whether every KVP decode selection runs gfx950's dense core on an
         # FP8 cache, whose DCP records form the head-sharded decode runs.
         self._dcp_decode_records_core: bool = False
@@ -593,6 +595,7 @@ class DSABackend(PagedAttentionBackend):
         self.kvp_block_granularity = block_granularity
         self.kvp_virtual_block_count = virtual_block_count
         # Probed here: a router's solution pin lands after construction.
+        self._kvp_decode_solution = self._probe_kvp_decode_solution()
         self._dcp_records_core = self._probe_dcp_records_core()
         self._dcp_padded_query = self._probe_dcp_padded_query()
         self._dcp_decode_records_core = self._probe_dcp_decode_records_core()
@@ -714,6 +717,41 @@ class DSABackend(PagedAttentionBackend):
             return core.name == "flashinfer_trtllm_dsa_prefill"
         return False
 
+    def _probe_kvp_decode_solution(self) -> str | None:
+        """The solution the head-sharded KVP decode pins: ``flashinfer_prims``
+        where it serves every decode selection the forward makes
+        (``_sparse_leaf_probes``), else the leaf's own pin.
+
+        The Prims-TS core attends the gathered heads unpadded and writes the
+        combine's LSE itself, -inf for a row owning no key; the trtllm-gen
+        core pads the heads and needs an LSE launch and a mask after it. Only
+        without a pin or plan of the leaf's own, on an FP8 cache. Boot
+        configuration only, so every rank of the group agrees.
+        """
+        if (
+            len(self.kvp_group) <= 1
+            or self.kernel_solution is not None
+            or self.decode_kernel_plan is not None
+            or self.data_type != torch.float8_e4m3fn
+            or current_platform().is_npu
+        ):
+            return self.kernel_solution
+        decodes = [
+            probe for probe in self._sparse_leaf_probes() if probe[1] == "dsa_decode"
+        ]
+        for _, mode, signature, traits, _, _ in decodes:
+            try:
+                select_kernel(
+                    "attention",
+                    mode,
+                    signature,
+                    traits=traits,
+                    solution="flashinfer_prims",
+                )
+            except NoKernelFoundError:
+                return self.kernel_solution
+        return "flashinfer_prims" if decodes else self.kernel_solution
+
     def _probe_dcp_decode_records_core(self) -> bool:
         """Whether the head-sharded KVP decode may run the DCP records core.
 
@@ -802,7 +840,7 @@ class DSABackend(PagedAttentionBackend):
                     "dsa_decode",
                     signature,
                     {**traits, "q_len": q_len, "return_lse": use_dcp},
-                    self.kernel_solution,
+                    self._kvp_decode_solution if use_dcp else self.kernel_solution,
                     self.decode_kernel_plan,
                 )
             )
@@ -2636,7 +2674,7 @@ class DSABackend(PagedAttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=1.0,
             return_lse=use_dcp,
-            solution=self.kernel_solution,
+            solution=self._kvp_decode_solution if use_dcp else self.kernel_solution,
             kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
         )

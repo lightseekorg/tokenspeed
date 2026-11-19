@@ -199,6 +199,7 @@ _K31_SPARSE_LEAF = dict(
     kvp_prefill_query_layout=False,
     _dcp_records_core=False,
     _dcp_padded_query=False,
+    _kvp_decode_solution=None,
     _dcp_decode_records_core=False,
     _row_shard_prefill=False,
 )
@@ -770,6 +771,44 @@ def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, cas
     assert backend._dcp_decode_records_core is (case == "gfx950")
 
 
+@pytest.mark.parametrize(
+    "case", ["prims", "kvp1", "verify_unserved", "pinned", "planned", "bf16_cache"]
+)
+def test_kvp_decode_pins_prims_where_it_serves_every_decode(monkeypatch, case):
+    """The head-sharded KVP decode pins the Prims-TS core only where it serves
+    both decode selections (one row per request and the verify rows) on an
+    FP8 cache without a pin or plan of the leaf's own; the probes then ask
+    for it, as the forward does."""
+    dsa = backends.dsa
+    backend, _ = _sparse_leaf_backend(
+        monkeypatch,
+        data_type=torch.bfloat16 if case == "bf16_cache" else torch.float8_e4m3fn,
+        kvp_group=(0,) if case == "kvp1" else (0, 1, 2, 3),
+        kernel_solution="triton" if case == "pinned" else None,
+        decode_kernel_plan=_plan("planned_decode", []) if case == "planned" else None,
+    )
+
+    def select(family, mode, signature, *, traits, solution):
+        if solution == "flashinfer_prims":
+            assert mode == "dsa_decode" and traits["return_lse"]
+            if case == "verify_unserved" and traits["q_len"] > 1:
+                raise NoKernelFoundError("no verify-width Prims-TS core")
+            return SimpleNamespace(name="flashinfer_prims_dsa_decode")
+        return SimpleNamespace(name=f"fake_{mode}")
+
+    monkeypatch.setattr(dsa, "select_kernel", select)
+    backend.configure_runtime(
+        block_granularity=128,
+        virtual_block_count=17,
+        shard_count=len(backend.kvp_group),
+    )
+    expected = {"prims": "flashinfer_prims", "pinned": "triton"}.get(case)
+    assert backend._kvp_decode_solution == expected
+    decodes = [p for p in backend._sparse_leaf_probes() if p[1] == "dsa_decode"]
+    pin = expected if case != "kvp1" else None
+    assert decodes and all(probe[4] == pin for probe in decodes)
+
+
 @pytest.mark.parametrize("kvp", [1, 8])
 def test_trtllm_sparse_buffers_are_reserved_before_any_forward(monkeypatch, kvp):
     """configure_runtime reserves the trtllm-gen cores' persistent buffers for
@@ -845,6 +884,13 @@ def test_dcp_records_core_on_the_real_k31_selection(monkeypatch, solution):
     )
     # Where trtllm-gen runs the 96 gathered heads, as 128, qlayout pads them.
     assert backend._dcp_padded_query is (solution is None and trtllm_outranks)
+    # The KVP decode takes the Prims-TS core on SM100 to SM103 unless pinned.
+    prims = current_platform().is_nvidia and (10, 0) <= tuple(
+        torch.cuda.get_device_capability()
+    ) <= (10, 3)
+    assert backend._kvp_decode_solution == (
+        "flashinfer_prims" if solution is None and prims else solution
+    )
 
 
 @pytest.mark.skipif(
