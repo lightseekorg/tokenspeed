@@ -754,6 +754,32 @@ Other memory regions retain their local release semantics. Readiness is
 MIN-reduced over the replica and then attention DP
 before any release runs on the forward thread.
 
+Sampler state, cache-arena geometry, capture placeholders and forward metadata
+use the existing CPU-backed persistent-buffer regions. Their addresses and
+contents survive the `weights` release/resume lifecycle; KV payload bytes keep
+the separate discard-and-rebuild policy. These allocation scopes do not add
+another execution path or change the draining order.
+Per-forward packed cache tables join the same pool when built, including
+their shared-storage views retained by the backend after the last decode.
+Live forwards and prefill capture use the same managed table factory; target
+and draft decode capture prepare their metadata through one explicit entry.
+
+Host-transfer workspace address tables and per-submission device metadata use
+the same CPU-backed regions, both at initialization and when a write or load
+grows its tables on a transfer stream. Memory release drains those streams;
+weights resume restores the tables before any cache transfer can use them.
+The immutable Host-transfer geometry tables and capture-boundary barrier
+dispatch markers use these regions too, so they cannot pin ordinary allocator
+segments while the engine sleeps.
+The capture barriers use the default WORLD group, bound eagerly during
+distributed initialization; NVIDIA fabric discovery also exercises its
+all-gather before model construction, outside any managed allocation region.
+
+The default generator's graph seed and offset join the CPU-backed region when
+registered, before CUDA capture begins. They keep their addresses and values
+across weights sleep/wake; the graph's private temporary buffers remain
+discardable under the separate `cuda_graph` tag.
+
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.
 Other regions still resume locally. A pending collective resume refuses a
