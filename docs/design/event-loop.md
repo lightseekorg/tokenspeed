@@ -654,8 +654,11 @@ Queue subcategories overlap the total and must not be added to it again.
 
 Only ranks with an engine metrics exporter retain per-request timing samples.
 Decode request logs, exported latency metrics, and request traces use the
-arrival of the bootstrap token as the first-token timestamp. Metrics and
-tracing are independently enabled; tracing alone retains no metric samples.
+first local decode output as the first-token timestamp. The remote bootstrap
+token's arrival is the prefill/queue boundary (`decode_ready_wait`), not the
+start of the decode window, so a wait for a decode execution permit is TTFT.
+Metrics and tracing are independently enabled; tracing alone retains no
+metric samples.
 Decode throughput counts tokens appended to the request, including the stop
 token when present. A speculative suffix discarded at the stop boundary still
 advances the scheduler frontier but contributes no output tokens.
