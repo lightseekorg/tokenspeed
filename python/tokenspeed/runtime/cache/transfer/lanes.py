@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
 )
 
 from tokenspeed.runtime.utils import get_device_module
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 device_module = get_device_module()
 
@@ -390,13 +391,16 @@ class HostTransferLane:
     workspace's pinned metadata staging. Two submissions that must never wait
     on each other's staging (L2's stream-ordered and pinned write-backs; the
     snapshot executor's stores and restores) take separate lanes.
+    Device metadata uses the arena's CPU-backed pool, including later growth
+    on the transfer stream, so it follows the drained weights sleep/wake.
     """
 
-    __slots__ = ("metadata_done", "workspace")
+    __slots__ = ("metadata_done", "workspace", "_memory_saver_adapter")
 
-    def __init__(self) -> None:
+    def __init__(self, memory_saver_adapter: TorchMemorySaverAdapter) -> None:
         self.workspace = HostTransferWorkspace()
         self.metadata_done = None
+        self._memory_saver_adapter = memory_saver_adapter
 
     def _stage(
         self,
@@ -423,7 +427,10 @@ class HostTransferLane:
         num_blocks, _ = self.workspace.load_block_transfers(
             transfers, geometry=geometry
         )
-        with device_module.stream(stream):
+        with (
+            device_module.stream(stream),
+            self._memory_saver_adapter.named_region("workspace"),
+        ):
             mode = self.workspace.prepare_backend(
                 device_buffers, host_buffer, backend=backend
             )
