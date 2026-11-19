@@ -2212,8 +2212,9 @@ window and sink cover the draft's visibility. `check_block_drafter_storage`
 validates that binding; a private sliding group is allocated, matched,
 transferred and reclaimed through the ordinary scheduler path. Its fields
 may share physical planes with other groups, with K and V as consecutive
-fields within each page. Such noncontiguous history views retain their page
-axis, and the pool and attention kernels address each page using its stride.
+fields within each page or in separate planes at one page stride. Such
+noncontiguous history views retain their page axis, and the pool and attention
+kernels address each page using its stride.
 
 DeepSeek
 V4.1's same-checkpoint DSpark has no draft attention layers of its own; its
@@ -2239,9 +2240,12 @@ released DSpark draft, as an MHA view over the one arena: each draft layer
 adds a K and a V plane at P=128, chosen from the draft config's type, and the
 KDA packing stays sized off the MLA plane. The planes join the MLA history
 group, unless every draft layer slides: such a draft owns a sliding-window
-group that retains its window plus one token, packed like the MLA group. KVP
-leaves that group unsharded, since PD cannot transfer K/V head rows out of a
-page-sharded group, and the draft's MHA config is built without KVP.
+group that retains its window plus one token and adds no planes. Each layer's
+K and V pages ride in two of the target's MLA planes, and the group packs as
+many pages as fit one such plane at a 16-byte-aligned stride, so a parent is
+the draft-less target's. KVP leaves that group unsharded, since PD cannot
+transfer K/V head rows out of a page-sharded group, and the draft's MHA config
+is built without KVP.
 
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and
