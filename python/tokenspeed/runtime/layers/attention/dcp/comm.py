@@ -94,6 +94,7 @@ def prepare_decode_exchange(
     Returns:
         Whether the group exchanges through it.
     """
+    timeout_ns = int((timeout_s - 30 if timeout_s >= 90 else timeout_s / 2) * 1e9)
     if value_heads is not None and group not in _VALUE_TAILS:
         from tokenspeed_kernel.ops.attention.mla.cute_dsl import create_dcp_value_tail
 
@@ -106,11 +107,11 @@ def prepare_decode_exchange(
             torch.device("cuda", torch.cuda.current_device()),
             heads=value_heads,
             rows=decode_rows,
+            timeout_ns=timeout_ns,
             eligible=True,
         )
         if tail is not None:
             _VALUE_TAILS[group] = tail
-    timeout_ns = int((timeout_s - 30 if timeout_s >= 90 else timeout_s / 2) * 1e9)
     prepared = prepare_small_exchange(group, DECODE_EXCHANGE_CAP_BYTES, timeout_ns)
     if torch.distributed.get_rank() == group[0]:
         logger.info(

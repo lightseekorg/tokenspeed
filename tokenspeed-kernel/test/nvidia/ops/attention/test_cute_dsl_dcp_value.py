@@ -21,10 +21,14 @@
 """The DCP value tail (``DcpValue``) keeps the bits of the unfused chain.
 
 Its output equals the records all-to-all, ``combine_dcp_attention_partials``
-and ``mla_value``, call after call and under CUDA graph replay with new inputs.
+and ``mla_value``, call after call and under CUDA graph replay with new inputs;
+a peer that never calls traps the kernel at the timeout, and every refusal is
+voted on.
 """
 
+import os
 import socket
+import time
 from datetime import timedelta
 
 import pytest
@@ -35,6 +39,7 @@ import torch.multiprocessing as mp
 HEADS, LATENT, VALUE = 12, 512, 128
 CAP = 128
 BATCHES = (1, 8, 17, 64, 128)
+TIMEOUT_NS = 60 * 10**9
 
 
 def _port() -> int:
@@ -109,7 +114,12 @@ def _worker(rank, degree, port):
 
         gather_fabric_map()
         tail = create_dcp_value_tail(
-            dist.new_group(backend="gloo"), device, heads=HEADS, rows=CAP, eligible=True
+            dist.new_group(backend="gloo"),
+            device,
+            heads=HEADS,
+            rows=CAP,
+            timeout_ns=TIMEOUT_NS,
+            eligible=True,
         )
         assert tail is not None
         gen = torch.Generator(device=device).manual_seed(77 + rank)
@@ -178,3 +188,87 @@ def test_dcp_value_is_the_combine_and_projection_bit_for_bit(degree):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("DcpValue needs SM100 or SM103")
     mp.spawn(_worker, args=(degree, _port()), nprocs=degree, join=True)
+
+
+def _init(rank, degree, port):
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=degree,
+        device_id=device,
+        timeout=timedelta(seconds=120),
+    )
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+    gather_fabric_map()
+    return device
+
+
+def _refusal_worker(rank, degree, port):
+    device = _init(rank, degree, port)
+    try:
+        from tokenspeed_kernel.ops.attention.mla.cute_dsl import create_dcp_value_tail
+
+        group = dist.new_group(backend="gloo")
+        common = dict(heads=HEADS, rows=CAP, timeout_ns=TIMEOUT_NS, eligible=True)
+        # One rank's refusal leaves every rank without a tail.
+        mine = dict(common, eligible=rank != 1)
+        assert create_dcp_value_tail(group, device, **mine) is None
+        assert (
+            create_dcp_value_tail(group, device, **dict(common, timeout_ns=0)) is None
+        )
+        # A mailbox of 2**31 elements would wrap the merge's int32 offsets.
+        rows = -(-(2**31) // (2 * degree * HEADS * LATENT))
+        assert create_dcp_value_tail(group, device, **dict(common, rows=rows)) is None
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _timeout_worker(rank, degree, port):
+    """Rank 1 never calls: rank 0's tail traps once its polls pass the timeout."""
+    device = _init(rank, degree, port)
+    from tokenspeed_kernel.ops.attention.mla.cute_dsl import create_dcp_value_tail
+
+    group = dist.new_group(backend="gloo")
+    timeout_ns = 2 * 10**9
+    tail = create_dcp_value_tail(
+        group, device, heads=HEADS, rows=CAP, timeout_ns=timeout_ns, eligible=True
+    )
+    assert tail is not None
+    verdict = torch.zeros(1, dtype=torch.int64)
+    if rank == 0:
+        rows, lse = _partials(8, degree, rank, device, 0)
+        w_uv = torch.zeros((HEADS, VALUE, LATENT), device=device)
+        w_uv = w_uv.to(torch.bfloat16).transpose(1, 2)
+        out = torch.empty((8, HEADS * VALUE), dtype=torch.bfloat16, device=device)
+        start = time.monotonic()
+        try:
+            tail(rows, lse, w_uv, None, out)
+            torch.cuda.synchronize()
+        except RuntimeError:
+            waited = time.monotonic() - start
+            verdict[0] = int(timeout_ns / 1e9 <= waited < 60)
+    # The trap ends rank 0's CUDA context: report over gloo and exit at once.
+    dist.all_reduce(verdict, group=group)
+    os._exit(0 if int(verdict) == 1 else 1)
+
+
+@pytest.mark.parametrize("degree", [2])
+def test_dcp_value_refusals_are_voted(degree):
+    if torch.cuda.device_count() < degree:
+        pytest.skip(f"needs {degree} GPUs")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("DcpValue needs SM100 or SM103")
+    mp.spawn(_refusal_worker, args=(degree, _port()), nprocs=degree, join=True)
+
+
+def test_dcp_value_traps_when_a_peer_never_calls():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs 2 GPUs")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("DcpValue needs SM100 or SM103")
+    mp.spawn(_timeout_worker, args=(2, _port()), nprocs=2, join=True)

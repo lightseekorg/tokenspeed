@@ -219,6 +219,7 @@ def create_dcp_value_tail(
     *,
     heads: int,
     rows: int,
+    timeout_ns: int,
     eligible: bool,
 ) -> DcpValueTail | None:
     """Collectively build a KVP group's :class:`DcpValueTail`.
@@ -233,6 +234,8 @@ def create_dcp_value_tail(
         device: This rank's CUDA device, with its index.
         heads: Local query heads per rank, equal on every rank.
         rows: Most decode rows of one call, equal on every rank.
+        timeout_ns: Bound of every in-kernel wait; a peer that does not reach
+            the same call within it fails the kernel with a trap.
         eligible: The caller's own verdict for this rank, voted on with the rest.
 
     Returns:
@@ -250,6 +253,9 @@ def create_dcp_value_tail(
         and degree in (2, 4, 8)
         and 0 < heads
         and 0 < rows
+        # The merge reads the local mailbox through int32 element offsets.
+        and 2 * degree * rows * heads * _LATENT < 2**31
+        and timeout_ns > 0
     )
     if local_ok:
         # A rendezvous over hosts the fabric cannot map would hang.
@@ -273,4 +279,6 @@ def create_dcp_value_tail(
         )
     if not ok:
         return None
-    return DcpValueTail(DcpValueMailbox(group, device, heads=heads, cap=rows))
+    return DcpValueTail(
+        DcpValueMailbox(group, device, heads=heads, cap=rows, timeout_ns=timeout_ns)
+    )

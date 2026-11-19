@@ -46,6 +46,10 @@ builds a group's Lamport mailboxes in symmetric memory, and a
   memory, so a rank stores into a parity only after every peer finished
   reading the call before. The grid holds at most one CTA per SM, so every
   CTA's stores land while the merging CTAs poll.
+- Every poll is bounded by the group's timeout: a peer that never reaches the
+  call traps the kernel, as a hung NCCL kernel would end the group. Groups
+  whose mailbox would hold 2^31 or more elements get no tail, since the merge
+  addresses it with int32 offsets.
 
 On GB300, eight ranks over two nodes, 12 heads per rank, CUDA graphs of back
 to back calls, us per call:

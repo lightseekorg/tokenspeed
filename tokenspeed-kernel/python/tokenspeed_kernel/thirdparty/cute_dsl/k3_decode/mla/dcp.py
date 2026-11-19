@@ -14,6 +14,7 @@
 # - A use's parity comes from a call count in device memory, so any sequence of
 #   calls alternates parities, graph replays included.
 # - NaN LSEs are sent canonical, so no sent LSE is the sentinel.
+# - Every poll is bounded by a timeout: a peer that never sends traps the kernel.
 
 """The DCP tail of a sparse MLA decode: partials to their head owners, merged and projected.
 
@@ -31,7 +32,9 @@ Head ``gh`` belongs to rank ``gh // H``. One launch per rank:
 
 The mailbox's data marks its own arrival, so no rank waits on a barrier. A rank
 publishes into parity ``p`` again only after the use between, which every peer
-starts after its merge of this use: no slot is overwritten while it is read.
+starts after its merge of this use: no slot is overwritten while it is read. A
+poll still unanswered past the call's timeout traps, as a hung NCCL kernel would
+end the group.
 """
 
 import math
@@ -111,6 +114,23 @@ def load_count(ctrl):
     return "ld.relaxed.gpu.global.u64 $0, [$1];", "=l,l", (ctrl,)
 
 
+@asm(Uint64)
+def global_timer():
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@asm()
+def trap_after(deadline):
+    """Trap once the ``%globaltimer`` clock passes ``deadline``."""
+    code = (
+        "{ .reg .u64 now; .reg .pred late;\n"
+        "mov.u64 now, %globaltimer;\n"
+        "setp.gt.u64 late, now, $0;\n"
+        "@late trap; }"
+    )
+    return code, "l", (Uint64(deadline),)
+
+
 @asm()
 def finish(ctrl, grid, count):
     """Count this CTA in; the last one resets the ticket and publishes ``count``."""
@@ -138,9 +158,9 @@ class DcpValue:
         self.heads, self.size, self.cap, self.gated = heads, size, cap, gated
 
     @cute.jit
-    def __call__(self, rows, lse, box, lbox, peers, lpeers, w_uv, gate, output, ctrl: Int64, batch: Int32, rank: Int32, tiles: Int32, pushers: Int32, stream):  # fmt: skip
+    def __call__(self, rows, lse, box, lbox, peers, lpeers, w_uv, gate, output, ctrl: Int64, batch: Int32, rank: Int32, tiles: Int32, pushers: Int32, timeout: Int64, stream):  # fmt: skip
         args = (rows, lse, box, lbox, peers, lpeers, w_uv, gate, output, ctrl)
-        args += (batch, rank, tiles, pushers, stream)
+        args += (batch, rank, tiles, pushers, timeout, stream)
         launch(self.kernel, args, (self.heads, tiles, pushers), THREADS)
 
     @cute.kernel
@@ -163,6 +183,7 @@ class DcpValue:
                 words = load_words(at(w_uv, head, 32 * c + 8 * quarter, v), count=4)
             wb.append(words)
         cute.arch.griddepcontrol_wait()
+        deadline = global_timer() + Uint64(args[14])
         count = load_count(ctrl) + Uint64(1)
         parity = Int32(count & Uint64(1))
         self.push(args, parity, head, tile, pusher, tid)
@@ -170,7 +191,7 @@ class DcpValue:
         if pusher == 0:
             batch = args[10]
             for t in range(tile, (batch + ROWS - 1) // ROWS, tiles):
-                self.merge(args, latent, weights, wb, parity, t, tid)
+                self.merge(args, latent, weights, wb, parity, deadline, t, tid)
         cute.arch.sync_threads()
         if tid == 0:
             finish(ctrl, self.heads * tiles * pushers, count)
@@ -202,7 +223,7 @@ class DcpValue:
             store_relaxed(address, tuple(no_neg_zero(w) for w in words))
 
     @cute.jit
-    def merge(self, args, latent, weights, wb, parity, t, tid):
+    def merge(self, args, latent, weights, wb, parity, deadline, t, tid):
         """Rows ``16 t ..`` of this head: weights, polled merge, W_UV and gate."""
         box, lbox, gate, output, batch = args[2], args[3], args[7], args[8], args[10]
         D = self.size
@@ -227,6 +248,7 @@ class DcpValue:
             if lane < D:
                 word = load_words(source, count=1, volatile=True, word_type="u32")[0]
                 while word == Uint32(LSE_SENT):
+                    trap_after(deadline)
                     word = load_words(source, count=1, volatile=True, word_type="u32")[0]  # fmt: skip
                 store_words(source, (Uint32(LSE_SENT),))
                 value = bits_float(word)
@@ -265,7 +287,9 @@ class DcpValue:
                     for s in sources
                 ]
                 for s in cutlass.range_constexpr(D):
-                    self.add_source(sources[s], loads[s], weights[r, s], merged)
+                    self.add_source(
+                        sources[s], loads[s], weights[r, s], merged, deadline
+                    )
             pairs = tuple(
                 pack_pair(merged[2 * e], merged[2 * e + 1], policy=None)
                 for e in range(4)
@@ -298,11 +322,12 @@ class DcpValue:
         cute.arch.sync_threads()  # the next tile rewrites the latent and weights
 
     @cute.jit
-    def add_source(self, source, words, weight, merged):
+    def add_source(self, source, words, weight, merged, deadline):
         """Poll a source's 16 B chunk until published, re-arm it and add its eight
         values times ``weight`` (an empty source's ``-1 - weight``: zeros) to
         ``merged``, unfused, as the combine's ``acc + values * weight``."""
         while not published(words, sentinel=PAIR_SENT):
+            trap_after(deadline)
             words = load_words(source, count=4, volatile=True, word_type="u32")
         store_words(source, (Uint32(PAIR_SENT),) * 4)
         empty = weight < Float32(0)
@@ -320,12 +345,14 @@ class DcpValue:
 class DcpValueMailbox:
     """A KVP group's DcpValue state: two parities of BF16 partial rows ``[2, D, cap,
     H, 512]`` and FP32 LSEs ``[2, D, cap, H]`` in symmetric memory, sentinel-armed,
-    their peers' addresses, and the call count. Creation is collective over
-    ``group`` (eagerly, outside graph capture)."""
+    their peers' addresses, the call count and the bound of every in-kernel wait
+    (``timeout_ns``). Creation is collective over ``group`` (eagerly, outside
+    graph capture)."""
 
-    def __init__(self, group: dist.ProcessGroup, device: torch.device, *, heads: int, cap: int) -> None:  # fmt: skip
+    def __init__(self, group: dist.ProcessGroup, device: torch.device, *, heads: int, cap: int, timeout_ns: int) -> None:  # fmt: skip
         self.size, self.rank = dist.get_world_size(group), dist.get_rank(group)
         self.heads, self.cap, self.device = heads, cap, device
+        self.timeout_ns = timeout_ns
         shape = (2, self.size, cap, heads)
         with torch.cuda.device(device):
             self.partial = symm_mem.empty((*shape, LATENT), dtype=torch.bfloat16, device=device)  # fmt: skip
@@ -372,7 +399,8 @@ def compile_dcp_value(heads: int, size: int, cap: int, gated: bool, arch: str):
     lbox = fake((2, size, cap, heads), None, torch.float32, 4)
     peers = fake((size,), None, torch.int64, 8)
     args = (rows(3, 16), lses(), box, lbox, peers, peers, w_uv, rows(2, 4), rows(2, 4))
-    args += (Int64(0), Int32(0), Int32(0), Int32(1), Int32(1), make_fake_stream())
+    args += (Int64(0), Int32(0), Int32(0), Int32(1), Int32(1), Int64(0))
+    args += (make_fake_stream(),)
     return cute.compile(
         DcpValue(heads, size, cap, gated), *args, options=f"--gpu-arch={arch}"
     )
@@ -413,5 +441,6 @@ def dcp_value(rows, lse, mailbox: DcpValueMailbox, w_uv, gate, output, stream):
         Int32(mailbox.rank),
         Int32(tiles),
         Int32(pushers),
+        Int64(mailbox.timeout_ns),
         stream,
     )
