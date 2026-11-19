@@ -178,9 +178,14 @@ releases it and leaves a tombstone.
 cache or Host pool into the reader's Device pages. The holder's data plane
 takes no part. A reader starts its reads only once its own plan's device work
 that precedes page reuse has run -- the write-back stores that still read
-victims' old bytes, the copies, the zeroing -- the point PD's decode role
-starts its receive from: a destination may be a block that plan freed, and
-the device's reads of it are not ordered with the network's writes.
+victims' old bytes, the copies, the zeroing -- and the plan's loads of its
+local Host hit: a destination may be a block that plan freed, and the
+device's reads of it are not ordered with the network's writes; and the
+landing's end releases the request to a later plan's forward, which does not
+wait for this plan's loads. PD's decode role starts its receive from the same
+point. The landing waits on separate completion events for the default and
+load streams after the current forward is launched. The default stream does
+not wait for the entire load, so that forward keeps its layerwise load overlap.
 
 **Release.** The servicer answers whether the pages stayed untouched from the
 pin: either no plan ran on the holder since the pin's answer, or the hard pin
@@ -277,6 +282,9 @@ servicer's endpoint (`host:port`, one per attention-DP replica), which the
 router's hint carries; on first contact a reader fetches the holder's layout:
 its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
+The first member owns the bound listener continuously through startup. A
+caller using an OS-selected port binds before constructing the replica's name
+and scheduler, then moves that listener into the peer without rebinding.
 Until the shim's NVLink path is wired, replicas on one node also read over
 RDMA (the NIC's loopback); only the router's cost model tells the two apart.
 
@@ -341,17 +349,21 @@ gain falls below a minimum fetch size.
 
 ### Engine roles and scope
 
-The first version covers what write-back covers: fused and prefill roles, with
+The first version covers every role, with
 attention TP and KV parallelism; replicated cache groups only, no KV-page
 sharding; no pipeline stages and no query context parallelism. It needs the
 Host tier (`--enable-kvstore`): the Host is half of the capacity a holder
 serves, and its layout is the field list both sides read by. A prefill
 replica that reuses a peer's prefix then transfers to its decode peer through
-the ordinary PD path. Hybrid models (sliding window, State checkpoints) are in
-scope through the holder's matchers.
+the ordinary PD path. A decode replica holds and never reads: it serves the
+history it decoded, prompts and replies, so the next turn's prefill replica
+reads a reply instead of computing it, and its own prompts come from its
+prefill peer (RFC 0005, which also gives the decode role a Host tier under
+write-back). Hybrid models (sliding window, State checkpoints) are in scope
+through the holder's matchers.
 
-Out of scope: a storage tier, a central owner, the decode role, sharing across
-namespaces, and moving PD itself onto the new read entry point.
+Out of scope: a storage tier, a central owner, sharing across namespaces, and
+moving PD itself onto the new read entry point.
 
 ### Configuration
 
@@ -383,7 +395,8 @@ leases held by tier, demoted and dropped blocks and their returns.
    across two nodes; token-identical output with and without reuse.
 2. Medium in KV events; Dynamo peer credit, link cost models and hints.
 3. Holder demotion of the leaf chain a complete read released.
-4. Larger scopes: KV-page sharding, other roles.
+4. Larger scopes: KV-page sharding. The decode role as a holder came with
+   RFC 0005.
 
 ## Testing
 

@@ -198,21 +198,25 @@ void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerReleas
 }
 
 void PeerExports::Expire(std::int64_t now_us) {
+    // Older libstdc++ versions pass const entries to erase_if predicates.
+    // Expiration also updates hard pins, so walk the mutable entries directly.
     for (auto it = leases_.begin(); it != leases_.end();) {
         Lease& lease = it->second;
         if (now_us < lease.deadline_us) {
             ++it;
-        } else if (lease.phase != Phase::kHard) {
-            it = leases_.erase(it);
-        } else {
-            if (observe_pins_) {
-                pin_samples_.push_back({now_us - lease.pinned_us, lease.deadline_us - now_us, true});
-            }
-            lease.phase = Phase::kExpired;
-            lease.pins.clear();
-            lease.deadline_us = Deadline(now_us, hard_pin_us_);
-            ++it;
+            continue;
         }
+        if (lease.phase != Phase::kHard) {
+            it = leases_.erase(it);
+            continue;
+        }
+        if (observe_pins_) {
+            pin_samples_.push_back({now_us - lease.pinned_us, lease.deadline_us - now_us, true});
+        }
+        lease.phase = Phase::kExpired;
+        lease.pins.clear();
+        lease.deadline_us = Deadline(now_us, hard_pin_us_);
+        ++it;
     }
 }
 

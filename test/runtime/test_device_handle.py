@@ -706,8 +706,12 @@ class _PeerOutbox:
         self._trace.append("reads_ready")
 
 
-def _peer_handle(trace):
-    handle = _handle(trace, peer_outbox=_PeerOutbox(trace))
+def _peer_handle(trace, host_cache_executor=None):
+    handle = _handle(
+        trace,
+        peer_outbox=_PeerOutbox(trace),
+        host_cache_executor=host_cache_executor,
+    )
     executor = handle._executor
     executor.copy_cache_pages = lambda pairs: trace.append("copy")
     executor.zero_cache_pages = lambda pages: trace.append("zero")
@@ -749,6 +753,32 @@ def test_peer_reads_start_behind_the_plans_device_work(wire_ops, forwards):
         ("default waits", "execution-stream"),
         ("record", handle._executor.default_stream),
         *(["forward"] if forwards else []),
+        "wait_fence",
+        "reads_ready",
+    ]
+
+
+def test_peer_reads_start_behind_the_loads_of_the_local_hit(wire_ops):
+    """A landing that extends a local Host hit: the reader's first forward
+    runs in a later plan, which does not wait for this plan's loads, so the
+    READs -- whose end releases the request -- start behind them."""
+    trace: list = []
+    handle = _peer_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+
+    _execute(
+        handle,
+        _plan(cache=[_LoadBackOp("load")], has_peer_fetches=True),
+        None,
+    )
+
+    assert trace == [
+        "write_backs",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
+        ("record", "load-stream"),
+        "wait_fence",
         "wait_fence",
         "reads_ready",
     ]
@@ -1010,17 +1040,42 @@ def _decode_peer(trace):
     return _Peer()
 
 
-def _receiving_handle(trace, *, prepare=None):
-    handle = _handle(trace, kv_transfer=_decode_peer(trace))
+def _receiving_handle(trace, *, prepare=None, host_cache_executor=None):
+    handle = _handle(
+        trace,
+        kv_transfer=_decode_peer(trace),
+        host_cache_executor=host_cache_executor,
+    )
     executor = handle._executor
     executor.prepare_remote_cache_slots = prepare or (
         lambda slots: trace.append(("prepare", slots))
     )
     executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
-    executor.zero_cache_pages = lambda pages: SimpleNamespace(
-        synchronize=lambda: trace.append("wait_zeroing")
-    )
+    executor.zero_cache_pages = lambda pages: trace.append("zero")
+
+    class _Event:
+        def record(self, stream) -> None:
+            trace.append(("record", stream))
+
+        def synchronize(self) -> None:
+            trace.append("wait_fence")
+
+    executor.device_module = SimpleNamespace(Event=_Event)
     return handle
+
+
+def _l2_with_load_stream(trace):
+    """A Host L2 executor that records its submissions and names its load
+    stream."""
+    return SimpleNamespace(
+        submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+            trace.append("write_backs")
+        ),
+        submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+            "load_backs"
+        ),
+        load_stream="load-stream",
+    )
 
 
 def _remote_prefill():
@@ -1028,27 +1083,195 @@ def _remote_prefill():
 
 
 @pytest.mark.parametrize("forwards", [True, False])
-def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
-    """The zeroing fence the pull waits on is ordered behind the step in
-    flight; the round's forward is launched first so that wait never delays
-    its launch. A round without a batch still pulls."""
+@pytest.mark.parametrize("zeroes", [True, False])
+def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards, zeroes):
+    """The landing fence the pull waits on is recorded on the default stream
+    behind the zeroing and the forwards in flight, whether or not the plan
+    zeroes anything; the round's forward is launched first so that wait never
+    delays its launch. A round without a batch still pulls."""
     trace: list = []
     handle = _receiving_handle(trace)
     remote_prefill = _remote_prefill()
 
     _execute(
         handle,
-        _plan(pages_to_zero=[5], remote_prefill=remote_prefill),
+        _plan(pages_to_zero=[5] if zeroes else [], remote_prefill=remote_prefill),
         _planned(num_extends=0) if forwards else None,
     )
 
     assert trace == [
+        *(["zero"] if zeroes else []),
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
         ("prepare", [3]),
         "reset",
         *(["forward"] if forwards else []),
-        "wait_zeroing",
+        "wait_fence",
         ("pull", remote_prefill),
     ]
+
+
+def test_a_remote_prefill_pulls_behind_the_loads_of_its_host_hit(wire_ops):
+    """A D admission's Host hit loads below its landing. The landed request's
+    first forward runs in a later plan, whose layerwise load waits name only
+    that plan's loads, so the pull -- whose end releases the request -- waits
+    for this plan's loads, and for the stores reading the victims it
+    regranted."""
+    trace: list = []
+    store, load = _WriteBackOp("store"), _LoadBackOp("load")
+    handle = _receiving_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+    remote_prefill = _remote_prefill()
+
+    _execute(
+        handle,
+        _plan(pages_to_zero=[5], cache=[store, load], remote_prefill=remote_prefill),
+        None,
+    )
+
+    assert trace == [
+        "write_backs",
+        "zero",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
+        ("record", "load-stream"),
+        ("prepare", [3]),
+        "reset",
+        "wait_fence",
+        "wait_fence",
+        ("pull", remote_prefill),
+    ]
+
+
+class _PendingDeviceWork:
+    """GPU work with the dependencies captured when it was submitted."""
+
+    def __init__(self, dependencies, action):
+        self.dependencies = dependencies
+        self.action = action
+        self.completed = False
+
+    def complete(self):
+        if self.completed:
+            return
+        for dependency in self.dependencies:
+            dependency.complete()
+        if self.action is not None:
+            self.action()
+        self.completed = True
+
+
+class _OrderedDeviceStream:
+    def __init__(self):
+        self.work = None
+
+    def submit(self, action):
+        dependencies = () if self.work is None else (self.work,)
+        self.work = _PendingDeviceWork(dependencies, action)
+        return self.work
+
+    def wait_stream(self, stream):
+        dependencies = tuple(
+            work for work in (self.work, stream.work) if work is not None
+        )
+        self.work = _PendingDeviceWork(dependencies, None)
+
+
+class _RecordedDeviceEvent:
+    def __init__(self):
+        self.work = None
+
+    def record(self, stream):
+        self.work = stream.work
+
+    def synchronize(self):
+        if self.work is not None:
+            self.work.complete()
+
+
+class _LandingFenceDeviceModule:
+    Event = _RecordedDeviceEvent
+
+
+class _LandingFenceDevice:
+    """Substitute GPU queues and model work while driving the real handle.
+
+    Completing the forward follows its actual stream dependencies; a wait
+    on the entire load makes it observe the loaded bytes. The landing must
+    observe them regardless of whether a forward ran in the plan.
+    """
+
+    mode = "decode"
+
+    def __init__(self):
+        self.device = "cpu"
+        self.device_module = _LandingFenceDeviceModule()
+        self.default_stream = _OrderedDeviceStream()
+        self.execution_stream = _OrderedDeviceStream()
+        self.load_stream = _OrderedDeviceStream()
+        self.loaded = False
+        self.forward_saw_load = None
+        self.landing_saw_load = None
+
+    def complete_pending_drafting(self):
+        pass
+
+    def submit_write_backs(self, ops, *, prerequisite_stream, fence_stream):
+        pass
+
+    def submit_load_backs(self, ops, *, prerequisite_stream):
+        self.load_stream.wait_stream(prerequisite_stream)
+        self.load_stream.submit(self._load)
+
+    def _load(self):
+        self.loaded = True
+
+    def execute_forward_op(self, *args, **kwargs):
+        # ModelExecutor's forward prologue orders model work after this stream.
+        self.execution_stream.wait_stream(self.default_stream)
+        self.execution_stream.submit(self._forward).complete()
+
+    def _forward(self):
+        self.forward_saw_load = self.loaded
+
+    def prepare_remote_cache_slots(self, slots):
+        pass
+
+    def reset_remote_prefill_cache_lengths(self, op):
+        self.execution_stream.wait_stream(self.default_stream)
+
+    def execute(self, op):
+        self.landing_saw_load = self.loaded
+
+    def reads_ready(self):
+        self.landing_saw_load = self.loaded
+
+
+@pytest.mark.parametrize("landing", ["pd", "peer"])
+@pytest.mark.parametrize("forwards", [True, False])
+def test_landing_waits_for_host_load_without_delaying_current_forward(
+    wire_ops, landing, forwards
+):
+    device = _LandingFenceDevice()
+    handle = DeviceHandle(
+        device,
+        host_cache_executor=device,
+        kv_transfer=device if landing == "pd" else None,
+        peer_outbox=device if landing == "peer" else None,
+    )
+    _execute(
+        handle,
+        _plan(
+            cache=[_LoadBackOp("load")],
+            remote_prefill=_remote_prefill() if landing == "pd" else None,
+            has_peer_fetches=landing == "peer",
+        ),
+        _planned(num_extends=0) if forwards else None,
+    )
+
+    assert device.forward_saw_load is (False if forwards else None)
+    assert device.landing_saw_load is True
 
 
 def test_a_failed_slot_preparation_never_triggers_the_pull():

@@ -234,6 +234,23 @@ pub struct PeerUsage {
     pub admission_at: Option<std::time::Instant>,
 }
 
+/// Actual nonempty output blocks on this engine, independent of forward timing.
+/// Present only after a metrics-enabled request emits its first token block.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamOutputTiming {
+    pub first_output: f64,
+    pub last_output: f64,
+    pub first_chunk_tokens: usize,
+    pub output_tokens: usize,
+}
+
+impl StreamOutputTiming {
+    pub fn e2e_tpot(&self, finished: f64) -> Option<f64> {
+        let subsequent = self.output_tokens - self.first_chunk_tokens;
+        (subsequent > 0).then(|| (finished - self.first_output).max(0.0) / subsequent as f64)
+    }
+}
+
 /// One admitted request.
 #[derive(Debug, Clone)]
 pub struct RequestState {
@@ -320,6 +337,7 @@ pub struct RequestState {
     /// then. Unlike `timings`, this is collected whenever the rank reports
     /// engine metrics.
     pub first_token_time: f64,
+    pub(crate) stream_output_timing: Option<StreamOutputTiming>,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
     /// Sampled PD timings, consumed at the first output or terminal release.
@@ -402,6 +420,7 @@ impl RequestState {
             decode_ready_at: None,
             created_time: 0.0,
             first_token_time: 0.0,
+            stream_output_timing: None,
             timings: None,
             ttft: None,
             grammar: None,

@@ -245,6 +245,41 @@ TEST_F(PeerExportsTest, ASoftPinExpiresAndAPinAfterItHoldsNothing) {
     EXPECT_FALSE(exports_.Held(answer.lease));
 }
 
+TEST_F(PeerExportsTest, ExpirationHandlesSoftPinsHardPinsAndTombstonesTogether) {
+    const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
+    Publish(tokens);
+    PeerConfig config = Config();
+    config.max_leases = 3;
+    PeerExports exports{config};
+
+    exports.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
+    const cache::PeerLookup hard_pin = Lookup(2, tokens, 2 * kP);
+    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, hard_pin);
+    exports.Lookup(coordinator_, hard_pin, /*now_us=*/0);
+    exports.Pin(coordinator_,
+                cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                /*now_us=*/0);
+    exports.Lookup(coordinator_, Lookup(3, tokens, 2 * kP), /*now_us=*/950);
+    ASSERT_EQ(exports.NumLeases(), 3u);
+    ASSERT_EQ(exports.NumPinnedBlocks(), 3u);
+    ASSERT_TRUE(exports.Held(answer.lease));
+
+    exports.Expire(/*now_us=*/1000);
+    EXPECT_EQ(exports.NumLeases(), 2u) << "the live soft pin and the hard pin's tombstone";
+    EXPECT_EQ(exports.NumPinnedBlocks(), 0u);
+    EXPECT_FALSE(exports.Held(answer.lease));
+    EXPECT_TRUE(coordinator_.ClearCache());
+
+    exports.Expire(/*now_us=*/1049);
+    EXPECT_EQ(exports.NumLeases(), 2u);
+    exports.Expire(/*now_us=*/1050);
+    EXPECT_EQ(exports.NumLeases(), 1u) << "the soft pin expires at its own deadline";
+    exports.Expire(/*now_us=*/1999);
+    EXPECT_EQ(exports.NumLeases(), 1u) << "sweeping again must not extend the tombstone's lifetime";
+    exports.Expire(/*now_us=*/2000);
+    EXPECT_EQ(exports.NumLeases(), 0u);
+}
+
 TEST_F(PeerExportsTest, ALookupPastTheLeaseLimitOrNotCoveringItsBoundIsNoLease) {
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     Publish(tokens);

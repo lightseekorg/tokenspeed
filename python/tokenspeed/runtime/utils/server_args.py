@@ -679,7 +679,8 @@ class ServerArgs:
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
     # draw depends on its co-batch; "per-request" keys it by (request seed,
-    # position) through the Gumbel-max pool kernels. See
+    # position) through the Gumbel-max pool kernels and keys chain verify
+    # coins by the request seed and verify round's first position. See
     # docs/design/numerics.md, sampling.deterministic.
     sampling_stream: str = "batch"
     dp_sampling: bool = False
@@ -2584,10 +2585,6 @@ class ServerArgs:
         unsupported = [
             setting
             for setting, refused in (
-                (
-                    "--disaggregation-mode decode",
-                    self.disaggregation_mode == "decode",
-                ),
                 ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
                 ("--disable-prefix-caching", not self.enable_prefix_caching),
                 (
@@ -2654,8 +2651,7 @@ class ServerArgs:
             ("write_through", "write_back"),
         )
         if self.kvstore_write_policy == "write_back":
-            # Decode's Host holds retraction images only, and L3 staging would
-            # split what is written back; pipeline stages and query context
+            # L3 staging would split what is written back; pipeline stages and query context
             # parallelism have not run write-back. Attention TP and
             # --kv-parallel-size need no refusal: a written-back segment
             # publishes once every rank of the replica has acknowledged it
@@ -2666,10 +2662,6 @@ class ServerArgs:
                 setting
                 for setting, refused in (
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
-                    (
-                        "--disaggregation-mode decode",
-                        self.disaggregation_mode == "decode",
-                    ),
                     (
                         "--kvstore-storage-backend",
                         self.kvstore_storage_backend is not None,
@@ -3568,8 +3560,10 @@ class ServerArgs:
             "prefill role caches. "
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
-            "the copy), so the two tiers hold mostly different pages. "
-            "write_back is refused with --disaggregation-mode decode, "
+            "the copy), so the two tiers hold mostly different pages; on "
+            "--disaggregation-mode decode a remote admission then loads its "
+            "Host hit and the prefill node sends only the rest. "
+            "write_back is refused with "
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with more than 64 cache groups; see "
@@ -3603,8 +3597,10 @@ class ServerArgs:
             "this replica serves its own cache the same way. Its endpoint binds "
             "this port (attention-DP rank r binds this port + r). Needs the Host "
             "tier (--enable-kvstore) and prefix caching; refused with "
-            "--disaggregation-mode decode, --kvstore-storage-backend, "
+            "--kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
+            "A --disaggregation-mode decode replica serves the history it "
+            "decoded but never reads: its prefill node sends what it lacks. "
             "Replicas share only with replicas of "
             "the same model, cache layout, weights and parallel layout. RDMA "
             "devices come from --disaggregation-ib-device. See "
@@ -4286,9 +4282,9 @@ class ServerArgs:
             "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
             "by the batch row, so a request's draw depends on its co-batch. "
             "'per-request': the Gumbel-max pool kernels keyed by the request's "
-            "seed and position, so a request samples the same tokens alone and "
-            "inside any batch (finite top_k is capped at 128). Folded to "
-            "per-request by --numerics rl-bitwise.",
+            "seed and position (finite top_k is capped at 128). Chain verify "
+            "coins are keyed by the request's seed and the round's first "
+            "target position. Folded to per-request by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--dp-sampling",

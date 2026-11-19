@@ -18,7 +18,8 @@ The selected kernel preprocessor returns a `PreparedExpertWeights` manifest:
 a layout identity, processed expert-major tensors, and an explicit distinction
 between streamed weights and small per-expert constants. Non-expert state stays
 on the layer. In particular, the loader must preserve the existing layer-wide
-input-scale maximum across all logical experts.
+input-scale maximum across all logical experts. MXFP4 experts store no input
+scale; the kernel quantizes their activations on each forward.
 
 A model-owned `MoEPeerWeights` publishes each processed layer immediately and
 rebinds its parameters to immutable owned storage. Old processed allocations do
@@ -84,7 +85,8 @@ unmapping source storage. A model exposing peer weights implements
 
 ## Initial supported configuration
 
-The initial integration supports K3 NVFP4 SiTU on a fabric-connected NVIDIA
+The initial integration supports K3 NVFP4 and MXFP4 SiTU experts through the
+FlashInfer TRT-LLM kernels on a fabric-connected NVIDIA
 prefill instance with local execution groups and a fixed token budget. Model
 CUDA graphs are disabled; kernel tuning and graph consumers can use stable
 weight views with acquisition/release outside capture. Unsupported model,
