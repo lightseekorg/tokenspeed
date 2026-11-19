@@ -506,6 +506,7 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
     )
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
     executor.drafter = drafter
     executor.forward_step = SimpleNamespace(
         disable=True, capture_ladders=lambda entries: {}, stream="stream"
@@ -555,6 +556,7 @@ def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
     buckets = [16, 32, 48, 64, 80, 96, 112]
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
     executor.drafter = Drafter()
     executor.draft_attn_backend = "draft backend"
     executor.forward_step = SimpleNamespace(

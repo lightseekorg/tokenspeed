@@ -37,6 +37,7 @@ SM100 = ArchVersion(10, 0)
 SM103 = ArchVersion(10, 3)
 SM107 = ArchVersion(10, 7)
 TILE16, TILE32, TILE64 = fi.TGV_DECODE_TILES
+SM107_TILE16, SM107_TILE32, SM107_TILE64 = fi.TGV_DECODE_SM107_TILES
 MIB = 1 << 20
 
 # FlashInfer 0.7.3's TGV tactic table, the release requirements/cuda.txt pins:
@@ -148,10 +149,78 @@ def test_k_outside_the_window_is_not_routed(m, n, k):
 
 
 @pytest.mark.parametrize(
-    "arch,routed", [(SM100, True), (SM103, True), (SM107, False), (SM90, False)]
+    "arch,routed", [(SM100, True), (SM103, True), (SM107, True), (SM90, False)]
 )
-def test_only_sm100_and_sm103_are_routed(arch, routed):
+def test_only_sm100_sm103_and_sm107_are_routed(arch, routed):
     assert (select(48, 512, arch=arch) is not None) is routed
+
+
+def sm107(m, n, k=2560, *, weight_bytes=None):
+    return fi.select_tgv_decode_tile(
+        m=m,
+        n=n,
+        k=k,
+        weight_bytes=2 * n * k if weight_bytes is None else weight_bytes,
+        arch=SM107,
+        sm_count=212,
+        pdl=True,
+    )
+
+
+def test_sm107_routes_k_from_2048_to_6144_and_weights_up_to_32_mib():
+    assert sm107(64, 512, 2047) is None
+    assert sm107(64, 512, 2048) == SM107_TILE16
+    assert sm107(64, 512, 6144) == SM107_TILE16
+    assert sm107(64, 512, 6145) is None
+    # An attention output projection, 2560 x 6144, takes 30 MiB.
+    assert sm107(64, 2560, 6144) == SM107_TILE32
+    # 4096 x 4096 takes exactly 32 MiB; its grid fits only with 64-row tiles.
+    assert sm107(33, 4096, 4096) == SM107_TILE64
+    assert sm107(33, 4096, 4096, weight_bytes=32 * MIB + 2) is None
+    assert select(33, 4096, 4096) is None
+
+
+def test_sm107_routes_only_weights_of_at_least_512_rows():
+    assert sm107(64, 511) is None
+    assert sm107(64, 512) == SM107_TILE16
+    assert sm107(64, 128, 6144) is None
+    assert select(48, 128) is not None
+
+
+@pytest.mark.parametrize(
+    "m,n,expected",
+    [
+        # 2560 weight rows: 40 CTAs per activation-row tile; half of 212 SMs is 106.
+        (33, 2560, SM107_TILE32),
+        (64, 2560, SM107_TILE32),
+        (65, 2560, SM107_TILE64),
+        (128, 2560, SM107_TILE64),
+        (129, 2560, None),
+        # 512 weight rows: 8 CTAs per activation-row tile.
+        (208, 512, SM107_TILE16),
+        (209, 512, SM107_TILE32),
+        (416, 512, SM107_TILE32),
+        (417, 512, SM107_TILE64),
+        (512, 512, SM107_TILE64),
+    ],
+)
+def test_sm107_takes_the_first_tile_whose_grid_fills_half_the_sms(m, n, expected):
+    assert sm107(m, n) == expected
+
+
+@pytest.mark.parametrize("sm_count,routed", [(211, False), (212, True), (213, True)])
+def test_sm107_grid_bound_rounds_half_the_sms_down(sm_count, routed):
+    # 6784 weight rows launch 106 CTAs for one 64-row activation tile.
+    tile = fi.select_tgv_decode_tile(
+        m=64,
+        n=6784,
+        k=2048,
+        weight_bytes=2 * 6784 * 2048,
+        arch=SM107,
+        sm_count=sm_count,
+        pdl=True,
+    )
+    assert tile == (SM107_TILE64 if routed else None)
 
 
 @pytest.mark.parametrize("arch", [SM100, SM103])
@@ -194,34 +263,43 @@ def test_first_tile_whose_grid_fits_in_one_wave(m, n, sm_count, expected):
     assert select(m, n, sm_count=sm_count) == expected
 
 
-@pytest.mark.parametrize("sm_count", [148, 160])
+@pytest.mark.parametrize("arch", [SM100, SM107])
+@pytest.mark.parametrize("sm_count", [148, 160, 212])
 @pytest.mark.parametrize("n", [128, 512, 640, 960, 1344, 2560, 4096, 9600])
-def test_tile_only_grows_with_rows(n, sm_count):
+def test_tile_only_grows_with_rows(n, sm_count, arch):
     """The choice is a step function of M over the three tiles, then None."""
-    order = [*fi.TGV_DECODE_TILES, None]
+    order = [*fi.TGV_DECODE_WINDOWS[arch].tiles, None]
     steps = [
-        order.index(select(m, n, sm_count=sm_count))
+        order.index(select(m, n, arch=arch, sm_count=sm_count))
         for m in range(fi.TGV_DECODE_MIN_M + 1, fi.TGV_DECODE_MAX_M + 1)
     ]
     assert steps == sorted(steps)
 
 
 def test_tactics_are_found_by_shape():
-    assert fi.resolve_tgv_tactics(FLASHINFER_0_7_3_TACTICS) == {
+    tiles = fi.TGV_DECODE_TILES
+    assert fi.resolve_tgv_tactics(FLASHINFER_0_7_3_TACTICS, tiles) == {
         TILE16: 18,
         TILE32: 21,
         TILE64: 23,
     }
+    assert fi.resolve_tgv_tactics(
+        FLASHINFER_0_7_3_TACTICS, fi.TGV_DECODE_SM107_TILES
+    ) == {SM107_TILE16: 39, SM107_TILE32: 40, SM107_TILE64: 41}
     # A release that reorders or extends the table moves the ids. Reversed,
     # the SM107 tiles of the pinned shapes, with more stages, come first.
     reordered = FLASHINFER_0_7_3_TACTICS[::-1]
-    assert fi.resolve_tgv_tactics(reordered) == {
+    assert fi.resolve_tgv_tactics(reordered, tiles) == {
         TILE16: 46 - 18,
         TILE32: 46 - 21,
         TILE64: 46 - 23,
     }
     extended = [(64, 16, 4, True), (64, 256, 2, True), *FLASHINFER_0_7_3_TACTICS]
-    assert fi.resolve_tgv_tactics(extended) == {TILE16: 20, TILE32: 23, TILE64: 25}
+    assert fi.resolve_tgv_tactics(extended, tiles) == {
+        TILE16: 20,
+        TILE32: 23,
+        TILE64: 25,
+    }
 
 
 @pytest.mark.parametrize(
@@ -238,5 +316,6 @@ def test_table_without_a_pinned_tile_resolves_to_nothing(missing, replacement):
     table = [
         replacement if entry == missing else entry for entry in FLASHINFER_0_7_3_TACTICS
     ]
-    assert fi.resolve_tgv_tactics([entry for entry in table if entry]) is None
-    assert fi.resolve_tgv_tactics([]) is None
+    tiles = fi.TGV_DECODE_TILES
+    assert fi.resolve_tgv_tactics([entry for entry in table if entry], tiles) is None
+    assert fi.resolve_tgv_tactics([], tiles) is None

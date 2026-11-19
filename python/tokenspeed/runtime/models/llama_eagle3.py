@@ -201,7 +201,6 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         self._eagle3_config = config
         self._eagle3_mapping = mapping
         self._eagle3_quant_config = quant_config
-        self._eagle3_prefix = prefix
 
         super().__init__(
             config=config,
@@ -711,9 +710,6 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
-
-    def get_embed(self):
-        return self.model.embed_tokens.weight
 
     def set_embed_and_head(self, embed, head):
         # If draft hidden size != target hidden size, embed cannot be shared
