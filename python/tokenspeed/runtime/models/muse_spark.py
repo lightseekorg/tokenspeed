@@ -86,14 +86,13 @@ from tokenspeed.runtime.distributed.comm_backend.registry import get_global_back
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
-    acquire_projection_output,
     all_gather,
     all_reduce,
     can_acquire_all_reduce_outputs,
     prepare_projection_collectives,
     projection_all_to_all,
     projection_gather_mm,
-    projection_reduce_scatter,
+    projection_mm_reduce_scatter,
     reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -242,11 +241,9 @@ class _OwnedRowProjections:
         self, x: torch.Tensor, rows: int, weight: torch.Tensor
     ) -> torch.Tensor:
         """Sum every rank's ``x @ weight.T`` partial into this rank's ``[L, N]`` rows."""
-        local_rows = self.local_rows(rows)
-        partial = acquire_projection_output(local_rows, self.output, None)
-        mm(x, weight, out=partial[:rows])
-        partial[rows:].zero_()
-        return projection_reduce_scatter(partial, local_rows, self.output, None)
+        return projection_mm_reduce_scatter(
+            x, self.local_rows(rows), weight, self.output, None
+        )
 
     def matmul_to_owners(
         self, x: torch.Tensor, rows: int, weight: torch.Tensor

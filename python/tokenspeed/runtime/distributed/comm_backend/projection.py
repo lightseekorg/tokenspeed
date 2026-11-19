@@ -34,6 +34,10 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._cute_dsl.gemm_reduce_scatter import (
+        GemmReduceScatterState,
+    )
+
     from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
@@ -215,6 +219,7 @@ class ProjectionWorkspace:
         self.fused_column = None
         self.fused_row = None
         self.copy_engine: CopyEngineGather | None = None
+        self.gemm_reduce_scatter: "GemmReduceScatterState | None" = None
 
     def close(self) -> None:
         """Collectively release native resources and owned scratch references.
@@ -237,6 +242,7 @@ class ProjectionWorkspace:
             self.fused_row = None
         self.a2a = None
         self.copy_engine = None
+        self.gemm_reduce_scatter = None
         if self.gather is not None:
             self.gather.close()
             self.gather = self.gather_quant = None
@@ -392,6 +398,36 @@ def projection_gather_mm(
     return mm(gathered, weight, out=out)
 
 
+def _check_scatter(weight: torch.Tensor, workspace: ProjectionWorkspace) -> None:
+    spec = workspace.spec
+    # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
+    if (
+        spec.kind != "scatter"
+        or weight.shape != (spec.output_size, spec.input_size // len(spec.group))
+        or weight.shape[0] == weight.shape[1]
+    ):
+        raise ValueError(
+            "A scatter GEMM takes its scatter workspace's non-square [N, K / TP] shard"
+        )
+
+
+def projection_mm_reduce_scatter(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> torch.Tensor:
+    """Project all rows into borrowed partials, then reduce them through backend."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    _check_scatter(weight, workspace)
+    partial = backend.acquire_projection_output(rows, workspace)
+    mm(inputs, weight, out=partial[: inputs.shape[0]])
+    partial[inputs.shape[0] :].zero_()
+    return backend.projection_reduce_scatter(partial, rows, workspace)
+
+
 def projection_all_to_all(
     inputs: torch.Tensor,
     rows: int,
@@ -515,6 +551,18 @@ def projection_reduce_scatter(
     return backend.reduce_scatter(partial, workspace.spec.group)
 
 
+def _gemm_reduce_scatter_supported(spec: ProjectionSpec) -> bool:
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        gemm_reduce_scatter_supported,
+    )
+    from tokenspeed_kernel.ops.communication.multimem import multimem_available
+
+    size = len(spec.group)
+    return multimem_available() and gemm_reduce_scatter_supported(
+        size, spec.output_size, spec.input_size // size, spec.dtype, spec.device
+    )
+
+
 class ProjectionBackend:
     """Dispatch prepared projection operations through native or fallback kernels.
 
@@ -563,10 +611,16 @@ class ProjectionBackend:
             min_fused_rows = (
                 _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
             )
-            if spec.kind in ("gather", "scatter"):
-                fused_disabled_reason = f"a {spec.kind} has no fused projection"
+            if spec.kind == "gather":
+                fused_disabled_reason = "a gather has no fused projection"
             elif batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
+            elif spec.kind == "scatter":
+                fused_disabled_reason = (
+                    None
+                    if _gemm_reduce_scatter_supported(spec)
+                    else "unsupported device or dimensions for the GEMM reduce-scatter"
+                )
             elif len(spec.group) not in fused_tp_sizes:
                 fused_disabled_reason = (
                     f"automatic TP{len(spec.group)} fusion is disabled"
@@ -616,9 +670,21 @@ class ProjectionBackend:
                 elif all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
                         create_fused_tp_column_projection_state,
+                        create_gemm_reduce_scatter_state,
                     )
 
-                    if spec.kind == "row":
+                    if spec.kind == "scatter":
+                        size = len(spec.group)
+                        workspace.gemm_reduce_scatter = (
+                            create_gemm_reduce_scatter_state(
+                                pg_manager.get_device_process_group(spec.group),
+                                spec.device,
+                                size * spec.max_tokens,
+                                spec.output_size,
+                                spec.input_size // size,
+                            )
+                        )
+                    elif spec.kind == "row":
                         from tokenspeed_kernel.ops.communication.cute_dsl import (
                             create_fused_tp_row_projection_state,
                         )
@@ -648,9 +714,10 @@ class ProjectionBackend:
                 )
 
         if (
-            spec.kind in ("column", "row")
+            spec.kind != "gather"
             and workspace.fused_column is None
             and workspace.fused_row is None
+            and workspace.gemm_reduce_scatter is None
             and dist.get_rank() == spec.group[0]
         ):
             logger.info(
@@ -839,6 +906,33 @@ class ProjectionBackend:
         return workspace.copy_engine.gather_mm(
             inputs, rows, weight, out, workspace.gathered
         )
+
+    def mm_reduce_scatter(
+        self,
+        inputs: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        # Lamport reduces the rows it holds; one fused kernel takes larger ones.
+        state = workspace.gemm_reduce_scatter
+        if state is None or (
+            workspace.reduction is not None and rows <= workspace.reduction.max_rows
+        ):
+            return projection_mm_reduce_scatter(
+                inputs, rows, weight, workspace, self._fallback
+            )
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_gemm_reduce_scatter,
+        )
+
+        _check_workspace(rows, workspace, self._fallback)
+        _check_scatter(weight, workspace)
+        padding = len(workspace.spec.group) * rows - inputs.shape[0]
+        if padding:
+            inputs = torch.nn.functional.pad(inputs, (0, 0, 0, padding))
+        # Not through select_kernel: a collective with state prepared before capture.
+        return cute_dsl_gemm_reduce_scatter(state, inputs, weight)
 
     def all_to_all(
         self,

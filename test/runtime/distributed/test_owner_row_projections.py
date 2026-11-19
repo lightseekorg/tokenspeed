@@ -54,16 +54,13 @@ def _gathered_reference(inputs, counts, rows, weight):
 
 
 def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
-    from tokenspeed_kernel.ops.gemm import mm
-
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.comm_backend.projection import ProjectionSpec
     from tokenspeed.runtime.distributed.comm_ops import (
-        acquire_projection_output,
         prepare_projection_collectives,
         projection_gather_mm,
-        projection_reduce_scatter,
+        projection_mm_reduce_scatter,
     )
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager,
@@ -97,7 +94,7 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
             ProjectionSpec(
                 group=group,
                 kind="scatter",
-                input_size=32 * world_size,
+                input_size=64 * world_size,
                 output_size=_HIDDEN,
                 max_tokens=_MAX_ROWS,
                 dtype=torch.bfloat16,
@@ -126,11 +123,13 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
         for seed, rows in enumerate((1, 100, 700)):
             generator = torch.Generator().manual_seed(100 + seed + rank)
             # Every partial and sum stays an exact BF16 integer, so any order agrees.
-            inputs = _integers(generator, (world_size * rows, 32), -1, 1, device)
-            weight = _integers(generator, (_HIDDEN, 32), -1, 1, device)
-            partial = acquire_projection_output(rows, scatter, backend)
-            mm(inputs, weight, out=partial)
-            reduced = projection_reduce_scatter(partial, rows, scatter, backend)
+            # The last owner's padding rows are left for the projection to fill.
+            inputs = _integers(generator, (world_size * rows - 1, 64), -1, 1, device)
+            weight = _integers(generator, (_HIDDEN, 64), -1, 1, device)
+            reduced = projection_mm_reduce_scatter(
+                inputs, rows, weight, scatter, backend
+            )
+            inputs = torch.nn.functional.pad(inputs, (0, 0, 0, 1))
             parts = [torch.empty_like(inputs) for _ in range(world_size)]
             dist.all_gather(parts, inputs)
             weights = [torch.empty_like(weight) for _ in range(world_size)]
