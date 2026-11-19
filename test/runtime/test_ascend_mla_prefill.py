@@ -573,6 +573,8 @@ def test_unsupported_mla_cache_keeps_prefix_history_without_transport(
         extend_seq_lens=torch.tensor([3], device="npu", dtype=torch.int32),
         extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
         page_table=torch.tensor([[1, 2, 3, 0]], device="npu", dtype=torch.int32),
+        extend_with_prefix=True,
+        page_table_cpu=torch.tensor([[1, 2, 3, 0]], dtype=torch.int32),
     )
     meta = backend.chunked_prefill_metadata
     assert meta.chunked_loop_num > 0
