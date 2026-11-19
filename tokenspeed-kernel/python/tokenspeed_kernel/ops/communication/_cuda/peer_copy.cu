@@ -19,12 +19,16 @@
 // SOFTWARE.
 
 // Copy-engine peer fetch. A worker thread per store submits each layer's
-// copies as one cudaMemcpyBatchAsync; the call blocks once the copy stream's
-// queue is full, so it runs off the forward thread. Fetch and reader order is
-// kept on the GPU with 64-bit sequence flags (stream wait/write value). A flag
-// wait is enqueued only after its write: a wait ahead of its producer blocks
-// the GPU, and lazy module loading on any thread then deadlocks.
+// copies with cudaMemcpyBatchAsync; the call blocks once the copy stream's
+// queue is full, so it runs off the forward thread. A layer goes in batches of
+// a fixed number of copies: the driver may hold a batch's copies until the call
+// returns, and with several batches the first ones copy while the rest are
+// submitted. Fetch and reader order is kept on the GPU with 64-bit sequence
+// flags (stream wait/write value). A flag wait is enqueued only after its
+// write: a wait ahead of its producer blocks the GPU, and lazy module loading
+// on any thread then deadlocks.
 #include "tvm_ffi_utils.h"
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -85,8 +89,8 @@ struct Job {
 
 class Worker {
 public:
-  Worker(int device, cudaStream_t stream)
-      : device_(device), stream_(stream), thread_([this] { run(); }) {}
+  Worker(int device, cudaStream_t stream, size_t batch_copies)
+      : device_(device), stream_(stream), batch_copies_(batch_copies), thread_([this] { run(); }) {}
 
   ~Worker() {
     {
@@ -147,14 +151,16 @@ private:
       if (result != CUDA_SUCCESS)
         fail("cuStreamWaitValue64", result);
       const Layer &layer = *job.layer;
-      if (!layer.size.empty()) {
+      const size_t copies = layer.size.size();
 #if CUDART_VERSION < 13000
-        // CUDA 13 removed the per-copy failure index from this API.
-        size_t failed_index = 0;
+      // CUDA 13 removed the per-copy failure index from this API.
+      size_t failed_index = 0;
 #endif
-        error = cudaMemcpyBatchAsync(const_cast<void **>(layer.dst.data()),
-                                     const_cast<void **>(layer.src.data()),
-                                     const_cast<size_t *>(layer.size.data()), layer.size.size(),
+      for (size_t begin = 0; begin < copies; begin += batch_copies_) {
+        const size_t count = std::min(batch_copies_, copies - begin);
+        error = cudaMemcpyBatchAsync(const_cast<void **>(layer.dst.data() + begin),
+                                     const_cast<void **>(layer.src.data() + begin),
+                                     const_cast<size_t *>(layer.size.data() + begin), count,
                                      &attr, &attr_index, 1,
 #if CUDART_VERSION < 13000
                                      &failed_index,
@@ -176,6 +182,7 @@ private:
 
   int device_;
   cudaStream_t stream_;
+  size_t batch_copies_;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::condition_variable submitted_cv_;
@@ -211,12 +218,14 @@ void check_int64(TensorView t) {
 
 } // namespace
 
-int64_t create_worker(int64_t device, int64_t stream) {
+int64_t create_worker(int64_t device, int64_t stream, int64_t batch_copies) {
+  TVM_FFI_ICHECK(batch_copies > 0) << "copies per batch must be positive";
   driver();
   std::lock_guard<std::mutex> lock(registry_mutex);
   int64_t handle = next_handle++;
   registry[handle] =
-      std::make_unique<Worker>(static_cast<int>(device), reinterpret_cast<cudaStream_t>(stream));
+      std::make_unique<Worker>(static_cast<int>(device), reinterpret_cast<cudaStream_t>(stream),
+                               static_cast<size_t>(batch_copies));
   return handle;
 }
 
