@@ -805,6 +805,30 @@ class ForwardStepRunner:
             decode_width=self.max_tokens_per_req,
         )
 
+    def _capture_forward(
+        self, bs: int, ctx: ForwardContext, sampling_info: SamplingBatchInfo
+    ):
+        """One forward of a capture: a warmup, or the captured one itself.
+
+        Restores the query extent a round starts from first. Packed
+        verification narrows ``ctx.input_num_tokens`` for the rest of the
+        forward that selected it, while the warmups and the capture share one
+        context. The grammar fill slices this round's verify candidates by
+        that extent, so a narrowed context would record an empty copy and
+        every replay would fill its masks from stale draft tokens.
+        """
+        ctx.input_num_tokens = bs * self.max_tokens_per_req
+        # Dummy add_batch keeps grammar batches 1:1 with replays: the
+        # host node pops one batch per forward.
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.add_batch(
+                grammars=[None] * bs,
+                bs=bs,
+                has_candidates=False,
+                output_layout=ctx.output_layout,
+            )
+        return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
     def _capture_barrier(self) -> None:
         """Synchronize the eagerly initialized world group during capture setup."""
         # DistributedInitializer eagerly binds WORLD with device_id before model
@@ -925,16 +949,7 @@ class ForwardStepRunner:
             self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
-            # Dummy add_batch keeps grammar batches 1:1 with replays: the
-            # host node pops one batch per forward.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * bs,
-                    bs=bs,
-                    has_candidates=False,
-                    output_layout=ctx.output_layout,
-                )
-            return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            return self._capture_forward(bs, ctx, sampling_info)
 
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
@@ -1118,16 +1133,9 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                if self.capturable_grammar is not None:
-                    self.capturable_grammar.add_batch(
-                        grammars=[None] * bs,
-                        bs=bs,
-                        has_candidates=False,
-                        output_layout=ctx.output_layout,
-                    )
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
-                self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+                self._capture_forward(bs, ctx, sampling_info)
                 self.device_module.synchronize()
                 self._capture_barrier()
 

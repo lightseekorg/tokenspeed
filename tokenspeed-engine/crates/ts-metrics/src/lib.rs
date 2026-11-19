@@ -665,7 +665,8 @@ impl EngineMetrics {
                 "tokenspeed:decode_ready_wait_seconds",
                 "Wall time on the decode role from observing complete prefill KV arrival \
                  to first decode forward dispatch, observed once per request. Requests \
-                 cancelled or finished before decode dispatch are excluded.",
+                 cancelled or finished before decode dispatch are excluded. This wait is \
+                 part of the decode role's time to first token, not its decode time.",
                 names,
                 &[
                     0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.5, 1.0, 2.0, 5.0,
@@ -747,7 +748,10 @@ impl EngineMetrics {
             time_to_first_token: Metric::histogram(
                 exporter,
                 "tokenspeed:time_to_first_token_seconds",
-                "Wall time from request creation to its first output token, on this role.",
+                "Wall time from request creation to this role's first output token. On a \
+                 decode role this is the first local decode output; a remote prefill's \
+                 bootstrap token alone does not end it, except when that token ends the \
+                 request, so the wait for a decode execution permit is included.",
                 names,
                 &[
                     0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
@@ -766,7 +770,8 @@ impl EngineMetrics {
             decode_time: Metric::histogram(
                 exporter,
                 "tokenspeed:decode_time_seconds",
-                "Wall time from the first token to the request's end.",
+                "Wall time from this role's first output token to the request's end. On a \
+                 decode role this starts at the first local decode output.",
                 names,
                 &[
                     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,

@@ -138,10 +138,11 @@ void SchedulerConfig::Validate() const {
     if (peer_config) {
         peer_config->Validate();
         // A holder exports what it caches, and a reader lands a prefix it
-        // caches next; the D role computes no prompt, and a page-sharded
-        // group's pages are not whole on one rank.
-        if (role == Role::kD || disable_prefix_cache) {
-            throw std::invalid_argument("Scheduler: peer prefix sharing needs prefix caching outside the D role");
+        // caches next. The D role holds (the history it decoded) but never
+        // reads: its prompts come from its PD peer. A page-sharded group's
+        // pages are not whole on one rank.
+        if (disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing needs prefix caching");
         }
         if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count != 1; })) {
             throw std::invalid_argument("Scheduler: peer prefix sharing supports replicated cache groups only");
@@ -169,11 +170,6 @@ void SchedulerConfig::Validate() const {
     if (host_write_policy == HostWritePolicy::kWriteBack) {
         if (!HasHostCache()) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
-        }
-        if (role == Role::kD) {
-            throw std::invalid_argument(
-                "Scheduler: host_write_policy WriteBack is not available on the D role: its Host holds retraction "
-                "images only and remote admission probes the Device alone");
         }
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
