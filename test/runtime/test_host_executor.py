@@ -1914,7 +1914,11 @@ class TestCompactHostParentTest:
         )
         pool = _SyntheticPool(
             layout,
-            SimpleNamespace(cache_group_specs=specs, runtime_contract=contract),
+            SimpleNamespace(
+                cache_group_specs=specs,
+                runtime_contract=contract,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+            ),
         )
         tracker = Mock()
         tracker.event_sets = [object()]
