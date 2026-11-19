@@ -161,7 +161,7 @@ def main() -> None:
                     "cuda-toolkit==12.6.3",
                     "cuda-python==12.9.7",
                     "cuda-bindings==12.9.7",
-                    "tokenspeed-mooncake==0.3.13.post20261117",
+                    "tokenspeed-mooncake==0.3.13.post20261119",
                     "nvidia-cutlass-dsl-libs-cu13<0",
                     "nvidia-cublas<0",
                     "nvidia-cuda-runtime<0",
