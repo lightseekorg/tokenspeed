@@ -1105,6 +1105,7 @@ impl OutputProcessor {
             &mut state,
             self.stream_interval,
             self.spec_num_tokens,
+            self.metrics_enabled,
             Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
         );
         self.collect_stream_end(&state, wall_seconds());
@@ -2368,6 +2369,7 @@ mod tests {
             p.states.get_mut(rid).unwrap(),
             p.stream_interval,
             p.spec_num_tokens,
+            p.metrics_enabled,
             (p.metrics_enabled && p.role != Role::Prefill).then_some((&mut p.tpot_seconds, now)),
         )
     }
