@@ -223,6 +223,9 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Cumulative reasoning tokens per request, excluding structural markers.
     # Appended wire tail: older producers omit it and decode as [].
     reasoning_tokens: list[int] = []
+    # Rank-wide token counts; None means an older producer did not report them.
+    num_resident_tokens: int | None = None
+    num_waiting_uncached_tokens: int | None = None
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):

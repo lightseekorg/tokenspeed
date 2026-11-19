@@ -397,6 +397,7 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .active_decode_slots = static_cast<std::size_t>(scheduler.ActiveDecodeSlots()),
         .ready_waiting = scheduler.ReadyWaitingSize(),
         .waiting = scheduler.WaitingSize(),
+        .pending_prefill_tokens = scheduler.PendingPrefillTokens(),
         .prefilling = scheduler.PrefillSize(),
         .decoding = scheduler.DecodingSize(),
         .retracted = scheduler.RetractedSize(),
