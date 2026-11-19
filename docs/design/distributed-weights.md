@@ -112,7 +112,7 @@ the storage API for compatible model integrations, not as a K3 transport option.
 Eager execution and ordinary breakable prefill graphs use the same weight
 ordering. Idle forwards skip weight reads. Kernel tuning and other graph
 consumers can use stable weight views with acquisition/release outside capture.
-Unsupported model, layout, transport and graph combinations fail explicitly.
+Unsupported model, layout, transport, and graph combinations fail explicitly.
 
 Validation includes cross-node reconstruction, page-boundary handling, complete
 expert metadata, idle owners, odd/even queued forwards, bounded staging,
