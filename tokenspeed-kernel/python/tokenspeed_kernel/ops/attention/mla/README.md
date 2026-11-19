@@ -51,8 +51,8 @@ builds a group's Lamport mailboxes in symmetric memory, and a
   whose mailbox would hold 2^31 or more elements get no tail, since the merge
   addresses it with int32 offsets.
 
-On GB300, eight ranks over two nodes, 12 heads per rank, CUDA graphs of back
-to back calls, us per call:
+On GB300, eight ranks over two nodes, 12 heads per rank, CUDA graphs of
+back-to-back calls, microseconds per call:
 
 | rows | tail | dispatch, LL all-to-all, combine, projection | with NCCL |
 |-----:|-----:|-----:|-----:|

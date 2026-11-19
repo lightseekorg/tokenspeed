@@ -32,6 +32,8 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dcp_weight_for_reduce_scatter,
     dispatch_dcp_attention_partials,
 )
+from tokenspeed_kernel.ops.attention.mla import mla_project_value
+from tokenspeed_kernel.ops.attention.mla.cute_dsl import create_dcp_value_tail
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_exchange_input,
@@ -43,6 +45,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     reduce_scatter,
     try_combine_records,
 )
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +99,6 @@ def prepare_decode_exchange(
     """
     timeout_ns = int((timeout_s - 30 if timeout_s >= 90 else timeout_s / 2) * 1e9)
     if value_heads is not None and group not in _VALUE_TAILS:
-        from tokenspeed_kernel.ops.attention.mla.cute_dsl import create_dcp_value_tail
-
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager,
-        )
-
         tail = create_dcp_value_tail(
             process_group_manager.get_process_group("gloo", group),
             torch.device("cuda", torch.cuda.current_device()),
@@ -421,13 +418,21 @@ def combine_project_attention_partials(
 ) -> torch.Tensor:
     """Combine head-sharded partials without a sink, then apply ``projection``.
 
-    The combine is :func:`combine_attention_partials`'s; the result lands in
-    ``projection.out``. A group with a prepared fused value tail runs both in
-    one launch, bit for bit; otherwise the combine and ``mla_project_value``
-    run in turn.
-    """
-    from tokenspeed_kernel.ops.attention.mla import mla_project_value
+    The combine is :func:`combine_attention_partials`'s. A group with a
+    prepared fused value tail runs both in one launch, bit for bit; otherwise
+    the combine and ``mla_project_value`` run in turn.
 
+    Args:
+        local_output: This rank's partials of every gathered head,
+            ``[tokens, ranks * heads, 512]``.
+        local_lse: Their natural-log LSEs, ``[tokens, ranks * heads]``.
+        group: Global ranks of the KVP group.
+        rank: This rank's index in ``group``.
+        projection: The value projection to apply, whose ``out`` receives it.
+
+    Returns:
+        ``projection.out``, holding this rank's heads combined and projected.
+    """
     lse = local_lse.float()
     tail = _VALUE_TAILS.get(group)
     if tail is not None and tail.serves(

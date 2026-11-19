@@ -1645,14 +1645,16 @@ def build_device_side(
         )
         if server_args.mapping.attn.has_kvp:
             # A fused decode value tail for the attentions that project as they merge.
-            value_heads = {
-                module.num_local_heads
-                for runner in (target, draft)
-                if runner is not None
-                for module in runner.model.modules()
-                if isinstance(module, GlmDsaSparseAttentionMixin)
-                and module.owned_decode_value_weight() is not None
-            }
+            value_heads = set()
+            for runner in (target, draft):
+                if runner is None:
+                    continue
+                for module in runner.model.modules():
+                    if (
+                        isinstance(module, GlmDsaSparseAttentionMixin)
+                        and module.owned_decode_value_weight() is not None
+                    ):
+                        value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
                 (
