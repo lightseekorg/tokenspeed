@@ -475,6 +475,13 @@ GEMM plan without changing its weight owner or storage. The logits processor
 uses that method for a registered bitwise envelope, preserving its normal
 input dtype cast and vocabulary communication.
 
+A profile whose modules implement every dense projection can set
+`model_owns_dense_projections` during configuration. The ordinary unquantized
+Linear and embedding modules then hold checkpoint weights and still support
+embedding lookups. Calling their generic projection raises an error. The
+profile can also bind `block_sumexp_solution` to the registry implementation
+used for both prompt and output logprobs.
+
 Plugins may call `register_numerics_envelope` from the runtime registration
 surface. A policy supplies its name, bitwise classification, launch resolver
 and checkpoint validator. Plugin discovery precedes CLI choices and launch
