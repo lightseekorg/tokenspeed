@@ -41,6 +41,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
     MoEConfig,
     MoEPipelinedProgram,
     WPreshuffledLdsDescriptor,
+    _make_n16_gate_up_w_full_offsets,
     _make_preshuffled_w_full_offsets,
     _preshuffled_w_copy_layout,
     _preshuffled_w_read_layout,
@@ -49,9 +50,18 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
     _route_next_pow2,
     gluon_route_supported,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import _n16_weight_offset
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
     gluon_mxfp4_moe_stage2_reduce_kernel,
 )
+
+# Expert-bank layouts a warp-decode stage reads (its compile-time W_LAYOUT):
+# K-packed linear rows, the 128x128 gdot128 tiles, or the N16 bank
+# (n16_weights.py), whose 1 KB blocks the N16 path copies into the same LDS
+# slots as gdot128.
+W_LAYOUT_LINEAR = gl.constexpr(0)
+W_LAYOUT_GDOT128 = gl.constexpr(1)
+W_LAYOUT_N16 = gl.constexpr(2)
 
 
 def _sorted_stage1_launch_metadata(grid, kernel, args):
@@ -226,7 +236,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         EP=max(_route_next_pow2(n_experts), 64 * COOP_NUM_WARPS), TKP=64 * COOP_NUM_WARPS,
         BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
         NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
-        W_PRESHUFFLED=w13_preshuffled,
+        W_LAYOUT=(W_LAYOUT_GDOT128 if w13_preshuffled else W_LAYOUT_LINEAR).value,
         EVEN_K=coop_even_k,
         HAS_BIAS=w13_bias is not None,
         SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
@@ -262,7 +272,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         w2_act_scale, b2,
         I_PACKED=i_dim // 2, TOPK=top_k,
         BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
-        W_PRESHUFFLED=w2_preshuffled,
+        W_LAYOUT=(W_LAYOUT_GDOT128 if w2_preshuffled else W_LAYOUT_LINEAR).value,
         HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
         ROUND_TOPK_PARTIALS=False,
         EXPERT_START=0, NUM_LOCAL_EXPERTS=n_experts,
@@ -351,7 +361,7 @@ def _warp_decode_stage1_coop_compute(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
@@ -366,7 +376,13 @@ def _warp_decode_stage1_coop_compute(
     ``_pipelined_moe_tile_compute`` (W_TRANSPOSE=False, swizzled w-scale,
     per-tensor x scale) but specialized to a single decode token (row 0 of the
     BLOCK_M tile).
+
+    ``W_LAYOUT`` names the W13 bank layout. An N16 bank is copied into the
+    same LDS slots as a gdot128 bank (only the source offsets and the K step
+    differ), and its scales are read with the N16 gate/up unswizzle, so the
+    MFMA operands are the same bytes.
     """
+    W_PRESHUFFLED: gl.constexpr = W_LAYOUT != W_LAYOUT_LINEAR
     N = 2 * i_dim
     off_n = pid_n * BLOCK_N
     valid = (token < M) & (expert >= 0)
@@ -398,6 +414,7 @@ def _warp_decode_stage1_coop_compute(
         W_PRESHUFFLED=W_PRESHUFFLED,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
+        W_SCALE_N16_GATE_UP=W_LAYOUT == W_LAYOUT_N16,
     )
 
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
@@ -449,20 +466,36 @@ def _warp_decode_stage1_coop_compute(
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
             BLOCK_N // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
         )
-        offsets_w, base_off_w = _make_preshuffled_w_full_offsets(
-            w_base_offset,
-            pid_n,
-            LOAD_W_COPY_LAYOUT,
-            BLOCK_N,
-            BLOCK_N,
-            BLOCK_K_W,
-        )
+        if W_LAYOUT == W_LAYOUT_N16:
+            # The same LDS image from the N16 bank: its 16-row blocks are
+            # 16 * (D // 2) bytes apart, and a K step moves every source by
+            # 16 * BLOCK_K_W bytes.
+            offsets_w, base_off_w = _make_n16_gate_up_w_full_offsets(
+                w_base_offset,
+                pid_n,
+                8 * D,
+                LOAD_W_COPY_LAYOUT,
+                BLOCK_N,
+                BLOCK_N,
+                BLOCK_K_W,
+            )
+            w_stride_k = gl.to_tensor(16)
+        else:
+            offsets_w, base_off_w = _make_preshuffled_w_full_offsets(
+                w_base_offset,
+                pid_n,
+                LOAD_W_COPY_LAYOUT,
+                BLOCK_N,
+                BLOCK_N,
+                BLOCK_K_W,
+            )
+            w_stride_k = gl.to_tensor(N)
         w_desc = WPreshuffledLdsDescriptor(
             cfg,
             BLOCK_K_W,
             W,
             W.dtype.element_ty,
-            gl.to_tensor(N),
+            w_stride_k,
             offsets_w + base_off_w,
             pred=gl.to_tensor(True),
             load_layout=LOAD_W_LAYOUT,
@@ -618,7 +651,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     BLOCK_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
@@ -702,7 +735,7 @@ def _warp_decode_topk_stage1_coop_kernel(
         stride_ym, stride_yn,
         x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
         TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
-        W_PRESHUFFLED, EVEN_K, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
+        W_LAYOUT, EVEN_K, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
         DO_SITU=False, PACKED_ROUTES=False,
     )
 
@@ -740,7 +773,7 @@ def _warp_decode_precomputed_situ_stage1_kernel(
     BLOCK_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SITU_BETA: gl.constexpr,
@@ -798,7 +831,7 @@ def _warp_decode_precomputed_situ_stage1_kernel(
         BLOCK_K,
         NUM_BUFFERS,
         NUM_WARPS,
-        W_PRESHUFFLED,
+        W_LAYOUT,
         EVEN_K,
         HAS_BIAS,
         SITU_BETA,
@@ -840,7 +873,7 @@ def _warp_decode_precomputed_situ_dedup_stage1_kernel(
     BLOCK_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SITU_BETA: gl.constexpr,
@@ -921,7 +954,7 @@ def _warp_decode_precomputed_situ_dedup_stage1_kernel(
             BLOCK_K,
             NUM_BUFFERS,
             NUM_WARPS,
-            W_PRESHUFFLED,
+            W_LAYOUT,
             EVEN_K,
             HAS_BIAS,
             SITU_BETA,
@@ -963,7 +996,7 @@ def _warp_decode_precomputed_situ_sorted_stage1_kernel(
     BLOCK_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SITU_BETA: gl.constexpr,
@@ -1025,7 +1058,7 @@ def _warp_decode_precomputed_situ_sorted_stage1_kernel(
             BLOCK_K,
             NUM_BUFFERS,
             NUM_WARPS,
-            W_PRESHUFFLED,
+            W_LAYOUT,
             EVEN_K,
             HAS_BIAS,
             SITU_BETA,
@@ -1089,7 +1122,7 @@ def _warp_decode_stage2_load_tile(
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
     I_PACKED: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     MASK_TAIL: gl.constexpr = False,
 ):
     k_elem = kt * BLOCK_K + ak
@@ -1097,7 +1130,14 @@ def _warp_decode_stage2_load_tile(
     a_off = (x_row_off + k_elem.to(gl.int64) * stride_xk + am.to(gl.int64) * 0).to(
         gl.int32
     )
-    if W_PRESHUFFLED:
+    if W_LAYOUT == W_LAYOUT_N16:
+        # N16 W2 bank (n16_weights.py): 16-row blocks of I_PACKED bytes, in
+        # 1 KB [K quarter][row][16 bytes] cells per 64-byte K chunk. The K
+        # loop never reads past I_PACKED, so no padding is needed.
+        b_off = (
+            w_expert_off + _n16_weight_offset(n_cols, k_pack, I_PACKED).to(gl.int64)
+        ).to(gl.int32)
+    elif W_LAYOUT == W_LAYOUT_GDOT128:
         b_off = _warp_decode_stage2_preshuffled_w_offset(
             w_expert_off, k_pack, n_cols, N_PHYS
         )
@@ -1155,7 +1195,7 @@ def _warp_decode_stage2_load_pair(
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
     I_PACKED: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
 ):
     """Load the even (kt) and odd (kt+1) K-tiles of one pipeline step."""
     # fmt: off
@@ -1163,13 +1203,13 @@ def _warp_decode_stage2_load_pair(
         kt, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
     )
     a_odd, b_odd, s_odd = _warp_decode_stage2_load_tile(
         kt + 1, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
     )
     # fmt: on
     return a_even, b_even, s_even, a_odd, b_odd, s_odd
@@ -1223,7 +1263,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     BLOCK_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SPLIT_K: gl.constexpr,
     ROUND_TOPK_PARTIALS: gl.constexpr,
@@ -1240,7 +1280,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     """
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
-    if W_PRESHUFFLED:
+    if W_LAYOUT == W_LAYOUT_GDOT128:
         gl.static_assert(
             128 % BLOCK_N == 0 and BLOCK_K_PACKED == 64,
             "warp_decode preshuffled W2 expects BLOCK_N to divide the "
@@ -1333,7 +1373,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                         kt_start, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
                         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
                     )
                     for kt in range(kt_start, main_end - 2, 2):
                         (nxt_a_even, nxt_b_even, nxt_s_even,
@@ -1341,7 +1381,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                             kt + 2, ak, bk, bsk, am, X, W, WScale,
                             x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
                             n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-                            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+                            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
                         )
                         acc = _warp_decode_stage2_mfma_pair(
                             acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale
@@ -1360,7 +1400,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                         kt, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
                         n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+                        BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
                         MASK_TAIL=True,
                     )
                     acc = gl.amd.cdna4.mfma_scaled(
@@ -1437,7 +1477,7 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
     BLOCK_K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS_N: gl.constexpr,
-    W_PRESHUFFLED: gl.constexpr,
+    W_LAYOUT: gl.constexpr,
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
@@ -1519,13 +1559,13 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
             0, ak, bk, bsk, am, X, W, WScale,
             x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
             n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
         )
         tail_a, tail_b, tail_scale = _warp_decode_stage2_load_tile(
             2, ak, bk, bsk, am, X, W, WScale,
             x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
             n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
-            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
+            BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_LAYOUT,
         )
         acc = _warp_decode_stage2_mfma_pair(
             acc, a_even, b_even, s_even, a_odd, b_odd, s_odd, a_scale

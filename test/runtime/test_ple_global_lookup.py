@@ -84,7 +84,7 @@ def _worker(rank, rendezvous, tp_size):
         assert lookup.table_rank == rank
         full_table = torch.arange(256 * 3).reshape(256, 3).float()
         lookup.ngram_embedding.weight.data.zero_()
-        lookup.load_shard(full_table, 0, 1)
+        lookup.load_shard(full_table, 0, 1, prescanned=False)
 
         def reduce(values, group):
             assert values.ndim == 2

@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.ops._triton_ptx import rcp_approx_ftz_f32
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -1225,19 +1226,6 @@ NVFP4_BLOCK = 16
 
 
 @triton.jit
-def _rcp_approx(x):
-    """flashinfer's reciprocal: the approximate, flush-to-zero PTX instruction."""
-    return tl.inline_asm_elementwise(
-        "rcp.approx.ftz.f32 $0, $1;",
-        "=f,f",
-        [x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _mailbox_row_dirty(halves, sentinel_half: tl.constexpr):
     """Whether any BF16 element of the row still holds the sentinel's half."""
     return tl.max((halves == sentinel_half).to(tl.int32), axis=0) != 0
@@ -1303,11 +1291,11 @@ def _rmsnorm_nvfp4_quant_kernel(
     blocks = tl.reshape(values, [BLOCK // SF_BLOCK, SF_BLOCK])
     amax = tl.max(tl.abs(blocks), axis=1)
     global_scale = tl.load(global_scale_ptr) + tl.zeros_like(amax)
-    rcp_six = _rcp_approx(tl.full(amax.shape, 6.0, tl.float32))
+    rcp_six = rcp_approx_ftz_f32(tl.full(amax.shape, 6.0, tl.float32))
     sf_value = tl.where(amax != 0.0, global_scale * (amax * rcp_six), 0.0)
     sf_e4m3 = sf_value.to(tl.float8e4nv)
     sf_f32 = sf_e4m3.to(tl.float32)
-    out_scale = _rcp_approx(sf_f32 * _rcp_approx(global_scale))
+    out_scale = rcp_approx_ftz_f32(sf_f32 * rcp_approx_ftz_f32(global_scale))
     # A block whose E4M3 scale rounds to zero encodes zero values.
     out_scale = tl.where(sf_f32 != 0.0, out_scale, 0.0)
     scaled = tl.reshape(blocks * out_scale[:, None], [BLOCK // 2, 2])

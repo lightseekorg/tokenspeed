@@ -88,12 +88,19 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _select_route_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
+    W_LAYOUT_GDOT128,
+    W_LAYOUT_N16,
     _gluon_mxfp4_fp8_warp_decode_moe,
     _warp_decode_precomputed_situ_dedup_stage1_kernel,
     _warp_decode_precomputed_situ_sorted_stage1_kernel,
     _warp_decode_precomputed_situ_stage1_kernel,
     _warp_decode_sorted_stage2_fp8_mxfp4_kernel,
     _warp_decode_stage2_fp8_mxfp4_kernel,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import n16_mxfp4_shape
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
+    B_LAYOUT_GDOT128,
+    B_LAYOUT_N16,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
     gluon_mxfp4_moe_stage2_reduce_kernel,
@@ -395,6 +402,17 @@ def _situ_package_prefill(
     )
 
 
+def _n16_situ_bank(w13_weight, w2_weight, w13_mx_scale, w2_mx_scale):
+    """(experts, hidden, intermediate) of an N16 expert bank, else None.
+
+    A rank-6 W13 tensor is an N16 bank (``n16_weights.py``); inconsistent N16
+    cells raise instead of falling through to another layout.
+    """
+    if not isinstance(w13_weight, torch.Tensor) or w13_weight.ndim != 6:
+        return None
+    return n16_mxfp4_shape(w13_weight, w13_mx_scale, w2_weight, w2_mx_scale)
+
+
 def gluon_mxfp4_fp8_precomputed_situ(
     hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     topk_weights: torch.Tensor,
@@ -441,6 +459,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
     ``gluon_moe_sorting``'s block-16 format, produced upstream; the
     expert-sorted decode then skips its sort. Other paths ignore it.
     """
+    n16_shape = _n16_situ_bank(w13_weight, w2_weight, w13_mx_scale, w2_mx_scale)
     if isinstance(hidden_states, tuple):
         rows = _mxfp4_input_metadata(hidden_states)[0]
         if (
@@ -527,25 +546,28 @@ def gluon_mxfp4_fp8_precomputed_situ(
             activation_format=prefill_activation_format,
         )
 
-    w13_raw = _extract_gluon_raw_w(w13_weight)
-    w2_raw = _extract_gluon_raw_w(w2_weight)
-    w13_scale = _extract_gluon_raw_s(w13_mx_scale)
-    w2_scale = _extract_gluon_raw_s(w2_mx_scale)
-    if not all(
-        isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
-    ):
-        return None
-    if not (
-        w13_raw.ndim == 3
-        and w2_raw.ndim == 3
-        and w13_raw.dtype == torch.uint8
-        and w2_raw.dtype == torch.uint8
-        and bool(getattr(w13_raw, "is_shuffled_for_gluon_dot", False))
-        and bool(getattr(w2_raw, "is_shuffled_for_gluon_dot", False))
-    ):
-        return None
+    if n16_shape is not None:
+        num_local_experts = n16_shape[0]
+    else:
+        w13_raw = _extract_gluon_raw_w(w13_weight)
+        w2_raw = _extract_gluon_raw_w(w2_weight)
+        w13_scale = _extract_gluon_raw_s(w13_mx_scale)
+        w2_scale = _extract_gluon_raw_s(w2_mx_scale)
+        if not all(
+            isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
+        ):
+            return None
+        if not (
+            w13_raw.ndim == 3
+            and w2_raw.ndim == 3
+            and w13_raw.dtype == torch.uint8
+            and w2_raw.dtype == torch.uint8
+            and bool(getattr(w13_raw, "is_shuffled_for_gluon_dot", False))
+            and bool(getattr(w2_raw, "is_shuffled_for_gluon_dot", False))
+        ):
+            return None
+        num_local_experts = int(w13_raw.shape[0])
 
-    num_local_experts = int(w13_raw.shape[0])
     if global_num_experts is None:
         global_num_experts = num_local_experts
     if (
@@ -554,13 +576,36 @@ def gluon_mxfp4_fp8_precomputed_situ(
     ):
         raise ValueError("local expert range exceeds global expert count")
 
-    two_i = int(w13_raw.shape[2])
-    if two_i % 2 or int(getattr(w13_raw, "original_k_pk", 0)) * 2 != D:
-        return None
-    i_dim = two_i // 2
-    N = int(getattr(w2_raw, "original_n", int(w2_raw.shape[2])))
-    if int(getattr(w2_raw, "original_k_pk", 0)) * 2 != i_dim or N != D:
-        return None
+    if n16_shape is not None:
+        _, weight_d, i_dim = n16_shape
+        if weight_d != D:
+            return None
+        w_layout = W_LAYOUT_N16.value
+        two_i, N = 2 * i_dim, weight_d
+        w13_raw, w2_raw = w13_weight, w2_weight
+        # N16 scale panels hold the same bytes per 32 rows as the CDNA4
+        # tensors; viewed as (E, K_scale_padded * 32, N / 32) with
+        # stride(-2) == 1 they take the kernels' existing scale addressing.
+        w13_scale = w13_mx_scale.view(num_local_experts, two_i // 32, -1).transpose(
+            1, 2
+        )
+        w2_scale = w2_mx_scale.view(num_local_experts, N // 32, -1).transpose(1, 2)
+        # The N16 decode paths read only the expert stride of each bank.
+        w13_strides = (w13_raw.stride(0), two_i, 1)
+        w2_strides = (w2_raw.stride(0), N, 1)
+        n_phys_w2 = N
+    else:
+        w_layout = W_LAYOUT_GDOT128.value
+        two_i = int(w13_raw.shape[2])
+        if two_i % 2 or int(getattr(w13_raw, "original_k_pk", 0)) * 2 != D:
+            return None
+        i_dim = two_i // 2
+        N = int(getattr(w2_raw, "original_n", int(w2_raw.shape[2])))
+        if int(getattr(w2_raw, "original_k_pk", 0)) * 2 != i_dim or N != D:
+            return None
+        w13_strides = (w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1))
+        w2_strides = (w2_raw.stride(0), w2_raw.stride(-2), w2_raw.stride(-1))
+        n_phys_w2 = int(w2_raw.shape[2])
 
     # Tiny-M kernels index routing tensors as flat [M * TOPK] arrays. Preserve
     # that contract when the caller supplies an otherwise valid strided view.
@@ -694,9 +739,9 @@ def gluon_mxfp4_fp8_precomputed_situ(
             i_dim,
             x_fp8.stride(0),
             x_fp8.stride(1),
-            w13_raw.stride(0),
-            w13_raw.stride(-2),
-            w13_raw.stride(-1),
+            w13_strides[0],
+            w13_strides[1],
+            w13_strides[2],
             w13_scale.stride(0),
             w13_scale.stride(-2),
             w13_scale.stride(-1),
@@ -711,7 +756,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             BLOCK_M=16,
             NUM_BUFFERS=num_buffers,
             NUM_WARPS=num_warps,
-            W_PRESHUFFLED=True,
+            W_LAYOUT=w_layout,
             EVEN_K=even_k,
             HAS_BIAS=False,
             SITU_BETA=float(situ_beta),
@@ -742,9 +787,9 @@ def gluon_mxfp4_fp8_precomputed_situ(
             x_fp8.stride(1),
             topk_ids.stride(0),
             topk_ids.stride(1),
-            w13_raw.stride(0),
-            w13_raw.stride(-2),
-            w13_raw.stride(-1),
+            w13_strides[0],
+            w13_strides[1],
+            w13_strides[2],
             w13_scale.stride(0),
             w13_scale.stride(-2),
             w13_scale.stride(-1),
@@ -759,7 +804,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             BLOCK_M=16,
             NUM_BUFFERS=num_buffers,
             NUM_WARPS=num_warps,
-            W_PRESHUFFLED=True,
+            W_LAYOUT=w_layout,
             EVEN_K=even_k,
             HAS_BIAS=False,
             SITU_BETA=float(situ_beta),
@@ -791,13 +836,13 @@ def gluon_mxfp4_fp8_precomputed_situ(
             partial,
             M,
             N,
-            int(w2_raw.shape[2]),
+            n_phys_w2,
             i_dim,
             inter.stride(0),
             inter.stride(1),
-            w2_raw.stride(0),
-            w2_raw.stride(-2),
-            w2_raw.stride(-1),
+            w2_strides[0],
+            w2_strides[1],
+            w2_strides[2],
             w2_scale.stride(0),
             w2_scale.stride(-2),
             w2_scale.stride(-1),
@@ -810,7 +855,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             BLOCK_K=128,
             BLOCK_N=sorted_stage2_block_n,
             NUM_WARPS_N=sorted_stage2_num_warps,
-            W_PRESHUFFLED=True,
+            W_LAYOUT=w_layout,
             EXPERT_START=expert_start,
             NUM_LOCAL_EXPERTS=num_local_experts,
             XCD_SWIZZLE=_A8W4_SORTED_XCD_SWIZZLE,
@@ -875,13 +920,13 @@ def gluon_mxfp4_fp8_precomputed_situ(
         stage2_out,
         M,
         N,
-        int(w2_raw.shape[2]),
+        n_phys_w2,
         i_dim,
         inter.stride(0),
         inter.stride(1),
-        w2_raw.stride(0),
-        w2_raw.stride(-2),
-        w2_raw.stride(-1),
+        w2_strides[0],
+        w2_strides[1],
+        w2_strides[2],
         w2_scale.stride(0),
         w2_scale.stride(-2),
         w2_scale.stride(-1),
@@ -895,7 +940,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
         BLOCK_K=128,
         BLOCK_N=stage2_block_n,
         M_DUP=1,
-        W_PRESHUFFLED=True,
+        W_LAYOUT=w_layout,
         HAS_BIAS=False,
         SPLIT_K=1,
         ROUND_TOPK_PARTIALS=combine_topk,
@@ -1907,12 +1952,12 @@ def warm_gluon_mxfp4_situ_prefill_rows(
     """
     if max_rows <= _SITU_WARP_DECODE_MAX_M:
         return
-    package_w13 = getattr(w13_weight, "gluon_package_prefill_weight", None)
-    package_w2 = getattr(w2_weight, "gluon_package_prefill_weight", None)
-    if not isinstance(package_w13, torch.Tensor) or not isinstance(
-        package_w2, torch.Tensor
-    ):
+    operands = _package_prefill_operands(
+        w13_weight, w2_weight, w13_mx_scale, w2_mx_scale
+    )
+    if operands is None:
         return
+    package_w13, _, package_w2, package_w2_scale, _ = operands
     n_experts = int(package_w13.shape[0])
     hidden_dim = int(package_w13.shape[2]) * 2
     if global_num_experts is None:
@@ -1937,7 +1982,7 @@ def warm_gluon_mxfp4_situ_prefill_rows(
         activation_format=prefill_activation_format,
         hidden_dim=hidden_dim,
         inter_dim=int(package_w13.shape[1]) // 2,
-        stage2_k=int(package_w2.shape[2]) * 2,
+        stage2_k=_package_stage2_k(package_w2_scale),
         num_local_experts=n_experts,
         num_experts=global_num_experts,
         top_k=top_k,
@@ -2015,8 +2060,9 @@ def _maybe_gluon_package_mxfp4_prefill(
 
     Selection is automatic: this returns ``None`` (so the caller falls back to
     the reference path) unless the batch is large enough
-    (``M >= _PACKAGE_PREFILL_MIN_M``) and the weights were gdot128-preshuffled
-    (the preprocessor attaches the zero-copy gdot128-storage aliases).
+    (``M >= _PACKAGE_PREFILL_MIN_M``) and the weights are a gdot128 bank (the
+    preprocessor attaches zero-copy aliases of its storage) or an N16 bank
+    (viewed here, also without copying). N16 banks take E2M1 activations only.
     """
     n_tokens, hidden_dim, device, _ = _mxfp4_input_metadata(hidden_states)
     if n_tokens < _PACKAGE_PREFILL_MIN_M:
@@ -2032,12 +2078,14 @@ def _maybe_gluon_package_mxfp4_prefill(
         x_quantized is not None or isinstance(hidden_states, tuple)
     ) and activation_format != "e2m1":
         raise ValueError("prequantized package input must use the E2M1 format")
-    w13_package = _package_prefill_weights(w13_weight, required=False)
-    w2_package = _package_prefill_weights(w2_weight, required=False)
-    if w13_package is None or w2_package is None:
+    operands = _package_prefill_operands(
+        w13_weight, w2_weight, w13_mx_scale, w2_mx_scale
+    )
+    if operands is None:
         return None
-    package_w13, package_w13_scale = w13_package
-    package_w2, package_w2_scale = w2_package
+    package_w13, package_w13_scale, package_w2, package_w2_scale, b_layout = operands
+    if b_layout == B_LAYOUT_N16.value and activation_format != "e2m1":
+        raise ValueError("N16 expert banks take E2M1 prefill activations only")
 
     topk_weights = precomputed_topk_weights
     topk_ids = precomputed_topk_ids
@@ -2141,7 +2189,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         n_tokens,
         hidden_dim=hidden_dim,
         inter_dim=inter_dim,
-        stage2_k=int(package_w2.shape[2]) * 2,
+        stage2_k=_package_stage2_k(package_w2_scale),
         num_local_experts=n_experts,
         num_experts=global_num_experts,
         top_k=top_k,
@@ -2161,6 +2209,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         package_w13,
         package_w13_scale,
         config,
+        b_layout=b_layout,
         expert_start=expert_start,
         out_dtype=out_dtype,
         model_dim=hidden_dim,
@@ -2169,7 +2218,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         situ_linear_beta=situ_linear_beta,
         intermediate=None,
         intermediate_scale=None,
-        output_k=int(package_w2.shape[2]) * 2,
+        output_k=_package_stage2_k(package_w2_scale),
         deterministic_order=False,
         out=out,
     )
@@ -2180,6 +2229,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         package_w2,
         package_w2_scale,
         out,
+        b_layout=b_layout,
         deferred_out=deferred_out,
         do_finalize=do_finalize,
         force_reduce=force_reduce,
@@ -2235,6 +2285,7 @@ def _package_prefill_gate_up(
     package_w13_scale: torch.Tensor,
     config,
     *,
+    b_layout: int,
     expert_start: int,
     out_dtype: torch.dtype,
     model_dim: int,
@@ -2247,7 +2298,10 @@ def _package_prefill_gate_up(
     deterministic_order: bool,
     out: torch.Tensor | None,
 ) -> tuple[MXFP4SortedRoutes, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sort routes and run the gate/up GEMM into sorted block-scaled rows."""
+    """Sort routes and run the gate/up GEMM into sorted block-scaled rows.
+
+    ``b_layout`` names the W13 bank layout (``B_LAYOUT_*``).
+    """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
         gluon_moe_sorting,
     )
@@ -2351,7 +2405,7 @@ def _package_prefill_gate_up(
         block_m=sort_block_m,
         num_warps=config.stage1_num_warps,
         b_preshuffled=True,
-        b_gdot128=True,
+        b_layout=b_layout,
         swiglu_alpha=float(swiglu_alpha),
         swiglu_limit=float(swiglu_limit),
         swiglu_beta=float(swiglu_beta),
@@ -2385,6 +2439,7 @@ def _package_prefill_down(
     package_w2_scale: torch.Tensor,
     out: torch.Tensor,
     *,
+    b_layout: int,
     deferred_out: torch.Tensor | None,
     do_finalize: bool,
     force_reduce: bool,
@@ -2392,7 +2447,10 @@ def _package_prefill_down(
     activation_format: str,
     logical_k: int,
 ) -> torch.Tensor:
-    """Run the down GEMM over sorted block-scaled rows."""
+    """Run the down GEMM over sorted block-scaled rows.
+
+    ``b_layout`` names the W2 bank layout (``B_LAYOUT_*``).
+    """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
         invoke_gluon_mxfp4_moe_stage2_1x2,
     )
@@ -2419,13 +2477,51 @@ def _package_prefill_down(
         a2_scale=intermediate_scale,
         sorted_weights=routes.sorted_weights,
         b_preshuffled=True,
-        b_gdot128=True,
+        b_layout=b_layout,
         block_m=routes.block_m,
         sort_block_m=routes.block_m,
         force_reduce=force_reduce,
         input_sorted=True,
         a_format=activation_format,
     )
+
+
+def _package_prefill_operands(
+    w13_weight, w2_weight, w13_mx_scale, w2_mx_scale
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+    """Package-prefill W13, W13 scale, W2 and W2 scale views, and their layout.
+
+    A gdot128 bank carries zero-copy aliases attached at load
+    (``attach_prefill_aliases``). An N16 bank's rank-6 cells are viewed here,
+    also without copying (``.view`` refuses rather than copies): W13
+    ``(E, 2I, D/2)``, W13 scales ``(E, 2I, D/32)``, W2 ``(E, D, I/2)`` and W2
+    scales ``(E, D, groups)``, with the groups padded to whole 8-group panels.
+    Returns None when the weights are neither.
+    """
+    n16_shape = _n16_situ_bank(w13_weight, w2_weight, w13_mx_scale, w2_mx_scale)
+    if n16_shape is not None:
+        experts, hidden, inter = n16_shape
+        return (
+            w13_weight.view(experts, 2 * inter, hidden // 2),
+            w13_mx_scale.view(experts, 2 * inter, hidden // MXFP4_BLOCK),
+            w2_weight.view(experts, hidden, inter // 2),
+            w2_mx_scale.view(experts, hidden, -1),
+            B_LAYOUT_N16.value,
+        )
+    w13_package = _package_prefill_weights(w13_weight, required=False)
+    w2_package = _package_prefill_weights(w2_weight, required=False)
+    if w13_package is None or w2_package is None:
+        return None
+    return (*w13_package, *w2_package, B_LAYOUT_GDOT128.value)
+
+
+def _package_stage2_k(package_w2_scale: torch.Tensor) -> int:
+    """Padded W2 K width: whole 8-group scale panels (512 for 384 columns).
+
+    gdot128 pads its W2 rows to this width; N16 rows stop at the real K bytes,
+    so the width comes from the scale panels, which both layouts pad alike.
+    """
+    return int(package_w2_scale.shape[2]) * MXFP4_BLOCK
 
 
 def _package_prefill_weights(
@@ -2531,6 +2627,7 @@ def gluon_mxfp4_sorted_gate_up_gfx950(
         package_w13,
         package_w13_scale,
         config,
+        b_layout=B_LAYOUT_GDOT128.value,
         expert_start=0,
         out_dtype=torch.bfloat16,
         model_dim=hidden_dim,
@@ -2600,6 +2697,7 @@ def gluon_mxfp4_sorted_down_gfx950(
         package_w2,
         package_w2_scale,
         out,
+        b_layout=B_LAYOUT_GDOT128.value,
         deferred_out=deferred_out,
         do_finalize=False,
         force_reduce=False,

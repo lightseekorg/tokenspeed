@@ -2372,6 +2372,13 @@ num_valid_ids)`, and the wrapper checks the buffers' shapes and dtypes against
 The stage GEMMs do not depend on the order of routes inside an expert's
 blocks, so either sort gives the same output bit for bit.
 
+### N16 expert banks for the gfx950 A8W4 SiTU experts
+
+The A8W4 SiTU tensor-parallel experts on gfx950 also read MXFP4 banks in the
+N16 layout when a plan asks for it (`moe_plan(expert_layout="n16")`). Their
+results are bit-identical to the default gdot128 layout. The N16 prefill
+takes E2M1 activations only.
+
 ### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
 
 `gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts
@@ -2532,6 +2539,84 @@ retains an independent scan over chunks, with partial expert groups masked.
 When the layer quantizes an MXFP4 input, the placement stage adds one program
 per 8 x 512 tile of it after its routing programs.
 
+### gfx1250 warp-pipelined FP8 x MXFP4 experts
+
+`gluon_mxfp_precomputed_mxfp4_warp_pipelined_moe` (`mxfp4/warp_pipelined.py`)
+runs the FP8-activation layer of the section above on the same preprocessed
+weights, routing and numerics: E4M3 activations scaled by the static
+per-tensor input scales, a gate/up epilogue that applies SwiGLU or SiTU and
+writes E4M3, and a down GEMM scattered to the route rows before the weighted
+top-k reduction. Three kernels replace the two expert GEMMs:
+
+- `gluon_moe_gate_up_warp_pipelined_gfx1250`: persistent prefill gate/up.
+- `gluon_moe_down_warp_pipelined_gfx1250`: prefill down, one tile per
+  program; `gluon_moe_down_warp_pipelined_persistent_gfx1250` keeps the ring
+  across tiles and stores from registers.
+- `gluon_moe_decode_warp_pipelined_gfx1250`: persistent 16-row decode tiles
+  for either GEMM.
+
+#### Contract
+
+- Prefill tiles are `block_m` routed rows by 512 columns with 256-wide K
+  tiles. The gate/up K must span at least three K tiles (K > 512); the down
+  K at least `num_buffers` of them, so a two-slot ring covers K of 384 or 512.
+  Decode tiles are 16 x 128 with `block_k` from 128 to 512.
+- M, N and K need not be tile multiples. Every K step moves its TDM
+  descriptors with `clamp_bounds`, so a partial last K tile reads zeros past
+  K; `add_offsets` alone moves the tile but keeps the descriptor's extent.
+- A cluster of `cta_m` workgroups owns `block_m * cta_m` rows of one expert
+  and shares each W tile by multicast; that product must be a routing block
+  size.
+- `resolve_partition_conflicts` splits X (by rows) and W over the two LDS
+  partitions, so the two warps that issue together read different
+  partitions. The gate/up GEMM gathers into, and stores its output from, the
+  row-partitioned X ring; that needs a Triton whose TDM gather and store
+  accept partitioned layouts. It measured no faster for gate/up, so only the
+  down GEMM enables it by default.
+- Per-batch counts and routing buffers are `do_not_specialize`, so token
+  counts never recompile a kernel.
+
+#### Algorithm
+
+Each program keeps a `num_buffers`-slot ring of X, W and W scales. Step t
+waits for K tile t, refills the slot step t - 1 consumed with K tile
+t + num_buffers - 1, and runs four warp-pipeline stages: load the low K half,
+its WMMAs, load the high half, its WMMAs. Warps 4-7 run one stage behind warps
+0-3, so one group reads LDS while the other issues WMMAs. Only warps 0-3
+produce TDM copies, because a TDM wait covers only the waiting warp's own
+copies and warps 4-7 reach theirs one stage late. Each K tile is one gather
+for X plus one fused copy of W and its scales (gate/up), or one fused copy of
+all three (down; two copies when the operands are partitioned).
+
+The persistent kernels issue the next tile's leading K tiles before the
+epilogue, so their latency hides under it. The gate/up epilogue stages its
+256-column E4M3 output in a ring slot and leaves the TDM store in flight; the
+next tile's first wait retires it, since TDM ops complete in order. The
+one-tile down kernel allocates its ring per tile, so the BF16 output tile is
+staged in the LDS the ring frees and scattered with one TDM op.
+
+The decode kernel keeps two 16-row programs per CU and streams each touched
+expert's W once with non-temporal loads. The down GEMM may stage its output
+and copy it with asynchronous LDS-to-global stores that drain under the next
+tile's K loop.
+
+`select_prefill_tiles` and `select_decode_tiles` hold the tiles measured on
+MI450 for GPT-OSS-120B, Kimi K3 (TP8 and EP8 shards), GLM-5.3-Flash and
+DeepSeek V4.1-Flash expert shapes. Against the A8W4 GEMMs of the section
+above, at 4096 to 8192 tokens the down GEMM runs 20% to 140% faster wherever
+its K spans three K tiles, and gate/up 30% to 50% faster except for Kimi K3
+(20% slower to 15% faster). A down K of 384 or 512 (two-slot ring) and Kimi K3
+TP8's 768-column gate/up stay slower than A8W4, as do prefill batches near
+1024 tokens. Decode GEMMs match or beat A8W4 except the down GEMM with K of
+384 or 512. With FP8 activations, `gluon_mxfp_precomputed_mxfp4_fused_moe`
+runs a projection on these kernels only for the shapes and token counts where
+`select_warp_pipelined_gemms` lists a measured gain above 10%, and on the A8W4
+kernels otherwise.
+
+The fused gate activations use approximate (2.5 ULP) reciprocals and an
+exponential form of `tanh`; libdevice `tanh` made the SiTU epilogue 15% to
+20% slower and, on newer Triton, spilled about 400 VGPRs.
+
 ### Causal MLA verification on gfx950
 
 `gluon_mla_decode_fp8_query_blocks_gfx950` decodes 2–16 causal queries per
@@ -2640,6 +2725,83 @@ the minimum expert id. The weight is the sigmoid captured for that expert.
 Channel-scaled FP8 expert weights can remain in their compact checkpoint
 format while projections use BF16 operands and FP32 accumulation. FP8 storage
 does not require native FP8 matrix arithmetic.
+
+### gfx950 Kimi-K3 MoE layer tail
+
+`gfx950/kimi_k3/moe_tail/` runs a Kimi-K3 (and K3.1) decoder layer's work
+after the attention core as one persistent launch per layer and rank: the
+attention output projection and its reduction across the eight TP ranks, the
+MLP attention-residual mix and post-attention norm, the router, the shared
+expert, the latent projections and norm around the MXFP4 routed experts,
+and the layer output. `tokenspeed_kernel/ops/model/kimi_k3/` registers it as
+the `kimi_k3` family's `moe_tail`, `moe_tail_prepare` and `moe_tail_pack`
+ops; its README describes the API.
+
+The tail is not a decode monokernel, and `docs/design/monokernel.md` does
+not apply to it: it covers only the part of a layer after the attention
+core, owns its buffers and step words, and needs no server flag. The
+Kimi-K3 model binds it wherever a registration serves its shapes. Unlike a
+monokernel, it does not keep the regular path's activation quantization
+(see the Algorithm).
+
+#### Contract
+
+Every registration of the `kimi_k3` MoE-tail API keeps this contract.
+
+- Scope: one Kimi-K3-family decoder layer's work after the attention core,
+  for the rows of one request's decode or speculative verify step, with one
+  tensor-parallel group for attention and MoE. A registration declares the
+  shapes (`KimiK3MoeTailShape`), expert weight formats and platforms it
+  serves as traits. For any other shape, `kimi_k3_moe_tail_expert_layout`
+  returns `None`, and the model keeps the regular path.
+- The layout query returns the routed-expert bank layout that the serving
+  registration reads. The MoE layers store their banks in that layout, and
+  `pack_kimi_k3_moe_tail_layer` refuses weights of any other dtype, shape or
+  layout.
+- A tail's row count (`shape.rows`) is fixed. A layer's launch options (its
+  index, whether it starts a step, its residual-block state, its norm
+  epsilons and whether it writes the next layer's input) are fixed when it
+  is packed.
+- Every rank of the group runs the same layers' tails in the same order.
+  `prepare_kimi_k3_moe_tail` is collective and returns this rank's buffers,
+  which every layer shares. A layer's first `kimi_k3_moe_tail` call is
+  collective too.
+- A registration may compute with numerics that differ from the regular
+  path's ops, for example in how it quantizes activations, and documents
+  them. The model binds a serving tail automatically, so a request's decode
+  numerics can depend on whether its step has the tail's row count.
+- With `next_mix`, the caller passes the next layer's FP32
+  attention-residual block partial, complete before the launch. The launch
+  writes that layer's normalized attention input with the separate
+  combine's reduction order and roundings.
+
+#### Algorithm
+
+This kernel serves Kimi-K3 and K3.1 at TP8 (hidden size 7168, latent size
+3584, 896 routed experts) at up to eight rows, on gfx950 with 256 to 1024
+compute units: all 256 workgroups are resident at once. Its routed experts
+read N16 banks and run A4W4: the normalized latent rows and the SiTU outputs
+are quantized to MXFP4, with one E8M0 scale per 32 values rounded up from
+amax / 6. The regular decode MoE quantizes its activations to FP8 (A8W4).
+Every wait has a time limit. A wait past its limit sets a stop flag on every
+rank and stops its launch with a store to the null page, so the process
+aborts with a GPU memory access fault; no host-readable record is kept, and
+a rank blocked outside the tail does not see the flag.
+
+Workgroups hand off through eight-byte tagged pairs, a payload and the
+step's tag read by one atomic load. Across ranks, the reductions use
+four-byte exchange words that each consumer re-arms after reading, and the
+router logits' partials and the quantized latent rows travel as tagged pairs
+in every rank's peer buffer. A reduction across ranks adds the eight ranks'
+words in rank order, so every rank computes the same sums. One group of
+workgroups projects the attention output while another reduces it slice by
+slice, mixes the residual blocks and normalizes. The router, latent and
+shared-expert projections then read the tagged rows. Every workgroup takes
+routed gate/up tasks over the sorted union of the rows' experts, then down
+tasks, and the shared-expert and latent up projections add into the
+exchanged layer output. Each task issues its weight loads before it waits
+on its inputs. The kernel is modified from sgl-amd-mono (Apache License
+2.0); see `THIRDPARTYNOTICES`.
 
 ## Residual
 
