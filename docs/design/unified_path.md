@@ -20,6 +20,12 @@ path nothing exercised routinely.
 
 ## Invariants
 
+For models with reduce-scattered MoE input, the scheduler already supplies the
+live token count for every attention DP group. Before decode graph replay the
+runner intersects each fixed TP shard with its group's live prefix and copies
+the resulting EP source counts into the model's capture-time buffer. An idle
+DP group's shards all contribute zero rows.
+
 ### Slot state belongs to an admission
 
 Persistent request-pool rows are reused across requests. Before a forward,

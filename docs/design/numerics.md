@@ -483,8 +483,7 @@ uses that method for a registered bitwise envelope, preserving its normal
 input dtype cast and vocabulary communication.
 
 NPU RL alignment compares model logits for a fixed input history. The worker
-keeps the configured sampler and random stream. When scores are requested,
-the NPU scorer selects a block reduction with the trainer’s reduction order.
+keeps the configured sampler and random stream.
 
 Plugins may call `register_numerics_envelope` from the runtime registration
 surface. A policy supplies its name, bitwise classification, launch resolver

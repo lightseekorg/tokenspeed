@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -366,7 +367,7 @@ class ForwardStepRunner:
         )
     """
 
-    model_decode_row_hooks: tuple[Callable, ...] = ()
+    moe_source_rows: tuple[MoESourceRows, ...] = ()
 
     def __init__(
         self,
@@ -383,10 +384,10 @@ class ForwardStepRunner:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
-        model_decode_row_hooks: tuple[Callable, ...] = (),
+        moe_source_rows: tuple[MoESourceRows, ...] = (),
     ):
         self.config = config
-        self.model_decode_row_hooks = model_decode_row_hooks
+        self.moe_source_rows = moe_source_rows
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -968,7 +969,7 @@ class ForwardStepRunner:
                 # Keep warmup seq_lens >= q_len_per_req so no query row gets an
                 # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-                self._init_capture_metadata(bs)
+                self._init_capture_metadata(bs, query_tokens=query_tokens)
                 run_once()
             # Order the reset below after the last warmup's stateful kernels.
             self.device_module.synchronize()
@@ -984,13 +985,13 @@ class ForwardStepRunner:
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
         # metadata refreshes update the same tensors recorded by the graph.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, query_tokens=query_tokens)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         self._prepare_sampling_capture(bs=bs, variant=variant)
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, query_tokens=query_tokens)
 
         self.deepep_adapter.capture()
 
@@ -1194,7 +1195,8 @@ class ForwardStepRunner:
                 block_tables=block_tables,
             )
             tokens = bs * self.max_tokens_per_req
-            self._prepare_model_decode_rows(tokens, tokens, capture=False)
+            for rows in self.moe_source_rows:
+                rows.upload_scattered(tokens, [tokens] * self.world_size)
             self.deepep_adapter.replay()
 
         try:
@@ -1203,16 +1205,12 @@ class ForwardStepRunner:
             torch.cuda.synchronize(self.device)
             self._init_capture_metadata(bs)
 
-    def _prepare_model_decode_rows(
-        self, padded_tokens: int, live_tokens: int, *, capture: bool
-    ):
-        for hook in self.model_decode_row_hooks:
-            hook(padded_tokens=padded_tokens, live_tokens=live_tokens, capture=capture)
-
-    def _init_capture_metadata(self, bs: int):
+    def _init_capture_metadata(self, bs: int, *, query_tokens: int | None = None):
         """Prepare address-stable decode metadata before entering graph capture."""
         tokens = bs * self.max_tokens_per_req
-        self._prepare_model_decode_rows(tokens, tokens, capture=True)
+        for rows in self.moe_source_rows:
+            capacity = query_tokens if query_tokens is not None else tokens
+            rows.upload_scattered(capacity, [capacity] * self.world_size)
         tables = self.placeholder_block_tables(bs)
         prepare_capture_metadata(
             self.attn_backend,
@@ -1606,11 +1604,18 @@ class ForwardStepRunner:
                             )
                         ),
                     )
-            self._prepare_model_decode_rows(
-                query_tokens,
-                query_tokens if packed else bs * self.max_tokens_per_req,
-                capture=False,
-            )
+            for rows in self.moe_source_rows:
+                live = ctx.global_num_tokens
+                if packed:
+                    # The packed query layout may have several rows per request.
+                    live = [query_tokens] * self.world_size
+                elif live is None:
+                    if rows.mapping.attn.has_dp:
+                        raise ValueError(
+                            "MoE source rows require the DP scheduler token counts"
+                        )
+                    live = [ctx.input_num_tokens] * self.world_size
+                rows.upload_scattered(query_tokens, live)
             # MegaMoE's count pair assumes a uniform number of rows per
             # request. Packed prefixes vary, so that mask could drop live rows.
             live_requests = (

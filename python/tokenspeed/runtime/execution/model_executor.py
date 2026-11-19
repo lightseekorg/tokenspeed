@@ -1051,12 +1051,11 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
-            model_decode_row_hooks=tuple(
-                hook
+            moe_source_rows=tuple(
+                rows
                 for runner in (self.model_runner, self._draft_model_runner)
                 if runner is not None
-                and (hook := getattr(runner.model, "prepare_decode_graph_rows", None))
-                is not None
+                and (rows := getattr(runner.model, "moe_source_rows", None)) is not None
             ),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.

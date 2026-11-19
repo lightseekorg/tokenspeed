@@ -25,7 +25,6 @@ from tokenspeed_kernel.ops.sampling import blockwise_logprobs
 
 from tokenspeed.runtime.configs.numerics import BLOCKWISE_LOGPROB_ORDERS
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -109,10 +108,6 @@ def gather_token_logprobs(
             tokens.to(torch.int64),
             vocab_block=vocab_block,
             form=form,
-            reference_reduction=(
-                global_server_args_dict["numerics"] == "rl-bitwise"
-                and global_server_args_dict["device"] == "npu"
-            ),
         )
     if logprob_order != "torch":
         raise ValueError(f"Unknown logprob order: {logprob_order!r}")
