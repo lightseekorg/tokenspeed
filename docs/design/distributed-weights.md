@@ -58,11 +58,13 @@ Host run-ahead is allowed. Only startup and collective teardown coordinate with
 other weight owners, over a dedicated named process group; ordinary prefetch,
 acquire and release do not.
 
-A prefetch submits one batch of copy-engine copies on the store's copy stream.
-The batch splits each peer's bytes into chunks of 8 MB divided by the number
+A prefetch submits a layer's copy-engine copies on the store's copy stream.
+The schedule splits each peer's bytes into chunks of 8 MB divided by the number
 of owners and takes one chunk from every peer per round, in a fixed per-rank
 random order. Submitting a layer's tens of thousands of copies blocks while
-the copy stream's queue is full, so a worker thread submits it. The reader
+the copy stream's queue is full, so a worker thread submits them, in batches of
+4,096 copies: the driver may hold a batch's copies until its submission returns,
+and with several batches the first ones copy while the rest are submitted. The reader
 waits on the host until the worker has enqueued the ready write, then enqueues
 its flag wait.
 
