@@ -56,6 +56,9 @@ logger = logging.getLogger(__name__)
 # exchanges up to 64 rows (eight requests of eight tokens) fit; larger ones,
 # and prefill's, keep the generic collectives, which win from about this size.
 DECODE_EXCHANGE_CAP_BYTES = 1 << 20
+# Largest per-rank gather of float words: the owned decode top-k's scores and
+# query rider at 64 requests of eight tokens.
+DECODE_FLOAT_EXCHANGE_CAP_BYTES = 8 << 20
 
 # Each KVP group's fused decode value tail, when prepared.
 _VALUE_TAILS: dict[tuple[int, ...], DcpValueTail] = {}
@@ -112,7 +115,9 @@ def prepare_decode_exchange(
         )
         if tail is not None:
             _VALUE_TAILS[group] = tail
-    prepared = prepare_small_exchange(group, DECODE_EXCHANGE_CAP_BYTES, timeout_ns)
+    prepared = prepare_small_exchange(
+        group, DECODE_EXCHANGE_CAP_BYTES, DECODE_FLOAT_EXCHANGE_CAP_BYTES, timeout_ns
+    )
     if torch.distributed.get_rank() == group[0]:
         logger.info(
             f"KVP group {group} exchanges up to {DECODE_EXCHANGE_CAP_BYTES >> 10} KiB "

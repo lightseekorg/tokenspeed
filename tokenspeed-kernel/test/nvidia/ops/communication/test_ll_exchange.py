@@ -35,6 +35,7 @@ import torch.multiprocessing as mp
 from tokenspeed_kernel.ops.communication.cute_dsl import (
     create_ll_exchange_state,
     cute_dsl_ll_all_gather,
+    cute_dsl_ll_all_gather_floats,
     cute_dsl_ll_all_to_all,
 )
 from utils import assert_no_cute_compile, kernel_supported
@@ -68,7 +69,7 @@ def _bytes(count, generator, device):
 def _exchange_matches_nccl(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     state = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
     )
     assert state is not None
     generator = torch.Generator(device=device).manual_seed(1000 + rank)
@@ -90,6 +91,19 @@ def _exchange_matches_nccl(rank, size, rendezvous):
                 )
                 assert torch.equal(got_gather, expected_gather), payload
                 assert torch.equal(got_a2a, expected_a2a), payload
+    # Float words travel as themselves; only the sentinel word changes, to
+    # another NaN.
+    for payload in SIZES:
+        words = torch.randint(
+            -(2**31), 2**31 - 1, (payload // 4,), dtype=torch.int32, device=device,
+            generator=generator,
+        )
+        words[:: 97] = -1
+        expected = torch.empty(size * words.numel(), dtype=torch.int32, device=device)
+        dist.all_gather_into_tensor(expected, words)
+        expected[expected == -1] = 0x7FFFFFFF
+        got = cute_dsl_ll_all_gather_floats(state, words, torch.empty_like(expected))
+        assert torch.equal(got, expected), payload
     # Other dtypes travel as their bytes.
     words = torch.randn(size * 1024, device=device).view(torch.int32)
     got = cute_dsl_ll_all_to_all(state, words, torch.empty_like(words))
@@ -102,7 +116,7 @@ def _exchange_matches_nccl(rank, size, rendezvous):
 def _graph_replays_fresh_inputs(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     state = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
     )
     generator = torch.Generator(device=device).manual_seed(2000 + rank)
     payloads = (4096, 65536, 16, 262144)
@@ -113,10 +127,12 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    float_out = [torch.empty(size * p, dtype=torch.uint8, device=device) for p in payloads]  # fmt: skip
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         for i in range(len(payloads)):
             cute_dsl_ll_all_gather(state, gather_in[i], gather_out[i])
             cute_dsl_ll_all_to_all(state, a2a_in[i], a2a_out[i])
+            cute_dsl_ll_all_gather_floats(state, gather_in[i], float_out[i])
     for _ in range(3):
         for tensor in gather_in + a2a_in:
             tensor.random_(0, 256, generator=generator)
@@ -130,13 +146,17 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
             assert torch.equal(gather_out[i], expected)
             dist.all_to_all_single(expected, a2a_in[i])
             assert torch.equal(a2a_out[i], expected)
+            dist.all_gather_into_tensor(expected, gather_in[i])
+            words = expected.view(torch.int32)
+            words[words == -1] = 0x7FFFFFFF
+            assert torch.equal(float_out[i], expected)
     dist.destroy_process_group()
 
 
 def _epochs_skip_zero(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     state = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
     )
     # Three calls before a 32-bit epoch would wrap to the zeroed slots' 0: the
     # calls past it must still wait for their peers' stores.
@@ -162,17 +182,18 @@ def _refusals(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     # One ineligible rank keeps every rank on its collectives.
     refused = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=rank != 1
+        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=rank != 1
     )
     assert refused is None
     unaligned = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES + 8, timeout_ns=TIMEOUT_NS, eligible=True
+        group, device, cap_bytes=CAP_BYTES + 8, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
     )
     assert unaligned is None
     state = create_ll_exchange_state(
-        group, device, cap_bytes=4096, timeout_ns=TIMEOUT_NS, eligible=True
+        group, device, cap_bytes=4096, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
     )
-    assert state.serves(4096) and not state.serves(4112) and not state.serves(24)
+    assert state.serves(4096, floats=False) and not state.serves(4112, floats=False)
+    assert not state.serves(24, floats=False) and state.serves(4112, floats=True)
     payload = torch.zeros(4096, dtype=torch.uint8, device=device)
     out = torch.empty(size * 4096, dtype=torch.uint8, device=device)
     for bad_in, bad_out in (

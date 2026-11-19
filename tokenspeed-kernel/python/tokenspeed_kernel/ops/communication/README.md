@@ -258,3 +258,17 @@ The runtime prepares one per KVP group (`prepare_small_exchange`), and
 keeps NCCL. On 8 GB300s over two nodes a
 64 KiB per-rank all-gather takes 6.9 us against NCCL's 23.4 us and a 1 MiB
 all-to-all 30 us against 37 us; NCCL wins from about 4 MiB.
+
+`cute_dsl_ll_all_gather_floats` gathers float words (FP32, BF16 pairs, or E4M3
+bytes) at half those bytes: each word travels as itself into a second
+workspace whose slots start armed with `0xFFFFFFFF`. A sender stores that word
+as `0x7FFFFFFF`, a NaN either way as one FP32, as a BF16 pair's high half and
+as an E4M3 byte, and the receiver polls each 16-byte unit until none of its
+words is armed, then re-arms it. Its own call count and parity slots order its
+calls as above, and its workspace holds `2 * ranks * float_cap_bytes`. A
+gather of 256 KiB per rank or more runs on every SM, a smaller one on 64 CTAs.
+`AutoBackend.all_gather_float_words_single` takes it where it serves the size;
+the owned decode top-k gathers its scores and query rider through it. On 8
+GB300s over two nodes a per-rank gather of 123 KB takes 6.3 us (NCCL 23.6 us),
+967 KB 18.1 us (46.3 us), 1.9 MB 31.5 us (47.7 us), 3.9 MB 59.4 us (72.2 us)
+and 7.7 MB 124 us (137 us).

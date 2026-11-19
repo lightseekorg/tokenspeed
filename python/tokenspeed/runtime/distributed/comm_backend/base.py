@@ -90,15 +90,23 @@ class CommBackend(ABC):
         return False
 
     def prepare_small_exchange(
-        self, group: Group, cap_bytes: int, timeout_ns: int
+        self, group: Group, cap_bytes: int, float_cap_bytes: int, timeout_ns: int
     ) -> bool:
         """Collectively prepare a one-hop exchange for small payloads.
 
         It serves ``all_gather_single``, ``all_gather`` and equal-split
-        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank; False
-        keeps the generic collectives.
+        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank, and
+        ``all_gather_float_words_single`` calls of up to ``float_cap_bytes``;
+        False keeps the generic collectives.
         """
         return False
+
+    def all_gather_float_words_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        """``all_gather_single`` of float words (FP32, BF16 pairs, or E4M3
+        bytes), whose NaN words may come back with other NaN bits."""
+        self.all_gather_single(output, input, group)
 
     def try_shard_exchange(
         self, tensor: torch.Tensor, group: Group, inverse: bool
