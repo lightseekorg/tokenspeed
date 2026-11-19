@@ -1083,7 +1083,9 @@ workers. Omitting the option keeps resident expert weights.
 
 DWDP requires the CUDA 13 toolkit.
 
-The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
+The initial K3 configuration (NVFP4 or MXFP4 experts on the FlashInfer TRT-LLM
+kernels; pass `--moe-backend flashinfer_trtllm` for MXFP4, where `auto` may
+select another kernel) requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
 `--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
 The weight-sharing size must divide the instance size. Shared-expert and

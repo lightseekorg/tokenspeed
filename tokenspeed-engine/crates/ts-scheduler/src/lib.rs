@@ -422,6 +422,8 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
+        /// P-role prompts with final output ready, awaiting PD completion.
+        prefill_inflight: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
     }

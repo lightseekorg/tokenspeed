@@ -407,6 +407,7 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .prefill_inflight = scheduler.PrefillInflightSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }
