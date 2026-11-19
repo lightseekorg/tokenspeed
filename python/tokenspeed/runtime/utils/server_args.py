@@ -679,7 +679,8 @@ class ServerArgs:
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
     # draw depends on its co-batch; "per-request" keys it by (request seed,
-    # position) through the Gumbel-max pool kernels. See
+    # position) through the Gumbel-max pool kernels and keys chain verify
+    # coins by the request seed and verify round's first position. See
     # docs/design/numerics.md, sampling.deterministic.
     sampling_stream: str = "batch"
     dp_sampling: bool = False
@@ -4286,9 +4287,9 @@ class ServerArgs:
             "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
             "by the batch row, so a request's draw depends on its co-batch. "
             "'per-request': the Gumbel-max pool kernels keyed by the request's "
-            "seed and position, so a request samples the same tokens alone and "
-            "inside any batch (finite top_k is capped at 128). Folded to "
-            "per-request by --numerics rl-bitwise.",
+            "seed and position (finite top_k is capped at 128). Chain verify "
+            "coins are keyed by the request's seed and the round's first "
+            "target position. Folded to per-request by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--dp-sampling",
