@@ -62,7 +62,7 @@ class EngineMetrics:
         labelnames = list(labels.keys())
         self.num_requests_running = factory.gauge(
             name="tokenspeed:num_requests_running",
-            documentation="Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.",
+            documentation="Requests in the dispatched forward batch, excluding idle padding and transfer waits.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -74,7 +74,7 @@ class EngineMetrics:
         )
         self.num_requests_waiting = factory.gauge(
             name="tokenspeed:num_requests_waiting",
-            documentation="Requests waiting in the C++ scheduler queue.",
+            documentation="Requests waiting for scheduler admission, restore, a decode execution permit, or pause resume.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -107,6 +107,64 @@ class EngineMetrics:
                 4096.0,
                 8192.0,
             ],
+        )
+        self.spec_decode_accept_length = factory.histogram(
+            name="tokenspeed:spec_decode_accept_length",
+            documentation="Accepted tokens including bonus per verify request-slot.",
+            labelnames=labelnames,
+            buckets=[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+        )
+        self.prefix_cache_hit_ratio = factory.histogram(
+            name="tokenspeed:prefix_cache_hit_ratio",
+            documentation="Admission cache hits divided by prompt tokens, weighted by prompt tokens.",
+            labelnames=labelnames,
+            buckets=[0.0, 0.25, 0.5, 0.75, 1.0],
+        )
+        self.prefix_device_hit_ratio = factory.histogram(
+            name="tokenspeed:prefix_device_hit_ratio",
+            documentation="Admission Device cache hits divided by prompt tokens, weighted by prompt tokens.",
+            labelnames=labelnames,
+            buckets=[0.0, 0.25, 0.5, 0.75, 1.0],
+        )
+        self.prefix_host_hit_ratio = factory.histogram(
+            name="tokenspeed:prefix_host_hit_ratio",
+            documentation="Admission Host cache hits divided by prompt tokens, weighted by prompt tokens.",
+            labelnames=labelnames,
+            buckets=[0.0, 0.25, 0.5, 0.75, 1.0],
+        )
+        self.decode_prefix_cache_hit_ratio = factory.histogram(
+            name="tokenspeed:decode_prefix_cache_hit_ratio",
+            documentation="Decode-local admission cache hits divided by prompt tokens, weighted by prompt tokens.",
+            labelnames=labelnames,
+            buckets=[0.0, 0.25, 0.5, 0.75, 1.0],
+        )
+        self.decode_prefix_prompt_tokens = factory.counter(
+            name="tokenspeed:decode_prefix_prompt_tokens",
+            documentation="Prompt tokens admitted by the decode-local scheduler.",
+            labelnames=labelnames,
+        )
+        self.decode_prefix_hit_tokens = factory.counter(
+            name="tokenspeed:decode_prefix_hit_tokens",
+            documentation="Prompt tokens served by the decode-local prefix cache at admission.",
+            labelnames=labelnames,
+        )
+        self.kv_cache_resident_usage_perc = factory.gauge(
+            name="tokenspeed:kv_cache_resident_usage_perc",
+            documentation="Resident KV pages including reclaimable prefix entries divided by usable pages, 0-1.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.num_resident_tokens = factory.gauge(
+            name="tokenspeed:num_resident_tokens",
+            documentation="KV tokens held by resident pages including reclaimable prefix entries.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+        )
+        self.request_completion_tokens = factory.histogram(
+            name="tokenspeed:request_completion_tokens",
+            documentation="Output tokens per ended request, including a prefill bootstrap token.",
+            labelnames=labelnames,
+            buckets=[0.0, 1.0, 8.0, 32.0, 128.0, 512.0, 2048.0, 8192.0],
         )
         self.spec_decode_num_accepted_tokens = factory.counter(
             name="tokenspeed:spec_decode_num_accepted_tokens",
@@ -182,15 +240,15 @@ class EngineMetrics:
         self.kv_token_usage_ratio = factory.gauge(
             name="tokenspeed:kv_token_usage_perc",
             documentation=(
-                "Fraction of usable KV pages resident (active plus reclaimable "
-                "prefix-cache entries), 0-1."
+                "Fraction of usable KV pages held by active requests "
+                "(excludes reclaimable entries), 0-1."
             ),
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
         self.num_used_tokens = factory.gauge(
             name="tokenspeed:num_used_tokens",
-            documentation="KV tokens held by resident pages (active plus reclaimable).",
+            documentation="KV tokens held by active requests (excludes reclaimable entries).",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -208,7 +266,7 @@ class EngineMetrics:
         )
         self.num_prefill_inflight_queue_reqs = factory.gauge(
             name="tokenspeed:num_prefill_inflight_queue_reqs",
-            documentation="Prefill requests whose KV a transfer still pins.",
+            documentation="Prefill requests after their final forward result and before PD completion.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -226,7 +284,7 @@ class EngineMetrics:
         )
         self.num_decode_transfer_queue_reqs = factory.gauge(
             name="tokenspeed:num_decode_transfer_queue_reqs",
-            documentation="Decode requests whose KV a transfer still pins.",
+            documentation="Decode requests waiting for remote prefill KV (alias of KV wait).",
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
@@ -322,9 +380,28 @@ class EngineMetrics:
                 60.0,
             ],
         )
+        self.e2e_time_per_output_token_seconds = factory.histogram(
+            name="tokenspeed:e2e_time_per_output_token_seconds",
+            documentation="Time from first emitted chunk to request end divided by tokens after the first chunk.",
+            labelnames=labelnames,
+            buckets=[
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+                2.0,
+                5.0,
+            ],
+        )
         self.time_per_output_token_seconds = factory.histogram(
             name="tokenspeed:time_per_output_token_seconds",
-            documentation="Decode time divided by generated tokens after the first one.",
+            documentation="Time between nonempty emitted chunks divided by tokens in the later chunk.",
             labelnames=labelnames,
             buckets=[
                 0.001,
@@ -473,6 +550,10 @@ class EngineMetrics:
         self.spec_decode_num_accepted_tokens.labels(**self.labels).inc(
             max(0, accepted_draft_tokens)
         )
+        total = max(0, accepted_draft_tokens) + num_decode_slots
+        self.spec_decode_accept_length.labels(**self.labels).observe_weighted(
+            total / num_decode_slots, weight=num_decode_slots
+        )
 
     def record_jit_compiles(self, stats: "CompileStats | None") -> None:
         """Export serving-time compilations; ``None`` when not monitored."""
@@ -521,13 +602,14 @@ class EngineMetrics:
             return
         used = min(max(used_pages, 0), total_pages)
         active = min(max(active_pages, 0), total_pages)
-        self.kv_token_usage_ratio.labels(**self.labels).set(used / total_pages)
-        self.num_used_tokens.labels(**self.labels).set(
+        self.kv_token_usage_ratio.labels(**self.labels).set(active / total_pages)
+        self.kv_cache_resident_usage_perc.labels(**self.labels).set(used / total_pages)
+        active_tokens = active * token_capacity // total_pages
+        self.num_used_tokens.labels(**self.labels).set(active_tokens)
+        self.num_resident_tokens.labels(**self.labels).set(
             used * token_capacity // total_pages
         )
-        self.num_free_tokens.labels(**self.labels).set(
-            (total_pages - active) * token_capacity // total_pages
-        )
+        self.num_free_tokens.labels(**self.labels).set(token_capacity - active_tokens)
 
     def record_prefill_queues(
         self, *, prealloc: int, inflight: int, retracted: int
@@ -577,9 +659,28 @@ class EngineMetrics:
         if self.enabled and math.isfinite(seconds) and seconds >= 0.0:
             self.time_per_output_token_seconds.labels(**self.labels).observe(seconds)
 
+    def observe_e2e_time_per_output_token(self, seconds: float) -> None:
+        if self.enabled and math.isfinite(seconds) and seconds >= 0.0:
+            self.e2e_time_per_output_token_seconds.labels(**self.labels).observe(
+                seconds
+            )
+
     def record_completion_tokens(self, count: int) -> None:
         if self.enabled and count > 0:
             self.completion_tokens.labels(**self.labels).inc(count)
+
+    def observe_request_completion_tokens(self, count: int) -> None:
+        if self.enabled:
+            self.request_completion_tokens.labels(**self.labels).observe(count)
+
+    def record_decode_prefix_hits(self, prompt: int, hit: int) -> None:
+        if not self.enabled or prompt <= 0:
+            return
+        self.decode_prefix_prompt_tokens.labels(**self.labels).inc(prompt)
+        self.decode_prefix_hit_tokens.labels(**self.labels).inc(hit)
+        self.decode_prefix_cache_hit_ratio.labels(**self.labels).observe_weighted(
+            hit / prompt, weight=prompt
+        )
 
     def record_grammar_queue(self, waiting: int) -> None:
         if self.enabled:
@@ -597,6 +698,14 @@ class EngineMetrics:
             return
         if prompt_tokens > 0:
             self.prefix_prompt_tokens.labels(**self.labels).inc(prompt_tokens)
+            for metric, hit in (
+                (self.prefix_cache_hit_ratio, device_hit_tokens + host_hit_tokens),
+                (self.prefix_device_hit_ratio, device_hit_tokens),
+                (self.prefix_host_hit_ratio, host_hit_tokens),
+            ):
+                metric.labels(**self.labels).observe_weighted(
+                    hit / prompt_tokens, weight=prompt_tokens
+                )
         if device_hit_tokens > 0:
             self.prefix_device_hit_tokens.labels(**self.labels).inc(device_hit_tokens)
         if host_hit_tokens > 0:
@@ -662,6 +771,12 @@ class KVTransferMetrics:
             documentation="KV transfers that timed out, by transfer stage.",
             labelnames=[*labelnames, "stage"],
         )
+        self.kv_transfer_request_size_bytes = factory.histogram(
+            name="tokenspeed:kv_transfer_request_size_bytes",
+            documentation="Bytes moved by one KV transfer send.",
+            labelnames=labelnames,
+            buckets=[0.0, 1024.0, 1048576.0, 1073741824.0],
+        )
         self.kv_transfer_size_bytes = factory.counter(
             name="tokenspeed:kv_transfer_size_bytes",
             documentation="Bytes one KV cache transfer send moved to a peer.",
@@ -688,7 +803,10 @@ class KVTransferMetrics:
         self.kv_transfer_failures.labels(**self.labels).inc()
 
     def record_kv_transfer_size(self, bytes_moved: int) -> None:
-        if self.enabled and bytes_moved > 0:
+        if not self.enabled or bytes_moved < 0:
+            return
+        self.kv_transfer_request_size_bytes.labels(**self.labels).observe(bytes_moved)
+        if bytes_moved > 0:
             self.kv_transfer_size_bytes.labels(**self.labels).inc(bytes_moved)
 
     def observe_kv_transfer_latency(self, transfer_time_seconds: float) -> None:

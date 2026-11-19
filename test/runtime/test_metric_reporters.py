@@ -290,6 +290,7 @@ def test_plugin_speculation_and_abort_counters():
         ("tokenspeed:spec_decode_num_drafts_total", "inc", 2),
         ("tokenspeed:spec_decode_num_draft_tokens_total", "inc", 8),
         ("tokenspeed:spec_decode_num_accepted_tokens_total", "inc", 3),
+        ("tokenspeed:spec_decode_accept_length", "observe", 2.5),
         ("tokenspeed:num_nan_aborted_requests_total", "inc", 1),
         ("tokenspeed:num_capacity_aborted_requests_total", "inc", 1),
     ]
@@ -392,3 +393,96 @@ def test_memory_sampler_logs_unavailable_device(caplog):
         logger.removeHandler(caplog.handler)
     assert "Cannot initialize memory metrics for invalid" in caplog.text
     assert not sink.events
+
+
+def test_atomic_ratios_include_bonus_and_use_local_decode_admissions():
+    sink = ListSink()
+    registry = CollectorRegistry()
+    metrics = EngineMetrics(
+        LABELS,
+        enabled=True,
+        reporters=["prometheus", "test_reporter"],
+        event_sink=sink,
+        registry=registry,
+    )
+    metrics.record_spec_decode_step(
+        num_decode_slots=4, accepted_draft_tokens=5, draft_width=3
+    )
+    metrics.record_spec_decode_step(
+        num_decode_slots=2, accepted_draft_tokens=0, draft_width=3
+    )
+    metrics.record_prefix_hits(
+        prompt_tokens=100, device_hit_tokens=40, host_hit_tokens=30, l3_hit_tokens=800
+    )
+    metrics.record_prefix_hits(
+        prompt_tokens=200, device_hit_tokens=0, host_hit_tokens=0, l3_hit_tokens=0
+    )
+    # The prefill response's usage must not feed D-local cache hit ratios.
+    metrics.record_request_tokens(prompt_tokens=100, cache_hit_tokens=90)
+    metrics.record_decode_prefix_hits(100, 20)
+    events = {
+        name: [e for e in sink.events if e.metric == name]
+        for name in (
+            "tokenspeed:spec_decode_accept_length",
+            "tokenspeed:prefix_cache_hit_ratio",
+            "tokenspeed:decode_prefix_cache_hit_ratio",
+        )
+    }
+    spec = events["tokenspeed:spec_decode_accept_length"]
+    assert [(e.value, e.weight) for e in spec] == [(2.25, 4), (1.0, 2)]
+    cache = events["tokenspeed:prefix_cache_hit_ratio"]
+    assert [(e.value, e.weight) for e in cache] == [(0.7, 100), (0, 200)]
+    decode = events["tokenspeed:decode_prefix_cache_hit_ratio"]
+    assert [(e.value, e.weight) for e in decode] == [(0.2, 100)]
+    assert (
+        registry.get_sample_value("tokenspeed:spec_decode_accept_length_sum", LABELS)
+        == 11
+    )
+    assert (
+        registry.get_sample_value("tokenspeed:spec_decode_accept_length_count", LABELS)
+        == 6
+    )
+    assert (
+        registry.get_sample_value("tokenspeed:prefix_cache_hit_ratio_sum", LABELS) == 70
+    )
+    assert (
+        registry.get_sample_value("tokenspeed:prefix_cache_hit_ratio_count", LABELS)
+        == 300
+    )
+
+
+def test_active_kv_occupancy_releases_but_resident_prefix_cache_remains():
+    sink = ListSink()
+    metrics = EngineMetrics(
+        LABELS, enabled=True, reporters=["test_reporter"], event_sink=sink
+    )
+    metrics.record_cache_occupancy(
+        used_pages=12, active_pages=8, total_pages=40, token_capacity=647
+    )
+    latest = {e.metric: e.value for e in sink.events}
+    assert latest["tokenspeed:kv_token_usage_perc"] == 0.2
+    assert latest["tokenspeed:kv_cache_resident_usage_perc"] == 0.3
+    assert latest["tokenspeed:num_used_tokens"] == 129
+    assert (
+        latest["tokenspeed:num_used_tokens"] + latest["tokenspeed:num_free_tokens"]
+        == 647
+    )
+    metrics.record_cache_occupancy(
+        used_pages=12, active_pages=0, total_pages=40, token_capacity=647
+    )
+    latest = {e.metric: e.value for e in sink.events}
+    assert latest["tokenspeed:kv_token_usage_perc"] == 0
+    assert latest["tokenspeed:num_used_tokens"] == 0
+    assert latest["tokenspeed:num_resident_tokens"] == 194
+    assert latest["tokenspeed:num_free_tokens"] == 647
+
+
+def test_kv_transfer_size_keeps_each_transfer_separate_from_total():
+    sink = ListSink()
+    metrics = KVTransferMetrics(
+        LABELS, enabled=True, reporters=["test_reporter"], event_sink=sink
+    )
+    for size in (1024, 2048, 0):
+        metrics.record_kv_transfer_size(size)
+    assert [e.value for e in sink.events if e.operation == "observe"] == [1024, 2048, 0]
+    assert sum(e.value for e in sink.events if e.operation == "inc") == 3072
