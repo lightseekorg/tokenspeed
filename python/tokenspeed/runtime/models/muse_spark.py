@@ -257,6 +257,8 @@ class _NcclOwnedRows:
         assert gather is not None and local_rows <= gather.slots.shape[1]
         assert rows > (self.world_size - 1) * local_rows
         assert x.dtype == torch.bfloat16 and x.shape[1] == gather.slots.shape[2]
+        # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
+        assert weight.shape[0] != weight.shape[1]
         parity = gather.parity
         gather.parity ^= 1
         gather.slots[parity, :local_rows].copy_(x)
@@ -2907,6 +2909,11 @@ class MuseSparkModel(BaseTransformerModel):
             state.start_step()
         attention_input = None
         if owned_global_rows is not None:
+            # Captured graphs replay the gather parities they recorded from 0.
+            assert (
+                self.iris_state is not None
+                or self.nccl_owned_rows.copy_engine.parity == 0
+            )
             local_rows = (
                 rows + self.mapping.attn.tp_size - 1
             ) // self.mapping.attn.tp_size
@@ -3320,7 +3327,16 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         backend = get_global_backend()
         group = mapping.attn.tp_group
         owned = self.model.nccl_owned_rows
-        if owned is not None and max_num_tokens >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS:
+        from tokenspeed_kernel.ops.communication.fabric import multicast_reachable
+
+        if (
+            owned is not None
+            and max_num_tokens >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS
+            # Symmetric memory maps across the group only on one host or an NVLink fabric.
+            and multicast_reachable(
+                process_group_manager.get_device_process_group(group)
+            )
+        ):
             gather = owned.copy_engine
             rows = owned.local_rows(max_num_tokens)
             if gather is None or gather.slots.shape[1] < rows:
