@@ -917,13 +917,7 @@ impl OutputProcessor {
                 &mut state,
                 self.stream_interval,
                 self.spec_num_tokens,
-                (self.metrics_enabled && self.role != Role::Prefill)
-                    .then_some(&mut self.tpot_seconds),
-                if self.metrics_enabled && self.role != Role::Prefill {
-                    wall_seconds()
-                } else {
-                    0.0
-                },
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
             )
             .into_iter()
             .collect();
@@ -1013,13 +1007,7 @@ impl OutputProcessor {
                 &mut state,
                 self.stream_interval,
                 self.spec_num_tokens,
-                (self.metrics_enabled && self.role != Role::Prefill)
-                    .then_some(&mut self.tpot_seconds),
-                if self.metrics_enabled && self.role != Role::Prefill {
-                    wall_seconds()
-                } else {
-                    0.0
-                },
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
             )
             .into_iter()
             .collect();
@@ -1053,13 +1041,7 @@ impl OutputProcessor {
                 &mut state,
                 self.stream_interval,
                 self.spec_num_tokens,
-                (self.metrics_enabled && self.role != Role::Prefill)
-                    .then_some(&mut self.tpot_seconds),
-                if self.metrics_enabled && self.role != Role::Prefill {
-                    wall_seconds()
-                } else {
-                    0.0
-                },
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
             )
             .into_iter()
             .collect();
@@ -1119,12 +1101,7 @@ impl OutputProcessor {
             &mut state,
             self.stream_interval,
             self.spec_num_tokens,
-            (self.metrics_enabled && self.role != Role::Prefill).then_some(&mut self.tpot_seconds),
-            if self.metrics_enabled && self.role != Role::Prefill {
-                wall_seconds()
-            } else {
-                0.0
-            },
+            Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
         );
         self.collect_stream_end(&state, wall_seconds());
         output.into_iter().collect()
@@ -1150,13 +1127,7 @@ impl OutputProcessor {
                 &mut state,
                 self.stream_interval,
                 self.spec_num_tokens,
-                (self.metrics_enabled && self.role != Role::Prefill)
-                    .then_some(&mut self.tpot_seconds),
-                if self.metrics_enabled && self.role != Role::Prefill {
-                    wall_seconds()
-                } else {
-                    0.0
-                },
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
             )
             .into_iter()
             .collect();
@@ -1190,13 +1161,7 @@ impl OutputProcessor {
                 &mut state,
                 self.stream_interval,
                 self.spec_num_tokens,
-                (self.metrics_enabled && self.role != Role::Prefill)
-                    .then_some(&mut self.tpot_seconds),
-                if self.metrics_enabled && self.role != Role::Prefill {
-                    wall_seconds()
-                } else {
-                    0.0
-                },
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
             )
             .into_iter()
             .collect();
@@ -1226,13 +1191,7 @@ impl OutputProcessor {
                     &mut state,
                     self.stream_interval,
                     self.spec_num_tokens,
-                    (self.metrics_enabled && self.role != Role::Prefill)
-                        .then_some(&mut self.tpot_seconds),
-                    if self.metrics_enabled && self.role != Role::Prefill {
-                        wall_seconds()
-                    } else {
-                        0.0
-                    },
+                    Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
                 ));
             } else if state.abort_notify_client {
                 committed.outputs.extend(Self::stream_state(
@@ -1240,13 +1199,7 @@ impl OutputProcessor {
                     &mut state,
                     self.stream_interval,
                     self.spec_num_tokens,
-                    (self.metrics_enabled && self.role != Role::Prefill)
-                        .then_some(&mut self.tpot_seconds),
-                    if self.metrics_enabled && self.role != Role::Prefill {
-                        wall_seconds()
-                    } else {
-                        0.0
-                    },
+                    Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
                 ));
             }
             self.log_end(&abort.request_id, &state);
@@ -1780,6 +1733,15 @@ impl OutputProcessor {
         }
     }
 
+    /// Pair the sample destination with its output clock, only when collected.
+    fn tpot_observation(
+        metrics_enabled: bool,
+        role: Role,
+        samples: &mut Vec<f64>,
+    ) -> Option<(&mut Vec<f64>, f64)> {
+        (metrics_enabled && role != Role::Prefill).then(|| (samples, wall_seconds()))
+    }
+
     /// The output due from one request this step, at its stream interval,
     /// if any is. A free function so the commit streams states in place
     /// without lifting them out of the map.
@@ -1788,8 +1750,7 @@ impl OutputProcessor {
         state: &mut RequestState,
         stream_interval: i64,
         spec_num_tokens: Option<usize>,
-        tpot_samples: Option<&mut Vec<f64>>,
-        now: f64,
+        tpot_observation: Option<(&mut Vec<f64>, f64)>,
     ) -> Option<StreamedOutput> {
         if !state.output_due(stream_interval) {
             return None;
@@ -1813,7 +1774,7 @@ impl OutputProcessor {
         state.send_token_offset = state.output_ids.len();
         let n_new = output_ids.len();
         if n_new > 0 {
-            if let Some(samples) = tpot_samples {
+            if let Some((samples, now)) = tpot_observation {
                 if let Some(timing) = &mut state.stream_output_timing {
                     samples.push((now - timing.last_output).max(0.0) / n_new as f64);
                     timing.last_output = now;
@@ -1896,13 +1857,7 @@ impl OutputProcessor {
                 state,
                 interval,
                 spec,
-                (self.metrics_enabled && self.role != Role::Prefill)
-                    .then_some(&mut self.tpot_seconds),
-                if self.metrics_enabled && self.role != Role::Prefill {
-                    wall_seconds()
-                } else {
-                    0.0
-                },
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
             ) {
                 outputs.push(output);
             }
@@ -2333,8 +2288,7 @@ mod tests {
             p.states.get_mut(rid).unwrap(),
             p.stream_interval,
             p.spec_num_tokens,
-            (p.metrics_enabled && p.role != Role::Prefill).then_some(&mut p.tpot_seconds),
-            now,
+            (p.metrics_enabled && p.role != Role::Prefill).then_some((&mut p.tpot_seconds, now)),
         )
     }
 

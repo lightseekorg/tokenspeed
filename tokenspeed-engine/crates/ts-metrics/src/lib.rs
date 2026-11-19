@@ -401,7 +401,7 @@ pub struct EngineMetrics {
     decode_prefix_prompt_tokens: Metric,
     decode_prefix_hit_tokens: Metric,
     kv_cache_resident_usage_perc: Metric,
-    num_resident_tokens: Metric,
+    num_resident_kv_tokens: Metric,
     request_completion_tokens: Metric,
 
     num_requests_running: Metric,
@@ -515,9 +515,9 @@ impl EngineMetrics {
                 "Resident KV pages including reclaimable prefix entries divided by usable pages, 0-1.",
                 names,
             ),
-            num_resident_tokens: Metric::gauge(
+            num_resident_kv_tokens: Metric::gauge(
                 exporter,
-                "tokenspeed:num_resident_tokens",
+                "tokenspeed:num_resident_kv_tokens",
                 "KV tokens held by resident pages including reclaimable prefix entries.",
                 names,
             ),
@@ -966,7 +966,7 @@ impl EngineMetrics {
             (i128::from(pages) * i128::from(token_capacity) / i128::from(total_pages)) as f64
         };
         self.num_used_tokens.set(&labels, tokens(active));
-        self.num_resident_tokens.set(&labels, tokens(used));
+        self.num_resident_kv_tokens.set(&labels, tokens(used));
         self.num_free_tokens
             .set(&labels, token_capacity as f64 - tokens(active));
     }

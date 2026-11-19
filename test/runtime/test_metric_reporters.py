@@ -473,7 +473,7 @@ def test_active_kv_occupancy_releases_but_resident_prefix_cache_remains():
     latest = {e.metric: e.value for e in sink.events}
     assert latest["tokenspeed:kv_token_usage_perc"] == 0
     assert latest["tokenspeed:num_used_tokens"] == 0
-    assert latest["tokenspeed:num_resident_tokens"] == 194
+    assert latest["tokenspeed:num_resident_kv_tokens"] == 194
     assert latest["tokenspeed:num_free_tokens"] == 647
 
 
@@ -486,3 +486,32 @@ def test_kv_transfer_size_keeps_each_transfer_separate_from_total():
         metrics.record_kv_transfer_size(size)
     assert [e.value for e in sink.events if e.operation == "observe"] == [1024, 2048, 0]
     assert sum(e.value for e in sink.events if e.operation == "inc") == 3072
+
+
+def test_weighted_observations_preserve_exact_totals():
+    registry = CollectorRegistry()
+    metrics = EngineMetrics(
+        LABELS, enabled=True, reporters=["prometheus"], registry=registry
+    )
+    metrics.record_prefix_hits(
+        prompt_tokens=49, device_hit_tokens=1, host_hit_tokens=1, l3_hit_tokens=0
+    )
+    metrics.record_decode_prefix_hits(49, 1)
+    metrics.record_spec_decode_step(
+        num_decode_slots=49, accepted_draft_tokens=4, draft_width=1
+    )
+    for name, total in (
+        ("prefix_cache_hit_ratio", 2.0),
+        ("prefix_device_hit_ratio", 1.0),
+        ("prefix_host_hit_ratio", 1.0),
+        ("decode_prefix_cache_hit_ratio", 1.0),
+        ("spec_decode_accept_length", 53.0),
+    ):
+        assert registry.get_sample_value(f"tokenspeed:{name}_sum", LABELS) == total
+        assert registry.get_sample_value(f"tokenspeed:{name}_count", LABELS) == 49
+        assert (
+            registry.get_sample_value(
+                f"tokenspeed:{name}_bucket", {**LABELS, "le": "+Inf"}
+            )
+            == 49
+        )

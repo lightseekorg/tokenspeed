@@ -1274,7 +1274,7 @@ the data plane; see [distributed immutable weights](distributed-weights.md).
 
 The legacy used-token convention excludes reclaimable prefix-cache pages.
 `kv_token_usage_perc` and `num_used_tokens` therefore use active pages;
-`kv_cache_resident_usage_perc` and `num_resident_tokens` preserve physical resident
+`kv_cache_resident_usage_perc` and `num_resident_kv_tokens` preserve physical resident
 occupancy. `num_free_tokens` includes reclaimable pages and complements used tokens.
 
 Cache ratios are atomic weighted observations: one admission snapshot carries
@@ -1329,3 +1329,5 @@ clock, and single-chunk requests have neither metric. These clocks are the
 engine's role-local output boundary; the native frontend exposes the same
 formulas at its client-facing output boundary, including transport overhead.
 Both observations preserve their distributions without window averaging.
+Each output observation pairs its sample destination and timestamp together;
+disabled metrics and prefill output do not create an observation.

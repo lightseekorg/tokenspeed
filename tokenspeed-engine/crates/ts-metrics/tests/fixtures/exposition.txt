@@ -30,7 +30,7 @@
 # HELP tokenspeed:num_requests_inflight Requests admitted and not finished, including PD transfer and waiting states.
 # HELP tokenspeed:num_requests_running Requests in the dispatched forward batch, excluding idle padding and transfer waits.
 # HELP tokenspeed:num_requests_waiting Requests waiting for scheduler admission, restore, a decode execution permit, or pause resume.
-# HELP tokenspeed:num_resident_tokens KV tokens held by resident pages including reclaimable prefix entries.
+# HELP tokenspeed:num_resident_kv_tokens KV tokens held by resident pages including reclaimable prefix entries.
 # HELP tokenspeed:num_retracted_queue_reqs Requests suspended with a retraction image.
 # HELP tokenspeed:num_used_tokens KV tokens held by active requests (excludes reclaimable entries).
 # HELP tokenspeed:prefix_cache_hit_ratio Admission cache hits divided by prompt tokens, weighted by prompt tokens.
@@ -82,7 +82,7 @@
 # TYPE tokenspeed:num_requests_inflight gauge
 # TYPE tokenspeed:num_requests_running gauge
 # TYPE tokenspeed:num_requests_waiting gauge
-# TYPE tokenspeed:num_resident_tokens gauge
+# TYPE tokenspeed:num_resident_kv_tokens gauge
 # TYPE tokenspeed:num_retracted_queue_reqs gauge
 # TYPE tokenspeed:num_used_tokens gauge
 # TYPE tokenspeed:prefix_cache_hit_ratio histogram
@@ -213,7 +213,7 @@ tokenspeed:num_prefill_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"
 tokenspeed:num_requests_inflight{app_key="",dp_rank="0",model_name="m"} 4.0
 tokenspeed:num_requests_running{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_requests_waiting{app_key="",dp_rank="0",model_name="m"} 0.0
-tokenspeed:num_resident_tokens{app_key="",dp_rank="0",model_name="m"} 194.0
+tokenspeed:num_resident_kv_tokens{app_key="",dp_rank="0",model_name="m"} 194.0
 tokenspeed:num_retracted_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_used_tokens{app_key="",dp_rank="0",model_name="m"} 129.0
 tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 100.0

@@ -154,8 +154,8 @@ class EngineMetrics:
             labelnames=labelnames,
             multiprocess_mode="livemax",
         )
-        self.num_resident_tokens = factory.gauge(
-            name="tokenspeed:num_resident_tokens",
+        self.num_resident_kv_tokens = factory.gauge(
+            name="tokenspeed:num_resident_kv_tokens",
             documentation="KV tokens held by resident pages including reclaimable prefix entries.",
             labelnames=labelnames,
             multiprocess_mode="livemax",
@@ -552,7 +552,7 @@ class EngineMetrics:
         )
         total = max(0, accepted_draft_tokens) + num_decode_slots
         self.spec_decode_accept_length.labels(**self.labels).observe_weighted(
-            total / num_decode_slots, weight=num_decode_slots
+            total / num_decode_slots, total=total, weight=num_decode_slots
         )
 
     def record_jit_compiles(self, stats: "CompileStats | None") -> None:
@@ -606,7 +606,7 @@ class EngineMetrics:
         self.kv_cache_resident_usage_perc.labels(**self.labels).set(used / total_pages)
         active_tokens = active * token_capacity // total_pages
         self.num_used_tokens.labels(**self.labels).set(active_tokens)
-        self.num_resident_tokens.labels(**self.labels).set(
+        self.num_resident_kv_tokens.labels(**self.labels).set(
             used * token_capacity // total_pages
         )
         self.num_free_tokens.labels(**self.labels).set(token_capacity - active_tokens)
@@ -679,7 +679,7 @@ class EngineMetrics:
         self.decode_prefix_prompt_tokens.labels(**self.labels).inc(prompt)
         self.decode_prefix_hit_tokens.labels(**self.labels).inc(hit)
         self.decode_prefix_cache_hit_ratio.labels(**self.labels).observe_weighted(
-            hit / prompt, weight=prompt
+            hit / prompt, total=hit, weight=prompt
         )
 
     def record_grammar_queue(self, waiting: int) -> None:
@@ -704,7 +704,7 @@ class EngineMetrics:
                 (self.prefix_host_hit_ratio, host_hit_tokens),
             ):
                 metric.labels(**self.labels).observe_weighted(
-                    hit / prompt_tokens, weight=prompt_tokens
+                    hit / prompt_tokens, total=hit, weight=prompt_tokens
                 )
         if device_hit_tokens > 0:
             self.prefix_device_hit_tokens.labels(**self.labels).inc(device_hit_tokens)
