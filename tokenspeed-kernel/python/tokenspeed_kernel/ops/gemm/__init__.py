@@ -520,6 +520,7 @@ def plan_dense_gemm(
     dtype: torch.dtype,
     batch_size: int | None,
     batch_invariant: bool,
+    solution: str | None = None,
 ) -> KernelPlan:
     """Plan dense MM/BMM from model geometry, without allocating example tokens.
 
@@ -538,7 +539,7 @@ def plan_dense_gemm(
         features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         static_traits=traits,
         variable_traits=frozenset({"m"}),
-        solution=None,
+        solution=solution,
         declared_traits=frozenset(),
         ignore_layout=False,
     )
@@ -4430,7 +4431,7 @@ def fp32_router_gemv_execute(
         or not x.is_contiguous()
     ):
         raise ValueError(
-            "router input must be contiguous FP32 " f"[rows, {typed_plan.hidden_size}]"
+            f"router input must be contiguous FP32 [rows, {typed_plan.hidden_size}]"
         )
     return typed_plan.kernel(
         x,

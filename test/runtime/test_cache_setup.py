@@ -153,8 +153,10 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
     uses_paged_state_verify, expected_bytes
 ):
     backend = Mock(spec=AttentionBackend)
+    backend.preallocate_prefill_workspace.return_value = 0
     backend.preallocate_verify_workspace.return_value = 128
     draft_backend = Mock(spec=AttentionBackend)
+    draft_backend.preallocate_prefill_workspace.return_value = 0
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=3),
         config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
