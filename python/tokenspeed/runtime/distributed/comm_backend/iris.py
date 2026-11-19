@@ -231,6 +231,13 @@ class IrisBackend(CommBackend):
             )
         return state
 
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        """Create the ordinary state without replacing model-prepared capacities."""
+        if len(group) <= 1 or not current_platform().is_amd or dtype != torch.bfloat16:
+            return False
+        self._get_or_create(group, dtype)
+        return True
+
     def prepare_all_reduce_buffers(
         self,
         group: Group,

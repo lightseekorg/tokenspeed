@@ -588,6 +588,11 @@ class AutoBackend(CommBackend):
             dtype=dtype,
         )
 
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        if not self.can_prepare_all_reduce_buffers(group, dtype):
+            return False
+        return self._iris.prepare_all_reduce_runtime(group, dtype)
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

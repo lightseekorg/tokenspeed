@@ -500,6 +500,8 @@ pub struct RequestMetrics {
     pub completion_tokens: u64,
     /// One output-token count per ended request, including zero-token ends.
     pub completion_token_samples: Vec<u64>,
+    /// Mean output tokens per verify round, including bonus, per ended request.
+    pub spec_decode_accept_length_samples: Vec<f64>,
 }
 
 /// The admitted requests and their outputs.
@@ -533,6 +535,7 @@ pub struct OutputProcessor {
     e2e_tpot_seconds: Vec<f64>,
     completion_tokens: u64,
     completion_token_samples: Vec<u64>,
+    spec_decode_accept_length_samples: Vec<f64>,
     /// The OTLP trace exporter, when tracing is on. Presence also widens
     /// the request-stats clock: the trace needs the same timestamps.
     trace: Option<Arc<crate::trace::TracePublisher>>,
@@ -575,6 +578,7 @@ impl OutputProcessor {
             e2e_tpot_seconds: Vec::new(),
             completion_tokens: 0,
             completion_token_samples: Vec::new(),
+            spec_decode_accept_length_samples: Vec::new(),
         }
     }
 
@@ -590,6 +594,9 @@ impl OutputProcessor {
             e2e_tpot_seconds: std::mem::take(&mut self.e2e_tpot_seconds),
             completion_tokens: std::mem::take(&mut self.completion_tokens),
             completion_token_samples: std::mem::take(&mut self.completion_token_samples),
+            spec_decode_accept_length_samples: std::mem::take(
+                &mut self.spec_decode_accept_length_samples,
+            ),
         }
     }
 
@@ -665,6 +672,9 @@ impl OutputProcessor {
             let completion_tokens = state.output_ids.len() as u64;
             self.completion_tokens += completion_tokens;
             self.completion_token_samples.push(completion_tokens);
+            if let Some(accept_length) = request_stats::accept_draft_tokens(state) {
+                self.spec_decode_accept_length_samples.push(accept_length);
+            }
             self.collect_request_latencies(state);
         }
     }
@@ -2547,6 +2557,76 @@ mod tests {
             assert!(samples.tpot_seconds.is_empty());
             assert!(samples.e2e_tpot_seconds.is_empty());
         }
+    }
+
+    #[test]
+    fn request_acceptance_samples_include_bonus_and_drain_once_per_request() {
+        let mut p = processor(Some(3));
+
+        register(&mut p, "two_rounds", 1, 5, &[]);
+        p.commit(
+            &batch(&[("two_rounds", 1, 0, 1)], 1),
+            None,
+            &result(&[0], &[1]),
+        )
+        .unwrap();
+        p.commit(
+            &batch(&[("two_rounds", 3, 0, 1)], 0),
+            None,
+            &result(&[1, 2], &[2]),
+        )
+        .unwrap();
+        assert_eq!(
+            p.commit(
+                &batch(&[("two_rounds", 3, 0, 1)], 0),
+                None,
+                &result(&[3, 4], &[2]),
+            )
+            .unwrap()
+            .released,
+            ["two_rounds"]
+        );
+
+        register(&mut p, "one_round", 1, 4, &[]);
+        p.commit(
+            &batch(&[("one_round", 1, 0, 1)], 1),
+            None,
+            &result(&[10], &[1]),
+        )
+        .unwrap();
+        assert_eq!(
+            p.commit(
+                &batch(&[("one_round", 3, 0, 1)], 0),
+                None,
+                &result(&[11, 12, 13], &[3]),
+            )
+            .unwrap()
+            .released,
+            ["one_round"]
+        );
+
+        // Finishing during prefill has no verify round and emits no sample.
+        register(&mut p, "no_verify", 1, 1, &[]);
+        assert_eq!(
+            p.commit(
+                &batch(&[("no_verify", 1, 0, 1)], 1),
+                None,
+                &result(&[20], &[1]),
+            )
+            .unwrap()
+            .released,
+            ["no_verify"]
+        );
+
+        let samples = p.take_request_metrics();
+        // Three verify rounds across two requests produce exactly two samples.
+        // Each value includes every round's bonus token: (5 - 1) / 2 and 4 - 1.
+        assert_eq!(samples.spec_decode_accept_length_samples, [2.0, 3.0]);
+        assert_eq!(samples.completion_token_samples, [5, 4, 1]);
+        assert!(p
+            .take_request_metrics()
+            .spec_decode_accept_length_samples
+            .is_empty());
     }
 
     #[test]

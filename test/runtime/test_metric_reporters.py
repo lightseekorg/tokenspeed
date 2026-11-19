@@ -296,6 +296,34 @@ def test_plugin_speculation_and_abort_counters():
     ]
 
 
+def test_request_acceptance_length_is_unweighted_per_request():
+    sink = ListSink()
+    registry = CollectorRegistry()
+    metrics = EngineMetrics(
+        LABELS,
+        enabled=True,
+        reporters=["prometheus", "test_reporter"],
+        event_sink=sink,
+        registry=registry,
+    )
+    metrics.observe_request_spec_decode_accept_length(2.0)
+    metrics.observe_request_spec_decode_accept_length(3.0)
+    events = [
+        event
+        for event in sink.events
+        if event.metric == "tokenspeed:request_spec_decode_accept_length"
+    ]
+    assert [(event.operation, event.value, event.weight) for event in events] == [
+        ("observe", 2.0, 1),
+        ("observe", 3.0, 1),
+    ]
+    name = "tokenspeed:request_spec_decode_accept_length"
+    assert registry.get_sample_value(f"{name}_count", LABELS) == 2
+    assert registry.get_sample_value(f"{name}_sum", LABELS) == 5
+    assert registry.get_sample_value(f"{name}_bucket", {**LABELS, "le": "2.0"}) == 1
+    assert registry.get_sample_value(f"{name}_bucket", {**LABELS, "le": "+Inf"}) == 2
+
+
 def test_transfer_reporters_preserve_dynamic_stage_labels():
     sink = ListSink()
     registry = CollectorRegistry()
