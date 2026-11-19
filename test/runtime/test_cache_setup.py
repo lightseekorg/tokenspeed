@@ -1991,10 +1991,19 @@ def _receive_pool_env(monkeypatch, slots, slot_mb):
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
     from tokenspeed.runtime.execution import device, factory
+    from tokenspeed.runtime.layers.attention import utils as attention_utils
 
     _receive_pool_env(monkeypatch, 16, 256)
     _fake_around_the_budget(monkeypatch, lambda: 60 << 30)
+    groups = ProcessGroupManager()
+    groups.register_process_group(
+        "gloo",
+        (0,),
+        torch.distributed.ProcessGroupGloo(torch.distributed.HashStore(), 0, 1),
+    )
+    monkeypatch.setattr(attention_utils, "pg_manager", groups)
     target = SimpleNamespace(
         model=object(),
         prepare_multimodal_runtime=lambda: None,
@@ -2013,18 +2022,14 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
         device="cuda",
-        mapping=SimpleNamespace(
-            world_size=1,
-            world_group=None,
-            is_first_pp_rank=True,
-            attn=SimpleNamespace(has_kvp=False),
-        ),
+        # Budget each rank locally; collective reductions are tested separately.
+        mapping=Mapping(rank=0, world_size=1),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
             server_args=server_args,
             model_config=SimpleNamespace(
-                is_multimodal=True, is_multimodal_active=active
+                is_multimodal=True, is_multimodal_active=active, dtype=torch.bfloat16
             ),
             draft_model_config=None,
             gpu_id=0,
