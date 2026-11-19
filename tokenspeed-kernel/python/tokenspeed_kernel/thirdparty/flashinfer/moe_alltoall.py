@@ -18,12 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer MoE all-to-all with caller-owned MNNVL workspace."""
-
-from types import SimpleNamespace
+"""FlashInfer NVLink one-sided MoE all-to-all for one expert-parallel group."""
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 
 
 class FlashInferMoeAlltoAll:
@@ -35,13 +32,15 @@ class FlashInferMoeAlltoAll:
         top_k: int,
         num_experts: int,
         dtype: torch.dtype,
-        weights_dtype: torch.dtype,
     ) -> None:
-        from flashinfer.comm import (
-            moe_a2a_get_workspace_size_per_rank,
-            moe_a2a_initialize,
+        from flashinfer.moe_ep import (
+            BootstrapConfig,
+            MoEEpCommParams,
+            create_communication,
         )
-        from flashinfer.comm.mnnvl import MnnvlConfig, MnnvlMemory, TorchDistBackend
+        from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.config import (
+            NVLinkOneSidedConfig,
+        )
 
         self.ep_rank = group.rank()
         self.ep_size = group.size()
@@ -53,35 +52,30 @@ class FlashInferMoeAlltoAll:
             raise ValueError(
                 "MoE all-to-all requires an even contiguous expert partition"
             )
-        # The BF16 capacity also covers packed NVFP4 plus its block scales.
-        payload_bytes = hidden_size * (torch.finfo(dtype).bits // 8)
-        routing_bytes = top_k * (4 + torch.finfo(weights_dtype).bits // 8)
-        size = moe_a2a_get_workspace_size_per_rank(
-            ep_size=self.ep_size,
-            max_num_tokens=max_tokens,
-            total_dispatch_payload_size_per_token=payload_bytes + routing_bytes,
-            combine_payload_size_per_token=payload_bytes,
-            eplb_stats_num_experts=0,
+        # A valid nonlocal ID makes every expert backend ignore unused receive slots.
+        self.unused_expert_id = ((self.ep_rank + 1) % self.ep_size) * (
+            num_experts // self.ep_size
         )
-        mapping = SimpleNamespace(pp_rank=0, cp_rank=0, cp_size=1, tp_rank=self.ep_rank)
-        MnnvlMemory.initialize()
-        MnnvlMemory.set_comm_from_config(
-            mapping,
-            MnnvlConfig(
-                comm_backend=TorchDistBackend(group=group),
-                allocation_granularity=0,
-                fabric_page_size=1 << 29,
-            ),
-        )
-        self.memory = MnnvlMemory(mapping, size)
-        self.workspace = self.memory.as_torch_strided_tensor(torch.uint8)
-        self.metainfo = moe_a2a_initialize(
-            workspace=self.workspace,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-            max_num_tokens=max_tokens,
-            eplb_stats_num_experts=0,
-        )
+        # Rows are sized for unquantized activations, which also covers packed
+        # NVFP4 plus its block scales. FlashInfer builds its host-side layout
+        # tensors on the default device, which a model loader may set to CUDA.
+        with torch.device("cpu"):
+            self.communication = create_communication(
+                BootstrapConfig(
+                    world_size=self.ep_size,
+                    rank=self.ep_rank,
+                    device=torch.cuda.current_device(),
+                    process_group=group,
+                ),
+                MoEEpCommParams(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    max_tokens_per_rank=max_tokens,
+                    hidden_size=hidden_size,
+                    dtype=dtype,
+                ),
+                NVLinkOneSidedConfig(),
+            )
 
     def dispatch(
         self,
@@ -93,91 +87,45 @@ class FlashInferMoeAlltoAll:
         torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         torch.Tensor,
         torch.Tensor,
-        int,
     ]:
-        """Dispatch local tokens or an NVFP4 pair, routing, and return flattened receives."""
-        from flashinfer.comm import moe_a2a_dispatch, moe_a2a_sanitize_expert_ids
+        """Send local tokens to the ranks owning their experts.
 
-        if not 0 < max_tokens <= self.max_tokens:
-            raise ValueError(
-                "MoE all-to-all token count exceeds its workspace capacity"
-            )
+        Args:
+            hidden_states: ``[local_tokens, width]`` activations, or an NVFP4
+                ``(packed, scales)`` pair.
+            topk_ids: ``[local_tokens, top_k]`` global expert ids.
+            topk_weights: ``[local_tokens, top_k]`` routing weights.
+            max_tokens: Largest local token count over all ranks this step;
+                every rank passes the same value.
+
+        Returns:
+            Received activations (same form as ``hidden_states``), expert ids
+            and routing weights, each with ``ep_size * max_tokens`` rows. They
+            are views of the transport's buffers, valid until ``combine``.
+        """
         prequantized = isinstance(hidden_states, tuple)
-        input_payloads = [topk_ids, topk_weights]
-        if prequantized:
-            input_payloads.extend(hidden_states)
-        else:
-            input_payloads.append(hidden_states)
-        payloads, offset, _ = moe_a2a_dispatch(
-            token_selected_experts=topk_ids,
-            input_payloads=input_payloads,
-            workspace=self.workspace,
-            metainfo=self.metainfo,
+        received = self.communication.dispatch(
+            hidden_states[0] if prequantized else hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_states_scale=hidden_states[1] if prequantized else None,
             runtime_max_tokens_per_rank=max_tokens,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-            top_k=self.top_k,
-            num_experts=self.num_experts,
-            enable_pdl=pdl_enabled(),
-            eplb_local_stats=None,
-            enable_rank_mask=False,
-            active_rank_mask=None,
         )
-        ids, weights, hidden = payloads[:3]
-        # A valid nonlocal ID makes every expert backend ignore unused receive slots.
-        invalid_id = ((self.ep_rank + 1) % self.ep_size) * (
-            self.num_experts // self.ep_size
-        )
-        moe_a2a_sanitize_expert_ids(
-            expert_ids=ids,
-            workspace=self.workspace,
-            metainfo=self.metainfo,
-            ep_rank=self.ep_rank,
-            invalid_expert_id=invalid_id,
-            enable_pdl=pdl_enabled(),
-        )
-        routed_input = hidden.view(-1, input_payloads[2].shape[1])
+        ids = received.topk_ids
+        ids.masked_fill_(ids < 0, self.unused_expert_id)
+        routed_input = received.hidden_states
         if prequantized:
-            routed_input = (
-                routed_input,
-                payloads[3].view(-1, input_payloads[3].shape[1]),
-            )
-        return (
-            routed_input,
-            ids.view(-1, self.top_k),
-            weights.view(-1, self.top_k),
-            offset,
-        )
+            routed_input = (routed_input, received.hidden_states_scale)
+        return routed_input, ids, received.topk_weights
 
-    def combine(
-        self,
-        routed_output: torch.Tensor,
-        local_tokens: int,
-        max_tokens: int,
-        combine_offset: int,
-    ) -> torch.Tensor:
-        """Sum already-weighted rank outputs and restore the original local token order."""
-        from flashinfer.comm import moe_a2a_combine
-        from flashinfer.tllm_enums import SfLayout
+    def combine(self, routed_output: torch.Tensor) -> torch.Tensor:
+        """Sum already-weighted rank outputs of the last dispatch.
 
-        return moe_a2a_combine(
-            payload=routed_output.view(self.ep_size, max_tokens, self.hidden_size),
-            local_num_tokens=local_tokens,
-            workspace=self.workspace,
-            metainfo=self.metainfo,
-            runtime_max_tokens_per_rank=max_tokens,
-            ep_rank=self.ep_rank,
-            ep_size=self.ep_size,
-            top_k=self.top_k,
-            combine_payload_offset=combine_offset,
-            payload_in_workspace=False,
-            output_dtype=routed_output.dtype,
-            output_scales=None,
-            output_scalar_scale=1.0,
-            sf_layout=SfLayout.layout_linear,
-            output=None,
-            use_low_precision=False,
-            enable_pdl=pdl_enabled(),
-            enable_rank_mask=False,
-            active_rank_mask=None,
-        )
+        Args:
+            routed_output: ``[ep_size * max_tokens, hidden_size]`` outputs for
+                the rows ``dispatch`` returned.
+
+        Returns:
+            ``[local_tokens, hidden_size]`` outputs in the dispatched order.
+        """
+        return self.communication.combine(routed_output)
