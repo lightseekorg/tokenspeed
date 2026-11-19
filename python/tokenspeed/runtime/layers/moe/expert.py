@@ -595,12 +595,12 @@ class MoELayer(torch.nn.Module):
                     "Peer weights require local full-expert TP1/EP1 compute"
                 )
             if not (
-                self._quant_kind == "nvfp4"
+                self._quant_kind in ("nvfp4", "mxfp4")
                 and self.activation == "situ"
                 and self.plan["solution"] == "flashinfer_trtllm"
             ):
                 raise ValueError(
-                    "Peer weights currently require FlashInfer TRTLLM NVFP4 SiTU"
+                    "Peer weights currently require FlashInfer TRTLLM NVFP4 or MXFP4 SiTU"
                 )
             self._storage_spec = replace(
                 self._spec,
