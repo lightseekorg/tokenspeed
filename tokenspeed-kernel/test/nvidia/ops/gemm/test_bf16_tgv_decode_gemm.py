@@ -36,14 +36,15 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from utils import assert_no_cute_compile
 
+WINDOW = fi.TGV_DECODE_WINDOWS.get(fi.platform.arch_version)
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or fi.platform.arch_version not in (fi.ArchVersion(10, 0), fi.ArchVersion(10, 3))
+    or WINDOW is None
     or not fi.has_flashinfer_cute_dsl_bf16(),
-    reason="pinned TGV tiles need FlashInfer's BF16 GEMMs on SM100/SM103",
+    reason="pinned TGV tiles need FlashInfer's BF16 GEMMs on SM100/SM103/SM107",
 )
 
-TILE16, TILE32, TILE64 = fi.TGV_DECODE_TILES
+TILE16, TILE32, TILE64 = fi.TGV_DECODE_TILES if WINDOW is None else WINDOW.tiles
 TGV = "flashinfer_tgv_decode_gemm"
 
 
@@ -115,7 +116,7 @@ def test_installed_flashinfer_lists_the_pinned_tiles():
     # lookup by shape), which a FlashInfer change can also break.
     tgv = fi._flashinfer_tgv()
     assert tgv is not None
-    assert set(tgv.tactics) == set(fi.TGV_DECODE_TILES)
+    assert set(tgv.tactics) == {TILE16, TILE32, TILE64}
     x, w = inputs(48, 512, 2560, 1)
     unpinned = next(i for i in range(64) if i not in tgv.tactics.values())
     with pytest.raises(ValueError, match="Unsupported input"):
@@ -161,8 +162,11 @@ def test_pinned_tiles_start_where_the_joint_path_ends():
     ],
 )
 def test_mm_routes_decode_rows_by_the_tile_policy(m, n, k, routed):
-    if not 128 <= fi.platform.sm_count < 200:
-        pytest.skip("these shapes route as listed on GPUs with 128 to 199 SMs")
+    if fi.platform.arch_version not in (
+        fi.ArchVersion(10, 0),
+        fi.ArchVersion(10, 3),
+    ) or not (128 <= fi.platform.sm_count < 200):
+        pytest.skip("these shapes route as listed on SM100/SM103 with 128 to 199 SMs")
     x, w = inputs(m, n, k, seed=m + n + k)
     out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     tactic = fi.flashinfer_tgv_decode_tactic(x, w, out)
@@ -182,7 +186,15 @@ def test_mm_routes_decode_rows_by_the_tile_policy(m, n, k, routed):
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize(
     "n,k",
-    [(512, 2560), (960, 2560), (2560, 2080), (2560, 160), (160, 2560), (1000, 2560)],
+    [
+        (512, 2560),
+        (960, 2560),
+        (2560, 2080),
+        (2560, 160),
+        (160, 2560),
+        (1000, 2560),
+        (2560, 6144),
+    ],
 )
 def test_pinned_tiles_match_fp64(pdl, n, k):
     """Every tile, with full and partial last activation, weight and K tiles:
@@ -190,6 +202,8 @@ def test_pinned_tiles_match_fp64(pdl, n, k):
     tgv = fi._flashinfer_tgv()
     assert tgv is not None
     x, w = inputs(fi.TGV_DECODE_MAX_M, n, k, seed=n + k)
+    if not fi.flashinfer_joint_bf16_supported(x, w, None):
+        pytest.skip(f"the joint BF16 contract keeps K = {k} off this GPU's TGV route")
     pdl_enabled(pdl)  # startup_with_pdl restores it
     for tile, tactic in tgv.tactics.items():
         for m in (33, 3 * tile.cta_n, 3 * tile.cta_n + 1, 255, x.shape[0]):
@@ -199,7 +213,10 @@ def test_pinned_tiles_match_fp64(pdl, n, k):
             assert torch.all(storage[m * n :] == 42)
 
 
-@pytest.mark.parametrize("m,tile", [(33, TILE16), (96, TILE32), (192, TILE64)])
+@pytest.mark.parametrize(
+    "m,tile",
+    [(33, TILE16), (96, TILE32), (192, TILE64), (64, TILE32), (128, TILE64)],
+)
 def test_captured_graph_replays_the_tile_bit_for_bit(m, tile):
     n, k = 2560, 2560
     x, w = inputs(m, n, k, seed=m)
@@ -337,7 +354,7 @@ def test_warmup_compiles_the_tiles_for_every_row_and_weight(tgv_compiles):
     with kernel_warmup(enabled=True):
         mm(warmed_x[:64], warmed_w)
     # 64 rows of this weight need one tile; warmup compiled all three.
-    assert len(compiled) == len(fi.TGV_DECODE_TILES)
+    assert len(compiled) == len(WINDOW.tiles)
     warmed = set(compiled)
     capture = ShapeCapture.get()
     capture.clear()

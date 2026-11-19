@@ -1598,6 +1598,9 @@ def build_device_side(
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
     from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
+    from tokenspeed.runtime.execution.distributed_initializer import (
+        DistributedConfig,
+    )
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
         create_model_executor,
@@ -1615,6 +1618,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.dcp.cache import (
         prepare_prefix_history_transport,
     )
+    from tokenspeed.runtime.layers.attention.dcp.comm import prepare_decode_exchange
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1651,6 +1655,15 @@ def build_device_side(
             [runner.model for runner in (target, draft) if runner is not None],
             torch.device(server_args.device, gpu_id),
         )
+        if server_args.mapping.attn.has_kvp:
+            prepare_decode_exchange(
+                tuple(server_args.mapping.attn.kvp_group),
+                (
+                    server_args.distributed_timeout_seconds
+                    if server_args.distributed_timeout_seconds is not None
+                    else DistributedConfig.distributed_timeout_seconds
+                ),
+            )
     if communication_first:
         prepare_multimodal()
 

@@ -41,7 +41,7 @@ register_cuda_ci(
 PROMPT_IDS = [11, 25, 3, 999, 42, 7, 128, 55, 1023, 64, 2, 300, 17, 500]
 DECODE_TOKENS = [123, 45, 678]
 PAGE_SIZE = 64
-REQ_SLOT = 1  # 1-based request pool slot (row 0 reserved), page id 1
+REQ_SLOT = 1  # 1-based request pool slot (row 0 reserved).
 # bf16 kernels vs fp32-accum reference; tiny dummy weights keep activations
 # O(1e-3) so absolute tolerance is tight.
 TOL = 5e-3
@@ -171,9 +171,6 @@ class _Harness:
 
     def __init__(self, model, text, device="cuda"):
         from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-        from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-            CacheGroupGeometry,
-        )
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (
             MHAAttnBackend,
         )
@@ -189,6 +186,7 @@ class _Harness:
         from tokenspeed.runtime.layers.attention.kv_cache.mha import (
             MHATokenToKVPool,
         )
+        from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 
         self.model = model
         self.text = text
@@ -216,33 +214,24 @@ class _Harness:
         # layers' group_ids are the cache_layer_types labels; sliding layers
         # split into sub-groups). Write locations are router-owned: the layer
         # call carries none, the router derives them from block_tables.
-        self.attn_groups = tuple(dict.fromkeys(text.cache_layer_types))
+        layer_types = tuple(text.cache_layer_types)
+        self.attn_groups = tuple(dict.fromkeys(layer_types))
         leaves = {
             gid: MHAAttnBackend(config, spec, kernel_page_size=PAGE_SIZE)
             for gid in self.attn_groups
         }
         inner = CacheGroupRouter(
-            None,
+            lambda gid, _grain: leaves[gid],
             is_draft=False,
             spec_num_tokens=1,
             device=device,
             consumed_group_ids=None,
         )
-        inner.bind(
-            CacheGroupGeometry(
-                granularities={gid: PAGE_SIZE for gid in self.attn_groups},
-                attn_kinds={gid: "full_history" for gid in self.attn_groups},
-                full_history_group_id=(
-                    "full_attention"
-                    if "full_attention" in self.attn_groups
-                    else self.attn_groups[0]
-                ),
-                row_geometry={gid: (PAGE_SIZE, 1) for gid in self.attn_groups},
-                windows={gid: None for gid in self.attn_groups},
-            ),
-            leaves,
+        from test.runtime.cache_pool_test_utils import (
+            make_mha_memory_plan,
+            make_pool,
+            specs_for_layers,
         )
-        from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         layer_kv_heads = tuple(
             (
@@ -262,6 +251,14 @@ class _Harness:
                 kv_heads=text.num_key_value_heads,
                 head_dim=text.head_dim,
                 dtype=torch.bfloat16,
+                layer_types=layer_types,
+                sliding_window_tokens=text.sliding_window_size,
+            ),
+            cache_group_specs=specs_for_layers(
+                layer_types=layer_types,
+                group_ids=layer_types,
+                prefix_granularity=PAGE_SIZE,
+                sliding_window_tokens=text.sliding_window_size,
             ),
             device=device,
             dtype=torch.bfloat16,
@@ -287,7 +284,7 @@ class _Harness:
             "pd_endpoint_snapshots": False,
         }
         self.backend = InklingAttnBackend(inner, conv_pool)
-        # The leaves bind directly below; supply the groups a wrapper bind learns.
+        # The checkpoint buffers below supply the wrapper's two conv groups.
         self.backend.conv_columns = conv_columns
         self.pool_view = _ConvCheckpointPool(
             self.kv_pool,
@@ -300,17 +297,19 @@ class _Harness:
         # Two-slot conv tables: the request starts cold and writes block 1.
         conv_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
         self.conv_tables = {"kvconv": conv_table, "hiddenconv_0": conv_table}
-        # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
+        # Groups can share planes, so give each group disjoint parent IDs.
         max_pages = 1024 // PAGE_SIZE
-        self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
-        for p in range(max_pages - 1):
-            self.page_table[REQ_SLOT, p] = p + 1
-        # Router tables are batch-row-major ([bs, cols]); every attention
-        # group shares this one request's page row over the single pool.
-        attn_table = self.page_table[REQ_SLOT : REQ_SLOT + 1]
+        attn_tables = {}
+        for index, gid in enumerate(self.attn_groups):
+            table = torch.zeros(1, max_pages, dtype=torch.int32, device=device)
+            pages = torch.arange(
+                index + 1, max_pages + 1, len(self.attn_groups), device=device
+            )
+            table[0, : len(pages)] = pages
+            attn_tables[gid] = table
         self.block_tables = {
             **self.conv_tables,
-            **{gid: attn_table for gid in self.attn_groups},
+            **attn_tables,
         }
         # The runner's host mirror of the tables, as the router's extend
         # metadata contract requires (read only under a query shard).
@@ -321,15 +320,9 @@ class _Harness:
         # Unified decode path: decode metadata is refreshed into persistent
         # buffers allocated here (production allocates them unconditionally
         # at ForwardStepRunner construction, enforce-eager included). The
-        # router is hand-bound above, so bind the pool to its leaves the way
-        # set_cache_pool would.
-        for leaf in leaves.values():
-            leaf.set_cache_pool(self.kv_pool)
-        # Production binds each layer's cache group from the pool's plan
-        # (bind_cache_groups); this harness plans a plain pool and hand-binds
-        # the router per label, so stamp the labels the same way.
-        for layer_id, layer in enumerate(self.model.model.layers):
-            layer.attn.attn.bind_cache_group(text.cache_layer_types[layer_id])
+        # router and its leaves learn the same geometry from the bound pool.
+        inner.set_cache_pool(self.kv_pool)
+        bind_cache_groups(self.model, self.kv_pool)
         self.backend.init_cuda_graph_state(max_bs=4)
 
     def _ctx(self, mode):
@@ -340,18 +333,20 @@ class _Harness:
             bs=1,
         )
 
-    def _token_locs(self, start, n):
-        # Page ids start at 1: token location = page_id * page_size + offset.
+    def _token_locs(self, group_id, start, n):
         pos = torch.arange(start, start + n, device=self.device)
-        return (pos // PAGE_SIZE + 1) * PAGE_SIZE + pos % PAGE_SIZE
+        pages = (
+            pos // PAGE_SIZE * len(self.attn_groups)
+            + self.attn_groups.index(group_id)
+            + 1
+        )
+        return pages * PAGE_SIZE + pos % PAGE_SIZE
 
     def _check_write_locations(self, mode, start, n):
-        """Pin the router-derived KV write slots to the page map above: every
-        layer's group shares the request's page row, so every layer writes
-        the same token locations the old explicit out_cache_loc named."""
-        expected = self._token_locs(start, n)
+        """Check the router's writes against each group's independently owned pages."""
         for layer in self.model.model.layers:
             paged = layer.attn.attn  # InklingAttention -> its PagedAttention
+            expected = self._token_locs(paged.group_id, start, n)
             got = self.backend.write_locations(paged, mode).long()
             assert torch.equal(got, expected), (
                 f"layer {paged.layer_id} ({paged.group_id!r}) {mode}: "
@@ -451,16 +446,18 @@ class TestInklingActivationParity:
             assert _pytest_a_1 < _pytest_b_2, _pytest_msg_3
         return report
 
-    def test_layerwise_prefill_and_decode(self):
+    @pytest.mark.parametrize("prompt_length", [len(PROMPT_IDS), PAGE_SIZE - 1])
+    def test_layerwise_prefill_and_decode(self, prompt_length):
         harness = _Harness(self.model, self.text)
         report = []
+        prompt = [PROMPT_IDS[i % len(PROMPT_IDS)] for i in range(prompt_length)]
         with torch.no_grad():
             # ---- prefill: compare every position, every layer ----
-            got = harness.prefill(PROMPT_IDS)
-            ref = list(_reference_layer_states(self.model, self.text, PROMPT_IDS))
+            got = harness.prefill(prompt)
+            ref = list(_reference_layer_states(self.model, self.text, prompt))
             report += self._compare("prefill", got, ref, slice(None))
             # ---- rolling decode: compare the new position, every layer ----
-            seq = list(PROMPT_IDS)
+            seq = list(prompt)
             for step, tok in enumerate(DECODE_TOKENS):
                 seq.append(tok)
                 got = harness.decode(tok)

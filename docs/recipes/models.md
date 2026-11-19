@@ -1322,6 +1322,21 @@ object:
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
 
+### FlatKV cache
+
+Qwen4-Exp uses FlatKV by default, putting target and draft KV, GDN, PLE and QSA
+fields on one shared physical plane while preserving their logical groups.
+Qwen3.8-Flash-Next has five groups, with all GDN layers in one group. Each group
+packs pages according to its payload and alignment. Full-history K/V and
+compressed QSA use translated atom-page IDs; state and recent windows retain
+explicit strides. No KV gather is introduced.
+
+This requires PP=1, uniform K/V heads within each compute view and non-MXFP8
+KV. It reduces padding for partially filled groups; a full-attention parent
+that was already full keeps the same useful KV bytes per token. Use
+`--no-qwen4-exp-flat-kv` for the plane-based layout. L3 compatibility follows
+the resulting cache layout.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

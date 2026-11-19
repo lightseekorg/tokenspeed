@@ -369,6 +369,10 @@ pub struct Load {
     pub kv_total_pages: i64,
     /// Resident cache blocks, including reclaimable prefix-cache entries.
     pub kv_used_pages: i64,
+    /// Prompt plus committed output tokens of every request held by the rank.
+    pub num_resident_tokens: i64,
+    /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
+    pub num_waiting_uncached_tokens: i64,
 }
 
 /// The frontend: requests in, outputs out.
@@ -948,6 +952,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 kv_active_pages: i64::from(self.active_pages()),
                 kv_total_pages: self.config.kv_total_pages,
                 kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
+                num_resident_tokens: self.outputs.num_resident_tokens(),
+                num_waiting_uncached_tokens: sizes.pending_prefill_tokens,
             };
             // Silent aborts must refresh load immediately; periodic heartbeats
             // also keep an idle engine's load snapshot fresh at its frontend.

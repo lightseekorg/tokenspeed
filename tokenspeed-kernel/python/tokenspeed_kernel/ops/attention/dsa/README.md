@@ -157,11 +157,16 @@ row. That is bit for bit `cuda_dsa_merge_candidates`' selection compacted to
 the rank's slots, without exchanging positions; `triton_dsa_merge_candidates`
 selects the same candidates in score order. A score plane reads an invalid
 candidate off its score, so `scores_out` holds -inf for every -1 offset.
-Only gfx950 registers it, as one launch over the gathered planes:
-`dsa_select_owned_candidates_supported` accepts a power-of-two rank count, a
-power-of-two topk of at least 512, at most 16384 gathered scores per row and
-rank chunks within 32-bit offsets, and refuses other platforms. A KVP decode
-whose sizes it refuses merges the candidates instead.
+gfx950 and SM100/SM103 register it for a topk of 512, 1024, or 2048, each as
+one launch over the gathered planes. gfx950's leaf accepts a power-of-two rank
+count, at most 16384 gathered scores per row, and rank chunks within 32-bit
+offsets. `cute_dsl_dsa_select_owned_candidates` runs one 1024-thread CTA per
+row: the row's scores stay in registers, three radix digits of 11, 11, and 10
+bits over a shared-memory histogram find the k-th largest score, and two block
+scans keep the rank's candidates in candidate order. It accepts two or more
+power-of-two ranks and at most 32768 gathered scores per row.
+`dsa_select_owned_candidates_supported` refuses other sizes and platforms; a
+KVP decode whose sizes it refuses merges the candidates instead.
 
 ## Materialized Triton row top-k
 

@@ -404,6 +404,8 @@ mod ffi {
         ready_waiting: usize,
         /// Requests awaiting admission or restore.
         waiting: usize,
+        /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
+        pending_prefill_tokens: i64,
         /// Requests prefilling.
         prefilling: usize,
         /// Requests decoding.
