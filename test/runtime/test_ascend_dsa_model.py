@@ -159,6 +159,9 @@ def test_prefill_weight_preparation_follows_model_opt_in(
     pointers = (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
     attention.process_weights_after_loading()
     assert pointers == (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
+    if prefill_enabled:
+        _, kc, vc, _ = attention._prefill_weights
+        assert kc is attention.w_kc and vc is attention.w_vc
 
 
 @pytest.mark.parametrize("rows", [1, 1025, 2049])
@@ -382,6 +385,7 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
             layer_id=0,
             lora_norm_eps=1e-5,
             prefill_enabled=False,
+            decode_enabled=True,
         ).bfloat16()
         layer.indexer.weights_proj.float()
     if index_heads == 64:
@@ -549,4 +553,177 @@ def test_indexer_head_count_is_rejected_at_initialization(index_heads):
             kv_lora_rank=4,
             lora_norm_eps=1e-6,
             prefill_enabled=True,
+            decode_enabled=False,
         )
+
+
+@pytest.mark.parametrize(
+    "kvp,prefill,decode,local_heads,can_decode",
+    [
+        (2, True, False, 4, False),
+        (2, False, True, 2, True),
+        (2, True, True, 2, True),
+        (2, True, None, 4, False),
+        (2, False, None, 2, True),
+        (1, True, None, 4, True),
+        (1, True, True, 4, True),
+    ],
+)
+def test_native_dsa_role_projection_layouts(
+    kvp, prefill, decode, local_heads, can_decode
+):
+    config = make_attention(nope=True, separate=True, independent=True).config
+    # Omitting decode_enabled exercises plugins using the original constructor.
+    options = {} if decode is None else {"decode_enabled": decode}
+    with torch.device("meta"):
+        attention = AscendDSAAttention(
+            config=config,
+            mapping=Mapping(rank=0, world_size=2, attn_tp_size=2, attn_kvp_size=kvp),
+            hidden_size=8,
+            num_heads=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            q_lora_rank=4,
+            kv_lora_rank=4,
+            lora_norm_eps=1e-6,
+            prefill_enabled=prefill,
+            **options,
+        )
+    assert attention.q_b_proj.weight.shape == (local_heads * 8, 4)
+    assert attention.kv_b_proj.weight.shape == (local_heads * 8, 4)
+    assert attention.o_proj.weight.shape == (8, local_heads * 4)
+    assert attention.num_local_heads == local_heads
+    assert attention.decode_enabled is can_decode
+
+
+def test_unified_dsa_prefill_views_preserve_decode_shards(monkeypatch):
+    from tokenspeed.runtime.layers.attention.dsa import ascend
+
+    # Only communication is simulated. Rank one's shard has twice the
+    # coefficients of rank zero's shard for each projection.
+    def gather(value, group, dim):
+        assert tuple(group) == (0, 1)
+        return torch.cat((value, value * 2), dim=dim)
+
+    monkeypatch.setattr(ascend, "all_gather", gather)
+    config = make_attention(nope=True, separate=True, independent=True).config
+    attention = AscendDSAAttention(
+        config=config,
+        mapping=Mapping(rank=0, world_size=2, attn_tp_size=2, attn_kvp_size=2),
+        hidden_size=8,
+        num_heads=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=4,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        lora_norm_eps=1e-6,
+        prefill_enabled=True,
+        decode_enabled=True,
+    ).bfloat16()
+    addresses = None
+    for generation in (1, 3):
+        with torch.no_grad():
+            for weight in (
+                attention.q_b_proj.weight,
+                attention.kv_b_proj.weight,
+                attention.o_proj.weight,
+            ):
+                weight.fill_(generation)
+        attention.process_weights_after_loading()
+        qb, kc, vc, output = attention._prefill_weights
+        assert qb.shape == (32, 4)
+        assert kc.shape == vc.shape == (4, 4, 4)
+        assert output.shape == (8, 16)
+        for rank in range(2):
+            for actual in (
+                qb[rank * 16 : (rank + 1) * 16],
+                kc[rank * 2 : (rank + 1) * 2],
+                vc[rank * 2 : (rank + 1) * 2],
+                output[:, rank * 8 : (rank + 1) * 8],
+            ):
+                torch.testing.assert_close(
+                    actual,
+                    torch.full_like(actual, generation * (rank + 1)),
+                    atol=0,
+                    rtol=0,
+                )
+        for weight in (
+            attention.q_b_proj.weight,
+            attention.w_kc,
+            attention.w_vc,
+            attention.o_proj.weight,
+        ):
+            torch.testing.assert_close(
+                weight, torch.full_like(weight, generation), atol=0, rtol=0
+            )
+        current = tuple(
+            t.data_ptr() for t in (qb, kc, vc, output, attention.w_kc, attention.w_vc)
+        )
+        if addresses is not None:
+            assert current == addresses
+        addresses = current
+
+
+def test_native_projection_initializes_from_indexer_rotary_descriptor(monkeypatch):
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as decode,
+    )
+
+    # Substitute only absent accelerator transfer, HCCL, and the native kernel
+    # provider. Use the real attention, indexer, coefficient packing and owner.
+    monkeypatch.setattr(torch.Tensor, "npu", lambda value: value, raising=False)
+    monkeypatch.setattr(decode, "validate_dsa_prolog", lambda **kwargs: None)
+
+    class CpuWeightCarrier:
+        def prepare_weight(self, value):
+            return value
+
+    monkeypatch.setattr(decode, "select_dsa_projection_kernels", CpuWeightCarrier)
+
+    def gather(pieces, value, group):
+        for piece in pieces:
+            piece.copy_(value)
+
+    monkeypatch.setattr(decode.dist, "all_gather", gather)
+    config = PretrainedConfig(
+        rms_norm_eps=1e-6,
+        mla_use_nope=True,
+        index_use_rope=False,
+        mla_use_output_gate=False,
+        mla_scale_q_lora=False,
+        cli_factor=1,
+        index_n_heads=16,
+        index_head_dim=128,
+        index_topk=2048,
+        index_init_tokens=0,
+        index_local_tokens=0,
+    )
+    attention = AscendDSAAttention(
+        config=config,
+        mapping=Mapping(rank=0, world_size=8, attn_tp_size=8, attn_kvp_size=8),
+        hidden_size=2048,
+        num_heads=32,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        q_lora_rank=768,
+        kv_lora_rank=512,
+        layer_id=0,
+        lora_norm_eps=1e-6,
+        prefill_enabled=False,
+        decode_enabled=True,
+    ).bfloat16()
+    attention.indexer.weights_proj.float()
+    with torch.no_grad():
+        for parameter in attention.parameters():
+            parameter.zero_()
+    attention.process_weights_after_loading()
+    projection = decode.AscendDSATPKVPProjection(
+        attention, rank=0, group=None, eps_q=1e-6, eps_kv=1e-6, outputs={}
+    )
+    assert projection.rotary_mode == 0
+    assert projection.rotary_emb is None and projection.cos_sin is None
+    torch.testing.assert_close(projection.w_vc, attention.w_vc, atol=0, rtol=0)
+    torch.testing.assert_close(projection.w_o, attention.o_proj.weight, atol=0, rtol=0)

@@ -31,6 +31,7 @@ from torch.nn import functional as F
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
+from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
     DSA_DECODE_ROWS,
 )
@@ -42,6 +43,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy
 from tokenspeed.runtime.models.deepseek_v3 import (
     _prepare_mla_kv_b_proj_weights,
 )
@@ -124,6 +126,7 @@ class AscendDSAAttention(nn.Module):
         *,
         lora_norm_eps: float,
         prefill_enabled: bool,
+        decode_enabled: bool | None = None,
     ) -> None:
         if config.index_n_heads not in (16, 32):
             raise NotImplementedError("Ascend DSA supports only Indexer16/32")
@@ -155,16 +158,18 @@ class AscendDSAAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank, self.kv_lora_rank = q_lora_rank, kv_lora_rank
         self.num_heads = num_heads
-        # Prefill partitions query rows and KV pages, not projection weights.
-        # Its host Mapping still describes the QCP/KVP communication group.
-        self.head_tp_size = 1 if prefill_enabled else mapping.attn.head_tp_size
-        self.head_tp_rank = 0 if prefill_enabled else mapping.attn.head_tp_rank
-        self.head_tp_group = None if prefill_enabled else mapping.attn.head_tp_group
-        if (
-            not prefill_enabled
-            and mapping.attn.kvp_size == 1
-            and self.head_tp_size != 1
-        ):
+        # Earlier callers select only Prefill capability. Their full projections
+        # also serve local (KVP1) Decode. Sharded Decode must be requested on
+        # replicas that serve both phases.
+        if decode_enabled is None:
+            decode_enabled = not prefill_enabled or mapping.attn.kvp_size == 1
+        use_decode_shards = not prefill_enabled or (
+            decode_enabled and mapping.attn.kvp_size > 1
+        )
+        self.head_tp_size = mapping.attn.head_tp_size if use_decode_shards else 1
+        self.head_tp_rank = mapping.attn.head_tp_rank if use_decode_shards else 0
+        self.head_tp_group = mapping.attn.head_tp_group if use_decode_shards else None
+        if decode_enabled and mapping.attn.kvp_size == 1 and self.head_tp_size != 1:
             raise ValueError("Local DSA Decode requires TP1/KVP1 projections")
         if num_heads % self.head_tp_size:
             raise ValueError(
@@ -247,6 +252,8 @@ class AscendDSAAttention(nn.Module):
         self._scales_prepared = False
         self._fused_tp_kvp_decode_runtime = None
         self.prefill_enabled = prefill_enabled
+        self.decode_enabled = decode_enabled
+        self._prefill_weights: tuple[torch.Tensor, ...] | None = None
 
     def configure_fused_tp_kvp_decode(self, runtime) -> None:
         """Attach prepared weights and communication state outside forward."""
@@ -265,19 +272,28 @@ class AscendDSAAttention(nn.Module):
         if not self._scales_prepared:
             self._prepare_lora_scales()
             self._scales_prepared = True
-            self.w_kc, self.w_vc = _prepare_mla_kv_b_proj_weights(
-                self.kv_b_proj.weight, self
-            )
 
-        if self.prefill_enabled and (
-            self.q_b_proj.tp_size != 1
-            or self.kv_b_proj.tp_size != 1
-            or self.o_proj.tp_size != 1
-            or self.num_local_heads != self.num_heads
-        ):
-            raise ValueError(
-                "Token-local DSA Prefill requires complete TP1 projections"
+        self.w_kc, self.w_vc = _prepare_mla_kv_b_proj_weights(
+            self.kv_b_proj.weight, self
+        )
+        if not self.prefill_enabled:
+            return
+
+        local = (self.q_b_proj.weight, self.w_kc, self.w_vc, self.o_proj.weight)
+        if self.head_tp_size == 1:
+            # Keep the original absorbed strides and avoid redundant copies.
+            self._prefill_weights = local
+            return
+
+        # QB, KC and VC are partitioned by head; O is partitioned by input.
+        # Reuse each prepared buffer when the model reloads its coefficients.
+        previous = self._prefill_weights or (None, None, None, None)
+        self._prefill_weights = tuple(
+            bind_or_copy(
+                buffer, all_gather(weight.contiguous(), self.head_tp_group, dim)
             )
+            for buffer, weight, dim in zip(previous, local, (0, 0, 0, 1), strict=True)
+        )
 
     def _forward_fused_tp_kvp_decode(self, positions, hidden_states, ctx, comm_manager):
         packed_query, index_query, index_weights = (
@@ -306,14 +322,9 @@ class AscendDSAAttention(nn.Module):
         return self._fused_tp_kvp_decode_runtime.output_projection(out)
 
     def _forward_prefill(self, positions, hidden, ctx):
-        if self.w_kc is None:
+        if self._prefill_weights is None:
             raise RuntimeError("Prepare token-local DSA Prefill weights before forward")
-        qb, kc, vc, wo = (
-            self.q_b_proj.weight,
-            self.w_kc,
-            self.w_vc,
-            self.o_proj.weight,
-        )
+        qb, kc, vc, wo = self._prefill_weights
         indexer = self.indexer
         if hidden.shape[0]:
             q_lora = self.q_a_layernorm(self.q_a_proj(hidden)[0])
@@ -378,10 +389,9 @@ class AscendDSAAttention(nn.Module):
                     "DSA Prefill weights were disabled for this decode-only model"
                 )
             return self._forward_prefill(positions, hidden_states, ctx)
-        if self.prefill_enabled and self.mapping.attn.kvp_size > 1:
-            raise ValueError(
-                "Full-weight QCP Prefill requires a separate Decode replica; "
-                "construct TP/KVP Decode with prefill_enabled=False"
+        if not self.decode_enabled:
+            raise RuntimeError(
+                "DSA Decode weights were disabled for this Prefill-only model"
             )
         if hidden_states.shape[0] == 0:
             return hidden_states

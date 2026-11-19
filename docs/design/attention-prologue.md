@@ -464,8 +464,7 @@ interfaces. Stream order protects reuse after the final attention consumer;
 `finish` drops layer references without freeing storage. Warmup may hand over
 to the serving stream after the executor's synchronization. Rebind or teardown
 synchronizes queued consumers before dropping the workspace's tensor references.
-Prefill weight preparation and graph behavior remain unchanged. Decode keeps
-its numerical and causal contracts; its model runtime shares the fused prologue
+The Decode model runtime shares the fused prologue
 producer buffers across sequential layers and selects projection computations
 through the attention registry. The DSA module constructs its checkpoint
 projections and absorbed attention directly; it does not construct then discard
@@ -532,12 +531,14 @@ in `attention/backends/paged/ascend_dsa_tp_kvp_decode.py`. Native resource
 release remains explicit after graph teardown; PyTorch buffers follow owner
 lifetime and are reused across layers.
 
-Token-local Prefill loads complete projection weights directly. The existing
-host mapping still describes KV ownership and query groups. A Prefill replica
-using full projections must not execute head-sharded Decode; construct the
-separate TP/KVP Decode replica with Prefill disabled. Local Decode requires TP1.
-With KVP1, a TP4 Prefill group replicates KV on each rank. The local Decode
-TP1 requirement applies when a Decode forward is requested.
+Token-local Prefill uses complete projections for each rank's query rows.
+A Prefill-only replica loads these weights directly. A unified replica serving
+TP/KVP Decode keeps the local Decode weights and gathers the Prefill views
+after each weight load. It gathers QB, KC and VC along the head dimension
+and O along its input dimension. Later loads refresh the same buffers for graph
+replay. A Decode-only replica needs only the local weights. Local KVP1 Decode
+requires TP1 projections. With KVP1, a TP4 Prefill group replicates KV on
+each rank.
 
 NoPE native DSA Decode writes the prepared latent directly with `latent_store`;
 its Q is already complete. Prefill defers the owner-local KV write to the shared

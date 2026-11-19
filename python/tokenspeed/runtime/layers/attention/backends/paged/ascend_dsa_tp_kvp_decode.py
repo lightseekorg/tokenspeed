@@ -298,7 +298,7 @@ class AscendDSATPKVPProjection:
         self.w_vc = layer.w_vc.detach().contiguous()
         self.w_o = layer.o_proj.weight.detach().contiguous()
         self.rotary_mode = int(layer.rotary_emb is not None) | (
-            int(layer.indexer.use_rotary) << 1
+            int(layer.indexer.rotary_emb is not None) << 1
         )
         self.rotary_emb = (
             layer.rotary_emb
