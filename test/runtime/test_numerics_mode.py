@@ -34,6 +34,52 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class TestNumericsMode:
+    @pytest.mark.parametrize(
+        "numerics,backend", [("rl-bitwise", "greedy"), ("auto", "ascend_full")]
+    )
+    def test_ascend_default_sampling_backend(self, monkeypatch, numerics, backend):
+        from dataclasses import replace
+
+        from tokenspeed_kernel.platform import current_platform
+
+        from tokenspeed.runtime.utils import server_args
+
+        args = ServerArgs(model="x")
+        platform = replace(current_platform(), vendor="ascend")
+        monkeypatch.setattr(server_args, "current_platform", lambda: platform)
+        args.sampling_backend = None
+        args.numerics = numerics
+        args.resolve_kernel_backends()
+        assert args.sampling_backend == backend
+
+    def test_model_owned_projections_load_weights_and_support_lookup(self, monkeypatch):
+        import torch
+
+        from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+        from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+            UnquantizedEmbeddingMethod,
+        )
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+        monkeypatch.setitem(
+            global_server_args_dict, "model_owns_dense_projections", True
+        )
+        indices = torch.tensor([2, 0])
+        for method in (UnquantizedEmbeddingMethod(), UnquantizedLinearMethod()):
+            layer = torch.nn.Module()
+            method.create_weights(layer, 2, [4], 2, 4, torch.bfloat16)
+            with torch.no_grad():
+                layer.weight.copy_(torch.arange(8).view(4, 2))
+            if isinstance(method, UnquantizedEmbeddingMethod):
+                assert torch.equal(
+                    method.embedding(layer, indices), layer.weight[indices]
+                )
+            else:
+                method.process_weights_after_loading(layer)
+            with pytest.raises(RuntimeError, match="model owns"):
+                method.apply(layer, torch.ones(1, 2, dtype=torch.bfloat16))
+
     def test_moe_cutlass_fused_finalize_defaults_on(self):
         from tokenspeed.runtime.utils.server_args import prepare_server_args
 

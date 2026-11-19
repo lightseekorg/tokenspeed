@@ -832,6 +832,11 @@ class ServerArgs:
     # Megatron's vocab-parallel cross-entropy over fixed 32768-wide vocab
     # blocks. Changes the reported logprobs only, never the sampled tokens.
     logprob_order: str = "torch"
+    # A model profile may require a particular in-block reduction tree.
+    block_sumexp_solution: str | None = dataclasses.field(default=None, init=False)
+    # Some model profiles use Linear and embedding modules only as weight
+    # owners and bind every projection in their own numerical path.
+    model_owns_dense_projections: bool = dataclasses.field(default=False, init=False)
     # How a token's routed-expert contributions meet across the MoE TP-EP
     # group: per-rank partials summed by the host (rank), or folded in fp32
     # slot order inside the MoE leaf as the trainer does (slot).
@@ -1377,7 +1382,10 @@ class ServerArgs:
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
-                self.sampling_backend = "ascend_full"
+                # Greedy is the Ascend backend with canonical ties under RL numerics.
+                self.sampling_backend = (
+                    "greedy" if self.numerics == "rl-bitwise" else "ascend_full"
+                )
             else:
                 self.sampling_backend = "greedy"
 

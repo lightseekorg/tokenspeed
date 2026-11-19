@@ -76,6 +76,16 @@ def test_gather_rejects_unknown_order(order):
         gather_token_logprobs(logits, tokens, logprob_order=order)
 
 
+def test_blockwise_gather_requires_the_launchs_selected_reduction(monkeypatch):
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    monkeypatch.setitem(global_server_args_dict, "block_sumexp_solution", "absent")
+    with pytest.raises(NoKernelFoundError, match="absent"):
+        gather_token_logprobs(
+            _logits(1), torch.tensor([5]), logprob_order="blockwise-direct"
+        )
+
+
 @pytest.mark.parametrize("order,block,form", ORDER_CASES)
 def test_gather_dispatches_on_the_order(order, block, form):
     logits = _logits(3)
