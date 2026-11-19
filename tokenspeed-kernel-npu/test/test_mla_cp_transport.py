@@ -83,8 +83,8 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             current_capacity=4096 if degree == 2 else 2048,
             null_rows=128,
             history_capacity=8192,
-            degree=1,
-            has_index=True,
+            degree=degree,
+            has_index=has_index,
         )
         local_rows = 4096 if degree == 2 else 2048
         cache = torch.empty((local_rows, 576), dtype=torch.bfloat16, device="npu")
