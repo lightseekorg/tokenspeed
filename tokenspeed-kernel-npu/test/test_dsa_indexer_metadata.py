@@ -25,9 +25,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    _AscendDSAContextParallel,
-)
+from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPMetadata
 
 
 @pytest.mark.parametrize("rank", range(8))
@@ -37,7 +35,7 @@ def test_grouped_metadata_graph_reads_changed_and_restored_causal_ends(rank):
     table = torch.tensor(pages, dtype=torch.int32, device="npu").repeat_interleave(8, 0)
     lengths = torch.arange(1017, 1025, dtype=torch.int32, device="npu").repeat(2)
     q_ends = torch.arange(1, 17, dtype=torch.int32, device="npu")
-    dcp = _AscendDSAContextParallel(
+    dcp = AscendDCPMetadata(
         degree=8,
         rank=rank,
         ranks=tuple(range(8)),
@@ -195,7 +193,7 @@ def test_fused_dsa_cp_metadata_exact_replay(
         raw[-1] = 2**60
     slots = raw.npu()
     rows = batch * width
-    dcp = _AscendDSAContextParallel(
+    dcp = AscendDCPMetadata(
         degree=degree,
         rank=rank,
         ranks=tuple(range(degree)),
@@ -284,7 +282,7 @@ def test_metadata_temporaries_survive_foreign_stream_allocator_reuse():
         window=129,
         capacity=17,
     )
-    dcp = _AscendDSAContextParallel(
+    dcp = AscendDCPMetadata(
         degree=8, rank=0, ranks=tuple(range(8)), virtual_block_count=17
     )
     dcp.allocate_decode_buffers(8, 513, "npu")

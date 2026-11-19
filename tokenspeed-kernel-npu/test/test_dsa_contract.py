@@ -20,6 +20,10 @@
 
 """CPU tensor contracts at the Ascend DSA native operator boundary."""
 
+import os
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -32,6 +36,40 @@ _CP_OPERATORS = (
     "npu_dcp_merge_topk",
     "npu_dsa_merge_lse_direct",
 )
+
+
+def test_provider_registers_flash_operators_in_a_fresh_process():
+    env = os.environ.copy()
+    env.pop("TOKENSPEED_LONGCAT_DSA_LIBRARY", None)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels\n"
+            "kernels = AscendDSAKernels()\n"
+            "assert callable(kernels._attention) and callable(kernels._index)",
+        ],
+        env=env,
+        check=True,
+    )
+
+
+def test_provider_reports_missing_default_library(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_LONGCAT_DSA_LIBRARY", raising=False)
+    monkeypatch.setitem(sys.modules, "flash_ops", None)
+    with pytest.raises(
+        RuntimeError, match="flash_ops or TOKENSPEED_LONGCAT_DSA_LIBRARY"
+    ):
+        AscendDSAKernels()
+
+
+def test_provider_accepts_explicit_library_without_default_import(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_LONGCAT_DSA_LIBRARY", "override.so")
+    monkeypatch.setitem(sys.modules, "flash_ops", None)
+    loaded = []
+    monkeypatch.setattr(torch.ops, "load_library", loaded.append)
+    AscendDSAKernels()
+    assert loaded == ["override.so"]
 
 
 @pytest.fixture(autouse=True)

@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(
-    est_time=60,
+    est_time=120,
     suite="runtime-2gpu",
     disabled_on_runners=["amd-*"],
     disabled_on_runners_reason="Muse Spark owns rows over NCCL on NVIDIA only",
@@ -93,11 +93,86 @@ def _worker(rank: int, port: int, world_size: int) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-def test_nccl_owned_rows_split_and_restore_padded_rows(world_size) -> None:
+def _gather_mm_worker(rank: int, port: int, world_size: int) -> None:
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.models.muse_spark import _CopyEngineRows, _NcclOwnedRows
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        group = tuple(range(world_size))
+        process_group_manager.init_process_group(group)
+        set_global_backend(AutoBackend())
+        device = torch.device("cuda", rank)
+        width, columns = 256, 64
+        owned = _NcclOwnedRows(group)
+        owned.copy_engine = _CopyEngineRows(group, owned.local_rows(8192), width)
+
+        def operands(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+            # Small integers multiply and sum exactly, so any GEMM order agrees.
+            generator = torch.Generator().manual_seed(seed)
+            weight = torch.randint(-4, 5, (columns, width), generator=generator)
+            local = torch.randint(
+                -4, 5, (world_size, owned.local_rows(rows), width), generator=generator
+            )[rank]
+            return (
+                local.to(device=device, dtype=torch.bfloat16),
+                weight.to(device=device, dtype=torch.bfloat16),
+            )
+
+        # Odd row counts leave the last rank's padding out of the product.
+        for seed, rows in enumerate((4097, 8192, 4099)):
+            local, weight = operands(rows, seed)
+            expected = mm(owned.all_gather_owned_rows(local, rows), weight)
+            torch.testing.assert_close(
+                owned.all_gather_mm(local, rows, weight), expected, atol=0, rtol=0
+            )
+
+        # A captured pair of gathers replays both parities on new rows.
+        rows = 4097
+        first, weight = operands(rows, 10)
+        second, _ = operands(rows, 11)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = (
+                owned.all_gather_mm(first, rows, weight),
+                owned.all_gather_mm(second, rows, weight),
+            )
+        first.copy_(operands(rows, 12)[0])
+        second.copy_(operands(rows, 13)[0])
+        graph.replay()
+        for local, output in zip((first, second), outputs):
+            expected = mm(owned.all_gather_owned_rows(local, rows), weight)
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def _spawn(worker, world_size: int) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} GPUs")
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_worker, args=(port, world_size), nprocs=world_size, join=True)
+    mp.spawn(worker, args=(port, world_size), nprocs=world_size, join=True)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_nccl_owned_rows_split_and_restore_padded_rows(world_size) -> None:
+    _spawn(_worker, world_size)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_copy_engine_gather_projects_like_the_nccl_gather(world_size) -> None:
+    _spawn(_gather_mm_worker, world_size)

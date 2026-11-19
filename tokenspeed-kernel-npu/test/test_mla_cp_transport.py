@@ -28,7 +28,10 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
-from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
+)
+from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
 from tokenspeed.runtime.execution.workspace import workspace_pool
 
@@ -68,18 +71,20 @@ class PrefillMetadata:
 
 def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
     """Uneven/empty owners, shared pages, both planes and mapped commits."""
-    from tokenspeed.runtime.layers.attention.dcp.ascend import (
-        AscendPrefillOptions,
-        AscendPrefillPlan,
+    from tokenspeed.runtime.layers.attention.ascend_qcp_prefill import (
+        AscendQCPPrefill,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
     results = []
     runtimes = []
     for has_index in (False, True):
-        capacity = AscendPrefillOptions(
-            4096 if degree == 2 else 2048,
-            kv_page_size=128,
+        capacity = AscendQCPPrefillWorkspaceLayout(
+            current_capacity=4096 if degree == 2 else 2048,
+            null_rows=128,
+            history_capacity=8192,
+            degree=degree,
+            has_index=has_index,
         )
         local_rows = 4096 if degree == 2 else 2048
         cache = torch.empty((local_rows, 576), dtype=torch.bfloat16, device="npu")
@@ -88,16 +93,15 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             if has_index
             else None
         )
-        runtime = AscendDSAPrefill(
+        runtime = AscendQCPPrefillTransport(
             cache,
             index,
             ranks=ranks,
             history_group=groups[int(has_index)],
-            max_current_rows=capacity.max_current_rows,
-            history_null_rows=capacity.kv_page_size,
+            layout=capacity,
         )
         runtimes.append(runtime)
-        assert runtime.workspace_bytes == 0
+        assert runtime.workspace_bytes == runtime.layout.nbytes
         pending = []
         for case in range(17 if degree == 2 else 16):
             page = (64, 128)[case % 2]
@@ -135,29 +139,28 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             lengths = torch.tensor(extends)
             past = torch.tensor(prefixes)
             placement = CachePlacement(128, degree * 31 + 1, ranks, rank)
-            kwargs = {
-                "degree": degree,
-                "rank": rank,
-                "page_size": page,
-                "topk": 1,
-                "local_cache_pages": local_rows // page,
-                "options": capacity,
-                "query_partition": (0, rows),
-            }
-            cpu_plan = AscendPrefillPlan.build(
-                PrefillMetadata(lengths, past, table), placement, **kwargs
+            cpu_plan = AscendQCPPrefill(
+                layout=capacity, page_size=page, topk=1, runtime=runtime
+            )
+            cpu_plan.prepare_batch_metadata(
+                PrefillMetadata(lengths, past, table),
+                placement,
+                page_table_cpu=table,
+                query_partition=(0, rows),
             )
             if case == 16:
-                assert cpu_plan.gather.row_counts == (10 * page, 20 * page)
-            plan = AscendPrefillPlan.build(
+                assert cpu_plan.history_counts == (10 * page, 20 * page)
+            plan = AscendQCPPrefill(
+                layout=capacity, page_size=page, topk=1, runtime=runtime
+            )
+            plan.prepare_batch_metadata(
                 PrefillMetadata(lengths, past, table.npu()),
                 placement,
                 page_table_cpu=table,
-                **kwargs,
+                query_partition=(0, rows),
             )
             for name in (
                 "page_table",
-                "index_table",
                 "query_cu",
                 "key_cu",
                 "query_seq",
@@ -188,56 +191,27 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                     )
                 ]
             )
-            runtime.prefetch(
-                case,
-                cache.unsqueeze(1),
-                None if index is None else index.unsqueeze(1),
-                batch_key=plan,
-                total_rows=rows,
-                has_history=any(prefixes),
-                history_slots=plan.gather.send_slots,
-                history_counts=plan.gather.row_counts,
+            kv, index_k = plan.prepare_layer_kv(
+                cache,
+                index,
+                values[begin:end].contiguous().npu(),
+                values[begin:end, :128].contiguous().npu() if has_index else None,
+                slots.to(device="npu", dtype=torch.int32),
             )
-            runtime.prefetch(
-                case,
-                cache.unsqueeze(1),
-                None if index is None else index.unsqueeze(1),
-                batch_key=plan,
-                total_rows=rows,
-                has_history=any(prefixes),
-                history_slots=plan.gather.send_slots,
-                history_counts=plan.gather.row_counts,
-            )
-            planes = [(576, runtime.kv, cache)]
+            planes = [(576, kv, cache)]
             if has_index:
-                planes.insert(0, (128, runtime.index, index))
+                planes.insert(0, (128, index_k, index))
             expected_cache = histories[rank].clone()
             for token, slot in enumerate(slots.tolist()):
                 block, offset = divmod(slot, 128)
                 if (block - 1) % degree == rank:
                     local = ((block - 1) // degree + 1) * 128 + offset
                     expected_cache[local] = values[token]
-            for width, _, _ in planes:
-                runtime.gather_current(
-                    case,
-                    values[begin:end, :width].contiguous().npu(),
-                    width=width,
-                    total_rows=rows,
-                )
-            commit_slots = torch.empty(rows, dtype=torch.int64, device="npu")
             for width, receive, owner_cache in planes:
-                plan.patch(
-                    runtime,
-                    case,
-                    slots.to(device="npu", dtype=torch.int32),
-                    slots_workspace=commit_slots,
-                    width=width,
-                    block_rows=128,
-                    virtual_blocks=degree * 31 + 1,
-                )
                 # Every logical row must resolve to the original prefix or its
                 # current producer. Shared prefix pages are transported once.
                 offset = 0
+                active_req = 0
                 for req, (prefix, extent) in enumerate(
                     zip(prefixes, extends, strict=True)
                 ):
@@ -251,7 +225,8 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                         local = ((block - 1) // degree + 1) * 128 + tail
                         expected.append(histories[owner][local, :width])
                     expected.extend(values[offset : offset + extent, :width])
-                    mapped = cpu_plan.page_table[req]
+                    mapped = cpu_plan.page_table[active_req]
+                    active_req += 1
                     positions = torch.arange(prefix + extent)
                     locations = (
                         mapped[positions // page].long() * page + positions % page
@@ -263,9 +238,8 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                 pending.append(
                     (owner_cache.clone(), expected_cache[:, :width].contiguous())
                 )
-            runtime.finish(case)
-            assert runtime.workspace_bytes == 0
-            del planes, receive, commit_slots
+            assert runtime.workspace_bytes == runtime.layout.nbytes
+            del planes, receive
             # Force scratch reuse while native operations may remain queued.
             scratch_pool.allocate(((rows,), torch.int64))[0].fill_(-1)
             results.append(
@@ -273,14 +247,12 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                     "case": case,
                     "page_size": page,
                     "index_plane": has_index,
-                    "owner_counts": plan.gather.row_counts,
+                    "owner_counts": plan.history_counts,
                     "rows": rows,
                 }
             )
         for actual, expected in pending:
             exact(actual, expected)
-    for runtime in runtimes:
-        runtime.close()
     return results
 
 
