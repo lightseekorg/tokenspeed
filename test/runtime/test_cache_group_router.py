@@ -7,8 +7,11 @@ check the fused triton fills against the same torch reference.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import sys
+import textwrap
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1804,7 +1807,32 @@ class TestCacheGroupRouterRebindTest:
 class TestPagedLeafRebindTest:
     """Rebinding drops forward/graph views, including state owned by a base class."""
 
+    def _optional_slots(self, backend_cls):
+        slots = set()
+        for owner in backend_cls.__mro__:
+            # Common paged state has separate rebind coverage above. Include
+            # intermediate owners such as MLAMetadataBackend in the leaf check.
+            if owner is PagedAttentionBackend:
+                break
+            init = owner.__dict__.get("__init__")
+            if init is None:
+                continue
+            tree = ast.parse(textwrap.dedent(inspect.getsource(init)))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Attribute)
+                    and isinstance(node.target.value, ast.Name)
+                    and node.target.value.id == "self"
+                    and ast.unparse(node.annotation).endswith("| None")
+                ):
+                    slots.add(node.target.attr)
+        return slots
+
     def _check(self, backend_cls, expected, **publish_reads):
+        slots = self._optional_slots(backend_cls)
+        assert slots
+        assert sorted(slots) == sorted(expected)
         leaf = backend_cls.__new__(backend_cls)
         leaf._init_pool_binding()
         leaf.cache_pool = object()
