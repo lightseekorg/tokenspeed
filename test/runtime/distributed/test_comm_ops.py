@@ -33,7 +33,7 @@ class TestAutoBackendTopology:
             "mapping",
             SimpleNamespace(nprocs_per_node=4),
         )
-        backend = AutoBackend.__new__(AutoBackend)
+        backend = AutoBackend()
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._iris = Mock()

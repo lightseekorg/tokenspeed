@@ -505,6 +505,29 @@ def prepare_all_reduce_buffers(
     )
 
 
+def prepare_all_reduce_runtime(
+    groups: tuple[Group, ...],
+    dtype: torch.dtype,
+    backend: CommBackend | None,
+) -> bool:
+    """Prepare ordinary reductions before profiling memory or capturing graphs.
+
+    Args:
+        groups: Shared device groups in collective preparation order.
+        dtype: Model activation dtype.
+        backend: Backend to prepare, or None for the configured global backend.
+
+    Returns:
+        Whether any group has a prepared ordinary all-reduce implementation.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    prepared = False
+    for group in groups:
+        prepared = backend.prepare_all_reduce_runtime(group, dtype) or prepared
+    return prepared
+
+
 def prepare_all_reduce_fusion(
     group: Group,
     hidden_dim: int,

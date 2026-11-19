@@ -251,6 +251,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         device.build_device_side(
             server_args=args,
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 context_len=4096,
                 is_multimodal_active=False,
                 dsa_padded_prefill_replay=declares_padded_replay,
