@@ -1642,6 +1642,20 @@ def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
     assert long_k["block_n"] == short_k["block_n"] == 128
 
 
+def test_gfx1250_quantizing_route_takes_one_launch_by_row_count() -> None:
+    def one_launch(tokens: int, topk: int) -> bool:
+        ids = torch.empty((tokens, topk), dtype=torch.int32)
+        return gfx1250_fused._uses_quantizing_small_route(ids, 896)
+
+    assert one_launch(1, 16) and one_launch(512, 16)
+    # Just past 8192 rows the route's programs do twice the work for the same
+    # rows, so that stretch stays on the staged route.
+    assert not one_launch(513, 16) and not one_launch(767, 16)
+    assert one_launch(768, 16) and one_launch(1024, 16)
+    assert not one_launch(1025, 16)
+    assert one_launch(1024, 8) and not one_launch(1025, 8)
+
+
 def _sparse_decode_moe_case(num_tokens: int):
     """Decode MoE inputs where most experts are idle, leaving padded blocks."""
     generator = torch.Generator(device="cuda").manual_seed(20261012 + num_tokens)

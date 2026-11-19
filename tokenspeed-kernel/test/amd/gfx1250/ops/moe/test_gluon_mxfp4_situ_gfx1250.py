@@ -401,7 +401,7 @@ def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
 
 
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
-@pytest.mark.parametrize("num_tokens", [4, 64])
+@pytest.mark.parametrize("num_tokens", [4, 64, 512, 1024])
 def test_gfx1250_small_route_fp8_quantize_matches_standalone(
     num_tokens: int, scaled: bool
 ) -> None:
