@@ -1391,7 +1391,7 @@ def test_gfx1250_gate_up_mxfp4_output_matches_quantized_fp32(
         **(
             decode_tile_config(hidden_size)
             if decode
-            else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_TILES
+            else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
         ),
     )
     w13 = module.w13_weight_triton_tensor
