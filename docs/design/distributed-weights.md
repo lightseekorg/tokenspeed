@@ -18,7 +18,8 @@ The selected kernel preprocessor returns a `PreparedExpertWeights` manifest:
 a layout identity, processed expert-major tensors, and an explicit distinction
 between streamed weights and small per-expert constants. Non-expert state stays
 on the layer. In particular, the loader must preserve the existing layer-wide
-input-scale maximum across all logical experts.
+input-scale maximum across all logical experts. MXFP4 experts store no input
+scale; the kernel quantizes their activations on each forward.
 
 A model-owned `MoEPeerWeights` publishes each processed layer immediately and
 rebinds its parameters to immutable owned storage. Old processed allocations do
@@ -57,11 +58,13 @@ Host run-ahead is allowed. Only startup and collective teardown coordinate with
 other weight owners, over a dedicated named process group; ordinary prefetch,
 acquire and release do not.
 
-A prefetch submits one batch of copy-engine copies on the store's copy stream.
-The batch splits each peer's bytes into chunks of 8 MB divided by the number
+A prefetch submits a layer's copy-engine copies on the store's copy stream.
+The schedule splits each peer's bytes into chunks of 8 MB divided by the number
 of owners and takes one chunk from every peer per round, in a fixed per-rank
 random order. Submitting a layer's tens of thousands of copies blocks while
-the copy stream's queue is full, so a worker thread submits it. The reader
+the copy stream's queue is full, so a worker thread submits them, in batches of
+4,096 copies: the driver may hold a batch's copies until its submission returns,
+and with several batches the first ones copy while the rest are submitted. The reader
 waits on the host until the worker has enqueued the ready write, then enqueues
 its flag wait.
 
@@ -84,7 +87,8 @@ unmapping source storage. A model exposing peer weights implements
 
 ## Initial supported configuration
 
-The initial integration supports K3 NVFP4 SiTU on a fabric-connected NVIDIA
+The initial integration supports K3 NVFP4 and MXFP4 SiTU experts through the
+FlashInfer TRT-LLM kernels on a fabric-connected NVIDIA
 prefill instance with local execution groups and a fixed token budget. Model
 CUDA graphs are disabled; kernel tuning and graph consumers can use stable
 weight views with acquisition/release outside capture. Unsupported model,
