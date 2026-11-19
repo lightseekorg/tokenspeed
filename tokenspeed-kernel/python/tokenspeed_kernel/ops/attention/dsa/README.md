@@ -157,11 +157,16 @@ row. That is bit for bit `cuda_dsa_merge_candidates`' selection compacted to
 the rank's slots, without exchanging positions; `triton_dsa_merge_candidates`
 selects the same candidates in score order. A score plane reads an invalid
 candidate off its score, so `scores_out` holds -inf for every -1 offset.
-Only gfx950 registers it, as one launch over the gathered planes:
-`dsa_select_owned_candidates_supported` accepts a power-of-two rank count, a
-power-of-two topk of at least 512, at most 16384 gathered scores per row and
-rank chunks within 32-bit offsets, and refuses other platforms. A KVP decode
-whose sizes it refuses merges the candidates instead.
+gfx950 and SM100/SM103 register it for a topk of 512, 1024, or 2048, each as
+one launch over the gathered planes. gfx950's leaf accepts a power-of-two rank
+count, at most 16384 gathered scores per row, and rank chunks within 32-bit
+offsets. `cute_dsl_dsa_select_owned_candidates` runs one 1024-thread CTA per
+row: the row's scores stay in registers, three radix digits of 11, 11, and 10
+bits over a shared-memory histogram find the k-th largest score, and two block
+scans keep the rank's candidates in candidate order. It accepts two or more
+power-of-two ranks and at most 32768 gathered scores per row.
+`dsa_select_owned_candidates_supported` refuses other sizes and platforms; a
+KVP decode whose sizes it refuses merges the candidates instead.
 
 ## Materialized Triton row top-k
 
@@ -215,7 +220,7 @@ never convert a plane:
 
 | dtype | `index_k_format` | `index_k_layout` | row |
 | --- | --- | --- | --- |
-| `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one fp32 scale per 128 elements |
+| `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one four-byte scale word per 128 elements |
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
@@ -224,7 +229,12 @@ and its scale view must preserve the plane's storage offset. The packed FP8
 row above is the plane's tensor shape; in memory each page stores the key
 bytes of all its slots first, then their FP32 scales.
 
-The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes. A
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes.
+The four-byte scale word is the fp32 scale on sm90 and, on Blackwell, that
+scale rounded up to a power of two as four equal UE8M0 bytes
+(`kvcache/index_k_scale.py`): DeepGEMM 2.8.2's sm100 MQA logits read it as
+the MX scales of the row's four 32-element groups, and every Blackwell
+writer and reader of the plane uses that encoding. A
 leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
 and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else.
 A leaf that must reproduce an RL trainer's selection order also declares the

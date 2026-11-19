@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused BF16/block-FP8 DP column and row projections on GB300, and the fused
-paged-row all-gather on SM100 and SM103."""
+"""CuTe DSL projection and communication kernels for NVIDIA Blackwell."""
 
 import logging
 from typing import TYPE_CHECKING
@@ -46,6 +45,9 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection import (
         FusedTPProjectionState,
     )
+    from tokenspeed_kernel.ops.communication._cute_dsl.ll_exchange import (
+        LLExchangeState,
+    )
     from tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather import (
         PagedRowAllGatherState,
     )
@@ -57,6 +59,8 @@ cute_dsl_fused_fp8_dp_row_linear = error_fn
 cute_dsl_fused_bf16_dp_column_linear = error_fn
 cute_dsl_fused_bf16_dp_row_linear = error_fn
 cute_dsl_paged_row_all_gather = error_fn
+cute_dsl_ll_all_gather = error_fn
+cute_dsl_ll_all_to_all = error_fn
 
 # The paged-row all-gather's modes, in the order a mode code numbers them.
 _PAGED_ROW_ALL_GATHER_MODES = ("multicast", "peer")
@@ -79,11 +83,11 @@ def create_fused_tp_column_projection_state(
     """Allocate and compile column-projection state before graph capture.
 
     Args:
-        group: Two, four, or eight node-local peers, in output-shard order.
-        device: This peer's GB300 CUDA device.
+        group: Two, four, or eight NVLink-connected peers, in output-shard order.
+        device: This peer's SM100 or SM103 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by 128.
-        output_size: Padded output width, divisible by group size times 128.
+        output_size: Padded output width, divisible by group size times tile alignment.
         weight_dtype: BF16 or E4M3 weights; fixes the prepared GEMM variant.
 
     Returns:
@@ -118,11 +122,11 @@ def create_fused_tp_row_projection_state(
     """Collectively allocate and compile a workspace before graph capture.
 
     Args:
-        group: Two or four node-local peers, in input-shard order.
-        device: This peer's GB300 CUDA device.
+        group: Two or four NVLink-connected peers, in input-shard order.
+        device: This peer's SM100 or SM103 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by group size times 128.
-        output_size: Padded output width, divisible by group size times 128.
+        output_size: Padded output width, divisible by group size times tile alignment.
         weight_dtype: BF16 or E4M3 weights; fixes the prepared GEMM variant.
 
     Returns:
@@ -158,7 +162,7 @@ def fused_tp_column_projection_supported(
     """Return whether the layout and device support fused column projection.
 
     Args:
-        group_size: Number of ranks in a node-local projection group.
+        group_size: Number of ranks in an NVLink-connected projection group.
         input_size: Full input channel count.
         output_size: Full padded output channel count.
         max_rows: Positive prepared capacity per owner.
@@ -168,30 +172,36 @@ def fused_tp_column_projection_supported(
 
     Returns:
         Whether this fixed schedule can be prepared. The caller must separately
-        agree on node locality and eligibility across the group.
+        agree on peer-memory reachability and eligibility across the group.
     """
-    return (
+    if not (
         current_platform().is_nvidia
         and device.type == "cuda"
-        and group_size in ((2, 4) if weight_dtype == torch.bfloat16 else (2, 4, 8))
-        and weight_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and group_size in (2, 4, 8)
+        and max_rows >= 1
+        and dtype == torch.bfloat16
+    ):
+        return False
+    if weight_dtype == torch.float8_e4m3fn:
+        return (
+            input_size >= 128
+            and input_size % 128 == 0
+            and output_size >= group_size * 128
+            and output_size % (group_size * 128) == 0
+            and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+        )
+    return (
+        weight_dtype == torch.bfloat16
+        and group_size in (2, 4)
         and input_size == 7168
         and (
             output_size
             in {
                 ((rows + group_size * 128 - 1) // (group_size * 128)) * group_size * 128
-                for rows in (
-                    (49376, 14400) if weight_dtype == torch.bfloat16 else (49376,)
-                )
+                for rows in (49376, 14400)
             }
-            or (
-                weight_dtype == torch.bfloat16
-                and group_size == 4
-                and output_size == 14592
-            )
+            or (group_size == 4 and output_size == 14592)
         )
-        and max_rows >= 1
-        and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) == (10, 3)
         and torch.cuda.get_device_properties(device).multi_processor_count == 152
     )
@@ -210,7 +220,7 @@ def fused_tp_row_projection_supported(
     """Return whether the static layout and device match the kernel constraints.
 
     Args:
-        group_size: Number of ranks in a node-local projection group.
+        group_size: Number of ranks in an NVLink-connected projection group.
         input_size: Full input channel count.
         output_size: Full padded output channel count.
         max_rows: Positive prepared capacity per owner.
@@ -220,17 +230,28 @@ def fused_tp_row_projection_supported(
 
     Returns:
         Whether this fixed schedule can be prepared. The caller must separately
-        agree on node locality and eligibility across the group.
+        agree on peer-memory reachability and eligibility across the group.
     """
-    return (
+    if not (
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4)
-        and weight_dtype in (torch.bfloat16, torch.float8_e4m3fn)
-        and input_size == 12288
-        and output_size == 7168
         and max_rows >= 1
         and dtype == torch.bfloat16
+    ):
+        return False
+    if weight_dtype == torch.float8_e4m3fn:
+        return (
+            input_size >= group_size * 128
+            and input_size % (group_size * 128) == 0
+            and output_size >= group_size * 128
+            and output_size % (group_size * 128) == 0
+            and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+        )
+    return (
+        weight_dtype == torch.bfloat16
+        and input_size == 12288
+        and output_size == 7168
         and torch.cuda.get_device_capability(device) == (10, 3)
         and torch.cuda.get_device_properties(device).multi_processor_count == 152
     )
@@ -372,6 +393,115 @@ def create_paged_row_all_gather_state(
     )
 
 
+def _check_ll_tensors(
+    state, input: torch.Tensor, out: torch.Tensor, gather: bool
+) -> None:
+    """Raise ValueError unless this state's LL exchange serves the operands.
+
+    ``input`` and ``out`` must be contiguous, 16-byte aligned payloads of the
+    sizes it serves.
+    """
+    payload = input.numel() * input.element_size()
+    if not gather:
+        payload //= state.ranks
+    if (
+        input.device != state.device
+        or out.device != state.device
+        or not input.is_contiguous()
+        or not out.is_contiguous()
+        or input.data_ptr() % 16
+        or out.data_ptr() % 16
+        or not state.serves(payload)
+        or (
+            not gather and payload * state.ranks != input.numel() * input.element_size()
+        )
+        or out.numel() * out.element_size() != payload * state.ranks
+    ):
+        raise ValueError("the LL exchange does not serve these tensors")
+
+
+def create_ll_exchange_state(
+    group: dist.ProcessGroup,
+    device: torch.device,
+    *,
+    cap_bytes: int,
+    timeout_ns: int,
+    eligible: bool,
+) -> "LLExchangeState | None":
+    """Collectively build the one-hop LL exchange for small payloads.
+
+    The state serves an all-gather and an all-to-all, or every rank agrees
+    that the group keeps its collectives.
+
+    Every rank of the group calls this at the same program point, before graph
+    capture and before the KV cache is sized. Every refusal is voted on before
+    any rank returns, so all ranks take the same branch.
+
+    Args:
+        group: CPU (gloo) process group over the 2, 4 or 8 ranks; the CUDA
+            symmetric-memory backend exchanges handles through its store.
+        device: This rank's CUDA device, with its index.
+        cap_bytes: Largest per-rank payload, a positive multiple of 16; equal
+            on every rank. The workspace holds ``4 * ranks * cap_bytes``.
+        timeout_ns: Bound of every in-kernel wait; a peer that does not reach
+            the same call within it fails the kernel with a trap.
+        eligible: The caller's own verdict for this rank, voted on with the
+            rest.
+
+    Returns:
+        A state serving ``cute_dsl_ll_all_gather`` and
+        ``cute_dsl_ll_all_to_all``, or None on every rank.
+    """
+    degree = group.size()
+    local_ok = (
+        eligible
+        and current_platform().is_nvidia
+        and device.type == "cuda"
+        and device.index is not None
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+        and degree in (2, 4, 8)
+        and cap_bytes > 0
+        and cap_bytes % 16 == 0
+        and 4 * degree * cap_bytes < 2**31
+        and timeout_ns > 0
+    )
+    if local_ok:
+        # A rendezvous over hosts the fabric cannot map would hang.
+        local_ok = multicast_reachable(group)
+    multicast = False
+    if local_ok:
+        with torch.cuda.device(device):
+            multicast = multimem_available()
+        # Imported before the vote: a rank failing after it would strand its peers.
+        try:
+            from tokenspeed_kernel.ops.communication._cute_dsl.ll_exchange import (
+                build_ll_exchange_state,
+            )
+        except Exception as exc:  # noqa: BLE001 - local failure is voted on
+            logger.warning(f"ll_exchange: kernel module import failed: {exc!r}")
+            local_ok = False
+    # MIN over the group; a negated value gives its MAX.
+    votes = torch.tensor(
+        [int(local_ok), int(multicast), cap_bytes, -cap_bytes], dtype=torch.int64
+    )
+    dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
+    ok, all_multicast, low, high = votes.tolist()
+    if ok and low != -high:
+        raise ValueError(
+            f"ll_exchange: cap_bytes differs across ranks "
+            f"{dist.get_process_group_ranks(group)}"
+        )
+    if not ok:
+        return None
+    return build_ll_exchange_state(
+        group,
+        device,
+        cap_bytes=cap_bytes,
+        multicast=bool(all_multicast),
+        timeout_ns=timeout_ns,
+    )
+
+
 if current_platform().is_nvidia:
 
     @register_kernel(
@@ -380,7 +510,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_fused_fp8_dp_column_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -436,7 +566,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_fused_fp8_dp_row_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -640,3 +770,68 @@ if current_platform().is_nvidia:
             wait for; the launch of ``epoch + 2`` records it again.
         """
         return state.launch(plane, fetch_slots, owned, send_rows, header)
+
+    @register_kernel(
+        "communication",
+        "ll_all_gather",
+        name="cute_dsl_ll_all_gather",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("input",), "dense", {torch.uint8}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_ll_all_gather(
+        state: "LLExchangeState", input: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather every rank's ``input`` bytes into ``out`` in rank order.
+
+        Args:
+            state: From ``create_ll_exchange_state``.
+            input: Contiguous 16-byte aligned payload of any dtype on the
+                state's device, ``state.serves`` its byte size, equal on
+                every rank.
+            out: Contiguous 16-byte aligned destination of ``ranks`` times
+                the payload; rank ``r``'s bytes land at offset ``r`` times it.
+
+        Returns:
+            ``out``, bit for bit what an all-gather of ``input`` gives.
+        """
+        _check_ll_tensors(state, input, out, gather=True)
+        state.launch(input, out, gather=True)
+        return out
+
+    @register_kernel(
+        "communication",
+        "ll_all_to_all",
+        name="cute_dsl_ll_all_to_all",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("input",), "dense", {torch.uint8}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_ll_all_to_all(
+        state: "LLExchangeState", input: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Send ``input``'s ``r``-th equal part to rank ``r``; receive into ``out``.
+
+        Args:
+            state: From ``create_ll_exchange_state``.
+            input: Contiguous 16-byte aligned ``ranks`` equal parts of any
+                dtype; ``state.serves`` one part's byte size, equal on every rank.
+            out: Contiguous 16-byte aligned destination of the same size; the
+                part rank ``r`` sent lands at part ``r``.
+
+        Returns:
+            ``out``, bit for bit what an equal-split all-to-all gives.
+        """
+        _check_ll_tensors(state, input, out, gather=False)
+        state.launch(input, out, gather=False)
+        return out

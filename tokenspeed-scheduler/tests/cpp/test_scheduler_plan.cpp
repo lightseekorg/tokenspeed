@@ -238,6 +238,7 @@ protected:
         // Force the candidates loop to break after exactly one push so the
         // tiebreaker decides which request wins.
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -568,23 +569,27 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
             for (const auto& key : history) {
                 complete &= coordinator.GroupPrefixIndex(key.group_id).Contains(device, key);
             }
-            EXPECT_EQ(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable, complete);
+            EXPECT_EQ(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).device_publishable, complete);
         };
         const auto store = [&](BlockPool& pool, const CacheKey& key) {
             auto block = pool.AcquireBlock(key.group_id);
             coordinator.GroupPrefixIndex(key.group_id)
                 .Register(pool, block, key, 1, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
         };
-        const auto remove = [&](const CacheKey& key) {
+        const auto remove_from = [&](BlockPool& pool, const CacheKey& key) {
             auto& index = coordinator.GroupPrefixIndex(key.group_id);
-            const auto entry = index.Inspect(device, key);
+            const auto entry = index.Inspect(pool, key);
             ASSERT_TRUE(entry.has_value());
-            EXPECT_TRUE(index.Evict(device, entry->location).has_value());
+            EXPECT_TRUE(index.Evict(pool, entry->location).has_value());
         };
+        const auto remove = [&](const CacheKey& key) { remove_from(device, key); };
         check();
+        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).host_publishable);
         for (const auto& key : history) store(host, key);
         check();  // Host history must not satisfy Device publication.
-        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        const auto on_host = coordinator.GetBoundaryEventStatus(boundary, tail_tokens);
+        EXPECT_TRUE(on_host.host_publishable) << "complete Host history publishes on the Host medium";
+        EXPECT_TRUE(on_host.retains_descriptor) << "a Host entry keeps the descriptor";
         const CacheKey state{.group_id = 2, .content_hash = boundary.content_hash};
         const CacheKey swa{.group_id = 3, .content_hash = boundary.content_hash};
         store(device, state);
@@ -594,12 +599,12 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
             store(device, key);
             check();
         }
-        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).device_publishable);
         remove(state);
         remove(swa);
         check();  // Complete history remains publishable without auxiliary state.
-        EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, tail_tokens),
-                  CacheCoordinator::BoundaryResidency::kPartial);
+        EXPECT_EQ(coordinator.Store().DeviceBoundaryResidency(boundary, tail_tokens),
+                  CacheStore::BoundaryResidency::kPartial);
         store(device, state);
         store(device, swa);
         // Removing any sub-block of either sharded Full group withdraws the
@@ -607,7 +612,7 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
         for (const auto& key : history) {
             remove(key);
             check();
-            EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+            EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).device_publishable);
             store(device, key);
             check();
         }
@@ -615,11 +620,16 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
             remove(key);
             check();
         }
-        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).retains_descriptor);
         remove(state);
         remove(swa);
         check();
-        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).retains_descriptor)
+            << "the Host history still holds the boundary";
+        for (const auto& key : history) remove_from(host, key);
+        const auto gone = coordinator.GetBoundaryEventStatus(boundary, tail_tokens);
+        EXPECT_FALSE(gone.host_publishable);
+        EXPECT_FALSE(gone.retains_descriptor);
     }
 }
 
@@ -1086,6 +1096,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = kBudget;
         cfg.max_batch_size = batch_;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = yield_;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -1720,6 +1731,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -2024,6 +2036,7 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeMinIntervalOutsideTheFusedR
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.device_allocator.total_pages = 32;
         cfg.disable_l2_cache = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -2056,6 +2069,7 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.device_allocator.total_pages = 32;
         cfg.disable_l2_cache = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -2131,6 +2145,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     cfg.prefix_granularity = 2;
     cfg.max_scheduled_tokens = 64;
     cfg.max_batch_size = 8;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full_attention",
         .block_granularity = cfg.prefix_granularity,
@@ -2158,6 +2173,7 @@ TEST(SchedulerConstructionTest, PrefillChunkYieldIsAPrefillRoleOptionOfAtMostHal
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = budget;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
             .block_granularity = cfg.prefix_granularity,

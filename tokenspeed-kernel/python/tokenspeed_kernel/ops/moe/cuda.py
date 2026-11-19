@@ -112,8 +112,7 @@ if routing_available():
     name="cuda_kimi3_sigmoid_bias_topk",
     solution="cuda",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
+        min_arch_version=ArchVersion(9, 0),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=frozenset(
@@ -164,8 +163,6 @@ __all__ = [
     "moe_finalize_fuse_shared",
 ]
 
-# The vendored front serves SM100 and SM103 parts with the SM counts its plan
-# rules are validated for (148 and 152); ``available`` checks both.
 _FRONT_PLATFORM = current_platform()
 if _FRONT_PLATFORM.is_nvidia and kimi3_latent_front.available():
 
@@ -237,3 +234,41 @@ if _FRONT_PLATFORM.is_nvidia and kimi3_latent_front.available():
         )
 
     __all__.append("cuda_latent_input")
+
+
+@register_kernel(
+    "moe",
+    "router_gemm_nvfp4",
+    name="cuda_router_gemm_nvfp4",
+    solution="cuda",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 7),
+        max_arch_version=ArchVersion(10, 7),
+    ),
+    signatures=frozenset(
+        {
+            format_signature(
+                hidden_states=dense_tensor_format(torch.bfloat16),
+                router_weight=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={
+        # Admission follows the measured producer; the CUDA tile also supports
+        # other model dimensions without specializing on runtime row counts.
+        "tokens": frozenset({1, 4}),
+        "hidden_size": frozenset({2560}),
+        "num_experts": frozenset({512}),
+        "inputs_contiguous": frozenset({True}),
+        "inputs_aligned_16": frozenset({True}),
+        "pdl_enabled": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def cuda_router_gemm_nvfp4(hidden_states, router_weight, quant_scale):
+    if not pdl_enabled():
+        raise ValueError("router GEMM NVFP4 requires PDL")
+    from tokenspeed_kernel.thirdparty.cuda.router_gemm_nvfp4 import router_gemm_nvfp4
+
+    return router_gemm_nvfp4(hidden_states, router_weight, quant_scale)

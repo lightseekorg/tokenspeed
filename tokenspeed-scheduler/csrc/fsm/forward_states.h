@@ -34,12 +34,15 @@
 #include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
+#include "cache/tier/peer.h"
 #include "scheduler/request_spec.h"
 #include "utils.h"
 
 namespace tokenspeed::fsm {
 
-enum class PrefillSource { kLocal, kRemote };
+// Who fills a first chunk's pages: this engine's forward, the PD peer's
+// prefill (the D role), or another replica's cache (a peer prefix landing).
+enum class PrefillSource { kLocal, kRemote, kPeer };
 
 // A scheduling attempt advances this in place and StagedCacheProgress
 // (scheduler/operations/progress.h) undoes the advance when the attempt
@@ -55,7 +58,7 @@ struct CacheProgress {
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};
     // The tail checkpoint the request resumed from on the Device
-    // (CacheCoordinator::AdmissionResult::resumed_tail_hash). The finish that
+    // (AdmissionResult::resumed_tail_hash). The finish that
     // publishes the end state marks it superseded.
     std::optional<std::string> resumed_tail_hash;
     // The in-forward State checkpoint a scheduled forward writes
@@ -119,11 +122,24 @@ struct StorageReadyHold {
 
 // Resources shared by pre-admission states. Moving a state carries the hold
 // with it, including when a PD bootstrap completes after the L3 read.
+// A holder's answer to a waiting prompt's lookup: the boundary it soft-pinned
+// under the lease (docs/rfcs/0004-peer-prefix-sharing.md).
+struct PeerHit {
+    PeerLeaseId lease;
+    std::int32_t num_tokens{0};
+};
+
 struct AdmissionResources {
     TokenContainer* token_container;
     std::int32_t prefix_granularity;
+    // Last admission probe's hit, for load reporting only; never reused by admission.
+    std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // The request has asked its peer holder once (or has none to ask), and
+    // what the holder answered.
+    bool peer_prepared{false};
+    std::optional<PeerHit> peer_hit;
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
@@ -143,8 +159,8 @@ struct Submitted {
 };
 
 // Everything a page-holding state owns on the request's behalf: the KV
-// pages, the request-pool slot, the prefix-cache progress and the count of
-// forwards still out against those pages. Move-only, and moved as ONE
+// pages, the request-pool slot, any decode permit, the prefix-cache progress
+// and the count of forwards still out against those pages. Move-only, and moved as ONE
 // bundle: a transition hands it whole to exactly one successor state, or
 // returns the pages to the coordinator and lets the empty bundle die. There
 // is no third path, and no field that a transition could forget to carry.
@@ -152,10 +168,11 @@ struct ForwardResources {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
     ReqPoolIndex req_pool_index;
+    DecodeSlotIndex decode_slot;
     std::vector<BlockTable> block_tables;
     // Per cache group, the copy-in blocks the request holds for its prompt
     // end, which its first decode publishes and keeps writing past: aligned
-    // to CacheCoordinator::CopyInSlots, each reserved by the admission that
+    // to CacheStore::CopyInSlots, each reserved by the admission that
     // allocated the block of its slot, null until then. The first decode
     // spends them (CacheCoordinator::Admit); they go with the tables, so a
     // retraction releases them and a restore reserves them again. Empty
@@ -340,7 +357,8 @@ struct Retracted {
 // the slot-state blob into is NOT in `resources` yet: the restore op owns it
 // until its ACK (an abort meanwhile must not re-grant a row still being
 // written), and RestoreDoneEvent installs it; `resources.req_pool_index` is
-// empty here.
+// empty here. A resumed decode's permit stays with that op too, so cancelling
+// the request cannot admit another decode before the restore retires.
 struct Restoring {
     ForwardResources resources;
     RetractionImage image;
@@ -359,13 +377,17 @@ struct Restoring {
 // result still arrives and extends the tokens by what it reports (nothing
 // when the device stopped the request, which keeps the frontier before the
 // token the finish was decided on). Nothing is scheduled for it, and it is no
-// retraction victim.
+// retraction victim. Cancellation with queued forwards uses the same state
+// to retain their resources, but releases them without publishing a frontier.
 struct Finishing {
-    explicit Finishing(ForwardResources resources) : resources{std::move(resources)} {}
+    Finishing(ForwardResources resources, bool publish_completed_pages)
+        : resources{std::move(resources)}, publish_completed_pages{publish_completed_pages} {}
 
     void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
 
     ForwardResources resources;
+    // A cancelled request waits for its forwards too, but publishes nothing.
+    bool publish_completed_pages;
 };
 
 struct Finished {};

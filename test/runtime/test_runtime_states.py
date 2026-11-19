@@ -22,7 +22,7 @@ import os
 import sys
 
 import pytest
-import tokenspeed_scheduler as ts
+import tokenspeed_engine.scheduler as ts
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -215,6 +215,7 @@ def _scheduled_batch():
         num_device_pages=_PAGES,
         max_scheduled_tokens=64,
         max_batch_size=2,
+        max_resident_requests=2,
         prefix_granularity=4,
         num_host_pages=0,
         disable_l2_cache=True,

@@ -124,7 +124,6 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (
     MuseSparkMonokernelState,
     enable_decode_monokernels,
     prepare_monokernel_state,
-    reserve_monokernel_heap,
 )
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
@@ -148,8 +147,12 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
 
-# Row limit of the generic column gather and the NVLS mailbox.
+# Row limit of the generic column gather.
 _GATHER_WORKSPACE_ROWS = 64
+# A gather mailbox moves only each rank's own block, so it beats the NCCL gather well past 64 rows.
+_GATHER_MAILBOX_ROWS = 512
+# Past this, multicasting a full partial per rank costs more than the two-shot all-reduce (128 rows: 73 us vs 29).
+_REDUCE_MAILBOX_ROWS = 64
 # Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path. It is the
 # TP4 Lamport mailbox capacity (43 * 4096 elements, i.e. 172 rows of a
 # 1024-wide shard), and TP8 uses the same limit. In measurements the fused
@@ -317,7 +320,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 block_index=layer_id,
                 layer_count=layer_count,
                 model_scope=f"{prefix.split('.layers.')[0]}.{prefix.rsplit('.', 1)[-1]}",
-                max_m=_GATHER_WORKSPACE_ROWS,
+                max_m=_GATHER_MAILBOX_ROWS,
                 # Takes this call's weight view; the mailbox publishes wider blocks.
                 publish_gemm=partial(_block_gemm, self),
                 rank_major=True,
@@ -762,7 +765,7 @@ def _bind_mailbox(
         block_index=layer_id,
         layer_count=config.num_hidden_layers,
         model_scope=model_scope,
-        max_m=_GATHER_WORKSPACE_ROWS,
+        max_m=_REDUCE_MAILBOX_ROWS,
         # Pooled across layers: the weight must come from the call, never the closure.
         publish_gemm=lambda x, weight, out: _block_gemm(linear, x, weight, out),
         rank_major=True,
@@ -788,7 +791,7 @@ def _bind_ep_all_reduce(
         layer_count=config.num_hidden_layers,
         # Mailboxes pool across layers, so the scope excludes the layer index.
         model_scope=f"{prefix.split('.layers.')[0]}.ep_all_reduce",
-        max_m=_GATHER_WORKSPACE_ROWS,
+        max_m=_REDUCE_MAILBOX_ROWS,
         publish_gemm=_no_route_sum_gemm,
         rank_major=False,
     )
@@ -1110,8 +1113,7 @@ class MuseSparkAttention(nn.Module):
 # Every decoder gain is stored as its deviation from unity; the output gain is not.
 ZERO_CENTERED_GAIN_OFFSET = 1.0
 OUTPUT_GAIN_OFFSET = 0.0
-# Norm-preserving residual gate constants, fixed by the architecture.
-RESIDUAL_GATE_TEMPERATURE = 0.3
+# Norm-preserving residual gate epsilon, fixed by the architecture.
 RESIDUAL_GATE_EPS = 1e-3
 MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
@@ -3206,14 +3208,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
     model_cls = MuseSparkModel
     supports_aux_capture = True
 
-    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
-        super().set_eagle3_layers_to_capture(layer_ids)
-        self._reserve_monokernel_taps()
-
-    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        super().set_dflash_layers_to_capture(layer_ids)
-        self._reserve_monokernel_taps()
-
     def stores_capture_taps(self, ctx: ForwardContext) -> bool:
         """Whether this step's decode monokernels store the draft's taps (the
         forward then hands them over in one block, see ``MuseSparkModel``)."""
@@ -3224,12 +3218,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             and not self.model._can_use_owned_rows(rows, ctx)
             and state.stores_taps(rows, ctx)
         )
-
-    def _reserve_monokernel_taps(self) -> None:
-        # The draft's target and the draft load before the Iris heap exists,
-        # in either order; the monokernels' heap reservation counts the taps.
-        if self.model.config.decode_monokernel:
-            reserve_monokernel_heap(self.model)
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""

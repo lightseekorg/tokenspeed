@@ -25,4 +25,4 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 where = ["python"]
 
 [tool.setuptools.package-data]
-"tokenspeed_kernel_amd" = ["_intrinsics/*.ll"]
+"tokenspeed_kernel_amd" = ["_intrinsics/*.ll", "ops/gfx950/kimi_k3/moe_tail/_stages/*.ll"]

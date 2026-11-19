@@ -190,6 +190,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
 cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
@@ -579,9 +580,9 @@ impl TransferPeer for FakePeer {
     }
 }
 
-/// EPD: a `lost-*` request's receive fails at its second poll, a `slow-*`
-/// one's lands after a hundred; the others' land after three polls, one more
-/// on each later rank. Each landed item takes one slot of eight.
+/// EPD: a `lost-*` request's receive fails at its second poll. Other
+/// requests land after three polls, one more on each later rank. Each
+/// landed item takes one slot of eight.
 struct FakeReceiver {
     rank: usize,
     staged: Vec<(String, Vec<EmbeddingItem>, usize)>,
@@ -603,8 +604,6 @@ impl EmbeddingReceiver for FakeReceiver {
                 *polls += 1;
                 let landed_at = if rid.starts_with("lost") {
                     return i64::from(*polls < 2);
-                } else if rid.starts_with("slow") {
-                    100
                 } else {
                     3 + rank
                 };
@@ -1300,7 +1299,12 @@ struct Setup {
     /// The requests each engine serves itself before its frontend attaches,
     /// [`STARTUP_OUTPUT_TOKENS`] each.
     startup: Vec<startup::Phase>,
+    /// Receives the scheduler the loop runs over, as a peer servicer holds
+    /// it.
+    scheduler: Option<Arc<Mutex<Option<SharedScheduler>>>>,
 }
+
+type SharedScheduler = Arc<parking_lot::Mutex<Scheduler>>;
 
 const STARTUP_OUTPUT_TOKENS: usize = 3;
 
@@ -1358,7 +1362,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             } else {
                 vec!["kv_cache".to_owned(), "weights".to_owned()]
             },
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {
@@ -1424,6 +1428,7 @@ fn run_rank<F: Frontend>(
         grammar_timeouts,
         epd_receive_enabled,
         startup,
+        scheduler: scheduler_handle,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1466,8 +1471,17 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     // Attached once the startup requests ran, as the host does.
+    let scheduler = Arc::new(parking_lot::Mutex::new(new_scheduler(
+        tiers,
+        role,
+        kv_shard_count,
+        device_pages.unwrap_or(513),
+    )));
+    if let Some(handle) = scheduler_handle {
+        *handle.lock().unwrap() = Some(scheduler.clone());
+    }
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
+        scheduler,
         device,
         None,
         outputs,
@@ -1499,6 +1513,7 @@ fn run_rank<F: Frontend>(
             }),
             l3_metrics: None,
             l3: store.map(|store| l3_executor(store, rank)),
+            peer: None,
         },
     );
     if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {
@@ -2242,6 +2257,8 @@ async fn idle_load_reports_preserve_resident_cache_capacity() {
     let load = snapshots[0].1;
     assert_eq!((load.num_running, load.num_waiting), (0, 0));
     assert_eq!(load.kv_active_pages, 0);
+    assert_eq!(load.num_resident_tokens, Some(0));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert!(load.kv_used_pages > 0, "reclaimable prefixes stay resident");
     assert_eq!(load.kv_total_pages, 512);
 }
@@ -2294,7 +2311,11 @@ async fn a_long_prompt_is_prefilled_in_chunks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delayed_long_prefill_completes_above_the_watermark() {
-    for layout in [Layout::Single, Layout::Dp(2)] {
+    for (layout, single_round) in [
+        (Layout::Single, false),
+        (Layout::Dp(2), false),
+        (Layout::Dp(2), true),
+    ] {
         for depth in [0, 1] {
             let engine = start_ranks_with(
                 layout,
@@ -2305,6 +2326,7 @@ async fn delayed_long_prefill_completes_above_the_watermark() {
                     prefill_delay: Some(PrefillDelay {
                         attempt_interval: 2,
                         any_interval: 4,
+                        single_round,
                     }),
                     ..Setup::default()
                 },
@@ -2377,12 +2399,12 @@ async fn dropping_a_stream_aborts_the_request() {
             );
             // Cancellation produces no final output for the dropped stream,
             // but the frontend must still learn that the engine is idle.
-            if engine
-                .client
-                .loads()
-                .iter()
-                .all(|load| load.num_running == 0 && load.num_waiting == 0)
-            {
+            if engine.client.loads().iter().all(|load| {
+                load.num_running == 0
+                    && load.num_waiting == 0
+                    && load.num_resident_tokens == Some(0)
+                    && load.num_waiting_uncached_tokens == Some(0)
+            }) {
                 return;
             }
         }
@@ -3649,6 +3671,63 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
     }
 }
 
+/// A peer servicer answers from the scheduler between rounds. A loop waiting
+/// on a transfer -- here a decode engine waiting for its prefill peer's KV --
+/// runs neither a forward nor an idle frontend wait, the two points that
+/// release the scheduler, so it hands the scheduler to a waiting servicer
+/// once per round instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    let handle = Arc::new(Mutex::new(None));
+    let decode = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire: wire.clone(),
+            }),
+            scheduler: Some(handle.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _stream = decode
+        .client
+        .generate(disaggregated("waiting-kv", 70, 20, 4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while wire
+            .lock()
+            .unwrap()
+            .rooms
+            .get(&70)
+            .is_none_or(|room| room.preallocated.is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("decode allocated its KV landing pages and waits for them");
+
+    let scheduler = handle.lock().unwrap().clone().unwrap();
+    let held = tokio::task::spawn_blocking(move || {
+        scheduler.try_lock_for(Duration::from_secs(5)).is_some()
+    })
+    .await
+    .unwrap();
+    assert!(
+        held,
+        "the servicer waited past five seconds of empty rounds"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
     assert_pause_waits_for_pd_retirement("abort").await;
@@ -4721,6 +4800,9 @@ async fn an_abort_pause_aborts_what_runs_and_a_keep_pause_freezes_it() {
         before += 1;
     }
     assert!(before < 30, "the request kept running while frozen");
+    let load = engine.client.loads()[0];
+    assert_eq!(load.num_resident_tokens, Some(3 + before));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert_eq!(
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", true)]
@@ -5364,8 +5446,8 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
+#[test]
+fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
     let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
         rid: None,
         http_worker_ipc: None,
@@ -5377,7 +5459,16 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
         tags: None,
     });
     for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
-        let engine = start_ranks_with(
+        let tag = drain.reply_tag();
+        let undo_tag = undo.reply_tag();
+        let mut script = vec![Vec::new(); 16];
+        script[0].push(EngineRequest::Add(Box::new(epd_request("pending"))));
+        // The receive lands on the third poll. Drain on the second round
+        // while it is pending, then resume once the receive has settled.
+        script[1].push(EngineRequest::Control(Box::new(drain)));
+        script[3].push(EngineRequest::Control(Box::new(undo)));
+        script[4].push(EngineRequest::Add(Box::new(epd_request("img-1"))));
+        let ranks = run_scripted(
             Layout::Single,
             1,
             Tiers::DeviceOnly,
@@ -5385,34 +5476,36 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
                 epd_receive_enabled: true,
                 ..Setup::default()
             },
-        )
-        .await;
-        // The drain arrives while the request waits for its image's
-        // embeddings: it is not in the scheduler, so the drain must end it
-        // rather than answer with it staged until the resume.
-        let stream = engine.client.generate(epd_request("slow-0")).await.unwrap();
-        let tag = drain.tag();
-        let drained = control(&engine, drain).await;
-        assert_eq!(drained.len(), 1);
-        assert!(drained[0].1, "{tag}");
-        let chunks = tokio::time::timeout(Duration::from_secs(1), collect(stream))
-            .await
-            .unwrap_or_else(|_| panic!("{tag} answered while the request still waits"));
-        let last = chunks.last().unwrap();
-        assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{tag}");
-        let details = &last.finish_details.as_ref().unwrap().0;
+            vec![script],
+            no_reaction,
+        );
+        let rank = &ranks[0];
+        assert_eq!(rank.outcome, Ok(()), "{tag}");
+        assert_eq!(
+            outcome(rank.replies.clone()),
+            [(tag, true), (undo_tag, true)]
+        );
+        let aborted = rank
+            .outputs
+            .iter()
+            .find(|output| output.rid == "pending")
+            .unwrap();
+        assert_eq!(aborted.finish_reason, Some("abort"), "{tag}");
+        assert!(aborted.output_ids.is_empty(), "{tag}");
+        let details = &aborted.finish_details.as_ref().unwrap().0;
         assert!(
             details
                 .iter()
                 .any(|(k, v)| k == "message" && *v == Value::from("Aborted by pause")),
             "{tag}: {details:?}"
         );
-        assert!(control(&engine, undo).await[0].1);
-        // The engine serves on.
-        assert_eq!(
-            tokens(&run(&engine.client, epd_request("img-1")).await),
-            [1000, 1001, 1002]
-        );
+        let recovered: Vec<_> = rank
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "img-1")
+            .flat_map(|output| output.output_ids.iter().copied())
+            .collect();
+        assert_eq!(recovered, [1000, 1001, 1002], "{tag}");
     }
 }
 

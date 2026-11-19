@@ -41,6 +41,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
+#include "scheduler/operations/admission.h"
 #include "scheduler/operations/forward.h"
 #include "scheduler/operations/group_demands.h"
 #include "cache/prefix/prefix_hasher.h"
@@ -88,7 +89,8 @@ CacheKey eventKey(const CacheKey& key) {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
-      req_pool_allocator_{config_.max_batch_size},
+      req_pool_allocator_{config_.max_resident_requests},
+      decode_slots_{config_.role == Role::kD ? config_.max_batch_size : 0},
       snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), config_.host_group_packing},
@@ -102,7 +104,8 @@ Scheduler::Scheduler(SchedulerConfig config)
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
-                             : nullptr} {
+                             : nullptr},
+      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -111,8 +114,14 @@ Scheduler::Scheduler(SchedulerConfig config)
     max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
-            markKvEventBoundaryForReconcile(eventKey(key));
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheMutation mutation) {
+            const CacheKey boundary = eventKey(key);
+            // A Host block can arrive for a boundary no publication here ever
+            // described (an L3 read): without its tokens there is no event.
+            if (mutation == CacheMutation::kHostResidency && !kv_event_boundaries_.contains(boundary)) {
+                return;
+            }
+            markKvEventBoundaryForReconcile(boundary);
         });
     }
 
@@ -126,7 +135,12 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
         checkpoint_lineage_.emplace();
     }
-    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value());
+    // A peer's complete read demotes the holder's copy (PeerExports::Release)
+    // through the same marks.
+    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value() || peer_exports_ != nullptr);
+    if (config_.peer_config) {
+        next_peer_lease_ = config_.peer_config->incarnation << 32;
+    }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
@@ -139,18 +153,7 @@ Request* Scheduler::findRequest(const std::string& request_id) {
 }
 
 bool Scheduler::pdTransferInFlight(const Request& request) const {
-    switch (config_.role) {
-        case Role::kD:
-            return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();
-        case Role::kP:
-            // Every page-holding state but Finishing, PdTransferring
-            // included: SucceededEvent moves a request to Finishing once the
-            // peer has read its pages.
-            return request.HoldsPages() && !request.Is<fsm::Finishing>();
-        case Role::kFused:
-            return false;
-    }
-    return false;
+    return PdTransferInFlight(config_.role, request);
 }
 
 bool Scheduler::PdTransferPinned(const std::string& request_id) const {
@@ -186,12 +189,15 @@ KvEventBatch Scheduler::DrainKvEventBatch() {
                                      ? static_cast<std::int32_t>(descriptor_tokens)
                                      : 0;
         const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
-        if (status.publishable != event_boundary.published) {
-            mutations.push_back({event_boundary.stored->block_hash,
-                                 status.publishable ? event_boundary.stored : KvEventDescriptorRef{}});
+        const std::array<bool, kNumKvEventMedia> publishable{status.device_publishable, status.host_publishable};
+        if (publishable != event_boundary.published) {
+            const bool anywhere = status.device_publishable || status.host_publishable;
+            mutations.push_back({.block_hash = event_boundary.stored->block_hash,
+                                 .stored = anywhere ? event_boundary.stored : KvEventDescriptorRef{},
+                                 .resident = publishable});
         }
-        event_boundary.published = status.publishable;
-        if (!status.has_device_entries) kv_event_boundaries_.erase(it);
+        event_boundary.published = publishable;
+        if (!status.retains_descriptor) kv_event_boundaries_.erase(it);
     }
     // Cache keys own no payload; retain the allocation for the next round.
     kv_event_boundaries_to_reconcile_.clear();
@@ -465,9 +471,30 @@ std::size_t Scheduler::RetractedSize() const {
     }));
 }
 
+std::int64_t Scheduler::PendingPrefillTokens() const {
+    std::int64_t tokens = 0;
+    for (const auto& request : requests_) {
+        if (const auto* admission = request->AdmissionResourcesPtr()) {
+            tokens += std::int64_t{request->PrefillSize()} - admission->cached_prefix_tokens;
+        } else if (request->Is<fsm::Prefilling>()) {
+            tokens += std::int64_t{request->PrefillSize()} - request->NumComputedTokens();
+        }
+    }
+    return tokens;
+}
+
 std::size_t Scheduler::DecodingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));
+}
+
+std::size_t Scheduler::ReadyWaitingSize() const {
+    if (config_.role != Role::kD) {
+        return 0;  // Only D requests wait for a separate execution permit.
+    }
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->Is<fsm::PrefillDone>() && !request->HasDecodeSlot();
+    }));
 }
 
 std::size_t Scheduler::PrefillSize() const {
@@ -523,14 +550,14 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .eviction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kEviction),
         .prefix_loads = tier_transfers_.PrefixLoadStats(),
         .restore_loads = tier_transfers_.RestoreLoadStats(),
-        .host_evictions = coordinator_.HostEvictions(),
-        .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
+        .host_evictions = coordinator_.Evictor().HostEvictions(),
+        .store_candidates_dropped_by_flush = coordinator_.Host().StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
-        .lone_compactions = coordinator_.LoneCompactions(),
-        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
-        .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
+        .lone_compactions = lone_requests_.Compactions(),
+        .lone_compaction_moves = lone_requests_.CompactionMoves(),
+        .checkpoint_resume_gaps = coordinator_.History().CheckpointResumeGaps(),
     };
 }
 
@@ -625,6 +652,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
     }
+    if (peer_exports_) {
+        ProfileSpan profile_span{"Scheduler::preparePeer"};
+        for (const auto& request : requests_) preparePeer(*request);
+    }
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
@@ -634,6 +665,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         }
     }
     ++plan_calls_;
+    lone_requests_.StartPlan();
     const std::size_t num_live_requests = candidates.size();
     ExecutionPlan plan;
     for (const std::string& group_id : cache_group_ids_) {
@@ -714,8 +746,8 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     // warning as before. The abort ends the streak, like any plan carrying
     // an abort: the next request stuck alone is judged on a streak of its
     // own.
-    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans &&
-        last_lone_compaction_plan_ != plan_calls_ && built.blocked_alone != nullptr) {
+    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans && !lone_requests_.ActedInPlan() &&
+        built.blocked_alone != nullptr) {
         Request& stuck = *built.blocked_alone;
         const bool restore = stuck.Is<fsm::Retracted>();
         const std::string detail = fmt::format(

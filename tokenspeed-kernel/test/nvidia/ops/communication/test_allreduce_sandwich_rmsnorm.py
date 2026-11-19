@@ -686,7 +686,8 @@ def test_a_missing_pair_launches_with_unit_multipliers(wrapper):
     [
         dict(world=1),
         dict(tokens=0),
-        dict(tokens=33, max_token_num=32),
+        dict(max_token_num=0),
+        dict(max_token_num=-1),
         dict(no_mnnvl=True),
         dict(unarmed=True),
         dict(hidden=2880),  # no whole-warp cluster partition
@@ -721,15 +722,14 @@ def test_a_one_sided_pair_takes_one_for_the_missing_side(
     wrapper, scales, launched, tokens
 ):
     """As the unfused rmsnorm(): the missing multiplier is 1.0, at T = 1, at
-    the fused limit (max_token_num 2048), and above it, where the call
-    returns None for the unfused chain instead of raising."""
+    the fused limit (max_token_num 2048), and above it, where every launch
+    of a 2048-row slice and the 1-row rest takes it."""
     wrapper.manager.mnnvl_workspace = _workspace(8, 4096)
     out = _call(wrapper, tokens=tokens, **scales)
-    if tokens > 2048:
-        assert out is None and wrapper.module.calls == []
-        return
-    assert out is not None
-    assert wrapper.module.calls[-1][-2:] == launched
+    assert out is not None and out[1].shape == (tokens, 4096)
+    rows = [args[8] for args in wrapper.module.calls]
+    assert rows == ([2048, 1] if tokens > 2048 else [tokens])
+    assert all(args[-2:] == launched for args in wrapper.module.calls)
 
 
 @pytest.mark.parametrize(
@@ -769,6 +769,11 @@ def test_mismatched_shapes_raise(wrapper):
     assert wrapper.module.calls == []
 
 
+def _same_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """The launch got ``b``'s memory, as a view of all its rows."""
+    return a.data_ptr() == b.data_ptr() and a.shape == b.shape
+
+
 def _fp8_buffers(tokens=4, hidden=4096):
     return (
         torch.empty(tokens, hidden, dtype=torch.float8_e4m3fn),
@@ -793,8 +798,10 @@ def test_a_token_fp8_call_launches_the_fp8_entry(wrapper, bf16_out):
     (args,) = wrapper.module.calls
     assert args[0] == "token_fp8"
     args = args[1:]
-    assert (args[4] is None) == (not bf16_out) and args[4] is out[0]
-    assert args[5] is out[1] and args[6] is codes and args[7] is scales
+    assert (args[4] is None) == (not bf16_out)
+    assert not bf16_out or _same_storage(args[4], out[0])
+    assert _same_storage(args[5], out[1])
+    assert _same_storage(args[6], codes) and _same_storage(args[7], scales)
     assert args[8:12] == (8, 3, 4, 4096)
     assert args[12:14] == (0x1000, 0x2000)
     assert args[17:] == (True, True, 1e-5, 0.5, 0.75)

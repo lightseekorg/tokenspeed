@@ -50,7 +50,10 @@ register_cuda_ci(
     disabled_on_runners_reason="The whole-row sampler compared against uses flashinfer's softmax.",
 )
 
-from tokenspeed_kernel.ops.sampling import vocab_shard_draft_stats  # noqa: E402
+from tokenspeed_kernel.ops.sampling import (  # noqa: E402
+    vocab_shard_draft_stats,
+    vocab_shard_draft_stats_width,
+)
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 from tokenspeed.runtime.execution.drafter.speculative_sampling import (  # noqa: E402
@@ -125,6 +128,7 @@ def _sampler(
         runtime_states=states,
         input_buffers=buffers,
         spec_num_tokens=N,
+        sampling_stream="batch",
         vocab_map=vocab_map,
         device="cuda",
     )
@@ -246,6 +250,14 @@ def test_a_shard_table_takes_proposals_from_shards_only():
         sharded.propose(logits, step=STEP)
     with pytest.raises(RuntimeError, match="gathered logits"):
         whole.propose_vocab_shard(_shard(logits, 0), step=STEP)
+
+
+def test_partial_rows_are_whole_groups_of_64_floats():
+    # The lamport column gather moves rows of whole 128-word groups.
+    slots = torch.tensor([1], dtype=torch.int64, device="cuda")
+    sampler, _ = _sampler(_pools(), slots, (0, COLUMNS))
+    width = sampler._shard_stats.shape[1]
+    assert width % 64 == 0 and width >= vocab_shard_draft_stats_width(COLUMNS)
 
 
 if __name__ == "__main__":

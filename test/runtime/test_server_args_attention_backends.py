@@ -56,6 +56,20 @@ class TestAttentionBackendChoices:
                 return action
         raise AssertionError(f"no action with dest={dest!r}")
 
+    @pytest.mark.parametrize(
+        ("flags", "enabled"),
+        [
+            ([], True),
+            (["--qwen4-exp-flat-kv"], True),
+            (["--no-qwen4-exp-flat-kv"], False),
+            (["--qwen4-exp-flat-kv", "--no-qwen4-exp-flat-kv"], False),
+            (["--no-qwen4-exp-flat-kv", "--qwen4-exp-flat-kv"], True),
+        ],
+    )
+    def test_qwen4_exp_flat_kv_default_and_overrides(self, flags, enabled):
+        args = prepare_server_args(["--model", "x", *flags])
+        assert args.qwen4_exp_flat_kv is enabled
+
     def test_attention_backend_accepts_trtllm_mla(self):
         args = self._build_parser().parse_args(
             ["--model", "x", "--attention-backend", "trtllm_mla"]
@@ -142,6 +156,7 @@ class TestAttentionBackendChoices:
             is_draft=False,
             speculative_num_draft_tokens=1,
             max_bs=4,
+            max_resident_requests=4,
             component=components.get,
         )
         model_config = SimpleNamespace(
@@ -257,6 +272,7 @@ class TestAttentionBackendChoices:
             context_len=65536,
             kernel_page_size=64,
             max_bs=8,
+            max_resident_requests=8,
             components=(spec,),
         )
 
@@ -355,6 +371,7 @@ class TestAttentionBackendChoices:
             kernel_page_size=kernel_page_size,
             context_len=256,
             max_bs=2,
+            max_resident_requests=2,
             kv_cache_quant_method="none",
             components=(spec,),
         )
@@ -778,6 +795,7 @@ class TestPagedRouterNameResolution:
             kernel_page_size=64,
             context_len=256,
             max_bs=2,
+            max_resident_requests=2,
             kv_cache_quant_method="none",
             components=(spec,),
         )

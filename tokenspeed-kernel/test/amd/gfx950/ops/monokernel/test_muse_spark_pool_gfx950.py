@@ -90,7 +90,7 @@ def _worker(me: int, port: int, rows: int, present) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = Plan(
             grid=256,
-            stages=moe_pool.stages({"pool": 0}),
+            stages=moe_pool.stages({"pool": 0}, rows),
             regions=(("xin", HIDDEN // 4), ("xflag", FLAGS)) + moe_pool.regions(),
             rows=rows,
             chain=rows,
@@ -200,7 +200,7 @@ def _spawn(rows: int, present) -> None:
     )
 
 
-@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("rows", [1, 8, 16])
 def test_pooler_gathers_every_ranks_columns(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")

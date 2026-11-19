@@ -208,7 +208,6 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "tokenspeed-fast-hadamard-transform",
         "tokenspeed-flashmla",
         "tokenspeed-mla",
-        "tokenspeed-trtllm-kernel",
         "tokenspeed-triton-kernels",
     }.isdisjoint(requirements)
 

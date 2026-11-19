@@ -4,8 +4,8 @@ These kernels run one decoder layer of Muse Spark Open (`muse_spark`) as one
 persistent launch per rank of a TP8 group (attention TP8, MoE TP8 / EP1), for
 the rows of a decode step: one decode row, or the 2 to 8 consecutive tokens
 of a speculative verify (`Plan.chain`). The row count is a compile-time
-parameter up to two requests' rows (16); the runtime serves one request a
-launch. They use the building blocks in [`../README.md`](../README.md).
+parameter up to two requests' rows (16), the requests' rows one after
+another. They use the building blocks in [`../README.md`](../README.md).
 That file also gives the launch contract and the rules for writing a stage.
 
 ## Kernels
@@ -67,10 +67,10 @@ seam. The switch `--decode-monokernel` enables it.
   and a cold compile can take longer on one rank than on the others. Thus
   the first launch of each layer and row count only compiles
   (`compile_only`), the ranks meet at a CPU barrier, and then they launch.
-- A forward uses the kernels when it is a decode step of one request: one
-  token, or a speculative verify of up to 8 tokens (row `t` has length
-  `seq - rows + t + 1` for the step's `seq_lens`). Other forwards use the
-  regular path.
+- A forward uses the kernels when it is a decode step of one or two requests
+  of equal rows: one token each, or a speculative verify of up to 8 tokens
+  each (a request's row `t` has length `seq - chain + t + 1` for its
+  `seq_lens`). Other forwards use the regular path.
 - A draft model that taps the residual entering a layer (DFlash2's
   `target_layer_ids`) gets whole rows there: the fused run before that layer
   gathers the 8 owned slices, as before a regular layer.
@@ -82,15 +82,15 @@ docstring gives its math and task split):
 
 | Module | Stages | Work |
 |---|---|---|
-| `qkvg.py` | qkvg, gate, qnext | The fused q / k / v / output-gate projection, in two K halves. Between two fused layers (past one row) the q / k / v part moves to the end of the launch before: qnext tasks project the out tasks' rows with the next layer's weights into a global buffer, which the next launch's head and attn tasks read with plain loads, so that launch's attention starts at once. Past 8 rows the CTAs that run both out and qnext issue their qnext weights before their out task, so the weights land while out waits for its inputs. |
+| `qkvg.py` | qkvg, gate, qnext | The fused q / k / v / output-gate projection, in two K halves. Between two fused layers (past one row) the q / k / v part moves to the end of the launch before: qnext tasks project the out tasks' rows with the next layer's weights into a global buffer, which the next launch's head and attn tasks read with plain loads, so that launch's attention starts at once. With one request a full layer's attention has a task on every CTA, so each gate block splits into two 8-row tasks over all CTAs (half the bytes a task): no attention task waits on a whole gate task. Past 8 rows the CTAs that run both out and qnext issue their qnext weights before their out task, so the weights land while out waits for its inputs. |
 | `attention.py` | head, attn, merge | k norm, RoPE and the KV write; split attention with an online softmax, its K and V copied to an LDS ring two chunks ahead (on a full layer at long context, each warp group over its own keys of a chunk, combined once a split; a BF16 cache copied a page at a time; an FP8 cache scores the cached keys with FP8 MFMAs and q rounded once to FP8, as the regular path does); the LSE merge and the gated head norm. |
 | `attn_tail.py` | oproj, tail1, tail2 | `o_proj` reduce-scattered to the owners; the post-attention norm, residual gate and pre-FFN norm. |
 | `moe_route.py` | router, topk | Partial router logits of the owned columns; the sum, sigmoid scores and top 8. |
 | `moe_pool.py` | pool | The pre-expert projection, gathered on every rank. Its input, the whole MoE input every rank's attention tail publishes, arrives as plain words and one flag per tail task (`Mailbox.store_words_peer`, `bf16.load_word_rows`): half the bytes of tagged pairs. |
 | `moe_experts.py` | slt, xq, ex1, exr, ex2 | The MXFP4 experts, each rank's 512 of 4096 intermediate values. The rows' distinct experts are slots: each streams once for every row that picked it. slt builds the slot table once after the routing; xq norms and quantizes the expert input once; ex1 streams its first slot's weights as soon as the table is in, then loads its K quarter from xq; exr sums ex1's K quarters and requantizes to MXFP4 once, so ex2 polls 72 words a row and quantizes nothing; ex2 polls its lane's first slots' intermediates at once, then streams the slots' weights ahead with no poll between them. The module docstring gives the placement and batching rules. |
 | `warm.py` (shared) | warm | For one row, when the next layer is fused too, CTAs 0 to 63 read its packed QKVG weights into the memory-side cache after their expert tasks, so the next launch's projections read the MALL (earlier, the expert weights would evict them). |
-| `moe_tail.py` | comb1, comb2, unpool, out | Combine the routes, the post-expert projection, the post-FFN norm, residual gate and the next layer's input norm. Each out task sums its row's partial sums of squares from every rank into the two norm scales itself. The out tasks of the rank's owned columns also store the FP32 residual and, before a layer a draft taps, the BF16 residual into every rank's tap buffer. |
-| `draft_layer.py` | both halves in one plan | A whole DFlash2 draft layer as one launch: the attention half hands its partial to the MLP half's owners through the mailbox (afin in place of scat) and the residual between the two sums stays in registers. The last layer's launch also runs the draft's final norm (fin puts its partial to the owners; fsum, fnorm and fout store the normed rows on every rank). Served with `--decode-monokernel` for one request's draft block (`python/tokenspeed/runtime/models/muse_spark_dflash2_monokernel.py`). |
+| `moe_tail.py` | comb1, comb2, unpool, out | Combine the routes, the post-expert projection, the post-FFN norm, residual gate and the next layer's input norm. Each out task sums its row's partial sums of squares from every rank into the two norm scales itself. The out tasks of the rank's owned columns also store the FP32 residual. Before a layer a draft taps, every out task also stores its columns of the BF16 residual to its own rank's tap buffer, so each rank's tap holds the whole row. |
+| `draft_layer.py` | both halves in one plan | A whole DFlash2 draft layer as one launch: the attention half hands its partial to the MLP half's owners through the mailbox (afin in place of scat) and the residual between the two sums stays in registers. The last layer's launch also runs the draft's final norm (fin puts its partial to the owners; fsum, fnorm and fout store the normed rows on every rank). Served with `--decode-monokernel` for one or two requests' draft blocks (`python/tokenspeed/runtime/models/muse_spark_dflash2_monokernel.py`). |
 | `draft_context.py` | fc, fsum, fnorm, kv, kvout | The DFlash2 context write after a verify as one launch: the rank's eighth of `fc` over the target's 5 taps (K split over all CTAs), `hidden_norm` with the sum of squares exchanged, then every draft layer's K and V of the rank's KV head (k RMSNorm and RoPE) into the draft cache. Served with the draft layers. |
 | `draft_head.py` | lmh, hproj, merge1, merge2, score | The DFlash2 draft head as one launch: the logits of the rank's 25256-row LM-head shard with each draft step's best 16 a task, the rank's best 16 put to every rank, the sorted best 16 of the 8 ranks (softcapped), and the candidate selector's 16 x 16 edge scores. The best-16 passes are runtime loops: unrolled, they run cold in the instruction cache once a step. Served with the draft layers. |
 | `draft_attn.py` | head, attn, merge (with draft_mlp's sum, norm, coefficient, convolution and projection stages around them) | The attention half of a DFlash2 draft layer: the input norm of the ranks' sum, the attention convolution, qkv, the per-head q / k RMSNorm and RoPE with the KV write, non-causal block attention over the window from the paged cache (its partials published as plain words and one flag a task), `o_proj` and the convolution after it, ending in this rank's partial. Served as part of `draft_layer.py`. |

@@ -136,6 +136,7 @@ def _moe_layer(comm, moe, *, writes_block):
         k3_comm=comm,
         comm_manager=SimpleNamespace(get_num_tokens=lambda _: (_ROWS, _ROWS)),
         _prepare_next_fallback_attnres_partial=mock.Mock(),
+        _next_fallback_attnres_partial_args=mock.Mock(return_value=None),
     )
 
 

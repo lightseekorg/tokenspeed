@@ -130,6 +130,26 @@ void SchedulerConfig::Validate() const {
             throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
         }
     }
+    if (peer_config) {
+        peer_config->Validate();
+        // A holder exports what it caches, and a reader lands a prefix it
+        // caches next; the D role computes no prompt, and a page-sharded
+        // group's pages are not whole on one rank.
+        if (role == Role::kD || disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing needs prefix caching outside the D role");
+        }
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count != 1; })) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing supports replicated cache groups only");
+        }
+        // A replayable group is never cached, so no holder exports the
+        // suffix a landed prefix would have to replay.
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.replayable; })) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing excludes replayable cache groups");
+        }
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing excludes L3 storage");
+        }
+    }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
@@ -242,6 +262,14 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     }
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
+    }
+    if (max_resident_requests < max_batch_size ||
+        max_resident_requests > std::numeric_limits<std::int32_t>::max() - 2) {
+        throw std::invalid_argument(
+            "Scheduler: max_resident_requests must cover max_batch_size and leave room for null and padding rows");
+    }
+    if (role != Role::kD && max_resident_requests != max_batch_size) {
+        throw std::invalid_argument("Scheduler: extra resident requests require the decode role");
     }
     if (checkpoint_retention_requests &&
         (*checkpoint_retention_requests < 0 || *checkpoint_retention_requests > kMaxCheckpointRetentionRequests)) {

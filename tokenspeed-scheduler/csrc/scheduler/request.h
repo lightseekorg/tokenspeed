@@ -49,13 +49,12 @@ public:
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
     const std::string& CacheGroupId() const { return cache_group_id_; }
+    const std::string& PeerHolder() const { return peer_holder_; }
     std::span<const std::int32_t> SharedPrefixTokens() const { return shared_prefix_tokens_; }
     // The registration of its group/session owner under the access epoch that
     // its first admission returned: held for the request's whole life, which
     // every later admission, publication and restore under that epoch lies in.
-    void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
-        session_access_ = std::move(session_access);
-    }
+    void HoldSessionAccess(SessionAccess session_access) { session_access_ = std::move(session_access); }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -295,6 +294,11 @@ public:
 
     std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
+    bool HasDecodeSlot() const { return forwardResources("HasDecodeSlot").decode_slot.valid(); }
+
+    // The reference must not outlive the request or cross Request::Apply.
+    fsm::ForwardResources& ForwardResourcesRef() { return forwardResources("ForwardResourcesRef"); }
+
     const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
@@ -343,8 +347,10 @@ public:
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
                               [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
+                              [](const fsm::PeerLooking&) -> std::string { return "PeerLooking"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                              [](const fsm::PeerLanding&) -> std::string { return "PeerLanding"; },
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
@@ -370,8 +376,9 @@ private:
     std::string id_;
     std::string session_id_;
     std::string cache_group_id_;
+    std::string peer_holder_;
     std::vector<std::int32_t> shared_prefix_tokens_;
-    CacheCoordinator::SessionAccess session_access_;
+    SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};

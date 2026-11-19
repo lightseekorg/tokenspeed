@@ -165,7 +165,7 @@ def _assert_bitwise(out, scratch, expected_out, expected_scratch):
             assert torch.equal(a.view(torch.int32), e.view(torch.int32))
 
 
-@pytest.mark.parametrize("output_size", [3648, 6288])
+@pytest.mark.parametrize("output_size", [3648, 3808, 6288])
 @pytest.mark.parametrize("tokens", [5, 8, 16])
 @pytest.mark.parametrize("num_blocks", [1, 6, 11])
 def test_gemv_tokens_match_unfused_projection_and_partials_bitwise(

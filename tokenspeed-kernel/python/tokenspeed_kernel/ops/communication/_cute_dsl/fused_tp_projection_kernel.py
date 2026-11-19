@@ -51,7 +51,7 @@ that completion also retires reads of the owner's input. Those buckets can
 reuse the same input layout without another peer join. Layout changes and
 kernels that skip padding retain the acknowledgement join.
 
-Node-local GB300 GPUs use prepared row buckets, aligned widths, and a fixed,
+Node-local SM100/SM103 GPUs use prepared row buckets, aligned widths, and a fixed,
 fully resident grid on idle GPUs. Column and row projections use their own
 bucket ladders; remote stores split GEMM tiles at owner boundaries.
 Input staging zero-fills each owner's row tail, and final stores write only
@@ -252,7 +252,7 @@ def _publish_epoch_async(
 class FusedTPProjectionKernel:
     """Fuse row/column-sharded BF16 or block-FP8 GEMM and output exchange.
 
-    Use 64x128 or 128x128 tiles on node-local GB300 peers.
+    Use 64x128 or 128x128 tiles on node-local SM100/SM103 peers.
 
     Selected row buckets pair adjacent N tiles to share TMA loads of A.
     A fully resident grid and warp specialization overlap TMA,
@@ -350,6 +350,7 @@ class FusedTPProjectionKernel:
         self.num_ctas = 0
         self.gemm_ctas = 0
         self.num_cta_flags = 0
+        self.epoch_bank_offset = 0
         self.large_row_bucket = False
         self.reduction_rows = 32
         self.use_input_multicast = use_input_multicast
@@ -730,6 +731,7 @@ class FusedTPProjectionKernel:
 
         # Setup attributes that dependent on gemm inputs
         self.num_cta_flags = ready.shape[0] - 16
+        self.epoch_bank_offset = (ready.shape[0] + 15) // 16 * 16
         self.input_phase_clear = (
             self.quantized
             and self.row_parallel
@@ -4852,7 +4854,8 @@ class FusedTPProjectionKernel:
             )
             if arrivals == self.num_ctas - 1:
                 _publish_input_epoch(
-                    notice + cutlass.Int64((176 + rank * 16) * 8), epoch
+                    notice + cutlass.Int64((self.epoch_bank_offset + rank * 16) * 8),
+                    epoch,
                 )
             cute.arch.mbarrier_arrive(barriers + 4)
 
@@ -4866,7 +4869,7 @@ class FusedTPProjectionKernel:
                 scope="gpu",
             )
             band = tile_m // 2
-            slot = 176 + band // 2 * 16
+            slot = self.epoch_bank_offset + band // 2 * 16
             if band % 2 == 0:
                 slot += 2
             address = flags.iterator + slot
@@ -5086,7 +5089,9 @@ class FusedTPProjectionKernel:
                         flags.iterator + 3, cutlass.Int64(0), sem="relaxed", scope="gpu"
                     )
                     _publish_input_epoch(
-                        notify_address + cutlass.Int64((178 + rank * 16) * 8), epoch
+                        notify_address
+                        + cutlass.Int64((self.epoch_bank_offset + rank * 16 + 2) * 8),
+                        epoch,
                     )
                     cute.arch.store(flags.iterator, epoch, sem="release", scope="gpu")
                 elif cutlass.const_expr(
@@ -5106,11 +5111,15 @@ class FusedTPProjectionKernel:
                     cute.arch.store(flags.iterator, epoch, sem="relaxed", scope="gpu")
                     if cutlass.const_expr(len(input_peers) == 2):
                         _publish_epoch_async(
-                            notify_address + cutlass.Int64((176 + rank * 16) * 8), epoch
+                            notify_address
+                            + cutlass.Int64((self.epoch_bank_offset + rank * 16) * 8),
+                            epoch,
                         )
                     else:
                         _publish_input_epoch(
-                            notify_address + cutlass.Int64((176 + rank * 16) * 8), epoch
+                            notify_address
+                            + cutlass.Int64((self.epoch_bank_offset + rank * 16) * 8),
+                            epoch,
                         )
                 else:
                     cute.arch.store(flags.iterator, epoch, sem="release", scope="sys")
@@ -5512,7 +5521,7 @@ class FusedTPProjectionKernel:
             if cutlass.const_expr(self.native_input_multicast):
                 # The state already reserves one local multicast cache line
                 # per owner. Keep SYS acquire for the cross-GPU publisher.
-                address = flags.iterator + 176 + owner * 16
+                address = flags.iterator + self.epoch_bank_offset + owner * 16
             else:
                 address = peer_flags[0].iterator
                 for peer in cutlass.range_constexpr(len(peer_flags)):
@@ -5647,7 +5656,9 @@ class FusedTPProjectionKernel:
                 cute.arch.barrier()
                 if tid == 0:
                     _publish_epoch_async(
-                        notify_address + cutlass.Int64((177 + rank * 16) * 8), epoch
+                        notify_address
+                        + cutlass.Int64((self.epoch_bank_offset + rank * 16 + 1) * 8),
+                        epoch,
                     )
         copy_in = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
@@ -5663,7 +5674,9 @@ class FusedTPProjectionKernel:
                 # An overlapping output can cover input rows another CTA is
                 # still staging. Acquire this owner's final input publication.
                 if tid == 0:
-                    address = local_input_flags.iterator + 176 + rank * 16
+                    address = (
+                        local_input_flags.iterator + self.epoch_bank_offset + rank * 16
+                    )
                     arrival = cute.arch.load(
                         address, cutlass.Int64, sem="acquire", scope="sys"
                     )
@@ -5932,7 +5945,9 @@ class FusedTPProjectionKernel:
                 elif cutlass.const_expr(self.row_parallel and self.use_input_multicast):
                     cute.arch.store(ack.iterator, epoch, sem="relaxed", scope="gpu")
                     _publish_epoch_async(
-                        notify_address + cutlass.Int64((176 + rank * 16 + 1) * 8), epoch
+                        notify_address
+                        + cutlass.Int64((self.epoch_bank_offset + rank * 16 + 1) * 8),
+                        epoch,
                     )
                 else:
                     cute.arch.store(ack.iterator, epoch, sem="release", scope="sys")

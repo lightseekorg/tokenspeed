@@ -79,6 +79,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = 512
 cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
 cfg.num_device_pages = 64
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [
@@ -97,6 +98,7 @@ fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
         session_id: String::new(),
         cache_group_id: String::new(),
         shared_prefix_tokens: Vec::new(),
+        peer_holder: String::new(),
         request_id: request_id.to_owned(),
         tokens,
         max_new_tokens: 4,
@@ -173,6 +175,7 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
         .submit_requests(&[spec("long", (1..=52).collect()), queued])
         .unwrap();
 
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 54);
     for prefix in (0..52).step_by(8) {
         let probe = scheduler.probe_prefill_gate();
         assert!(probe.wants_prefill, "prefix {prefix}");
@@ -182,6 +185,10 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
         assert_eq!(batches[0].request_ids, ["long"]);
         assert_eq!(batches[0].extend_prefix_lens, [prefix]);
         assert_eq!(batches[0].input_lengths, [(52 - prefix).min(8)]);
+        assert_eq!(
+            scheduler.sizes().pending_prefill_tokens,
+            i64::from((52 - prefix - 8).max(0) + 2)
+        );
         assert!(plan.aborts().is_empty());
         scheduler
             .advance(&[event(
@@ -214,6 +221,42 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
 }
 
 #[test]
+fn pending_prefill_tokens_use_the_queued_prompts_observed_cache_hit() {
+    interpreter();
+    let code = NEW_SCHEDULER.replace(
+        "max_scheduled_tokens = 512",
+        "max_scheduled_tokens = 64\ncfg.enable_short_prefill_first = True",
+    );
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+    scheduler
+        .submit_requests(&[spec("seed", (0..32).collect())])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[
+            event(ForwardEventKind::ExtendResult, "seed", vec![42]),
+            event(ForwardEventKind::Finish, "seed", Vec::new()),
+        ])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .submit_requests(&[
+            spec("cold", (1000..1064).collect()),
+            spec("hot", (0..128).collect()),
+        ])
+        .unwrap();
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 192);
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["cold"]);
+    assert_eq!(scheduler.sizes().waiting, 1);
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 96);
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "hot", Vec::new())])
+        .unwrap();
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 0);
+}
+
+#[test]
 fn a_request_runs_from_prefill_to_finish() {
     interpreter();
     let mut scheduler =
@@ -224,11 +267,13 @@ fn a_request_runs_from_prefill_to_finish() {
         .unwrap();
     let sizes = scheduler.sizes();
     assert_eq!((sizes.waiting, sizes.running), (1, 0));
+    assert_eq!(sizes.pending_prefill_tokens, 10);
 
     let plan = scheduler.next_execution_plan(true, false);
     let batches = plan.forward_batches();
     assert_eq!(batches.len(), 1);
     assert_eq!(scheduler.sizes().running, 1);
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 0);
     let prefill = &batches[0];
     assert_eq!(prefill.request_ids, ["r1"]);
     assert_eq!(
@@ -363,7 +408,7 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
         "Scheduler::scheduleLocalPrefillWork",
         "Scheduler::schedulePrefillFirstChunk",
         "Scheduler::matchPrefixAtAdmission",
-        "CacheCoordinator::ProbePromptPrefix",
+        "PrefixProber::ProbePromptPrefix",
         "CacheCoordinator::Admit",
         "planAdmission",
         "AdmissionPlanner::fitWithEviction",
@@ -505,6 +550,7 @@ cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
 cfg.num_snapshot_pages = 1
 cfg.max_scheduled_tokens = 8
 cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
 cfg.disable_l2_cache = False
 cfg.enable_l3_storage = True
 cfg.storage_config = ts.StorageConfig(
@@ -737,6 +783,105 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
         (1, 1, 0)
     );
     assert_eq!(python_transfer_view(plan, "remote_prefill"), rows);
+}
+
+#[test]
+fn decode_slot_counts_distinguish_resident_ready_and_draining_work() {
+    interpreter();
+    let code = pd_scheduler("D")
+        .replace("max_batch_size = 8", "max_batch_size = 2")
+        .replace("max_resident_requests = 8", "max_resident_requests = 4");
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+    scheduler
+        .submit_requests(&[
+            spec("a", vec![1, 2]),
+            spec("b", vec![3, 4]),
+            spec("c", vec![5, 6]),
+            spec("d", vec![7, 8]),
+            spec("queued", vec![9, 10]),
+        ])
+        .unwrap();
+    for rid in ["a", "b", "c", "d", "queued"] {
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, rid, vec![])])
+            .unwrap();
+    }
+    for rid in ["a", "b", "c", "d"] {
+        let transfer = scheduler
+            .next_execution_plan(true, false)
+            .remote_prefill_transfer()
+            .unwrap();
+        assert_eq!(transfer.request_ids, [rid]);
+    }
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (4, 0, 0)
+    );
+    // The old load counters keep their existing meanings: unadmitted work
+    // waits, and remote prefills do not count as a running decode batch.
+    assert_eq!(
+        (sizes.running, sizes.waiting, sizes.remote_prefilling),
+        (0, 1, 4)
+    );
+    assert!(scheduler
+        .next_execution_plan(true, false)
+        .remote_prefill_transfer()
+        .is_none());
+    for rid in ["a", "b", "c", "d"] {
+        scheduler
+            .advance(&[ForwardEvent {
+                bootstrap_token: 42,
+                ..event(ForwardEventKind::PdRemotePrefillDone, rid, vec![])
+            }])
+            .unwrap();
+    }
+    assert_eq!(scheduler.sizes().ready_waiting, 4);
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["a", "b"]);
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (4, 2, 2)
+    );
+    assert_eq!(
+        (sizes.running, sizes.waiting, sizes.remote_prefilling),
+        (4, 1, 0),
+        "ready requests retain their existing contribution to the load report"
+    );
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "a", vec![])])
+        .unwrap();
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (4, 2, 2),
+        "an aborted in-flight forward still owns its request slot and decode permit"
+    );
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "a", vec![43])])
+        .unwrap();
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (3, 1, 2)
+    );
 }
 
 #[test]
@@ -1343,6 +1488,7 @@ fn python_event_lists_keep_their_payload_after_cache_clear() {
         py.run(
             c"events = scheduler.drain_kv_events()\n\
               assert [e.kind for e in events] == ['BlockStored'] * 3\n\
+              assert [e.medium for e in events] == [None] * 3\n\
               hashes = [e.block_hashes[0] for e in events]\n\
               assert [e.parent_block_hash for e in events] == [None, *hashes[:-1]]\n\
               assert scheduler.clear_cache()\n\

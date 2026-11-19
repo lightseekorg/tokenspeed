@@ -926,6 +926,12 @@ class GlmDsaSparseAttentionMixin:
             and cached.candidate_lens_cpu is not None
             and cached.row_starts.numel() == num_prefill_tokens
         ):
+            # Every candidate is the selection whatever the layer: the last layer's stands.
+            if ctx.attn_backend.cache_placement(self.attn_mqa) is None and (
+                num_prefill_tokens == 0
+                or int(cached.candidate_lens_cpu.max()) <= self.index_topk
+            ):
+                return cached
             return self._compute_prefill_topk_indices_portable(
                 indexer_output=indexer_output,
                 ctx=ctx,

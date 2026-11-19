@@ -95,6 +95,31 @@ def _launch(executor):
     executor.host.launch(torch.cuda.current_stream().cuda_stream)
 
 
+def test_candidate_copy_precedes_in_place_input_packing():
+    bs, width = 2, 4
+    executor = _executor(max_bs=bs, tokens_per_req=width)
+    executor.add_batch(
+        grammars=[None] * bs,
+        bs=bs,
+        has_candidates=True,
+        output_layout=ForwardOutputLayout(0, 0, bs, width),
+    )
+    source = torch.arange(bs * width, dtype=torch.int32, device="cuda")
+    packed = source.flip(0).contiguous()
+    expected = source.view(bs, width).cpu()
+
+    # Delay the old side-stream D2H so the main stream's in-place packing
+    # would win unless schedule_fill orders the candidate copy first.
+    with torch.cuda.stream(executor.stream):
+        torch.cuda._sleep(100_000_000)
+    executor.schedule_fill(source, candidate_start=0)
+    source.copy_(packed)
+    executor.wait_bitmask()
+    torch.cuda.synchronize()
+
+    assert torch.equal(executor.candidates[:bs].cpu(), expected)
+
+
 def test_host_node_advances_and_fills_without_the_gil(compile_grammar):
     compiled = compile_grammar('root ::= "a" ("b" | "c")* "}"')
     executor = _executor(max_bs=1)

@@ -39,9 +39,9 @@ transfer registration through it and a wake restores it.
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import json
 import os
-import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -54,6 +54,8 @@ from tokenspeed.runtime.utils.network import (
     get_local_ip_by_remote,
     is_valid_ipv6_address,
     join_host_port,
+    resolve_host,
+    split_host_port,
 )
 
 if TYPE_CHECKING:
@@ -351,7 +353,13 @@ def kv_bootstrap_address(server_args) -> tuple[str, int]:
     ``--disaggregation-bootstrap-port``. Its ranks register there, and a
     frontend sends the decode side there with each request."""
     if server_args.dist_init_addr:
-        host = socket.gethostbyname(server_args.dist_init_addr.split(":")[0])
+        host = resolve_host(split_host_port(server_args.dist_init_addr)[0])
+        # A loopback rendezvous (a one-node deployment) is no address for a
+        # decode on another host: declare this host's routable IP instead
+        # (TOKENSPEED_HOST_IP when set). The bootstrap server binds every
+        # address, so the ranks still register.
+        if ipaddress.ip_address(host.split("%", 1)[0]).is_loopback:
+            host = get_ip()
     else:
         host = get_ip()
     return host, server_args.disaggregation_bootstrap_port

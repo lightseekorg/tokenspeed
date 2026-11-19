@@ -77,6 +77,62 @@ unsafe extern "C" fn write_pages(
     0
 }
 
+/// The last span READ: (target, sources, destinations, lengths), as the C
+/// entry point names them: `sources` on the peer, `destinations` local.
+type SpanRead = (String, Vec<u64>, Vec<u64>, Vec<u64>);
+static LAST_SPAN_READ: std::sync::Mutex<Option<SpanRead>> = std::sync::Mutex::new(None);
+
+unsafe extern "C" fn read(
+    _: *mut c_void,
+    target: *const c_char,
+    sources: *const u64,
+    destinations: *const u64,
+    lengths: *const u64,
+    count: usize,
+) -> c_int {
+    // SAFETY: Engine::read passes columns of `count` entries.
+    let read = unsafe {
+        (
+            CStr::from_ptr(target).to_str().unwrap().to_owned(),
+            std::slice::from_raw_parts(sources, count).to_vec(),
+            std::slice::from_raw_parts(destinations, count).to_vec(),
+            std::slice::from_raw_parts(lengths, count).to_vec(),
+        )
+    };
+    *LAST_SPAN_READ.lock().unwrap() = Some(read);
+    0
+}
+
+/// The last page READ: (target, source pages, destination pages, fields,
+/// batch size).
+type PageRead = (String, Vec<i64>, Vec<i64>, Vec<i64>, usize);
+static LAST_PAGE_READ: std::sync::Mutex<Option<PageRead>> = std::sync::Mutex::new(None);
+
+unsafe extern "C" fn read_pages(
+    _: *mut c_void,
+    target: *const c_char,
+    src_pages: *const i64,
+    dst_pages: *const i64,
+    num_pages: usize,
+    fields: *const i64,
+    num_fields: usize,
+    max_batch_size: usize,
+) -> c_int {
+    // SAFETY: Engine::read_pages passes columns of the counts it states.
+    let read = unsafe {
+        (
+            CStr::from_ptr(target).to_str().unwrap().to_owned(),
+            std::slice::from_raw_parts(src_pages, num_pages).to_vec(),
+            std::slice::from_raw_parts(dst_pages, num_pages).to_vec(),
+            std::slice::from_raw_parts(fields, num_fields * 5).to_vec(),
+            max_batch_size,
+        )
+    };
+    *LAST_PAGE_READ.lock().unwrap() = Some(read);
+    0
+}
+
+/// A library of ABI version 1 from before the READ entries.
 fn library() -> Arc<Library> {
     Arc::new(Library {
         path: PathBuf::from("test-process"),
@@ -87,9 +143,84 @@ fn library() -> Arc<Library> {
         unregister,
         write,
         write_pages,
+        read: None,
+        read_pages: None,
         // All function pointers above live in this test process.
         _library: libloading::os::unix::Library::this().into(),
     })
+}
+
+/// A library with the READ entries.
+fn library_with_reads() -> Arc<Library> {
+    Arc::new(Library {
+        path: PathBuf::from("test-process"),
+        create,
+        destroy,
+        rpc_port,
+        register,
+        unregister,
+        write,
+        write_pages,
+        read: Some(read),
+        read_pages: Some(read_pages),
+        _library: libloading::os::unix::Library::this().into(),
+    })
+}
+
+#[test]
+fn a_library_without_reads_refuses_a_read_and_says_so() {
+    let library = library();
+    assert!(!library.reads());
+    let engine = Engine::start(library, "127.0.0.1", "rdma", "").unwrap();
+    assert!(matches!(
+        engine.read_pages("peer:1", &PageGrid::default(), 0),
+        Err(Error::NoReads(_))
+    ));
+    assert!(matches!(
+        engine.read("peer:1", &[], &[], &[]),
+        Err(Error::NoReads(_))
+    ));
+}
+
+#[test]
+fn a_span_read_takes_the_peers_addresses_as_its_sources() {
+    let engine = Engine::start(library_with_reads(), "127.0.0.1", "rdma", "").unwrap();
+    engine
+        .read("peer:1", &[0x1000, 0x2000], &[0x9000, 0xa000], &[64, 32])
+        .unwrap();
+    assert_eq!(
+        LAST_SPAN_READ.lock().unwrap().clone(),
+        Some((
+            "peer:1".to_owned(),
+            vec![0x1000, 0x2000],
+            vec![0x9000, 0xa000],
+            vec![64, 32]
+        )),
+        "the C entry point takes the peer's sources first and the local destinations second"
+    );
+}
+
+#[test]
+fn a_page_read_takes_the_peers_pages_as_its_source() {
+    let library = library_with_reads();
+    assert!(library.reads());
+    let engine = Engine::start(library, "127.0.0.1", "rdma", "").unwrap();
+    let grid = PageGrid {
+        src_pages: vec![7, 9],
+        dst_pages: vec![1, 2],
+        fields: vec![[1000, 64, 2000, 32, 16]],
+    };
+    engine.read_pages("peer:1", &grid, 8).unwrap();
+    assert_eq!(
+        LAST_PAGE_READ.lock().unwrap().clone(),
+        Some((
+            "peer:1".to_owned(),
+            vec![7, 9],
+            vec![1, 2],
+            vec![1000, 64, 2000, 32, 16],
+            8
+        ))
+    );
 }
 
 #[test]

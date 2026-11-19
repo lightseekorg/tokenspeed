@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    index_k_scale_ue8m0,
+    index_k_scale_value,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     _index_k_layernorm_fp8_scatter_args,
     _index_k_layernorm_fp8_scatter_row,
@@ -645,6 +649,7 @@ def _index_k_write_quantize_query_kernel(
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
     MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
     DIM: tl.constexpr,
     HEADS_PER_PROGRAM: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -693,6 +698,7 @@ def _index_k_write_quantize_query_kernel(
             BLOCK_NG,
             FP8_MAX,
             MXFP4,
+            UE8M0,
         )
 
 
@@ -878,6 +884,7 @@ def _dsa_decode_logits_fp8_kernel(
     max_seq_len,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    UE8M0: tl.constexpr,
     num_groups: tl.constexpr,
     softmax_scale: tl.constexpr,
     q_len_per_req: tl.constexpr,
@@ -946,11 +953,14 @@ def _dsa_decode_logits_fp8_kernel(
                     mask=valid[:, None] & (dims[None, :] < head_dim),
                     other=0.0,
                 ).to(tl.float32)
-                k_scale = tl.load(
-                    index_k_scale + scale_base + dim_start // 128,
-                    mask=valid,
-                    other=0.0,
-                ).to(tl.float32)
+                k_scale = index_k_scale_value(
+                    tl.load(
+                        index_k_scale + scale_base + dim_start // 128,
+                        mask=valid,
+                        other=0,
+                    ),
+                    UE8M0,
+                )
                 head_score += tl.sum(
                     k_vals * k_scale[:, None] * q_vals[None, :], axis=1
                 )
@@ -991,6 +1001,7 @@ def _dsa_prefill_logits_fp8_kernel(
     page_stride_bytes: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    UE8M0: tl.constexpr,
     num_groups: tl.constexpr,
     softmax_scale: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1034,11 +1045,14 @@ def _dsa_prefill_logits_fp8_kernel(
                 mask=valid[:, None] & (dims[None, :] < head_dim),
                 other=0.0,
             ).to(tl.float32)
-            k_scale = tl.load(
-                index_k_scale + scale_base + dim_start // 128,
-                mask=valid,
-                other=0.0,
-            ).to(tl.float32)
+            k_scale = index_k_scale_value(
+                tl.load(
+                    index_k_scale + scale_base + dim_start // 128,
+                    mask=valid,
+                    other=0,
+                ),
+                UE8M0,
+            )
             head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
         scores += (
             tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL) * head_weight
@@ -1690,7 +1704,7 @@ def dsa_decode_topk_fp8(
     _dsa_decode_logits_fp8_kernel[grid](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        index_k_cache.view(torch.int32),
         weights,
         seq_lens,
         block_table,
@@ -1707,6 +1721,7 @@ def dsa_decode_topk_fp8(
         max_seq_len=max_seq_len,
         num_heads=q.shape[1],
         head_dim=q.shape[2],
+        UE8M0=index_k_scale_ue8m0(),
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
         q_len_per_req=q_len_per_req,
@@ -1801,7 +1816,7 @@ def dsa_prefill_topk_fp8(
         _dsa_prefill_logits_fp8_kernel[grid](
             q[start:end],
             index_k_cache.view(torch.float8_e4m3fn),
-            index_k_cache.view(torch.float32),
+            index_k_cache.view(torch.int32),
             weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
@@ -1814,6 +1829,7 @@ def dsa_prefill_topk_fp8(
             page_stride_bytes=page_stride_bytes,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
+            UE8M0=index_k_scale_ue8m0(),
             num_groups=q.shape[2] // 128,
             softmax_scale=float(softmax_scale),
             BLOCK_N=block_n,

@@ -745,17 +745,20 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
         ),
     )
     groups = tuple(group for group, _ in recipe.groups())
-    attention_registry._validate_hybrid_kvp_cache(
-        SimpleNamespace(cache_group_specs=groups),
-        kvp_size=8,
-    )
-    with pytest.raises(ValueError, match="full-history cache group"):
+
+    def validate(cache_groups):
         attention_registry._validate_hybrid_kvp_cache(
             SimpleNamespace(
-                cache_group_specs=tuple(g for g in groups if g.attn_kind == "state")
+                cache_group_specs=cache_groups,
+                memory_plan=SimpleNamespace(fields=()),
             ),
             kvp_size=8,
+            num_target_layers=0,
         )
+
+    validate(groups)
+    with pytest.raises(ValueError, match="full-history cache group"):
+        validate(tuple(g for g in groups if g.attn_kind == "state"))
 
     window_only = tuple(
         (
@@ -766,10 +769,7 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
         for g in groups
     )
     with pytest.raises(ValueError, match="full-history cache group"):
-        attention_registry._validate_hybrid_kvp_cache(
-            SimpleNamespace(cache_group_specs=window_only),
-            kvp_size=8,
-        )
+        validate(window_only)
 
     history = next(g for g in groups if g.attn_kind != "state")
     for shard_count in (1, 8):
@@ -781,10 +781,7 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
             shard_count=shard_count,
         )
         with pytest.raises(ValueError, match="must be a full-history group"):
-            attention_registry._validate_hybrid_kvp_cache(
-                SimpleNamespace(cache_group_specs=(*groups, window)),
-                kvp_size=8,
-            )
+            validate((*groups, window))
 
 
 def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:

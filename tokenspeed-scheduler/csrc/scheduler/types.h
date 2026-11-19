@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -99,6 +100,8 @@ struct SchedulerConfig {
     // all local prefill requests in one batch. Zero leaves this unbounded.
     std::int32_t max_kv_page_num{0};
     std::int32_t max_batch_size{};
+    // Real request-pool rows, independently of the execution batch limit.
+    std::int32_t max_resident_requests{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports
@@ -107,6 +110,9 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Sharing cached prefixes with other replicas
+    // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
+    std::optional<PeerConfig> peer_config;
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};

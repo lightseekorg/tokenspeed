@@ -96,7 +96,7 @@ class UnloadedExperts(nn.Module):
 def build_layer(monkeypatch, *, alt_stream):
     """An attention-DP Kimi-K3 MoE block with packed projection weights."""
     if not (current_platform().is_nvidia and kimi3_latent_front.available()):
-        pytest.skip("requires an SM100/SM103 part with 148 or 152 SMs")
+        pytest.skip("requires an SM100/SM103 device")
     # Imported after the skip: the CuTe DSL runner needs the NVIDIA toolchain.
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 

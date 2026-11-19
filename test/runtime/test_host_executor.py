@@ -24,6 +24,9 @@ from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
 
 # Pure Python, no runtime dependencies: the knobs of an L2-only executor.
 from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
+    TorchMemorySaverAdapter,
+)
 
 NO_POOL = RetractionPoolRequest(
     host_gb=0.0, ratio=0.0, max_retracted_requests=0, tail_lcm_blocks_per_request=0
@@ -65,7 +68,9 @@ def _replicated_contract(layout, *, num_lcm_blocks=None):
 def _synthetic_arena(layout):
     contract = _replicated_contract(layout)
     return SimpleNamespace(
-        cache_group_specs=contract.group_specs, runtime_contract=contract
+        cache_group_specs=contract.group_specs,
+        runtime_contract=contract,
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
 
 
@@ -115,7 +120,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
-    scheduler = ModuleType("tokenspeed_scheduler")
+    scheduler = ModuleType("tokenspeed_engine.scheduler")
 
     class Cache:
         class WriteBackOp:
@@ -158,7 +163,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     runtime_utils.get_device_module = Mock(return_value=Mock())
     fake_modules = {
         "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
-        "tokenspeed_scheduler": scheduler,
+        "tokenspeed_engine.scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
         "tokenspeed.runtime.cache.host_storage": storage,
         "tokenspeed.runtime.cache.transfer.lanes": lanes,
@@ -233,6 +238,7 @@ class TestGroupAwareWireTest:
         executor._load_poisoned = False
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
+        executor._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(
             buffers=(SimpleNamespace(device=device),),
@@ -446,7 +452,9 @@ class TestGroupAwareWireTest:
         # is the lane's, the executor only picks which lane an op rides.
         for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
             with patch.object(lanes_module, "HostTransferWorkspace", Mock):
-                lane = lanes_module.HostTransferLane()
+                lane = lanes_module.HostTransferLane(
+                    TorchMemorySaverAdapter.create(enable=False)
+                )
             lane.workspace.load_block_transfers.return_value = (1, (0, 1))
             lane.workspace.prepare_backend.return_value = SimpleNamespace(
                 uses_device_tables=True,
@@ -923,6 +931,9 @@ class TestGroupAwareWireTest:
         )
         draft_layout = SimpleNamespace(consumers=(("draft.0.k",),))
         target_pool = Mock()
+        target_pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False
+        )
         target_pool.cache_transfer_layout.return_value = target_layout
         target_pool.arena.runtime_contract = _replicated_contract(
             combined_layout, num_lcm_blocks=11
@@ -1024,6 +1035,7 @@ class TestGroupAwareWireTest:
         HostCacheExecutor = executor_module.HostCacheExecutor
 
         pool = Mock()
+        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pool.arena.runtime_contract = SimpleNamespace(
             group_specs=(
                 SimpleNamespace(
@@ -1124,7 +1136,7 @@ class TestGroupAwareWireTest:
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
             "tokenspeed_kernel.ops.kvcache.host_transfer",
-            "tokenspeed_scheduler",
+            "tokenspeed_engine.scheduler",
             "tokenspeed.runtime.cache.l2.layerwise_load",
             "tokenspeed.runtime.cache.host_storage",
             "tokenspeed.runtime.cache.transfer.lanes",
@@ -1383,6 +1395,7 @@ class TestHostMemoryShareTest:
             payload_bytes=16,
         )
         pool = Mock()
+        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pool.cache_transfer_layout.return_value = SimpleNamespace(
             num_lcm_blocks=device_lcm_blocks,
             buffers=(SimpleNamespace(device=SimpleNamespace(type="cuda")),),
@@ -2309,7 +2322,9 @@ class TestCompactLayoutRoundTripTest:
             token_capacity=4,
         )
         arena = SimpleNamespace(
-            cache_group_specs=contract.group_specs, runtime_contract=contract
+            cache_group_specs=contract.group_specs,
+            runtime_contract=contract,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
         )
 
         class WriteBackOp:

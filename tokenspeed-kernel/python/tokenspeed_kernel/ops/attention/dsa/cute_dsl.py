@@ -55,6 +55,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -84,6 +85,7 @@ def _ts_supported_arch() -> bool:
 _CUTE_DSL_TOPK_AVAILABLE = False
 _ClusterRunner = None
 _BaseRunner = None
+_topk_runner = None
 
 if _ts_supported_arch():
     try:
@@ -95,6 +97,7 @@ if _ts_supported_arch():
         from tokenspeed_kernel.thirdparty.cute_dsl.topk import (
             CuteDSLTopKDecodeSinglePassMultiCTARunner as _BaseRunner,
         )
+        from tokenspeed_kernel.thirdparty.cute_dsl.topk import runner as _topk_runner
 
         _CUTE_DSL_TOPK_AVAILABLE = True
     except ImportError:
@@ -116,6 +119,7 @@ def cute_dsl_decode_topk(
     *,
     next_n: int = 1,
     out: torch.Tensor | None = None,
+    scan_cols: int | None = None,
 ) -> torch.Tensor:
     """Length-aware per-row top-k over a dense indexer-logits matrix.
 
@@ -128,6 +132,10 @@ def cute_dsl_decode_topk(
         topk: Candidates to select per row (1..2048).
         next_n: Query rows per request (speculative ``q_len_per_req``); 1 for decode.
         out: Optional int32 ``[num_rows, topk]`` buffer, written in place and returned.
+        scan_cols: Columns any row can read, when ``logits`` carries allocation
+            padding past them (DeepGEMM pads rows to its KV split). The CTA
+            split then follows these columns, not the padded width, whose
+            rounding would otherwise halve the CTAs per row.
 
     Returns:
         int32 ``[num_rows, topk]`` of per-row selected column indices (unsorted).
@@ -157,6 +165,17 @@ def cute_dsl_decode_topk(
 
     logits = logits.contiguous()
     seq_lens = seq_lens.to(device=logits.device, dtype=torch.int32).contiguous()
+    chunk_size = None
+    num_cols = logits.shape[1]
+    if scan_cols is not None and 0 < scan_cols < num_cols:
+        # The base heuristic's split for the real width; the cluster runner
+        # clamps an explicit chunk to its capacity the same way for both.
+        dtype = _topk_runner._TORCH_TO_CUTLASS_DTYPE[logits.dtype]
+        _, ctas, vec = _BaseRunner._get_chunk_config(
+            dtype, int(scan_cols), None, num_rows=num_rows
+        )
+        chunk_size = -(-num_cols // ctas)
+        chunk_size = -(-chunk_size // vec) * vec
 
     if out is not None:
         if out.shape != (num_rows, topk):
@@ -176,6 +195,7 @@ def cute_dsl_decode_topk(
         topk,
         next_n,
         return_val=False,
+        chunk_size=chunk_size,
         output_indices=out,
     )
     if indices is None:
@@ -187,6 +207,7 @@ def cute_dsl_decode_topk(
             topk,
             next_n,
             return_val=False,
+            chunk_size=chunk_size,
             output_indices=out,
         )
     return indices
@@ -763,3 +784,127 @@ if _decode_front is not None:
             float(softmax_scale),
         )
         return q_norm, projected, q_fp8, weights
+
+
+# Owned selection: a KVP rank's share of the merged top-k in one launch.
+
+if _fused_indexer is not None:
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl.owned_selection import (
+        cute_dsl_select_owned_from_gathered,
+        owned_selection_supported,
+    )
+
+    @register_kernel(
+        "attention",
+        "dsa_select_owned_candidates",
+        name="cute_dsl_dsa_select_owned_candidates",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {format_signature(scores=dense_tensor_format(torch.float32))}
+        ),
+        traits={
+            "topk": frozenset({512, 1024, 2048}),
+            "problem_filter": frozenset(
+                {
+                    traits_problem_filter(
+                        owned_selection_supported,
+                        "ranks",
+                        "rows",
+                        "topk",
+                        "rank_stride",
+                    )
+                }
+            ),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_dsa_select_owned_candidates(
+        scores: torch.Tensor,
+        positions: torch.Tensor,
+        local_page_table: torch.Tensor,
+        query_requests: torch.Tensor,
+        *,
+        rank: int,
+        topk: int,
+        page_size: int,
+        out: torch.Tensor | None = None,
+        lens_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run ``dsa_select_owned_candidates`` in one launch.
+
+        Serves the sizes ``dsa_select_owned_candidates_supported`` admits.
+
+        Args:
+            scores: FP32 ``[ranks, rows, topk]`` every rank's gathered
+                candidate scores (``-inf`` invalid), rows contiguous; the rank
+                stride may be wider.
+            positions: Int32 ``[rows, topk]`` logical positions of this
+                rank's candidates, rows contiguous.
+            local_page_table: Int32 ``[requests, pages]`` this rank's local
+                pages (``-1`` where not owned), rows contiguous.
+            query_requests: Int32 ``[rows]`` request of every row.
+            rank: This rank's index in ``scores``.
+            topk: Entries selected per row over all ranks.
+            page_size: Tokens per page of ``local_page_table``.
+            out: Optional contiguous int32 ``[rows, topk]`` output.
+            lens_out: Optional contiguous int32 ``[rows]`` output.
+
+        Returns:
+            ``(out, lens_out)``: this rank's kept candidates as local slots
+            in candidate order, ``-1`` after, and their count per row.
+        """
+        degree, rows, width = scores.shape
+        if (
+            width != topk
+            or scores.stride()[1:] != (width, 1)
+            or not owned_selection_supported(
+                ranks=degree, rows=rows, topk=topk, rank_stride=scores.stride(0)
+            )
+        ):
+            raise ValueError(
+                "owned selection needs FP32 [ranks, rows, topk] scores with "
+                "contiguous rows, power-of-two ranks and topk, and every rank's "
+                f"row in registers; got {tuple(scores.shape)} strided "
+                f"{scores.stride()} for top-{topk}"
+            )
+        if not 0 <= rank < degree:
+            raise ValueError(f"rank {rank} is outside {degree} ranks")
+        if any(
+            value.dtype != torch.int32
+            for value in (positions, local_page_table, query_requests)
+        ):
+            raise TypeError(
+                "candidate positions, local pages, and requests must be int32"
+            )
+        if positions.shape != (rows, width) or positions.stride(1) != 1:
+            raise ValueError(
+                "this rank's candidate positions need contiguous [rows, topk] rows"
+            )
+        if local_page_table.stride(1) != 1:
+            raise ValueError("local pages need contiguous rows")
+        if query_requests.shape != (rows,) or not query_requests.is_contiguous():
+            raise ValueError("every row needs its request")
+        if out is None:
+            out = torch.empty((rows, topk), device=scores.device, dtype=torch.int32)
+        if lens_out is None:
+            lens_out = torch.empty((rows,), device=scores.device, dtype=torch.int32)
+        if out.shape != (rows, topk) or not out.is_contiguous():
+            raise ValueError("owned slots need a contiguous [rows, topk] output")
+        if lens_out.shape != (rows,) or not lens_out.is_contiguous():
+            raise ValueError("owned counts need a contiguous [rows] output")
+        return cute_dsl_select_owned_from_gathered(
+            scores,
+            positions,
+            local_page_table,
+            query_requests,
+            rank=rank,
+            topk=topk,
+            page_size=page_size,
+            out=out,
+            lens_out=lens_out,
+        )

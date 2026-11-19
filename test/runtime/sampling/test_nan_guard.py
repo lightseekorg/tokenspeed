@@ -22,18 +22,23 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 NAN = float("nan")
 
 
 def _ctx(bs: int, num_extends: int = 0, width: int = 1):
-    return SimpleNamespace(
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        input_num_tokens=num_extends + (bs - num_extends) * width,
+        forward_mode=ForwardMode.from_num_extends(num_extends, bs),
         bs=bs,
         num_extends=num_extends,
         output_layout=ForwardOutputLayout(
@@ -43,7 +48,9 @@ def _ctx(bs: int, num_extends: int = 0, width: int = 1):
 
 
 def _logits_output(logits: torch.Tensor, layout_plan=None):
-    return SimpleNamespace(next_token_logits=logits, logits_layout_plan=layout_plan)
+    return LogitsProcessorOutput(
+        next_token_logits=logits, logits_layout_plan=layout_plan
+    )
 
 
 def test_audit_logits_flags_per_extend_row():

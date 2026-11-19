@@ -33,6 +33,11 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    index_k_scale_word,
+)
 from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _mxfp4_index_rows,
     _ue8m0_word,
@@ -3531,7 +3536,9 @@ def index_k_block_split_scatter(
         buf: uint8 slot matrix or paged byte view. Pages may have padding
             between them; bytes within each page must be contiguous.
         index_k_fp8: ``[tokens, head_dim]`` FP8 values.
-        index_k_scale: ``[tokens, num_groups]`` float32 scales.
+        index_k_scale: ``[tokens, num_groups]`` scale words in the plane's
+            encoding (``kvcache/index_k_scale.py``): float32 scales, or the
+            int32 UE8M0 words of a Blackwell plane.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
             dtype).
         write_mask: Required explicit ownership mask, or None to write all rows.
@@ -3568,8 +3575,12 @@ def index_k_block_split_scatter(
     if buf.storage_offset() % 4 or page_bytes % 4:
         raise ValueError("Index-K pages must be float32 aligned")
 
+    if index_k_scale.dtype not in (torch.float32, torch.int32):
+        raise ValueError(
+            f"index-K scale words are float32 or int32, got {index_k_scale.dtype}"
+        )
     fp8_buf = buf
-    scale_buf = buf.view(torch.float32)  # aliases the same storage
+    scale_buf = buf.view(index_k_scale.dtype)  # aliases the same storage
     k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
     k_scale = index_k_scale.reshape(-1, ng).contiguous()
 
@@ -3723,6 +3734,7 @@ def _index_k_layernorm_fp8_scatter_row(
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
     MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
 ):
     tl.static_assert(not MXFP4 or (HD == 128 and GROUP == 32))
     g = tl.arange(0, BLOCK_NG)[:, None]
@@ -3769,6 +3781,8 @@ def _index_k_layernorm_fp8_scatter_row(
         )
     else:
         scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+        # The plane's scale-word encoding (kvcache/index_k_scale.py).
+        scale, word = index_k_scale_word(scale, UE8M0)
         codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
         store_mask = mask & write
         tl.store(
@@ -3778,7 +3792,7 @@ def _index_k_layernorm_fp8_scatter_row(
         )
         tl.store(
             scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
-            scale[:, None],
+            word[:, None],
             mask=store_mask,
         )
 
@@ -3804,6 +3818,7 @@ def _index_k_layernorm_fp8_scatter_kernel(
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
     MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
 ):
     _index_k_layernorm_fp8_scatter_row(
         fp8_buf_ptr,
@@ -3826,6 +3841,7 @@ def _index_k_layernorm_fp8_scatter_kernel(
         BLOCK_NG,
         FP8_MAX,
         MXFP4,
+        UE8M0,
     )
 
 
@@ -3892,7 +3908,8 @@ def _index_k_layernorm_fp8_scatter_args(
         raise ValueError("Index-K pages must be float32 aligned")
     args = (
         buf,
-        buf.view(torch.int32 if mxfp4 else torch.float32),
+        # Scale words are stored as int32 in every encoding.
+        buf.view(torch.int32),
         index_k,
         weight.contiguous(),
         bias.contiguous(),
@@ -3912,8 +3929,85 @@ def _index_k_layernorm_fp8_scatter_args(
         "BLOCK_NG": _next_power_of_two(ng),
         "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
         "MXFP4": mxfp4,
+        "UE8M0": not mxfp4 and index_k_scale_ue8m0(),
     }
     return args, constexprs
+
+
+@triton.jit
+def _quantize_index_k_rows_kernel(
+    x_ptr,
+    codes_ptr,
+    words_ptr,
+    x_row_stride,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    UE8M0: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, BLOCK_NG)[:, None]
+    c = tl.arange(0, GROUP)[None, :]
+    d = g * GROUP + c
+    mask = g < NG
+    y = tl.load(x_ptr + t * x_row_stride + d, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+    scale, word = index_k_scale_word(scale, UE8M0)
+    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    tl.store(codes_ptr + t * HD + d, codes, mask=mask)
+    tl.store(words_ptr + t * NG + g, word[:, None], mask=mask)
+
+
+def quantize_index_k_rows(
+    index_k: torch.Tensor, *, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize index keys to ``fp8_scaled`` rows in the plane's encoding.
+
+    Each ``group_size`` group gets the scale ``max(amax, 1e-10) / 448``, in
+    the scale-word encoding of this GPU's planes (``kvcache/index_k_scale.py``),
+    and the E4M3 codes of the clamped quotient: the rows
+    ``index_k_layernorm_fp8_scatter`` writes for already normalized keys, as
+    ``index_k_block_split_scatter`` takes them.
+
+    Args:
+        index_k: ``[tokens, head_dim]`` keys with unit inner stride.
+        group_size: Elements per scale; a power of two dividing ``head_dim``.
+
+    Returns:
+        ``[tokens, head_dim]`` E4M3 codes and ``[tokens, head_dim //
+        group_size]`` scale words (float32 scales, or int32 UE8M0 words).
+    """
+    tokens, head_dim = index_k.shape
+    if index_k.ndim != 2 or index_k.stride(-1) != 1:
+        raise ValueError("index_k must be [tokens, head_dim] with unit inner stride")
+    if group_size <= 0 or head_dim % group_size or group_size & (group_size - 1):
+        raise ValueError(
+            f"group_size {group_size} must be a power of two dividing {head_dim}"
+        )
+    ng = head_dim // group_size
+    codes = torch.empty(
+        (tokens, head_dim), dtype=torch.float8_e4m3fn, device=index_k.device
+    )
+    words = torch.empty(
+        (tokens, ng), dtype=index_k_scale_dtype(), device=index_k.device
+    )
+    if tokens:
+        _quantize_index_k_rows_kernel[(tokens,)](
+            index_k,
+            codes,
+            words.view(torch.int32),
+            index_k.stride(0),
+            HD=head_dim,
+            GROUP=group_size,
+            NG=ng,
+            BLOCK_NG=_next_power_of_two(ng),
+            FP8_MAX=float(torch.finfo(torch.float8_e4m3fn).max),
+            UE8M0=index_k_scale_ue8m0(),
+            num_warps=1,
+        )
+    return codes, words
 
 
 def index_k_layernorm_fp8_scatter(
@@ -3931,10 +4025,11 @@ def index_k_layernorm_fp8_scatter(
 ) -> None:
     """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
 
-    One launch equivalent of ``index_k_block_split_scatter(buf, *fp8(ln(x)),
-    loc, ...)`` where ``ln`` is the FP32 LayerNorm rounded to ``index_k``'s
-    dtype and ``fp8`` gives each ``group_size`` group the scale
-    ``max(amax, 1e-10) / 448`` and the E4M3 codes of the clamped quotient.
+    One launch equivalent of ``index_k_block_split_scatter(buf,
+    *quantize_index_k_rows(ln(x)), loc, ...)`` where ``ln`` is the FP32
+    LayerNorm rounded to ``index_k``'s dtype: each ``group_size`` group gets
+    the scale ``max(amax, 1e-10) / 448`` in the plane's encoding
+    (``kvcache/index_k_scale.py``) and the E4M3 codes of the clamped quotient.
 
     Args:
         buf: uint8 ``index_k_block_split_scatter`` plane: a ``[slots,

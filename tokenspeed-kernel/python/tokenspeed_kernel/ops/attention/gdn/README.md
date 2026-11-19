@@ -20,10 +20,29 @@ the Triton chunked-chain candidate described below.
 Automatic BF16 state-writing verify and ordinary decode require the
 `padding_safe` trait, so the selected kernel preserves the reserved null page.
 The operator owns this policy; runtime code supplies no solution choice.
-Explicit solutions retain their documented padding contract. Read-only verify
+Explicit solutions retain their documented padding contract. Page-strided input
+or output pools require the `strided_state` trait. The portable recurrence
+uses separate runtime strides for its source and destination pools, including
+tree-parent reloads and per-token scatter. Rows themselves remain dense in
+K-last order; the row index is widened before multiplying by the stride. Read-only verify
 uses normal selection, including fallback kernels for
 unsupported WY geometry. It may read the reserved null page for padding, but
 never writes it; padded outputs are ignored.
+
+Decode and verify registrations for Triton, CuTe DSL, Gluon and FlashInfer
+accept `strided_state=True` within their existing execution contracts. The
+operator derives this trait from both state pools, and runtime capability
+queries include the bound input pool's layout. Decode benchmark generators
+allocate contiguous state rows and select with `strided_state=False`, matching
+the operator's dispatch for those inputs. FlashInfer 0.7.4 uses native
+4D pool indexing for padded FP32 state, including final-state writeback and
+per-token scatter; its BF16 MTP path also preserves padded pool strides.
+The CuTe DSL WY leaf remains output-only, and FlashInfer MTP still writes
+within its input pool rather than accepting a separate output pool.
+Far-page GPU tests cover BF16/FP32 MTP reads, writeback, per-token scatter,
+tree verification and direct chain verification beyond 2^31 elements. They
+compare outputs and live states with dense pools and preserve guard regions
+around every state row without traversing the large gaps.
 
 The leaf reads the committed state once per value tile, forms the small WY
 output transform and computes every token's output without writing the state

@@ -82,6 +82,7 @@ def _leaf(pool, rank: int):
         kernel_page_size=None,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_quant_method=None,
         speculative_num_draft_tokens=1,
         attn_tp_rank=rank,

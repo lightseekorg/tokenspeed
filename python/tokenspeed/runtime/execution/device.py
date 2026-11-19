@@ -183,6 +183,7 @@ logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
+    from tokenspeed.runtime.cache.peer import PeerGeometry
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
@@ -343,6 +344,8 @@ class DeviceBuild:
             model, so it must only run after the EPD receive's gate has
             decided the node is a multimodal prefill node. Startup-only, like
             the rest of this object.
+        peer_geometry: With peer prefix sharing, where this rank's cache
+            blocks live, for the host's peer endpoint; None without.
     """
 
     specs: DeviceSpecs
@@ -350,6 +353,7 @@ class DeviceBuild:
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
     encoder_model_facts: Any
+    peer_geometry: PeerGeometry | None
 
 
 class DeviceRole(enum.Enum):
@@ -400,6 +404,7 @@ class DeviceHandle:
         kv_transfer=None,
         weight_memory: WeightMemoryState | None = None,
         forward_reloader: ForwardReloader | None = None,
+        peer_outbox=None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
@@ -422,6 +427,9 @@ class DeviceHandle:
         # forwards and page zeroing as everything else behind this handle.
         self._kv_transfer = kv_transfer
         self._role = _resolve_role(kv_transfer)
+        # With peer prefix sharing, where the host learns that a plan's
+        # landings may be read (``PeerOutbox.reads_ready``); None without.
+        self._peer_outbox = peer_outbox
 
     def bind_forward_thread(self) -> None:
         """Make the calling thread the forward thread: give it the rank's
@@ -535,10 +543,12 @@ class DeviceHandle:
         peer = self._kv_transfer
         remote_decode = execution_plan.remote_decode
         remote_prefill = execution_plan.remote_prefill
+        peer_fetches = self._peer_outbox is not None and execution_plan.has_peer_fetches
         if (
             cache_ops
             or copies
             or pages
+            or peer_fetches
             or remote_decode is not None
             or remote_prefill is not None
             or (planned is not None and self._role is DeviceRole.PD_PREFILL)
@@ -583,6 +593,18 @@ class DeviceHandle:
             # and a draft round still pending from the previous forward began
             # in that forward, behind the waits for that plan's load.
             l2.submit_load_backs(cache_ops, prerequisite_stream=executor.default_stream)
+        peer_fence = None
+        if peer_fetches:
+            # A peer landing's READs write this plan's blocks from outside
+            # the streams, so they start once everything before them that
+            # touches those blocks ran: the forwards in flight (an abort frees
+            # its blocks at once, and this plan may grant one to a landing),
+            # and the stores reading the victims this plan regranted, its
+            # copies and its zeroing, all on the default stream by now. The
+            # landing's own blocks are never zeroed or copied into.
+            executor.default_stream.wait_stream(executor.execution_stream)
+            peer_fence = executor.device_module.Event()
+            peer_fence.record(executor.default_stream)
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
         # handed over asynchronously exactly like the model's ForwardBatch,
@@ -617,6 +639,12 @@ class DeviceHandle:
 
         if remote_prefill is not None:
             self._pull_remote_prefill(remote_prefill, zero_event)
+        if peer_fence is not None:
+            # Behind the forward's launch, as the remote prefill's pull is:
+            # the wait holds the forward thread until the step in flight
+            # ends, and never delays this plan's launch.
+            peer_fence.synchronize()
+            self._peer_outbox.reads_ready()
         return result
 
     @property
@@ -1283,6 +1311,9 @@ def _capture_serving_graphs(
     from tokenspeed.runtime.utils import set_random_seed
 
     executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    if executor.drafter is not None:
+        with startup_phase("drafter.profile"):
+            executor.drafter.profile_startup(executor)
     if replays_prefill_graphs and not executor.prefill_graph.disable:
         # Release capture-stream cache no forward reuses; graph pools are not freed.
         device_module = torch.get_device_module(server_args.device)
@@ -1456,6 +1487,7 @@ def _retraction_pool_request(
     *,
     host_group_packing,
     max_batch_size: int,
+    max_resident_requests: int,
     max_context_len: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
@@ -1486,7 +1518,8 @@ def _retraction_pool_request(
             virtual_packing=host_group_packing,
             limits=SchedulerLimits(
                 role=scheduler_role(server_args.disaggregation_mode),
-                max_live_requests=max_batch_size,
+                max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 max_scheduled_tokens=int(server_args.chunked_prefill_size),
                 max_context_len=max_context_len,
                 decode_input_tokens=decode_input_tokens,
@@ -1517,7 +1550,9 @@ def build_device_side(
     overlap_schedule_depth: int,
     decode_input_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     kv_transfer_builder,
+    peer_outbox,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
 
@@ -1545,13 +1580,16 @@ def build_device_side(
             size the KV budget.
         overlap_schedule_depth: Decode KV reservation depth.
         decode_input_tokens: Tokens each decode step feeds per request.
-        max_batch_size: Rank-local scheduler batch bound; the executor
-            sizes its request pool one row past it for the graph-padding
-            sink row.
+        max_batch_size: Rank-local scheduler execution bound.
+        max_resident_requests: Rank-local request-pool bound. Null row 0 and
+            the graph-padding row sit outside the live range.
         kv_transfer_builder: Builds the PD transfer peer from the finished
             attention build, or returns None outside disaggregation: the
             host's ``build_host_peer`` (``pd/host_peer.py``), bound to the
             outbox its Rust peer reads.
+        peer_outbox: With peer prefix sharing, the host's ``PeerOutbox``,
+            which the handle tells when a plan's landings may be read (see
+            ``cache/peer.py``); None without.
 
     Returns:
         A ``DeviceBuild``. No device object escapes except inside the
@@ -1560,6 +1598,9 @@ def build_device_side(
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
     from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
+    from tokenspeed.runtime.execution.distributed_initializer import (
+        DistributedConfig,
+    )
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
         create_model_executor,
@@ -1577,6 +1618,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.dcp.cache import (
         prepare_prefix_history_transport,
     )
+    from tokenspeed.runtime.layers.attention.dcp.comm import prepare_decode_exchange
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1613,6 +1655,15 @@ def build_device_side(
             [runner.model for runner in (target, draft) if runner is not None],
             torch.device(server_args.device, gpu_id),
         )
+        if server_args.mapping.attn.has_kvp:
+            prepare_decode_exchange(
+                tuple(server_args.mapping.attn.kvp_group),
+                (
+                    server_args.distributed_timeout_seconds
+                    if server_args.distributed_timeout_seconds is not None
+                    else DistributedConfig.distributed_timeout_seconds
+                ),
+            )
     if communication_first:
         prepare_multimodal()
 
@@ -1697,7 +1748,7 @@ def build_device_side(
                 server_args=server_args,
                 model_config=model_config,
                 model=target.model,
-                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
+                max_req_pool_size=RequestSlotLayout(max_resident_requests).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,
@@ -1784,6 +1835,7 @@ def build_device_side(
         views.token_to_kv_pool.arena.runtime_contract,
         host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
+        max_resident_requests=max_resident_requests,
         max_context_len=model_config.context_len + server_args.spec_context_pad,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
@@ -1851,6 +1903,29 @@ def build_device_side(
                 if spec.checkpoint_granularity is not None
                 and spec.checkpoint_granularity > 1
             ),
+        )
+
+    peer_geometry = None
+    if peer_outbox is not None:
+        from tokenspeed.runtime.cache.peer import build_peer_geometry
+
+        if host_cache is None:
+            raise ValueError(
+                "peer prefix sharing needs the Host tier (--enable-kvstore)"
+            )
+        arena = views.token_to_kv_pool.arena
+        peer_geometry = build_peer_geometry(
+            scheduler_group_ids=tuple(
+                spec.group_id for spec in arena.runtime_contract.group_specs
+            ),
+            groups=host_cache.groups,
+            field_addresses={
+                field.field_id: arena.field_address(field.field_id)
+                for group in host_cache.groups
+                for field in group.fields
+            },
+            device_regions=arena.registration_regions(),
+            host_storage=host_cache.storage,
         )
 
     kv_transfer = kv_transfer_builder(
@@ -1935,6 +2010,7 @@ def build_device_side(
 
     return DeviceBuild(
         host_cache=host_cache,
+        peer_geometry=peer_geometry,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,
@@ -1948,6 +2024,7 @@ def build_device_side(
                 if server_args.allow_reload_forward
                 else None
             ),
+            peer_outbox=peer_outbox,
         ),
     )
 

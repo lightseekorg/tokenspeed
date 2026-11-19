@@ -1,10 +1,7 @@
 # FP8 quantization
 
-TRT-LLM providers are optional: their FP8 leaves are registered only when
-`trtllm_kernel` is installed. Importing the common operators remains possible
-without that extension, and directly requesting the TRT-LLM group quantizer
-reports the missing package. Providers that depend on this quantizer, including
-DeepGEMM DSA, follow the same availability requirement.
+The TRT-LLM FP8 providers (the 1x128 token-group and per-token quantizers)
+are built into tokenspeed-kernel's CUDA extension, adapted from TensorRT-LLM.
 
 `quantize_fp8` returns `(values, scales)`. A plain cast has no scales;
 static scaling returns the supplied scale. Dynamic `token` quantization

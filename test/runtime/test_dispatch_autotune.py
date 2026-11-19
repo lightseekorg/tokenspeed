@@ -30,9 +30,11 @@ order of the startup steps -- not the shape of the production source.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal, get_args
@@ -765,6 +767,13 @@ class _ObserverDouble:
         return nullcontext()
 
 
+@dataclass
+class _CaptureConfig:
+    """The ModelExecutorConfig field capture_graphs() reads."""
+
+    enable_cudagraph_gc: bool
+
+
 class _CaptureExecutor:
     """The ModelExecutor state capture_graphs() reads, without the GPU boot."""
 
@@ -774,7 +783,8 @@ class _CaptureExecutor:
     drafter_extend_ladders = ModelExecutor.drafter_extend_ladders
     _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
 
-    def __init__(self, *, forward_step, prefill_graph, drafter):
+    def __init__(self, *, forward_step, prefill_graph, drafter, enable_cudagraph_gc):
+        self.config = _CaptureConfig(enable_cudagraph_gc=enable_cudagraph_gc)
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
@@ -823,6 +833,7 @@ def test_capture_lifecycle_preserves_main_order(
                 extend_graphs=drafter_graphs == "extend", on_capture=capture_draft
             )
         ),
+        enable_cudagraph_gc=False,
     )
     ModelExecutor.capture_graphs(
         executor,
@@ -836,6 +847,133 @@ def test_capture_lifecycle_preserves_main_order(
         *(["draft"] if not prefill_disabled and drafter_graphs is not None else []),
     ]
     reset_workspace_pools()
+
+
+@pytest.fixture
+def unfrozen_heap() -> Iterator[int]:
+    """Yield the freeze count of a heap nothing froze, with fresh workspace pools."""
+    gc.unfreeze()
+    # A collection parks CPython's immortal objects in the permanent generation.
+    gc.collect()
+    reset_workspace_pools()
+    yield gc.get_freeze_count()
+    reset_workspace_pools()
+
+
+def _record_gc_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    for name, real in (
+        ("collect", gc.collect),
+        ("freeze", gc.freeze),
+        ("unfreeze", gc.unfreeze),
+    ):
+
+        def record(
+            *args: int, name: str = name, real: Callable[..., object] = real
+        ) -> object:
+            calls.append(name)
+            return real(*args)
+
+        monkeypatch.setattr(gc, name, record)
+    return calls
+
+
+def _capture_executor(
+    capture: Callable[[str], Callable[..., None]],
+    *,
+    decode_disabled: bool,
+    prefill_disabled: bool,
+    drafter_graphs: Literal["own", "extend"],
+    enable_cudagraph_gc: bool,
+) -> _CaptureExecutor:
+    return _CaptureExecutor(
+        forward_step=_DecodeCaptureDouble(
+            disable=decode_disabled, stream=object(), on_capture=capture("decode")
+        ),
+        prefill_graph=_PrefillCaptureDouble(
+            disable=prefill_disabled, on_capture=capture("prefill")
+        ),
+        drafter=_DrafterCaptureDouble(
+            extend_graphs=drafter_graphs == "extend", on_capture=capture("draft")
+        ),
+        enable_cudagraph_gc=enable_cudagraph_gc,
+    )
+
+
+@pytest.mark.parametrize("enable_cudagraph_gc", [False, True])
+@pytest.mark.parametrize("decode_disabled", [False, True])
+@pytest.mark.parametrize("prefill_disabled", [False, True])
+@pytest.mark.parametrize("drafter_graphs", ["own", "extend"])
+def test_capture_freezes_the_heap_once_around_every_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    unfrozen_heap: int,
+    enable_cudagraph_gc: bool,
+    decode_disabled: bool,
+    prefill_disabled: bool,
+    drafter_graphs: Literal["own", "extend"],
+) -> None:
+    """One freeze spans the decode, prefill and drafter captures unless
+    --enable-cudagraph-gc, and a boot that captures nothing collects nothing."""
+    frozen: dict[str, bool] = {}
+
+    def capture(name: str) -> Callable[..., None]:
+        def run(*_args: object) -> None:
+            frozen[name] = gc.get_freeze_count() > unfrozen_heap
+
+        return run
+
+    executor = _capture_executor(
+        capture,
+        decode_disabled=decode_disabled,
+        prefill_disabled=prefill_disabled,
+        drafter_graphs=drafter_graphs,
+        enable_cudagraph_gc=enable_cudagraph_gc,
+    )
+    calls = _record_gc_calls(monkeypatch)
+    ModelExecutor.capture_graphs(executor, entries=None, observer=_ObserverDouble())
+
+    captured = [
+        *([] if decode_disabled else ["decode"]),
+        *([] if prefill_disabled else ["prefill", "draft"]),
+    ]
+    assert frozen == {name: not enable_cudagraph_gc for name in captured}
+    if not captured:
+        assert calls == []
+    elif enable_cudagraph_gc:
+        assert calls == ["collect"]
+    else:
+        assert calls == ["collect", "freeze", "unfreeze", "collect"]
+    assert gc.get_freeze_count() == unfrozen_heap
+
+
+@pytest.mark.parametrize(
+    ("failing", "drafter_graphs"),
+    [("decode", "own"), ("prefill", "own"), ("draft", "own"), ("draft", "extend")],
+)
+def test_a_failed_capture_leaves_the_heap_unfrozen(
+    unfrozen_heap: int, failing: str, drafter_graphs: Literal["own", "extend"]
+) -> None:
+    frozen: list[bool] = []
+
+    def capture(name: str) -> Callable[..., None]:
+        def run(*_args: object) -> None:
+            frozen.append(gc.get_freeze_count() > unfrozen_heap)
+            if name == failing:
+                raise RuntimeError(f"{name} capture failed")
+
+        return run
+
+    executor = _capture_executor(
+        capture,
+        decode_disabled=False,
+        prefill_disabled=False,
+        drafter_graphs=drafter_graphs,
+        enable_cudagraph_gc=False,
+    )
+    with pytest.raises(RuntimeError, match=f"{failing} capture failed"):
+        ModelExecutor.capture_graphs(executor, entries=None, observer=_ObserverDouble())
+    assert frozen and all(frozen)
+    assert gc.get_freeze_count() == unfrozen_heap
 
 
 # ---------------------------------------------------------------------------

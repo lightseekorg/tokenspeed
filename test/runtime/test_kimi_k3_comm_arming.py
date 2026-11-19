@@ -81,6 +81,11 @@ def _capture_iris_preparation(monkeypatch):
                 output=torch.empty((kwargs["sharded_max_rows"], 7168), device="meta")
             ),
             pull_exchange=None,
+            word_max=(
+                SimpleNamespace(max_rows=kwargs["word_max_rows"])
+                if kwargs["word_max_rows"]
+                else None
+            ),
         )
 
     prepare = Mock(side_effect=allocate)
@@ -101,7 +106,9 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
     )
     monkeypatch.setattr(K3AttnComm, "iris_states", {})
     mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
-    config = SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584)
+    config = SimpleNamespace(
+        hidden_size=7168, routed_expert_hidden_size=3584, num_experts=None
+    )
 
     def moe():
         value = kimi_k3.KimiLinearMoE.__new__(kimi_k3.KimiLinearMoE)
@@ -109,6 +116,7 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
         value.iris_state = None
         value.comm = None
         value.shared_experts = SimpleNamespace(shared_parallel=None)
+        value.experts = SimpleNamespace(plan={"weight_dtype": "unquant"})
         # As on CDNA4: the execution plan leaves the decode chain off.
         value.execution_plan = SimpleNamespace(decode_chain=False)
         return value
@@ -176,12 +184,17 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         lambda: SimpleNamespace(is_cdna4=True),
     )
 
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_lamport_word_max_supported,
+    )
+
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=max_rows,
         states={},
+        word_max_rows=1024,
     )
     prepare.assert_called_once_with(
         group=group,
@@ -196,6 +209,7 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         device=torch.device("cuda:0"),
         rank_in_group=0,
         pull_exchange_max_bytes=0,
+        word_max_rows=1024 if iris_lamport_word_max_supported(8) else 0,
     )
 
 
@@ -238,6 +252,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             device=torch.device("cuda:0"),
             rank_in_group=0,
             pull_exchange_max_bytes=0,
+            word_max_rows=0,
         ),
         call(
             group=moe_group,
@@ -252,6 +267,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             device=torch.device("cuda:0"),
             rank_in_group=0,
             pull_exchange_max_bytes=0,
+            word_max_rows=0,
         ),
     ]
 
@@ -294,6 +310,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         device=torch.device("cuda:0"),
         rank_in_group=0,
         pull_exchange_max_bytes=0,
+        word_max_rows=0,
     )
 
 
@@ -334,6 +351,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         device=torch.device("cuda:0"),
         rank_in_group=0,
         pull_exchange_max_bytes=0,
+        word_max_rows=0,
     )
 
 

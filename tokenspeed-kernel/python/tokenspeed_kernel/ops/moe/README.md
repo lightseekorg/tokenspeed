@@ -561,7 +561,7 @@ groups, the top 8 experts of the kept groups, their unbiased scores renormalized
   least one row, a scale that rounds to a finite zero or normal FP32). It
   launches as a programmatic dependent where `pdl_enabled()`.
 
-Beam calls the Triton kernel on NVIDIA SM90 to SM103 where the guard admits the
+Beam calls the Triton kernel on NVIDIA SM90 and newer where the guard admits the
 call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
@@ -585,7 +585,7 @@ kernel's own finalized output.
 
 ## Kimi-K3 router
 
-On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
+On NVIDIA SM90 and newer, batches from 2,560 tokens use a vendored CUDA top-16 router
 over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
@@ -596,16 +596,20 @@ also sorts the routes by expert for the A8W4 SiTU decode, in one launch for
 up to 256 rows. Each row program routes one row with the packed top-k's own
 code, so ids and FP32 weights match `kimi3_sigmoid_bias_topk` bit for bit,
 writes them through to memory, sets its row's bit in each selected expert's
-arrival mask, and increments an arrival counter. One sorting program per 512
-routes follows the row programs in the grid (so every row program has
-dispatched before they wait) and polls the counter. Each sorting program
-derives the expert offsets from the masks and places its share of the routes
-at their expert's first slot plus the number of earlier rows in that expert's
-mask, in `gluon_moe_sorting`'s block-16 format. Routes within an expert
-therefore follow the flat top-k order, as `deterministic_order=True` does. The
-last sorting program leaves the caller-owned scratch zeroed, so sequential and
-graph-replayed launches can share it. The Kimi-K3 TP decode on gfx950 uses it,
-and the MoE then skips its own sort.
+arrival mask, and increments an arrival counter. From 33 rows, one sorting
+program per 512 routes follows the row programs in the grid (so every row
+program has dispatched before they wait) and polls the counter. Each sorting
+program derives the expert offsets from the masks and places its share of the
+routes at their expert's first slot plus the number of earlier rows in that
+expert's mask, in `gluon_moe_sorting`'s block-16 format. Through 32 rows, the
+masks fit one word per expert and there are no sorting programs: once every
+row has arrived, each row program derives the same offsets and places its own
+routes. Routes within an expert therefore follow the flat top-k order, as
+`deterministic_order=True` does. Every launch leaves the caller-owned scratch
+ready for the next, so sequential and graph-replayed launches can share it:
+the last sorting program zeroes it, and self-sorting launches alternate
+between two mask buffers, each zeroing the one its predecessor read. The
+Kimi-K3 TP decode on gfx950 uses it, and the MoE then skips its own sort.
 
 ## Kimi-K3 front projections
 
@@ -622,7 +626,7 @@ bound no fused kernel matches and the runtime keeps the separate path.
 (`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
 persistent launch produces the FP32 router logits, the BF16 latent input and
 the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
-SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
+SM103, with launch planning based on the device's SM count,
 for 2048 BF16 rows or more (no upper bound: the plan scales with the row
 count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
 and SiTU clamps 4 and 25. Attention-DP uses it only
@@ -897,3 +901,18 @@ also exercise uneven/empty owners over multiple GPUs:
 python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
 ```
+
+
+## Router projection with NVFP4 input
+
+`try_router_gemm_nvfp4` produces BF16 router logits and the packed E2M1 / linear
+E4M3 input accepted by NVFP4 MoE. Its scalar is the consumer's quantization-domain
+global scale. Routing, top-k and expert evaluation remain with the caller.
+Automatic SM107 selection covers the measured M1/M4, H2560/E512, aligned BF16/PDL
+case; other inputs retain separate projection and quantization. The Qwen caller
+also retains serial preparation for prefill, other topologies and padded expert
+widths. The CUDA producer keeps four FP32 K partials, reduces them in order, and
+rounds logits once to BF16. Compile/cache keys contain model dimensions only;
+row count stays runtime, with M1 and capacity-8 kernels built together before
+capture. The native tile is a temporary CUDA implementation preserving the
+validated arithmetic; no AOT files or task-specific loader are needed.

@@ -338,20 +338,22 @@ the subgroup's largest physical token count. The runtime prepares communication
 buffers before CUDA-graph capture and reuses them across layers. Shared
 experts use separate buffers. Shared AllGather finishes before routed
 dispatch, shared GEMMs finish before routed BMM, and shared ReduceScatter
-runs after dispatch and before combine. The runtime selects optimized
-collectives for supported shapes and topologies, with generic collective
-fallbacks otherwise. Place each subgroup
+runs after dispatch and before combine. With MegaMoE, shared ReduceScatter
+instead follows its fused dispatch/BMM/combine kernel and overlaps the routed
+norm and local up-projection. Native collectives cover the configured decode
+batch bound including speculative tokens; larger batches retain NCCL.
+Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
-On GB300, TP2 and TP4 can fuse projection communication with BF16 or block-FP8
-GEMM. BF16 fusion starts at a subgroup maximum of 32 physical rows and covers KDA
-and sparse-MLA QKV and output projections. Block-FP8 fusion keeps its 64-row
-minimum. BF16 QKV shards normally align to 128 channels. TP4 sparse-MLA shards
+Block-FP8 projection fusion supports aligned widths on SM100 and SM103 when
+the subgroup maximum is at least 64 physical rows. On GB300, node-local TP2 and
+TP4 can also fuse BF16 KDA and sparse-MLA QKV and output projections, starting
+at a subgroup maximum of 32 physical rows. BF16 QKV shards normally align to 128 channels. TP4 sparse-MLA shards
 use 96-channel alignment, padding 14400 logical outputs to 14592 stored channels.
 Checkpoint loading and returned logical outputs keep their original order and
 width. BF16 fusion uses BF16 operands directly. Row GEMM partials round to BF16,
-then sum in FP32 rank order before final BF16 rounding. Other shapes and devices
-use the ordinary projection collectives.
+then sum in FP32 rank order before final BF16 rounding. Unsupported BF16
+configurations use the ordinary projection collectives.
 
 These projection settings apply to DEP; DWDP still requires them to be `1`.
 Shared-expert TP requires BF16 weights.
@@ -1092,6 +1094,8 @@ Before benchmarking:
 `N` immutable expert shards and fetches remote weights while executing its own
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
+
+DWDP requires the CUDA 13 toolkit.
 
 The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,

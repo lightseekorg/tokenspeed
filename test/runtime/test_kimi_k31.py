@@ -37,6 +37,10 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from test.runtime.conftest import kimi_layout, kimi_recipe, kimi_tp8_layout
+from test.runtime.dsa_index_k_test_utils import (
+    assert_top_k_up_to_ties,
+    index_candidate_scores,
+)
 
 from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.platform import current_platform
@@ -470,7 +474,7 @@ def _kernel_page_table(block_ids: list[int], device) -> torch.Tensor:
 
 @requires_gpu
 def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.kvcache.triton import quantize_index_k_rows
 
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -494,12 +498,10 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
         index_head_dim=128,
         index_k_format="fp8_scaled",
     )
-    expected_fp8, expected_scale = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    expected_fp8, expected_scale = quantize_index_k_rows(keys, group_size=128)
 
     assert torch.equal(fp8, expected_fp8.view(torch.uint8))
-    assert torch.equal(scale, expected_scale.reshape(200, 1))
+    assert torch.equal(scale, expected_scale)
     # The next DSA layer's plane is untouched.
     assert not pool.get_index_k_buffer(7).any()
 
@@ -531,7 +533,10 @@ _KEY_PROJECTION_WIDTHS = pytest.mark.parametrize(
 def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) -> None:
     """A pre-norm key handed over with its LayerNorm lands in the plane as the
     normalized key would; owned rows only."""
-    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        index_k_block_split_scatter,
+        quantize_index_k_rows,
+    )
     from tokenspeed_kernel.platform import current_platform
 
     from tokenspeed.runtime.layers.layernorm import LayerNorm
@@ -551,12 +556,11 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) 
 
     deferred.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
     if index_k_format == "fp8_scaled" and not current_platform().is_amd:
-        # Mirror the fused FP8 rounding; NVIDIA quantize_fp8 may differ, AMD's matches.
-        normed = norm(keys).float()
-        scale = normed.abs().amax(dim=1, keepdim=True).clamp_min(1e-10) / 448.0
+        # Mirror the fused FP8 rounding and the plane's scale-word encoding.
+        codes, scale = quantize_index_k_rows(norm(keys).float(), group_size=128)
         index_k_block_split_scatter(
             eager.index_k_buffer[3],
-            (normed / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+            codes,
             scale,
             slots,
             page_size=eager.index_k_page_size,
@@ -716,10 +720,13 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     prefix = min(slots, 40000) - num_rows
     q = torch.randn(num_rows, 32, 128, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(num_rows, 32, device="cuda", dtype=torch.bfloat16)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=(slots + 1535) // 1536)
+    page = 64
+    # The workspace starts past the reserved null page 0, as in serving.
+    kv_slots = torch.arange(page, page + slots, device="cuda", dtype=torch.int64)
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=(page + slots + 1535) // 1536)
     pool.set_index_k_buffer(
         3,
-        torch.arange(slots, device="cuda", dtype=torch.int64),
+        kv_slots,
         torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16),
         write_mask=None,
     )
@@ -728,12 +735,12 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     args = dict(
         q=q,
         weights=weights,
-        kv_workspace_slots=torch.arange(slots, device="cuda", dtype=torch.int64),
+        kv_workspace_slots=kv_slots,
         row_starts=torch.zeros(num_rows, device="cuda", dtype=torch.int32),
         row_ends=row_ends_cpu.to(device="cuda", dtype=torch.int32),
         candidate_lens_cpu=row_ends_cpu,
         index_k_cache=plane,
-        page_size=64,
+        page_size=page,
         max_logits_bytes=1 << 30,
         topk=2048,
     )
@@ -770,7 +777,26 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     assert projected_rows == [num_rows - 1264, 1264]
     selected = workspace_indices_to_kv_slots(selected, None)
     assert torch.equal(lens, expected_lens)
-    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    mine, theirs = selected.sort(dim=1).values, expected.sort(dim=1).values
+    # Workspace page p is plane page p + 1.
+    table = torch.arange(1, 1 - (-slots // page), device="cuda", dtype=torch.int32)
+    # The top-k keeps tied candidates in atomic order, so two runs may differ on an exact tie.
+    for row in (mine != theirs).any(dim=1).nonzero().flatten().tolist():
+        query, q_scales = attention._scorer_index_query(q[row : row + 1], plane)
+        scores = index_candidate_scores(
+            query,
+            weights[row : row + 1],
+            plane,
+            table[None],
+            torch.zeros(1, device="cuda", dtype=torch.int32),
+            args["row_ends"][row : row + 1],
+            page_size=page,
+            softmax_scale=attention.indexer.weights_softmax_scale,
+            q_scales=q_scales,
+        )
+        assert_top_k_up_to_ties(
+            row, (mine[row], theirs[row]), int(row_ends_cpu[row]), scores[0], 2048
+        )
 
 
 @requires_gpu
@@ -1267,6 +1293,57 @@ def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
     assert bitwise.q_b_wq_b_weight is None
 
 
+@requires_gpu
+@pytest.mark.parametrize("rows", [2, 8, 12])
+def test_the_query_norm_and_projection_match_the_two_launches(
+    monkeypatch, rows
+) -> None:
+    """A decode round's q/KV latent norms and stacked [q_b; wq_b] projection
+    give ``fused_qk_layernorm`` then ``mm`` bit for bit, in one launch on
+    gfx950 up to eight rows. TP8 widths; the latents are views of the wider
+    a-projection."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+    from tokenspeed.runtime.models import kimi_k31
+
+    torch.manual_seed(rows)
+    norms = FusedRMSNorm(RMSNorm(1536), RMSNorm(512)).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        norms.weight_q_a.uniform_(0.5, 1.5)
+        norms.weight_kv_a.uniform_(0.5, 1.5)
+    layer = SimpleNamespace(
+        fused_qk_layernorm=norms,
+        q_b_wq_b_weight=torch.randn(6400, 1536, device="cuda", dtype=torch.bfloat16)
+        / 32,
+    )
+    projected = torch.randn(rows, 3648, device="cuda", dtype=torch.bfloat16) * 4
+    want_rows = projected.clone()
+    want_norm = want_rows.new_empty(rows, 1536)
+    norms(
+        input_q_a=want_rows[:, :1536],
+        input_kv_a=want_rows[:, 1536:2048],
+        output_q_a=want_norm,
+    )
+    want = mm(want_norm, layer.q_b_wq_b_weight)
+
+    launches = []
+    fused = kimi_k31.mv_rmsnorm
+    monkeypatch.setattr(
+        kimi_k31,
+        "mv_rmsnorm",
+        lambda *args: launches.append(args) or fused(*args),
+    )
+    q_norm = torch.empty_like(want_norm)
+    got = kimi_k31.KimiK31SparseMLAAttention._normalize_project_query(
+        layer, projected[:, :1536], projected[:, 1536:2048], q_norm
+    )
+    assert len(launches) == int(rows <= 8 and current_platform().is_cdna4)
+    assert torch.equal(got, want)
+    assert torch.equal(q_norm, want_norm)
+    assert torch.equal(projected, want_rows)
+
+
 def _separable_keys(num_tokens: int, bad: torch.Tensor, device):
     """Index rows whose top-k is unambiguous: every head's query is the same
     direction ``u``; good keys point along it (positive score), bad keys
@@ -1327,6 +1404,11 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         dsa_plan,
         dsa_prefill_topk,
     )
+    from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+        decode_index_k_scale,
+        index_k_scale_ue8m0,
+        round_index_k_scale,
+    )
 
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
     from tokenspeed.runtime.layers.layernorm import LayerNorm
@@ -1354,15 +1436,20 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         index_k_format=model_config.index_k_format,
     )
     normalized = norm(keys).float()
+    scales = decode_index_k_scale(scales)
     torch.testing.assert_close(
-        scales, normalized.abs().amax(dim=1, keepdim=True) / 448, rtol=1e-6, atol=1e-9
+        scales,
+        round_index_k_scale(normalized.abs().amax(dim=1, keepdim=True) / 448),
+        rtol=1e-6,
+        atol=1e-9,
     )
     # E4M3 has three mantissa bits; check the quantized values after scaling.
+    # A power-of-two scale doubles the subnormal step of the smallest values.
     torch.testing.assert_close(
         fp8.view(torch.float8_e4m3fn).float() * scales,
         normalized,
         rtol=1 / 16,
-        atol=1e-5,
+        atol=2e-5 if index_k_scale_ue8m0() else 1e-5,
     )
     indexer_output = _indexer_output(u, 1)
     common = dict(
@@ -1722,6 +1809,66 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
 
 @requires_gpu
 @pytest.mark.parametrize(
+    "extend_len, placed, reused",
+    [
+        (300, False, True),
+        # A row past topk is scored in every layer.
+        (2100, False, False),
+        # A KV-placed cache keeps its own per-layer selection.
+        (300, True, False),
+    ],
+)
+def test_a_later_layer_reuses_an_every_candidate_selection(
+    monkeypatch: pytest.MonkeyPatch, extend_len: int, placed: bool, reused: bool
+) -> None:
+    """A layer after the first takes its every-candidate selection as is."""
+    torch.manual_seed(5)
+    attention = _indexer_attention(index_topk=2048)
+    num_blocks = (extend_len + 127) // 128
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=max(2, (num_blocks + 2 + 11) // 12))
+    block_ids = list(range(2, 2 + num_blocks))[::-1]
+    slots = _slots(block_ids, extend_len, "cuda")
+    u, keys = _separable_keys(extend_len, torch.arange(0, device="cuda"), "cuda")
+    pool.set_index_k_buffer(3, slots, keys, write_mask=None)
+    page_table = torch.zeros(
+        1, max(64, 2 * num_blocks), dtype=torch.int32, device="cuda"
+    )
+    kernel_pages = _kernel_page_table(block_ids, "cuda")
+    page_table[:, : kernel_pages.shape[1]] = kernel_pages
+    backend = SimpleNamespace(
+        sparse_topk=SimpleNamespace(prefill=None),
+        chunked_prefill_metadata=SimpleNamespace(
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[extend_len],
+            page_table=page_table,
+        ),
+        cache_placement=lambda layer: None,
+    )
+    ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool, num_extends=1)
+    first = attention._compute_prefill_topk_indices(
+        _indexer_output(u, extend_len), ctx, extend_len
+    )
+    backend.sparse_topk.prefill = first
+
+    scored = []
+
+    def score(**kwargs):
+        scored.append(kwargs["num_prefill_tokens"])
+        return first
+
+    monkeypatch.setattr(attention, "_compute_prefill_topk_indices_portable", score)
+    if placed:
+        backend.cache_placement = lambda layer: object()
+    second = attention._compute_prefill_topk_indices(
+        _indexer_output(u, extend_len), ctx, extend_len
+    )
+
+    assert second is first
+    assert scored == ([] if reused else [extend_len])
+
+
+@requires_gpu
+@pytest.mark.parametrize(
     "prefix_len, extend_len, scored",
     [
         (0, 15, False),
@@ -1997,6 +2144,7 @@ def _dsa_leaf(pool, *, q_len: int, heads: int, padded_prefill_replay: bool = Fal
         kernel_page_size=None,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_quant_method=None,
         speculative_num_draft_tokens=q_len,
         components=(spec,),
@@ -2323,6 +2471,7 @@ def _k31_attention_stack(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method=None,
         max_bs=4,
+        max_resident_requests=4,
         context_len=context_len,
         speculative_num_draft_tokens=spec_width,
         kvp_size=kvp_size,

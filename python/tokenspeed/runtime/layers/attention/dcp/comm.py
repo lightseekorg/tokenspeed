@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     combine_dcp_attention_partials,
@@ -36,9 +38,42 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_gather_single,
     all_reduce,
     all_to_all_single,
+    prepare_small_exchange,
     reduce_scatter,
     try_combine_records,
 )
+
+logger = logging.getLogger(__name__)
+
+# Largest per-rank payload of a KVP group's one-hop exchange: the decode
+# exchanges up to 64 rows (eight requests of eight tokens) fit; larger ones,
+# and prefill's, keep the generic collectives, which win from about this size.
+DECODE_EXCHANGE_CAP_BYTES = 1 << 20
+
+
+def prepare_decode_exchange(group: tuple[int, ...], timeout_s: float) -> bool:
+    """Collectively prepare the KVP group's one-hop exchange of small payloads.
+
+    Every rank of ``group`` calls this once at the same program point, before
+    graph capture and before the KV cache is sized. The decode's query, index
+    and partial exchanges then take it whenever their payload fits; nothing
+    else changes, and every byte arrives as the generic collective delivers it.
+
+    Args:
+        group: Global ranks of the KVP group.
+        timeout_s: The process group's timeout; in-kernel waits end before it.
+
+    Returns:
+        Whether the group exchanges through it.
+    """
+    timeout_ns = int((timeout_s - 30 if timeout_s >= 90 else timeout_s / 2) * 1e9)
+    prepared = prepare_small_exchange(group, DECODE_EXCHANGE_CAP_BYTES, timeout_ns)
+    if torch.distributed.get_rank() == group[0]:
+        logger.info(
+            f"KVP group {group} exchanges up to {DECODE_EXCHANGE_CAP_BYTES >> 10} KiB "
+            f"per rank {'in one hop' if prepared else 'through its collectives'}"
+        )
+    return prepared
 
 
 def _query_payload(query: torch.Tensor) -> torch.Tensor:

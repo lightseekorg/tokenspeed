@@ -74,12 +74,30 @@ class CommBackend(ABC):
         """Broadcast in place when prepared; otherwise let the caller fall back."""
         return False
 
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        """Reduce 1-D int64 ``words`` with MAX over ``group`` in place when a
+        model prepared the group's word MAX; False lets the caller run
+        ``all_reduce`` MAX. Only group-wide facts decide, so every rank takes
+        the same path."""
+        return False
+
     def prepare_shard_exchange(
         self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
     ) -> bool:
         """Collectively prepare an even token/channel-shard exchange of
         ``channels`` full width and up to ``max_rows`` rows per rank (see
         ``try_shard_exchange``); False keeps the generic all-to-all."""
+        return False
+
+    def prepare_small_exchange(
+        self, group: Group, cap_bytes: int, timeout_ns: int
+    ) -> bool:
+        """Collectively prepare a one-hop exchange for small payloads.
+
+        It serves ``all_gather_single``, ``all_gather`` and equal-split
+        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank; False
+        keeps the generic collectives.
+        """
         return False
 
     def try_shard_exchange(

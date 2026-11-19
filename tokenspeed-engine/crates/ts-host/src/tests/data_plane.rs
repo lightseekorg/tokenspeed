@@ -171,6 +171,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = 64
 cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
 cfg.num_device_pages = 64
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [
@@ -257,6 +258,7 @@ fn admission_identity_and_stop_criteria_reach_python_together() {
             session_id: String::new(),
             cache_group_id: String::new(),
             shared_prefix_tokens: Vec::new(),
+            peer_holder: String::new(),
             tokens: vec![1, 2, 3],
             max_new_tokens: 8,
             max_cached_prefix_tokens: i32::MAX,
