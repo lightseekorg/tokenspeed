@@ -127,6 +127,7 @@ def _prepare_value_tail():
     """
     from unittest import mock
 
+    from tokenspeed_kernel.ops.attention.mla.cute_dsl import DcpValueTail
     from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
 
     from tokenspeed.runtime.distributed.process_group_manager import (
@@ -141,8 +142,9 @@ def _prepare_value_tail():
         "gloo", group, dist.new_group(backend="gloo")
     )
     comm.prepare_decode_exchange(group, 120, value_heads=_HEADS, decode_rows=64)
-    tail = type(comm._VALUE_TAILS[group])
-    return mock.patch.object(tail, "__call__", autospec=True, side_effect=tail.__call__)
+    return mock.patch.object(
+        DcpValueTail, "__call__", autospec=True, side_effect=DcpValueTail.__call__
+    )
 
 
 def _selection_case(
