@@ -23,9 +23,6 @@
 import torch
 import torch.distributed as dist
 import torch_npu
-from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
-    AscendQCPPrefillWorkspaceLayout,
-)
 from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
     gather_history,
     pack_current,
@@ -48,21 +45,19 @@ class AscendQCPPrefillTransport:
         *,
         ranks,
         history_group,
-        max_current_rows,
-        max_history_rows,
-        history_null_rows,
+        layout,
     ):
         self.degree = len(ranks)
         self.rank = ranks.index(dist.get_rank())
         self.device = kv_cache.device
         self.local_rows = kv_cache.numel() // 576
-        self.layout = AscendQCPPrefillWorkspaceLayout(
-            history_capacity=max_history_rows,
-            current_capacity=max_current_rows,
-            degree=self.degree,
-            null_rows=history_null_rows,
-            has_index=index_cache is not None,
-        )
+        if layout.degree != self.degree or layout.has_index != (
+            index_cache is not None
+        ):
+            raise ValueError(
+                "Prefill workspace layout must match cache owners and planes"
+            )
+        self.layout = layout
         for cache, width in ((kv_cache, 576), (index_cache, 128)):
             if cache is not None and (
                 cache.device != self.device
@@ -112,9 +107,9 @@ class AscendQCPPrefillTransport:
             send[split:].view(-1, 128) if self.layout.has_index else None
         )
         # No later operation writes the null page; initialize it once.
-        self._attention_kv[:history_null_rows].zero_()
+        self._attention_kv[: layout.null_rows].zero_()
         if self._attention_index is not None:
-            self._attention_index[:history_null_rows].zero_()
+            self._attention_index[: layout.null_rows].zero_()
         self.peak_buffer_bytes = 0
 
     @property
@@ -187,6 +182,14 @@ class AscendQCPPrefillTransport:
 
     def gather_current(self, kv, index, *, row_counts):
         """Pack both projections once and gather their rows in rank order."""
+        if (
+            len(row_counts) != self.degree
+            or min(row_counts) < 0
+            or sum(row_counts) > self.layout.current_capacity
+            or row_counts[self.rank] > self.layout.gather_send_rows
+            or (index is not None) != self.layout.has_index
+        ):
+            raise ValueError("Invalid current row counts or Prefill cache planes")
         local_rows = row_counts[self.rank]
         total_rows = sum(row_counts)
         self.peak_buffer_bytes = max(
@@ -194,8 +197,7 @@ class AscendQCPPrefillTransport:
             (total_rows + local_rows) * self.layout.width * 2,
         )
         packet = self._gather_send[:local_rows]
-        if local_rows:
-            pack_current(kv, index, packet)
+        pack_current(kv, index, packet)
         if self.degree == 1:
             return packet
         receive = self._current_receive[:total_rows]

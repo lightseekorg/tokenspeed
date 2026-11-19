@@ -23,12 +23,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from itertools import accumulate
 
 import torch
 
+from tokenspeed.runtime.distributed.comm_manager import scattered_moe_source_rows
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.query_shard import scatter_count
+from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 class MoESourceRows:
@@ -38,27 +39,24 @@ class MoESourceRows:
         self.mapping = mapping
         self.max_rows_per_rank = max_rows_per_rank
         self.counts: tuple[int, ...] | None = None
-        self.source_token_counts = torch.zeros(
-            len(mapping.moe.tp_ep_group), dtype=torch.int32, device=device
+        saver = TorchMemorySaverAdapter.create(
+            enable=torch.device(device).type == "cuda"
+            and global_server_args_dict["enable_memory_saver"]
         )
+        with saver.named_region("runtime_states"):
+            self.source_token_counts = torch.zeros(
+                len(mapping.moe.tp_ep_group), dtype=torch.int32, device=device
+            )
 
     def upload_scattered(self, padded_tokens: int, global_num_tokens: Sequence[int]):
         """Intersect each captured TP shard with its DP group's live prefix."""
-        attn = self.mapping.attn
-        if len(global_num_tokens) != self.mapping.world_size:
-            raise ValueError("expected one scheduler token count per global rank")
-        lengths = scatter_count(padded_tokens, attn.tp_size)
-        offsets = tuple(accumulate(lengths, initial=0))
-        counts = []
-        for rank in self.mapping.moe.tp_ep_group:
-            dp, tp = divmod(attn.scatter_index(rank), attn.tp_size)
-            live = global_num_tokens[dp * attn.tp_size]
-            if not 0 <= live <= padded_tokens:
-                raise ValueError(
-                    f"{live} live rows do not fit {padded_tokens} padded rows"
-                )
-            counts.append(min(lengths[tp], max(0, live - offsets[tp])))
-        self.publish(tuple(counts))
+        segments = scattered_moe_source_rows(
+            self.mapping,
+            [padded_tokens] * self.mapping.world_size,
+            global_num_tokens,
+            self.mapping.moe.tp_ep_group,
+        )
+        self.publish(tuple(live for _, live in segments))
 
     def publish(self, counts: tuple[int, ...]) -> None:
         if len(counts) != self.source_token_counts.numel() or any(

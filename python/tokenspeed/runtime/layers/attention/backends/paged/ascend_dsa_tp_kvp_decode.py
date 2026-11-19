@@ -71,7 +71,10 @@ def prepare_ascend_dsa_cp_metadata(
 
 def _nk(weight, widths, kl1=512):
     # Bit-preserving private NK panel stream; no dtype conversion.
-    assert sum(widths) == weight.shape[0] and weight.shape[1] % kl1 == 0
+    if weight.ndim != 2 or sum(widths) != weight.shape[0] or weight.shape[1] % kl1:
+        raise ValueError(
+            "DSA NK panels must cover the weight rows and tile its input width"
+        )
     panels = []
     col = 0
     for width in widths:
@@ -172,9 +175,8 @@ def supports_fused_dsa_tp_kvp_decode(layer) -> bool:
 def pack_dsa_qb(mla_qb, index_qb):
     """Pack actual attention and Indexer channels into the native carrier.
 
-    The32-head attention layout splits each128-wide Indexer head across two64-wide carrier lanes,
-    retaining all32 attention heads and16 Indexer heads without extra heads.
-    The historical attention64 carrier retains its128-wide Indexer lanes.
+    The 32-head layout splits each 128-wide indexer head across two 64-wide
+    carrier lanes. The 64-head attention carrier uses 128-wide indexer lanes.
     """
     if tuple(mla_qb.shape) == (32, 192, 768) and tuple(index_qb.shape) == (
         16,
@@ -193,7 +195,7 @@ def pack_dsa_qb(mla_qb, index_qb):
         )
     else:
         raise ValueError(
-            "Expected attention32/Indexer16 or attention64/Indexer32,64 QB weights"
+            "Expected 32 attention and 16 indexer heads, or 64 attention and 32 or 64 indexer heads"
         )
     return pack_qb_panels(
         torch.cat((mla_qb, index_lanes), 1).reshape(-1, mla_qb.shape[2])

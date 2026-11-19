@@ -165,6 +165,8 @@ def test_the_probe_arena_does_not_grow_with_max_num_seqs() -> None:
     reason="requires an NVIDIA GPU",
 )
 def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
+    from test.runtime.test_cache_setup import _mla_config
+
     from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
     from tokenspeed.runtime.layers.attention.kv_cache.offload_config import (
         KVOffloadPolicy,
@@ -172,8 +174,6 @@ def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
         OrdinaryRecipe,
     )
-
-    from test.runtime.test_cache_setup import _mla_config
 
     recipe = OrdinaryRecipe(
         family="mla",

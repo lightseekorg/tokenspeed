@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode

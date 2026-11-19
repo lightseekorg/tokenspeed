@@ -367,8 +367,6 @@ class ForwardStepRunner:
         )
     """
 
-    moe_source_rows: tuple[MoESourceRows, ...] = ()
-
     def __init__(
         self,
         forward_func: Callable,
@@ -387,13 +385,18 @@ class ForwardStepRunner:
         moe_source_rows: tuple[MoESourceRows, ...] = (),
     ):
         self.config = config
-        self.moe_source_rows = moe_source_rows
+        self.moe_source_rows: tuple[MoESourceRows, ...] = moe_source_rows
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.drafter = drafter
         self.dp_local_graph = config.enable_dp_local_cuda_graph
+        if self.dp_local_graph and moe_source_rows:
+            raise ValueError(
+                "MoE source rows require globally padded Decode graphs: "
+                "--enable-dp-local-cuda-graph does not supply peer graph capacities"
+            )
         if self.dp_local_graph and drafter is None:
             raise ValueError(
                 "--enable-dp-local-cuda-graph requires a supported drafter"
@@ -1174,7 +1177,7 @@ class ForwardStepRunner:
     @contextmanager
     def decode_profile_metadata(
         self, *, bs: int, variant: str, block_tables: dict[str, torch.Tensor]
-    ) -> Iterator[Callable[[], None]]:
+    ) -> Iterator[Callable[[int], None]]:
         """Lend the normal metadata preparation path to startup measurements.
 
         Before each replay, the caller fills the input buffers and invokes the
@@ -1182,7 +1185,7 @@ class ForwardStepRunner:
         including when measurement fails. Call only before live admission.
         """
 
-        def prepare() -> None:
+        def prepare(query_tokens: int) -> None:
             self._prepare_sampling_capture(bs=bs, variant=variant)
             self._prepare_decode_metadata(
                 bs,
@@ -1194,9 +1197,8 @@ class ForwardStepRunner:
                 settle=lambda: None,
                 block_tables=block_tables,
             )
-            tokens = bs * self.max_tokens_per_req
             for rows in self.moe_source_rows:
-                rows.upload_scattered(tokens, [tokens] * self.world_size)
+                rows.upload_scattered(query_tokens, [query_tokens] * self.world_size)
             self.deepep_adapter.replay()
 
         try:

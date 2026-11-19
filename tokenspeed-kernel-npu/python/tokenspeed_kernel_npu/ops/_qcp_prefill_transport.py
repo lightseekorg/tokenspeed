@@ -221,8 +221,27 @@ def _store_current(
                                 tl.store(CacheIndex + local * 128 + lane, index)
 
 
+def _plane_matches(plane, rows, width, device):
+    return (
+        plane.dtype == torch.bfloat16
+        and plane.device == device
+        and plane.is_contiguous()
+        and plane.ndim >= 2
+        and plane.shape[-1] == width
+        and plane.numel() == rows * width
+    )
+
+
 def pack_current(kv, index, packet):
     rows = packet.shape[0]
+    if (
+        not _plane_matches(packet, rows, 704 if index is not None else 576, kv.device)
+        or not _plane_matches(kv, rows, 576, kv.device)
+        or (index is not None and not _plane_matches(index, rows, 128, kv.device))
+    ):
+        raise ValueError(
+            "Current Prefill planes must be contiguous BF16 rows on one device"
+        )
     if rows:
         _pack_current[(triton.cdiv(rows, 32),)](
             kv.view(torch.int16),
@@ -234,7 +253,26 @@ def pack_current(kv, index, packet):
 
 
 def gather_history(kv, index, slots, send_kv, send_index):
-    if slots.numel():
+    rows = slots.numel()
+    cache_rows = kv.numel() // 576
+    if (
+        slots.dtype not in (torch.int32, torch.int64)
+        or slots.ndim != 1
+        or not slots.is_contiguous()
+        or slots.device != kv.device
+        or not _plane_matches(kv, cache_rows, 576, kv.device)
+        or not _plane_matches(send_kv, rows, 576, kv.device)
+        or (index is None) != (send_index is None)
+        or (
+            index is not None
+            and (
+                not _plane_matches(index, cache_rows, 128, kv.device)
+                or not _plane_matches(send_index, rows, 128, kv.device)
+            )
+        )
+    ):
+        raise ValueError("Invalid Prefill history slots or BF16 cache planes")
+    if rows:
         _gather_history[(triton.cdiv(slots.numel(), 32),)](
             kv.view(torch.int16),
             index.view(torch.int16) if index is not None else kv.view(torch.int16),

@@ -57,7 +57,7 @@ def test_grouped_plan_shares_weights_and_encodes_scales_without_numeric_cast():
         stage,
         True,
     )
-    plan = prepare_w4a4_grouped_plan(state)
+    plan = prepare_w4a4_grouped_plan(state, prefill_only=False)
     assert plan.weights is state
     for encoded, expected in ((plan.scale13, scale13), (plan.scale2, scale2)):
         assert encoded.dtype == torch.uint64
@@ -147,6 +147,14 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
     assert torch.equal(plan.scale2, s2)
 
 
+@pytest.mark.parametrize("clip", (0.0, -1.0, 1.1, float("nan")))
+def test_flatquant_rejects_invalid_clip(clip):
+    with pytest.raises(ValueError, match="clip"):
+        prepare_flatquant_stage(
+            torch.eye(4).bfloat16(), torch.eye(8).bfloat16(), torch.tensor([clip])
+        )
+
+
 @pytest.mark.parametrize("transposed", (False, True))
 @pytest.mark.parametrize("h,i", ((128, 128), (512, 1024)))
 @pytest.mark.parametrize("activation_range", (1, 7))
@@ -182,8 +190,9 @@ def test_real_nz_weights_match_integer_gmm(transposed, h, i, activation_range):
         stage(h),
         stage(i),
         transposed=transposed,
+        role="null",
     )
-    grouped = prepare_w4a4_grouped_plan(plan)
+    grouped = prepare_w4a4_grouped_plan(plan, prefill_only=False)
     for nz, weight, scale in (
         (grouped.weights.w13, w13, grouped.scale13),
         (grouped.weights.w2, w2, grouped.scale2),

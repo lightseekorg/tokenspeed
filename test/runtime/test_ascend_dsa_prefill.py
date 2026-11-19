@@ -140,6 +140,7 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
     global_pages = {0}
     for plan in plans:
         assert plan.key_row_count == int(plan.key_cu[-1])
+        assert plan.key_lengths == tuple(plan.key_cu.diff().tolist())
     for request, length in enumerate(lengths):
         global_pages.update(table[request, : (length + page - 1) // page].tolist())
     caches = [{} for _ in range(degree)]

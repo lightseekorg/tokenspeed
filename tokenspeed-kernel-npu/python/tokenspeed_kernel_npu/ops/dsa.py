@@ -26,7 +26,6 @@ import os
 
 import torch
 import torch_npu
-
 from tokenspeed_kernel_npu._triton import tl, triton
 from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
@@ -70,7 +69,23 @@ def _current_page(token, seq_start, seq_end, prefix, total, degree, PAGE: tl.con
     return owner, page_start - owner_start, direct
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "batch",
+        "columns",
+        "table_stride",
+        "first",
+        "rows",
+        "total",
+        "per_block",
+        "degree",
+        "local_pages",
+        "current_rank_stride",
+        "history_pages",
+        "table_tiles",
+        "query_tiles",
+    ]
+)
 def _qcp_prefill_metadata(
     Table,
     Cum,
@@ -289,18 +304,14 @@ class AscendDSAKernels:
         *,
         ranks,
         history_group,
-        max_current_rows,
-        max_history_rows,
-        history_null_rows,
+        layout,
     ):
         return AscendQCPPrefillTransport(
             kv_cache,
             index_cache,
             ranks=ranks,
             history_group=history_group,
-            max_current_rows=max_current_rows,
-            max_history_rows=max_history_rows,
-            history_null_rows=history_null_rows,
+            layout=layout,
         )
 
     @staticmethod

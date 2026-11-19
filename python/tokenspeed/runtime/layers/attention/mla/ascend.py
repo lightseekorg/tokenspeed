@@ -130,7 +130,11 @@ class AscendMLAAttention(KimiLinearMLAAttention):
     def _forward_prefill(self, positions, hidden, ctx, comm_manager):
         backend = ascend_mla_prefill_backend(ctx.attn_backend)
         plan = backend._prefill
-        if plan is None or hidden.shape[0] != plan.row_counts[backend._dcp.rank]:
+        if (
+            plan is None
+            or not plan.row_counts
+            or hidden.shape[0] != plan.row_counts[backend._dcp.rank]
+        ):
             raise ValueError("MLA Prefill hidden rows must follow the TP partition")
         if (
             self.use_output_gate

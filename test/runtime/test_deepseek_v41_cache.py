@@ -27,6 +27,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.ops.attention.dsv41 import _metadata as dsv41_metadata
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -39,9 +43,6 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_CACHE_FORMATS,
-    V41_GROUP_GEOMETRY,
-    v41_layer_mapping,
-    v41_table_widths,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID as TAIL,
@@ -53,7 +54,14 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_GLOBAL_R2_GROUP_ID as R2,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    V41_GROUP_GEOMETRY,
+)
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID as SWA,
+)
+from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
+    v41_layer_mapping,
+    v41_table_widths,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
@@ -64,9 +72,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 from tokenspeed.runtime.utils.server_args import ServerArgs
-from tokenspeed_kernel.ops.attention import dsv41
-from tokenspeed_kernel.ops.attention.dsv41 import _metadata as dsv41_metadata
-from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -3128,9 +3133,9 @@ def _tables_with_packing(device, packing):
     used = {SWA: 4, R2: widths[R2], R1: widths[R1], TAIL: 100}
     for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):
         first = packing[gid] * parent + 1
-        assert first + 2 * used[gid] <= packing[gid] * 16, (
-            f"{gid} needs {2 * used[gid]} pages from parent {parent}"
-        )
+        assert (
+            first + 2 * used[gid] <= packing[gid] * 16
+        ), f"{gid} needs {2 * used[gid]} pages from parent {parent}"
     for req in range(2):
         tables[SWA][req, :4] = torch.arange(1 + req * 4, 5 + req * 4, device=device)
         for gid, parent in ((R2, 8), (R1, 9), (TAIL, 10)):

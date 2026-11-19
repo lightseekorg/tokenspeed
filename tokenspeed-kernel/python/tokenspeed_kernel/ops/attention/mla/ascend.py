@@ -41,9 +41,7 @@ def prepare_ascend_mla_qcp_prefill(
     *,
     ranks,
     history_group,
-    max_current_rows,
-    max_history_rows,
-    history_null_rows,
+    layout,
 ):
     """Prepare shared QCP KV transport for MLA, without an Index-K plane."""
     from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
@@ -53,9 +51,7 @@ def prepare_ascend_mla_qcp_prefill(
         None,
         ranks=ranks,
         history_group=history_group,
-        max_current_rows=max_current_rows,
-        max_history_rows=max_history_rows,
-        history_null_rows=history_null_rows,
+        layout=layout,
     )
 
 

@@ -84,7 +84,7 @@ class W4A4GroupedPlan:
 
 
 def prepare_w4a4_grouped_plan(
-    weights: W4A4MoePlan, *, prefill_only: bool = False
+    weights: W4A4MoePlan, *, prefill_only: bool
 ) -> W4A4GroupedPlan:
     """Select the Prefill NZ weights and encode the official GMM scales."""
 
@@ -232,14 +232,14 @@ def prepare_flatquant_stage(left, right, clip) -> FlatQuantStage:
 
 
 def prepare_w4a4_moe_weights(
-    w13, w2, scale13, scale2, first, second, *, transposed: bool, role: str = "null"
+    w13, w2, scale13, scale2, first, second, *, transposed: bool, role: str
 ) -> W4A4MoePlan:
     """Convert checkpoint INT32 tensors to NZ without changing their INT4 layout.
 
     Input checkpoint shapes are [E,N,K/8] (transposed) or [E,N/8,K].
     Fused Decode uses [E,K,N/8] or [E,N,K/8] according to ``transposed``.
     Prefill needs the eight packed output channels contiguous in each word.
-    NT checkpoints therefore also get an [E,K,N/8] representation. Scales
+    The unified role ("null") retains both layouts for NT checkpoints. Scales
     remain FP32 [E,N] until the grouped plan encodes them for official GMM.
     """
     if role not in ("prefill", "decode", "null"):

@@ -29,6 +29,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, DeviceRole
 from tokenspeed.runtime.execution.types import PlannedForward

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.moe.weights.int4 import (
     create_int4_weight_pair,
@@ -123,36 +124,15 @@ def test_quant_config_int4_int8_and_gpu_boundary(monkeypatch):
         _config(4).moe_weight_dtype()
 
 
-def test_w4a4_plan_selects_only_the_fused_kernel():
+def test_ascend_common_registry_leaves_int4_apply_to_the_model():
     pytest.importorskip("torch_npu")
-    import tokenspeed_kernel
+    from tokenspeed_kernel.registry import KernelRegistry
 
     if not torch.npu.is_available():
         pytest.skip("requires Ascend registration")
-    plan = tokenspeed_kernel.moe_plan(
-        "int4",
-        input_dtype=torch.bfloat16,
-        activation="swiglu",
-        routing_mode="precomputed_topk",
-        a2a_backend="none",
-        ep_size=16,
-        ispp=1024,
-        hidden=512,
-        swiglu_form="standard",
-        activation_clamped=False,
-        expert_id_repeats=True,
-        internal_activation_dtype="int4",
-        with_bias=False,
-        solution="flash_npu_chain",
-        fast_math=True,
-        combine_order="rank",
-        features=frozenset(),
-    )
-    assert plan["apply_kernel_name"] == "ascend_int4_precomputed_moe_apply"
-    assert plan["solution"] == "flash_npu_chain"
-    assert plan["supports_precomputed_topk"]
-    assert not plan["supports_deferred_finalize"]
-    assert not plan["supports_all_to_all_ep"]
+    registry = KernelRegistry.get()
+    assert registry.get_by_name("ascend_int8_precomputed_moe_apply") is not None
+    assert registry.get_by_name("ascend_int4_precomputed_moe_apply") is None
 
 
 def test_shared_weight_factory_keeps_flatquant_separate_from_smoothquant():

@@ -365,9 +365,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Collapse the GDN scan's batched [1, T, Hv, D] to z-shaped (see docstring).
         if ret is not None and ret.dim() == 4:
             # Strictly [1, T, Hv, D]: a genuine B>1 must fail loud, not corrupt the handoff.
-            assert ret.shape[0] == 1, (
-                f"GDN scan batched rank expected leading 1, got {ret.shape}"
-            )
+            assert (
+                ret.shape[0] == 1
+            ), f"GDN scan batched rank expected leading 1, got {ret.shape}"
             ret = ret.flatten(0, 1)
         return ret
 

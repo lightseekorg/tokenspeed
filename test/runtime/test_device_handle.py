@@ -42,12 +42,24 @@ import json
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 import torch
+from tokenspeed_engine.scheduler import (
+    AttnKind,
+    CacheGroupConfig,
+    ExecutionEvent,
+    ForwardEvent,
+    RequestSpec,
+    Scheduler,
+    SchedulerConfig,
+)
+from transformers import PretrainedConfig
+
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
     RestoreOp,
@@ -66,18 +78,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
-from tokenspeed_engine.scheduler import (
-    AttnKind,
-    CacheGroupConfig,
-    ExecutionEvent,
-    ForwardEvent,
-    RequestSpec,
-    Scheduler,
-    SchedulerConfig,
-)
-from transformers import PretrainedConfig
-
-from test.ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="runtime-2gpu")
 

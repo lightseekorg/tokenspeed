@@ -27,6 +27,9 @@ from types import ModuleType
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
+)
 
 
 def pack_current(kv, index, packet):
@@ -111,9 +114,13 @@ def test_growing_history_reuses_one_allocation_without_stale_bytes(
         index[rank] if has_index else None,
         ranks=tuple(range(degree)),
         history_group=object(),
-        max_current_rows=129,
-        max_history_rows=256 * degree,
-        history_null_rows=128,
+        layout=AscendQCPPrefillWorkspaceLayout(
+            current_capacity=129,
+            history_capacity=256 * degree,
+            null_rows=128,
+            degree=degree,
+            has_index=has_index,
+        ),
     )
     allocation = runtime._storage.data_ptr()
     allocated_bytes = runtime.workspace_bytes
@@ -169,9 +176,13 @@ def test_prefill_refuses_batch_over_capacity_before_writing(
         None,
         ranks=(0,),
         history_group=None,
-        max_current_rows=128,
-        max_history_rows=128,
-        history_null_rows=128,
+        layout=AscendQCPPrefillWorkspaceLayout(
+            current_capacity=128,
+            history_capacity=128,
+            null_rows=128,
+            degree=1,
+            has_index=False,
+        ),
     )
     runtime._storage.fill_(7)
     before = runtime._storage.clone()

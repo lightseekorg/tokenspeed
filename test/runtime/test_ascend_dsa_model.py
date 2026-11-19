@@ -25,10 +25,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from transformers import PretrainedConfig
+
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
-from transformers import PretrainedConfig
 
 
 def make_attention(
@@ -80,13 +81,14 @@ def test_unprepared_weights_fail_before_device_execution():
 
 
 def test_failed_native_initialization_releases_its_window(monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
     from tokenspeed.runtime.layers.attention.backends.paged import (
         ascend_dsa_tp_kvp_decode as ascend,
     )
-    from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     # Substitute only communication and its native window. The real fused
     # constructor rejects this small model after the resource has been acquired.
@@ -168,6 +170,10 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     monkeypatch, rows, scale_q
 ):
     """The prologue's KV write alone cannot release a DSA producer step."""
+    from tokenspeed_kernel.ops.attention.prologue.types import (
+        LatentKVCache,
+    )
+
     from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
         AscendDSABackend,
     )
@@ -180,9 +186,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     from tokenspeed.runtime.layers.dense import unquant
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.pd.utils import StepCounter
-    from tokenspeed_kernel.ops.attention.prologue.types import (
-        LatentKVCache,
-    )
 
     class CpuStepCounter(StepCounter):
         # Substitute only device/pinned allocation, retaining record_cache's
@@ -399,13 +402,14 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
     """Real model resource owner with only native projection/communication replaced."""
     from types import SimpleNamespace
 
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
     from tokenspeed.runtime.layers.attention.backends.paged import (
         ascend_dsa_tp_kvp_decode as ascend,
     )
-    from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     class Group:
         def _get_backend(self, device):

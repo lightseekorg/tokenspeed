@@ -248,20 +248,8 @@ def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     assert spec.traits["store"] == frozenset({False, True})
 
 
-@pytest.mark.parametrize(
-    "degree,rank,missing",
-    [
-        (1, 0, None),
-        (1, 0, "npu_dcp_merge_topk"),
-        (2, 0, None),
-        (4, 0, None),
-        (8, 3, None),
-        (8, 3, "npu_dcp_merge_topk"),
-        (8, 3, "npu_dsa_merge_lse_direct"),
-        (16, 0, None),
-    ],
-)
-def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missing):
+@pytest.mark.parametrize("degree,rank", [(1, 0), (2, 0), (4, 0), (8, 3), (16, 0)])
+def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank):
     # Mock device initialization, but keep the NPU constructor and its topology
     # checks. The config deliberately has no legacy dcp_* attributes.
     def initialize_base(self, config, spec, *, kernel_page_size):
@@ -271,15 +259,7 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missin
 
     monkeypatch.setattr(DSABackend, "__init__", initialize_base)
 
-    def require_fused(*, rank_size, num_heads):
-        if missing is not None:
-            raise RuntimeError(f"Ascend DSA CP requires fused operators: {missing}")
-
-    monkeypatch.setattr(
-        ascend_dsa,
-        "ascend_dsa_kernels",
-        lambda: SimpleNamespace(require_fused_context_parallel=require_fused),
-    )
+    monkeypatch.setattr(ascend_dsa, "ascend_dsa_kernels", lambda: SimpleNamespace())
     config = SimpleNamespace(
         max_bs=64,
         speculative_num_draft_tokens=8,
@@ -881,10 +861,39 @@ def test_dsa_metadata_needs_no_collective_process_group(monkeypatch):
     assert metadata.page_table.tolist() == [[1, 0]]
 
 
+@pytest.mark.parametrize("missing", ["npu_dcp_merge_topk", "npu_dsa_merge_lse_direct"])
+def test_fused_dsa_binding_requires_context_parallel_operators(monkeypatch, missing):
+    backend = _fused_backend(monkeypatch, 1, degree=8, heads=32)
+
+    def reject(*, rank_size, num_heads):
+        assert (rank_size, num_heads) == (8, 32)
+        raise RuntimeError(f"Missing operator {missing}")
+
+    monkeypatch.setattr(
+        ascend_dsa.ascend_dsa_kernels(), "require_fused_context_parallel", reject
+    )
+    with pytest.raises(RuntimeError, match=missing):
+        backend._decode.configure_fused_decode(
+            group="test",
+            ranks=tuple(range(8)),
+            attention_outputs={
+                1: (
+                    torch.empty(32, 1, 512),
+                    torch.empty(1, 1, 32),
+                    torch.empty(1, 1, 32),
+                )
+            },
+        )
+    assert backend._decode._fused_decode is None
+
+
 @pytest.mark.parametrize(
     "heads,degree,rows",
     [
+        (64, 2, 64),
+        (64, 4, 64),
         (64, 8, 64),
+        (64, 16, 64),
         (64, 8, 128),
         (64, 8, 256),
         (64, 8, 512),

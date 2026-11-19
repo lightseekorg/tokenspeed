@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -39,8 +40,9 @@ class TestNumericsMode:
     def test_ascend_default_sampling_backend(self, monkeypatch, numerics, backend):
         from dataclasses import replace
 
-        from tokenspeed.runtime.utils import server_args
         from tokenspeed_kernel.platform import current_platform
+
+        from tokenspeed.runtime.utils import server_args
 
         args = ServerArgs(model="x")
         platform = replace(current_platform(), vendor="ascend")
@@ -81,11 +83,12 @@ class TestNumericsMode:
     def test_moe_cutlass_fused_finalize_reaches_global_server_args(
         self, fused_finalize
     ):
+        from tokenspeed_kernel.platform import pdl_enabled
+
         from tokenspeed.runtime.utils.env import (
             global_server_args_dict,
             global_server_args_dict_update,
         )
-        from tokenspeed_kernel.platform import pdl_enabled
 
         original = global_server_args_dict.copy()
         original_pdl = pdl_enabled()
@@ -242,12 +245,13 @@ class TestNumericsMode:
             ServerArgs(model="x", numerics=numerics, **{field: device})
 
     def test_yarn_devices_reach_rope_launch_state(self):
+        from tokenspeed_kernel.platform import pdl_enabled
+
         from tokenspeed.runtime.utils.env import (
             global_server_args_dict,
             global_server_args_dict_update,
         )
         from tokenspeed.runtime.utils.server_args import prepare_server_args
-        from tokenspeed_kernel.platform import pdl_enabled
 
         args = prepare_server_args(
             [
@@ -406,6 +410,7 @@ class TestNumericsMode:
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
+
         from tokenspeed.runtime.distributed.comm_backend.auto import ordered_fold_sum
 
         torch.manual_seed(7)
@@ -427,6 +432,7 @@ class TestNumericsMode:
         from unittest import mock
 
         import torch
+
         from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
 
         group = (0, 1, 2)
@@ -564,6 +570,7 @@ class TestModelVerificationGate:
 class TestCanonicalGreedyTies:
     def test_sampled_greedy_rows_take_the_lowest_tied_id(self):
         import torch
+
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_tokens,
         )
@@ -579,6 +586,7 @@ class TestCanonicalGreedyTies:
 
     def test_verified_greedy_rows_follow_the_exact_match_chain(self):
         import torch
+
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_verify,
         )

@@ -24,7 +24,13 @@ For models with reduce-scattered MoE input, the scheduler already supplies the
 live token count for every attention DP group. Before decode graph replay the
 runner intersects each fixed TP shard with its group's live prefix and copies
 the resulting EP source counts into the model's capture-time buffer. An idle
-DP group's shards all contribute zero rows.
+DP group's shards all contribute zero rows. Models that publish these counts
+require globally padded decode graphs; startup rejects DP-local graphs because
+the scheduler does not publish peer graph capacities. Startup profiling uploads
+the selected packed tier's query count and restores the full capture metadata
+on exit. With CUDA memory saving enabled, the count vector lives in the
+CPU-backed `runtime_states` region so release/resume preserves its address and
+contents.
 
 ### Slot state belongs to an admission
 

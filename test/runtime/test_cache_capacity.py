@@ -242,14 +242,16 @@ def test_qcp_reserves_one_shared_workspace_before_sizing(qcp, draft):
     )
 
 
-def test_probe_uses_demand_and_reports_resident_bytes_with_zero_budget():
-    # Demand above the scheduler's minimum working set must set the probe size.
-    recipe = mha_recipe(budget=0, probe=8)
+@pytest.mark.parametrize("demand,expected", [(3, 4), (8, 8)])
+def test_probe_uses_demand_and_reports_resident_bytes_with_zero_budget(
+    demand, expected
+):
+    recipe = mha_recipe(budget=0, probe=demand)
     setup = recipe.setup_for_layers(
         resident_cache_window=(0, 2), synchronize_capacity=local_cache_capacity
     )
     resident = setup.spec.memory_plan.narrow_to_layers(0, 2)
-    assert resident.num_lcm_blocks == 8
+    assert resident.num_lcm_blocks == expected
     assert setup.cache_budget_bytes == resident.arena_bytes
 
 

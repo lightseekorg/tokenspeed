@@ -25,9 +25,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import torch
-from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
-    AscendQCPPrefillWorkspaceLayout,
-)
 from tokenspeed_kernel.ops.attention.mla.ascend import (
     ascend_mla_dcp_kernels,
     prepare_ascend_mla_qcp_prefill,
@@ -37,6 +34,8 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention.ascend_qcp_prefill import (
     AscendQCPPrefill,
+    AscendQCPPrefillBackend,
+    prefill_history_group,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mla import (
     MLAAttnBackend,
@@ -81,7 +80,7 @@ def mla_prefill_spans(extends, prefixes, *, first, rows):
     return tuple(spans)
 
 
-class AscendMLABackend(MLAAttnBackend):
+class AscendMLABackend(AscendQCPPrefillBackend, MLAAttnBackend):
     supports_mla_dcp = True
     supports_mla_projected_value_decode = False
     supports_layer_sliding_window = False
@@ -128,20 +127,11 @@ class AscendMLABackend(MLAAttnBackend):
         )
         self._current_active: torch.Tensor | None = None
         self._current_local = None
-        self._prefill_group = None
         self._prefill: AscendQCPPrefill | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
         self._prefill_pages: torch.Tensor | None = None
         self._prefill_layout = None
         self._prefill_cpu_table = None
-
-    @property
-    def prefill_enabled(self):
-        return self._prefill_layout is not None
-
-    @property
-    def prefill_needs_host_page_table(self):
-        return self.prefill_enabled
 
     def init_forward_metadata(self, *args, page_table_cpu=None, **kwargs):
         self._prefill_cpu_table = page_table_cpu
@@ -160,50 +150,21 @@ class AscendMLABackend(MLAAttnBackend):
         self._prefill = None
         self._prefill_pages = None
         self._prefill_spans = ()
-        self._prefill_group = None
 
-    @property
-    def prefill_kv_capacity(self) -> int:
-        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
-
-    def preallocate_prefill_workspace(self, pool_options=None) -> int:
-        if self._prefill is not None:
-            return self._prefill.runtime.workspace_bytes
-        if pool_options is None:
-            return 0
-        if not isinstance(pool_options, AscendQCPPrefillWorkspaceLayout):
-            raise TypeError("Ascend Prefill requires a recipe workspace layout")
-        if self.cache_pool is None:
-            raise RuntimeError("Bind the MLA cache before preparing Prefill")
-        self._prefill_layout = pool_options
-        # Every world rank creates the cache-owner groups before any forward.
-        if self._dcp.degree > 1:
-            from tokenspeed.runtime.distributed.process_group_manager import (
-                process_group_manager,
-            )
-
-            self._prefill_group = process_group_manager.get_dedicated_device_group(
-                self._dcp.ranks, "prefill-history"
-            )
-        else:
-            self._prefill_group = None
-        layer_id = min(self.cache_pool.history_group_by_layer())
+    def _create_qcp_prefill(self, layout, layer_id):
         kv = self.cache_pool.get_key_buffer(layer_id)
         runtime = prepare_ascend_mla_qcp_prefill(
             kv,
             ranks=self._dcp.ranks,
-            history_group=self._prefill_group,
-            max_current_rows=self._prefill_layout.current_capacity,
-            max_history_rows=self._prefill_layout.history_capacity,
-            history_null_rows=self._prefill_layout.null_rows,
+            history_group=prefill_history_group(self._dcp.ranks),
+            layout=layout,
         )
-        self._prefill = AscendQCPPrefill(
-            layout=self._prefill_layout,
+        return AscendQCPPrefill(
+            layout=layout,
             page_size=self.kernel_page_size,
             topk=1,
             runtime=runtime,
         )
-        return runtime.workspace_bytes
 
     def _init_prefill_metadata(self, **kwargs):
         if not self.prefill_enabled:

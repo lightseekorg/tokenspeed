@@ -2747,8 +2747,8 @@ Historical KV and Indexer-K receive directly into separate attention planes;
 current rows share a packed transfer and a fused owner-cache/boundary-page write.
 The batch page table defines compact receive addresses and owner writeback.
 
-The page-rounded `chunk_prefill_kv_size`, or model context length when omitted,
-bounds the workspace's historical rows. The bound covers the **sum** of request
+The model plugin supplies the historical-row capacity in its cache recipe.
+It can use the page-rounded `chunk_prefill_kv_size` or the model context length. The bound covers the **sum** of request
 KV pages, including cached prefixes, rather than one request's length. The
 backend publishes it to scheduler startup, which applies the smaller of this
 capacity and an explicit admission bound. Decode remains limited by its cache

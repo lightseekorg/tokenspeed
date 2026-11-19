@@ -23,6 +23,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
+)
 
 from tokenspeed.runtime.execution.query_shard import scatter_count
 
@@ -102,6 +105,47 @@ def prepare_qcp_prefill_gather_metadata(
     )
 
 
+class AscendQCPPrefillBackend:
+    """Bind one recipe-sized Prefill workspace to a paged backend's cache pool."""
+
+    @property
+    def prefill_enabled(self):
+        return self._prefill_layout is not None
+
+    @property
+    def prefill_needs_host_page_table(self):
+        return self.prefill_enabled
+
+    @property
+    def prefill_kv_capacity(self):
+        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
+
+    def preallocate_prefill_workspace(self, pool_options=None):
+        if self._prefill is not None:
+            return self._prefill.runtime.workspace_bytes
+        if pool_options is None:
+            return 0
+        if not isinstance(pool_options, AscendQCPPrefillWorkspaceLayout):
+            raise TypeError("Ascend Prefill requires a recipe workspace layout")
+        if self.cache_pool is None:
+            raise RuntimeError("Bind the cache before preparing Prefill")
+        layer_id = min(self.cache_pool.history_group_by_layer())
+        self._prefill = self._create_qcp_prefill(pool_options, layer_id)
+        self._prefill_layout = pool_options
+        return self._prefill.runtime.workspace_bytes
+
+
+def prefill_history_group(ranks):
+    """Create the cache-owner group on every participating rank before forward."""
+    if len(ranks) == 1:
+        return None
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+
+    return process_group_manager.get_dedicated_device_group(ranks, "prefill-history")
+
+
 class AscendQCPPrefill:
     """Prepare QCP/KVP metadata once per batch and reuse one transport workspace."""
 
@@ -120,6 +164,7 @@ class AscendQCPPrefill:
         self.current_direct = self.patch_slots = None
         self.has_prefix_history = False
         self.key_row_count = 0
+        self.key_lengths = ()
         self.history_slots = None
         self.history_counts = ()
         self.history_rows = self.current_rank_stride = 0
@@ -162,7 +207,8 @@ class AscendQCPPrefill:
         # history_rows + rank * current_rank_stride. This 128-row-aligned
         # stride is distinct from layout.gather_send_rows (buffer capacity).
         current_rank_stride = ((rows + degree * 128 - 1) // (degree * 128)) * 128
-        offset, active, key_rows = 0, 0, 0
+        offset = 0
+        key_lengths = []
         for prefix, extent in zip(prefixes, extends, strict=True):
             if (
                 count
@@ -170,8 +216,7 @@ class AscendQCPPrefill:
                 and offset + extent > first
                 and extent > 0
             ):
-                active += 1
-                key_rows += prefix + min(extent, first + count - offset)
+                key_lengths.append(prefix + min(extent, first + count - offset))
             offset += extent
         # 3. Plan the batch's compact history region and owner-local reads.
         # The page set includes current cache pages; their new values arrive
@@ -321,7 +366,7 @@ class AscendQCPPrefill:
                 current_rank_stride=current_rank_stride,
                 page_size=page_size,
                 topk=topk,
-                active_requests=active,
+                active_requests=len(key_lengths),
                 history_table=history_table,
                 patch_slots=patch_slots,
                 history_pages=history_pages,
@@ -340,7 +385,8 @@ class AscendQCPPrefill:
         # and patch partial pages before attention reads the shared planes.
         self.current_direct, self.patch_slots = direct, patch_slots
         self.has_prefix_history = any(prefixes)
-        self.key_row_count = key_rows
+        self.key_lengths = tuple(key_lengths)
+        self.key_row_count = sum(key_lengths)
         self.history_slots, self.history_counts = history_slots, history_counts
         self.history_rows = layout.null_rows + sum(history_counts)
         self.current_rank_stride = current_rank_stride

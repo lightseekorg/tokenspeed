@@ -98,9 +98,7 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             index,
             ranks=ranks,
             history_group=groups[int(has_index)],
-            max_current_rows=capacity.current_capacity,
-            max_history_rows=capacity.history_capacity,
-            history_null_rows=capacity.null_rows,
+            layout=capacity,
         )
         runtimes.append(runtime)
         assert runtime.workspace_bytes == runtime.layout.nbytes

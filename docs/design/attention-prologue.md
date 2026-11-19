@@ -540,7 +540,7 @@ that transport before skipping Indexer/SFA. The model derives the contiguous
 query span from the batch token count and KVP rank, using the same `scatter_count`
 as the backend; it does not search the backend tree during forward.
 
-The cache recipe reserves Prefill memory using `AscendQCPPrefillWorkspaceLayout`,
+An Ascend model plugin opts into QCP Prefill by reserving memory in its cache recipe using `AscendQCPPrefillWorkspaceLayout`,
 the same layout used for allocation. The recipe's optional `pool_options` passes
 directly to the backend's Prefill preallocation hook. Cache pools expose cache
 planes without carrying platform-specific workspace configuration.

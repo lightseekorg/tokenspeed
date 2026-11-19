@@ -70,6 +70,14 @@ def test_add_rmsnorm_updates_residual(
     torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_bf16_output_retains_fp32_scale_until_multiplication():
+    x = torch.tensor([1.0, 2.0], dtype=torch.bfloat16, device="npu").repeat(1, 512)
+    scale = torch.full((1024,), 1.0038, dtype=torch.float32, device="npu")
+    expected = _reference(x, scale, 1e-6)
+    assert not torch.equal(expected, _reference(x, scale.bfloat16(), 1e-6))
+    torch.testing.assert_close(rmsnorm(x, scale, 1e-6), expected, atol=0, rtol=0)
+
+
 def test_fp32_scale_graph_replay() -> None:
     x = torch.randn(7, 1024, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(1024, device="npu", dtype=torch.float32)

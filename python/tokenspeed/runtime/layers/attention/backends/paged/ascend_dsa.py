@@ -25,9 +25,6 @@ from __future__ import annotations
 import dataclasses
 
 import torch
-from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
-    AscendQCPPrefillWorkspaceLayout,
-)
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
     ascend_dsa_kernels,
 )
@@ -37,6 +34,8 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.ascend_qcp_prefill import (
     AscendQCPPrefill,
+    AscendQCPPrefillBackend,
+    prefill_history_group,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_local_decode import (
     AscendDSALocalDecode,
@@ -57,7 +56,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 ASCEND_SFAD_PAGE_SIZE = 128
 
 
-class AscendDSABackend(DSABackend):
+class AscendDSABackend(AscendQCPPrefillBackend, DSABackend):
     """Ascend DSA execution backed by Ascend indexer and sparse-attention ops."""
 
     # The decode path owns its DCP page placement and query exchange; the
@@ -121,68 +120,30 @@ class AscendDSABackend(DSABackend):
             )
         self._indexer_kernels = ascend_dsa_kernels()
         self._prefill: AscendQCPPrefill | None = None
-        self._prefill_group = None
         self._prefill_layout = None
-
-    @property
-    def prefill_enabled(self):
-        return self._prefill_layout is not None
-
-    @property
-    def prefill_needs_host_page_table(self):
-        return self.prefill_enabled
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         self._prefill = None
         self._ascend_placement = None
         super()._publish_cache_pool(cache_pool)
         self._prefill_layout = None
-        self._prefill_group = None
 
-    @property
-    def prefill_kv_capacity(self) -> int:
-        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
-
-    def preallocate_prefill_workspace(self, pool_options=None) -> int:
-        if self._prefill is not None:
-            return self._prefill.runtime.workspace_bytes
-        if pool_options is None:
-            return 0
-        if not isinstance(pool_options, AscendQCPPrefillWorkspaceLayout):
-            raise TypeError("Ascend Prefill requires a recipe workspace layout")
-        if self.cache_pool is None:
-            raise RuntimeError("Bind the DSA cache before preparing Prefill")
-        self._prefill_layout = pool_options
-        # Every world rank creates the cache-owner groups before any forward.
-        if self._kvp_degree > 1:
-            from tokenspeed.runtime.distributed.process_group_manager import (
-                process_group_manager,
-            )
-
-            self._prefill_group = process_group_manager.get_dedicated_device_group(
-                self._kvp_ranks, "prefill-history"
-            )
-        else:
-            self._prefill_group = None
-        layer_id = min(self.cache_pool.history_group_by_layer())
+    def _create_qcp_prefill(self, layout, layer_id):
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
         runtime = self._indexer_kernels.prepare_qcp_prefill(
             kv,
             index,
             ranks=self._kvp_ranks,
-            history_group=self._prefill_group,
-            max_current_rows=self._prefill_layout.current_capacity,
-            max_history_rows=self._prefill_layout.history_capacity,
-            history_null_rows=self._prefill_layout.null_rows,
+            history_group=prefill_history_group(self._kvp_ranks),
+            layout=layout,
         )
-        self._prefill = AscendQCPPrefill(
-            layout=self._prefill_layout,
+        return AscendQCPPrefill(
+            layout=layout,
             page_size=self.kernel_page_size,
             topk=self._indexer_spec.index_topk,
             runtime=runtime,
         )
-        return runtime.workspace_bytes
 
     def configure_runtime(self, **kwargs):
         super().configure_runtime(**kwargs)
@@ -317,6 +278,10 @@ class AscendDSABackend(DSABackend):
             raise ValueError("Prefill init/local token counts must fit index_topk")
         head_major_output = kwargs.pop("head_major_output", False)
         spec, prefill = self._indexer_spec, self._prefill
+        if prefill is None or not prefill.row_counts:
+            raise ValueError(
+                "DSA Prefill requires initialized workspace and batch metadata"
+            )
         if q.shape[:2] != (prefill.row_counts[prefill.rank], spec.num_attention_heads):
             raise ValueError(
                 "Prefill needs token-local queries with all attention heads"

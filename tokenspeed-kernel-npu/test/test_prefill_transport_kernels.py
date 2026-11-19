@@ -22,6 +22,9 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
+)
 
 torch_npu = pytest.importorskip("torch_npu")
 pytestmark = pytest.mark.skipif(
@@ -62,9 +65,13 @@ def test_prefill_workspace_reuses_caching_allocator_storage(monkeypatch):
         None,
         ranks=(0,),
         history_group=None,
-        max_current_rows=128,
-        max_history_rows=256,
-        history_null_rows=128,
+        layout=AscendQCPPrefillWorkspaceLayout(
+            current_capacity=128,
+            history_capacity=256,
+            null_rows=128,
+            degree=1,
+            has_index=False,
+        ),
     )
     size = runtime.workspace_bytes
     address = runtime._storage.data_ptr()
@@ -323,14 +330,24 @@ def test_cache_addresses_beyond_int32_elements():
 @pytest.mark.parametrize("has_index", [False, True])
 @torch.inference_mode()
 def test_batch_lengths_reuse_compiled_transport_kernels(has_index):
-    import importlib.util
-    from pathlib import Path
-
     from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
         _gather_history,
         _pack_current,
         _store_current,
     )
+
+    helper = _compile_test_utils()
+    test_history_and_current_copies_preserve_every_byte(has_index, 16)
+    with helper.assert_no_triton_compile(
+        _gather_history, _pack_current, _store_current
+    ):
+        for rows in (1, 17, 513):
+            test_history_and_current_copies_preserve_every_byte(has_index, rows)
+
+
+def _compile_test_utils():
+    import importlib.util
+    from pathlib import Path
 
     spec = importlib.util.spec_from_file_location(
         "prefill_kernel_test_utils",
@@ -338,9 +355,37 @@ def test_batch_lengths_reuse_compiled_transport_kernels(has_index):
     )
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    test_history_and_current_copies_preserve_every_byte(has_index, 16)
-    with helper.assert_no_triton_compile(
-        _gather_history, _pack_current, _store_current
-    ):
-        for rows in (1, 17, 513):
-            test_history_and_current_copies_preserve_every_byte(has_index, rows)
+    return helper
+
+
+def test_prefill_metadata_reuses_compiled_kernel_across_batch_sizes():
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels, _qcp_prefill_metadata
+
+    def prepare(batch, rows_per_request):
+        table = torch.ones((batch, 1), dtype=torch.int32, device="npu")
+        cumulative = (
+            torch.arange(batch + 1, dtype=torch.int32, device="npu") * rows_per_request
+        )
+        prefixes = torch.zeros(batch, dtype=torch.int32, device="npu")
+        rows = batch * rows_per_request
+        _, query_cu, _, _, _, _ = AscendDSAKernels.qcp_prefill_metadata(
+            table,
+            cumulative,
+            prefixes,
+            first=0,
+            rows=rows,
+            total=rows,
+            per_block=1,
+            degree=1,
+            local_pages=2,
+            current_rank_stride=128,
+            page_size=128,
+            topk=2048,
+            active_requests=batch,
+        )
+        torch.testing.assert_close(query_cu.cpu(), cumulative.long().cpu())
+
+    prepare(2, 8)
+    with _compile_test_utils().assert_no_triton_compile(_qcp_prefill_metadata):
+        for batch, per_request in [(1, 1), (3, 7), (16, 2)]:
+            prepare(batch, per_request)
