@@ -40,6 +40,10 @@ The runtime's unclamped `SiluAndMul` uses the fused NPU SwiGLU operator through
 `tokenspeed-kernel`, including shared-expert FFNs. Clamped activations keep
 the native FP32 calculation; FP8 output is unsupported on NPU.
 
+RMSNorm accepts FP32 checkpoint scales with BF16 activations. It promotes mixed
+inputs for the CANN operation and returns the activation dtype, preserving the
+caller's output buffer and residual storage.
+
 The Ascend plugin's explicit prefill composition can prepare a
 `W4A4GroupedPlan` from the prepared W4A4 weights. The standalone INT4
 `moe/apply` chain is removed; complete Decode owns its fused execution. Prefill shares NZ

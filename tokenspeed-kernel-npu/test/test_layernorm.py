@@ -37,28 +37,52 @@ def _reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tenso
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_rmsnorm(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_rmsnorm(dtype: torch.dtype, weight_dtype: torch.dtype) -> None:
     x = torch.randn(7, 1024, device="npu", dtype=dtype)
-    weight = torch.randn(1024, device="npu", dtype=dtype)
+    weight = torch.randn(1024, device="npu", dtype=weight_dtype)
     expected = _reference(x, weight, 1e-6)
 
     out = torch.empty_like(x)
     result = rmsnorm(x, weight, 1e-6, out=out)
 
     assert result is out
+    assert result.dtype == dtype
     torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_add_rmsnorm_updates_residual(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_add_rmsnorm_updates_residual(
+    dtype: torch.dtype, weight_dtype: torch.dtype
+) -> None:
     x = torch.randn(7, 1024, device="npu", dtype=dtype)
     residual = torch.randn_like(x)
-    weight = torch.randn(1024, device="npu", dtype=dtype)
+    weight = torch.randn(1024, device="npu", dtype=weight_dtype)
     expected_residual = x + residual
     expected = _reference(expected_residual, weight, 1e-6)
 
     result, residual_out = rmsnorm(x, weight, 1e-6, residual=residual)
 
     assert residual_out is residual
+    assert result.dtype == dtype
     torch.testing.assert_close(residual, expected_residual, atol=0, rtol=0)
     torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_fp32_scale_graph_replay() -> None:
+    x = torch.randn(7, 1024, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(1024, device="npu", dtype=torch.float32)
+    rmsnorm(x, weight, 1e-6)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        result = rmsnorm(x, weight, 1e-6)
+    for _ in range(3):
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.npu.synchronize()
+        assert result.dtype == x.dtype
+        torch.testing.assert_close(
+            result, _reference(x, weight, 1e-6), atol=2e-2, rtol=2e-2
+        )
