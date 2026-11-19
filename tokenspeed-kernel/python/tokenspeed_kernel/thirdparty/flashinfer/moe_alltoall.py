@@ -21,6 +21,7 @@
 """FlashInfer NVLink one-sided MoE all-to-all for one expert-parallel group."""
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 class FlashInferMoeAlltoAll:
@@ -36,34 +37,23 @@ class FlashInferMoeAlltoAll:
         from flashinfer.moe_ep import (
             BootstrapConfig,
             MoEEpCommParams,
+            NVLinkOneSidedConfig,
             create_communication,
         )
-        from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.config import (
-            NVLinkOneSidedConfig,
-        )
 
-        self.ep_rank = group.rank()
-        self.ep_size = group.size()
-        self.max_tokens = max_tokens
-        self.hidden_size = hidden_size
-        self.top_k = top_k
-        self.num_experts = num_experts
-        if num_experts % self.ep_size:
+        ep_rank, ep_size = group.rank(), group.size()
+        if num_experts % ep_size:
             raise ValueError(
                 "MoE all-to-all requires an even contiguous expert partition"
             )
-        # A valid nonlocal ID makes every expert backend ignore unused receive slots.
-        self.unused_expert_id = ((self.ep_rank + 1) % self.ep_size) * (
-            num_experts // self.ep_size
-        )
         # Rows are sized for unquantized activations, which also covers packed
         # NVFP4 plus its block scales. FlashInfer builds its host-side layout
         # tensors on the default device, which a model loader may set to CUDA.
         with torch.device("cpu"):
             self.communication = create_communication(
                 BootstrapConfig(
-                    world_size=self.ep_size,
-                    rank=self.ep_rank,
+                    world_size=ep_size,
+                    rank=ep_rank,
                     device=torch.cuda.current_device(),
                     process_group=group,
                 ),
@@ -74,7 +64,7 @@ class FlashInferMoeAlltoAll:
                     hidden_size=hidden_size,
                     dtype=dtype,
                 ),
-                NVLinkOneSidedConfig(),
+                NVLinkOneSidedConfig(enable_pdl=pdl_enabled()),
             )
 
     def dispatch(
@@ -102,6 +92,7 @@ class FlashInferMoeAlltoAll:
             Received activations (same form as ``hidden_states``), expert ids
             and routing weights, each with ``ep_size * max_tokens`` rows. They
             are views of the transport's buffers, valid until ``combine``.
+            Unused expert slots carry -1 and must contribute zero.
         """
         prequantized = isinstance(hidden_states, tuple)
         received = self.communication.dispatch(
@@ -111,12 +102,10 @@ class FlashInferMoeAlltoAll:
             hidden_states_scale=hidden_states[1] if prequantized else None,
             runtime_max_tokens_per_rank=max_tokens,
         )
-        ids = received.topk_ids
-        ids.masked_fill_(ids < 0, self.unused_expert_id)
         routed_input = received.hidden_states
         if prequantized:
             routed_input = (routed_input, received.hidden_states_scale)
-        return routed_input, ids, received.topk_weights
+        return routed_input, received.topk_ids, received.topk_weights
 
     def combine(self, routed_output: torch.Tensor) -> torch.Tensor:
         """Sum already-weighted rank outputs of the last dispatch.
