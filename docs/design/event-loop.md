@@ -696,6 +696,13 @@ Generation throughput counts tokens committed by decode forwards; on a plain
 worker the first token normally comes from prefill. Completion counts are
 role-local: the bootstrap token appears in both P and D totals. Use decode
 completion totals for a disaggregated service's output-token count.
+Speculative acceptance has separate verify-slot and request-level views.
+`tokenspeed:spec_decode_accept_length` remains weighted by the decode slots in
+each verify round. `tokenspeed:request_spec_decode_accept_length` observes one
+unweighted sample per ended request with at least one verify round, using
+`(output_tokens - 1) / verify_rounds`: the bootstrap token is excluded and each
+round's bonus token is included. Requests without a verify round emit no
+sample, and draining the output processor cannot duplicate a request's sample.
 L3 query hits count the token span of each successful storage key. Cache
 groups can cover the same prompt positions, so this measures storage hits
 per group rather than unique prompt tokens.
