@@ -151,6 +151,33 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
 global_graph_memory_pool = None
 
 
+def prepare_capture_metadata(
+    attn_backend: AttentionBackend,
+    draft_attn_backend: AttentionBackend | None,
+    *,
+    memory_saver_adapter: TorchMemorySaverAdapter,
+    batch_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: dict[str, torch.Tensor],
+    num_tokens: int,
+) -> None:
+    """Initialize target and draft capture state in the restorable metadata pool."""
+    backends = [attn_backend]
+    if draft_attn_backend is not None:
+        backends.append(draft_attn_backend)
+    with memory_saver_adapter.named_region("attention_state"):
+        for backend in backends:
+            backend.init_forward_metadata_capture_cuda_graph(
+                batch_size,
+                req_pool_indices,
+                seq_lens,
+                ForwardMode.DECODE,
+                block_tables=block_tables,
+                num_tokens=num_tokens,
+            )
+
+
 def prepare_draft_extend_metadata(
     draft_attn_backend: AttentionBackend,
     drafter: BaseDrafter,
@@ -446,26 +473,27 @@ class ForwardStepRunner:
         # pre-contract warmup: per published group, a zero (null-page) table
         # of the full capture width — always-contract delivery, so no backend
         # carries a "no tables" arm. Allocated once, sliced per call.
-        self._placeholder_tables = {
-            str(spec.group_id): torch.zeros(
-                (
-                    self.max_decode_bs,
-                    compute_max_logical_pages_for_capture(
-                        spec,
-                        max_context_len=(
-                            self.max_tokens_per_req * self.max_decode_bs
-                            if self.context_len <= 0
-                            else self.context_len
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self._placeholder_tables = {
+                str(spec.group_id): torch.zeros(
+                    (
+                        self.max_decode_bs,
+                        compute_max_logical_pages_for_capture(
+                            spec,
+                            max_context_len=(
+                                self.max_tokens_per_req * self.max_decode_bs
+                                if self.context_len <= 0
+                                else self.context_len
+                            ),
+                            max_tokens_per_req=self.max_tokens_per_req,
+                            overlap_schedule_depth=self.overlap_schedule_depth,
                         ),
-                        max_tokens_per_req=self.max_tokens_per_req,
-                        overlap_schedule_depth=self.overlap_schedule_depth,
                     ),
-                ),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for spec in token_to_kv_pool.arena.cache_group_specs
-        }
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for spec in token_to_kv_pool.arena.cache_group_specs
+            }
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
@@ -777,6 +805,38 @@ class ForwardStepRunner:
             decode_width=self.max_tokens_per_req,
         )
 
+    def _capture_forward(
+        self, bs: int, ctx: ForwardContext, sampling_info: SamplingBatchInfo
+    ):
+        """One forward of a capture: a warmup, or the captured one itself.
+
+        Restores the query extent a round starts from first. Packed
+        verification narrows ``ctx.input_num_tokens`` for the rest of the
+        forward that selected it, while the warmups and the capture share one
+        context. The grammar fill slices this round's verify candidates by
+        that extent, so a narrowed context would record an empty copy and
+        every replay would fill its masks from stale draft tokens.
+        """
+        ctx.input_num_tokens = bs * self.max_tokens_per_req
+        # Dummy add_batch keeps grammar batches 1:1 with replays: the
+        # host node pops one batch per forward.
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.add_batch(
+                grammars=[None] * bs,
+                bs=bs,
+                has_candidates=False,
+                output_layout=ctx.output_layout,
+            )
+        return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
+    def _capture_barrier(self) -> None:
+        """Synchronize the eagerly initialized world group during capture setup."""
+        # DistributedInitializer eagerly binds WORLD with device_id before model
+        # setup; NVIDIA fabric discovery also runs a WORLD all-gather there.
+        # NCCL initialization stays outside this pool; barrier-owned tensors join here.
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            dist.barrier()
+
     def _capture_one(
         self,
         bs: int,
@@ -889,16 +949,7 @@ class ForwardStepRunner:
             self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
-            # Dummy add_batch keeps grammar batches 1:1 with replays: the
-            # host node pops one batch per forward.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * bs,
-                    bs=bs,
-                    has_candidates=False,
-                    output_layout=ctx.output_layout,
-                )
-            return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            return self._capture_forward(bs, ctx, sampling_info)
 
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
@@ -908,7 +959,7 @@ class ForwardStepRunner:
         with self.device_module.stream(self.stream):
             for _ in range(4):
                 self.device_module.synchronize()
-                dist.barrier()
+                self._capture_barrier()
                 self._prepare_sampling_capture(bs=bs, variant=variant)
                 # Keep warmup seq_lens >= q_len_per_req so no query row gets an
                 # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
@@ -924,7 +975,7 @@ class ForwardStepRunner:
             self.sampling_backend.reset_capture_state()
 
         self.device_module.synchronize()
-        dist.barrier()
+        self._capture_barrier()
 
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
@@ -975,7 +1026,7 @@ class ForwardStepRunner:
                 )
 
         self.device_module.synchronize()
-        dist.barrier()
+        self._capture_barrier()
         _is_capture_mode = False
         _is_cuda_graph_phase = False
 
@@ -1077,23 +1128,16 @@ class ForwardStepRunner:
                 )
 
                 self.device_module.synchronize()
-                dist.barrier()
+                self._capture_barrier()
                 self._prepare_sampling_capture(
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                if self.capturable_grammar is not None:
-                    self.capturable_grammar.add_batch(
-                        grammars=[None] * bs,
-                        bs=bs,
-                        has_candidates=False,
-                        output_layout=ctx.output_layout,
-                    )
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
-                self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+                self._capture_forward(bs, ctx, sampling_info)
                 self.device_module.synchronize()
-                dist.barrier()
+                self._capture_barrier()
 
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.reset_state()
@@ -1154,31 +1198,21 @@ class ForwardStepRunner:
             self._init_capture_metadata(bs)
 
     def _init_capture_metadata(self, bs: int):
+        """Prepare address-stable decode metadata before entering graph capture."""
         tables = self.placeholder_block_tables(bs)
-        self.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            self.input_buffers.req_pool_indices_buf[:bs],
-            self.input_buffers.seq_lens_buf[:bs],
-            ForwardMode.DECODE,
+        prepare_capture_metadata(
+            self.attn_backend,
+            self.draft_attn_backend,
+            memory_saver_adapter=self.memory_saver_adapter,
+            batch_size=bs,
+            req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+            seq_lens=self.input_buffers.seq_lens_buf[:bs],
             block_tables=tables,
             num_tokens=bs * self.max_tokens_per_req,
         )
         if self.draft_attn_backend is not None:
-            # One arena, one contract: the draft consumes its own groups out
-            # of the same placeholder set.
-            # Drafter mutates seq_lens_buf in place per step; backends alias.
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                self.input_buffers.req_pool_indices_buf[:bs],
-                self.input_buffers.seq_lens_buf[:bs],
-                ForwardMode.DECODE,
-                block_tables=tables,
-                num_tokens=bs * self.max_tokens_per_req,
-            )
-            # Block drafters (DFLASH) re-run the unified refresh inside their
-            # step loop with this round's tables; capture warm-ups run that
-            # loop eagerly before any live decode has published tables, so
-            # seed the placeholders here too.
+            # Draft metadata aliases the same arena tables and input buffers.
+            # Block drafters also need them before a live decode publishes tables.
             self.drafter.round_block_tables = tables
 
     def _prepare_decode_metadata(
@@ -1256,25 +1290,26 @@ class ForwardStepRunner:
         Pure decode goes through ``_prepare_decode_metadata``; this arm keeps
         the dynamic-shape prefill construction.
         """
-        self.attn_backend.init_forward_metadata(
-            bs=padded_bs,
-            num_extends=num_extends,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            forward_mode=forward_mode,
-            **kwargs,
-        )
-        if self.draft_attn_backend is not None:
-            prepare_draft_extend_metadata(
-                self.draft_attn_backend,
-                self.drafter,
-                padded_bs=padded_bs,
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.init_forward_metadata(
+                bs=padded_bs,
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 **kwargs,
             )
+            if self.draft_attn_backend is not None:
+                prepare_draft_extend_metadata(
+                    self.draft_attn_backend,
+                    self.drafter,
+                    padded_bs=padded_bs,
+                    num_extends=num_extends,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    forward_mode=forward_mode,
+                    **kwargs,
+                )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:

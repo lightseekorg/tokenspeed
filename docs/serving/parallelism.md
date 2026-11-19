@@ -273,6 +273,10 @@ Kimi-K3 requires
 `attention DP == MoE EP == world size`. By default, shared experts and attention
 projections are replicated. Only the routed experts require dispatch/combine
 communication.
+On this path (any transport but `deepep`, or MegaMoE), an EP size that does
+not divide the 896 routed experts takes redundant slots
+([static expert placement](#static-expert-placement-with-redundant-experts)),
+for example `--ep-num-redundant-experts 4 --ep-dispatch-algorithm static` at EP20.
 
 Select the transport with `--all2all-backend`:
 
@@ -491,11 +495,15 @@ rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
 from the placement and loading every placed slot — LongCat-Flash does, and
 Inkling2 does for static placements (it does not expose its expert weights to
-`--enable-eplb`).
+`--enable-eplb`), and so does Kimi-K3 with attention DP and EP-only MoE
+(MegaMoE, or the all-to-all / all-gather dispatch to the local MoE; static
+dispatch, no load recording or online rebalancing).
 TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
-replicas live on other ranks.
+replicas live on other ranks. It also serves an EP size that does not divide
+the routed experts: Kimi-K3's 896 experts run at EP20 with
+`--ep-num-redundant-experts 4` (900 slots, 45 per rank).
 
 1. **Record** the load of a representative workload. Serve with
    `--expert-distribution-recorder-mode stat --ep-dispatch-algorithm
@@ -1081,11 +1089,14 @@ Before benchmarking:
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
 
-DWDP requires the CUDA 13 toolkit.
+DWDP supports the CUDA 12.8 and 13 toolkits.
 
-The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
---ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
-`--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
+The initial K3 configuration (NVFP4 or MXFP4 experts on the FlashInfer TRT-LLM
+kernels; pass `--moe-backend flashinfer_trtllm` for MXFP4, where `auto` may
+select another kernel) requires `--attn-tp-size 1 --moe-tp-size 1
+--ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`, and a
+fixed prefill token budget. Eager execution and ordinary breakable prefill
+graphs are supported.
 The weight-sharing size must divide the instance size. Shared-expert and
 attention-projection TP overrides must also remain local. The additional
 staging memory is allocated before KV cache sizing. Live checkpoint replacement

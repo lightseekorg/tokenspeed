@@ -318,6 +318,17 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .reasoning_usage
         .as_ref()
         .map(|grammar| ReasoningTokens::new(grammar, &state.prompt_ids));
+    if request
+        .peer_holder
+        .as_ref()
+        .is_some_and(|holder| !holder.is_empty())
+    {
+        state.peer_usage = Some(crate::request::PeerUsage {
+            expected: request.peer_expected_tokens,
+            disposition: "not_attempted",
+            ..Default::default()
+        });
+    }
     state.created_time = request.created_time;
     state.session_id = request
         .session_params

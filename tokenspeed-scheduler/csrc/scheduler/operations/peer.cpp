@@ -101,7 +101,7 @@ void Scheduler::handleEvent(const cache::PeerPin& event) {
 
 void Scheduler::handleEvent(const cache::PeerRelease& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer release without configured peer sharing");
-    peer_exports_->Release(coordinator_, event);
+    peer_exports_->Release(coordinator_, event, peer_now_us_);
 }
 
 void Scheduler::handleEvent(const cache::PeerLookupAnswered& event) {
@@ -199,7 +199,9 @@ void Scheduler::preparePeer(Request& request) {
     submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
-    if (holder.empty() || holder == limits.name) {
+    // The D role computes no prompt: what it lacks comes from its PD peer,
+    // so it never reads from a holder, whatever the request names.
+    if (holder.empty() || holder == limits.name || config_.role == Role::kD) {
         return;
     }
     const std::int32_t grain = config_.prefix_granularity;
@@ -216,7 +218,9 @@ void Scheduler::preparePeer(Request& request) {
         return;
     }
     PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
-    peer_lookups_.push_back(PeerLookupRequest{.lease = lease,
+    peer_lookups_.push_back(PeerLookupRequest{.request_id = request.Id(),
+                                              .deadline_us = Deadline(peer_now_us_, limits.lookup_timeout_us),
+                                              .lease = lease,
                                               .holder = holder,
                                               .prefix_hashes = {hashes.begin(), hashes.end()},
                                               .tokens = {tokens.begin(), tokens.end()},

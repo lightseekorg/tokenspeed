@@ -86,7 +86,11 @@ fn run_scenario(directory: &Path) {
     engine.observe_request_time(1.5);
     engine.observe_decode_time(1.2);
     engine.observe_time_per_output_token(0.02);
+    engine.observe_e2e_time_per_output_token(0.03);
     engine.record_completion_tokens(5);
+    engine.observe_request_completion_tokens(0);
+    engine.observe_request_completion_tokens(5);
+    engine.record_decode_prefix_hits(100, 20);
     engine.record_grammar_queue(2);
     engine.record_prefix_hits(100, 40, 30, 10);
 
@@ -438,4 +442,63 @@ fn a_relay_message_is_the_python_event_array() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(encoded, expected.trim());
+}
+
+#[test]
+fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
+    let directory = scratch_dir("peer-estimates");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".into(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    engine.peer.increment("landed_tokens", 8);
+    let completed = engine.peer.queue_read("a".into(), 0, 64);
+    let cancelled = engine.peer.queue_read("a".into(), 0, 128);
+    completed.finish(
+        std::time::Instant::now(),
+        std::time::Duration::from_millis(200),
+        true,
+    );
+    drop(cancelled);
+    engine.peer.usage(Some(10), 14, "used");
+    engine.peer.usage(None, 5, "used");
+    engine.peer.usage(Some(8), 0, "lookup_miss");
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    for (name, outcome, expected) in [
+        ("peer_estimation_error_tokens_sum", "used", -4.0),
+        ("peer_estimation_error_tokens_count", "used", 1.0),
+        ("peer_estimation_error_tokens_sum", "lookup_miss", 8.0),
+        ("peer_consumed_tokens_sum", "", 19.0),
+        ("peer_consumed_tokens_count", "", 3.0),
+        ("peer_read_bytes_total", "", 64.0),
+        ("peer_outstanding_read_bytes", "", 0.0),
+        ("peer_scheduler_events_total", "", 8.0),
+    ] {
+        let line = text
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("tokenspeed:{name}{{"))
+                    && (outcome.is_empty() || l.contains(&format!("outcome=\"{outcome}\"")))
+            })
+            .unwrap();
+        assert_eq!(
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            expected
+        );
+    }
 }

@@ -36,7 +36,7 @@ use ts_control::peer::{
     geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
     landing::Timeouts,
     read::EngineReader,
-    Peer, PeerFence, PeerSettings,
+    Peer, PeerFence, PeerListener, PeerSettings,
 };
 use ts_scheduler::Scheduler;
 
@@ -73,6 +73,7 @@ impl Outbox {
 /// What the bootstrap resolved for this rank.
 pub struct Settings {
     peer: PeerSettings,
+    bind_host: String,
     port: u16,
     library: PathBuf,
     local_ip: String,
@@ -133,7 +134,6 @@ impl Settings {
         Ok(Some(Self {
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
-                bind_host: settings.getattr("bind_host")?.extract()?,
                 incarnation: settings.getattr("incarnation")?.extract()?,
                 deployment_id: settings.getattr("deployment_id")?.extract()?,
                 weight_version: settings.getattr("weight_version")?.extract()?,
@@ -148,6 +148,7 @@ impl Settings {
                         .max(0.0),
                 ),
             },
+            bind_host: settings.getattr("bind_host")?.extract()?,
             port: settings.getattr("port")?.extract()?,
             library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
             local_ip: settings.getattr("local_ip")?.extract()?,
@@ -227,11 +228,19 @@ pub fn start(
         weight_version = settings.peer.weight_version,
         "peer prefix sharing up"
     );
+    let listener = if replica.index() == 0 {
+        Some(
+            PeerListener::bind(&settings.bind_host, settings.port)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let peer = Peer::start(
         settings.peer,
         replica.index(),
         geometries,
-        settings.port,
+        listener,
         scheduler,
         Arc::new(EngineReader(Arc::new(engine))),
     )
