@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,18 @@ def test_drafter_refuses_an_unsupported_local_graph_scope():
     with pytest.raises(ValueError, match="enable-dp-local-cuda-graph"):
         drafter.configure_decode_graph_scope(local=True)
     assert not drafter.dp_local_graph
+
+
+def test_local_graph_rejects_global_moe_counts_at_startup():
+    with pytest.raises(ValueError, match="peer graph capacities"):
+        ForwardStepRunner(
+            None,
+            None,
+            None,
+            None,
+            SimpleNamespace(enable_dp_local_cuda_graph=True),
+            moe_source_rows=(object(),),
+        )
 
 
 def _runner(

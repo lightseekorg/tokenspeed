@@ -412,6 +412,19 @@ this platform cannot run, or whose traits exclude the request, raises.
 
 ## Ascend integration
 
+Numerical variants can reuse Prefill storage and communication independently
+of the native numerical backend.
+`AscendDSAAttention._prepare_lora_scales` isolates native norm-weight folding
+from checkpoint projection preparation. A variant that scales after the BF16
+norm output overrides that step and supplies its own numerical forward.
+`AscendQCPPrefill` prepares batch metadata once, then supplies each layer's
+cache to the shared history/current exchange and cache-write runtime.
+Additional fixed scratch belongs to the backend, is shared across its layers,
+and must be reserved by the cache recipe before allocation.
+Prefill transport and Index-K scatter are data-only entry points; they do not
+load the native fused Indexer/SFA library when a variant selects different
+arithmetic.
+
 Shared Ascend DSA and MLA components own attention execution. Models supply
 configuration and checkpoint weights; kernel selection and weight preparation
 belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
@@ -419,10 +432,10 @@ preserves coefficients and dtype.
 
 DSA's indexer uses the normalized Q latent before the main attention's Q-LoRA
 scale. Prefill and fused Decode with 16/32 Indexer heads scale the BF16 main
-Q projection result; the 64-head fused path retains scaled weight panels.
+Q projection result. Indexer64 is unsupported.
 The shared Q norm and indexer query projection remain unscaled. Indexer score
 projections retain FP32 and include `index_head_dim**-0.5 * index_n_heads**-0.5`;
-the 16-head fused path applies this factor after projection, while 32/64-head
+the 16-head fused path applies this factor after projection, while 32-head
 paths fold it into FP32 weights. These rounding boundaries do not establish
 cross-provider bitwise equality.
 
@@ -435,15 +448,21 @@ DSA Prefill uses token-local queries with all heads, gathers KV and Indexer-K,
 and returns complete output rows without Q/TopK/output/LSE exchanges. MLA
 Prefill keeps its head partition: it gathers normalized Q latents, projects
 local heads, consumes gathered KV history and current rows, and retains the
-existing output reduction. Indexer-K and KV share one BF16 transport packet
-per phase; gathering and cache commit preserve their bits.
+existing output reduction. Historical KV and Indexer-K gather directly into
+their respective attention planes. Current rows share a BF16 packet; one
+kernel unpacks both planes, fills partial history pages and writes owner caches.
+Gathering and cache commit preserve all bits, including BF16 NaN payloads.
 
-The preceding KDA segment may submit history gathering. The attention entry
-ensures it if absent. Receive and packet tensors are temporary and follow actual
-batch page geometry; fixed gather workspaces are not part of the model cache.
-All user-managed Prefill work uses one execution stream and synchronous HCCL
-interfaces. Tensor references and allocator stream tracking cover every queued
-consumer. Weight preparation and Decode graph behavior remain unchanged.
+At each attention layer the backend gathers history, then gathers and commits
+current rows before index selection. The cache recipe reserves one persistent
+Torch workspace with attention planes, send space and current-row receive space.
+Layers reuse this storage in execution-stream order. The executor synchronizes
+before handing off the workspace or releasing its owner.
+The Decode model runtime shares the fused prologue
+producer buffers across sequential layers and selects projection computations
+through the attention registry. The DSA module constructs its checkpoint
+projections and absorbed attention directly; it does not construct then discard
+a dense MLA projection or retain unused fused-norm children.
 These byte-preserving gathers do not establish cross-provider bitwise equality
 for attention arithmetic or reductions.
 
@@ -451,8 +470,8 @@ Prefill KV transport borrows an isolated accelerator process group from the
 runtime process-group manager. All world ranks create the cache-owner groups
 in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
-rank still participates in startup. Temporary tensor ownership ends after
-the final consumer, while the process-group manager retains the communicator.
+rank still participates in startup. The backend retains its shared workspace
+across layers, while the process-group manager retains the communicator.
 
 ### V4.1 fused decode attention
 
@@ -487,3 +506,58 @@ K and V fields share a plane. Prologue and context scatters resolve a token
 slot as ``page * page_stride + row * row_stride``; flattening these pages
 would discard the gap occupied by the other field. Dense row caches keep
 their existing three-dimensional views.
+
+
+### Ascend DSA execution ownership
+
+DSA Prefill prepares its batch metadata and reusable transport in
+`attention/ascend_qcp_prefill.py`. The DSA backend's `forward_extend` performs
+history/current KV preparation, Indexer selection and SFA in order. Each layer
+gathers its history at the attention entry and commits current KV/Index-K before
+selection. The next layer reuses the same buffers.
+
+`attention/backends/paged/ascend_dsa_local_decode.py` owns TP1/KVP1 Decode,
+including single-token and multi-token causal metadata. It has no DCP metadata
+or communicator. The
+TP/KVP attention, fused projections and communication registration live together
+in `attention/backends/paged/ascend_dsa_tp_kvp_decode.py`. Native resource
+release remains explicit after graph teardown; PyTorch buffers follow owner
+lifetime and are reused across layers.
+
+Token-local Prefill uses complete projections for each rank's query rows.
+A Prefill-only replica loads these weights directly. A unified replica serving
+TP/KVP Decode keeps the local Decode weights and gathers the Prefill views
+after each weight load. It gathers QB, KC and VC along the head dimension
+and O along its input dimension. Later loads refresh the same buffers for graph
+replay. A Decode-only replica needs only the local weights. Local KVP1 Decode
+requires TP1 projections. With KVP1, a TP4 Prefill group replicates KV on
+each rank.
+
+NoPE native DSA Decode writes the prepared latent directly with `latent_store`;
+its Q is already complete. Prefill defers the owner-local KV write to the shared
+transport after gathering current rows. Ranks with no query rows participate in
+that transport before skipping Indexer/SFA. The model derives the contiguous
+query span from the batch token count and KVP rank, using the same `scatter_count`
+as the backend; it does not search the backend tree during forward.
+
+An Ascend model plugin opts into QCP Prefill by reserving memory in its cache recipe using `AscendQCPPrefillWorkspaceLayout`,
+the same layout used for allocation. The recipe's optional `pool_options` passes
+directly to the backend's Prefill preallocation hook. Cache pools expose cache
+planes without carrying platform-specific workspace configuration.
+History capacity also limits scheduler KV admission, and the shared workspace
+is allocated once per backend rather than once per layer.
+
+`AscendQCPPrefill.prepare_batch_metadata` partitions current queries, plans the
+history gather, and builds the attention page table, Q/K boundaries and per-query
+causal metadata. `prepare_qcp_prefill_gather_metadata` only prepares addresses
+and counts; it does not read KV or issue collectives. Native and bitwise NPU
+paths use the same device metadata builder; the CPU branch is its reference.
+`prepare_layer_kv` then supplies the current layer's KV/Index-K cache and
+projections to `AscendQCPPrefillTransport` in `tokenspeed_kernel_npu.ops.qcp_prefill`.
+
+The workspace has three storage groups: `_attention_kv`/`_attention_index`
+(`attention_plane_rows`) hold final attention inputs and receive history
+directly; `_gather_send` (`gather_send_rows`) is reused for history and current
+sends; `_current_receive` (`current_receive_rows`) holds gathered current rows
+before they are unpacked. `current_rank_stride` is the aligned distance between
+producers' current regions in the attention planes, distinct from send capacity.
