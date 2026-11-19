@@ -71,7 +71,9 @@ pub struct TraceRecord {
     pub scheduled: f64,
     /// The prompt's last chunk committed.
     pub prefill_done: f64,
-    /// The first output token committed.
+    /// The role's first output token: on a decode role the first local
+    /// decode output, after the remote bootstrap token landed (or that
+    /// bootstrap token itself when it ends the request).
     pub first_token: f64,
     /// Finished or aborted: the span's end.
     pub finish: f64,

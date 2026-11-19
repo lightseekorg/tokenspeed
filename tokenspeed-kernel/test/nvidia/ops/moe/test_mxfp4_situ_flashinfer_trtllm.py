@@ -158,6 +158,8 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260827, 16)
     )
+    topk_ids[0] = -1
+    topk_ids[1, 0] = -1
     expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
