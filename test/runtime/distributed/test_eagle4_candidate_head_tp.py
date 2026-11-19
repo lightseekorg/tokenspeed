@@ -157,29 +157,25 @@ def _check_greedy_candidate(rank, world_size, device):
     assert all(torch.equal(g, best) for g in gathered)
 
 
-def _worker(rank, world_size, rendezvous, error_dict):
+def _worker(rank, world_size, rendezvous):
     # The test asks a stuck rank for its stacks before killing it.
     faulthandler.register(signal.SIGUSR1, all_threads=True)
-    try:
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=rendezvous,
-            rank=rank,
-            world_size=world_size,
-        )
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
-        )
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
 
-        pg_manager.init_process_group(tuple(range(world_size)))
-        _check_greedy_candidate(rank, world_size, device)
-        dist.destroy_process_group()
-    except Exception:
-        import traceback
-
-        error_dict[rank] = traceback.format_exc()
+    pg_manager.init_process_group(tuple(range(world_size)))
+    _check_greedy_candidate(rank, world_size, device)
+    dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
@@ -187,11 +183,12 @@ def _worker(rank, world_size, rendezvous, error_dict):
     reason="needs 2 GPUs",
 )
 def test_two_ranks_pick_the_best_of_their_gathered_candidates(tmp_path):
-    error_dict = mp.Manager().dict()
+    # spawn propagates worker exceptions itself. A Manager would fork after
+    # Torch started threads and can block workers while unpickling its proxy.
     # A file rendezvous: a probed free port can be taken before rank 0 binds it.
     ranks = mp.spawn(
         _worker,
-        args=(2, f"file://{tmp_path / 'rendezvous'}", error_dict),
+        args=(2, f"file://{tmp_path / 'rendezvous'}"),
         nprocs=2,
         join=False,
     )
@@ -206,14 +203,14 @@ def test_two_ranks_pick_the_best_of_their_gathered_candidates(tmp_path):
                     os.kill(process.pid, signal.SIGUSR1)
                     time.sleep(5)
             for process in ranks.processes:
-                process.kill()
+                if process.is_alive():
+                    process.kill()
+            for process in ranks.processes:
+                process.join(timeout=5)
             peer = torch.cuda.can_device_access_peer(0, 1)
             raise RuntimeError(
-                f"ranks still running after {JOIN_SECONDS} s (peer access {peer}); "
-                f"reported: {dict(error_dict)}"
+                f"ranks still running after {JOIN_SECONDS} s (peer access {peer})"
             )
-    if error_dict:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in error_dict.items()))
 
 
 if __name__ == "__main__":

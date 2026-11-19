@@ -198,6 +198,15 @@ ranks have completed admission.
 it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off it once, at construction.
 
+Ordinary communication buffers are prepared for the model's execution groups
+after model-specific communication preparation and before cache memory
+profiling. Large warmup batches can select RCCL while a later small prefix hit
+selects Iris, so warmup traversal alone cannot initialize every serving route.
+Preparation reuses model-owned capacities and follows the mapping's group-role
+order on every rank, so overlapping groups retain symmetric heap offsets.
+Pipeline, weight-sharing and named groups keep their separate communication
+lifecycles.
+
 The transfer itself is the host's (`ts-pd`): the routes between unequal rank
 sets, the block manifests read off each plan's block tables, the layerwise
 chunks and the copies are planned there, over the cache transfer contract the

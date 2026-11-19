@@ -1583,6 +1583,7 @@ def build_device_side(
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
+    from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_runtime
     from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
@@ -1650,6 +1651,12 @@ def build_device_side(
                     else DistributedConfig.distributed_timeout_seconds
                 ),
             )
+        # Large startup batches can select RCCL while a later prefix hit selects
+        # Iris. Prepare that small-batch route before the serving sync guard.
+        groups = server_args.mapping.all_reduce_groups
+        prepare_all_reduce_runtime(groups, model_config.dtype, backend=None)
+        if draft_model_config is not None:
+            prepare_all_reduce_runtime(groups, draft_model_config.dtype, backend=None)
     if communication_first:
         prepare_multimodal()
 
