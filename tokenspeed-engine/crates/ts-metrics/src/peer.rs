@@ -23,7 +23,38 @@ use super::{EngineLabels, Exporter, Metric};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+
+/// Holds a shard's outstanding bytes from enqueue until retirement or cancellation.
+pub struct QueuedPeerRead {
+    metrics: Arc<PeerMetrics>,
+    holder: String,
+    member: usize,
+    bytes: u64,
+    queued: Instant,
+}
+
+impl QueuedPeerRead {
+    /// Record a completed transport call. Dropping the guard also retires its bytes.
+    pub fn finish(self, started: Instant, elapsed: Duration, ok: bool) {
+        self.metrics.shard(
+            &self.holder,
+            self.member,
+            started.duration_since(self.queued).as_secs_f64(),
+            elapsed.as_secs_f64(),
+            self.bytes,
+            ok,
+        );
+    }
+}
+
+impl Drop for QueuedPeerRead {
+    fn drop(&mut self) {
+        self.metrics
+            .outstanding(&self.holder, self.member, self.bytes, false);
+    }
+}
 
 const SECONDS: &[f64] = &[
     0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1., 5., 15., 30., 60., 120.,
@@ -158,15 +189,33 @@ impl PeerMetrics {
                 .inc(&[&self.model, &self.app, &self.dp, state], delta as f64);
         }
     }
+    /// Account for a shard from the time it is queued.
+    pub fn queue_read(
+        self: &Arc<Self>,
+        holder: String,
+        member: usize,
+        bytes: u64,
+    ) -> QueuedPeerRead {
+        self.outstanding(&holder, member, bytes, true);
+        QueuedPeerRead {
+            metrics: Arc::clone(self),
+            holder,
+            member,
+            bytes,
+            queued: Instant::now(),
+        }
+    }
+
     /// Change outstanding byte load under the same lock as publishing it.
-    pub fn outstanding(&self, holder: &str, member: usize, bytes: u64, submit: bool) {
+    fn outstanding(&self, holder: &str, member: usize, bytes: u64, submit: bool) {
         let mut loads = self.loads.lock().expect("peer load lock");
         let key = (holder.to_owned(), member);
         let n = loads.entry(key.clone()).or_default();
         if submit {
             *n += bytes;
         } else {
-            *n -= bytes;
+            debug_assert!(*n >= bytes, "outstanding peer bytes underflow");
+            *n = n.saturating_sub(bytes);
         }
         self.outstanding.set(
             &[
@@ -199,15 +248,7 @@ impl PeerMetrics {
     }
 
     /// Separate physical queue delay from time spent in the transport.
-    pub fn shard(
-        &self,
-        holder: &str,
-        member: usize,
-        queued: f64,
-        elapsed: f64,
-        bytes: u64,
-        ok: bool,
-    ) {
+    fn shard(&self, holder: &str, member: usize, queued: f64, elapsed: f64, bytes: u64, ok: bool) {
         let rank = member.to_string();
         let l = [&*self.model, &*self.app, &*self.dp, holder, &rank];
         self.physical
@@ -227,6 +268,5 @@ impl PeerMetrics {
         if ok {
             self.bytes.inc(&l, bytes as f64);
         }
-        self.outstanding(holder, member, bytes, false);
     }
 }

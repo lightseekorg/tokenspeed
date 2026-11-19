@@ -62,18 +62,9 @@ pub struct ReadJob {
     pub spans: Spans,
 }
 
-/// Optional physical READ observation, owned by the queued job until retirement.
-pub(super) struct ReadObservation {
-    pub metrics: Arc<ts_metrics::PeerMetrics>,
-    pub holder: String,
-    pub member: usize,
-    pub bytes: u64,
-    pub queued: std::time::Instant,
-}
-
 /// The member's bounded read workers: jobs in, outcomes out.
 pub struct Reads {
-    jobs: Option<mpsc::Sender<(ReadJob, Option<ReadObservation>)>>,
+    jobs: Option<mpsc::Sender<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>>,
     outcomes: mpsc::Receiver<(String, bool)>,
     workers: Vec<thread::JoinHandle<()>>,
 }
@@ -82,7 +73,7 @@ impl Reads {
     /// Run at most `concurrency` reads at once over `reader`. Queued reads
     /// keep their landing's destinations held until their outcome arrives.
     pub fn start(reader: Arc<dyn PageReader>, concurrency: NonZeroUsize) -> std::io::Result<Self> {
-        let (jobs, incoming) = mpsc::channel::<(ReadJob, Option<ReadObservation>)>();
+        let (jobs, incoming) = mpsc::channel::<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>();
         let (done, outcomes) = mpsc::channel();
         let incoming = Arc::new(Mutex::new(incoming));
         // Own each worker as soon as it starts, so a later spawn failure
@@ -114,8 +105,7 @@ impl Reads {
                         reader.read(&job.session, &job.spans)
                     };
                     if let Some(observation) = observation {
-                        observation.metrics.shard(&observation.holder,observation.member,
-                            started.duration_since(observation.queued).as_secs_f64(),started.elapsed().as_secs_f64(),observation.bytes,outcome.is_ok());
+                        observation.finish(started, started.elapsed(), outcome.is_ok());
                     }
                     tracing::debug!(
                         request = job.request_id,
@@ -149,16 +139,13 @@ impl Reads {
         self.submit_observed(job, None);
     }
 
-    pub(super) fn submit_observed(&self, job: ReadJob, observation: Option<ReadObservation>) {
+    pub(super) fn submit_observed(
+        &self,
+        job: ReadJob,
+        observation: Option<ts_metrics::QueuedPeerRead>,
+    ) {
         if let Some(jobs) = &self.jobs {
-            if let Some(o) = &observation {
-                o.metrics.outstanding(&o.holder, o.member, o.bytes, true);
-            }
-            // The workers outlive the sender; a send fails only if they ended,
-            // which the next poll does not hide: nothing reports then.
-            if let Err(mpsc::SendError((_, Some(o)))) = jobs.send((job, observation)) {
-                o.metrics.outstanding(&o.holder, o.member, o.bytes, false);
-            }
+            let _ = jobs.send((job, observation));
         }
     }
 

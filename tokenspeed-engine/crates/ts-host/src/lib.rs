@@ -885,20 +885,20 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         })
         .transpose()
         .map_err(HostError::Peer)?;
-    if let (Some(peer), Some(exporter)) = (
-        &mut peer,
-        exporter.as_ref().filter(|_| config.metrics.transfer),
-    ) {
-        let report = metrics
+    if let Some(peer) = &mut peer {
+        let logical = metrics.as_ref().map(|m| Arc::clone(&m.peer));
+        let physical = exporter
             .as_ref()
-            .map(|m| Arc::clone(&m.peer))
-            .unwrap_or_else(|| {
-                Arc::new(ts_metrics::PeerMetrics::new(
-                    exporter,
-                    &config.metrics.labels,
-                ))
+            .filter(|_| config.metrics.transfer)
+            .map(|exporter| {
+                logical.clone().unwrap_or_else(|| {
+                    Arc::new(ts_metrics::PeerMetrics::new(
+                        exporter,
+                        &config.metrics.labels,
+                    ))
+                })
             });
-        peer.set_metrics(report);
+        peer.set_metrics(logical, physical);
     }
     let mut event_loop = EventLoop::new(
         scheduler,

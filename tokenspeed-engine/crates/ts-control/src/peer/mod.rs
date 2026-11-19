@@ -265,6 +265,7 @@ pub struct Peer {
     reading: HashSet<String>,
     reads: Reads,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
+    read_metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     // Only the endpoint owner measures logical attempts.
     lookup_times: HashMap<u64, (String, Instant, i64)>,
     decisions: Vec<(String, &'static str)>,
@@ -312,6 +313,7 @@ impl Peer {
             fenced: HashSet::new(),
             reading: HashSet::new(),
             metrics: None,
+            read_metrics: None,
             lookup_times: HashMap::new(),
             decisions: Vec::new(),
             next_sample_us: 0,
@@ -322,8 +324,13 @@ impl Peer {
     }
 
     /// Enable logical measurements on member zero and physical measurements on every member.
-    pub fn set_metrics(&mut self, metrics: Arc<ts_metrics::PeerMetrics>) {
-        self.metrics = Some(metrics);
+    pub fn set_metrics(
+        &mut self,
+        logical: Option<Arc<ts_metrics::PeerMetrics>>,
+        physical: Option<Arc<ts_metrics::PeerMetrics>>,
+    ) {
+        self.metrics = logical;
+        self.read_metrics = physical;
     }
 
     /// The native counters survive gaps between scrapes; gauges are sampled once per second.
@@ -713,7 +720,7 @@ impl Peer {
                 continue;
             };
             let fetch = landing.fetch();
-            if let Some(metrics) = &self.metrics {
+            if let Some(metrics) = &self.read_metrics {
                 metrics.fence(
                     &fetch.holder,
                     self.member,
@@ -747,12 +754,12 @@ impl Peer {
             self.reading.insert(request.clone());
             match job {
                 Ok((session, spans)) => {
-                    let observation = self.metrics.as_ref().map(|metrics| read::ReadObservation {
-                        metrics: Arc::clone(metrics),
-                        holder: fetch.holder.clone(),
-                        member: self.member,
-                        bytes: spans.lengths.iter().sum(),
-                        queued: Instant::now(),
+                    let observation = self.read_metrics.as_ref().map(|metrics| {
+                        metrics.queue_read(
+                            fetch.holder.clone(),
+                            self.member,
+                            spans.lengths.iter().sum(),
+                        )
                     });
                     self.reads.submit_observed(
                         ReadJob {

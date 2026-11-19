@@ -461,8 +461,14 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         },
     );
     engine.peer.increment("landed_tokens", 8);
-    engine.peer.outstanding("a", 0, 64, true);
-    engine.peer.shard("a", 0, 0.1, 0.2, 64, true);
+    let completed = engine.peer.queue_read("a".into(), 0, 64);
+    let cancelled = engine.peer.queue_read("a".into(), 0, 128);
+    completed.finish(
+        std::time::Instant::now(),
+        std::time::Duration::from_millis(200),
+        true,
+    );
+    drop(cancelled);
     engine.peer.usage(Some(10), 14, "used");
     engine.peer.usage(None, 5, "used");
     engine.peer.usage(Some(8), 0, "lookup_miss");
@@ -476,6 +482,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         ("peer_consumed_tokens_sum", "", 19.0),
         ("peer_consumed_tokens_count", "", 3.0),
         ("peer_read_bytes_total", "", 64.0),
+        ("peer_outstanding_read_bytes", "", 0.0),
         ("peer_scheduler_events_total", "", 8.0),
     ] {
         let line = text

@@ -124,15 +124,15 @@ impl Landing {
     }
 
     fn transition(&mut self, next: Phase, outcome: &str, now_us: i64) {
+        let stage = match self.phase {
+            Phase::Layout => "layout",
+            Phase::Pin => "pin",
+            Phase::Read => "read_agreement",
+            Phase::Release { .. } => "release",
+            Phase::Quarantine { .. } => "quarantine",
+            Phase::Done(_) => return,
+        };
         if let Some(metrics) = &self.metrics {
-            let stage = match self.phase {
-                Phase::Layout => "layout",
-                Phase::Pin => "pin",
-                Phase::Read => "read_agreement",
-                Phase::Release { .. } => "release",
-                Phase::Quarantine { .. } => "quarantine",
-                Phase::Done(_) => return,
-            };
             if outcome != "ok" && self.failure.is_none() {
                 self.failure = Some(stage);
             }
@@ -369,6 +369,8 @@ mod tests {
         );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 7);
         assert_eq!(landing.done(), Some(8));
+        landing.transition(super::Phase::Layout, "ok", 8);
+        assert_eq!(landing.done(), Some(8), "a finished landing is terminal");
     }
 
     #[test]

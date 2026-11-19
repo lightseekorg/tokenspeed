@@ -431,7 +431,7 @@ If the router supplied `peer_expected_tokens`, the same request also contributes
 outcome. An older hint with no estimate still contributes consumption.
 
 `tokenspeed:peer_stage_seconds_count` counts visits by stage and outcome.
-Inspect lookup, admission, layout, pin, read_agreement and release separately.
+Inspect lookup, admission, layout, pin, read_agreement, release and quarantine separately.
 The lookup_to_ready and landing timers span multiple stages. hard_pin uses the
 holder's clock, from PIN application until actual release or expiry.
 `tokenspeed:peer_hard_pin_remaining_seconds` measures deadline minus that time.

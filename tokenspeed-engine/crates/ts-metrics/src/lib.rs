@@ -34,7 +34,7 @@
 //! Metrics never fail serving: an output that errors is logged and skipped.
 
 mod peer;
-pub use peer::PeerMetrics;
+pub use peer::{PeerMetrics, QueuedPeerRead};
 mod prom;
 mod relay;
 

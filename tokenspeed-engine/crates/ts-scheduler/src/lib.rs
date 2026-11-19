@@ -572,11 +572,15 @@ mod ffi {
     /// Duration and deadline headroom of a completed hard pin.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct PinSampleView {
+        /// Time between applying and releasing the hard pin, in microseconds.
         held_us: i64,
+        /// Signed microseconds left until the deadline at release.
         remaining_us: i64,
+        /// Whether the holder reclaimed the pin on expiry.
         expired: bool,
     }
 
+    /// The scheduler's peer sharing observations.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct PeerStatsView {
         /// Holder: leases held.
@@ -715,7 +719,7 @@ pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
-    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
     SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
     StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
@@ -930,7 +934,7 @@ impl Scheduler {
     }
 
     /// Drain hard pins released or expired since the last sample.
-    pub fn take_peer_pin_samples(&mut self) -> Vec<ffi::PinSampleView> {
+    pub fn take_peer_pin_samples(&mut self) -> Vec<PinSampleView> {
         ffi::take_peer_pin_samples(self.pinned())
     }
 
