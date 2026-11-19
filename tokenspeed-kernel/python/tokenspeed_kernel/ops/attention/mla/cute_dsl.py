@@ -199,7 +199,7 @@ class DcpValueTail:
         same calls; see :meth:`serves`.
 
         Raises:
-            ValueError: If a stride, an alignment or a row span past int32
+            ValueError: If a stride, an alignment, or a row span past int32
                 offsets is one the kernel cannot address.
         """
         from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.host import stream

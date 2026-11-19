@@ -33,7 +33,10 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dispatch_dcp_attention_partials,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
-from tokenspeed_kernel.ops.attention.mla.cute_dsl import create_dcp_value_tail
+from tokenspeed_kernel.ops.attention.mla.cute_dsl import (
+    DcpValueTail,
+    create_dcp_value_tail,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_exchange_input,
@@ -55,7 +58,7 @@ logger = logging.getLogger(__name__)
 DECODE_EXCHANGE_CAP_BYTES = 1 << 20
 
 # Each KVP group's fused decode value tail, when prepared.
-_VALUE_TAILS: dict[tuple[int, ...], object] = {}
+_VALUE_TAILS: dict[tuple[int, ...], DcpValueTail] = {}
 
 
 @dataclass(frozen=True)

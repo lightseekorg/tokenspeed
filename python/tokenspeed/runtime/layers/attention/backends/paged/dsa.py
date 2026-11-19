@@ -1965,7 +1965,10 @@ class DSABackend(PagedAttentionBackend):
                 value_projection=value_projection,
             )
         if topk_owned or gathered_query is not None or value_projection is not None:
-            raise ValueError("an owned decode top-k needs its slots")
+            raise ValueError(
+                "topk_owned, gathered_query, and value_projection need the "
+                "sparse decode's top-k slots"
+            )
         if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
