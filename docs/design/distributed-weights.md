@@ -20,7 +20,8 @@ tensors, and an explicit distinction
 between streamed weights and small per-expert constants. Non-expert state stays
 on the layer. In particular, the loader must preserve the existing layer-wide
 input-scale maximum across all logical experts. The initial FlashInfer TRTLLM
-NVFP4 SiTU path supplies this manifest directly.
+NVFP4 SiTU path supplies this manifest directly. MXFP4 experts store no input
+scale; the kernel quantizes their activations on each forward.
 
 A model-owned `MoEPeerWeights` publishes each processed layer immediately and
 rebinds its parameters to immutable owned storage. Old processed allocations do
@@ -105,14 +106,15 @@ unmapping source storage. A model exposing peer weights implements
 
 ## Initial supported configuration
 
-The initial integration supports K3 NVFP4 SiTU on a fabric-connected NVIDIA
-prefill instance with local execution groups, PP1, and a fixed token budget.
-This K3 path selects fabric handles explicitly. POSIX support is exposed through
-the storage API for compatible model integrations, not as a K3 transport option.
-Eager execution and ordinary breakable prefill graphs use the same weight
-ordering. Idle forwards skip weight reads. Kernel tuning and other graph
-consumers can use stable weight views with acquisition/release outside capture.
-Unsupported model, layout, transport, and graph combinations fail explicitly.
+The initial integration supports K3 NVFP4 and MXFP4 SiTU experts through the
+FlashInfer TRT-LLM kernels on a fabric-connected NVIDIA prefill instance with
+local execution groups, PP1, and a fixed token budget. This K3 path selects
+fabric handles explicitly. POSIX support is exposed through the storage API for
+compatible model integrations, not as a K3 transport option. Eager execution
+and ordinary breakable prefill graphs use the same weight ordering. Idle
+forwards skip weight reads. Kernel tuning and other graph consumers can use
+stable weight views with acquisition/release outside capture. Unsupported
+model, layout, transport, and graph combinations fail explicitly.
 
 Validation includes cross-node reconstruction, page-boundary handling, complete
 expert metadata, idle owners, odd/even queued forwards, bounded staging,

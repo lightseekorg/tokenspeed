@@ -961,6 +961,7 @@ def _sink_dflash(
 ) -> DFlash:
     """A DFlash with only the capture-sink state set up."""
     drafter = DFlash.__new__(DFlash)
+    drafter.draft_sampler = None
     drafter.target_model = _TapTarget(stores_taps)
     drafter.hidden_size = hidden
     drafter._tap_count = taps

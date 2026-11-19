@@ -78,13 +78,15 @@ public:
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
 
     // Decode-side PD reuses local history pages; the KV boundary trims the
-    // peer's transfer and the partial block of a tail hit is left a hole for
-    // the transfer to fill whole. A State group's checkpoint counts only at
-    // exactly prompt_end_tokens (the peer's final state supersedes any
-    // shorter one): then state_at_prompt_end claims it as slot 0 and the
-    // transfer omits the state groups. prompt.prefix_hashes must cover the
-    // prompt's last full page and prompt.tokens the whole prompt.
-    PrefixProbe ProbeDecodeDevicePrefix(const PromptPrefix& prompt, std::int32_t prompt_end_tokens) const;
+    // peer's transfer. The Device hit's partial tail block is left a hole for
+    // the transfer to fill whole; the Host continues the Device's history in
+    // whole pages only, loaded below the landing. A State group's checkpoint
+    // counts only at exactly prompt_end_tokens and only on the Device (the
+    // peer's final state supersedes any shorter one): then
+    // state_at_prompt_end claims it as slot 0 and the transfer omits the
+    // state groups. prompt.prefix_hashes must cover the prompt's last full
+    // page and prompt.tokens the whole prompt.
+    PrefixProbe ProbeDecodePrefix(const PromptPrefix& prompt, std::int32_t prompt_end_tokens) const;
 
     // The pages of a probe's hit, as CacheCoordinator::ExportPrefix would
     // export them, without acquiring or refreshing anything: what a peer is
@@ -170,6 +172,9 @@ private:
                                    bool allow_host, const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
                                      bool claim_partial) const;
+    // ProbeDecodePrefix's Device history and whole-page Host suffix.
+    PrefixProbe probeDecodeHistoryPrefix(const PromptPrefix& prompt,
+                                         std::span<const std::size_t> history_match_order) const;
 
     const CacheStore& store_;
     const CacheEvictor& evictor_;
