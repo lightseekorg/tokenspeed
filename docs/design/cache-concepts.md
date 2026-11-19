@@ -526,32 +526,88 @@ the request without another forward. KDA convolution history may use either
 channel-major or channels-last storage; the PD schema partitions the channel
 axis in each layout, preserving its separate Q/K/V channel segments.
 
-KDA targets with a batched commit kernel use the same deferred-state lifecycle
-for ordinary decode (`T=1`) and speculative verification. Verify leaves the
-committed recurrent and convolution state unchanged; acceptance selects the
-prefix to commit into the live block.
+KDA uses retained history for ordinary decode (`T=1`) and speculative
+verification. Verify preserves the logical accepted checkpoint while preparing
+candidate records in the private live block. Acceptance selects the prefix
+that commit publishes. Unsupported configurations fail during initialization
+or kernel selection.
 
-On NVIDIA and AMD, verify saves FP32 corrections plus unnormalized keys and raw gates
-in the activation dtype (BF16 or FP16). Recovery recomputes key normalization
-and gate decay, then applies the saved corrections to the input checkpoint.
-It does not recompute the state-dependent correction or the gate projection.
-Original QKV rows are retained only for convolution-history commit. The
-persistent convolution pool keeps its cache dtype, independently of activation
-dtype. Records and position/generation stamps cover the current verify round;
-they are transient workspace, not prefix-cache entries.
+The dense base follows `--mamba-ssm-dtype` (FP32 or BF16). Logical-state
+accumulation and retained history stay FP32. Applying accepted history does not
+round at every token; rounding occurs only when materialization writes a new
+dense base. Both dense-base dtypes use the same checkpoint lifecycle.
 
-Both vendors consume the same post-convolution activation values in verify
-and save those unnormalized keys for recovery. NVIDIA uses Triton recovery;
-AMD uses Gluon recovery. Neither recomputes the state-dependent correction.
-Convolution history is committed separately so in-place pages are safe.
-Platforms without a matching batched commit and no-store verify keep the dense
-`max_bs * (draft_tokens + 1)` per-position state workspace.
+The retained-history checkpoint includes these fields in the same state block:
+`replay_correction`, `replay_key`, `replay_decay` and `replay_length`. The first
+three are FP32 `[heads, capacity, channel]` fields containing corrections,
+normalized keys and multiplicative per-token decays. Capacity is the total
+number of slots shared by accepted history and the current verify candidates;
+there is no separate per-round U/K/decay records allocation in this path. The
+INT32 length publishes only the accepted prefix. Zero means the dense base
+alone, even if unused entries contain stale or rejected candidates. Applying
+that prefix in token order reconstructs the accepted endpoint. The convolution
+window describes that endpoint, not the older dense base.
 
-The Kimi-K3 and GLM-5.3-Flash recipes share the backend's payload specification
-and reserve transient convolution rows, payloads, descriptors and record
-metadata before sizing the arena. Prefill-only engines reserve no decode
-records. GLM also reserves its target/draft-shared KPool tails once, so state
-memory does not disappear from the GPU budget.
+Verify writes candidate records directly into the private live page after
+its accepted prefix. It reserves the entire candidate window before writing:
+`history_length + candidate_count <= capacity`. If the window would not fit,
+verify consolidates only accepted history into the dense base and starts at
+slot zero; the candidate count itself must fit within capacity. Equality fits
+without consolidation. If the input checkpoint is on another page, verify
+reconstructs its accepted endpoint into the private live page's dense base
+and starts there with an empty history. Published input pages remain read-only.
+Both cases keep consolidation in verify.
+
+Writing candidates leaves the accepted length unchanged. After acceptance,
+commit advances that length by the accepted count without copying U/K/decay.
+The next verify's append offset is the accepted history length, never the
+previous candidate window's end. For example, writing four candidates at
+slots 0..3 and accepting two makes the next four candidates use slots 2..5;
+rejected slots are reused immediately, without clearing or leaving gaps.
+Publication must follow completion of the candidate writes.
+Commit still updates convolution history for the accepted tokens; original
+QKV retention and per-round routing/validity metadata are separate from these
+record fields. Stable pool storage and device-side page/offset selection serve
+both eager execution and CUDA graphs, for both T=1 and speculative decode.
+
+Prefill gathers the dense base into its existing temporary state buffer and
+applies the source's accepted history there. It never consolidates a shared
+source page in place. After storing a dense endpoint, a separate ordered kernel
+resets the destination's length. This applies to both the live page and each
+in-forward checkpoint page. This keeps existing prefill
+implementations independent of the retained checkpoint representation.
+
+Decode binds candidate history to the private live pages prepared before
+verify. The accepted-state planner retains its source and destination routing;
+batched commit updates convolution across all participating layers before
+publishing their lengths. Its descriptor includes each layer's page count and
+element strides. Mixed forwards use the decode subbatch's packed boundaries
+for both original QKV and commit, not the restored full-batch offsets.
+
+These fields share the base's cache group and block ownership. Whole-block
+copy, zeroing, prefix reuse, retraction and transfer must carry the complete
+checkpoint. Head-valued fields partition with attention TP; the length is
+replicated. The cache planner includes all fields when sizing a state plane;
+retained history is not counted again as transient verify workspace. Supported
+Kimi and GLM consumers declare capacity `max(16, effective_verify_width)` from
+fixed startup configuration. Execution requires both explicit retained verify
+support and batched commit support. Prefill-only engines use the same checkpoint
+schema for matching startup configuration, but allocate no decode workspace.
+PD peers must agree on that schema, including capacity when their verify widths differ.
+
+Records save the normalized keys and multiplicative decays already used by
+verify, together with FP32 corrections. NVIDIA uses CuTe or Triton, and AMD uses Gluon.
+Commit loads source convolution taps before storing live taps so a request's
+own source and destination may alias. The convolution pool keeps its cache
+dtype, independently of activation dtype; original QKV is converted on commit.
+
+The recipes reserve original QKV rows, commit descriptors, page routing and
+record metadata before sizing the arena. Convolution reads the committed
+window directly. Generation stamps and accepted counts describe the current
+verify window. Cache pages own accepted history. The planner uses the same
+descriptor width and payload geometry as the actual allocations. Prefill-only
+engines reserve no decode records. GLM also counts its target/draft-shared
+KPool tails once in the GPU budget.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

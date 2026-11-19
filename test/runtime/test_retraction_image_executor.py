@@ -26,8 +26,9 @@ L2 write-back and the snapshot store with its slot-state export) ride the
 write stream under ONE fence on the default stream; a restore orders behind
 the zeroing, copies its rows from both Host tiers, imports the slot state and
 is acknowledged once. The owner translation keeps a KVP rank's rows on both
-ends of every row of every op. One GPU test (skipped without CUDA) round-trips
-real bytes through two ranks' executors, both tiers, over one sharded group.
+ends of every row of every op. GPU tests (skipped without CUDA) round-trip
+real bytes through two ranks' executors and both tiers, and a complete retained
+KDA checkpoint through the snapshot pool into a different device page.
 """
 
 from __future__ import annotations
@@ -1170,3 +1171,186 @@ def _round_trip_two_ranks(io_backend, executors):
         assert bool(slot_states[rank].flag[3]) and not bool(slot_states[rank].flag[1])
         assert slot_states[rank].table[0].tolist() == [200 + rank] * 5
         assert not bool(slot_states[rank].flag[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("io_backend", ["direct", "kernel"])
+def test_retained_kda_snapshot_restores_into_a_different_page(io_backend):
+    """A snapshot owns all six fields after its original page is reused.
+
+    The recurrence below only checks the restored checkpoint's meaning; it
+    does not exercise the production KDA replay kernels or scheduler pressure.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_state_fields,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheFieldSpec,
+        pack,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        FULL_ATTENTION,
+        LINEAR_ATTENTION,
+        CacheGroupSpec,
+    )
+
+    heads, dim, capacity, accepted = 2, 8, 4, 3
+    groups = (
+        (
+            CacheGroupSpec(
+                group_id=FULL_ATTENTION,
+                attn_kind="full_history",
+                rows_per_page=128,
+                entry_stride_tokens=1,
+                replayable=False,
+            ),
+            (CacheFieldSpec("layer.0.latent_kv", "slot.0", (128, 1, 576), "bfloat16"),),
+        ),
+        (
+            CacheGroupSpec(
+                group_id=LINEAR_ATTENTION, attn_kind="state", replayable=False
+            ),
+            kda_state_fields(
+                1,
+                "slot.0",
+                conv_shape=(3 * heads * dim, 3),
+                recurrent_shape=(heads, dim, dim),
+                recurrent_state_dtype=torch.float32,
+                history_capacity=capacity,
+            ),
+        ),
+    )
+    plan = pack(
+        groups,
+        prefix_granularity=128,
+        cache_blocks_per_lcm_block={FULL_ATTENTION: 1, LINEAR_ATTENTION: 1},
+        max_padding_fraction=float("inf"),
+    ).bind(4)
+    arena = CacheArena(
+        plan, "cuda", cache_group_specs=tuple(spec for spec, _ in groups)
+    )
+    pool = HybridKDATokenToKVPool(
+        arena=arena,
+        model_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
+        quant_method=None,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_num=2,
+        rank=0,
+        layer_types=(FULL_ATTENTION, LINEAR_ATTENTION),
+    )
+    # Distinct field and page bytes also expose writes to unrelated owners.
+    arena.buffer.fill_(0xA5)
+    names = (
+        "conv_state",
+        "recurrent_state",
+        "replay_correction",
+        "replay_key",
+        "replay_decay",
+        "replay_length",
+    )
+    components = {name: pool.get_component(1, name) for name in names}
+    generator = torch.Generator(device="cuda").manual_seed(431)
+    for index, (name, tensor) in enumerate(components.items()):
+        if name == "replay_length":
+            tensor[1, 0] = accepted
+        else:
+            values = torch.randn(
+                tensor[1].shape,
+                dtype=tensor.dtype,
+                device="cuda",
+                generator=generator,
+            )
+            tensor[1].copy_(values / 8 + index / 4)
+    keys = components["replay_key"][1]
+    keys.copy_(torch.nn.functional.normalize(keys, dim=-1))
+    components["replay_decay"][1].sigmoid_()
+    for name in ("replay_correction", "replay_key", "replay_decay"):
+        components[name][1, :, accepted:].fill_(float("nan"))
+    checkpoint = {name: tensor[1].clone() for name, tensor in components.items()}
+    saved = {name: tensor.cpu().double() for name, tensor in checkpoint.items()}
+    # Independent scalar FP64 oracle, consuming only accepted records.
+    expected_endpoint = torch.empty((heads, dim, dim), dtype=torch.float64)
+    for head in range(heads):
+        for row in range(dim):
+            for column in range(dim):
+                value = float(saved["recurrent_state"][head, row, column])
+                for token in range(accepted):
+                    value = value * float(
+                        saved["replay_decay"][head, token, column]
+                    ) + float(saved["replay_correction"][head, token, row]) * float(
+                        saved["replay_key"][head, token, column]
+                    )
+                expected_endpoint[head, row, column] = value
+
+    executor = HostCacheExecutor(
+        pool,
+        draft_pool=None,
+        l2_tier=False,
+        host_ratio=0,
+        host_size_gb=0,
+        snapshot_pool=_pool(0, 1, ratio=1),
+        slot_state_exporters=(),
+        io_backend=io_backend,
+        attn_tp_rank=0,
+        kvp_rank=0,
+        nprocs_per_node=1,
+        world_cpu_group=None,
+    )
+    try:
+        stream = torch.cuda.current_stream()
+        state_group = 1
+        executor.submit_write_backs(
+            [_snapshot_op(101, 1, [_transfer(state_group, 1, 2)])],
+            prerequisite_stream=stream,
+            fence_stream=stream,
+        )
+        torch.cuda.synchronize()
+        assert _acks(executor.poll_results()) == _snapshot_done(101)
+
+        # The old page now belongs to another request. Restoring into page 3
+        # must preserve its new bytes, the neighbors, MLA and arena padding.
+        for index, tensor in enumerate(components.values()):
+            tensor[1].fill_(index + 20)
+        expected_arena = arena.buffer.clone()
+        for name, tensor in checkpoint.items():
+            begin = arena.field_block_byte_offset(f"layer.1.{name}", 3)
+            payload = tensor.contiguous().view(torch.uint8).reshape(-1)
+            expected_arena[begin : begin + payload.numel()].copy_(payload)
+        executor.submit_load_backs(
+            [
+                _restore_op(
+                    102,
+                    1,
+                    [(HostTier.SNAPSHOT_POOL, _transfer(state_group, 2, 3))],
+                )
+            ],
+            prerequisite_stream=stream,
+        )
+        torch.cuda.synchronize()
+        assert _acks(executor.poll_results()) == _restore_done(102)
+        for name, tensor in components.items():
+            assert torch.equal(
+                tensor[3].contiguous().view(torch.uint8),
+                checkpoint[name].contiguous().view(torch.uint8),
+            ), name
+        assert torch.equal(arena.buffer, expected_arena)
+
+        restored = {
+            name: tensor[3].cpu().double() for name, tensor in components.items()
+        }
+        endpoint = restored["recurrent_state"].clone()
+        for token in range(int(restored["replay_length"][0])):
+            endpoint = (
+                endpoint * restored["replay_decay"][:, token, None, :]
+                + restored["replay_correction"][:, token, :, None]
+                * restored["replay_key"][:, token, None, :]
+            )
+        torch.testing.assert_close(endpoint, expected_endpoint, atol=1e-12, rtol=1e-12)
+    finally:
+        executor.shutdown()

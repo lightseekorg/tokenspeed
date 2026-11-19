@@ -22,7 +22,7 @@
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
-KDA state (12 at attn tp=8 with the default FP32 state, 6 with BF16); the state
+KDA checkpoint (16 at attn tp=8 with an FP32 base, 10 with BF16); the state
 groups pack to match the MLA plane's byte width so no parent is wasted.
 
 Kimi-K3.1 (a DSA target config) adds one index-K plane per MLA target layer
@@ -62,7 +62,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
     kda_recurrent_state_dtype,
-    kda_replay_supported,
+    kda_state_fields,
     kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
@@ -72,7 +72,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
-    cache_dtype_name,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -363,21 +362,13 @@ class KimiK3Recipe(CacheRecipe):
                 )
             return (latent,)
         conv_shape, recurrent_shape = self._kda_shapes
-        return (
-            CacheFieldSpec(
-                f"layer.{layer_id}.conv_state",
-                plane_id,
-                conv_shape,
-                cache_dtype_name(torch.bfloat16),
-                exact_page_stride=False,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.recurrent_state",
-                plane_id,
-                recurrent_shape,
-                cache_dtype_name(self._recurrent_dtype),
-                exact_page_stride=False,
-            ),
+        return kda_state_fields(
+            layer_id,
+            plane_id,
+            conv_shape=conv_shape,
+            recurrent_shape=recurrent_shape,
+            recurrent_state_dtype=self._recurrent_dtype,
+            history_capacity=self.history_capacity,
         )
 
     # ---- packing: state groups match the MLA plane's byte width ----
@@ -398,8 +389,8 @@ class KimiK3Recipe(CacheRecipe):
             if field.plane_id == "slot.0"
         )
         # The smallest packing whose plane width covers one per-layer KDA
-        # state, so the state page rides inside the MLA plane at the least
-        # parent granularity. Attn tp=8 gives the historical 12; attention-DP
+        # checkpoint, so the state page rides inside the MLA plane at the least
+        # parent granularity. Attn tp=8 gives 16 for retained capacity 16; attention-DP
         # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
         # while larger tp shrinks the state and the parent with it.
         mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
@@ -453,9 +444,10 @@ class KimiK3Recipe(CacheRecipe):
     # ---- extras ----
 
     @cached_property
-    def replay_kda(self) -> bool:
-        """Whether target decode uses replay, including the one-token window."""
-        return kda_replay_supported(self.attn_config)
+    def history_capacity(self) -> int:
+        """Checkpoint schema is fixed at startup and shared by PD roles."""
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        return max(16, width)
 
     @override
     def workspace_bytes(self) -> int:
@@ -470,13 +462,10 @@ class KimiK3Recipe(CacheRecipe):
         if self.server_args.disaggregation_mode == "prefill":
             return history
         width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
-        if width == 1 and not self.replay_kda:
-            return history
         return history + kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
             draft_token_num=width,
-            replay_kda=self.replay_kda,
         )
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----

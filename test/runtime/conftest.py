@@ -12,7 +12,7 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
 )
 
-TP8_PHYSICAL_PAGE_BYTES = 884_736
+TP8_PHYSICAL_PAGE_BYTES = 1_179_648
 TP8_PHYSICAL_SLOTS = 24
 TP8_PAGE_SET_BYTES = TP8_PHYSICAL_SLOTS * TP8_PHYSICAL_PAGE_BYTES
 KIMI_GROUP_IDS = (
@@ -27,7 +27,7 @@ MLA_QK_ROPE_DIM = 64
 MLA_LATENT_DIM = MLA_KV_LORA_RANK + MLA_QK_ROPE_DIM
 
 
-def kimi_recipe(
+def kimi_recipe_with_history(
     *,
     text_config=None,
     tp_size: int = 8,
@@ -45,6 +45,7 @@ def kimi_recipe(
     kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
     mamba_ssm_dtype: str = "float32",
     dsa_index_k_format: str | None = None,
+    history_capacity: int | None,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits.
 
@@ -148,7 +149,7 @@ def kimi_recipe(
         )
     else:
         raise ValueError(f"unknown draft_attn {draft_attn!r}")
-    return KimiK3Recipe(
+    recipe = KimiK3Recipe(
         server_args=SimpleNamespace(
             kv_offload_config=None,
             max_total_tokens=None,
@@ -185,6 +186,41 @@ def kimi_recipe(
         overlap_schedule_depth=overlap_schedule_depth,
     )
 
+    if history_capacity is not None:
+        from types import MethodType
+
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+            kda_state_fields,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            LINEAR_ATTENTION,
+        )
+
+        original_fields = recipe.fields_for_layer
+
+        def fields_for_layer(self, layer_id, group_id, occurrence):
+            if self.layer_types[layer_id] != LINEAR_ATTENTION:
+                return original_fields(layer_id, group_id, occurrence)
+            conv, recurrent = self._kda_shapes
+            fields = kda_state_fields(
+                layer_id,
+                f"slot.{occurrence}",
+                conv_shape=conv,
+                recurrent_shape=recurrent,
+                recurrent_state_dtype=self._recurrent_dtype,
+                history_capacity=max(1, history_capacity),
+            )
+            # A deliberately malformed external schema for rejection tests.
+            return fields if history_capacity else fields[:2]
+
+        recipe.fields_for_layer = MethodType(fields_for_layer, recipe)
+    return recipe
+
+
+def kimi_recipe(**recipe_kwargs):
+    """The production retained checkpoint fixture."""
+    return kimi_recipe_with_history(history_capacity=None, **recipe_kwargs)
+
 
 def kimi_tp8_layout(**recipe_kwargs):
     """The capacity-independent K3 layout: group, then pack."""
@@ -218,7 +254,14 @@ def _kimi_group_specs(group_ids, layer_types, plan):
     return tuple(spec for spec, _ in kimi_recipe().groups())
 
 
-def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
+def make_kimi_pool_with_history(
+    device,
+    usable_pages: int = 6,
+    *,
+    history_capacity: int,
+    with_mla_dims: bool = True,
+    mamba_ssm_dtype: str = "float32",
+):
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
@@ -226,8 +269,21 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
 
     del with_mla_dims
     text_config = KimiLinearConfig()
-    plan = kimi_tp8_plan(num_lcm_blocks=usable_pages)
-    recipe = kimi_recipe()
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    recipe = kimi_recipe_with_history(
+        history_capacity=history_capacity, mamba_ssm_dtype=mamba_ssm_dtype
+    )
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+    recipe.check_layout(layout)
+    plan = layout.bind(usable_pages)
     group_ids = recipe.target_group_ids
     layer_types = recipe.layer_types
     from test.runtime.cache_pool_test_utils import make_pool
@@ -244,9 +300,15 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         layer_num=text_config.num_hidden_layers,
         rank=0,
         layer_types=layer_types,
-        cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
+        cache_group_specs=tuple(spec for spec, _ in recipe.groups()),
     )
     return pool
+
+
+def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
+    return make_kimi_pool_with_history(
+        device, usable_pages, history_capacity=16, with_mla_dims=with_mla_dims
+    )
 
 
 def layer_for_group(pool, group_id: str) -> int:

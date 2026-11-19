@@ -28,9 +28,58 @@ It supplies the main-branch accepted-state reference for differential tests.
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-    batched_kda_commit_conv_window_kernel,
-)
+
+
+@triton.jit
+def _reference_commit_conv_window_kernel(
+    addresses,
+    qkv_ref,
+    conv_ref,
+    group_indices,
+    read_indices,
+    write_indices,
+    accepted_length,
+    B,
+    T: tl.constexpr,
+    STRIDE_QKV: tl.constexpr,
+    STRIDE_CONV: tl.constexpr,
+    CONV_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Publish convolution windows after every recurrent program has read.
+
+    qkv_ref and conv_ref provide only the raw-QKV and history storage types.
+    """
+    i_l, i_n, i_cb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    ab = i_l * 10
+    qkv = tl.load(addresses + ab).to(tl.pointer_type(qkv_ref.dtype.element_ty))
+    conv_pool = tl.load(addresses + ab + 2).to(
+        tl.pointer_type(conv_ref.dtype.element_ty)
+    )
+    group = tl.load(group_indices + i_l).to(tl.int64)
+    read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
+    write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
+    steps = tl.load(accepted_length + i_n).to(tl.int32)
+    steps = tl.minimum(tl.maximum(steps, 0), T)
+    offsets = i_cb * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < CONV_DIM
+    src = conv_pool + read_page * STRIDE_CONV + offsets * 3
+    s0 = tl.load(src, mask=mask & (read_page >= 0), other=0.0)
+    s1 = tl.load(src + 1, mask=mask & (read_page >= 0), other=0.0)
+    s2 = tl.load(src + 2, mask=mask & (read_page >= 0), other=0.0)
+    for i_t in range(steps):
+        x = tl.load(
+            qkv + (i_n * T + i_t) * STRIDE_QKV + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        # Keep loop-carried history in the cache storage dtype.
+        s0, s1, s2 = s1, s2, x.to(conv_pool.dtype.element_ty)
+    dst = conv_pool + write_page * STRIDE_CONV + offsets * 3
+    tl.store(dst, s0, mask=mask & (write_page >= 0))
+    tl.store(dst + 1, s1, mask=mask & (write_page >= 0))
+    tl.store(dst + 2, s2, mask=mask & (write_page >= 0))
+
 
 _SM_COUNT: dict[int, int] = {}
 
@@ -514,7 +563,7 @@ def batched_recurrent_kda_replay_commit(
     conv_dim = 3 * num_heads * head_dim
     conv_block = 128
     typed = torch.empty(0, dtype=torch.bfloat16, device=addresses.device)
-    batched_kda_commit_conv_window_kernel[
+    _reference_commit_conv_window_kernel[
         (layers, batch, triton.cdiv(conv_dim, conv_block))
     ](
         addresses,

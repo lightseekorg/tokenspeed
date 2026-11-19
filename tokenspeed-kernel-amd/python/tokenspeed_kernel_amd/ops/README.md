@@ -1905,60 +1905,58 @@ next product without leaving registers, walks with the `coexec` scheduler
 M and B three groups ahead in the chain. gfx950 uses MFMA and schedules its
 prepare kernel with `max-ilp`.
 
-### KDA records verify and commit (gfx950 / gfx1250)
+### KDA retained history (gfx950 / gfx1250)
 
-Standard target decode is a one-token verify window. Both standard and
-speculative decode follow verify, acceptance, and commit. Verify retains
-the Gluon fused convolution, LDS vectors and batched value-split selection.
-GFX950 uses 32-row state panels for one-token windows with a bounded gate
-and no value split; its other cases use 16-row panels. GFX1250 gives each
-value split one panel of its share of the head (16, 32 or 64 rows for 8, 4
-or 2 splits) and walks two 64-row panels when a program owns a whole head
-(from 16 requests). Its record, output and correction stores are buffer
-stores, whose masks do not branch. Verify preserves committed FP32 or BF16
-state and widens it to FP32. It saves correction U in FP32, and
-unnormalized K and raw gate in the activation dtype.
-Convolution values round to that dtype before recurrence so recovery uses
-the same K as verify. The current AMD registration supports BF16. Verify can
-also retain original QKV in a separate caller-owned buffer, which commit
-reads for conv history.
-A null destination leaves retention to the caller. Padding pages do not write
-retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
-inside verify for up to 64 total input rows and uses a separate GEMM above that.
-MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
-GFX1250 projects inside verify at every row count. Its split programs load
-the gate rows of a dense window before the query boundaries arrive, so the
-projection overlaps the state loads; other boundaries reload the rows. A
-supplied raw gate is used directly. Both save the gate used by verify. On
-both targets, each value split starts its first checkpoint-panel load
-before preparing the token vectors.
-Without value splits, one-token verify keeps 64 state rows in flight after
-preparation.
-GFX950 recovery uses 64-row panels for one-token windows with a bounded gate.
-Other windows keep 16-row panels, with two in flight for one-token softplus.
-GFX1250 recovery loads a head's whole checkpoint into LDS with one
-tensor-data-mover load, loads the records before the stamp check, and
-updates 16-row panels whose waves span whole 128-key rows. It still
-normalizes K over 16-lane rows, as verify does.
+The direct retained verify and commit APIs use a page-owned history with FP32
+correction U, normalized K, multiplicative decay, and an INT32 accepted length
+L. Each page represents its V-major FP32 or BF16 dense base followed by L accepted
+updates. Reconstruction accumulates in FP32. Materialization rounds only when
+writing the dense base; accepted U, normalized K and decay remain FP32.
+The caller provides all storage, including a private live page for each active
+request. Shared source pages are immutable; a live page must not alias another
+active request's source or live page.
 
-Records use slot/head/ring-position/channel order. INT64 metadata supplies the
-slot, generation, and absolute start; position/generation stamps guard against
-reusing a stale window. Recovery reads the accepted prefix, recomputes key
-normalization and decay, and applies U without recomputing the prediction.
-A zero accepted count copies the checkpoint. Nonpositive source/destination
-pages are padding. Groups select independent page-table rows for each layer.
-Verify and commit disable Triton debug mode and automatic integer-overflow
-instrumentation. Interval and generation guards remain active; invalid
-records are skipped without device assertions.
+Standard target decode is a one-token verify window. Verify retains the Gluon
+fused convolution and LDS vectors. gfx950 batches gate projection and Q/K
+normalization for windows of 4–16 tokens. Its one-token bounded-gate windows
+with no value split use 32-row state panels; its other cases use 16-row panels.
+gfx1250 walks one 16-, 32-, or 64-row panel for a value split, or two 64-row
+panels for a whole head. Its split programs prefetch the gate inputs for
+dense windows and reload them if the packed token boundaries differ. Both
+architectures use supplied raw gate inputs directly.
 
-Batched descriptors use the shared ten-column table: original QKV (0), conv
-history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 or BF16
-state (8). The remaining columns are reserved. Recovery retains one program
-per head, request and layer. It stages accepted
-U, K and raw gate once in LDS, then applies the same updates per value panel.
-It commits each head's convolution history after loading all old taps,
-including when source and destination alias. History retains its bound pool
-dtype; original QKV is converted on commit.
+Before verify, a source-to-live transition or L + T greater than capacity C
+consolidates the accepted endpoint into the live dense base. T is the actual
+packed request length. A separate, ordered kernel resets the live length after
+all state tiles finish. L + T equal to C still fits. Empty requests and padding
+pages leave page storage unchanged.
+
+Verify reconstructs the accepted endpoint from the live base and history, then
+writes candidate U, K and decay at L + token offset. It preserves L and the
+dense base. Convolution still reads the original source page, because recurrent
+consolidation does not copy convolution history. The fused convolution,
+activation-dtype rounding, gate projection and state-panel scheduling are shared
+by one-token and speculative windows. The registered activation dtype is BF16.
+
+Retained commit clamps the accepted count to the actual window and configured
+bound, updates convolution from the caller's original QKV, then publishes the
+new length. It does not replay dense state or copy retained records. Zero
+acceptance still copies source convolution history to a distinct live page.
+Invalid accepted stamps prevent both convolution writes and length publication.
+Stamps validate the current candidate window; accepted history is independent
+of stamp-ring reuse.
+
+The public adapter accepts `KdaRetainedRecords`, including its
+`KdaRetainedHistory`; the AMD package receives the tensors explicitly and has
+no dependency on `tokenspeed-kernel`. Batched commit uses a
+nine-column descriptor for QKV, convolution and length pointers, page count,
+and per-layer element strides. One launch updates all layers' convolution;
+the next publishes lengths. Public verify requires retained records;
+unsupported configurations fail instead of selecting another checkpoint format.
+
+Prefill materializes source history into its existing gathered dense input,
+then clears live lengths after storing the final dense state. These utilities
+use wave64 on gfx950 and wave32 on gfx1250 and preserve source page storage.
 
 
 ## Transform

@@ -64,9 +64,6 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, const_expr, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
-from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
-    check_recoverssm_verify_inputs,
-)
 
 __all__ = ["FACTORED_DECAY", "recoverssm_verify", "recoverssm_verify_supported"]
 
@@ -85,6 +82,19 @@ _DTYPES = {
     torch.int32: Int32,
     torch.int64: Int64,
 }
+
+
+from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
+    consolidate_history,
+)
+from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
+    fake_retained_arguments,
+    initialize_tile,
+    retained_arguments,
+    retained_length,
+    retained_page,
+)
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
 
 def _asm(ret, args, text, constraints, side_effects, loc, ip):
@@ -386,8 +396,10 @@ class RecoverSsmVerify:
         a_log: cute.Tensor,
         dt_bias: cute.Tensor,
         state: cute.Tensor,
+        retained: tuple,
+        ring_capacity: Int64,
         correction: cute.Tensor,
-        key_gate: cute.Tensor,
+        normalized_key: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
         state_indices: cute.Tensor,
@@ -410,8 +422,10 @@ class RecoverSsmVerify:
             a_log.iterator,
             dt_bias.iterator,
             state.iterator,
+            retained,
+            ring_capacity,
             correction.iterator,
-            key_gate.iterator,
+            normalized_key.iterator,
             out.iterator,
             query_start_loc.iterator,
             state_indices.iterator,
@@ -429,9 +443,9 @@ class RecoverSsmVerify:
             correction.stride[0],
             correction.stride[1],
             correction.stride[2],
-            key_gate.stride[0],
-            key_gate.stride[1],
-            key_gate.stride[2],
+            normalized_key.stride[0],
+            normalized_key.stride[1],
+            normalized_key.stride[2],
         ).launch(
             grid=[
                 self.value_dim // self.value_tile_rows,
@@ -454,8 +468,10 @@ class RecoverSsmVerify:
         a_log,
         dt_bias,
         state,
+        retained: tuple,
+        ring_capacity: Int64,
         correction,
-        key_gate,
+        normalized_key,
         out,
         query_start_loc,
         state_indices,
@@ -473,9 +489,9 @@ class RecoverSsmVerify:
         correction_slot_stride: Int64,
         correction_head_stride: Int64,
         correction_position_stride: Int64,
-        key_gate_slot_stride: Int64,
-        key_gate_head_stride: Int64,
-        key_gate_position_stride: Int64,
+        normalized_key_slot_stride: Int64,
+        normalized_key_head_stride: Int64,
+        normalized_key_position_stride: Int64,
     ):
         K = self.key_dim
         W = self.window
@@ -491,7 +507,7 @@ class RecoverSsmVerify:
         page = Int64(_load(state_indices, request))
         value_start = value_tile * VT
 
-        if (page <= 0) | (valid_tokens <= 0):
+        if (page <= 0) | (retained_page(retained, request) <= 0) | (valid_tokens <= 0):
             # Padding requests: zero outputs for their tokens, no records.
             if tidx < VT:
                 for t in cutlass.range_constexpr(W):
@@ -511,9 +527,6 @@ class RecoverSsmVerify:
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     shared.token_barrier, W * (3 * K + VT) * 2
                 )
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    shared.state_barrier, VT * K * 4
-                )
             cute.arch.barrier()
             self._copy_token_rows(
                 shared,
@@ -532,18 +545,11 @@ class RecoverSsmVerify:
                 warp,
                 lane,
             )
+            initialize_tile(
+                shared.tile, retained, request, head, value_start, VT, K, tidx, THREADS
+            )
             if tidx == 0:
-                tile_src = state + (
-                    page * state_page_stride
-                    + head * state_head_stride
-                    + value_start * K
-                )
-                _bulk_load(
-                    shared.tile_addr,
-                    tile_src.toint(),
-                    VT * K * 4,
-                    Int32(shared.state_barrier.toint()),
-                )
+                cute.arch.mbarrier_arrive(shared.state_barrier)
 
             slot = Int64(request)
             generation = Int64(0)
@@ -553,7 +559,7 @@ class RecoverSsmVerify:
                 generation = Int64(_load(metadata, request * 3 + 1))
                 start = Int64(_load(metadata, request * 3 + 2))
             # Reduce the 64-bit start before narrowing so ring positions stay exact.
-            ring_start = Int32(start % self.capacity)
+            ring_start = Int32(start % ring_capacity)
             gate_scale = _exp(_load(a_log, head).to(Float32))
             gate_bias = Float32(0.0)
             if tidx < K:
@@ -569,7 +575,7 @@ class RecoverSsmVerify:
                 if (value_tile == 0) & (head == 0) & (tidx < W) & (tidx < valid_tokens):
                     stamp = cute.make_tensor(
                         stamps
-                        + (slot * self.capacity + (ring_start + tidx) % self.capacity)
+                        + (slot * ring_capacity + (ring_start + tidx) % ring_capacity)
                         * 2,
                         cute.make_layout((2,)),
                     )
@@ -584,8 +590,10 @@ class RecoverSsmVerify:
                 gate_bias,
                 gate_scale,
                 lower_bound,
-                key_gate + (slot * key_gate_slot_stride + head * key_gate_head_stride),
-                key_gate_position_stride,
+                retained,
+                retained_page(retained, request),
+                head,
+                retained_length(retained, retained_page(retained, request)),
                 Int32(value_tile == 0),
                 valid_tokens,
                 ring_start,
@@ -601,14 +609,16 @@ class RecoverSsmVerify:
                     + tidx
                 )
                 correction_row = correction + (
-                    slot * correction_slot_stride
+                    retained_page(retained, request) * correction_slot_stride
                     + head * correction_head_stride
                     + value_start
                     + tidx
                 )
                 for t in cutlass.range_constexpr(W):
                     live = Int32(t < valid_tokens)
-                    position = (ring_start + t) % self.capacity
+                    position = (
+                        retained_length(retained, retained_page(retained, request)) + t
+                    )
                     _store_if(
                         live, (out_row + t * out_token_stride).toint(), outputs[t], True
                     )
@@ -631,8 +641,10 @@ class RecoverSsmVerify:
         gate_bias: Float32,
         gate_scale: Float32,
         lower_bound: Float32,
-        key_record,
-        key_record_position_stride: Int64,
+        retained: tuple,
+        record_page: Int64,
+        record_head: Int32,
+        record_start: Int32,
         records_keys: Int32,
         valid_tokens: Int32,
         ring_start: Int32,
@@ -655,12 +667,6 @@ class RecoverSsmVerify:
             self._store_key_channel(
                 shared, tidx, raw_keys, raw_queries, steps, prefix_hi, prefix_lo
             )
-            for t in cutlass.range_constexpr(W):
-                live = Int32((records_keys != 0) & (t < valid_tokens))
-                position = (ring_start + t) % self.capacity
-                entry = key_record + (position * key_record_position_stride + tidx)
-                _store_if(live, entry.toint(), raw_keys[t], True)
-                _store_if(live, (entry + K).toint(), raw_gates[t], True)
         cute.arch.barrier()
 
         if const_expr(not self.factored):
@@ -680,6 +686,27 @@ class RecoverSsmVerify:
             cute.arch.barrier()
             self._finalize_coefficients(shared.sums, tidx)
             cute.arch.barrier()
+
+        cute.arch.barrier()
+        if tidx < K:
+            raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, tidx)
+            steps, prefix_hi, prefix_lo = self._gate_prefix(
+                raw_gates, gate_bias, gate_scale, lower_bound
+            )
+            for t in cutlass.range_constexpr(W):
+                stored = Int32((records_keys != 0) & (t < valid_tokens))
+                position = Int64(record_start) + t
+                for field, value in (
+                    (retained[2], raw_keys[t] * shared.sums[self.sums.key_scale + t]),
+                    (retained[3], _exp(steps[t])),
+                ):
+                    offset = (
+                        record_page * field.stride[0]
+                        + Int64(record_head) * field.stride[1]
+                        + position * field.stride[2]
+                        + Int64(tidx) * field.stride[3]
+                    )
+                    _store_if(stored, (field.iterator + offset).toint(), value, False)
 
     def _allocate_shared(self) -> _Shared:
         smem = cutlass.memory.SmemAllocator()
@@ -1116,6 +1143,8 @@ def _compile(
     window: int,
     value_tile_rows: int,
     capacity: int,
+    state_dtype: torch.dtype,
+    live_dtype: torch.dtype,
     bounded_gate: bool,
     factored: bool,
     has_metadata: bool,
@@ -1142,16 +1171,28 @@ def _compile(
     a_log = make_fake_tensor(_DTYPES[param_dtype], (heads,))
     dt_bias = make_fake_tensor(_DTYPES[bias_dtype], (heads * key_dim,))
     state = make_fake_tensor(
-        Float32, (cute.sym_int(), heads, value_dim, key_dim), divisibility=4
+        _DTYPES[state_dtype],
+        (cute.sym_int(), heads, value_dim, key_dim),
+        divisibility=4,
     )
     correction = make_fake_tensor(Float32, (slots, heads, capacity, value_dim))
-    key_gate = make_fake_tensor(BFloat16, (slots, heads, capacity, 2 * key_dim))
+    normalized_key = make_fake_tensor(
+        Float32, (slots, heads, capacity, key_dim), leading_dim=None
+    )
     query_start_loc = make_fake_tensor(_DTYPES[start_dtype], (cute.sym_int(),))
     state_indices = make_fake_tensor(_DTYPES[index_dtype], (batch,))
     metadata = stamps = None
     if has_metadata:
         metadata = make_fake_tensor(Int64, (batch, 3))
-        stamps = make_fake_tensor(Int64, (slots, capacity, 2))
+        stamps = make_fake_tensor(Int64, (cute.sym_int(), cute.sym_int(), 2))
+    retained = fake_retained_arguments(
+        state,
+        correction,
+        normalized_key,
+        slots=slots,
+        batch=batch,
+        live_dtype=_DTYPES[live_dtype],
+    )
     kernel = RecoverSsmVerify(
         key_dim,
         value_dim,
@@ -1172,8 +1213,10 @@ def _compile(
         a_log,
         dt_bias,
         state,
+        retained,
+        Int64(0),
         correction,
-        key_gate,
+        normalized_key,
         out,
         query_start_loc,
         state_indices,
@@ -1210,8 +1253,7 @@ def recoverssm_verify_supported(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     checkpoint_state: torch.Tensor,
-    correction_cache: torch.Tensor,
-    kg_cache: torch.Tensor,
+    retained_history,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     spec_query_len: int,
@@ -1224,12 +1266,14 @@ def recoverssm_verify_supported(
     gate's sign, and the alignment and strides its bulk copies and fixed
     descriptors need.
     """
+    correction_cache = retained_history.correction
     key_dim, value_dim = q.shape[-1], v.shape[-1]
     floats = (torch.bfloat16, torch.float16, torch.float32)
     rows = (q, k, v, raw_g, out)
     return (
-        all(x.dtype == torch.bfloat16 for x in (*rows, kg_cache))
-        and checkpoint_state.dtype == correction_cache.dtype == torch.float32
+        all(x.dtype == torch.bfloat16 for x in rows)
+        and checkpoint_state.dtype in (torch.float32, torch.bfloat16)
+        and correction_cache.dtype == torch.float32
         and all(x.dtype in floats for x in (raw_beta, A_log, dt_bias))
         and A_log.stride(0) == 1
         and key_dim % 32 == 0
@@ -1246,10 +1290,13 @@ def recoverssm_verify_supported(
         and checkpoint_state.data_ptr() % 16 == 0
         and all(
             x.dtype in (torch.int32, torch.int64) and x.stride(0) == 1
-            for x in (query_start_loc, state_indices)
+            for x in (
+                query_start_loc,
+                state_indices,
+                retained_history.live_state_indices,
+            )
         )
         and correction_cache.stride(3) == 1
-        and kg_cache.stride(3) == 1
     )
 
 
@@ -1263,8 +1310,7 @@ def recoverssm_verify(
     dt_bias: torch.Tensor,
     lower_bound: float | None,
     checkpoint_state: torch.Tensor,
-    correction_cache: torch.Tensor,
-    kg_cache: torch.Tensor,
+    retained_history,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     spec_query_len: int,
@@ -1273,24 +1319,20 @@ def recoverssm_verify(
     record_stamps: torch.Tensor | None,
 ) -> torch.Tensor:
     """Run the CuTe DSL verify; arguments and results match ``kda_recoverssm_verify``."""
-    check_recoverssm_verify_inputs(
-        q,
-        k,
-        v,
-        raw_g,
-        raw_beta,
-        A_log,
-        dt_bias,
+    from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+        _validate_retained_request,
+    )
+
+    _validate_retained_request(
+        retained_history,
         checkpoint_state,
-        correction_cache,
-        kg_cache,
-        query_start_loc,
         state_indices,
+        query_start_loc,
         spec_query_len,
-        out,
         record_metadata,
         record_stamps,
     )
+    correction_cache = retained_history.correction
     _, total_tokens, heads, key_dim = q.shape
     value_dim = v.shape[-1]
     if total_tokens == 0:
@@ -1304,8 +1346,7 @@ def recoverssm_verify(
         A_log,
         dt_bias,
         checkpoint_state,
-        correction_cache,
-        kg_cache,
+        retained_history,
         query_start_loc,
         state_indices,
         spec_query_len,
@@ -1321,6 +1362,8 @@ def recoverssm_verify(
         spec_query_len,
         _value_tile_rows(state_indices.shape[0], heads, spec_query_len, value_dim),
         correction_cache.shape[2],
+        checkpoint_state.dtype,
+        retained_history.live_state_indices.dtype,
         bounded,
         bounded and spec_query_len * abs(lower_bound) <= FACTORED_DECAY,
         record_metadata is not None,
@@ -1330,6 +1373,10 @@ def recoverssm_verify(
         query_start_loc.dtype,
         state_indices.dtype,
     )
+    consolidate_history(
+        checkpoint_state, retained_history, state_indices, query_start_loc
+    )
+    reset_retained_history(retained_history, state_indices, query_start_loc)
     kernel(
         q[0],
         k[0],
@@ -1339,8 +1386,14 @@ def recoverssm_verify(
         A_log,
         dt_bias.reshape(-1),
         checkpoint_state,
+        retained_arguments(checkpoint_state, retained_history),
+        (
+            record_stamps.shape[1]
+            if record_stamps is not None
+            else correction_cache.shape[2]
+        ),
         correction_cache,
-        kg_cache,
+        retained_history.key,
         out[0],
         query_start_loc,
         state_indices,

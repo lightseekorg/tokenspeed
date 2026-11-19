@@ -252,7 +252,9 @@ def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
 
 
 def test_the_override_reaches_the_plan_through_the_factory_seam() -> None:
-    template = _kimi_k3_recipe()
+    from test.runtime.conftest import kimi_recipe_with_history
+
+    template = kimi_recipe_with_history(history_capacity=None, max_bs=8)
     built = setup.prepare_cache_setup(
         family="kimi_k3",
         server_args=template.server_args,
@@ -677,7 +679,6 @@ def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -
 
     for family in sorted(_RECIPES):
         assert _RECIPES[family]().verify_scratch_in_pool() is False, family
-    monkeypatch.setattr(kda_ops, "kda_replay_commit_supported", lambda *a, **k: True)
     monkeypatch.setattr(
         kda_ops, "kda_fused_paged_verify_uses_split_producers", lambda *a, **k: True
     )
