@@ -519,6 +519,15 @@ std::size_t Scheduler::PdTransferSize() const {
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); }));
 }
 
+std::size_t Scheduler::PrefillInflightSize() const {
+    if (config_.role != Role::kP) {
+        return 0;
+    }
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
+    }));
+}
+
 std::int32_t Scheduler::ActiveLcmBlocks() const {
     const std::int32_t active = coordinator_.NumActiveLcmBlocks();
 #ifndef NDEBUG
