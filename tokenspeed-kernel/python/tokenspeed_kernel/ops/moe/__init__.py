@@ -237,7 +237,22 @@ def prepare_sm90_fp8_moe(
         A callable accepting FlashInfer's ``cutlass_fused_moe`` arguments and
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
-        routing layout. Initialize before warmup and CUDA graph capture;
+        routing layout.
+
+        Private modes also accept ``prepared_input=[packed, scales,
+        source_rows, inverse, offsets]`` to consume caller-owned block-FP8
+        activations without repeating routing or input quantization. The
+        tensors retain native expert-major packing and slot-major route IDs.
+        Supply both ``route_map`` and ``expert_offsets`` to write unweighted
+        BF16 expert rows to ``output``, skipping the weighted final reduction;
+        this requires ``use_fused_finalize=False``. The returned output list
+        is unchanged; its first tensor then has shape [tokens * topk, hidden].
+        These two interfaces compose, require bias-free block-FP8 with TP=1
+        and no all-to-all, and retain caller storage through completion.
+        See ops/moe/README.md for tensor layouts and ownership requirements.
+        No output quantization or model-specific projection is performed.
+
+        Initialize before warmup and CUDA graph capture;
         private modes require FlashInfer 0.7.4, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe

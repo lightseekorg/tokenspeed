@@ -91,6 +91,51 @@ Expert selection scores `sigmoid(logit) + bias` with `torch.sigmoid`'s
 reference. The router projection keeps the FP32 accumulator: `skinny_mm` for
 decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
 
+## SM90 block-FP8 native inputs and outputs
+
+`prepare_sm90_fp8_moe` binds the FlashInfer native runner before warmup and
+graph capture. Its private `expected_m` and `optimized` implementations accept
+two optional, composable interfaces using ordinary tensors. The installed
+`default` implementation retains its own API. Both interfaces require BF16
+activations, block-128 FP8 weights, no expert bias, TP=1, and no all-to-all.
+They do not change the expert GEMMs or add output quantization or projection.
+
+For N tokens, K routes, H channels and E local experts, `prepared_input` is
+`[packed, scales, source_rows, inverse, offsets]`:
+
+| Tensor | Native layout and meaning |
+| --- | --- |
+| `packed` | Contiguous E4M3 `[round_up(N*K, 4), H]`, local rows grouped by expert |
+| `scales` | Contiguous FP32 `[H/128, L]`, where `L=round_up(N*K+31*E, 32)` |
+| `source_rows` | Int32 `[N*K]`; packed row maps to `slot*N+token` |
+| `inverse` | Int32 `[N*K]`; `inverse[slot*N+token]` is its packed row or -1 |
+| `offsets` | Int64 `[E+1]`; local expert row prefixes, with the valid row count last |
+
+All five tensors are contiguous, 16-byte aligned and on the input device.
+Rows within each expert may be permuted if the maps describe the same order.
+Expert e's FP32 scale rows begin at
+`floor((offsets[e]+31*e)/32)*32`; channel blocks index the first dimension.
+Only the valid row prefix and corresponding scale rows are read. The caller
+produces these tensors for the supplied input and expert IDs, preserves the
+native quantization convention, and keeps their storage alive and unchanged
+until its consumers complete. The runner skips routing, input expansion and
+input quantization when these tensors are supplied.
+
+To defer the final weighted reduction, supply both `route_map` (int32 `[N*K]`)
+and `expert_offsets` (int64 `[E+1]`) with `use_fused_finalize=False`. The native
+output is then unweighted BF16 `[N*K, H]`; the ordinary returned list still
+contains that output as its first tensor. The original routing producer writes
+the caller's maps, including -1 for remote routes on every replay. Only rows
+below `expert_offsets[-1]` are initialized. Destinations must be contiguous,
+on the input device and disjoint from inputs and workspace. If prepared input
+is also supplied, the two metadata destinations must alias its exact inverse
+and offsets tensors, which remain read-only; the expert output remains separate.
+
+The consumer owns weighting, reduction order, collectives and subsequent
+quantization. This interface makes no additional batch-invariance promise.
+Eager execution and graph capture use the same arguments and storage contract;
+replay requires refreshing the original input buffers and prepared metadata.
+
 ## Deferred route outputs
 
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
