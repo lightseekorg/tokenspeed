@@ -999,6 +999,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     pg.input_buffers = ib
     pg.attn_backend = SimpleNamespace(init_forward_metadata=init_metadata)
     pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     pg.dp_size = 1
     pg.drafter = None
     executor.prefill_graph = pg

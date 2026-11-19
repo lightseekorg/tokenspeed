@@ -636,8 +636,21 @@ those separately. The ownership guard releases counts on failed sends and droppe
 queued work as well as normal completion.
 
 The same reasoning fixes the metrics call: the loop records scheduler
-iteration metrics once per round, from the same pre-dispatch snapshot as the
-scheduler stats.
+iteration metrics once per round, before dispatch and before committing prior
+forwards. `num_requests_running` counts the actual forward batch after DP
+agreement, excluding idle padding, PD transfer waits and resident rows without
+a decode execution permit. Scheduler `sizes.running` remains a state-occupancy
+count for routing and must not substitute for batch size. `num_requests_waiting`
+adds `sizes.waiting` (admission, prefetch and retraction/restore) and
+`sizes.ready_waiting` (KV-ready D requests without a decode permit), plus
+admissions withheld during a pause. Frozen rounds use the same recorder with
+no forward, so RunningBS becomes zero and queue gauges continue updating. The
+storage tick disables the scheduler's forward builder in those rounds. That
+builder is the source of capacity aborts, and the no-progress streak resets
+when forwards are forbidden, so a frozen plan has no scheduler aborts. Bootstrap,
+KV reception and grammar compilation retain their separate queue gauges;
+`num_requests_inflight` covers all unfinished requests, including those waits.
+Queue subcategories overlap the total and must not be added to it again.
 
 Only ranks with an engine metrics exporter retain per-request timing samples.
 Decode request logs, exported latency metrics, and request traces use the
@@ -682,10 +695,11 @@ Page gauges count LCM parents, excluding the reserved null parent. The
 per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
 Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
-The used and free token gauges prorate the recipe's effective token capacity
-by the resident and non-active parent counts, respectively. Round down after
-scaling so a fully free pool reports its full capacity, including packed or
-capacity-limited layouts.
+The used-token gauge prorates the recipe's effective token capacity by active
+parents, rounding down; free tokens are the complementary capacity. Separate
+resident-token and resident-ratio gauges include reclaimable prefix parents.
+A fully free pool reports its full capacity, including packed or capacity-limited
+layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
 `active_lcm_blocks()` is O(1): the block tables keep the count as they change
@@ -1286,3 +1300,81 @@ rendezvous for cache flushes while retaining their DP routing identities.
 Sharing immutable expert weights alone does not require forward coordination.
 Weight-copy streams and readiness/release events remain behind the model on
 the data plane; see [distributed immutable weights](distributed-weights.md).
+
+
+### Cache and request observation semantics
+
+The legacy used-token convention excludes reclaimable prefix-cache pages.
+`kv_token_usage_perc` and `num_used_tokens` therefore use active pages;
+`kv_cache_resident_usage_perc` and `num_resident_kv_tokens` preserve physical resident
+occupancy. `num_free_tokens` includes reclaimable pages and complements used tokens.
+
+Cache ratios are atomic weighted observations: one admission snapshot carries
+`hit / prompt` with weight `prompt`. Device and Host hits are disjoint admitted
+prefix spans; Host includes data supplied by L3. Storage-key matches can repeat by
+cache group and do not count as admitted L3 hits. Decode-cache observations come
+from the decode scheduler's own admission delta, never the prefill response's
+cached-token usage. A zero-hit admission must still emit a weighted zero.
+
+Speculative accept length includes the bonus token: `(accepted_draft + slots) /
+slots`, weighted by verify request-slots. Its aggregation window belongs to the
+reporter. These aggregate observations preserve means and sums, not individual
+request/token quantiles. Prometheus sums use the original totals exactly; raw
+metric events carry only mean and weight, so reconstructing their product can
+introduce floating-point rounding. Python's weighted Prometheus updates use
+`prometheus_client` histogram internals; the supported minor version is bounded
+in `python/pyproject.toml` and upgrades must pass the reporter tests.
+Completion-token samples, in contrast, preserve one
+sample per ended engine request (including zero output), separate from the sum;
+they retain role boundaries, including prefill's bootstrap output. Frontend
+end-to-end samples represent client-facing request distributions.
+
+A registered request whose PD transfer fails uses the normal request-metric
+completion path. Its generated-token total and per-request completion sample,
+request duration, first-token/decode latencies when available, and stream e2e
+sample are recorded once before removal. Invalid requests rejected before
+admission retain their existing metric coverage.
+
+
+PD cancellation retains the same protocol failure status and page-retirement
+fence as an error, but does not increment the KV transfer failure counter.
+Only actual failure paths increment that counter; cancellation acknowledgements
+and retries cannot turn a single failure into another counted error. Timeout
+counters remain separate. Replica-wide terminal agreement cancels remaining
+work without incrementing failures on unaffected ranks. The failure counter
+counts locally detected errors on their detecting ranks, not every replica
+rank affected by the same room termination; a rank-local timeout likewise
+remains a timeout when other ranks converge on its terminal status.
+
+P's transfer-wait queue uses `prefill_inflight`: PrefillDone plus Decoding,
+from the final prefill result landing until PD completion. Computing prefill
+chunks and cleanup pins are excluded. D's transfer queue uses RemotePrefilling,
+which is also its KV-wait queue; those two exported gauges are aliases, not
+additive subqueues. The broad scheduler pending gauge continues to include
+restore, permit, and pause waits.
+
+
+### Output-chunk TPOT and request e2e_TPOT
+
+TPOT observes each nonempty output chunk after the first: elapsed time
+since the previous nonempty emitted chunk divided by newly emitted tokens.
+The independent e2e_TPOT observes request end minus the first emitted chunk's
+time, divided by all output tokens minus the first chunk's token count. The
+first chunk may contain several tokens under speculation or stream batching;
+subtracting a fixed one is incorrect. Empty outputs do not advance the TPOT
+clock, and single-chunk requests have neither metric. These clocks are the
+engine's role-local output boundary; the native frontend exposes the same
+formulas at its client-facing output boundary, including transport overhead.
+Both observations preserve their distributions without window averaging.
+With `stream_interval=1`, the raw TPOT rate is the number of noninitial
+output chunks: approximately active decode requests times decode steps per
+second, summed across ranks. Do not replace a round's distinct samples with
+`observe_batched` of their mean: that preserves the sum but loses quantiles.
+Capacity checks must cover the relay and the chosen sink separately; a slow
+sink can fill the relay queue even when transport alone sustains the rate.
+Each output observation pairs its sample destination and timestamp together;
+disabled metrics and prefill output do not create an observation.
+
+Admission failures prepare their final output before logging completion, as the
+other terminal paths do. Preparing that output consumes a sampled TTFT trace;
+completion logging therefore emits no second breakdown for the same request.
