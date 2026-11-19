@@ -353,7 +353,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
     _assert(request->Is<fsm::Submitted>(), "the admission probe is for a Submitted request");
     const auto probe = [this, request](const PromptPrefix& prompt) {
         if (config_.role == Role::kD) {
-            return coordinator_.Prober().ProbeDecodeDevicePrefix(prompt, request->PrefillSize());
+            return coordinator_.Prober().ProbeDecodePrefix(prompt, request->PrefillSize());
         }
         return coordinator_.Prober().ProbePromptPrefix(prompt);
     };

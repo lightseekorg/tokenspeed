@@ -663,6 +663,32 @@ def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatc
             ts.SchedulerConfig.HostWritePolicy.WriteBack,
             (5, 8),
         ),
+        (
+            [
+                "--disaggregation-mode",
+                "decode",
+                "--kvstore-write-policy",
+                "write_back",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "decode",
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "8",
+                "--decode-context-parallel-size",
+                "8",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
     ],
     ids=[
         "default",
@@ -674,6 +700,8 @@ def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatc
         "fused_write_back_attention_tp",
         "fused_write_back_dcp",
         "fused_write_back_tp_wider_than_dcp",
+        "decode_write_back",
+        "decode_write_back_dcp",
     ],
 )
 def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
@@ -688,20 +716,6 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
 @pytest.mark.parametrize(
     "flags, refused",
     [
-        (["--disaggregation-mode", "decode"], "--disaggregation-mode decode"),
-        (
-            [
-                "--disaggregation-mode",
-                "decode",
-                "--attn-tp-size",
-                "8",
-                "--kv-parallel-size",
-                "8",
-                "--decode-context-parallel-size",
-                "8",
-            ],
-            "--disaggregation-mode decode",
-        ),
         (
             ["--disaggregation-mode", "prefill", "--disable-kvstore"],
             "--disable-kvstore (no Host L2)",
@@ -733,10 +747,10 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
         ),
         (["--pipeline-parallel-size", "2"], "--pipeline-parallel-size > 1"),
     ],
-    ids=["decode", "decode_dcp", "no_host", "encode", "l3", "qcp", "pp", "fused_pp"],
+    ids=["no_host", "encode", "l3", "qcp", "pp", "fused_pp"],
 )
 def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeypatch):
-    # The scheduler writes back on every role but decode; the runtime with
+    # The scheduler writes back on every role; the runtime with
     # Host L2 and no L3, on one pipeline stage, and not yet under a query
     # shard. Attention TP and KV parallelism are accepted (above). Each case
     # breaks one prerequisite, which the write_back check names. The debug
