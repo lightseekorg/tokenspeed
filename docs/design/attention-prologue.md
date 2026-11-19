@@ -453,17 +453,11 @@ their respective attention planes. Current rows share a BF16 packet; one
 kernel unpacks both planes, fills partial history pages and writes owner caches.
 Gathering and cache commit preserve all bits, including BF16 NaN payloads.
 
-The preceding KDA segment may submit history gathering. The attention entry
-ensures it if absent. One bounded Torch allocation serves successive layers;
-the cache recipe reserves its bytes before sizing the persistent cache. It
-holds attention planes, send space and current-row receive space in a persistent
-tensor managed by the Torch caching allocator. It contains no per-request
-retained state.
-All user-managed Prefill work uses one execution stream and synchronous HCCL
-interfaces. Stream order protects reuse after the final attention consumer;
-`finish` drops layer references without freeing storage. Warmup may hand over
-to the serving stream after the executor's synchronization. Rebind or teardown
-synchronizes queued consumers before dropping the workspace's tensor references.
+At each attention layer the backend gathers history, then gathers and commits
+current rows before index selection. The cache recipe reserves one persistent
+Torch workspace with attention planes, send space and current-row receive space.
+Layers reuse this storage in execution-stream order. The executor synchronizes
+before handing off the workspace or releasing its owner.
 The Decode model runtime shares the fused prologue
 producer buffers across sequential layers and selects projection computations
 through the attention registry. The DSA module constructs its checkpoint
@@ -520,8 +514,7 @@ DSA Prefill prepares its batch metadata and reusable transport in
 `attention/ascend_qcp_prefill.py`. The DSA backend's `forward_extend` performs
 history/current KV preparation, Indexer selection and SFA in order. Each layer
 gathers its history at the attention entry and commits current KV/Index-K before
-selection; there is no early-model
-prefetch, active-layer deduplication, finish call or workspace close protocol.
+selection. The next layer reuses the same buffers.
 
 `attention/backends/paged/ascend_dsa_local_decode.py` owns TP1/KVP1 Decode,
 including single-token and multi-token causal metadata. It has no DCP metadata

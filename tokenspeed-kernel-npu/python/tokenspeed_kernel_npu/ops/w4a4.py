@@ -20,6 +20,7 @@
 
 """FlatQuant INT4 weight preparation and composed Prefill experts."""
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -65,8 +66,9 @@ class FlatQuantStage:
 class W4A4MoePlan:
     w13: torch.Tensor
     w2: torch.Tensor
-    scale13: torch.Tensor
-    scale2: torch.Tensor
+    # FP32 Decode scales are omitted from a Prefill-only grouped view.
+    scale13: torch.Tensor | None
+    scale2: torch.Tensor | None
     first: FlatQuantStage
     second: FlatQuantStage
     transposed: bool
@@ -81,7 +83,9 @@ class W4A4GroupedPlan:
     scale2: torch.Tensor
 
 
-def prepare_w4a4_grouped_plan(weights: W4A4MoePlan) -> W4A4GroupedPlan:
+def prepare_w4a4_grouped_plan(
+    weights: W4A4MoePlan, *, prefill_only: bool = False
+) -> W4A4GroupedPlan:
     """Select the Prefill NZ weights and encode the official GMM scales."""
 
     def encode(scale):
@@ -96,7 +100,10 @@ def prepare_w4a4_grouped_plan(weights: W4A4MoePlan) -> W4A4GroupedPlan:
             transposed=False,
             prefill_weights=None,
         )
-    return W4A4GroupedPlan(weights, encode(weights.scale13), encode(weights.scale2))
+    scale13, scale2 = encode(weights.scale13), encode(weights.scale2)
+    if prefill_only:
+        weights = replace(weights, scale13=None, scale2=None)
+    return W4A4GroupedPlan(weights, scale13, scale2)
 
 
 def w4a4_grouped_experts(
@@ -202,12 +209,30 @@ def w4a4_grouped_experts(
 
 
 def prepare_flatquant_stage(left, right, clip) -> FlatQuantStage:
-    """Prepare checkpoint constants once, before graph capture."""
-    return FlatQuantStage(left.t().contiguous(), right.contiguous(), float(clip.item()))
+    """Validate and prepare constants once, before graph capture."""
+    if (
+        left.ndim != 2
+        or right.ndim != 2
+        or left.shape[0] != left.shape[1]
+        or right.shape[0] != right.shape[1]
+        or left.dtype != torch.bfloat16
+        or right.dtype != torch.bfloat16
+        or left.device != right.device
+        or clip.device != left.device
+        or clip.numel() != 1
+        or not clip.is_floating_point()
+    ):
+        raise ValueError("Invalid FlatQuant matrices/clip for the activation width")
+    ratio = float(clip.item())
+    if not math.isfinite(ratio) or not 0 < ratio <= 1:
+        raise ValueError("FlatQuant clip must be finite and in (0,1]")
+    if not torch.isfinite(left).all() or not torch.isfinite(right).all():
+        raise ValueError("FlatQuant matrices must be finite")
+    return FlatQuantStage(left.t().contiguous(), right.contiguous(), ratio)
 
 
 def prepare_w4a4_moe_weights(
-    w13, w2, scale13, scale2, first, second, *, transposed: bool
+    w13, w2, scale13, scale2, first, second, *, transposed: bool, role: str = "null"
 ) -> W4A4MoePlan:
     """Convert checkpoint INT32 tensors to NZ without changing their INT4 layout.
 
@@ -217,6 +242,8 @@ def prepare_w4a4_moe_weights(
     NT checkpoints therefore also get an [E,K,N/8] representation. Scales
     remain FP32 [E,N] until the grouped plan encodes them for official GMM.
     """
+    if role not in ("prefill", "decode", "null"):
+        raise ValueError(f"Unsupported W4A4 service role {role!r}")
     if type(transposed) is not bool:
         raise ValueError("W4A4 transpose selection must be a boolean")
     if (
@@ -300,11 +327,17 @@ def prepare_w4a4_moe_weights(
         if not transposed:
             weight = weight.transpose(1, 2)
         values = unpack_int4(weight)
+        if transposed and role == "prefill":
+            return values_to_nz(values.transpose(1, 2)), None
         base = values_to_nz(values)
         # Transposing packed words leaves the nibbles on K. Repack logical
         # INT4 values so official Prefill GMM gets [E,K,N/8]; preserve the
         # original NT packing and flag used by the fused Decode operation.
-        prefill = values_to_nz(values.transpose(1, 2)) if transposed else None
+        prefill = (
+            values_to_nz(values.transpose(1, 2))
+            if transposed and role == "null"
+            else None
+        )
         return base, prefill
 
     base13, prefill13 = to_nz(w13)
@@ -316,6 +349,6 @@ def prepare_w4a4_moe_weights(
         scale2.contiguous(),
         first,
         second,
-        transposed,
-        (prefill13, prefill2) if transposed else None,
+        transposed and role != "prefill",
+        (prefill13, prefill2) if prefill13 is not None else None,
     )

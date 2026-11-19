@@ -27,10 +27,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
-from tokenspeed_kernel.ops.sampling import blockwise_logprobs
-
 import tokenspeed.runtime.sampling.backends.flashinfer as flashinfer_module
+import torch
 from tokenspeed.runtime.configs.numerics import BLOCKWISE_VOCAB_BLOCK
 from tokenspeed.runtime.execution.context import InputLogprobRows
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -48,6 +46,7 @@ from tokenspeed.runtime.sampling.utils import (
     gather_token_logprobs_torch,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed_kernel.ops.sampling import blockwise_logprobs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci
@@ -79,8 +78,9 @@ def test_gather_rejects_unknown_order(order):
 def test_blockwise_gather_requires_the_launchs_selected_reduction(monkeypatch):
     from tokenspeed_kernel.selection import NoKernelFoundError
 
-    monkeypatch.setitem(global_server_args_dict, "block_sumexp_solution", "absent")
-    with pytest.raises(NoKernelFoundError, match="absent"):
+    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+    monkeypatch.setitem(global_server_args_dict, "device", "npu")
+    with pytest.raises(NoKernelFoundError):
         gather_token_logprobs(
             _logits(1), torch.tensor([5]), logprob_order="blockwise-direct"
         )

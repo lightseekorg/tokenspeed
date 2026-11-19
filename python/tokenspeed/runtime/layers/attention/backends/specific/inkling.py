@@ -95,7 +95,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
 
 logger = logging.getLogger(__name__)
 
@@ -496,12 +495,7 @@ class InklingAttnBackend(AttentionBackend):
     def cache_consumer_attn_kinds(self):
         return frozenset(self.inner.cache_consumer_attn_kinds) | {"state"}
 
-    def prepare_remote_cache_slots(
-        self,
-        slot_indices: list[int],
-        *,
-        admissions: Mapping[int, RemoteCacheAdmission] | None = None,
-    ) -> None:
+    def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
         """Clear stale hydration state before publishing RDMA destinations."""
         self.conv_pool.remote_restore_pending[slot_indices] = False
 

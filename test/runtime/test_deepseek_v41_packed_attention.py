@@ -20,13 +20,12 @@
 
 """Packed V4.1 decode metadata and target attention against uniform windows."""
 
-from test.runtime.test_deepseek_v41_cache import _tables, _verify_backend
-
 import pytest
 import torch
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed_kernel.ops.attention import dsv41
 
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from test.runtime.test_deepseek_v41_cache import _tables, _verify_backend
 
 
 @pytest.fixture(params=["cpu", "cuda"])
@@ -365,7 +364,6 @@ def test_startup_profile_replays_the_requested_graph_capacity():
     from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
-
     runner.dp_local_graph = False
     runner.max_tokens_per_req = 4
     runner.graphs = {}

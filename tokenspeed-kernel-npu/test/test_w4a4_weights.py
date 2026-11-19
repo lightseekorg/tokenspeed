@@ -65,9 +65,10 @@ def test_grouped_plan_shares_weights_and_encodes_scales_without_numeric_cast():
         torch.testing.assert_close(bits.view(torch.float32), expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("role", ["prefill", "decode", "null"])
 @pytest.mark.parametrize("transposed", (False, True))
 def test_prepare_preserves_layout_scales_and_matrix_orientation(
-    monkeypatch, transposed
+    monkeypatch, transposed, role
 ):
     torch.manual_seed(42)
     e, h, i = 2, 64, 64
@@ -94,7 +95,10 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
         assert fmt == 29
         return tensor.clone()
 
+    conversions = []
+
     def convert(tensor):
+        conversions.append(tensor.shape)
         rows, total_cols = tensor.shape
         # Simulate NZ's expert-major physical storage, not its logical ND view.
         values = tensor.reshape(rows, e, total_cols // e).permute(1, 0, 2)
@@ -122,19 +126,22 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
     )
     s13, s2 = torch.rand(e, 2 * i) + 0.1, torch.rand(e, h) + 0.1
     plan = prepare_w4a4_moe_weights(
-        w13, w2, s13, s2, first, second, transposed=transposed
+        w13, w2, s13, s2, first, second, transposed=transposed, role=role
     )
     result13, result2 = unpack_int4(plan.w13), unpack_int4(plan.w2)
-    if transposed:
+    assert len(conversions) == (4 if role == "null" and transposed else 2)
+    assert plan.transposed == (transposed and role != "prefill")
+    if plan.transposed:
         result13, result2 = result13.transpose(1, 2), result2.transpose(1, 2)
     assert torch.equal(result13, logical13)
     assert torch.equal(result2, logical2)
-    grouped = prepare_w4a4_grouped_plan(plan)
-    assert not grouped.weights.transposed
-    assert torch.equal(unpack_int4(grouped.weights.w13), logical13)
-    assert torch.equal(unpack_int4(grouped.weights.w2), logical2)
-    if not transposed:
-        assert grouped.weights is plan
+    if role != "decode":
+        grouped = prepare_w4a4_grouped_plan(plan, prefill_only=role == "prefill")
+        assert not grouped.weights.transposed
+        assert torch.equal(unpack_int4(grouped.weights.w13), logical13)
+        assert torch.equal(unpack_int4(grouped.weights.w2), logical2)
+        if role == "prefill":
+            assert grouped.weights.scale13 is grouped.weights.scale2 is None
     assert torch.equal(plan.first.left, left.t())
     assert torch.equal(plan.scale13, s13)
     assert torch.equal(plan.scale2, s2)

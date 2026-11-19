@@ -209,7 +209,6 @@ def _cache_storage_report(
     configured_cache_bytes: int,
     pool,
     fixed_workspace_bytes: int = 0,
-    temporary_workspace_bytes: int = 0,
     prefill_kv_capacity: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
@@ -238,11 +237,7 @@ def _cache_storage_report(
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
     storage = arena.storage_plan
-    planned_peak_bytes = (
-        allocated_cache_bytes
-        + temporary_workspace_bytes
-        + storage.temporary_workspace_bytes
-    )
+    planned_peak_bytes = allocated_cache_bytes + storage.temporary_workspace_bytes
     if planned_peak_bytes > configured_cache_bytes:
         raise RuntimeError(
             "planned cache storage exceeds its profiled budget: "
@@ -260,7 +255,6 @@ def _cache_storage_report(
             "arena_bytes": arena_bytes,
             "host_history_bytes": arena.allocated_host_bytes,
             "fixed_workspace_bytes": fixed_workspace_bytes,
-            "temporary_workspace_bytes": temporary_workspace_bytes,
             "offload_persistent_workspace_bytes": storage.persistent_workspace_bytes,
             "offload_temporary_workspace_bytes": storage.temporary_workspace_bytes,
         },
@@ -607,7 +601,15 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
         return "mha"
 
 
-def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
+def _get_backend_cls(
+    name: str | None,
+    arch: AttentionArch,
+    config: AttnConfig | None = None,
+) -> type[AttentionBackend]:
+    if config is not None and name in (None, _get_default_backend_name(arch)):
+        spec = config.component(SoftmaxAttnConfig)
+        if spec.paged_backend_cls is not None:
+            return spec.paged_backend_cls
     if name is None:
         entry = _BACKEND_REGISTRY.get(_get_default_backend_name(arch))
         if entry is not None and arch in entry[0]:
@@ -662,7 +664,7 @@ def create_paged_router(
         # server_args (and MHAConfig.generate copies into the spec). It
         # names the WRAPPER; the leaf under it auto-resolves from the arch.
         name = None
-    leaf_cls = _get_backend_cls(name, arch)
+    leaf_cls = _get_backend_cls(name, arch, config)
 
     def leaf_factory(group_id: str, block_granularity: int):
         del group_id
@@ -706,7 +708,7 @@ def _pin_fixed_kernel_page(
         config.component(SoftmaxAttnConfig), MSAConfig
     ):
         return config
-    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch)
+    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch, config)
     if (
         not issubclass(leaf_cls, PagedAttentionBackend)
         or leaf_cls.default_kernel_page_size is None
@@ -860,7 +862,7 @@ def _create_attn_backend_with_name(
         PagedAttentionBackend,
     )
 
-    cls = _get_backend_cls(name, arch)
+    cls = _get_backend_cls(name, arch, config)
     if issubclass(cls, PagedAttentionBackend):
         # Paged leaves are served through the cache-group router: one leaf
         # per history group, blocks -> kernel pages mapped in one place.
@@ -969,6 +971,10 @@ def _create_hybrid_linear_attn_backend(
     pool through the wrapper's ``set_cache_pool``. ``pool`` is inspected here
     only to select the consumers local to this model view.
     """
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+
     linear_factory = _LINEAR_ATTN_BACKENDS.get(linear_attention)
     if linear_factory is None:
         raise ValueError(
@@ -1017,17 +1023,17 @@ def _create_hybrid_linear_attn_backend(
             "layers, 0 linear "
             "attn layers in this cache view (skipping linear backend)",
         )
-        linear_attn_backend = None
+        backend = full_attn_backend
     else:
         linear_attn_backend = linear_factory(server_args, config)
+        backend = HybridLinearAttnBackend(
+            full_attn_backend, linear_attn_backend, full_attn_layers
+        )
         logger.info(
             f"Created hybrid_linear_attn backend: {len(full_attn_layers):d} full attn "
             f"layers, {len(linear_attn.layer_ids):d} linear attn layers, "
             f"{'LCM state fields'!s}",
         )
-    backend = config.create_hybrid_backend(
-        full_attn_backend, linear_attn_backend, full_attn_layers
-    )
     if is_qwen4_exp(hf_config):
         from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
             Qwen4ExpBackend,
@@ -1280,8 +1286,10 @@ def _narrow_spec_for_pp(
     )
 
 
-def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
-    backend_cls = _get_backend_cls(name, arch)
+def _validate_mla_dcp_backend(
+    name: str | None, arch: AttentionArch, config: AttnConfig | None = None
+) -> None:
+    backend_cls = _get_backend_cls(name, arch, config)
     if not backend_cls.supports_mla_dcp:
         raise ValueError(
             f"Attention backend {name or _get_default_backend_name(arch)!r} "
@@ -1410,11 +1418,12 @@ def create_attn_components(
         # V4.1 validates KVP in its config and specialized recipe.
         and softmax_attn.backend_name != "deepseek_v41"
         and (
-            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+            model_config.attention_arch in (AttentionArch.MLA, AttentionArch.DSA)
+            or target.is_hybrid_linear
         )
     ):
         _validate_mla_dcp_backend(
-            target_full_attn_backend_name, model_config.attention_arch
+            target_full_attn_backend_name, model_config.attention_arch, config
         )
     if config.kvp_size > 1 and target.is_hybrid_linear:
         resolved_softmax = dataclasses.replace(
@@ -1692,7 +1701,6 @@ def create_attn_components(
         configured_cache_bytes=cache_budget_bytes,
         pool=pool,
         fixed_workspace_bytes=fixed_workspace_bytes,
-        temporary_workspace_bytes=cache_setup.temporary_workspace_bytes,
         prefill_kv_capacity=backend.prefill_kv_capacity,
     )
 

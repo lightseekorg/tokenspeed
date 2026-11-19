@@ -70,9 +70,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
-        self.model_owns_projection = global_server_args_dict[
-            "model_owns_dense_projections"
-        ]
         self.kernel_plan = None
 
     def create_weights(
@@ -97,7 +94,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
-        if self.batch_invariant and not self.model_owns_projection:
+        if self.batch_invariant:
             self.kernel_plan = plan_dense_gemm(
                 mode="mm",
                 input_size=input_size_per_partition,
@@ -113,10 +110,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.model_owns_projection:
-            raise RuntimeError(
-                "The model owns this vocabulary projection; call its bound kernel"
-            )
         if self.batch_invariant:
             if self.kernel_plan is None:
                 raise RuntimeError(
@@ -306,9 +299,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.use_presharded_weights = use_presharded_weights
         if use_presharded_weights:
-            assert (
-                num_added_embeddings == 0
-            ), "Lora is not supported with presharded weights."
+            assert num_added_embeddings == 0, (
+                "Lora is not supported with presharded weights."
+            )
 
         self.org_vocab_size_padded = pad_vocab_size(
             self.org_vocab_size, self.padding_size
@@ -537,7 +530,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            ), (
+                f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            )
 
         # Copy the data.
         if not self.use_presharded_weights:

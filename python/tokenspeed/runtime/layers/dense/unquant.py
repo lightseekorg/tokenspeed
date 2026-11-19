@@ -37,9 +37,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
-        self.model_owns_projection = global_server_args_dict[
-            "model_owns_dense_projections"
-        ]
         self.kernel_plan = None
 
     def create_weights(
@@ -63,7 +60,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
-        if self.batch_invariant and not self.model_owns_projection:
+        if self.batch_invariant:
             self.kernel_plan = plan_dense_gemm(
                 mode="mm",
                 input_size=input_size_per_partition,
@@ -74,11 +71,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if (
-            self.batch_invariant
-            and not self.model_owns_projection
-            and self.kernel_plan is None
-        ):
+        if self.batch_invariant and self.kernel_plan is None:
             self.kernel_plan = plan_dense_gemm(
                 mode="mm",
                 input_size=layer.weight.shape[1],
@@ -94,10 +87,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.model_owns_projection:
-            raise RuntimeError(
-                "The model owns this Linear projection; call its bound kernel"
-            )
         if self.batch_invariant:
             if self.kernel_plan is None:
                 raise RuntimeError(

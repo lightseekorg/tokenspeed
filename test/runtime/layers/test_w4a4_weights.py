@@ -22,7 +22,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.moe.weights.int4 import (
     create_int4_weight_pair,
@@ -61,7 +60,8 @@ def test_expert_shards_and_required_flatquant_parameters(transposed, strategy):
     assert torch.all(layer.w13_weight[0, half:] == 3)
     assert torch.all(layer.w13_weight[1, :half] == 11)
     assert torch.all(layer.w13_weight_scale[1, 64:] == 13)
-    validate_int4_weights_loaded(layer)
+    with pytest.raises(ValueError, match="Missing FlatQuant"):
+        validate_int4_weights_loaded(layer)
     for module in (
         layer.w1_trans,
         layer.w2_trans,
@@ -110,7 +110,7 @@ def test_quant_config_int4_int8_and_gpu_boundary(monkeypatch):
     assert _config(4).moe_weight_dtype() == "int4"
     assert _config(8).moe_weight_dtype() == "int8"
     for kwargs in ({"input_symmetric": False}, {"input_dynamic": False}):
-        with pytest.raises(ValueError, match="unsupported|static token quantization"):
+        with pytest.raises(ValueError, match="unsupported"):
             _config(4, **kwargs).moe_weight_dtype()
     # MoE-only W4A4 must not override the shared Linear scheme.
     config = _config(8)
@@ -120,6 +120,38 @@ def test_quant_config_int4_int8_and_gpu_boundary(monkeypatch):
     monkeypatch.setattr(ct, "current_platform", lambda: SimpleNamespace(is_npu=False))
     with pytest.raises(ValueError, match="unsupported"):
         _config(4).moe_weight_dtype()
+
+
+def test_w4a4_plan_selects_only_the_fused_kernel():
+    pytest.importorskip("torch_npu")
+    import tokenspeed_kernel
+
+    if not torch.npu.is_available():
+        pytest.skip("requires Ascend registration")
+    plan = tokenspeed_kernel.moe_plan(
+        "int4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        a2a_backend="none",
+        ep_size=16,
+        ispp=1024,
+        hidden=512,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=True,
+        internal_activation_dtype="int4",
+        with_bias=False,
+        solution="flash_npu_chain",
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+    )
+    assert plan["apply_kernel_name"] == "ascend_int4_precomputed_moe_apply"
+    assert plan["solution"] == "flash_npu_chain"
+    assert plan["supports_precomputed_topk"]
+    assert not plan["supports_deferred_finalize"]
+    assert not plan["supports_all_to_all_ep"]
 
 
 def test_shared_weight_factory_keeps_flatquant_separate_from_smoothquant():
@@ -133,10 +165,12 @@ def test_shared_weight_factory_keeps_flatquant_separate_from_smoothquant():
         num_local_experts=2,
     )
     layer = torch.nn.Module()
-    create_layer_weights(spec, layer, "int4", config)
+    create_layer_weights(spec, layer, "int4", config, solution="flash_npu_chain")
     assert layer.w13_weight.shape == (2, 32, 64)
     assert layer.w13_weight_scale.dtype == torch.float32
     assert layer.w1_trans.matrix_left.shape == (8, 8)
     config.config["moe_enable_smooth_quant"] = True
     with pytest.raises(ValueError, match="SmoothQuant"):
-        create_layer_weights(spec, torch.nn.Module(), "int4", config)
+        create_layer_weights(
+            spec, torch.nn.Module(), "int4", config, solution="flash_npu_chain"
+        )

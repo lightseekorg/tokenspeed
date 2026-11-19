@@ -24,7 +24,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -35,14 +34,13 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 class TestNumericsMode:
     @pytest.mark.parametrize(
-        "numerics,backend", [("rl-bitwise", "greedy"), ("auto", "ascend_full")]
+        "numerics,backend", [("rl-bitwise", "ascend_full"), ("auto", "ascend_full")]
     )
     def test_ascend_default_sampling_backend(self, monkeypatch, numerics, backend):
         from dataclasses import replace
 
-        from tokenspeed_kernel.platform import current_platform
-
         from tokenspeed.runtime.utils import server_args
+        from tokenspeed_kernel.platform import current_platform
 
         args = ServerArgs(model="x")
         platform = replace(current_platform(), vendor="ascend")
@@ -51,34 +49,15 @@ class TestNumericsMode:
         args.numerics = numerics
         args.resolve_kernel_backends()
         assert args.sampling_backend == backend
-
-    def test_model_owned_projections_load_weights_and_support_lookup(self, monkeypatch):
-        import torch
-
-        from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
-        from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-            UnquantizedEmbeddingMethod,
-        )
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
-        monkeypatch.setitem(
-            global_server_args_dict, "model_owns_dense_projections", True
-        )
-        indices = torch.tensor([2, 0])
-        for method in (UnquantizedEmbeddingMethod(), UnquantizedLinearMethod()):
-            layer = torch.nn.Module()
-            method.create_weights(layer, 2, [4], 2, 4, torch.bfloat16)
-            with torch.no_grad():
-                layer.weight.copy_(torch.arange(8).view(4, 2))
-            if isinstance(method, UnquantizedEmbeddingMethod):
-                assert torch.equal(
-                    method.embedding(layer, indices), layer.weight[indices]
-                )
-            else:
-                method.process_weights_after_loading(layer)
-            with pytest.raises(RuntimeError, match="model owns"):
-                method.apply(layer, torch.ones(1, 2, dtype=torch.bfloat16))
+        if numerics == "rl-bitwise":
+            args.device = "npu"
+            stream = args.sampling_stream
+            args._resolve_rl_bitwise()
+            assert (args.sampling_backend, args.sampling_stream) == (backend, stream)
+            args.sampling_backend = "greedy"
+            args.resolve_kernel_backends()
+            args._resolve_rl_bitwise()
+            assert args.sampling_backend == "greedy"
 
     def test_moe_cutlass_fused_finalize_defaults_on(self):
         from tokenspeed.runtime.utils.server_args import prepare_server_args
@@ -102,12 +81,11 @@ class TestNumericsMode:
     def test_moe_cutlass_fused_finalize_reaches_global_server_args(
         self, fused_finalize
     ):
-        from tokenspeed_kernel.platform import pdl_enabled
-
         from tokenspeed.runtime.utils.env import (
             global_server_args_dict,
             global_server_args_dict_update,
         )
+        from tokenspeed_kernel.platform import pdl_enabled
 
         original = global_server_args_dict.copy()
         original_pdl = pdl_enabled()
@@ -264,13 +242,12 @@ class TestNumericsMode:
             ServerArgs(model="x", numerics=numerics, **{field: device})
 
     def test_yarn_devices_reach_rope_launch_state(self):
-        from tokenspeed_kernel.platform import pdl_enabled
-
         from tokenspeed.runtime.utils.env import (
             global_server_args_dict,
             global_server_args_dict_update,
         )
         from tokenspeed.runtime.utils.server_args import prepare_server_args
+        from tokenspeed_kernel.platform import pdl_enabled
 
         args = prepare_server_args(
             [
@@ -429,7 +406,6 @@ class TestNumericsMode:
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
-
         from tokenspeed.runtime.distributed.comm_backend.auto import ordered_fold_sum
 
         torch.manual_seed(7)
@@ -451,7 +427,6 @@ class TestNumericsMode:
         from unittest import mock
 
         import torch
-
         from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
 
         group = (0, 1, 2)
@@ -589,7 +564,6 @@ class TestModelVerificationGate:
 class TestCanonicalGreedyTies:
     def test_sampled_greedy_rows_take_the_lowest_tied_id(self):
         import torch
-
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_tokens,
         )
@@ -605,7 +579,6 @@ class TestCanonicalGreedyTies:
 
     def test_verified_greedy_rows_follow_the_exact_match_chain(self):
         import torch
-
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_verify,
         )

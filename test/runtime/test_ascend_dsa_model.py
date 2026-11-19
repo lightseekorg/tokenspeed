@@ -25,11 +25,10 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from transformers import PretrainedConfig
-
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
+from transformers import PretrainedConfig
 
 
 def make_attention(
@@ -81,14 +80,13 @@ def test_unprepared_weights_fail_before_device_execution():
 
 
 def test_failed_native_initialization_releases_its_window(monkeypatch):
-    from tokenspeed_kernel.ops.attention.dsa import DSAResources
-
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
     from tokenspeed.runtime.layers.attention.backends.paged import (
         ascend_dsa_tp_kvp_decode as ascend,
     )
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     # Substitute only communication and its native window. The real fused
     # constructor rejects this small model after the resource has been acquired.
@@ -170,10 +168,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     monkeypatch, rows, scale_q
 ):
     """The prologue's KV write alone cannot release a DSA producer step."""
-    from tokenspeed_kernel.ops.attention.prologue.types import (
-        LatentKVCache,
-    )
-
     from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
         AscendDSABackend,
     )
@@ -186,6 +180,9 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     from tokenspeed.runtime.layers.dense import unquant
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.pd.utils import StepCounter
+    from tokenspeed_kernel.ops.attention.prologue.types import (
+        LatentKVCache,
+    )
 
     class CpuStepCounter(StepCounter):
         # Substitute only device/pinned allocation, retaining record_cache's
@@ -402,14 +399,13 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
     """Real model resource owner with only native projection/communication replaced."""
     from types import SimpleNamespace
 
-    from tokenspeed_kernel.ops.attention.dsa import DSAResources
-
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
     from tokenspeed.runtime.layers.attention.backends.paged import (
         ascend_dsa_tp_kvp_decode as ascend,
     )
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     class Group:
         def _get_backend(self, device):
@@ -570,11 +566,33 @@ def test_indexer_head_count_is_rejected_at_initialization(index_heads):
     ],
 )
 def test_native_dsa_role_projection_layouts(
-    kvp, prefill, decode, local_heads, can_decode
+    kvp, prefill, decode, local_heads, can_decode, monkeypatch
 ):
     config = make_attention(nope=True, separate=True, independent=True).config
     # Omitting decode_enabled exercises plugins using the original constructor.
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
     options = {} if decode is None else {"decode_enabled": decode}
+    if kvp > 1 and prefill and decode is None:
+        monkeypatch.setitem(global_server_args_dict, "disaggregation_mode", "null")
+        with pytest.raises(ValueError, match="Unified DSA.*decode_enabled"):
+            AscendDSAAttention(
+                config=config,
+                mapping=Mapping(
+                    rank=0, world_size=2, attn_tp_size=2, attn_kvp_size=kvp
+                ),
+                hidden_size=8,
+                num_heads=4,
+                qk_nope_head_dim=4,
+                qk_rope_head_dim=4,
+                v_head_dim=4,
+                q_lora_rank=4,
+                kv_lora_rank=4,
+                lora_norm_eps=1e-6,
+                prefill_enabled=True,
+            )
+        monkeypatch.setitem(global_server_args_dict, "disaggregation_mode", "prefill")
+
     with torch.device("meta"):
         attention = AscendDSAAttention(
             config=config,

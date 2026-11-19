@@ -109,7 +109,10 @@ def gather_token_logprobs(
             tokens.to(torch.int64),
             vocab_block=vocab_block,
             form=form,
-            solution=global_server_args_dict["block_sumexp_solution"],
+            reference_reduction=(
+                global_server_args_dict["numerics"] == "rl-bitwise"
+                and global_server_args_dict["device"] == "npu"
+            ),
         )
     if logprob_order != "torch":
         raise ValueError(f"Unknown logprob order: {logprob_order!r}")

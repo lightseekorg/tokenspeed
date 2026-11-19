@@ -57,6 +57,7 @@ normal selection prefers it wherever it is installed, and ``solution=`` /
 from __future__ import annotations
 
 import torch
+
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -72,6 +73,7 @@ def blockwise_logprobs(
     *,
     vocab_block: int,
     form: str,
+    reference_reduction: bool = False,
     solution: str | None = None,
     override: str | None = None,
 ) -> torch.Tensor:
@@ -86,6 +88,7 @@ def blockwise_logprobs(
             32768); the fold across blocks is a fp32 left fold in block order.
         form: "negative-cross-entropy" for -(log(sum_exp) - target), or
             "direct" for target - log(sum_exp); selects the zero sign.
+        reference_reduction: Require the trainer's in-block reduction order.
         solution: Optional kernel solution for the block ``sum(exp)`` leaf;
             only leaves declaring the ``batch_invariant`` feature are eligible.
             None takes the highest-priority eligible leaf (a vendor leaf
@@ -116,7 +119,10 @@ def blockwise_logprobs(
         "sampling",
         "block_sumexp",
         format_signature(shifted=dense_tensor_format(torch.float32)),
-        features=_BATCH_INVARIANT,
+        features=_BATCH_INVARIANT | {"trainer_reduction"}
+        if reference_reduction
+        else _BATCH_INVARIANT,
+        traits={"block_size": vocab_block},
         solution=solution,
         override=override,
     )

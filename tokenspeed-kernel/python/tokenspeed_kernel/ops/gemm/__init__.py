@@ -29,6 +29,7 @@ from math import prod
 from types import MappingProxyType
 
 import torch
+
 from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
     interleave_linear_and_gate,
@@ -520,6 +521,7 @@ def plan_dense_gemm(
     dtype: torch.dtype,
     batch_size: int | None,
     batch_invariant: bool,
+    solution: str | None = None,
 ) -> KernelPlan:
     """Plan dense MM/BMM from model geometry, without allocating example tokens.
 
@@ -538,7 +540,7 @@ def plan_dense_gemm(
         features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         static_traits=traits,
         variable_traits=frozenset({"m"}),
-        solution=None,
+        solution=solution,
         declared_traits=frozenset(),
         ignore_layout=False,
     )
@@ -847,16 +849,18 @@ def mm(
         and A_scales is None
         and not _kernel_handles_online_mxfp8(kernel.name)
     ):
-        assert (
-            block_size is not None
-        ), "block_size is required for online activation quantization"
+        assert block_size is not None, (
+            "block_size is required for online activation quantization"
+        )
         A, A_scales = _online_quantize_mxfp8(
             A,
             block_size,
             (
                 "packed_ue8m0"
                 if B_scales.dtype == torch.int32
-                else "ue8m0" if B_scales.dtype == torch.uint8 else "float32"
+                else "ue8m0"
+                if B_scales.dtype == torch.uint8
+                else "float32"
             ),
             enable_pdl=enable_pdl,
             kernel_name=kernel.name,
@@ -1025,9 +1029,9 @@ def bmm(
         and A_scales is None
         and not _kernel_handles_online_mxfp8(kernel.name)
     ):
-        assert (
-            block_size is not None
-        ), "block_size is required for online activation quantization"
+        assert block_size is not None, (
+            "block_size is required for online activation quantization"
+        )
         A, A_scales = _online_quantize_mxfp8(
             A,
             block_size,
@@ -4430,7 +4434,7 @@ def fp32_router_gemv_execute(
         or not x.is_contiguous()
     ):
         raise ValueError(
-            "router input must be contiguous FP32 " f"[rows, {typed_plan.hidden_size}]"
+            f"router input must be contiguous FP32 [rows, {typed_plan.hidden_size}]"
         )
     return typed_plan.kernel(
         x,

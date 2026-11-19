@@ -157,7 +157,6 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -932,7 +931,6 @@ class ModelExecutor:
         """Publish the bound pools to the backends and the model's layers."""
         with self.memory_saver_adapter.named_region("attention_state"):
             self.attn_backend.configure_runtime(
-                model=self.model_runner.model,
                 request_slot_capacity=self.config.max_req_pool_size + 1,
                 cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=_cache_arena_attr(
@@ -941,7 +939,6 @@ class ModelExecutor:
             )
             if self.draft_attn_backend is not None:
                 self.draft_attn_backend.configure_runtime(
-                    model=self._draft_model_runner.model,
                     request_slot_capacity=self.config.max_req_pool_size + 1,
                     cache_group_specs=tuple(
                         _cache_arena_attr(
@@ -1051,6 +1048,16 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            create_decode_input_stager=getattr(
+                self.model_runner.model, "create_decode_input_stager", None
+            ),
+            model_decode_row_hooks=tuple(
+                hook
+                for runner in (self.model_runner, self._draft_model_runner)
+                if runner is not None
+                and (hook := getattr(runner.model, "prepare_decode_graph_rows", None))
+                is not None
+            ),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
@@ -2343,9 +2350,7 @@ class ModelExecutor:
                 # on every forward; the idle rank hands it an empty one, as the
                 # target's idle forward above does.
                 draft_kwargs: dict[str, object] = {}
-                if (
-                    self.drafter.draft_model_runner.model_config.requires_request_token_history
-                ):
+                if self.drafter.draft_model_runner.model_config.requires_request_token_history:
                     ib = self.input_buffers
                     draft_kwargs["request_token_history"] = (
                         self.runtime_states.draft_request_token_history_view(
@@ -2612,6 +2617,7 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        host_inputs = self.model_runner.host_input_processor
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2704,6 +2710,10 @@ class ModelExecutor:
                     decode_input_ids,
                     ngram_inputs=ngram_inputs,
                 )
+                if host_inputs is not None:
+                    host_inputs.prepare_inputs(
+                        forward_op, request_history_seeds, admission_ids
+                    )
                 if (
                     self.sampling_backend.config.synthetic_acceptance_length is not None
                     and decode_input_ids is not None
@@ -3054,7 +3064,7 @@ class ModelExecutor:
                     f"{mm_delta_count!s}",
                 )
 
-        return ModelExecutionResult(
+        result = ModelExecutionResult(
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
@@ -3074,6 +3084,9 @@ class ModelExecutor:
             output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
             output_token_cumulative_probs=output_cumulative_probs,
         )
+        if host_inputs is not None:
+            host_inputs.remember_result(forward_op, result, admission_ids)
+        return result
 
     def _input_logprob_rows(
         self,
@@ -3189,12 +3202,7 @@ class ModelExecutor:
         if step_counter is not None and num_extends > 0:
             step_counter.record_cache()
 
-    def prepare_remote_cache_slots(
-        self,
-        req_pool_indices: list[int],
-        *,
-        admissions: Mapping[int, RemoteCacheAdmission] | None = None,
-    ) -> None:
+    def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
         """Clear backend restore state before publishing RDMA destinations.
 
         A slot granted to a remote admission may be a victim's the same
@@ -3206,12 +3214,7 @@ class ModelExecutor:
         slots = [int(slot) for slot in req_pool_indices]
         self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
-            if admissions is None:
-                self.attn_backend.prepare_remote_cache_slots(slots)
-            else:
-                self.attn_backend.prepare_remote_cache_slots(
-                    slots, admissions=admissions
-                )
+            self.attn_backend.prepare_remote_cache_slots(slots)
 
     def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
         """Arm backend first-decode hydration after remote transfer success."""

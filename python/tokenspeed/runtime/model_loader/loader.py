@@ -604,7 +604,24 @@ class DefaultModelLoader(BaseModelLoader):
                     _load_kv_cache_scales(model, kv_cache_scales)
 
             with startup_phase("weights.postprocess"):
-                process_weights_after_loading(model, target_device)
+                # post_load_transformed_modules must recognise every hook run here.
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        # When quant methods need to process weights after loading
+                        # (for repacking, quantizing, etc), they expect parameters
+                        # to be on the global target device. This scope is for the
+                        # case where cpu offloading is used, where we will move the
+                        # parameters onto device for processing and back off after.
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
+
+                    process_method = getattr(
+                        module, "process_weights_after_loading", None
+                    )
+                    if process_method is not None:
+                        with device_loading_context(module, target_device):
+                            module.process_weights_after_loading(module)
 
             with startup_phase("weights.post_quant_warmup"):
                 post_quant_warmup = getattr(model, "post_quant_warmup", None)
@@ -612,33 +629,6 @@ class DefaultModelLoader(BaseModelLoader):
                     post_quant_warmup()
 
         return model.eval()
-
-
-def process_weights_after_loading(
-    model: nn.Module, target_device: torch.device
-) -> None:
-    """Process descendants in their existing order, then the root model.
-
-    A model-level hook may derive whole-layer operands from processed children.
-    Keep the established parent-first order *within* descendants: some modules
-    explicitly prepare their own children. Only the root is deferred.
-    post_load_transformed_modules must recognise every hook run here.
-    """
-    modules = list(model.modules())
-    for module in modules[1:] + modules[:1]:
-        _process_module_weights_after_loading(module, target_device)
-
-
-def _process_module_weights_after_loading(module, target_device) -> None:
-    # Offloaded weights must be on the target device while their hooks run.
-    quant_method = getattr(module, "quant_method", None)
-    if quant_method is not None:
-        with device_loading_context(module, target_device):
-            quant_method.process_weights_after_loading(module)
-    process_method = getattr(module, "process_weights_after_loading", None)
-    if process_method is not None:
-        with device_loading_context(module, target_device):
-            process_method(module)
 
 
 def no_op_post_load_hooks() -> frozenset[Callable]:
@@ -768,18 +758,21 @@ class DummyModelLoader(BaseModelLoader):
             if getattr(model, "post_load_weights", None):
                 model.post_load_weights()
 
-            target_device = torch.device(device_config.device)
-            for module in list(model.modules())[1:]:
-                _process_module_weights_after_loading(module, target_device)
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    quant_method.process_weights_after_loading(module)
+                process_method = getattr(module, "process_weights_after_loading", None)
+                if process_method is not None:
+                    module.process_weights_after_loading(module)
 
-            # Initialize in the prepared resident layouts, then derive model
-            # operands from those final values before runtime warmup/capture.
-            initialize_dummy_weights(model)
-            _process_module_weights_after_loading(model, target_device)
             post_quant_warmup = getattr(model, "post_quant_warmup", None)
             if callable(post_quant_warmup):
                 post_quant_warmup()
 
+            #  For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
         return model.eval()
 
 
@@ -876,12 +869,15 @@ class ShardedStateLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
-                # A sharded checkpoint already stores transformed child layouts.
-                # Allocate those layouts first; derive root operands after copy.
-                for module in list(model.modules())[1:]:
-                    _process_module_weights_after_loading(
-                        module, torch.device(device_config.device)
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
+                    process_method = getattr(
+                        module, "process_weights_after_loading", None
                     )
+                    if process_method is not None:
+                        module.process_weights_after_loading(module)
             rank = model_config.mapping.rank
             pattern = os.path.join(
                 local_model_path,
@@ -916,7 +912,6 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-        _process_module_weights_after_loading(model, torch.device(device_config.device))
         post_quant_warmup = getattr(model, "post_quant_warmup", None)
         if callable(post_quant_warmup):
             post_quant_warmup()

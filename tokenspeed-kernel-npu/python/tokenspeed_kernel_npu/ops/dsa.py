@@ -26,6 +26,7 @@ import os
 
 import torch
 import torch_npu
+
 from tokenspeed_kernel_npu._triton import tl, triton
 from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
@@ -263,6 +264,13 @@ class AscendDSAKernels:
         library = os.environ.get("TOKENSPEED_LONGCAT_DSA_LIBRARY")
         if library:
             torch.ops.load_library(library)
+        else:
+            try:
+                import flash_ops  # noqa: F401 -- registers torch.ops.custom
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "DSA requires flash_ops or TOKENSPEED_LONGCAT_DSA_LIBRARY"
+                ) from exc
         self._index = getattr(torch.ops.custom, "npu_lightning_indexer", None)
         self._attention = getattr(
             torch.ops.custom, "npu_sparse_flash_attention_decode", None

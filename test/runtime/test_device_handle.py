@@ -42,24 +42,12 @@ import json
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
-from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 import torch
-from tokenspeed_engine.scheduler import (
-    AttnKind,
-    CacheGroupConfig,
-    ExecutionEvent,
-    ForwardEvent,
-    RequestSpec,
-    Scheduler,
-    SchedulerConfig,
-)
-from transformers import PretrainedConfig
-
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
     RestoreOp,
@@ -71,7 +59,6 @@ from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import PlannedForward
-from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -79,6 +66,18 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
+from tokenspeed_engine.scheduler import (
+    AttnKind,
+    CacheGroupConfig,
+    ExecutionEvent,
+    ForwardEvent,
+    RequestSpec,
+    Scheduler,
+    SchedulerConfig,
+)
+from transformers import PretrainedConfig
+
+from test.ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
@@ -868,8 +867,8 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
             submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
                 trace.append(("store", [op.request_pool_index for op in ops]))
             ),
-            submit_load_backs=lambda ops, *, prerequisite_stream: (
-                trace.append("load_backs")
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
             ),
         ),
     )
@@ -1015,7 +1014,7 @@ def _receiving_handle(trace, *, prepare=None):
     handle = _handle(trace, kv_transfer=_decode_peer(trace))
     executor = handle._executor
     executor.prepare_remote_cache_slots = prepare or (
-        lambda slots, *, admissions: trace.append(("prepare", slots, admissions))
+        lambda slots: trace.append(("prepare", slots))
     )
     executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
     executor.zero_cache_pages = lambda pages: SimpleNamespace(
@@ -1025,14 +1024,7 @@ def _receiving_handle(trace, *, prepare=None):
 
 
 def _remote_prefill():
-    return SimpleNamespace(
-        num_extends=lambda: 1,
-        request_pool_indices=[3, 9],
-        request_ids=["incoming", "inactive"],
-        input_lengths=[2],
-        prefill_lengths=[10],
-        block_tables_arrays=lambda: {"state": np.array([[0, 5], [7, -1]])},
-    )
+    return SimpleNamespace(num_extends=lambda: 1, request_pool_indices=[3, 9])
 
 
 @pytest.mark.parametrize("forwards", [True, False])
@@ -1051,7 +1043,7 @@ def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
     )
 
     assert trace == [
-        ("prepare", [3], {3: RemoteCacheAdmission("incoming", 10, {"state": (0, 5)})}),
+        ("prepare", [3]),
         "reset",
         *(["forward"] if forwards else []),
         "wait_zeroing",
@@ -1064,7 +1056,7 @@ def test_a_failed_slot_preparation_never_triggers_the_pull():
     round itself, before the forward and the pull."""
     trace: list = []
 
-    def prepare(slots, *, admissions):
+    def prepare(slots):
         raise RuntimeError("slot preparation failed")
 
     handle = _receiving_handle(trace, prepare=prepare)

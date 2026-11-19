@@ -169,9 +169,6 @@ from tokenspeed.runtime.execution.types import (
     PlannedForward,
 )
 from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
-from tokenspeed.runtime.layers.attention.remote_cache import (
-    copy_remote_cache_admissions,
-)
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLoadSnapshot,
     get_global_expert_location_metadata,
@@ -780,15 +777,9 @@ class DeviceHandle:
         """
         executor = self._executor
         num_extends = remote_prefill.num_extends()
-        slots = list(remote_prefill.request_pool_indices[:num_extends])
-        admissions = copy_remote_cache_admissions(
-            slots=slots,
-            request_ids=remote_prefill.request_ids,
-            # A cached prefix still contributes to the expected prompt end.
-            prefill_lengths=remote_prefill.prefill_lengths,
-            block_tables=remote_prefill.block_tables_arrays(),
+        executor.prepare_remote_cache_slots(
+            list(remote_prefill.request_pool_indices[:num_extends])
         )
-        executor.prepare_remote_cache_slots(slots, admissions=admissions)
         executor.reset_remote_prefill_cache_lengths(remote_prefill)
 
     def _pull_remote_prefill(self, remote_prefill, zero_event) -> None:

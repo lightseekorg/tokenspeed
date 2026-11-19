@@ -28,9 +28,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
-
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, DeviceRole
 from tokenspeed.runtime.execution.types import PlannedForward
@@ -84,9 +82,7 @@ def _handle(trace, kv_transfer=None):
             # A drafter's pending round, finished before every task but a
             # forward.
             complete_pending_drafting=lambda: trace.append("settle"),
-            prepare_remote_cache_slots=lambda rows, *, admissions: trace.append(
-                ("slots", rows)
-            ),
+            prepare_remote_cache_slots=lambda rows: trace.append(("slots", rows)),
             reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
         ),
         kv_transfer=kv_transfer,
@@ -147,13 +143,7 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     handle._executor.zero_cache_pages = lambda pages: SimpleNamespace(
         synchronize=lambda: trace.append("zero-sync")
     )
-    remote_prefill = SimpleNamespace(
-        request_pool_indices=[3, 4],
-        num_extends=lambda: 1,
-        request_ids=["incoming"],
-        prefill_lengths=[3],
-        block_tables_arrays=lambda: {"kv": np.array([[7]])},
-    )
+    remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
 
     pending = _execute(
         handle, _plan(pages_to_zero=[7], remote_prefill=remote_prefill), None

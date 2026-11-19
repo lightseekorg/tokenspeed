@@ -62,6 +62,11 @@ class FlatQuantParameters(nn.Module):
 
         return load
 
+    def validate_loaded(self) -> None:
+        missing = set(self._parameters) - self.loaded
+        if missing:
+            raise ValueError(f"Missing FlatQuant parameters: {sorted(missing)}")
+
 
 def create_int4_weight_pair(
     spec, layer: nn.Module, *, transposed: bool, scale_strategy: str
@@ -155,3 +160,10 @@ def validate_int4_weights_loaded(layer: nn.Module) -> None:
     }
     if missing := expected - layer._int4_loaded:
         raise ValueError(f"Missing W4A4 checkpoint shards: {sorted(missing)[:8]}")
+    for module in (
+        layer.w1_trans,
+        layer.w2_trans,
+        layer.act_quantizer_w1,
+        layer.act_quantizer_w2,
+    ):
+        module.validate_loaded()

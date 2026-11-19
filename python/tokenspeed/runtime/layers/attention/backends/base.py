@@ -76,7 +76,6 @@ if TYPE_CHECKING:
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -778,14 +777,9 @@ class AttentionBackend(CachePoolBinding, ABC):
     # PD / speculative side state
     # ------------------------------------------------------------------
 
-    def prepare_remote_cache_slots(
-        self,
-        slot_indices: list[int],
-        *,
-        admissions: Mapping[int, RemoteCacheAdmission] | None = None,
-    ) -> None:
-        """Clear reused slots and bind any destination rows needed at transfer completion."""
-        del slot_indices, admissions
+    def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
+        """Clear model-specific restore state before remote cache admission."""
+        del slot_indices
 
     def mark_remote_cache_ready(self, slot_index: int) -> None:
         """Arm model-specific hydration after a remote cache transfer succeeds."""

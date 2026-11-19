@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, Sequence
 
 import torch
 
@@ -378,3 +378,20 @@ class ModelExecutionResult:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
         self._synced = True
+
+
+class HostInputProcessor(Protocol):
+    """CPU input preparation outside graphs, using the normal completion fence.
+
+    Created before cache profiling. The implementation owns persistent inputs;
+    prepare_inputs runs on the execution stream after previous outputs settle.
+    remember_result retains the CPU copy and its event without synchronizing.
+    """
+
+    def prepare_inputs(
+        self, op: Any, seeds: RequestHistorySeeds | None, admission_ids: Sequence[int]
+    ) -> None: ...
+
+    def remember_result(
+        self, op: Any, result: ModelExecutionResult, admission_ids: Sequence[int]
+    ) -> None: ...

@@ -188,9 +188,7 @@ class CacheRecipe(ABC):
             )
         )
         unit = layout.bind(1).narrow_to_layers(*resident_cache_window)
-        fixed_workspace_bytes = self.workspace_bytes()
-        temporary_workspace_bytes = self.temporary_workspace_bytes()
-        workspace_bytes = fixed_workspace_bytes + temporary_workspace_bytes
+        workspace_bytes = self.workspace_bytes()
         local_limit, error = 0, None
         try:
             if offload is not None:
@@ -261,8 +259,7 @@ class CacheRecipe(ABC):
                 if self.probe_batch_rows is None
                 else workspace_bytes + resident_storage.device_budget_bytes
             ),
-            fixed_workspace_bytes=fixed_workspace_bytes,
-            temporary_workspace_bytes=temporary_workspace_bytes,
+            fixed_workspace_bytes=workspace_bytes,
             local_parent_limit=local_limit,
             agreed_parent_limit=capacity,
             uses_paged_state_verify=self.uses_paged_state_verify,
@@ -430,11 +427,7 @@ class CacheRecipe(ABC):
 
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
         """Standalone full-layout sizing; families override the selection seam."""
-        usable_bytes = (
-            self.cache_budget_bytes
-            - self.workspace_bytes()
-            - self.temporary_workspace_bytes()
-        )
+        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
         return self.select_num_lcm_blocks(
             layout,
             max_lcm_blocks=min(
@@ -601,10 +594,6 @@ class CacheRecipe(ABC):
 
     def workspace_bytes(self) -> int:
         """Cache-adjacent fixed allocation this family also needs."""
-        return 0
-
-    def temporary_workspace_bytes(self) -> int:
-        """Peak per-forward scratch reserved alongside resident cache and fixed buffers."""
         return 0
 
     @cached_property

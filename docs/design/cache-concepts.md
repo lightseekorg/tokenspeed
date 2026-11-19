@@ -3053,11 +3053,6 @@ history in pinned Host regions; other fields retain their device placement.
 each selected field's hot buffer, GPU tags, LRU metadata, and transfer streams.
 Allocation bytes are checked against the storage plan.
 
-Recipes report startup buffers in `workspace_bytes()` and peak scratch allocated
-during a forward in `temporary_workspace_bytes()`. Cache sizing reserves both.
-Startup checks the fixed buffers against the actual allocation. The storage
-report includes the forward scratch in the planned peak.
-
 `arena.field(field_id)` returns authoritative history;
 `arena.compute_field(field_id)` returns the hot buffer for an offloaded field
 and the history view for other fields. PD registers the regions and publishes

@@ -35,7 +35,7 @@ their component explicitly: ``Backend(config, spec)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, TypeVar
+from typing import ClassVar, TypeVar
 
 import torch
 
@@ -45,9 +45,6 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import resolve_draft_query_width
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 
 
 def resolve_speculative_num_tokens(
@@ -144,6 +141,8 @@ class AttnComponentSpec:
 class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
 
+    # Optional model-specific implementation of this paged attention family.
+    paged_backend_cls: type | None = None
     is_dsa: ClassVar[bool] = False
     # Whether this family stores a latent KV page (MLA and its DSA variant) as
     # opposed to K/V head rows (MHA, MSA). A draft of the latter kind plans an
@@ -316,13 +315,7 @@ class AttnConfig:
                     raise ValueError(
                         "MLA DCP decode does not support non-causal block drafts"
                     )
-            elif softmax.is_dsa and (
-                softmax.backend_name in (None, "dsa")
-                or torch.device(self.device).type == "npu"
-            ):
-                # Ascend plugins can select a numerical DSA backend over the
-                # same paged storage. The registry validates its capability
-                # after resolving the hybrid wrapper's concrete leaf.
+            elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
                     raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")
@@ -358,25 +351,6 @@ class AttnConfig:
 
     def cache_cell_size(self) -> int:
         return self.component(SoftmaxAttnConfig).cache_cell_size(self)
-
-    def create_hybrid_backend(
-        self,
-        full_backend: AttentionBackend,
-        linear_backend: AttentionBackend | None,
-        full_attn_layers: list[int],
-    ) -> AttentionBackend:
-        """Compose the resolved leaves, including views with no linear layers.
-
-        A model-owned config may specialize the outer metadata entry without
-        changing leaf selection or the runner's capture/replay lifecycle.
-        """
-        from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-            HybridLinearAttnBackend,
-        )
-
-        if linear_backend is None:
-            return full_backend
-        return HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers)
 
 
 def model_wide_kwargs(

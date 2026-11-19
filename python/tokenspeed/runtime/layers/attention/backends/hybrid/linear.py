@@ -28,7 +28,6 @@ forwards dispatch per layer id.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,10 +38,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -56,15 +55,13 @@ class HybridLinearAttnBackend(AttentionBackend):
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
-        linear_attn_backend: AttentionBackend | None,
+        linear_attn_backend: MambaAttnBackend,
         full_attn_layers: list[int],
     ):
         self.device = full_attn_backend.device
         self.full_attn_layers = set(full_attn_layers)
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
-        if linear_attn_backend is None:
-            self.query_sharded = full_attn_backend.query_sharded
         self._init_pool_binding()
 
     # The MLA full-attention sub-backend owns the spec-decode token width and
@@ -169,15 +166,13 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def cache_consumer_attn_kinds(self) -> frozenset[str]:
-        """Cache families consumed by the present child backends."""
-        return frozenset().union(
-            *(backend.cache_consumer_attn_kinds for backend in self.child_backends())
+        """Cache families consumed by the two child backends."""
+        return (
+            self.full_attn_backend.cache_consumer_attn_kinds
+            | self.linear_attn_backend.cache_consumer_attn_kinds
         )
 
     def child_backends(self):
-        # A model may retain its outer metadata entry for an all-paged view.
-        if self.linear_attn_backend is None:
-            return (self.full_attn_backend,)
         return (self.full_attn_backend, self.linear_attn_backend)
 
     @property
@@ -188,51 +183,31 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
-        if self.linear_attn_backend is None or layer_id in self.full_attn_layers:
+        if layer_id in self.full_attn_layers:
             return self.full_attn_backend
         return self.linear_attn_backend
 
     # ---- Metadata delegation ----
 
-    def prepare_remote_cache_slots(
-        self,
-        slot_indices: list[int],
-        *,
-        admissions: Mapping[int, RemoteCacheAdmission] | None = None,
-    ) -> None:
-        for backend in self.child_backends():
-            if admissions is None:
-                backend.prepare_remote_cache_slots(slot_indices)
-            else:
-                backend.prepare_remote_cache_slots(slot_indices, admissions=admissions)
-
-    def mark_remote_cache_ready(self, slot_index: int) -> None:
-        for backend in self.child_backends():
-            backend.mark_remote_cache_ready(slot_index)
-
     def configure_runtime(self, **kwargs) -> None:
-        for backend in self.child_backends():
-            backend.configure_runtime(**kwargs)
+        self.full_attn_backend.configure_runtime(**kwargs)
+        self.linear_attn_backend.configure_runtime(**kwargs)
 
     def init_forward_metadata(self, *args, **kwargs):
-        for backend in self.child_backends():
-            backend.init_forward_metadata(*args, **kwargs)
+        self.full_attn_backend.init_forward_metadata(*args, **kwargs)
+        self.linear_attn_backend.init_forward_metadata(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
         # Both children are runner-facing nodes whose init_cuda_graph_state
         # absorbs the runner extras (cache_group_specs, ...) through **kwargs.
-        for backend in self.child_backends():
-            backend.init_cuda_graph_state(max_bs, **kwargs)
+        self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
+        self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
-        for backend in self.child_backends():
-            backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        self.full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
-        if self.linear_attn_backend is None:
-            return self.full_attn_backend.preallocate_verify_workspace(
-                max_bs, draft_token_num
-            )
         return self.linear_attn_backend.preallocate_verify_workspace(
             max_bs, draft_token_num
         )
@@ -254,12 +229,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        for backend in self.child_backends():
-            backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+        self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+        self.linear_attn_backend.init_forward_metadata_capture_cuda_graph(
+            *args, **kwargs
+        )
 
     def refresh_decode_metadata(self, *args, **kwargs) -> None:
-        for backend in self.child_backends():
-            backend.refresh_decode_metadata(*args, **kwargs)
+        self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)
+        self.linear_attn_backend.refresh_decode_metadata(*args, **kwargs)
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         return self.full_attn_backend.supports_narrowed_draft_decode(forward_mode)
@@ -269,13 +246,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     def admits_prefill_graph(
         self, token_capacity: int, bs: int, forward_mode: ForwardMode
     ) -> bool:
-        if self.linear_attn_backend is None:
-            return (
-                self.step_counter is None
-                and self.full_attn_backend.admits_prefill_graph(
-                    token_capacity, bs, forward_mode
-                )
-            )
         return (
             self.step_counter is None
             and self.linear_attn_backend.admits_prefill_graph(
@@ -288,10 +258,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     ) -> bool:
         if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
             return False
-        if self.linear_attn_backend is None:
-            return self.full_attn_backend.prepare_prefill_metadata(
-                token_capacity, bs, forward_mode, capture=capture
-            )
         return self.linear_attn_backend.prepare_prefill_metadata(
             token_capacity, bs, forward_mode, capture=capture
         )
@@ -399,15 +365,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Collapse the GDN scan's batched [1, T, Hv, D] to z-shaped (see docstring).
         if ret is not None and ret.dim() == 4:
             # Strictly [1, T, Hv, D]: a genuine B>1 must fail loud, not corrupt the handoff.
-            assert (
-                ret.shape[0] == 1
-            ), f"GDN scan batched rank expected leading 1, got {ret.shape}"
+            assert ret.shape[0] == 1, (
+                f"GDN scan batched rank expected leading 1, got {ret.shape}"
+            )
             ret = ret.flatten(0, 1)
         return ret
 
     def tree_support(self) -> TreeSupport:
-        if self.linear_attn_backend is None:
-            return self.full_attn_backend.tree_support()
         return TreeSupport(verify_blocker=None, draft_blocker=None)
 
     def commit_state_after_acceptance(
@@ -417,11 +381,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        backend = (
-            self.full_attn_backend
-            if self.linear_attn_backend is None
-            else self.linear_attn_backend
-        )
-        backend.commit_state_after_acceptance(
+        self.linear_attn_backend.commit_state_after_acceptance(
             accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
         )

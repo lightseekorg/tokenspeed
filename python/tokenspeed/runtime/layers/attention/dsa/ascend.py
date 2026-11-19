@@ -162,6 +162,15 @@ class AscendDSAAttention(nn.Module):
         # also serve local (KVP1) Decode. Sharded Decode must be requested on
         # replicas that serve both phases.
         if decode_enabled is None:
+            if (
+                prefill_enabled
+                and mapping.attn.kvp_size > 1
+                and global_server_args_dict.get("disaggregation_mode") in (None, "null")
+            ):
+                raise ValueError(
+                    "Unified DSA with KVP>1 needs explicit decode_enabled=True. "
+                    "Upgrade the model plugin or configure a Prefill-only worker."
+                )
             decode_enabled = not prefill_enabled or mapping.attn.kvp_size == 1
         use_decode_shards = not prefill_enabled or (
             decode_enabled and mapping.attn.kvp_size > 1

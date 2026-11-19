@@ -258,10 +258,11 @@ TopK candidates and attention partials; it never gathers the historical KV cache
 The Ascend DSA model supports Indexer16/32. Indexer64 is rejected during model
 construction, before weight preparation or native resource allocation.
 
-The public ``AscendDSABackend.attention_kernels(is_prefill=...)`` hook returns
-selected SFA/merge callables, with the tensor contracts documented by
-``PagedDSAAttentionKernels``. Plugins overriding it preserve cache ownership and
-CP metadata. Partial outputs use the shared DCP combine: zero empty-shard O
+Unified KVP workers retain full Prefill Q-B, K-C, V-C and output projections
+alongside the local Decode shards. Set both phase capabilities explicitly when
+constructing this model on a unified worker.
+
+Partial outputs use the shared DCP combine: zero empty-shard O
 before exchange, then normalize all-empty LSE rows before the native merge.
 
 Fused DSA projection outputs are ordinary PyTorch tensors allocated once by the
@@ -352,11 +353,6 @@ from one first bound to that pool:
   this same pass. Publishing the same pool again preserves their verify
   buffers; a different pool drops them (PLE's commit pointer tables, QSA's
   verify state); the router's geometry check covers the indexer's tables.
-The pool configuration call supplies `model` to `configure_runtime` for the
-corresponding target or draft backend. Plugins can bind model-owned batch
-inputs before capture and when pools are rebuilt, using the existing Decode
-metadata refresh entry rather than process-global discovery.
-
 * For nodes accepting pool replacement, binding drops every pool-derived latch:
   pointer tables, scratch and views,
   per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
@@ -2908,31 +2904,3 @@ frontier and Engram commit remain shared. Proposal distributions belong to
 RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
 with retraction state. Query capacity does not shorten the scheduler's
 reserved write extent. The sampled path currently requires attention TP1.
-
-
-### Model-owned hybrid metadata
-
-`AttnConfig.create_hybrid_backend` composes the already-resolved full and linear
-attention leaves. A model config may supply an outer backend to refresh shared
-model metadata alongside those leaves through the existing capture and decode
-refresh methods. The runner has no additional model callback. The default
-returns the full backend for a view with no linear layers; a model may retain
-its outer metadata entry in that view, with an absent linear child.
-
-Model metadata stays with its model-owned provider; neither attention leaf owns
-unrelated inputs. Capture-only capacity initialization must not run again during
-replay. Refresh runs once per batch outside replay, including idle ranks; device
-buffers keep their captured addresses. Eager execution may use scheduler counts
-already available in model forward without a second collective.
-
-### Model weight postprocessing order
-
-The loader runs child module quantization/post-load hooks in their existing
-order, then invokes the root model's `process_weights_after_loading` hook.
-This lets model-level operands reference processed child weights without using
-`post_quant_warmup` for weight transforms. Runtime warmup follows this phase.
-Dummy loading derives root operands after filling resident weights; sharded-state
-loading first prepares child storage layouts, copies the saved tensors, then
-prepares root operands. This ordering does not enable live updates of transformed
-weights: `post_load_transformed_modules` still identifies these hooks and the
-existing update boundary rejects them.

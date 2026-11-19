@@ -175,12 +175,10 @@ rows and no receive space. The cache recipe page-rounds
 The scheduler enforces this summed KV-page bound, including cached prefixes.
 There is no change to Decode history distribution.
 
-Prefetch may start at KDA; the attention entry ensures the same batch/layer
-history once. `finish` drops active references after the final consumer is
-queued, retaining storage for the next layer. A synchronized warmup-to-serving
-stream handoff is valid. `close` waits for queued consumers and releases tensor
-references to the Torch allocator; the process-group manager retains its
-communicator.
+Each attention layer gathers history at entry, then gathers current rows and
+commits them to the cache. Execution-stream order protects the shared Torch
+buffers across successive layers. The executor synchronizes before workspace
+handoff or teardown. The process-group manager owns the communicator.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It checks shared history, empty/uneven owners, both planes, natural
