@@ -399,6 +399,8 @@ def _output_slim() -> list[bytes]:
         kv_active_pages=1000,
         kv_total_pages=4096,
         kv_used_pages=1500,
+        num_resident_tokens=5_000_000_000,
+        num_waiting_uncached_tokens=3_000_000_000,
     )
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
