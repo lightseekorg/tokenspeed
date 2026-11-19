@@ -304,10 +304,10 @@ def test_decode_swa_written_early_is_the_attention_write(monkeypatch, rope):
     )
     attended = []
 
-    def fused_attention(q, cache, *args):
+    def fused_attention(q, cache, *args, out=None):
         # Read the SWA field the way attention would: after the write.
         attended.append((cache.clone(), args[0], args[1]))
-        return q, q
+        return (q, q) if out is None else out
 
     def attention(q, cache, *args, lse):
         attended.append((cache.clone(), args[0], args[1]))
