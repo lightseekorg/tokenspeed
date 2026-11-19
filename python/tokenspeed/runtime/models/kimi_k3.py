@@ -2701,7 +2701,6 @@ class KimiLinearMoE(nn.Module):
                     top_k=self.top_k,
                     num_experts=self.num_experts,
                     dtype=self.gate.weight.dtype,
-                    weights_dtype=self.topk.topk_config.topk_weights_dtype,
                 )
                 if (
                     self.moe_alltoall is None
@@ -3585,10 +3584,8 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.owns_ep_communication:
                 pass
             elif self.moe_alltoall is not None:
-                routed_input, topk_ids, topk_weights, combine_offset = (
-                    self.moe_alltoall.dispatch(
-                        routed_input, topk_ids, topk_weights, max_tokens
-                    )
+                routed_input, topk_ids, topk_weights = self.moe_alltoall.dispatch(
+                    routed_input, topk_ids, topk_weights, max_tokens
                 )
             else:
                 prequantized = isinstance(routed_input, tuple)
@@ -3652,9 +3649,7 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.owns_ep_communication:
                 pass
             elif self.moe_alltoall is not None:
-                routed_output = self.moe_alltoall.combine(
-                    routed_output, num_tokens, max_tokens, combine_offset
-                )
+                routed_output = self.moe_alltoall.combine(routed_output)
             else:
                 routed_output = reduce_scatter(
                     routed_output.contiguous(), group=self.mapping.moe.ep_group
