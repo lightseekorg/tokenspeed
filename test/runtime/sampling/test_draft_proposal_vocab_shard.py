@@ -128,6 +128,7 @@ def _sampler(
         runtime_states=states,
         input_buffers=buffers,
         spec_num_tokens=N,
+        sampling_stream="batch",
         vocab_map=vocab_map,
         device="cuda",
     )
