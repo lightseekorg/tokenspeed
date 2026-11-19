@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 from importlib.metadata import version
+from pathlib import Path
 from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
@@ -172,6 +173,7 @@ def test_expandable_allocations_around_managed_storage(configuration):
                 "test.runtime.distributed.test_memory_saver_expandable",
                 configuration,
             ],
+            cwd=Path(__file__).resolve().parents[3],
             env=env,
             text=True,
             stdout=subprocess.PIPE,
