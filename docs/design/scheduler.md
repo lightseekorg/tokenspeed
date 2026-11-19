@@ -19,6 +19,9 @@ first decode hold a request row and KV pages but no execution permit. All
 these requests share one pool; extra rows are not a dedicated transfer pool.
 
 On a D role, the first local decode acquires a move-only permit and keeps it across rounds.
+The wait for that first permit is a time-to-first-token cost: the first-token
+boundary is the first local decode output, so `decode_ready_wait_seconds`
+lies inside TTFT and outside TPOT.
 Permit admission for a newly completed prefill does not displace an
 already streaming request; KV-capacity recovery follows the victim policy below.
 Restoring a Decoding request reserves a permit before issuing the restore;
@@ -106,7 +109,8 @@ matching determines the reusable boundary. Buffers still owned by native I/O
 remain held.
 State groups use the same checkpoint matcher and fixed two-slot layout as
 local hits. Retraction remains an exact image restore, never an L3 re-prefill.
-The D role probes Device history and receives missing data from its peer.
+The D role probes Device and Host history and receives missing data from
+its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
 A first admission with no free request-pool row skips prefix matching; with
@@ -1638,11 +1642,16 @@ claimed by an extend forward, and the capacity model charges no prefill peak
 (§1.4).
 
 **What the D probe may claim.** The remote admission probes this node's own
-Device cache (`PrefixProber::ProbeDecodeDevicePrefix`) so the peer
+Device cache, then its Host (`PrefixProber::ProbeDecodePrefix`), so the peer
 transfers only what is missing. For the token-spanned groups it is the
 ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
-the peer to fill whole; the tail's full blocks below it, when a group's
+the peer to fill whole. The Host continues the Device's history in whole
+pages only, so a Host hit ends on a block boundary of every group: the
+admission loads it below the landing (`load_pairs`), no block is both loaded
+and landed, and the data plane starts the receive behind those loads, since
+the request's first decode runs in a later plan whose layerwise load waits
+name only that plan's loads; the tail's full blocks below it, when a group's
 blocks are smaller than a page, are the hitter's own copies like on every
 role (`pages_to_copy`). The peer fills whole every full-history block up to
 the prompt end, so the landing lists none of them in `pages_to_zero`

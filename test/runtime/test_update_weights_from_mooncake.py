@@ -661,11 +661,23 @@ def test_device_without_memory_saver_admits_every_weight_load():
 
 
 @pytest.mark.parametrize(
-    "memory_saver,protocol,rejected",
-    [(True, None, True), (False, None, False), (True, 1, True), (True, 2, False)],
+    "memory_saver,protocol,peer_prefix_port,has_peer_outbox,rejected",
+    [
+        (True, None, None, False, True),
+        (False, None, None, False, False),
+        (True, 1, None, False, True),
+        (True, 2, None, False, False),
+        (False, 2, 7100, False, True),
+        (False, 2, 7100, True, False),
+    ],
 )
 def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
-    monkeypatch, memory_saver, protocol, rejected
+    monkeypatch,
+    memory_saver,
+    protocol,
+    peer_prefix_port,
+    has_peer_outbox,
+    rejected,
 ):
     from tokenspeed.runtime.engine import rust_host
 
@@ -678,17 +690,19 @@ def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
             model="model-x",
             enable_memory_saver=memory_saver,
             weight_memory_policy="cpu_backup" if memory_saver else None,
+            peer_prefix_port=peer_prefix_port,
         )
         sender.send((args, None, None))
         call_args = (os.dup(receiver.fileno()), None)
         if protocol is not None:
             call_args += (protocol,)
+        bootstrap_kwargs = {"peer_outbox": object()} if has_peer_outbox else {}
         if rejected:
             with pytest.raises(RuntimeError, match="rebuild tokenspeed-engine"):
-                rust_host.bootstrap(*call_args)
+                rust_host.bootstrap(*call_args, **bootstrap_kwargs)
             build.assert_not_called()
         else:
-            assert rust_host.bootstrap(*call_args) is built
+            assert rust_host.bootstrap(*call_args, **bootstrap_kwargs) is built
             build.assert_called_once()
     finally:
         receiver.close()

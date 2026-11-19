@@ -351,6 +351,8 @@ impl Metric {
         self.observe_weighted(labels, interval / num_tokens as f64, interval, num_tokens);
     }
 
+    // Only the Prometheus sum retains total exactly. Raw events carry the mean
+    // and weight; reconstructing their product can introduce floating-point rounding.
     fn observe_weighted(&self, labels: &[&str], value: f64, total: f64, weight: i64) {
         assert_eq!(
             self.kind,
@@ -393,6 +395,17 @@ const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 #[derive(Debug)]
 pub struct EngineMetrics {
     labels: [String; 3],
+    spec_decode_accept_length: Metric,
+    prefix_cache_hit_ratio: Metric,
+    prefix_device_hit_ratio: Metric,
+    prefix_host_hit_ratio: Metric,
+    decode_prefix_cache_hit_ratio: Metric,
+    decode_prefix_prompt_tokens: Metric,
+    decode_prefix_hit_tokens: Metric,
+    kv_cache_resident_usage_perc: Metric,
+    num_resident_kv_tokens: Metric,
+    request_completion_tokens: Metric,
+
     num_requests_running: Metric,
     num_requests_inflight: Metric,
     num_requests_waiting: Metric,
@@ -411,8 +424,7 @@ pub struct EngineMetrics {
     num_preemptions: Metric,
     request_queue_time: Metric,
     decode_ready_wait: Metric,
-    /// Resident KV occupancy: pages in use (active plus reclaimable prefix
-    /// entries) over the usable pages, and the same in tokens.
+    /// Active (non-reclaimable) KV occupancy.
     kv_token_usage: Metric,
     num_used_tokens: Metric,
     num_free_tokens: Metric,
@@ -433,6 +445,7 @@ pub struct EngineMetrics {
     request_time: Metric,
     decode_time: Metric,
     time_per_output_token: Metric,
+    e2e_time_per_output_token: Metric,
     completion_tokens: Metric,
     /// Admissions waiting for their grammar to compile.
     grammar_queue: Metric,
@@ -451,6 +464,73 @@ impl EngineMetrics {
     pub fn new(exporter: &Arc<Exporter>, labels: &EngineLabels) -> Self {
         let names = &ENGINE_LABELS;
         Self {
+            spec_decode_accept_length: Metric::histogram(
+                exporter,
+                "tokenspeed:spec_decode_accept_length",
+                "Accepted tokens including bonus per verify request-slot.",
+                names,
+                &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+            ),
+            prefix_cache_hit_ratio: Metric::histogram(
+                exporter,
+                "tokenspeed:prefix_cache_hit_ratio",
+                "Admission cache hits divided by prompt tokens, weighted by prompt tokens.",
+                names,
+                &[0.0, 0.25, 0.5, 0.75, 1.0],
+            ),
+            prefix_device_hit_ratio: Metric::histogram(
+                exporter,
+                "tokenspeed:prefix_device_hit_ratio",
+                "Admission Device cache hits divided by prompt tokens, weighted by prompt tokens.",
+                names,
+                &[0.0, 0.25, 0.5, 0.75, 1.0],
+            ),
+            prefix_host_hit_ratio: Metric::histogram(
+                exporter,
+                "tokenspeed:prefix_host_hit_ratio",
+                "Admission Host cache hits divided by prompt tokens, weighted by prompt tokens.",
+                names,
+                &[0.0, 0.25, 0.5, 0.75, 1.0],
+            ),
+            decode_prefix_cache_hit_ratio: Metric::histogram(
+                exporter,
+                "tokenspeed:decode_prefix_cache_hit_ratio",
+                "Decode-local admission cache hits divided by prompt tokens, weighted by prompt tokens.",
+                names,
+                &[0.0, 0.25, 0.5, 0.75, 1.0],
+            ),
+            decode_prefix_prompt_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:decode_prefix_prompt_tokens",
+                "Prompt tokens admitted by the decode-local scheduler.",
+                names,
+            ),
+            decode_prefix_hit_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:decode_prefix_hit_tokens",
+                "Prompt tokens served by the decode-local prefix cache at admission.",
+                names,
+            ),
+            kv_cache_resident_usage_perc: Metric::gauge(
+                exporter,
+                "tokenspeed:kv_cache_resident_usage_perc",
+                "Resident KV pages including reclaimable prefix entries divided by usable pages, 0-1.",
+                names,
+            ),
+            num_resident_kv_tokens: Metric::gauge(
+                exporter,
+                "tokenspeed:num_resident_kv_tokens",
+                "KV tokens held by resident pages including reclaimable prefix entries.",
+                names,
+            ),
+            request_completion_tokens: Metric::histogram(
+                exporter,
+                "tokenspeed:request_completion_tokens",
+                "Output tokens per ended request, including a prefill bootstrap token.",
+                names,
+                &[0.0, 1.0, 8.0, 32.0, 128.0, 512.0, 2048.0, 8192.0],
+            ),
+
             labels: [
                 labels.model_name.clone(),
                 labels.app_key.clone(),
@@ -459,7 +539,7 @@ impl EngineMetrics {
             num_requests_running: Metric::gauge(
                 exporter,
                 "tokenspeed:num_requests_running",
-                "Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.",
+                "Requests in the dispatched forward batch, excluding idle padding and transfer waits.",
                 names,
             ),
             num_requests_inflight: Metric::gauge(
@@ -471,7 +551,7 @@ impl EngineMetrics {
             num_requests_waiting: Metric::gauge(
                 exporter,
                 "tokenspeed:num_requests_waiting",
-                "Requests waiting in the C++ scheduler queue.",
+                "Requests waiting for scheduler admission, restore, a decode execution permit, or pause resume.",
                 names,
             ),
             num_requests_resident: Metric::gauge(
@@ -504,8 +584,8 @@ impl EngineMetrics {
                 "Tokens scheduled in one scheduler forward step.",
                 names,
                 &[
-                    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
-                    2048.0, 4096.0, 8192.0,
+                    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0,
+                    4096.0, 8192.0,
                 ],
             ),
             spec_decode_num_accepted_tokens: Metric::counter(
@@ -585,24 +665,24 @@ impl EngineMetrics {
                 "tokenspeed:decode_ready_wait_seconds",
                 "Wall time on the decode role from observing complete prefill KV arrival \
                  to first decode forward dispatch, observed once per request. Requests \
-                 cancelled or finished before decode dispatch are excluded.",
+                 cancelled or finished before decode dispatch are excluded. This wait is \
+                 part of the decode role's time to first token, not its decode time.",
                 names,
                 &[
-                    0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.5, 1.0,
-                    2.0, 5.0, 10.0, 30.0, 60.0, 120.0,
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.5, 1.0, 2.0, 5.0,
+                    10.0, 30.0, 60.0, 120.0,
                 ],
             ),
             kv_token_usage: Metric::gauge(
                 exporter,
                 "tokenspeed:kv_token_usage_perc",
-                "Fraction of usable KV pages resident (active plus reclaimable \
-                 prefix-cache entries), 0-1.",
+                "Fraction of usable KV pages held by active requests (excludes reclaimable entries), 0-1.",
                 names,
             ),
             num_used_tokens: Metric::gauge(
                 exporter,
                 "tokenspeed:num_used_tokens",
-                "KV tokens held by resident pages (active plus reclaimable).",
+                "KV tokens held by active requests (excludes reclaimable entries).",
                 names,
             ),
             num_free_tokens: Metric::gauge(
@@ -620,7 +700,7 @@ impl EngineMetrics {
             num_prefill_inflight_queue_reqs: Metric::gauge(
                 exporter,
                 "tokenspeed:num_prefill_inflight_queue_reqs",
-                "Prefill requests whose KV a transfer still pins.",
+                "Prefill requests after their final forward result and before PD completion.",
                 names,
             ),
             num_decode_prealloc_queue_reqs: Metric::gauge(
@@ -638,7 +718,7 @@ impl EngineMetrics {
             num_decode_transfer_queue_reqs: Metric::gauge(
                 exporter,
                 "tokenspeed:num_decode_transfer_queue_reqs",
-                "Decode requests whose KV a transfer still pins.",
+                "Decode requests waiting for remote prefill KV (alias of KV wait).",
                 names,
             ),
             num_retracted_queue_reqs: Metric::gauge(
@@ -668,11 +748,13 @@ impl EngineMetrics {
             time_to_first_token: Metric::histogram(
                 exporter,
                 "tokenspeed:time_to_first_token_seconds",
-                "Wall time from request creation to its first output token, on this role.",
+                "Wall time from request creation to this role's first output token. On a \
+                 decode role this is the first local decode output; a remote prefill's \
+                 bootstrap token alone does not end it, except when that token ends the \
+                 request, so the wait for a decode execution permit is included.",
                 names,
                 &[
-                    0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0,
-                    300.0,
+                    0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
                 ],
             ),
             request_time: Metric::histogram(
@@ -682,24 +764,33 @@ impl EngineMetrics {
                  transfer done; decode: generation done).",
                 names,
                 &[
-                    0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0,
-                    300.0,
+                    0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
                 ],
             ),
             decode_time: Metric::histogram(
                 exporter,
                 "tokenspeed:decode_time_seconds",
-                "Wall time from the first token to the request's end.",
+                "Wall time from this role's first output token to the request's end. On a \
+                 decode role this starts at the first local decode output.",
+                names,
+                &[
+                    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
+                    30.0, 60.0,
+                ],
+            ),
+            e2e_time_per_output_token: Metric::histogram(
+                exporter,
+                "tokenspeed:e2e_time_per_output_token_seconds",
+                "Time from first emitted chunk to request end divided by tokens after the first chunk.",
                 names,
                 &[
                     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
-                    10.0, 30.0, 60.0,
                 ],
             ),
             time_per_output_token: Metric::histogram(
                 exporter,
                 "tokenspeed:time_per_output_token_seconds",
-                "Decode time divided by generated tokens after the first one.",
+                "Time between nonempty emitted chunks divided by tokens in the later chunk.",
                 names,
                 &[
                     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
@@ -806,6 +897,13 @@ impl EngineMetrics {
             .inc(&labels, (num_decode_slots * draft_width) as f64);
         self.spec_decode_num_accepted_tokens
             .inc(&labels, accepted_draft_tokens.max(0) as f64);
+        let total = accepted_draft_tokens.max(0) as f64 + num_decode_slots as f64;
+        self.spec_decode_accept_length.observe_weighted(
+            &labels,
+            total / num_decode_slots as f64,
+            total,
+            num_decode_slots,
+        );
     }
 
     /// The data plane's serving-time compilation totals; exports what they
@@ -852,7 +950,7 @@ impl EngineMetrics {
         self.decode_ready_wait.observe(&self.labels(), seconds);
     }
 
-    /// Resident KV occupancy. `used_pages` counts active and reclaimable
+    /// Active and resident KV occupancy. `used_pages` counts active and reclaimable
     /// prefix-cache pages; `active_pages` only what running requests hold.
     pub fn record_cache_occupancy(
         &self,
@@ -868,13 +966,16 @@ impl EngineMetrics {
         let used = used_pages.clamp(0, total_pages);
         let active = active_pages.clamp(0, total_pages);
         self.kv_token_usage
+            .set(&labels, active as f64 / total_pages as f64);
+        self.kv_cache_resident_usage_perc
             .set(&labels, used as f64 / total_pages as f64);
         let tokens = |pages: i64| {
             (i128::from(pages) * i128::from(token_capacity) / i128::from(total_pages)) as f64
         };
-        self.num_used_tokens.set(&labels, tokens(used));
+        self.num_used_tokens.set(&labels, tokens(active));
+        self.num_resident_kv_tokens.set(&labels, tokens(used));
         self.num_free_tokens
-            .set(&labels, tokens(total_pages - active));
+            .set(&labels, token_capacity as f64 - tokens(active));
     }
 
     /// The prefill role's PD queues: waiting for a decode peer, transfer in
@@ -890,7 +991,7 @@ impl EngineMetrics {
     }
 
     /// The decode role's PD queues: waiting for a prefill peer to connect,
-    /// waiting for its KV, transfer pins, and suspended requests.
+    /// waiting for its KV (also exposed as transfer queue), and suspended requests.
     pub fn record_decode_queues(&self, prealloc: i64, kv_wait: i64, transfer: i64, retracted: i64) {
         let labels = self.labels();
         self.num_decode_prealloc_queue_reqs
@@ -942,10 +1043,18 @@ impl EngineMetrics {
         }
     }
 
-    /// One request's decode seconds per generated token after the first.
+    /// One nonempty output chunk's interval per newly emitted token.
     pub fn observe_time_per_output_token(&self, seconds: f64) {
         if seconds >= 0.0 && seconds.is_finite() {
             self.time_per_output_token.observe(&self.labels(), seconds);
+        }
+    }
+
+    /// One ended request's latency per token after its first emitted chunk.
+    pub fn observe_e2e_time_per_output_token(&self, seconds: f64) {
+        if seconds >= 0.0 && seconds.is_finite() {
+            self.e2e_time_per_output_token
+                .observe(&self.labels(), seconds);
         }
     }
 
@@ -955,6 +1064,28 @@ impl EngineMetrics {
         if count > 0 {
             self.completion_tokens.inc(&self.labels(), count as f64);
         }
+    }
+
+    /// One ended request's output count, separate from the window token sum.
+    pub fn observe_request_completion_tokens(&self, count: u64) {
+        self.request_completion_tokens
+            .observe(&self.labels(), count as f64);
+    }
+
+    /// Local decode admission hits; never the remote prefill response's usage.
+    pub fn record_decode_prefix_hits(&self, prompt: u64, hit: u64) {
+        if prompt == 0 {
+            return;
+        }
+        let labels = self.labels();
+        self.decode_prefix_prompt_tokens.inc(&labels, prompt as f64);
+        self.decode_prefix_hit_tokens.inc(&labels, hit as f64);
+        self.decode_prefix_cache_hit_ratio.observe_weighted(
+            &labels,
+            hit as f64 / prompt as f64,
+            hit as f64,
+            prompt as i64,
+        );
     }
 
     /// Admissions currently waiting for a grammar compile.
@@ -974,6 +1105,22 @@ impl EngineMetrics {
         let labels = self.labels();
         if prompt_tokens > 0 {
             self.prefix_prompt_tokens.inc(&labels, prompt_tokens as f64);
+            // One weighted event keeps numerator and denominator atomic.
+            for (metric, hit) in [
+                (
+                    &self.prefix_cache_hit_ratio,
+                    device_hit_tokens + host_hit_tokens,
+                ),
+                (&self.prefix_device_hit_ratio, device_hit_tokens),
+                (&self.prefix_host_hit_ratio, host_hit_tokens),
+            ] {
+                metric.observe_weighted(
+                    &labels,
+                    hit as f64 / prompt_tokens as f64,
+                    hit as f64,
+                    prompt_tokens as i64,
+                );
+            }
         }
         if device_hit_tokens > 0 {
             self.prefix_device_hit_tokens
@@ -996,6 +1143,7 @@ pub struct KvTransferMetrics {
     labels: [String; 2],
     latency: Metric,
     size_bytes: Metric,
+    request_size_bytes: Metric,
     timeouts: Metric,
     failures: Metric,
 }
@@ -1015,6 +1163,13 @@ impl KvTransferMetrics {
                     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
                     30.0, 60.0,
                 ],
+            ),
+            request_size_bytes: Metric::histogram(
+                exporter,
+                "tokenspeed:kv_transfer_request_size_bytes",
+                "Bytes moved by one KV transfer send.",
+                &names,
+                &[0.0, 1024.0, 1048576.0, 1073741824.0],
             ),
             size_bytes: Metric::counter(
                 exporter,
@@ -1058,6 +1213,8 @@ impl KvTransferMetrics {
 
     /// Bytes one send moved.
     pub fn record_size(&self, bytes: u64) {
+        self.request_size_bytes
+            .observe(&[&self.labels[0], &self.labels[1]], bytes as f64);
         if bytes > 0 {
             self.size_bytes
                 .inc(&[&self.labels[0], &self.labels[1]], bytes as f64);
