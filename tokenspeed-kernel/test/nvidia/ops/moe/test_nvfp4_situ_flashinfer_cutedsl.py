@@ -98,7 +98,9 @@ def _checkpoint(w13_bf16, w2_bf16, *, unit_scale: bool) -> dict[str, torch.Tenso
 class _Experts(torch.nn.Module):
     """Minimal module carrying what the preprocessors and applies consume."""
 
-    def __init__(self, raw: dict[str, torch.Tensor]) -> None:
+    def __init__(
+        self, raw: dict[str, torch.Tensor], *, ep_rank: int, ep_size: int
+    ) -> None:
         from types import SimpleNamespace
 
         super().__init__()
@@ -108,11 +110,13 @@ class _Experts(torch.nn.Module):
             )
         self.activation_situ_beta = SITU_BETA
         self.activation_situ_linear_beta = SITU_LINEAR_BETA
+        num_local_experts = raw["w13_weight"].shape[0]
         self._spec = SimpleNamespace(
-            num_experts=NUM_EXPERTS,
-            num_local_experts=NUM_EXPERTS,
+            num_experts=num_local_experts * ep_size,
+            num_local_experts=num_local_experts,
             top_k=TOP_K,
-            ep_rank=0,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
         )
 
 
@@ -143,7 +147,9 @@ def _dequantize(packed, sf, scale_2) -> torch.Tensor:
     return (halves * scale_2.view(-1, 1, 1)).flatten(0, 1)
 
 
-def _reference(hidden_states, raw, topk_ids, topk_weights) -> torch.Tensor:
+def _reference(
+    hidden_states, raw, topk_ids, topk_weights, *, first_expert: int
+) -> torch.Tensor:
     def experts(prefix: str) -> DequantizedExperts:
         return DequantizedExperts(
             _dequantize,
@@ -166,7 +172,7 @@ def _reference(hidden_states, raw, topk_ids, topk_weights) -> torch.Tensor:
         quantize_input=lambda t: _quant_dequant(t.float()),
         quantize_intermediate=_quant_dequant,
         round_expert_output=None,
-        first_expert=0,
+        first_expert=first_expert,
     )
 
 
@@ -175,7 +181,8 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 @requires_cutedsl_situ
-def test_routed_moe_matches_dequant_reference_and_trtllm() -> None:
+@pytest.mark.parametrize("ep_rank,ep_size", [(0, 1), (0, 2), (1, 2)])
+def test_routed_moe_matches_dequant_reference_and_trtllm(ep_rank, ep_size) -> None:
     from flashinfer import fp4_quantize
     from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_nvfp4_situ_moe_weights,
@@ -190,14 +197,29 @@ def test_routed_moe_matches_dequant_reference_and_trtllm() -> None:
     num_tokens = 64
     w13, w2 = _weights(generator)
     raw = _checkpoint(w13, w2, unit_scale=False)
+    num_local_experts = NUM_EXPERTS // ep_size
+    first_expert = ep_rank * num_local_experts
+    raw = {
+        name: (
+            value
+            if name == "w13_input_scale"
+            else value[first_expert : first_expert + num_local_experts]
+        )
+        for name, value in raw.items()
+    }
     hidden_states = (
         (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
     )
     topk_ids, topk_weights = _routing(generator, num_tokens)
+    # Each EP2 rank gets a row routed entirely to the other rank.
+    topk_ids[0] = torch.arange(TOP_K, dtype=torch.int32, device="cuda")
+    topk_ids[1] = torch.arange(
+        NUM_EXPERTS - TOP_K, NUM_EXPERTS, dtype=torch.int32, device="cuda"
+    )
 
-    cute = _Experts(raw).cuda()
+    cute = _Experts(raw, ep_rank=ep_rank, ep_size=ep_size).cuda()
     flashinfer_cutedsl_nvfp4_situ_moe_weights({}, cute)
-    trtllm = _Experts(raw).cuda()
+    trtllm = _Experts(raw, ep_rank=ep_rank, ep_size=ep_size).cuda()
     flashinfer_trtllm_nvfp4_situ_moe_weights({}, trtllm)
 
     def run_cute(x):
@@ -220,7 +242,13 @@ def test_routed_moe_matches_dequant_reference_and_trtllm() -> None:
         topk_ids=topk_ids,
     )
     torch.cuda.synchronize()
-    expected = _reference(hidden_states, raw, topk_ids, topk_weights)
+    expected = _reference(
+        hidden_states, raw, topk_ids, topk_weights, first_expert=first_expert
+    )
+    nonlocal_rows = (
+        (topk_ids < first_expert) | (topk_ids >= first_expert + num_local_experts)
+    ).all(dim=-1)
+    assert torch.count_nonzero(actual[nonlocal_rows]) == 0
     cute_err, serving_err = _rel_l2(actual, expected), _rel_l2(serving, expected)
     assert cute_err < 0.06, f"{cute_err=:.4f}"
     assert cute_err < 1.5 * serving_err + 0.005, f"{cute_err=:.4f} {serving_err=:.4f}"
@@ -247,7 +275,7 @@ def test_routed_moe_compiles_once_for_any_row_count() -> None:
 
     generator = torch.Generator().manual_seed(20261119)
     w13, w2 = _weights(generator)
-    cute = _Experts(_checkpoint(w13, w2, unit_scale=False)).cuda()
+    cute = _Experts(_checkpoint(w13, w2, unit_scale=False), ep_rank=0, ep_size=1).cuda()
     flashinfer_cutedsl_nvfp4_situ_moe_weights({}, cute)
 
     def run(num_tokens: int) -> torch.Tensor:
@@ -281,10 +309,13 @@ def test_preprocessor_rejects_per_expert_gemm2_input_scales() -> None:
     raw = _checkpoint(w13, w2, unit_scale=False)
     raw["w2_input_scale"] = torch.linspace(0.5, 1.0, NUM_EXPERTS, device="cuda")
     with pytest.raises(RuntimeError, match="one global"):
-        flashinfer_cutedsl_nvfp4_situ_moe_weights({}, _Experts(raw).cuda())
+        flashinfer_cutedsl_nvfp4_situ_moe_weights(
+            {}, _Experts(raw, ep_rank=0, ep_size=1).cuda()
+        )
 
 
 @requires_cutedsl_situ
+@pytest.mark.parametrize("ep_size", [1, 2])
 @pytest.mark.parametrize(
     "solution,kernel",
     [
@@ -292,13 +323,13 @@ def test_preprocessor_rejects_per_expert_gemm2_input_scales() -> None:
         (None, "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"),
     ],
 )
-def test_plan_selects_cutedsl_only_when_requested(solution, kernel) -> None:
+def test_plan_selects_cutedsl_only_when_requested(solution, kernel, ep_size) -> None:
     plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
         routing_mode="precomputed_topk",
-        ep_size=1,
+        ep_size=ep_size,
         ispp=3072,
         internal_activation_dtype="input",
         hidden=3584,

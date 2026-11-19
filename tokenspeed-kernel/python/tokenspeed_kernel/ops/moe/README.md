@@ -467,6 +467,10 @@ kernel quantizes the GEMM2 input with one global scale (`1 / a2`), so the
 preprocessor rejects checkpoints whose per-expert `a2` differ (Kimi-K3-NVFP4
 ships 1.0 everywhere).
 
+Expert parallelism uses global routing IDs and computes only the local
+expert shard; the caller owns dispatch and combines the ranks' partial outputs.
+EP1 execution also supports DWDP's full-expert views over sharded weight storage.
+
 The apply uses one fixed tactic (256-row routing tiles, 2-CTA clusters) and
 the fused, atomic finalize; it always finalizes. On GB300 at K3 prefill shapes
 (896 experts, top-16, uniform routing) the routed MoE layer is 5-6% faster than

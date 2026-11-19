@@ -172,7 +172,7 @@ if platform.is_nvidia:
             "activation": frozenset({"situ"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({False}),
+            "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({128}),
             "internal_activation_dtype": frozenset({"input"}),
@@ -202,14 +202,15 @@ if platform.is_nvidia:
             w: Expert module prepared by the preprocessor.
             router_logits: Unused; routing is precomputed.
             topk_weights: ``[tokens, top_k]`` FP32 route weights.
-            topk_ids: ``[tokens, top_k]`` expert ids.
+            topk_ids: ``[tokens, top_k]`` global expert ids.
             num_tokens_global: Unused.
             max_num_tokens_per_gpu: Unused.
             do_finalize: Must be True.
             enable_pdl: Whether the kernels use programmatic dependent launch.
 
         Returns:
-            The BF16 ``[tokens, hidden]`` weighted sum over each token's experts.
+            The BF16 ``[tokens, hidden]`` weighted sum over this rank's local
+            experts. The caller combines contributions across EP ranks.
         """
         from flashinfer import fp4_quantize
         from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
@@ -234,20 +235,20 @@ if platform.is_nvidia:
                 is_sf_swizzled_layout=False,
                 enable_pdl=enable_pdl,
             )
-        experts, w13_rows, half_hidden = w.cutedsl_w1_weight.shape
+        num_local_experts, w13_rows, half_hidden = w.cutedsl_w1_weight.shape
         hidden = half_hidden * 2
         w1_sf = convert_sf_to_mma_layout(
-            w.cutedsl_w1_weight_sf.view(experts * w13_rows, -1),
+            w.cutedsl_w1_weight_sf.view(num_local_experts * w13_rows, -1),
             m=w13_rows,
             k=hidden,
-            num_groups=experts,
+            num_groups=num_local_experts,
             sf_vec_size=_SF_VEC,
         )
         w2_sf = convert_sf_to_mma_layout(
-            w.cutedsl_w2_weight_sf.view(experts * hidden, -1),
+            w.cutedsl_w2_weight_sf.view(num_local_experts * hidden, -1),
             m=hidden,
             k=w13_rows // 2,
-            num_groups=experts,
+            num_groups=num_local_experts,
             sf_vec_size=_SF_VEC,
         )
         return cute_dsl_fused_moe(
@@ -262,8 +263,10 @@ if platform.is_nvidia:
             w.cutedsl_w2_weight,
             w2_sf,
             w.cutedsl_w2_alpha,
-            num_experts=experts,
+            num_experts=w._spec.num_experts,
             top_k=topk_ids.shape[1],
+            num_local_experts=num_local_experts,
+            local_expert_offset=w._spec.ep_rank * num_local_experts,
             use_fused_finalize=True,
             enable_pdl=enable_pdl,
             activation_type=ActivationType.Swiglu.value,
