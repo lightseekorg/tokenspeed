@@ -1139,7 +1139,13 @@ Its responsibilities:
   checkpoint may sit on the Device's last page); when the Device alone
   resumes furthest the Host tier mirrors its boundary and claims nothing.
   The probe records the longest usable KV boundary even when its State is
-  missing, since admission uses that reach for the junction cut. Once it is
+  missing, since admission uses that reach for the junction cut; with a
+  State group the reach is at least the prefix-closed groups' coverage (on
+  the Host, their run past the Device's), rounded down to the checkpoint
+  grid, even where a sliding window is missing, because the chunk cut there
+  writes and publishes its own window. A sliding-only model and the D role's
+  probe (no State group in its order) keep the boundary every token-spanned
+  group accepts. Once it is
   known, shorter candidates missing a required State group are rejected
   before constructing their history hit arrays. This uses the same State
   predicate, including checkpoint granularity and mixed Device/Host hits;
@@ -1150,7 +1156,7 @@ Its responsibilities:
   Device pages. A new probe always reads the indexes again.
   `AdmissionResult::host_prefix_tokens` is a boundary, not a token count:
   the Host's when a Host suffix carries the hit, the Device's otherwise (0
-  without a Host pool and on the D role). Such a hit loads the KV beyond the
+  without a Host pool). Such a hit loads the KV beyond the
   Device's prefix (none when only checkpoints come from Host) and adds, over a
   Device-only hit, that boundary less the Device-only one (the scheduler's
   `PrefixHitStats` counts both).
@@ -1235,9 +1241,10 @@ Its responsibilities:
   a storage read. `ReserveStoragePrefix` matches the hinted boundary and pins
   its Host dependencies; ordinary local probes never expose remote hints as
   resident data. See [asynchronous L3](async-l3-cache.md).
-  `ProbeDecodeDevicePrefix` is the PD-decode variant: local history pages
-  are reused, and of a State group's checkpoints only the one at exactly the
-  prompt end counts (`PrefixProbe::state_at_prompt_end`, claimed as slot 0
+  `ProbeDecodePrefix` is the PD-decode variant: local history pages
+  are reused, on the Device and then, in whole pages, on the Host, and of a
+  State group's checkpoints only the one at exactly the prompt end on the
+  Device counts (`PrefixProbe::state_at_prompt_end`, claimed as slot 0
   so the peer omits the state transfer; any shorter checkpoint is ignored,
   since this node runs no prefill that could continue from it). Its tail
   phase leaves the partial block a hole: the peer's transfer starts at the
@@ -1381,10 +1388,11 @@ Its responsibilities:
   tier and has no default to fall back on. Under `kWriteThrough`, Device
   prefix publication streams to the Host tier
   (`stream_device_cache_to_host_`) on the fused and P roles; the D role's
-  Host tier holds retraction images only. Under `kWriteBack` (not on the D
+  Host tier then holds retraction images only. Under `kWriteBack` (every
   role, at most 64 groups, no L3: `Validate`)
   nothing streams at publication; what an admission or a restore evicts is
-  written back instead (below).
+  written back instead (below), and on the D role a remote admission loads
+  its Host hit (`ProbeDecodePrefix`).
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
   capacity first, then the same `CacheEvictionPlan` as Device admission:

@@ -90,6 +90,8 @@ inline constexpr std::int32_t kPeerStateSlot = 1;
 
 // Reader -> holder: a waiting prompt's question, sent once.
 struct PeerLookupRequest {
+    std::string request_id;
+    std::int64_t deadline_us{0};
     PeerLeaseId lease;
     // The holder's name (PeerConfig::name there).
     std::string holder;

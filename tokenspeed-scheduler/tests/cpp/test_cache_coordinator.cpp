@@ -3546,7 +3546,7 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 const PromptPrefix prompt{
                     .prefix_hashes = hashes, .tokens = tokens, .max_tokens = static_cast<std::int32_t>(tokens.size())};
                 auto probe = use == Use::kPublication      ? coordinator.Prober().ProbePrefix({})
-                             : use == Use::kDecodeStateHit ? coordinator.Prober().ProbeDecodeDevicePrefix(prompt, 4)
+                             : use == Use::kDecodeStateHit ? coordinator.Prober().ProbeDecodePrefix(prompt, 4)
                                                            : coordinator.Prober().ProbePromptPrefix(prompt);
                 if (use == Use::kDecodeStateHit) {
                     ASSERT_TRUE(probe.state_at_prompt_end);

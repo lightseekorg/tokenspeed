@@ -109,9 +109,10 @@ def test_quant_config_int4_int8_and_gpu_boundary(monkeypatch):
     monkeypatch.setattr(ct, "current_platform", lambda: SimpleNamespace(is_npu=True))
     assert _config(4).moe_weight_dtype() == "int4"
     assert _config(8).moe_weight_dtype() == "int8"
-    for kwargs in ({"input_symmetric": False}, {"input_dynamic": False}):
-        with pytest.raises(ValueError, match="unsupported"):
-            _config(4, **kwargs).moe_weight_dtype()
+    with pytest.raises(ValueError, match="unsupported"):
+        _config(4, input_symmetric=False).moe_weight_dtype()
+    with pytest.raises(ValueError, match="unsupported|static token quantization"):
+        _config(4, input_dynamic=False).moe_weight_dtype()
     # MoE-only W4A4 must not override the shared Linear scheme.
     config = _config(8)
     config.target_scheme_map["Moe"] = _config(4).target_scheme_map["Linear"]

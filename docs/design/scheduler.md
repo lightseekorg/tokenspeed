@@ -19,6 +19,9 @@ first decode hold a request row and KV pages but no execution permit. All
 these requests share one pool; extra rows are not a dedicated transfer pool.
 
 On a D role, the first local decode acquires a move-only permit and keeps it across rounds.
+The wait for that first permit is a time-to-first-token cost: the first-token
+boundary is the first local decode output, so `decode_ready_wait_seconds`
+lies inside TTFT and outside TPOT.
 Permit admission for a newly completed prefill does not displace an
 already streaming request; KV-capacity recovery follows the victim policy below.
 Restoring a Decoding request reserves a permit before issuing the restore;
@@ -106,7 +109,8 @@ matching determines the reusable boundary. Buffers still owned by native I/O
 remain held.
 State groups use the same checkpoint matcher and fixed two-slot layout as
 local hits. Retraction remains an exact image restore, never an L3 re-prefill.
-The D role probes Device history and receives missing data from its peer.
+The D role probes Device and Host history and receives missing data from
+its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
 A first admission with no free request-pool row skips prefix matching; with
@@ -185,17 +189,40 @@ entry both prefill paths call), what each group demands for it in
 
 **Junction cut.** A chunk is never shortened to a page boundary: a prompt
 end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
-costs nothing. The one cut is the *junction* of a hybrid hit: when the KV
-groups' hit `T` reaches past the longest state checkpoint `T_s`
-(`AdmissionResult::junction_tokens`, kept in `CacheProgress::junction_tokens`
-until a chunk passes it), the first chunk after `T_s` ends exactly at `T`, so
-the natural checkpoint it leaves coincides with KV already cached and the next
-prompt sharing that prefix resumes at `T` in every group. The next chunk's
-admission publishes that checkpoint (`PublicationPoint::kStateCheckpoint`):
-the state under the junction's key, but not the KV there, which is cached
-already, so the owner keeps writing its partial block and needs no copy-in
-(`cache-concepts.md`, copy-in). Every other chunk end publishes only its
-completed full pages.
+costs nothing. The one cut is the *junction* of a hit: when the KV reach `T`
+lies past the hit `T_s` (`AdmissionResult::junction_tokens`, kept in
+`CacheProgress::junction_tokens` until a chunk passes it), the first chunk
+after `T_s` ends exactly at `T`, so the natural checkpoint it leaves coincides
+with KV already cached and the next prompt sharing that prefix resumes at `T`
+in every group. With restricted State groups (G > 1) chunk ends stay on the G
+grid, so an on-grid junction publishes only when a chunk end lands on it.
+With a State group, the KV reach is at least the
+prefix-closed groups' coverage, rounded down to the checkpoint grid (a
+restricted State group, `checkpoint_granularity` G > 1, publishes only on
+multiples of G, so a junction off that grid could never be resumed at):
+`T_s` falls short of it where a State checkpoint is missing, and also where a
+sliding window is -- a producer publishes its window only where its chunks
+end, so a prompt that diverges inside another prompt's chunk finds the full
+history cached but no window there. The chunk cut at `T` writes its own
+window and publishes it with the checkpoint, like any chunk end's completed
+pages. Without a State group (a sliding-only model) there is no checkpoint to
+publish, and the D role's probe leaves the State groups out (its prompt
+arrives by transfer): both keep the reach every token-spanned group accepts,
+as before. The next chunk's admission publishes that checkpoint
+(`PublicationPoint::kStateCheckpoint`): the state under the junction's key
+and the windows the chunk wrote under their own page keys, but not the
+full-history KV there, which is cached already, so the owner keeps writing its
+partial block and needs no copy-in (`cache-concepts.md`, copy-in). Every other chunk end publishes only
+its completed full pages.
+
+The trade-off: a junction publishes one checkpoint, and reaching past a
+missing window moves it from the producer's chunk end below the coverage
+(the last boundary with a window, where the cut used to land) up to the
+coverage itself. A later prompt diverging between the two finds neither and
+resumes at the next checkpoint below (for example, a producer chunk end at 8, a
+coverage of 10: a prompt diverging at 9 resumed at 8 before and now at 0).
+The common case it serves is the opposite one: siblings that share the whole
+prefix up to the coverage, which now resume there instead of a chunk earlier.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -390,8 +417,9 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — a `PublicationPoint` other than an ordinary chunk end
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1; the KV there is cached already, so only the state is
-published), and a finish or retraction on every role (`kFinal`: the P's
+junction (§1; the full-history KV there is cached already, so only the state
+and the sliding windows the chunk wrote are published), and a finish or
+retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
 except the dead prompt ends and finishes that the in-forward checkpoint
 skips (below). An ordinary chunk end or decode step publishes nothing for a State
@@ -589,9 +617,11 @@ the KV is the Device's prefix plus a Host suffix, and each State group's
 checkpoint comes from whichever tier holds it, the Device first -- so Device
 KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
 groups reach further than the state (`kv_tokens >
-num_common_tokens`), the difference is the junction: the first chunk ends
-there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. For unrestricted
+num_common_tokens`; with a State group at least the prefix-closed groups'
+coverage on the checkpoint grid), the difference is the junction: the first
+chunk ends there and publishes the checkpoint and the sliding windows the
+cache lacked, so the next prompt that shares the prefix resumes at the KV
+boundary in every group. For unrestricted
 State groups no alignment is imposed on a chunk, and apart from the opt-in
 in-forward checkpoint above no checkpoint is produced inside a forward: a
 chunk's state output is its own natural checkpoint.
@@ -1580,11 +1610,16 @@ claimed by an extend forward, and the capacity model charges no prefill peak
 (§1.4).
 
 **What the D probe may claim.** The remote admission probes this node's own
-Device cache (`PrefixProber::ProbeDecodeDevicePrefix`) so the peer
+Device cache, then its Host (`PrefixProber::ProbeDecodePrefix`), so the peer
 transfers only what is missing. For the token-spanned groups it is the
 ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
-the peer to fill whole; the tail's full blocks below it, when a group's
+the peer to fill whole. The Host continues the Device's history in whole
+pages only, so a Host hit ends on a block boundary of every group: the
+admission loads it below the landing (`load_pairs`), no block is both loaded
+and landed, and the data plane starts the receive behind those loads, since
+the request's first decode runs in a later plan whose layerwise load waits
+name only that plan's loads; the tail's full blocks below it, when a group's
 blocks are smaller than a page, are the hitter's own copies like on every
 role (`pages_to_copy`). The peer fills whole every full-history block up to
 the prompt end, so the landing lists none of them in `pages_to_zero`

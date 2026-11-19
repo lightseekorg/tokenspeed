@@ -1376,7 +1376,7 @@ existing Gumbel/scalar-gather kernels. `_prepare_sampling_offsets` prepares it
 immediately before consumption, on the same stream, in eager execution and
 CUDA graph replay. The executor and graph runner own no sampling-position
 buffer and run no position-preparation prologue. Non-emitting prefill chunks,
-intermediate PP stages, greedy-only backends, and coin-based multi-token
+intermediate PP stages, greedy-only backends, and legacy multi-token
 verification do not prepare offsets they do not read.
 
 Preparation writes only the current call's unique positive request slots in
@@ -1393,10 +1393,12 @@ first target is at `frontier + 1`, regardless of candidate width. A chain adds
 its candidate index and a tree uses node depth. For example, a 2049-token prompt
 predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
-Constructing the base position does not implement MTP acceptance/residual RNG
-or domain separation; multi-token FlashInfer uses its existing coins except
-for sampled adaptive V4.1 DSpark, whose CuTe verifier keys each draw by request,
-position and draft/acceptance/rejection/bonus namespace.
+For a sampled MTP proposal, the drafter keys Gumbel noise by the committed
+frontier after the round and the draft step. This frontier includes the
+prefill input length or the accepted decode inputs. A prompt completed from
+a cached prefix therefore supplies the same position as a cold prefill.
+Sampled adaptive V4.1 DSpark uses its own CuTe verifier, which keys each draw
+by request, position, and its draft, acceptance, rejection, or bonus namespace.
 The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
 DFlash2 draft) keys its accept coins and draft noise by salted offsets
 disjoint from these positions. A row with a recorded draft q then emits an
@@ -1412,11 +1414,17 @@ Random-stream policy, verification geometry, and TP agreement are separate:
 * `per_request_stream` selects the position-keyed direct sampler for a window
   without draft candidates. `has_draft_candidates` describes the window, not a
   model family: wider windows still require acceptance and residual sampling.
-* `_prepare_step_hook` skips coin preparation only where no coins are consumed.
-  Wider per-request windows outside sampled adaptive V4.1 DSpark fall through
-  to `_refill_legacy_coins`; they do not yet have position-keyed accept/residual
-  randomness. That refill
-  owns only generator advancement and buffer writes, not sampler selection.
+* In a per-request FlashInfer chain outside sampled adaptive V4.1 DSpark,
+  `verify()` generates coins immediately before
+  rejection sampling, using the request seed, its first output position in
+  the round, and a distinct counter for each acceptance decision and one for
+  the final draw. The final coin is independent of the decisions that select
+  the rejection residual or the full target distribution for the bonus. A
+  later round starts at a new position, including when it proposes again at
+  a position from the discarded suffix.
+* The batch stream and tree verify use `_refill_legacy_coins` outside capture.
+  That refill owns only generator advancement and buffer writes, not sampler
+  selection.
 * Each selected sampling implementation declares `needs_tp_sync` locally.
   The common epilogue gathers DP-owned rows or broadcasts replicated TP outputs
   as required; it does not infer synchronization from random-stream policy or
@@ -1436,10 +1444,11 @@ changes relative to the old coin-based decode implementation. Logits must still 
 identical for this to imply token equality, and sampling parameters and any
 penalty/grammar state must also match.
 
-Multi-token FlashInfer speculative verification retains rejection sampling and
-its per-slot coin state; this change does not establish its invariance to cache
-hits or speculative scheduling. The `batch` sampling stream is also outside this
-position-based equality guarantee.
+Chain verification retains its distribution-preserving rejection algorithm.
+The fixed-seed replay comparison requires the same logical chain windows and
+identical target and draft scores, including when resuming from a retraction
+snapshot. Candidate generation itself can be schedule-dependent, such as when
+a DUMMY proposal includes the request slot in its arithmetic.
 
 `test_sampling_positions.py` exercises the metadata and slot-write contract
 on CPU and CUDA, including untouched slots and duplicate padding. `test_flashinfer_position_invariance.py` exercises real CUDA sampling,

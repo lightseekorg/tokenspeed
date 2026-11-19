@@ -203,6 +203,7 @@ class BaseDrafter:
             runtime_states=self.runtime_states,
             input_buffers=self.input_buffers,
             spec_num_tokens=self.spec_num_tokens,
+            sampling_stream=sampling_backend.config.sampling_stream,
             vocab_map=self.draft_vocab_map(),
             device=self.runtime_states.draft_probs.device,
         )
@@ -637,6 +638,10 @@ class HiddenStateDrafter(BaseDrafter):
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
+        if self.draft_sampler is not None:
+            self.draft_sampler.prepare_round(
+                accept_lengths, num_extends=base_ctx.num_extends
+            )
         draft_input = HiddenDraftInput(
             input_num_tokens=base_ctx.input_num_tokens,
             num_extends=base_ctx.num_extends,

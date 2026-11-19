@@ -471,6 +471,18 @@ std::size_t Scheduler::RetractedSize() const {
     }));
 }
 
+std::int64_t Scheduler::PendingPrefillTokens() const {
+    std::int64_t tokens = 0;
+    for (const auto& request : requests_) {
+        if (const auto* admission = request->AdmissionResourcesPtr()) {
+            tokens += std::int64_t{request->PrefillSize()} - admission->cached_prefix_tokens;
+        } else if (request->Is<fsm::Prefilling>()) {
+            tokens += std::int64_t{request->PrefillSize()} - request->NumComputedTokens();
+        }
+    }
+    return tokens;
+}
+
 std::size_t Scheduler::DecodingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));
@@ -505,6 +517,15 @@ std::size_t Scheduler::RemotePrefillSize() const {
 std::size_t Scheduler::PdTransferSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); }));
+}
+
+std::size_t Scheduler::PrefillInflightSize() const {
+    if (config_.role != Role::kP) {
+        return 0;
+    }
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
+    }));
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {

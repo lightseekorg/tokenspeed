@@ -1113,8 +1113,7 @@ class MuseSparkAttention(nn.Module):
 # Every decoder gain is stored as its deviation from unity; the output gain is not.
 ZERO_CENTERED_GAIN_OFFSET = 1.0
 OUTPUT_GAIN_OFFSET = 0.0
-# Norm-preserving residual gate constants, fixed by the architecture.
-RESIDUAL_GATE_TEMPERATURE = 0.3
+# Norm-preserving residual gate epsilon, fixed by the architecture.
 RESIDUAL_GATE_EPS = 1e-3
 MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048

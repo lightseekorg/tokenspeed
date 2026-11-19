@@ -186,14 +186,17 @@ impl RequestTimings {
         }
     }
 
-    /// Its prompt completed.
+    /// Its prompt completed; on a decode node, the remote KV and bootstrap
+    /// token landed.
     pub fn mark_prefill_done(&mut self, now: f64) {
         if self.prefill_done == 0.0 {
             self.prefill_done = now;
         }
     }
 
-    /// Its first token committed.
+    /// Its first output token existed; on a decode node, its first local
+    /// decode output, or the bootstrap token when that token ends the
+    /// request.
     pub fn mark_first_token(&mut self, now: f64) {
         if self.first_token == 0.0 {
             self.first_token = now;
@@ -272,6 +275,10 @@ pub fn stats_line(
 ) -> String {
     let prompt = state.prompt_len;
     let output = state.output_ids.len() as i64;
+    // `first_token` is this role's first output, not a decode node's KV
+    // landing. The decode window therefore excludes queue, prefill and the
+    // wait for a decode execution permit; those are in TTFT and
+    // `decode_wait_ms` instead.
     let decode_window = if timings.first_token > 0.0 {
         finish - timings.first_token
     } else {
@@ -310,8 +317,9 @@ pub fn stats_line(
     let created = state.created_time;
     // A decode node's remote prefill stamps `prefill_done` when the KV
     // lands, before its first decode dispatch stamps `scheduled`; the gap is
-    // then decode admission wait, not prefill time. Keep each direction under
-    // its own name so no role prints a misleading negative.
+    // then decode admission wait, not prefill time. It is part of `ttft_ms`
+    // and outside the decode window. Keep each direction under its own name
+    // so no role prints a misleading negative.
     let gap = ms(timings.prefill_done, timings.scheduled);
     let (prefill_ms, decode_wait_ms) = if gap >= 0.0 {
         (gap.abs(), 0.0)
@@ -450,17 +458,18 @@ mod tests {
         state.spec_verify_ct = 2;
         state.finished_reason = Some(FinishReason::Length(3));
         let mut timings = RequestTimings::default();
-        // D role: the KV lands — prefill done, first token — before the first
-        // decode dispatch.
+        // D role: the KV lands, the first decode dispatches after a permit
+        // wait, and the first local output follows. The wait is decode_wait
+        // and TTFT, not the decode window.
         timings.mark_scheduled(100.5);
         timings.mark_prefill_done(100.25);
-        timings.mark_first_token(100.25);
+        timings.mark_first_token(100.75);
         assert_eq!(
             stats_line("r", &state, &timings, 101.25, Some(4)),
             "Req: r Finish! RequestStats(status='finished', reason='length', prompt_tokens=4, \
              cache_tokens=2, output_tokens=3, cache_hit_rate=0.5, queue_ms=500.0, \
-             prefill_ms=0.0, decode_wait_ms=250.0, ttft_ms=250.0, total_ms=1250.0, \
-             preempt_ms=0.0, preempt_count=0, decode_tps=2.0, acc_len=1.0, acc_rate=0.0, \
+             prefill_ms=0.0, decode_wait_ms=250.0, ttft_ms=750.0, total_ms=1250.0, \
+             preempt_ms=0.0, preempt_count=0, decode_tps=4.0, acc_len=1.0, acc_rate=0.0, \
              recv_ts=100.0, commit_ts=100.5, finish_ts=101.25)"
         );
     }
