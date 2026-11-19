@@ -970,6 +970,12 @@ consumer rows carry no deferred post. Cache-only narrowing completes the incomin
 post before the global KV producer and skips new HC mixes; idle ranks still
 participate in expert-owned dispatch/combine, which never defers another reduction.
 
+Target prefill captures (whole model, encoder, and decoder) also execute each
+recorded segment before its eager break. Recording alone leaves intermediate
+buffers unwritten; a break may otherwise read stale allocator contents and
+produce invalid scores or cache entries before the first graph replay. This
+uses the same capture-time execution contract as the drafter graphs below.
+
 ### Drafter prefill graphs
 
 The drafter's work inside an extend forward replays from graphs too. The

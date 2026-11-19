@@ -1781,5 +1781,82 @@ def test_all_capture_stages_warm_the_execution_stream():
                 torch.testing.assert_close(output, torch.full_like(x, value * 2))
 
 
+@pytest.mark.parametrize("stage", ["bucket", "encoder", "decoder"])
+def test_capture_break_reads_computed_inputs(stage):
+    import torch
+
+    from tokenspeed.runtime.execution.breakable_cuda_graph import break_here
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    class CaptureFixture(PrefillGraph):
+        def __init__(self):
+            self.num_warmup = 1
+            self._pool = None
+            self._ctx = None
+            self._handoff_storage = {}
+            self._encoder_handoff_storage = {}
+            self._outputs = None
+            self._narrowing = self
+            self.capture_buckets = [17]
+            self.decoder_buckets = [17]
+            self.source = torch.full((17, 32), 2.0, device="cuda")
+            self.produced = torch.empty_like(self.source)
+            self.destination = torch.empty_like(self.source)
+            self.seen = []
+
+        def consume(self, value):
+            self.seen.append(value.clone())
+            return value * 2
+
+        def forward(self):
+            torch.add(self.source, 1, out=self.produced)
+            return break_here(self.consume, self.destination, self.produced) + 5
+
+        def _run_inner(self, bucket):
+            return self.forward(), None
+
+        def _run_encoder(self, bucket):
+            return self.forward()
+
+        def decoder_forward(self, statics, ctx):
+            return self.forward(), None
+
+    owner = CaptureFixture()
+
+    @contextlib.contextmanager
+    def poison_after_warmup():
+        # A graph records this buffer's producer without executing it. Keep a
+        # deterministic poison so the test never relies on allocator contents.
+        owner.produced.fill_(float("nan"))
+        owner.seen.clear()
+        yield
+
+    observer = poison_after_warmup()
+    if stage == "bucket":
+        cap, result = owner._capture_bucket(17, None, observer)
+        output = result.hidden_states
+    elif stage == "encoder":
+        result = owner._capture_encoder(17, None, observer)
+        cap, output = result.capture, result.state
+    else:
+        result = owner._capture_decoder(owner.source, lambda: None, None, observer)
+        cap, output = result.capture, result.output.hidden_states
+
+    torch.cuda.synchronize()
+    assert len(owner.seen) == 2  # capture-time break and smoke-test replay
+    for value in owner.seen:
+        torch.testing.assert_close(value, torch.full_like(value, 3))
+    torch.testing.assert_close(output, torch.full_like(output, 11))
+
+    owner.source.fill_(4)
+    cap.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(owner.seen[-1], torch.full_like(owner.source, 5))
+    torch.testing.assert_close(output, torch.full_like(output, 15))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
