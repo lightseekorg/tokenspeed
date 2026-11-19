@@ -175,7 +175,12 @@ def _check_column_projection(rank, world_size, device, parallel, config):
     if world_size == 8:
         # TP8 is available only through an explicitly prepared native state.
         state = create_fused_tp_column_projection_state(
-            dist.group.WORLD, device, 4097, 7168, candidate[0].output_size
+            dist.group.WORLD,
+            device,
+            4097,
+            7168,
+            candidate[0].output_size,
+            weight_dtype=torch.float8_e4m3fn,
         )
     else:
         assert state is not None

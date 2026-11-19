@@ -615,12 +615,18 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             prequantized = block_scale is not None and not dp_or_empty
             if attnres_partial_args is not None and not prequantized:
                 attnres_partial_dual(*attnres_partial_args)
-            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
-                hidden_states,
-                block_scale,
-                torch.bfloat16 if prequantized else None,
-                ctx=ctx,
-            )
+            if self.qkv_parallel is not None and block_scale is None:
+                # Q, KV, and gate are consumed within this attention layer.
+                qkv_gate = self.fused_qkv_a_proj_with_mqa.forward_intermediate(
+                    hidden_states, ctx=ctx
+                )
+            else:
+                qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
+                    hidden_states,
+                    block_scale,
+                    torch.bfloat16 if prequantized else None,
+                    ctx=ctx,
+                )
             if attnres_partial_args is not None and prequantized:
                 attnres_partial_dual(*attnres_partial_args)
             if dp_or_empty or self._fused_qkv_a_pad_rows:

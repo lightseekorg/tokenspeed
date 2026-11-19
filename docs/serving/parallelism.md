@@ -343,6 +343,16 @@ collectives for supported shapes and topologies, with generic collective
 fallbacks otherwise. Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
+On GB300, TP2 and TP4 can fuse projection communication with BF16 or block-FP8
+GEMM. BF16 fusion starts at a subgroup maximum of 32 physical rows and covers KDA
+and sparse-MLA QKV and output projections. Block-FP8 fusion keeps its 64-row
+minimum. BF16 QKV shards normally align to 128 channels. TP4 sparse-MLA shards
+use 96-channel alignment, padding 14400 logical outputs to 14592 stored channels.
+Checkpoint loading and returned logical outputs keep their original order and
+width. BF16 fusion uses BF16 operands directly. Row GEMM partials round to BF16,
+then sum in FP32 rank order before final BF16 rounding. Other shapes and devices
+use the ordinary projection collectives.
+
 These projection settings apply to DEP; DWDP still requires them to be `1`.
 Shared-expert TP requires BF16 weights.
 

@@ -46,6 +46,7 @@ _FUSED_COL_MIN_ROWS = 64
 # Smaller output projections retain the ordinary path.
 _FUSED_ROW_TP_SIZES = (2, 4)
 _FUSED_ROW_MIN_ROWS = 64
+_FUSED_BF16_MIN_ROWS = 32
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class ProjectionSpec:
     Sequential layers may share a prepared object with the same spec. Separate
     streams or concurrently executing models must prepare separate objects.
     Sizes are full (unsharded) widths; max_tokens is physical rows per owner.
+    Weight dtype fixes native GEMM preparation and is part of the sharing key.
     """
 
     group: Group
@@ -65,6 +67,7 @@ class ProjectionSpec:
     output_size: int
     max_tokens: int
     dtype: torch.dtype
+    weight_dtype: torch.dtype
     device: torch.device
 
     @property
@@ -435,7 +438,11 @@ class ProjectionBackend:
                 _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_COL_TP_SIZES
             )
             min_fused_rows = (
-                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
+                _FUSED_BF16_MIN_ROWS
+                if spec.weight_dtype == torch.bfloat16
+                else (
+                    _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
+                )
             )
             if batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
@@ -455,6 +462,7 @@ class ProjectionBackend:
                 spec.max_tokens,
                 spec.dtype,
                 spec.device,
+                weight_dtype=spec.weight_dtype,
             ):
                 fused_disabled_reason = (
                     "unsupported device, activation dtype, or projection dimensions"
@@ -493,6 +501,7 @@ class ProjectionBackend:
                             spec.max_tokens,
                             spec.input_size,
                             spec.output_size,
+                            weight_dtype=spec.weight_dtype,
                         )
                     else:
                         workspace.fused_column = (
@@ -502,6 +511,7 @@ class ProjectionBackend:
                                 spec.max_tokens,
                                 spec.input_size,
                                 spec.output_size,
+                                weight_dtype=spec.weight_dtype,
                             )
                         )
                 elif fused_disabled_reason is None:
@@ -533,26 +543,38 @@ class ProjectionBackend:
     ) -> bool:
         """Run fused DP column-linear, or leave out untouched and return False."""
         # Use the subgroup maximum so unequal or empty owners take the same
-        # collective path. TP2 and TP4 share one cutoff across all row buckets.
+        # collective path. Each weight format has one cutoff across row buckets.
         rows = max(owner_rows)
         if len(owner_rows) not in _FUSED_COL_TP_SIZES:
             return False
+        bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_column is None
-            or rows < _FUSED_COL_MIN_ROWS
-            or weight_scales is None
-            or weight.dtype != torch.float8_e4m3fn
-            or weight_scales.dtype != torch.float32
+            or rows < (_FUSED_BF16_MIN_ROWS if bf16 else _FUSED_COL_MIN_ROWS)
+            or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
-            or not weight_scales.is_contiguous()
         ):
             return False
-        from tokenspeed_kernel.ops.communication.cute_dsl import (
-            cute_dsl_fused_fp8_dp_column_linear,
-        )
+        if bf16:
+            if inputs.dtype != torch.bfloat16 or weight_scales is not None:
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_bf16_dp_column_linear as fused,
+            )
+        else:
+            if (
+                weight.dtype != torch.float8_e4m3fn
+                or weight_scales is None
+                or weight_scales.dtype != torch.float32
+                or not weight_scales.is_contiguous()
+            ):
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_fp8_dp_column_linear as fused,
+            )
 
         _check_workspace(rows, workspace, self._fallback)
-        cute_dsl_fused_fp8_dp_column_linear(
+        fused(
             workspace.fused_column,
             inputs.contiguous(),
             weight,
@@ -578,13 +600,47 @@ class ProjectionBackend:
         rows = max(owner_rows)
         if len(owner_rows) not in _FUSED_ROW_TP_SIZES:
             return False
+        bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_row is None
-            or rows < _FUSED_ROW_MIN_ROWS
-            or weight_scales is None
-            or weight.dtype != torch.float8_e4m3fn
-            or weight_scales.dtype != torch.float32
+            or rows < (_FUSED_BF16_MIN_ROWS if bf16 else _FUSED_ROW_MIN_ROWS)
+            or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
+        ):
+            return False
+        if bf16:
+            if (
+                inputs.dtype != torch.bfloat16
+                or input_scales is not None
+                or weight_scales is not None
+            ):
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_bf16_dp_row_linear,
+            )
+
+            _check_workspace(rows, workspace, self._fallback)
+            output = out[: inputs.shape[0]]
+            # Alignment is rank-local. Stage the output without changing the
+            # collective chosen by this rank or its peers.
+            aligned_output = (
+                torch.empty_like(output) if output.data_ptr() % 16 else output
+            )
+            cute_dsl_fused_bf16_dp_row_linear(
+                workspace.fused_row,
+                inputs.contiguous(),
+                weight,
+                None,
+                owner_rows,
+                aligned_output,
+            )
+            if aligned_output is not output:
+                output.copy_(aligned_output)
+            return True
+        if (
+            weight.dtype != torch.float8_e4m3fn
+            or weight_scales is None
+            or weight_scales.dtype != torch.float32
             or not weight_scales.is_contiguous()
         ):
             return False

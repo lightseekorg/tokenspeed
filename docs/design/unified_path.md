@@ -414,35 +414,33 @@ backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.
 `AutoBackend` composes the optimized projection dispatcher and reuses those
 generic operations for fallback.
-Sequential layers share model-private scratch on one stream, sized for the
-largest projection; matching configurations also share native resources.
-Concurrent streams or models use separate workspaces. Intermediate tensors
-borrow storage only for the current projection, so consumers finish before
-another projection reuses it. Final outputs belong to the caller and
-remain valid across later forwards. Graphs referencing a workspace are destroyed
-before it is released.
+Sequential layers on one stream share model-private scratch sized for the
+largest projection. They share native resources only when the projection
+configuration and weight dtype match. Concurrent streams or models use separate
+workspaces. Same-stream consumers must finish using borrowed intermediates,
+including eligible Kimi MLA QKV-A outputs, before the next projection reuses
+the workspace. Caller-owned outputs remain valid across later forwards.
+Destroy graphs that reference a workspace before releasing it.
 
-Fused projection runs communication, quantization, and FP8 GEMM in one kernel.
+Fused projection combines communication and GEMM in one kernel.
 Column projection combines all-gather, GEMM, and all-to-all.
 Row projection combines all-to-all, GEMM, and reduce-scatter.
 
-Use `DPColumnParallelLinear` or `DPRowParallelLinear` with `AutoBackend`.
-The backend selects fusion for supported TP2 and TP4 groups within one node.
-Fusion requires FP8 weights with FP32 scales for each 128 × 128 block.
-At least one rank must have 64 physical input rows.
-Smaller batches, batch-invariant collectives, and unsupported configurations use
-the ordinary projection operations. All ranks use their physical row counts to
-select the same path.
+`AutoBackend` uses the subgroup's largest physical row count so every rank
+selects the same path. Smaller batches, batch-invariant collectives, and
+unsupported configurations use ordinary projection operations. See
+[projection TP support](../serving/parallelism.md#tensor-parallel-subgroups-within-dp)
+for supported devices, shapes, and row-count thresholds.
 
 Kimi-K3.1 sparse MLA uses the same projection layers. Empty token owners run
 the parent MLA projection collectives and skip local DSA work.
 
-Both fused kernels accept BF16 inputs and return BF16 outputs.
-Row projection also accepts E4M3 inputs with FP32 scales per 128 channels.
-Pass the scales to `DPRowParallelLinear.forward` through its `scale` argument.
-The kernel skips input quantization in this case. All ranks must use the same
-input format. For FP8 inputs, empty ranks must supply empty E4M3 inputs and
-FP32 scales.
+Fused projections return BF16. The BF16-weight path takes BF16 inputs without
+scales. The block-FP8 path quantizes BF16 activations in the kernel when needed.
+With FP8 weights, row projection also accepts E4M3 inputs and FP32 scales per 128
+channels through the `scale` argument to `DPRowParallelLinear.forward`. All ranks
+use the same input format. Empty ranks on the E4M3 path supply empty inputs and
+scales.
 
 Prepared FP8 row buckets can transpose activation scales inside 128-row blocks
 so each K group's scales occupy consecutive shared-memory banks. The exchange
@@ -467,9 +465,9 @@ Supply runtime row counts within the prepared workspace capacity.
 Use each workspace on one stream.
 Do not run other distributed kernels at the same time.
 
-Row projection rounds partial results to BF16, sums them in fixed rank order
-in FP32, and returns BF16. This result can differ from an ordinary BF16
-collective reduction.
+Row projection rounds GEMM partials to BF16, sums them in FP32 in fixed rank
+order, then rounds the result to BF16. This result can differ from an ordinary
+BF16 collective reduction.
 
 ### Padding contract
 

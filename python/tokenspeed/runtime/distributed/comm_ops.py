@@ -165,7 +165,7 @@ def try_fused_dp_column_linear(
         weight: Local output-channel shard of the linear weight.
         weight_scales: Block-FP8 weight scales, or None for unsupported formats.
         owner_rows: Physical counts in subgroup order, including graph padding.
-        out: Caller-owned destination for this owner's complete output channels.
+        out: Destination for this owner's complete output channels.
         workspace: Collectively prepared scratch for this linear operation.
         backend: Backend used to prepare the workspace; None selects the global
             backend.
