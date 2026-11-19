@@ -172,10 +172,13 @@ public:
     // out. Non-owning, like the traversal.
     class EmptiableParents {
     public:
-        EmptiableParents(const std::vector<CacheGroup>& groups, const BlockPool& pool,
+        EmptiableParents(const std::vector<CacheGroup>& groups, const std::vector<bool>& cached, const BlockPool& pool,
                          const LocationSet& protected_locations)
             : groups_{groups}, pool_{pool}, protected_locations_{protected_locations} {
             for (std::size_t i = 0; i < groups.size(); ++i) {
+                if (!cached[i]) {
+                    continue;
+                }
                 const std::span<const PrefixCacheIndex::ParentEntries> entries =
                     groups[i].Index().EntriesByParent(pool);
                 for (std::size_t id = 1; id < entries.size(); ++id) {

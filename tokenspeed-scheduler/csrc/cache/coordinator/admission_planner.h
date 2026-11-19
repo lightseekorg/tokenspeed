@@ -1113,7 +1113,7 @@ protected:
         std::vector<VictimCandidate> through_fit;
         // By LCM block id: the parents the events emptied.
         std::vector<bool> emptied(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, false);
-        CacheEvictionCandidates::EmptiableParents parents{groups_, pool_, constraints.protected_locations};
+        CacheEvictionCandidates::EmptiableParents parents{groups_, cached, pool_, constraints.protected_locations};
         std::size_t next_reclaim = 0;
         std::optional<VictimCandidate> fit;
         while (!fit) {
