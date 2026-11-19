@@ -249,6 +249,12 @@ peer in the plan's own order, behind the forwards and the zeroing. Its control f
 registration and abort, the per-round agreement on transfer progress — is the
 loop's `TransferPeer` (`pd.rs`), where it feeds Principle 3's tail advance.
 
+On Decode, before the peer starts a remote prefill, each admitted slot is
+bound to its request ID, full prompt length (including any cached prefix)
+and destination block rows. A hybrid attention backend delivers the rows to
+both children. Once the transfer succeeds, the landing callback lets each
+child validate or arm that slot before its first decode.
+
 Consequences:
 
 * The control plane cannot **name** a model runner, backend or KV pool, so it

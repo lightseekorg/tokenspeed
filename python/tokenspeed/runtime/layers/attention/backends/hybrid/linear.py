@@ -28,6 +28,7 @@ forwards dispatch per layer id.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,6 +43,7 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBa
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
@@ -188,6 +190,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.linear_attn_backend
 
     # ---- Metadata delegation ----
+
+    def prepare_remote_cache_slots(
+        self,
+        slot_indices: list[int],
+        *,
+        admissions: Mapping[int, RemoteCacheAdmission] | None = None,
+    ) -> None:
+        for backend in self.child_backends():
+            if admissions is None:
+                backend.prepare_remote_cache_slots(slot_indices)
+            else:
+                backend.prepare_remote_cache_slots(slot_indices, admissions=admissions)
+
+    def mark_remote_cache_ready(self, slot_index: int) -> None:
+        for backend in self.child_backends():
+            backend.mark_remote_cache_ready(slot_index)
 
     def configure_runtime(self, **kwargs) -> None:
         self.full_attn_backend.configure_runtime(**kwargs)

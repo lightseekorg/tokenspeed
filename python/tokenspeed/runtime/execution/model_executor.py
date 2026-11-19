@@ -157,6 +157,7 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -3191,7 +3192,12 @@ class ModelExecutor:
         if step_counter is not None and num_extends > 0:
             step_counter.record_cache()
 
-    def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
+    def prepare_remote_cache_slots(
+        self,
+        req_pool_indices: list[int],
+        *,
+        admissions: Mapping[int, RemoteCacheAdmission] | None = None,
+    ) -> None:
         """Clear backend restore state before publishing RDMA destinations.
 
         A slot granted to a remote admission may be a victim's the same
@@ -3203,7 +3209,12 @@ class ModelExecutor:
         slots = [int(slot) for slot in req_pool_indices]
         self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
-            self.attn_backend.prepare_remote_cache_slots(slots)
+            if admissions is None:
+                self.attn_backend.prepare_remote_cache_slots(slots)
+            else:
+                self.attn_backend.prepare_remote_cache_slots(
+                    slots, admissions=admissions
+                )
 
     def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
         """Arm backend first-decode hydration after remote transfer success."""
