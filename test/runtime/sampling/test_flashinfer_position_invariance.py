@@ -21,7 +21,8 @@
 """Real CUDA sampling acceptance tests; missing CUDA/dependencies fail.
 
 Constructed logits isolate sampling from model numerics. No numerical kernel
-or communication is mocked. Run these explicitly on a CUDA host.
+or communication is mocked. Multi-token FlashInfer verification requires NVIDIA
+CUDA.
 """
 
 import sys
@@ -43,6 +44,11 @@ from tokenspeed.runtime.sampling.sampling_batch_info import (
 VOCAB = 512
 POOL = 8
 CHAIN_WIDTH = 4
+
+requires_flashinfer_chain = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="FlashInfer chain verification requires an NVIDIA CUDA GPU",
+)
 
 
 @pytest.fixture(params=["flashinfer", "flashinfer_full"])
@@ -431,6 +437,7 @@ def _emitted_chain_row(result, row):
     )
 
 
+@requires_flashinfer_chain
 @pytest.mark.parametrize("recorded_proposals", [False, True], ids=["target_only", "q"])
 def test_chain_verify_ignores_extra_prefill_prepare(make_backend, recorded_proposals):
     backend = make_backend(width=CHAIN_WIDTH, recorded_proposals=recorded_proposals)
@@ -460,6 +467,7 @@ def test_chain_verify_ignores_extra_prefill_prepare(make_backend, recorded_propo
     assert_exact(_emitted_chain_row(actual, 0), _emitted_chain_row(actual, 1))
 
 
+@requires_flashinfer_chain
 def test_chain_verify_resumes_from_sampler_snapshot(make_backend):
     backend = make_backend(width=CHAIN_WIDTH, recorded_proposals=True)
     logits, candidates, recorded = _chain_inputs(recorded_proposals=True)
@@ -489,6 +497,7 @@ def test_chain_verify_resumes_from_sampler_snapshot(make_backend):
         assert_exact(_emitted_chain_row(actual, 0), _emitted_chain_row(actual, 1))
 
 
+@requires_flashinfer_chain
 @pytest.mark.parametrize("recorded_proposals", [False, True], ids=["target_only", "q"])
 def test_chain_verify_replay_reads_current_seed_and_position(
     make_backend, recorded_proposals
