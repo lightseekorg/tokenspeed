@@ -2232,13 +2232,15 @@ if platform.is_nvidia:
             "w2_weight_bias",
         )
         replicated = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
-        parameters = dict(w.named_parameters(recurse=False))
+        # Read attributes rather than nn.Module parameters: kernel tests pass
+        # plain weight stand-ins. Absent optional tensors (biases, clamp
+        # limit) stay out of the manifest.
         return PreparedExpertWeights(
             layout=f"flashinfer-trtllm-mxfp4-{'situ' if situ else 'swiglu'}-v1",
             shards=tuple(
-                ExpertWeightShard(name, parameters[name], name in replicated)
+                ExpertWeightShard(name, tensor, name in replicated)
                 for name in (*streamed, *replicated)
-                if name in parameters
+                if (tensor := getattr(w, name, None)) is not None
             ),
         )
 
