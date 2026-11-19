@@ -60,6 +60,12 @@ struct SchedulerAbort {
     bool operator==(const SchedulerAbort&) const = default;
 };
 
+struct StateMaterialization {
+    std::uint32_t op_id;
+    std::vector<std::int32_t> request_pool_indices;
+    bool operator==(const StateMaterialization&) const = default;
+};
+
 class ExecutionPlan {
 public:
     template <typename OperationType>
@@ -122,6 +128,7 @@ public:
     // rounds): the last resort of a retraction whose victim could not be
     // imaged.
     std::vector<SchedulerAbort> aborts;
+    std::vector<StateMaterialization> state_materializations;
 
     bool operator==(const ExecutionPlan&) const = default;
 

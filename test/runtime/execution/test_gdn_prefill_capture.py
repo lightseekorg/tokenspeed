@@ -110,6 +110,7 @@ def _backend(*, writes_state_checkpoints_in_forward, layer_ids=(0,)):
     return GdnAttnBackend(
         *_config(layer_ids),
         writes_state_checkpoints_in_forward=writes_state_checkpoints_in_forward,
+        defer_recurrent_state=False,
     )
 
 
@@ -229,14 +230,14 @@ def test_uncaptured_shapes_keep_the_scheduler_metadata():
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
+@pytest.mark.parametrize("bucket", [2048, 2080])
+def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size, bucket):
     """Replay equals eager on the retained metadata, which equals plain eager."""
     backend = _backend(writes_state_checkpoints_in_forward=False)
     backend.cache_pool = object()
-    if not backend.admits_prefill_graph(2048, batch_size, ForwardMode.EXTEND):
+    if not backend.admits_prefill_graph(bucket, batch_size, ForwardMode.EXTEND):
         pytest.skip("the selected GDN scan is not graph-capturable here")
     torch.manual_seed(42)
-    bucket = 2048
     key_dim, value_dim = K_HEADS * HEAD_DIM, V_HEADS * HEAD_DIM
     channels = 2 * key_dim + value_dim
     conv = torch.randn(12, channels, 3, device="cuda", dtype=torch.bfloat16)
@@ -303,6 +304,9 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
         for actual_bs in (3, 1, 2, 3):
             cases.append(([64 + i for i in range(actual_bs)], [50303] * actual_bs))
             cases.append(([837] + [128] * (actual_bs - 1), [50303] * actual_bs))
+        if bucket > 2048:
+            # A full live chunk still needs a scan row for the fourth slot.
+            cases.append(([683, 683, 682], [0, 0, 0]))
     cases.append(([1] * batch_size, [0] * batch_size))
 
     def dummy(bucket, bs):
@@ -603,7 +607,12 @@ def test_qwen4_exp_composite_captures_gdn_inline_around_full_attention():
             return q * 2 + 1
 
     config, spec = _config((0, 2))
-    gdn = GdnAttnBackend(config, spec, writes_state_checkpoints_in_forward=True)
+    gdn = GdnAttnBackend(
+        config,
+        spec,
+        writes_state_checkpoints_in_forward=True,
+        defer_recurrent_state=False,
+    )
     root = Qwen4ExpBackend(
         config,
         HybridLinearAttnBackend(FullAttention(config, spec), gdn, [1]),

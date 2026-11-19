@@ -189,6 +189,8 @@ struct ForwardResources {
     // still writes KV into this request's tables -- retract it mid-flight
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
+    // Conservative: a scheduled verify may leave accepted recurrent replay.
+    bool recurrent_state_pending{false};
 
     std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
     void TrackScheduledForward() { ++results_in_flight; }
@@ -388,6 +390,18 @@ struct Finishing {
     ForwardResources resources;
     // A cancelled request waits for its forwards too, but publishes nothing.
     bool publish_completed_pages;
+};
+
+enum class MaterializationAction { kRetract, kFinish, kAbort };
+
+// The original residency is moved here as one RAII bundle. Neither pages nor
+// the request-pool slot can be reclaimed until the execution-stream ACK.
+struct StateMaterializing {
+    ForwardResources resources;
+    ResumeShape shape;
+    MaterializationAction action;
+    std::uint32_t op_id;
+    std::int32_t frontier;
 };
 
 struct Finished {};

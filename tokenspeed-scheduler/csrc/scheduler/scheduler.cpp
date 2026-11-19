@@ -729,10 +729,12 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     for (auto& operation : storage_operations) {
         plan.With(CacheOperation{std::move(operation)});
     }
+    plan.state_materializations = std::exchange(pending_state_materializations_, {});
     trackStalledRounds(num_live_requests,
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
-                           built.snapshot_restores.empty() && plan.aborts.empty());
+                           built.snapshot_restores.empty() && plan.aborts.empty() &&
+                           plan.state_materializations.empty());
     // The no-progress abort (docs/design/scheduler.md §1.4, §2), decided on
     // the diagnostic's own count: at the kNoProgressAbortPlans-th consecutive
     // stalled plan, unless lone-request compaction moved or published
@@ -776,7 +778,8 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
     const bool stalled = forward_allowed_ && (!storage_transfers_ || !storage_transfers_->HasPending()) &&
                          num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
-                             return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
+                             return request->ResultsInFlight() > 0 || request->Is<fsm::StateMaterializing>() ||
+                                    pdTransferInFlight(*request);
                          });
     if (!stalled) {
         if (stalled_rounds_ >= kStalledRoundsBeforeWarning) {

@@ -453,6 +453,8 @@ private:
     // and one whose finish overtook an overlapped decode settles with that
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
+    void materializeState(Request& request, fsm::MaterializationAction action);
+    void handleEvent(const cache::StateMaterialized& event);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
     // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
     // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
@@ -548,6 +550,7 @@ private:
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
     void handleEvent(const forward::Finish& event);
+    void handleEvent(const forward::RecurrentStateReady& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
     // Mutable state of one plan-building pass: the output plan, the model
@@ -805,6 +808,8 @@ private:
     std::uint64_t storage_pressure_bypasses_{0};
     bool forward_allowed_{true};
     std::vector<WriteBackOperation> pending_write_back_operations_;
+    std::vector<StateMaterialization> pending_state_materializations_;
+    std::uint32_t next_state_materialization_id_{1};
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.

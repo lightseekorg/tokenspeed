@@ -250,6 +250,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
                             to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
                     });
                     break;
+                case ForwardEventKind::RecurrentStateReady:
+                    execution_event.With(tokenspeed::forward::RecurrentStateReady{.request_id = std::move(request_id)});
+                    break;
                 case ForwardEventKind::Finish:
                     execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
                     break;
@@ -336,6 +339,9 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
                 break;
             case CacheEventKind::SnapshotDone:
                 execution_event.With(tokenspeed::cache::SnapshotDone{.op_id = event.op_id});
+                break;
+            case CacheEventKind::StateMaterialized:
+                execution_event.With(tokenspeed::cache::StateMaterialized{.op_id = event.op_id});
                 break;
             case CacheEventKind::RestoreDone:
                 execution_event.With(tokenspeed::cache::RestoreDone{.op_id = event.op_id});
@@ -626,6 +632,7 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 }
 
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
+    if (!plan.state_materializations.empty()) return true;
     // A peer landing's reads start from the fence the data plane reports for
     // its plan, which may have no other device work: a prefill replica's
     // landing prepays no decode room, so it zeroes nothing.
@@ -699,6 +706,9 @@ rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan)
 
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
     rust::Vec<CacheOpView> out;
+    for (const auto& materialization : plan.state_materializations) {
+        out.push_back(CacheOpView{.kind = CacheOpKind::StateMaterialize, .op_id = materialization.op_id});
+    }
     // One acknowledgment per op id, whatever the batch kind: an L2 batch
     // lists its ops, and a snapshot or restore batch has one op per request.
     // Storage operations are the L3 executor's, completed through the

@@ -104,6 +104,7 @@ logger = logging.getLogger(__name__)
 _TAPE_MAX_STATE_GROUPS = 8
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.gdn import GdnPendingReplay
     from tokenspeed_kernel.ops.metadata import PrepTape
 
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
@@ -843,6 +844,7 @@ class MambaAttnBackend(AttentionBackend):
             parameters,
             rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
             **tables,
+            request_mask=None,
         )
 
     def tree_support(self) -> TreeSupport:
@@ -2219,6 +2221,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_scratch,
                 state_in_blocks,
                 output_indices,
+                layer_id=layer_id,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 D=D,
@@ -2376,6 +2379,11 @@ class MambaAttnBackend(AttentionBackend):
         """
         return None
 
+    def _pending_replay_descriptor(
+        self, layer_id: int, batch: int
+    ) -> GdnPendingReplay | None:
+        return None
+
     def _verify_scan(
         self,
         query: torch.Tensor,
@@ -2386,6 +2394,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
+        layer_id: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         D: torch.Tensor | None,
@@ -2417,6 +2426,7 @@ class MambaAttnBackend(AttentionBackend):
                 ReplaySSM.
             state_in_blocks: Per-request committed-state page ids.
             output_indices: ``[bs, T]`` verify scratch row grid.
+            layer_id: Layer whose previous accepted state the scan may consume.
             A_log: Per-channel decay parameter.
             dt_bias: Per-channel timestep bias.
             D: Mamba2 per-head skip coefficient; None for GDN and KDA.
@@ -2487,6 +2497,7 @@ class MambaAttnBackend(AttentionBackend):
             tree_ancestors=self._verify_ancestors(batch_size),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
+            pending_replay=self._pending_replay_descriptor(layer_id, batch_size),
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:

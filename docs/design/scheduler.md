@@ -2182,3 +2182,32 @@ retirement, then for any outstanding local forward. Repeated cancellation
 cannot restart a transfer wait after its retirement event has arrived. Destroying
 the request destroys this state, so reusing a client request ID cannot inherit
 an old abort.
+
+## Deferred recurrent state
+
+With deferred recurrent replay enabled, scheduling a local decode marks its
+request conservatively pending before dispatch, so an abort cannot release
+its resources while that forward is queued. Normal forward completion carries a small device readiness snapshot with
+its existing D2H copy and completion event. `RecurrentStateReady` clears the
+mark only after every queued forward has landed; an older result cannot clear
+a younger forward's ownership. No accepted-length download or extra host wait
+is introduced. Device acceptance commits stopped rows immediately, so their
+normal completion releases the mark without a materialization round. Unknown
+readiness remains conservative and uses the explicit fence.
+
+`StateMaterializing` owns the original `ForwardResources` and resume shape,
+including their RAII cache-block and request-slot handles. It cannot be
+scheduled or selected as a retraction victim. Finish waits for all outstanding
+forward results, then requests materialization; abort retains the same
+resources and changes the completion action. A retraction resumes only after
+the matching operation acknowledgment and then enters the existing image
+protocol. Duplicate or unrelated acknowledgments cannot advance the request.
+
+An execution plan batches operation IDs and request slots. The data plane
+queues materialization on the model execution stream, records a completion
+event, and orders the plan's store, copy, zero and transfer work behind it.
+Event polling sends `StateMaterializedEvent` through the existing cache-op
+feedback and replica agreement. No global device synchronization is needed.
+The scheduler restores the saved state on acknowledgment, clears its pending
+mark and performs the original finish, abort or retraction action. Neither
+pending blocks nor their slot records may be published or snapshotted.

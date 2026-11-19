@@ -70,15 +70,17 @@ fn kind_name(kind: CacheEventKind) -> &'static str {
         CacheEventKind::LoadBackDone => "LoadBackDoneEvent",
         CacheEventKind::SnapshotDone => "SnapshotDoneEvent",
         CacheEventKind::RestoreDone => "RestoreDoneEvent",
+        CacheEventKind::StateMaterialized => "StateMaterializedEvent",
         _ => unreachable!("a cache event kind the bridge does not define"),
     }
 }
 
-const KINDS: [CacheEventKind; 4] = [
+const KINDS: [CacheEventKind; 5] = [
     CacheEventKind::WriteBackDone,
     CacheEventKind::LoadBackDone,
     CacheEventKind::SnapshotDone,
     CacheEventKind::RestoreDone,
+    CacheEventKind::StateMaterialized,
 ];
 
 type Key = (u32, &'static str);
@@ -291,13 +293,13 @@ mod tests {
             vec![
                 vec![
                     ack(CacheEventKind::WriteBackDone, 2),
-                    ack(CacheEventKind::SnapshotDone, 1),
+                    ack(CacheEventKind::StateMaterialized, 1),
                 ],
                 vec![],
                 vec![ack(CacheEventKind::RestoreDone, 4)],
             ],
             vec![
-                vec![ack(CacheEventKind::SnapshotDone, 1)],
+                vec![ack(CacheEventKind::StateMaterialized, 1)],
                 vec![
                     ack(CacheEventKind::RestoreDone, 4),
                     ack(CacheEventKind::WriteBackDone, 2),
@@ -317,7 +319,7 @@ mod tests {
                     let replica = Group::new(0, vec![0, 1], rank).unwrap();
                     let mut ops = CacheOps::new();
                     ops.dispatched(&[
-                        op(CacheOpKind::SnapshotStore, 1),
+                        op(CacheOpKind::StateMaterialize, 1),
                         op(CacheOpKind::WriteBack, 2),
                         op(CacheOpKind::SnapshotRestore, 4),
                     ]);
@@ -334,7 +336,7 @@ mod tests {
             assert_eq!(
                 rounds,
                 [
-                    vec![ack(CacheEventKind::SnapshotDone, 1)],
+                    vec![ack(CacheEventKind::StateMaterialized, 1)],
                     vec![ack(CacheEventKind::WriteBackDone, 2)],
                     vec![ack(CacheEventKind::RestoreDone, 4)],
                 ]

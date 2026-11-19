@@ -400,6 +400,7 @@ class DeviceHandle:
         self,
         executor,
         *,
+        recurrent_state_materialization: bool,
         host_cache_executor=None,
         kv_transfer=None,
         weight_memory: WeightMemoryState | None = None,
@@ -408,6 +409,7 @@ class DeviceHandle:
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
+        self._recurrent_state_materialization = recurrent_state_materialization
         self._weight_memory = weight_memory
         # Development only (--allow-reload-forward); None refuses reload_forward.
         self._forward_reloader = forward_reloader
@@ -419,9 +421,12 @@ class DeviceHandle:
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
         # transfers and records events. Snapshot stores ride ``execute``
-        # with the write-backs and restores with the load-backs; all four
-        # ACK kinds ride the cache poll.
+        # with the write-backs and restores with the load-backs; their ACKs
+        # ride the cache poll, alongside recurrent-state materialization.
         self._l2 = host_cache_executor
+        self._state_materializations: list[
+            tuple[Any, tuple[int, ...], torch.Tensor]
+        ] = []
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -544,11 +549,17 @@ class DeviceHandle:
         remote_decode = execution_plan.remote_decode
         remote_prefill = execution_plan.remote_prefill
         peer_fetches = self._peer_outbox is not None and execution_plan.has_peer_fetches
+        materializations = (
+            execution_plan.state_materializations
+            if self._recurrent_state_materialization
+            else ()
+        )
         if (
             cache_ops
             or copies
             or pages
             or peer_fetches
+            or materializations
             or remote_decode is not None
             or remote_prefill is not None
             or (planned is not None and self._role is DeviceRole.PD_PREFILL)
@@ -556,6 +567,27 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
+        if materializations:
+            slots = sorted(
+                {
+                    int(slot)
+                    for operation in materializations
+                    for slot in operation.request_pool_indices
+                }
+            )
+            # Retain each pinned source until the completion event lands;
+            # a pageable tensor's upload would synchronize this thread.
+            staged_slots = torch.tensor(slots, dtype=torch.int64, pin_memory=True)
+            with executor.device_module.stream(executor.execution_stream):
+                executor.attn_backend.materialize_recurrent_state(
+                    staged_slots.to(executor.device, non_blocking=True)
+                )
+                event = executor.device_module.Event()
+                event.record(executor.execution_stream)
+            self._state_materializations.append(
+                (event, tuple(int(op.op_id) for op in materializations), staged_slots)
+            )
+            executor.default_stream.wait_event(event)
         l2 = self._l2
         if l2 is not None and cache_ops:
             # Ahead of the zeroing: a stream-ordered store's sources may be
@@ -713,7 +745,8 @@ class DeviceHandle:
         """Collect completed Host cache ops (both tiers); never blocks.
 
         Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
-        ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
+        ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` and
+        ``StateMaterializedEvent`` --
         for the control plane to replica-intersect and advance.
 
         The control thread calls it, deliberately: completion is CUDA event
@@ -725,13 +758,23 @@ class DeviceHandle:
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
         """
-        l2 = self._l2
-        if l2 is None:
+        from tokenspeed_engine.scheduler import Cache
+
+        if self._l2 is None and not self._recurrent_state_materialization:
             raise RuntimeError(
-                "cache results polled without --enable-kvstore or a retraction "
-                "snapshot pool"
+                "cache polling requires --enable-kvstore or deferred recurrent state"
             )
-        return l2.poll_results()
+        results = [] if self._l2 is None else list(self._l2.poll_results())
+        while self._state_materializations:
+            event, op_ids, _staged_slots = self._state_materializations[0]
+            if not event.query():
+                break
+            self._state_materializations.pop(0)
+            for op_id in op_ids:
+                ack = Cache.StateMaterializedEvent()
+                ack.op_id = op_id
+                results.append(ack)
+        return results
 
     def shutdown_model(self) -> None:
         """Drain local readers, then release shared model weights
@@ -2016,6 +2059,7 @@ def build_device_side(
         encoder_model_facts=encoder_model_facts,
         handle=DeviceHandle(
             executor,
+            recurrent_state_materialization=server_args.enable_deferred_gdn_state,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
             weight_memory=weight_memory,

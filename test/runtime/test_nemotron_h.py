@@ -1028,6 +1028,7 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
         None if replay else scratch,
         pages,
         grid,
+        layer_id=0,
         A_log=A_log,
         dt_bias=dt_bias,
         D=D,

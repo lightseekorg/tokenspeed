@@ -315,6 +315,7 @@ def scheduler_config_from_args(
         prefill_decode_min_interval=server_args.prefill_decode_min_interval,
         enable_short_prefill_first=server_args.enable_short_prefill_first,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
+        defer_recurrent_state=server_args.enable_deferred_gdn_state,
         demote_superseded_state_checkpoints=_implied_scheduler_policy(
             server_args.writes_state_checkpoints_in_forward,
             "demote_superseded_state_checkpoints",

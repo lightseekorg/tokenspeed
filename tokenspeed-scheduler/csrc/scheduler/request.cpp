@@ -139,6 +139,7 @@ std::int32_t Request::NumComputedTokens() const {
             // token no landed forward consumed.
             [this](const fsm::Decoding&) { return TokenSize() - 1; },
             [this](const fsm::Finishing&) { return TokenSize() - 1; },
+            [](const fsm::StateMaterializing& state) { return state.frontier; },
             [this](const auto&) -> std::int32_t {
                 throw std::logic_error(
                     "Request::NumComputedTokens: expected Prefilling, PrefillDone, Decoding or Finishing; got " +
@@ -146,6 +147,64 @@ std::int32_t Request::NumComputedTokens() const {
             },
         },
         state_);
+}
+
+void Request::StartStateMaterialization(std::uint32_t op_id, fsm::MaterializationAction action) {
+    _assert(ResultsInFlight() == 0, "state materialization requires landed forwards");
+    const auto frontier = NumComputedTokens();
+    state_ = std::visit(
+        [&](auto&& original) -> fsm::State {
+            using S = std::remove_cvref_t<decltype(original)>;
+            if constexpr (std::same_as<S, fsm::Prefilling> || std::same_as<S, fsm::PrefillDone>) {
+                fsm::ResumeShape shape = [&]() -> fsm::ResumeShape {
+                    if constexpr (std::same_as<S, fsm::Prefilling>)
+                        return fsm::ResumePrefilling{original.window, original.ReserveNumTokensInNextScheduleEvent()};
+                    else
+                        return fsm::ResumePrefillDone{original.window, original.ReserveNumTokensInNextScheduleEvent()};
+                }();
+                return fsm::StateMaterializing{std::move(original.resources), std::move(shape), action, op_id,
+                                               frontier};
+            } else if constexpr (std::same_as<S, fsm::Decoding>) {
+                return fsm::StateMaterializing{std::move(original.resources),
+                                               fsm::ResumeDecoding{original.ReserveNumTokensInNextScheduleEvent()},
+                                               action, op_id, frontier};
+            } else if constexpr (std::same_as<S, fsm::Finishing>) {
+                return fsm::StateMaterializing{std::move(original.resources), fsm::ResumeDecoding{0}, action, op_id,
+                                               frontier};
+            } else {
+                throw std::logic_error("cannot materialize a request in " + StateName());
+            }
+        },
+        std::move(state_));
+}
+
+bool Request::CompleteStateMaterialization(std::uint32_t op_id) {
+    auto* pending = GetIf<fsm::StateMaterializing>();
+    if (pending == nullptr || pending->op_id != op_id) return false;
+    const auto action = pending->action;
+    pending->resources.recurrent_state_pending = false;
+    auto resources = std::move(pending->resources);
+    auto shape = std::move(pending->shape);
+    if (action == fsm::MaterializationAction::kFinish || action == fsm::MaterializationAction::kAbort) {
+        state_ = fsm::Finishing{std::move(resources), action == fsm::MaterializationAction::kFinish};
+    } else {
+        state_ = std::visit(
+            [&](const auto& resume) -> fsm::State {
+                using S = std::remove_cvref_t<decltype(resume)>;
+                if constexpr (std::same_as<S, fsm::ResumePrefilling>) {
+                    return fsm::Prefilling{std::move(resources), resume.window,
+                                           resume.reserve_num_tokens_in_next_schedule_event};
+                } else if constexpr (std::same_as<S, fsm::ResumePrefillDone>) {
+                    return fsm::PrefillDone{std::move(resources), resume.window,
+                                            resume.reserve_num_tokens_in_next_schedule_event};
+                } else {
+                    return fsm::Decoding{std::move(resources), resume.reserve_num_tokens_in_next_schedule_event};
+                }
+            },
+            shape);
+    }
+    materialized_retraction_ = action == fsm::MaterializationAction::kRetract;
+    return true;
 }
 
 fsm::ForwardResources& Request::forwardResources(const char* operation) {

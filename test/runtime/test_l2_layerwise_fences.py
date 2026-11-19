@@ -310,7 +310,11 @@ def host_cache(request, io_backend):
     model_executor._cache_runtime_contract = arena.runtime_contract
     model_executor._cache_kvp_rank = 0
     model_executor.drafter = None
-    handle = DeviceHandle(model_executor, host_cache_executor=executor)
+    handle = DeviceHandle(
+        model_executor,
+        host_cache_executor=executor,
+        recurrent_state_materialization=False,
+    )
     handle.bind_forward_thread()
     group = [layout.group_id for layout in executor.layout.groups].index(group_id)
     try:

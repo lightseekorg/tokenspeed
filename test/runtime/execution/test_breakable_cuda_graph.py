@@ -927,16 +927,16 @@ class TestPrefillTokenBuckets:
             []
         )
 
-    def test_clamped_to_chunk(self):
+    def test_explicit_ceiling_can_exceed_chunk(self):
         from tokenspeed.runtime.execution.prefill_graph import (
             get_prefill_token_buckets,
         )
 
-        # No bucket above the chunk (see get_prefill_token_buckets for why).
+        # Captured request padding may need rows above the live-token budget.
         buckets = get_prefill_token_buckets(
             self._cfg(prefill_graph_max_tokens=8192, chunked_prefill_size=2048)
         )
-        assert (buckets[-1]) == (2048)
+        assert (buckets[-1]) == (8192)
 
     def test_relative_ladder_properties(self):
         from tokenspeed.runtime.execution.prefill_graph import (

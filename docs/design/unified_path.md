@@ -2200,6 +2200,13 @@ with one variant per token bucket and request count. `ModelExecutorConfig`
 requires this field explicitly: factories forward the configured list or `None`
 for the default, so missing configuration wiring fails at
 construction. Token buckets still follow the shared prefill token ladder.
+The default token ceiling is bounded by the scheduler's chunk budget. An
+explicit larger `prefill_graph_max_tokens` is a physical graph capacity and
+must be preserved through capture and input-buffer sizing. It leaves room
+for unused scan slots when a full live chunk rounds up to a request capacity.
+The scheduler continues to count live tokens against its issue budget. Replay
+can select the next captured token bucket with that room, or retain the
+ordinary attention breaks when none fits.
 Capture requests have positive lengths and fit the model context and request
 buffers. At replay, unused execution slots have zero convolution length,
 negative state-block indices and one padding row each in the scan, past the
@@ -2891,3 +2898,40 @@ frontier and Engram commit remain shared. Proposal distributions belong to
 RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
 with retraction state. Query capacity does not shorten the scheduler's
 reserved write extent. The sampled path currently requires attention TP1.
+
+## Deferred GDN accepted state
+
+`--enable-deferred-gdn-state` opts NVIDIA BF16 K128/V128 chain T4 verify into
+accepted recurrent replay at the next layer's WY read. Convolution still
+commits during acceptance. Token and KV frontiers advance normally; pending
+recurrent state is a separate fact, never an artificially shortened frontier.
+
+Eager and graph decode execute the same device metadata operations. Two
+maximum-decode-batch payload banks retain `[k, v, a, b]` across forwards.
+Stable slot records carry a generation, bank/row, logical frontier and current
+batch membership. Layer mappings are copied before refresh can overwrite
+them. A new forward toggles the destination bank, matches its slots against
+the old generation and materializes rows absent from the new batch before
+convolution can reuse their bank. Each layer consumes the matched old row;
+acceptance retires that generation and records the new one. Padding owns no
+pending row. Batch counts, strides, bank choices and accepted lengths are
+runtime kernel inputs, including when the graph bucket changes. Acceptance
+refreshes its execution choice from the current forward. This lets graph
+replays defer acceptance again after an eager prefill.
+
+Only an in-place live state may be deferred. A first decode or checkpoint
+rotation with distinct source/destination blocks commits immediately, as do
+stopped rows. Mixed, prefill, tree verification and other unsupported
+forwards materialize existing pending rows before execution. Monokernels
+keep the immediate path. Pending work is not flushed from ordinary `settle()`;
+that would remove the opportunity to share the next WY state read. Scheduler
+materialization operations explicitly fence consumers of the live state
+([scheduler](scheduler.md#deferred-recurrent-state)).
+
+Readiness is copied with the normal forward output, after acceptance, under
+the same completion event. The slot-record snapshot has its own batch buffer,
+so a later forward cannot change the result already in flight to the host.
+All metadata stages, including acceptance and readiness outside target capture,
+are warmed before serving. Scheduler-requested slot uploads use pinned,
+nonblocking copies and retain their sources through the materialization event.
+The first implementation keeps pipeline-parallel execution on immediate commit.

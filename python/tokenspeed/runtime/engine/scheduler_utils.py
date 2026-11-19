@@ -52,12 +52,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 # The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
 # load-back ticket, a retraction image's snapshot store, a restore. The data
 # plane reports them to the Rust control plane as ``(kind, op_id)`` payloads.
-_CACHE_EVENT_TYPES = {
-    "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
-    "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
-    "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
-    "RestoreDoneEvent": Cache.RestoreDoneEvent,
-}
+_CACHE_EVENT_TYPES = frozenset(
+    {
+        "WriteBackDoneEvent",
+        "LoadBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateMaterializedEvent",
+    }
+)
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
@@ -129,6 +132,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     enable_short_prefill_first: bool = False,
     prefix_replay_tokens: int = 0,
+    defer_recurrent_state: bool,
     state_checkpoint_in_forward: bool = False,
     demote_superseded_state_checkpoints: bool = False,
     drop_short_prompt_end_checkpoints: bool = False,
@@ -281,6 +285,8 @@ def make_config(
     cfg.role = scheduler_role(role)
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
+    if defer_recurrent_state:
+        cfg.defer_recurrent_state = True
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
     if state_checkpoint_in_forward:

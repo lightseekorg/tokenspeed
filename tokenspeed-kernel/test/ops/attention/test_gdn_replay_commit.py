@@ -179,6 +179,7 @@ def _replay(
         state_dtype=pool.dtype,
         solution="triton",
         rows_aligned=rows_aligned,
+        request_mask=None,
     )
 
 
@@ -431,12 +432,14 @@ def test_gdn_replay_commit_reuses_shared_chunks_without_reading_rejected_tokens(
     ("state_dtype", "rows_aligned"),
     [(torch.bfloat16, False), (torch.float32, False), (torch.bfloat16, True)],
 )
+@pytest.mark.parametrize("masked", [False, True])
 def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
     device: str,
     state_dtype: torch.dtype,
     rows_aligned: bool,
     monkeypatch: pytest.MonkeyPatch,
     require,
+    masked: bool,
 ):
     require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
     if rows_aligned and not current_platform().is_nvidia:
@@ -481,6 +484,9 @@ def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
             state_dtype=pool.dtype,
             solution="triton",
             rows_aligned=rows_aligned,
+            request_mask=(
+                torch.ones(batch, device=device, dtype=torch.bool) if masked else None
+            ),
         )
         torch.cuda.synchronize()
 
@@ -488,7 +494,7 @@ def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
     commit(batch=1, tokens=1, capacity=7, layers=2)
     # With the cache cleared, a compiled binary shows the warm-up launched it.
     assert len(compiled_kernels(kernel)) == 1
-    with assert_no_triton_compile(kernel):
+    with assert_no_triton_compile(kernel, gdn_triton._gdn_selected_requests):
         commit(batch=4, tokens=3, capacity=13, layers=3)
         commit(batch=17, tokens=longest_window, capacity=281, layers=1)
     # Each call took the kernel watched above.
@@ -561,6 +567,7 @@ def test_gdn_replay_commit_tp4_graph_refresh(
             state_dtype=state_dtype,
             solution="triton",
             rows_aligned=rows_aligned,
+            request_mask=None,
         )
 
     commit()
@@ -737,6 +744,7 @@ def test_gdn_replay_commit_matches_flashinfer_qwen_geometry(device: str, require
         use_qk_l2norm=True,
         solution="flashinfer",
         tree_ancestors=None,
+        pending_replay=None,
     )
     _replay(
         k,
@@ -868,6 +876,7 @@ def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
         state_dtype=torch.float32,
         solution="triton",
         rows_aligned=False,
+        request_mask=None,
     )
 
     for layer_pool, layer_write, layer_expected in zip(pools, writes, expected):
@@ -949,9 +958,69 @@ def test_gdn_replay_commit_layer_offsets_beyond_int32(device: str, require):
             state_dtype=torch.float32,
             solution="triton",
             rows_aligned=False,
+            request_mask=None,
         )
 
     commit(payload, parameters, pools)
     last = initial[L - 1 :].clone()
     commit(payload[L - 1 :, : B * T].contiguous(), parameters[L - 1 :], last)
     assert torch.equal(pools[L - 1, 2:4], last[0, 2:4])
+
+
+@pytest.mark.parametrize("rows_aligned", [False, True])
+@pytest.mark.parametrize("layers", [1, 3])
+def test_masked_replay_skips_unselected_state_reads(device, rows_aligned, layers):
+    k, v, a, b, A, bias, pool, read, write, accepted = _inputs(
+        device, torch.bfloat16, head_k_dim=128, head_v_dim=128
+    )
+    payload = torch.cat((k.flatten(2), v.flatten(2), a, b), -1).reshape(
+        1, -1, k.shape[2] * 128 + v.shape[2] * 128 + 2 * v.shape[2]
+    )
+    payload = payload.repeat(layers, 1, 1)
+    pools = [pool.clone() for _ in range(layers)]
+    mask = torch.tensor([True, False, True, False], device=device)
+    expected = _reference_states(k, v, a, b, A, bias, pool[read.long()], accepted)
+    original = pool.clone()
+    # These pages must never be dereferenced, even in an empty materialization.
+    read = torch.where(mask, read, 2**30)
+    write = torch.where(mask, write, 2**30)
+    gdn_replay_commit(
+        payload,
+        torch.stack((A, bias))[None].repeat(layers, 1, 1),
+        state_addresses=torch.tensor(
+            [state.data_ptr() for state in pools], device=device, dtype=torch.uint64
+        ),
+        state_row_strides=torch.tensor(
+            [pool.stride(0)] * layers, device=device, dtype=torch.int64
+        ),
+        read_indices=read[None].repeat(layers, 1),
+        write_indices=write[None].repeat(layers, 1),
+        accepted_length=accepted,
+        request_mask=mask,
+        draft_token_num=4,
+        geometry=(k.shape[2], v.shape[2], 128, 128),
+        state_dtype=torch.bfloat16,
+        rows_aligned=rows_aligned,
+    )
+    original[write[mask].long()] = expected[mask].bfloat16()
+    for state in pools:
+        torch.testing.assert_close(state, original, rtol=2e-2, atol=1e-3)
+    mask.zero_()
+    gdn_replay_commit(
+        payload,
+        torch.stack((A, bias))[None].repeat(layers, 1, 1),
+        state_addresses=torch.zeros(layers, device=device, dtype=torch.uint64),
+        state_row_strides=torch.tensor(
+            [pool.stride(0)] * layers, device=device, dtype=torch.int64
+        ),
+        read_indices=read[None].repeat(layers, 1),
+        write_indices=write[None].repeat(layers, 1),
+        accepted_length=accepted,
+        request_mask=mask,
+        draft_token_num=4,
+        geometry=(k.shape[2], v.shape[2], 128, 128),
+        state_dtype=torch.bfloat16,
+        rows_aligned=rows_aligned,
+    )
+    for state in pools:
+        torch.testing.assert_close(state, original, rtol=2e-2, atol=1e-3)

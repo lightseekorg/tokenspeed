@@ -87,6 +87,7 @@ def _handle(trace, kv_transfer=None):
             reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
         ),
         kv_transfer=kv_transfer,
+        recurrent_state_materialization=False,
     )
 
 

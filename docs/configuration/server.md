@@ -81,6 +81,7 @@ its request partition is invalidated before another PD owner uses it.
 | `--kv-cache-dtype` | KV cache dtype. Lower precision reduces KV memory. |
 | `--kv-cache-quant-method` | KV cache quantization method. |
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
+| `--enable-deferred-gdn-state` | Defer accepted recurrent replay to the next GDN layer's WY state read. Off by default. NVIDIA BF16 state, K128/V128 chain MTP3/T4 with value-head counts divisible by four and one pipeline stage; convolution commits immediately. Stopped rows and distinct source/destination state blocks commit immediately; unsupported forwards first materialize pending rows. Reserves a second batch payload bank (about 291 MiB at batch 128 and 36 GDN layers) plus small slot metadata. See [the execution contract](../design/unified_path.md#deferred-gdn-accepted-state). |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 | `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
@@ -538,6 +539,13 @@ prefixes or each request's full sequence length. Two requests extending by
 configured. A smaller batch can reuse that capture if there is room for its
 dummy request slots. These settings do not replace the scheduler's
 `--max-num-seqs` limit.
+
+For a full chunk to reuse a larger recurrent request capacity, reserve a token
+bucket with room for its dummy scan rows. With a 2048-token issue budget and
+request capacities `1 8 32`, `--prefill-graph-max-tokens 2080` supplies that
+room. The capture ladder includes its ceiling even with an explicit bucket
+list. Input buffers cover 2080 rows while the scheduler issues up to 2048 live
+tokens per round.
 
 `--prefill-graph-capture-sizes` remains a compatibility alias for
 `--prefill-graph-capture-token-sizes`. Specify only one spelling per command.

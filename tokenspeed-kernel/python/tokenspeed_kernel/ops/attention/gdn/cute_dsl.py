@@ -212,3 +212,90 @@ if _AVAILABLE:
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
         )
+
+
+if _AVAILABLE:
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_mtp",
+        name="cute_dsl_gdn_deferred_mtp",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED + 3,
+        traits={
+            "head_dim": frozenset({128}),
+            "value_head_dim": frozenset({128}),
+            "verify_tokens": frozenset({4}),
+            "output_only": frozenset({True}),
+            "tree": frozenset({False}),
+            "varlen": frozenset({False}),
+            "pending_replay": frozenset({True}),
+            "strided_qkv": frozenset({True, False}),
+        },
+    )
+    def cute_dsl_gdn_deferred_mtp(
+        q,
+        k,
+        v,
+        *,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        initial_state,
+        initial_state_indices,
+        scale,
+        disable_state_update,
+        use_qk_l2norm,
+        intermediate_states_buffer,
+        output_state_indices,
+        output_state,
+        tree_ancestors,
+        replay_payload,
+        pending_replay,
+    ):
+        """Materialize previous accepted state and verify a T4 chain in one read.
+
+        Arguments follow gdn_decode_mtp. ``pending_replay`` is required and
+        owns both payload banks. The conv has written this round's bank.
+        Current output uses continuous accepted-state algebra; persistent
+        state is rounded once to BF16. There are no speculative state writes.
+        """
+        if not disable_state_update or any(
+            x is not None
+            for x in (
+                intermediate_states_buffer,
+                output_state_indices,
+                output_state,
+                tree_ancestors,
+            )
+        ):
+            raise ValueError("deferred WY requires output-only chain verification")
+        if replay_payload is not None:
+            raise ValueError(
+                "deferred WY consumes payload banks written by convolution"
+            )
+        from tokenspeed_kernel.ops.attention.gdn._cute_dsl.deferred_wy import (
+            launch_gdn_deferred_wy,
+        )
+
+        return launch_gdn_deferred_wy(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+            pending=pending_replay,
+        )

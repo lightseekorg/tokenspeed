@@ -769,6 +769,7 @@ class ServerArgs:
     # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
+    enable_deferred_gdn_state: bool = False
     eagle3_layers_to_capture: str | None = None
     # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
     speculative_exec_mode: int = -1
@@ -4680,6 +4681,12 @@ class ServerArgs:
             "[1.0, 2**20].",
         )
         parser.add_argument(
+            "--enable-deferred-gdn-state",
+            action="store_true",
+            default=ServerArgs.enable_deferred_gdn_state,
+            help="Defer accepted GDN recurrent replay to the next layer's WY (BF16 T4 chains).",
+        )
+        parser.add_argument(
             "--disable-replay-ssm",
             dest="enable_replay_ssm",
             action="store_false",
@@ -4832,7 +4839,8 @@ class ServerArgs:
             default=ServerArgs.prefill_graph_max_tokens,
             help="Largest token bucket captured by the breakable prefill CUDA "
             "graph. Default (unset) = min(8192, chunked-prefill size); "
-            "0 disables.",
+            "0 disables. An explicit larger value reserves graph padding above "
+            "the scheduler's live-token budget, including dummy request slots.",
         )
         prefill_token_sizes = parser.add_mutually_exclusive_group()
         prefill_token_sizes.add_argument(

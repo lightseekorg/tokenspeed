@@ -889,6 +889,7 @@ def test_gdn_decode_mtp_intermediate_states_buffer_matches_reference(
         intermediate_states_buffer=scratch,
         solution=solution,
         tree_ancestors=None,
+        pending_replay=None,
     )
 
     # disable_state_update=True: the read rows must never be mutated.
@@ -952,6 +953,7 @@ def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
         use_qk_l2norm=True,
         solution=solution,
         tree_ancestors=None,
+        pending_replay=None,
     )
 
     ref_out, ref_states = _torch_gdn_decode_reference(
@@ -1008,6 +1010,7 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
         scale=scale,
         disable_state_update=False,
         use_qk_l2norm=True,
+        pending_replay=None,
     )
 
     for bi, par in enumerate(parents):
@@ -1060,6 +1063,7 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
         use_qk_l2norm=True,
         solution="triton",
         tree_ancestors=None,
+        pending_replay=None,
     )
     torch.testing.assert_close(out[2], chain_out[2])
     rows = output_idx[2].long()
@@ -1108,11 +1112,24 @@ def test_gdn_decode_mtp_output_state_matches_in_place(
         solution=solution,
     )
     in_place = pool.clone()
-    expected = gdn_decode_mtp(q, k, v, initial_state=in_place, **common)
+    expected = gdn_decode_mtp(
+        q,
+        k,
+        v,
+        initial_state=in_place,
+        **common,
+        pending_replay=None,
+    )
     read_pool = pool.clone()
     scratch = torch.zeros_like(pool)
     actual = gdn_decode_mtp(
-        q, k, v, initial_state=read_pool, output_state=scratch, **common
+        q,
+        k,
+        v,
+        initial_state=read_pool,
+        output_state=scratch,
+        **common,
+        pending_replay=None,
     )
 
     live = read_idx >= 0
@@ -1170,6 +1187,7 @@ def test_gdn_decode_mtp_padding_indices_skip_state_writes(
         use_qk_l2norm=True,
         solution=solution,
         tree_ancestors=None,
+        pending_replay=None,
     )
 
     valid_batch = torch.tensor([0, 2, 3], device=device)
@@ -1238,6 +1256,7 @@ def test_gdn_decode_mtp_disable_state_update_false_writes_back(
         use_qk_l2norm=True,
         solution=solution,
         tree_ancestors=None,
+        pending_replay=None,
     )
 
     _, ref_states = _torch_gdn_decode_reference(
@@ -1407,6 +1426,7 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
         tree_ancestors=None,
         override=None,
         solution="flashinfer",
+        pending_replay=None,
     )
     expected, _ = reference_mtp(
         **kwargs,
@@ -1488,6 +1508,7 @@ def test_gdn_packed_decode_inputs(
             disable_state_update=False,
             intermediate_states_buffer=None,
             tree_ancestors=None,
+            pending_replay=None,
         )
     torch.testing.assert_close(
         actual.float(), expected.to(actual.dtype).float(), rtol=2e-2, atol=2e-2
@@ -1528,6 +1549,7 @@ def test_gdn_decode_mtp_rejects_strided_tree_ancestors(device: str, require):
             scale=q.shape[-1] ** -0.5,
             disable_state_update=False,
             use_qk_l2norm=True,
+            pending_replay=None,
         )
 
 
@@ -1593,6 +1615,7 @@ def test_gdn_decode_mtp_replay_tree_keeps_node_states_out_of_the_pool(
         output_state_indices=output_idx,
         disable_state_update=False,
         **common,
+        pending_replay=None,
     )
     replay_pool = pool.clone()
     states = torch.full(
@@ -1606,6 +1629,7 @@ def test_gdn_decode_mtp_replay_tree_keeps_node_states_out_of_the_pool(
         intermediate_states_buffer=states,
         disable_state_update=True,
         **common,
+        pending_replay=None,
     )
 
     assert torch.equal(replay_pool, pool)
@@ -1659,6 +1683,7 @@ def test_gdn_decode_mtp_replay_tree_node_states_beyond_int32_offsets(
             intermediate_states_buffer=states,
             use_qk_l2norm=True,
             disable_state_update=True,
+            pending_replay=None,
         )
         return out, states
 
@@ -1711,6 +1736,7 @@ def _tree_verify(q, k, v, pool, parents, *, rows: bool, **common):
                 output_state_indices=out_idx,
                 disable_state_update=False,
                 **common,
+                pending_replay=None,
             ),
             out_idx,
         )
@@ -1726,6 +1752,7 @@ def _tree_verify(q, k, v, pool, parents, *, rows: bool, **common):
             intermediate_states_buffer=buffer,
             disable_state_update=True,
             **common,
+            pending_replay=None,
         ),
         None,
     )
@@ -1845,7 +1872,15 @@ def test_gdn_decode_mtp_chunked_tree_fills_the_replay_payload(
         disable_state_update=True,
         tree_ancestors=_tree_ancestors(parents, device),
     )
-    want = gdn_decode_mtp(q, k, v, a=a, b=b, **common)
+    want = gdn_decode_mtp(
+        q,
+        k,
+        v,
+        a=a,
+        b=b,
+        **common,
+        pending_replay=None,
+    )
 
     mixed = torch.cat([t.reshape(rows, -1) for t in (q, k, v)], dim=1)
     q_view, k_view, v_view = (
@@ -1858,7 +1893,14 @@ def test_gdn_decode_mtp_chunked_tree_fills_the_replay_payload(
         (rows, H * K + HV * V + 2 * HV), float("nan"), device=device, dtype=q.dtype
     )
     got = gdn_decode_mtp(
-        q_view, k_view, v_view, a=a_view, b=b_view, replay_payload=payload, **common
+        q_view,
+        k_view,
+        v_view,
+        a=a_view,
+        b=b_view,
+        replay_payload=payload,
+        **common,
+        pending_replay=None,
     )
 
     assert torch.equal(got, want)

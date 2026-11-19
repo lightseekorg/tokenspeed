@@ -511,6 +511,17 @@ class ModelExecutorConfig:
         """Drafts go through the draft-tree path: topk > 1, or EAGLE-Harness chains."""
         return self.spec_topk > 1 or self.eagle_harness is not None
 
+    @property
+    def input_token_capacity(self) -> int:
+        """Input rows for live forwards and the configured prefill graph padding."""
+        max_bs = self.max_num_seqs // max(self.data_parallel_size, 1)
+        graph_tokens = (
+            self.prefill_graph_max_tokens
+            if not self.disable_prefill_graph and not self.enforce_eager
+            else 0
+        )
+        return max(self.chunked_prefill_size, max_bs * self.output_length, graph_tokens)
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -662,9 +673,7 @@ class ModelExecutor:
         with self.memory_saver_adapter.named_region("executor_inputs"):
             self.input_buffers = InputBuffers(
                 max_bs=max_bs,
-                max_num_tokens=max(
-                    config.chunked_prefill_size, max_bs * config.output_length
-                ),
+                max_num_tokens=config.input_token_capacity,
                 state_write_padding_pool_index=config.max_req_pool_size,
                 device=self.device,
                 reads_state_checkpoints=config.state_checkpoint_in_forward,
@@ -1222,7 +1231,9 @@ class ModelExecutor:
             )
             if self.config.chunked_prefill_size > 0:
                 num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
-        set_autotune_max_num_tokens(num_tokens)
+        # Capture can pad above the scheduler's live prefill budget. Keep the
+        # tactic mapper wide enough for those rows even when discovery is smaller.
+        set_autotune_max_num_tokens(num_tokens if decode_only else ib.max_num_tokens)
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)
@@ -1993,6 +2004,16 @@ class ModelExecutor:
             self.capturable_grammar.schedule_fill(
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
+
+        self.attn_backend.prepare_pending_recurrent_state(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            self.runtime_states.valid_cache_lengths,
+            allow_defer=(
+                ctx.forward_mode.is_decode()
+                and ctx.num_extends == 0
+                and ctx.output_layout.decode_width == 4
+            ),
+        )
 
         # KV offloading uses scheduler request slots to bind hot partitions;
         # ordinary backends keep their existing path through a no-op hook.
@@ -3023,6 +3044,13 @@ class ModelExecutor:
                 else:
                     forward_logprobs = ForwardLogprobs()
 
+                recurrent_state_pending = self.attn_backend.recurrent_state_pending(
+                    self.input_buffers.req_pool_indices_buf[:bs]
+                )
+                if recurrent_state_pending is not None:
+                    recurrent_state_pending = recurrent_state_pending.to(
+                        dtype=torch.int32
+                    ).to("cpu", non_blocking=True)
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
@@ -3064,6 +3092,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            recurrent_state_pending=recurrent_state_pending,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a

@@ -134,6 +134,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             storage_config=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,
+            defer_recurrent_state=False,
         )
     )
 
@@ -222,6 +223,7 @@ class TestGdnStateCheckpointInForward:
                 device="cuda",
             ),
             writes_state_checkpoints_in_forward=writes_state_checkpoints_in_forward,
+            defer_recurrent_state=False,
         )
         backend.set_kv_pool(_ContractPool({0: ("linear_attention", conv, recurrent)}))
         backend.init_cuda_graph_state(max_bs=4)
@@ -685,7 +687,12 @@ def test_startup_refuses_a_state_consumer_that_cannot_store_the_checkpoint(
     # The checkpoints sit at multiples of the bound pool's prefix granularity.
     pool.arena.runtime_contract.prefix_granularity = prefix_granularity
 
-    gdn = GdnAttnBackend(config, spec, writes_state_checkpoints_in_forward=True)
+    gdn = GdnAttnBackend(
+        config,
+        spec,
+        writes_state_checkpoints_in_forward=True,
+        defer_recurrent_state=False,
+    )
     gdn.set_cache_pool(pool)
     if prefix_granularity % 64 == 0:
         validate_state_checkpoint_in_forward(attn_backend=gdn, kv_pool=pool)

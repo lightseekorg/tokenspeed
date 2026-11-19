@@ -554,6 +554,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         speculative_eagle_topk=topk,
         speculative_draft_tree=topk > 1,
         enable_replay_ssm=replay_enabled,
+        enable_deferred_gdn_state=False,
         mamba_ssm_dtype="float32",
     )
 
