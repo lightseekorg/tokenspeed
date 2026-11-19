@@ -1059,6 +1059,22 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
         )
+        # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
+        # the decode wrapper above; borrows the decode capture stream so all
+        # graphs share one mempool-reuse domain. Built before the eager warmup
+        # below: warmup runs _forward_step, which selects prefill buckets
+        # through this owner on every target forward.
+        self.prefill_graph = PrefillGraph(
+            model_runner=self.model_runner,
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            input_buffers=self.input_buffers,
+            config=self.config,
+            memory_saver_adapter=self.memory_saver_adapter,
+            drafter=self.drafter,
+            graph_supported=self._graph_support.prefill_graph,
+        )
+
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
         # verify scratch it does not allocate, and its ranks initialize lazy
@@ -1076,20 +1092,6 @@ class ModelExecutor:
         # ingress refuses such requests instead of the data plane finding out.
         self.supports_prompt_logprobs: bool = (
             narrowing_prefill_model(self.model_runner.model) is None
-        )
-
-        # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
-        # the decode wrapper above; borrows the decode capture stream so all
-        # graphs share one mempool-reuse domain.
-        self.prefill_graph = PrefillGraph(
-            model_runner=self.model_runner,
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            input_buffers=self.input_buffers,
-            config=self.config,
-            memory_saver_adapter=self.memory_saver_adapter,
-            drafter=self.drafter,
-            graph_supported=self._graph_support.prefill_graph,
         )
 
     def capture_graphs(
