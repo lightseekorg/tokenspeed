@@ -36,11 +36,12 @@ import subprocess
 import sys
 import time
 
-# Cover imports as well as the worker body: spawn can stall before calling
-# the target, so installing the handler only inside _worker misses its stacks.
+# Cover imports as well as the worker body. The timer also captures waits
+# where the main thread cannot handle the parent's diagnostic signal.
 _WORKER_MODE = __name__ == "__main__" and sys.argv[1:2] == ["--worker"]
 if _WORKER_MODE:
     faulthandler.register(signal.SIGUSR1, all_threads=True)
+    faulthandler.dump_traceback_later(180)
 
 import pytest
 import torch
