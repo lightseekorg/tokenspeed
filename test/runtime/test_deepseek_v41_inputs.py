@@ -62,6 +62,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -999,6 +1000,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
     pg.dp_size = 1
     pg.drafter = None
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     executor.prefill_graph = pg
     monkeypatch.setattr(model_executor, "autotune", tuner)
     monkeypatch.setattr(

@@ -749,6 +749,7 @@ class TestDummyGroupTablesTest:
         )
         pg.dp_size = 1
         pg.drafter = drafter
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg.input_buffers = InputBuffers(
             max_bs=16,
             max_num_tokens=4096,
