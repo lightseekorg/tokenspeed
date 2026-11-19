@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -34,6 +34,33 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
     require_positive_int,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+
+def build_managed_cache_metadata(
+    forward_op: Any,
+    *,
+    memory_saver_adapter: TorchMemorySaverAdapter,
+    device: torch.device | str,
+    contract: CacheRuntimeContract,
+    num_requests: int,
+    validate_page_ids: bool,
+    host_tables: bool,
+) -> CacheBatchMetadata:
+    """Build forward tables in the pool that preserves them across weights sleep."""
+    with memory_saver_adapter.named_region("attention_state"):
+        return CacheBatchMetadata.from_forward_op(
+            forward_op,
+            device=device,
+            contract=contract,
+            num_requests=num_requests,
+            validate_page_ids=validate_page_ids,
+            host_tables=host_tables,
+        )
 
 
 @dataclass(frozen=True, init=False)

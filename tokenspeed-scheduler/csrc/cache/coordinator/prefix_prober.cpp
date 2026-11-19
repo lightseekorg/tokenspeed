@@ -464,6 +464,10 @@ bool PrefixProber::stateGroupsAcceptBoundary(std::span<const std::size_t> match_
     return true;
 }
 
+bool PrefixProber::probesStateGroup(std::span<const std::size_t> match_order) const {
+    return std::ranges::any_of(match_order, [&](std::size_t i) { return store_.GroupIsState(i); });
+}
+
 // The Device's probe: the aligned phase over the prefix-closed groups, then
 // the candidate phase -- longest first, a tail inside the page after the
 // closed coverage, the closed coverage itself, then every published tail and
@@ -577,6 +581,11 @@ PrefixProbe::Tier PrefixProber::ProbeTier(const PromptPrefix& prompt, std::span<
             : static_cast<std::int32_t>(std::min<std::int64_t>(
                   std::int64_t{aligned.num_common_tokens} + store_.PrefixGranularity() - 1, prompt.max_tokens));
     ForEachCandidateBoundary(prompt, /*floor_tokens=*/0, from_tokens, visit);
+    // A junction cut writes its own missing windows, so with a State group it reaches the closed coverage.
+    if (!closed_order.empty() && probesStateGroup(match_order)) {
+        out.kv_tokens = std::max(
+            out.kv_tokens, out.closed_kv_tokens / store_.CheckpointGranularity() * store_.CheckpointGranularity());
+    }
     if (out.num_common_tokens == 0) {
         // No boundary matched: no group claims anything on the Device.
         for (GroupPrefixProbe& hits : out.per_group) {
@@ -788,6 +797,12 @@ PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
             : static_cast<std::int32_t>(std::min<std::int64_t>(
                   std::int64_t{host_kv_end_tokens} + store_.PrefixGranularity() - 1, prompt.max_tokens));
     ForEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
+    // As on the Device: the closed groups' Host run past the Device's coverage is KV reach.
+    const std::int32_t host_reach =
+        host_kv_end_tokens / store_.CheckpointGranularity() * store_.CheckpointGranularity();
+    if (host_reach > device_kv_tokens && probesStateGroup(match_order)) {
+        host.kv_tokens = std::max(host.kv_tokens, host_reach);
+    }
     return HostSuffixProbe{.device = std::move(device), .host = std::move(host)};
 }
 

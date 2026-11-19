@@ -30,8 +30,8 @@ wire_struct! {
     /// One step's output for a frontend that detokenizes itself.
     ///
     /// Every column is parallel to `rids`. The load fields at the tail are
-    /// the scheduler's latest snapshot; an older producer omits them and
-    /// they decode as zero.
+    /// the scheduler's latest snapshot; fields omitted by an older producer
+    /// take their declared defaults.
     #[derive(Debug, Clone, PartialEq)]
     pub struct BatchTokenIDOutSlim: array("BatchTokenIDOutSlim") {
         /// Request ids. Always present on this wire.
@@ -98,6 +98,10 @@ wire_struct! {
         /// zero when no reasoning parser is configured. Cumulative, like
         /// `completion_tokens`. Appended to preserve older columns' positions.
         pub reasoning_tokens: Vec<i64> = Vec::new(),
+        /// Prompt plus committed output tokens of every request held by the rank.
+        pub num_resident_tokens: Option<i64> = None,
+        /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
+        pub num_waiting_uncached_tokens: Option<i64> = None,
     }
 }
 

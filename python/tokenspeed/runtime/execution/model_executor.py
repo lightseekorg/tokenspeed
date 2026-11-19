@@ -111,7 +111,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     resolve_cuda_graph_support,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
-    CacheBatchMetadata,
+    build_managed_cache_metadata,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeVerifyInputs,
@@ -871,7 +871,10 @@ class ModelExecutor:
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
         self._prev_decode_bs: int = 0
-        self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self._sentinel_neg1 = torch.tensor(
+                -1, device=self.device, dtype=torch.int64
+            )
         self.mm_runtime = MultimodalRuntime(
             model_is_mrope=config.model_is_mrope,
             input_buffers=self.input_buffers,
@@ -2645,6 +2648,7 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        """Execute one scheduled forward operation."""
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2691,8 +2695,9 @@ class ModelExecutor:
             if bs > 0:
                 # Check the per-group tables' structure and pack them once for
                 # this batch; the page IDs only under the diagnostic.
-                cache_metadata = CacheBatchMetadata.from_forward_op(
+                cache_metadata = build_managed_cache_metadata(
                     forward_op,
+                    memory_saver_adapter=self.memory_saver_adapter,
                     device=self.device,
                     contract=self._cache_runtime_contract,
                     num_requests=bs,

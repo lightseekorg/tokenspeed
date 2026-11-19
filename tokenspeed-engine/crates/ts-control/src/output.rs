@@ -798,6 +798,14 @@ impl OutputProcessor {
         self.states.len()
     }
 
+    /// Prompt plus committed output tokens of every request the rank holds.
+    pub fn num_resident_tokens(&self) -> i64 {
+        self.states
+            .values()
+            .map(|state| state.prompt_len + state.output_ids.len() as i64)
+            .sum()
+    }
+
     /// A running request's state.
     pub fn state(&self, rid: &str) -> Option<&RequestState> {
         self.states.get(rid)
@@ -3029,6 +3037,14 @@ mod tests {
     }
 
     #[test]
+    fn resident_tokens_include_waiting_prompts_and_committed_output() {
+        let mut p = processor(None);
+        register_history(&mut p, "decoding", &[1, 2, 3], &[7, 8]);
+        register_history(&mut p, "waiting", &[4, 5, 6, 7, 8], &[]);
+        assert_eq!(p.num_resident_tokens(), 10);
+    }
+
+    #[test]
     fn a_request_streams_until_its_stop_token() {
         let mut p = processor(None);
         register(&mut p, "r", 4, 10, &[2]);
@@ -3045,6 +3061,7 @@ mod tests {
             (vec![7], None)
         );
         assert_eq!(c.outputs[0].prompt_tokens, 4);
+        assert_eq!(p.num_resident_tokens(), 5);
 
         let c = p
             .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
@@ -3068,6 +3085,7 @@ mod tests {
         );
         assert_eq!(c.released, ["r"]);
         assert_eq!(p.num_running(), 0);
+        assert_eq!(p.num_resident_tokens(), 0);
     }
 
     #[test]
