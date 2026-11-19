@@ -516,7 +516,7 @@ class MLAAttnBackend(PagedMLABackend):
         *,
         extend_with_prefix: bool,
     ):
-        del extend_with_prefix
+        del extend_with_prefix  # Unused: the prefix lengths pick the prefill path.
         extend_seq_lens_cpu_list = [int(x) for x in extend_seq_lens_cpu.tolist()]
         cum_extend_seq_lens = torch.zeros(
             extend_seq_lens.shape[0] + 1,

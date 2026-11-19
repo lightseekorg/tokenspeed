@@ -254,7 +254,7 @@ class TRTLLMMLABackend(PagedMLABackend):
         extend_with_prefix: bool,
         page_table_cpu: torch.Tensor | None,
     ):
-        del extend_with_prefix, page_table_cpu
+        del extend_with_prefix, page_table_cpu  # Unused: no ragged path or KVP gather.
         max_seq_len = self.max_context_len
         cum_seq_lens = torch.zeros(
             len(seq_lens) + 1, dtype=torch.int32, device=seq_lens.device

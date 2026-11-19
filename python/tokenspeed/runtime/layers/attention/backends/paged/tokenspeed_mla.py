@@ -377,7 +377,7 @@ class CuteDSLMLABackend(PagedMLABackend):
         extend_with_prefix: bool,
         page_table_cpu: torch.Tensor | None,
     ):
-        del extend_with_prefix
+        del extend_with_prefix  # Unused: the prefix lengths drive the chunk loops.
         # Worst-case bound to avoid GPU->CPU sync from seq_lens.max().item().
         # TODO: track a loose CPU upper bound (advance by chunked_prefill_size /
         # accept_lengths.max(); correct when accurate values land) for tighter

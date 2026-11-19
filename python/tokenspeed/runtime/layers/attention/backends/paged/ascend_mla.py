@@ -195,6 +195,8 @@ class AscendMLABackend(MLAAttnBackend):
     def _init_prefill_metadata(self, **kwargs):
         if not self.prefill_enabled:
             return super()._init_prefill_metadata(**kwargs)
+        # The plan reads its own host table and the prefix lengths instead.
+        del kwargs["page_table_cpu"], kwargs["extend_with_prefix"]
         extends = kwargs["extend_seq_lens_cpu"].tolist()
         prefixes = kwargs["extend_prefix_lens_cpu"].tolist()
         cumulative = torch.zeros(
