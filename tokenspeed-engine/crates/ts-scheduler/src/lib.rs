@@ -404,6 +404,8 @@ mod ffi {
         ready_waiting: usize,
         /// Requests awaiting admission or restore.
         waiting: usize,
+        /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
+        pending_prefill_tokens: i64,
         /// Requests prefilling.
         prefilling: usize,
         /// Requests decoding.
@@ -416,6 +418,8 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
+        /// P-role prompts with final output ready, awaiting PD completion.
+        prefill_inflight: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
     }

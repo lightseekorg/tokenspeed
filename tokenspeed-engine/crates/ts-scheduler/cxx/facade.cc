@@ -397,12 +397,14 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .active_decode_slots = static_cast<std::size_t>(scheduler.ActiveDecodeSlots()),
         .ready_waiting = scheduler.ReadyWaitingSize(),
         .waiting = scheduler.WaitingSize(),
+        .pending_prefill_tokens = scheduler.PendingPrefillTokens(),
         .prefilling = scheduler.PrefillSize(),
         .decoding = scheduler.DecodingSize(),
         .retracted = scheduler.RetractedSize(),
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .prefill_inflight = scheduler.PrefillInflightSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }

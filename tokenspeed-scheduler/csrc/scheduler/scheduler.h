@@ -214,6 +214,8 @@ public:
     // Retracted (waiting to be restored) and Restoring (their copy back is in
     // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
+    // Waiting prompts less their last observed cache hit, plus unscheduled local prefill tokens.
+    std::int64_t PendingPrefillTokens() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
     // Requests in the running batch: local prefill forwards, prompts whose
@@ -245,6 +247,9 @@ public:
     std::size_t RemotePrefillSize() const;
     // Requests whose pages PD still pins. This resource count overlaps FSM states.
     std::size_t PdTransferSize() const;
+    // P-role prompts with their final result ready, awaiting PD completion.
+    // Excludes local prefill compute and aborted-transfer cleanup.
+    std::size_t PrefillInflightSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Only fused, page-less requests can finish without the normal forward/PD
     // completion fence. This is a read-only check for the head event channel.

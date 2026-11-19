@@ -1013,10 +1013,9 @@ def reconcile_special_tokens(tokenizer):
             if getattr(tok, "special", False) and tid not in existing_ids
         ]
         if missing:
-            tokenizer.add_special_tokens(
-                {"additional_special_tokens": missing},
-                replace_extra_special_tokens=False,
-            )
+            # The second parameter was renamed across Transformers versions.
+            # Pass it positionally to append without replacing existing tokens.
+            tokenizer.add_special_tokens({"additional_special_tokens": missing}, False)
 
     # Turn-final markers resolve by name; Muse's <|eom|> only ends a channel, not the turn.
     added_vocab = tokenizer.get_added_vocab()

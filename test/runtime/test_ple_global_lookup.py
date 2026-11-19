@@ -100,7 +100,7 @@ def _worker(rank, rendezvous, tp_size):
         assert lookup.table_rank == rank
         full_table = torch.arange(256 * 3).reshape(256, 3).float()
         lookup.ngram_embedding.weight.data.zero_()
-        lookup.load_shard(full_table, 0, 1)
+        lookup.load_shard(full_table, 0, 1, prescanned=False)
 
         def reduce(values, group):
             assert values.ndim == 2
@@ -178,7 +178,7 @@ def _cached_lookup_worker(rank, rendezvous, tp_size):
         full_table = (
             (torch.arange(vocab * dim).reshape(vocab, dim) % 383 - 191) / 7
         ).to(table_dtype)
-        lookup.load_shard(full_table, 0, 1)
+        lookup.load_shard(full_table, 0, 1, prescanned=False)
         scale = 0.125
         lookup.load_scale(torch.tensor(scale))
 
@@ -223,7 +223,7 @@ def test_sharded_host_cache_matches_unsharded_lookup(tmp_path, monkeypatch, tp_s
     )
 
 
-def test_online_fp8_host_lookup_uses_row_scales_with_hot_cache_enabled(monkeypatch):
+def test_online_fp8_host_lookup_uses_hot_cache(monkeypatch):
     from tokenspeed_kernel.platform import current_platform
 
     if not torch.cuda.is_available() or not (
@@ -246,14 +246,19 @@ def test_online_fp8_host_lookup_uses_row_scales_with_hot_cache_enabled(monkeypat
     )
     weights = torch.tensor([0.125, 1.0, -8.0, 32.0], dtype=torch.bfloat16)
     table = weights[:, None].expand(vocab, dim).contiguous()
-    for index, shard in enumerate(table.chunk(2)):
-        lookup.load_shard(shard, index, 2)
+    lookup.load_shard(table, 0, 1, prescanned=False)
+    monkeypatch.setattr(
+        lookup, "gather_host", lambda *_: pytest.fail("expected hot cache")
+    )
 
     ids = torch.arange(tokens * heads, device="cuda").reshape(tokens, heads) % vocab
     layout = lookup.make_layout(None, tokens)
-    actual = lookup.finish(lookup.start(ids, layout))
-    expected = table[ids.cpu()].flatten(1)
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    scale = (table.float().abs().max() / 448).bfloat16().item()
+    quantized = (table.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    expected = (quantized.float() * scale).bfloat16()[ids.cpu()].flatten(1)
+    for _ in range(2):
+        actual = lookup.finish(lookup.start(ids, layout))
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 def test_pure_tp_has_no_ids_collective(monkeypatch):

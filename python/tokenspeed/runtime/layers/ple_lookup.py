@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,8 +27,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
@@ -78,23 +75,7 @@ class PendingLookup:
 
 
 _PLE_FP8_MAX = 448.0  # torch.float8_e4m3fn finite maximum
-
-
-def quantize_ple_embedding_rows(
-    rows: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Online per-row FP8 quantization for the n-gram table.
-
-    Checkpoint shards stream in row ranges, so each row is quantized
-    independently (``scale = amax / 448``) -- no whole-table amax prescan is
-    needed and no clipping can occur. Returns the FP8 rows and their fp32
-    dequant scales.
-    """
-
-    values = rows.to(torch.float32)
-    scale = (values.abs().amax(dim=1) / _PLE_FP8_MAX).clamp_min(1e-12)
-    quantized = (values / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
-    return quantized, scale
+_PLE_QUANT_CHUNK_ELEMENTS = 1 << 20
 
 
 def materialize_ngram_table_on_host(embedding: VocabParallelEmbedding) -> None:
@@ -116,16 +97,8 @@ def host_gather_ngram_rows(
     ids: torch.Tensor,
     scale: float | None,
     out: torch.Tensor,
-    row_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table.
-
-    The dequant factor follows the checkpoint format (see
-    :func:`_ple_host_gather_kernel`): ``row_scale`` is the device per-row buffer
-    for an online-quantized table, ``scale`` the per-tensor scalar for an
-    offline FP8 one, and both ``None`` for a compute-dtype table that needs
-    none.
-    """
+    """Gather local host rows and apply the table's FP8 scale when present."""
 
     from tokenspeed_kernel.ops.ple import ple_host_gather
 
@@ -136,7 +109,7 @@ def host_gather_ngram_rows(
         embedding.shard_indices.org_vocab_start_index,
         embedding.shard_indices.org_vocab_end_index,
         scale,
-        row_scale,
+        None,
         table_shards=embedding.tp_size,
     )
 
@@ -222,19 +195,6 @@ class PLELookup(nn.Module):
                 vocab_end=shard.org_vocab_end_index,
                 device=self._compute_device,
             )
-        self.register_buffer(
-            "ngram_embedding_scale",
-            (
-                torch.ones(
-                    self.ngram_embedding.num_embeddings_per_partition,
-                    dtype=torch.float32,
-                    device=self._compute_device,
-                )
-                if storage_dtype is not None and not offload
-                else None
-            ),
-            persistent=False,
-        )
 
     def make_layout(self, global_num_tokens, local_tokens: int) -> LookupTokenLayout:
         if not self.has_dp:
@@ -295,11 +255,7 @@ class PLELookup(nn.Module):
         if self.offload_embedding:
             out = self.allocate_lookup_buffer(gathered_ids.shape[0], ids.device)
             cache = self._host_cache
-            use_cache = (
-                cache is not None
-                and self.ngram_embedding_scale is None
-                and cache.can_gather(gathered_ids)
-            )
+            use_cache = cache is not None and cache.can_gather(gathered_ids)
             if self._gather_stream is None:
                 self._gather_stream = torch.cuda.Stream(device=ids.device)
             stream = self._gather_stream
@@ -369,7 +325,7 @@ class PLELookup(nn.Module):
 
     def warmup_host_cache(self) -> None:
         cache = self._host_cache
-        if cache is not None and self.ngram_embedding_scale is None:
+        if cache is not None:
             cache.warmup(
                 scale=(
                     self._checkpoint_weight_scale
@@ -385,24 +341,13 @@ class PLELookup(nn.Module):
         the per-head rows land contiguously, so the flatten that the device
         path applies afterwards is already implicit here, and the FP8 dequant
         happens inside the kernel instead of materializing an fp32 temporary.
-        The dequant factor follows the checkpoint format: a per-row device
-        buffer for an online-quantized table, the per-tensor scalar for an
-        offline FP8 one (see :meth:`__init__`), and none for a compute-dtype
-        table.
         """
-
-        row_scale = self.ngram_embedding_scale
-        scale = (
-            self._checkpoint_weight_scale
-            if row_scale is None and self.embed_store_dtype is not None
-            else None
-        )
+        scale = self._checkpoint_weight_scale if self.embed_store_dtype else None
         host_gather_ngram_rows(
             self.ngram_embedding,
             ids,
             scale,
             out.view(-1, self.head_dim),
-            row_scale=row_scale,
         )
         return out
 
@@ -417,98 +362,123 @@ class PLELookup(nn.Module):
         """Read this rank's device table without reducing other ranks yet."""
         embeddings = self.ngram_embedding(ids, reduce_results=False)
         if self.embed_store_dtype is not None:
-            embeddings = self._dequant(embeddings, ids)
-        return embeddings.flatten(-2)
-
-    def _dequant(self, raw: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        """Cast the FP8 lookup to compute dtype and apply per-row scales.
-
-        Must run before the TP all-reduce: FP8 payloads cannot be reduced and
-        each row's scale lives only on its owning rank. Shard-masked rows were
-        zero-filled by the embedding forward, so gathering their folded row-0
-        scale is harmless (0 * finite = 0).
-        """
-
-        from tokenspeed.runtime.layers.vocab_parallel_embedding import (
-            get_masked_input_and_mask,
-        )
-
-        if self.ngram_embedding_scale is None:
-            return (raw.float() * self._checkpoint_weight_scale).to(
+            embeddings = (embeddings.float() * self._checkpoint_weight_scale).to(
                 self.embed_output_dtype
             )
-        module = self.ngram_embedding
-        if module.tp_size > 1:
-            local_ids, _ = get_masked_input_and_mask(
-                ids,
-                module.shard_indices.org_vocab_start_index,
-                module.shard_indices.org_vocab_end_index,
-                module.shard_indices.num_org_vocab_padding,
-                module.shard_indices.added_vocab_start_index,
-                module.shard_indices.added_vocab_end_index,
-            )
-        else:
-            local_ids = ids.clamp(min=0, max=module.num_embeddings_padded - 1)
-        scale = self.ngram_embedding_scale[local_ids]
-        return (raw.to(torch.float32) * scale.unsqueeze(-1)).to(self.embed_output_dtype)
+        return embeddings.flatten(-2)
 
-    def load_shard(self, loaded_weight, shard_index: int, split_parts: int):
+    def set_online_scale(self, local_amax: float) -> None:
+        """Derive the shared BF16 scale once for the logical PLE table.
+
+        Every rank of the table group must call it: the per-rank maxima are
+        all-reduced into the table-wide maximum, and the resulting BF16 scale
+        is stored on the lookup as ``_checkpoint_weight_scale``.
+        """
+        peak = torch.tensor(
+            local_amax, dtype=torch.float32, device=self._compute_device
+        )
+        if len(self.table_group) > 1:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
+
+            torch.distributed.all_reduce(
+                peak,
+                op=torch.distributed.ReduceOp.MAX,
+                group=process_group_manager.get_device_process_group(self.table_group),
+            )
+        self._checkpoint_weight_scale = (peak / _PLE_FP8_MAX).to(torch.bfloat16).item()
+
+    @staticmethod
+    def shard_amax(source: torch.Tensor) -> float:
+        lo, hi = torch.aminmax(source)
+        return max(abs(lo.item()), abs(hi.item()))
+
+    def quantize_shard(self, source: torch.Tensor, target: torch.Tensor) -> None:
+        """Quantize source rows into target with the stored checkpoint scale.
+
+        Rows are quantized in chunks bounded by ``_PLE_QUANT_CHUNK_ELEMENTS``;
+        a zero checkpoint scale writes zeros.
+        """
+        scale = self._checkpoint_weight_scale
+        chunk_rows = max(1, _PLE_QUANT_CHUNK_ELEMENTS // source.shape[1])
+        for start in range(0, len(source), chunk_rows):
+            chunk = source[start : start + chunk_rows].float()
+            if scale:
+                chunk = (chunk / scale).clamp_(-_PLE_FP8_MAX, _PLE_FP8_MAX)
+            else:
+                chunk = torch.zeros_like(chunk)
+            target[start : start + chunk_rows].copy_(chunk.to(torch.float8_e4m3fn))
+
+    def _checkpoint_shard_size(self, split_parts: int) -> int:
+        return (self.ngram_embedding.org_vocab_size + split_parts - 1) // split_parts
+
+    def shard_slices(
+        self, row_count: int, shard_index: int, split_parts: int
+    ) -> tuple[slice, slice]:
+        """Return the (checkpoint source, table target) row slices where the
+        given shard overlaps this rank's partition.
+        """
         embedding = self.ngram_embedding
-        shard_size = (embedding.org_vocab_size + split_parts - 1) // split_parts
-        row_start = shard_index * shard_size
-        row_end = row_start + loaded_weight.shape[0]
+        row_start = shard_index * self._checkpoint_shard_size(split_parts)
+        row_end = row_start + row_count
         tp_start = embedding.shard_indices.org_vocab_start_index
         tp_end = embedding.shard_indices.org_vocab_end_index
         overlap_start = max(row_start, tp_start)
         overlap_end = min(row_end, tp_end)
-        if overlap_start < overlap_end:
-            if self._host_cache is not None:
-                self._host_cache.invalidate()
-            destination = overlap_start - tp_start
-            source = overlap_start - row_start
-            rows = overlap_end - overlap_start
-            source_rows = loaded_weight[source : source + rows]
-            target_rows = embedding.weight.data[destination : destination + rows]
-            scale_buffer = self.ngram_embedding_scale
-            source_is_fp8 = source_rows.dtype == torch.float8_e4m3fn
-            target_is_fp8 = target_rows.dtype == torch.float8_e4m3fn
-            # Matching formats are copied unchanged. In particular, FP8-to-FP8
-            # preserves the checkpoint payload; its global scale is loaded by
-            # _load_ple_weight_scale independently of checkpoint weight ordering.
-            if target_is_fp8 and not source_is_fp8:
-                if scale_buffer is None:
-                    if not self.offload_embedding:
-                        raise RuntimeError(
-                            "FP8 PLE embedding is missing its scale buffer"
-                        )
-                    # A compute-dtype checkpoint under offload is quantized online,
-                    # one streamed shard at a time, and its FP8 payload lands on the
-                    # host table. The offline FP8 path offloading targets carries
-                    # only a per-tensor scale, so the per-row buffer is not built at
-                    # construction; allocate it lazily here, on the device the
-                    # gather reads scales from.
-                    scale_buffer = torch.ones(
-                        embedding.num_embeddings_per_partition,
-                        device=self._compute_device,
-                        dtype=torch.float32,
+        rows = max(0, overlap_end - overlap_start)
+        source = overlap_start - row_start
+        target = overlap_start - tp_start
+        return slice(source, source + rows), slice(target, target + rows)
+
+    def shard_rows(
+        self, weight: torch.Tensor, shard_index: int, split_parts: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the (checkpoint weight rows, table target rows) pair for the
+        shard, or ``None`` when the shard does not overlap this rank.
+        """
+        src, dst = self.shard_slices(len(weight), shard_index, split_parts)
+        if src.stop > src.start:
+            return weight[src], self.ngram_embedding.weight.data[dst]
+        return None
+
+    def needs_online_quantization(self, weight: torch.Tensor) -> bool:
+        return (
+            self.embed_store_dtype == torch.float8_e4m3fn
+            and weight.dtype != torch.float8_e4m3fn
+        )
+
+    def load_shard(
+        self,
+        weight: torch.Tensor,
+        shard_index: int,
+        split_parts: int,
+        *,
+        prescanned: bool,
+    ) -> None:
+        """Copy or online-quantize one checkpoint shard into the table.
+
+        ``prescanned`` must be true once :meth:`set_online_scale` has run for
+        the table, which is required when ``split_parts`` is greater than 1;
+        raises ``ValueError`` when a split table was not prescanned.
+        """
+        rows = self.shard_rows(weight, shard_index, split_parts)
+        if rows is not None and self._host_cache is not None:
+            self._host_cache.invalidate()
+        if self.needs_online_quantization(weight):
+            if not prescanned:
+                if split_parts != 1:
+                    raise ValueError(
+                        "Split online PLE quantization requires a checkpoint prescan"
                     )
-                    self.ngram_embedding_scale = scale_buffer
-                    if self._host_cache is not None:
-                        logger.warning(
-                            "PLE hot cache uses regular host gather for online FP8 "
-                            "tables with per-row scales"
-                        )
-                # Quantize compute-dtype checkpoint rows for FP8 storage and retain
-                # their independently derived dequant scales.
-                source_rows, scale = quantize_ple_embedding_rows(source_rows)
-                scale_buffer[destination : destination + rows].copy_(
-                    scale.to(scale_buffer.device, scale_buffer.dtype)
-                )
-            elif source_is_fp8 and not target_is_fp8:
-                source_rows = (
-                    source_rows.to(torch.float32) * self._checkpoint_weight_scale
-                )
-            target_rows.copy_(source_rows.to(target_rows.device, target_rows.dtype))
+                self.set_online_scale(0.0 if rows is None else self.shard_amax(rows[0]))
+            if rows is not None:
+                self.quantize_shard(*rows)
+        elif rows is not None:
+            source, target = rows
+            if weight.dtype == torch.float8_e4m3fn and target.dtype != weight.dtype:
+                source = source.float() * self._checkpoint_weight_scale
+            target.copy_(source)
 
     def load_scale(self, loaded_weight):
         if loaded_weight.numel() != 1:
@@ -523,17 +493,7 @@ class PLELookup(nn.Module):
                 f"{scale}"
             )
 
-        scale_buffer = self.ngram_embedding_scale
-        if scale_buffer is not None:
-            # The checkpoint scale is shared by every pre-quantized row, so one
-            # fill handles both scale-before-shards and scale-after-shards order.
-            scale_buffer.fill_(scale)
-        elif self.embed_store_dtype is not None:
-            # Offloaded FP8: the payload stays FP8 on the host and this per-tensor
-            # scalar is applied by the gather kernel, so there is no per-row buffer
-            # to fill and no payload to rescale -- recording it below is enough.
-            pass
-        else:
+        if self.embed_store_dtype is None:
             # Compute-dtype target: rescale any raw FP8 rows copied before the
             # scale tensor. Future shard copies multiply by the new value.
             if self._host_cache is not None:
