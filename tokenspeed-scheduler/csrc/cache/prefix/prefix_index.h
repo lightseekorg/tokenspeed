@@ -768,6 +768,20 @@ public:
         return entry_it->key;
     }
 
+    // The entry at `location` as an epoch traversal reports it
+    // (NextEvictionEpoch), when Evict would take it.
+    std::optional<EvictionCandidate> UnpinnedCandidateAt(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+            return std::nullopt;
+        }
+        return EvictionCandidate{.location = location, .metadata = evictionMetadataOf(*entry_it)};
+    }
+
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
         EvictableEntry evictable = FindEvictable(pool, location);
         if (!evictable) {

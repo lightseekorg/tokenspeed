@@ -74,6 +74,10 @@ public:
                                    const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) {
         return makeCandidate(group.Id(), groupRanking(group), location, metadata ? &metadata->eviction : nullptr);
     }
+    // An entry ranked as an epoch traversal of its group ranks it.
+    static Candidate MakeCandidate(const CacheGroup& group, const PrefixCacheIndex::EvictionCandidate& entry) {
+        return makeCandidate(group.Id(), groupRanking(group), entry.location, &entry.metadata);
+    }
 
     // Merge the caller's sorted request releases with the cache traversal.
     // Filters and selected-block membership are read for this call only.
@@ -199,9 +203,10 @@ public:
                     if (!pool_.IsOccupied(location)) {
                         continue;
                     }
-                    offered = group.Index().UnpinnedKeyAt(pool_, location) && !protected_locations_.contains(location);
+                    const auto entry = group.Index().UnpinnedCandidateAt(pool_, location);
+                    offered = entry && !protected_locations_.contains(location);
                     if (offered) {
-                        children.push_back(MakeCandidate(group, location, group.Index().MetadataFor(pool_, location)));
+                        children.push_back(MakeCandidate(group, *entry));
                     }
                 }
                 if (!offered) {
