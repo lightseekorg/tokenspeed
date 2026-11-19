@@ -1755,7 +1755,9 @@ class DeepseekV41Attention(nn.Module):
             codes, scales = out
             weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
         else:
-            if out.shape[0] == 0 and query_gather is not None:
+            # Zero rows arise from an empty query shard or an idle DP peer's
+            # stage replay; every head-TP rank sees the same row count.
+            if out.shape[0] == 0:
                 return hidden_states.new_empty((0, self.wo_b.output_size))
             out = out[:, : self.n_local_heads]
             weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
