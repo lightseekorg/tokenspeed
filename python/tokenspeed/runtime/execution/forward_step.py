@@ -367,7 +367,6 @@ class ForwardStepRunner:
     """
 
     model_decode_row_hooks: tuple[Callable, ...] = ()
-    stage_decode_inputs: Callable | None = None
 
     def __init__(
         self,
@@ -385,7 +384,6 @@ class ForwardStepRunner:
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
         model_decode_row_hooks: tuple[Callable, ...] = (),
-        create_decode_input_stager: Callable | None = None,
     ):
         self.config = config
         self.model_decode_row_hooks = model_decode_row_hooks
@@ -448,10 +446,6 @@ class ForwardStepRunner:
         self.disable = (
             config.enforce_eager or not decode_graph_supported or config.prefill_only
         )
-        if create_decode_input_stager is not None and not self.disable:
-            self.stage_decode_inputs = create_decode_input_stager(
-                self.max_capture_bs * self.max_tokens_per_req
-            )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         with self.memory_saver_adapter.named_region("attention_state"):
@@ -1200,7 +1194,6 @@ class ForwardStepRunner:
                 block_tables=block_tables,
             )
             tokens = bs * self.max_tokens_per_req
-            self._stage_decode_inputs(bs, tokens)
             self._prepare_model_decode_rows(tokens, tokens, capture=False)
             self.deepep_adapter.replay()
 
@@ -1209,17 +1202,6 @@ class ForwardStepRunner:
         finally:
             torch.cuda.synchronize(self.device)
             self._init_capture_metadata(bs)
-
-    def _stage_decode_inputs(self, bs: int, num_tokens: int) -> None:
-        if self.stage_decode_inputs is None:
-            return
-        buffers = self.input_buffers
-        history = self.runtime_states.request_token_history_view(
-            req_pool_indices=buffers.req_pool_indices_buf[:bs],
-            input_start_offsets=buffers.input_start_offsets_buf[: bs + 1],
-            active_request_mask=buffers.active_request_mask_buf[:bs],
-        )
-        self.stage_decode_inputs(buffers.input_ids_buf[:num_tokens], history)
 
     def _prepare_model_decode_rows(
         self, padded_tokens: int, live_tokens: int, *, capture: bool
@@ -1624,7 +1606,6 @@ class ForwardStepRunner:
                             )
                         ),
                     )
-            self._stage_decode_inputs(padded_bs, query_tokens)
             self._prepare_model_decode_rows(
                 query_tokens,
                 query_tokens if packed else bs * self.max_tokens_per_req,

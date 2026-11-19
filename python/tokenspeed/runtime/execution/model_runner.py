@@ -34,7 +34,6 @@ from tokenspeed.runtime.execution.model_update import (
     model_update_adapter_for,
 )
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
-from tokenspeed.runtime.execution.types import HostInputProcessor
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.execution.weight_update_group import (
     _assert_not_split,
@@ -144,7 +143,6 @@ class ModelRunner:
                 stages may not build it (``create_model_runner``).
             is_draft_worker: Whether this is the speculative draft model.
         """
-        self.host_input_processor: HostInputProcessor | None = None
         # Store configuration
         self.model_config = model_config
         self.server_args = server_args
@@ -316,9 +314,6 @@ class ModelRunner:
         prepared = prepare_dp_linear_communication(
             self.model, max_num_tokens, self.model_config.dtype, backend=None
         )
-        create_host_inputs = getattr(self.model, "create_host_input_processor", None)
-        if create_host_inputs is not None:
-            self.host_input_processor = create_host_inputs(max_num_tokens)
         prepare = getattr(self.model, "prepare_communication_runtime", None)
         if prepare is None:
             return prepared

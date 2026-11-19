@@ -1051,9 +1051,6 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
-            create_decode_input_stager=getattr(
-                self.model_runner.model, "create_decode_input_stager", None
-            ),
             model_decode_row_hooks=tuple(
                 hook
                 for runner in (self.model_runner, self._draft_model_runner)
@@ -2353,7 +2350,9 @@ class ModelExecutor:
                 # on every forward; the idle rank hands it an empty one, as the
                 # target's idle forward above does.
                 draft_kwargs: dict[str, object] = {}
-                if self.drafter.draft_model_runner.model_config.requires_request_token_history:
+                if (
+                    self.drafter.draft_model_runner.model_config.requires_request_token_history
+                ):
                     ib = self.input_buffers
                     draft_kwargs["request_token_history"] = (
                         self.runtime_states.draft_request_token_history_view(
@@ -2621,7 +2620,6 @@ class ModelExecutor:
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
         """Execute one scheduled forward operation."""
-        host_inputs = self.model_runner.host_input_processor
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2715,10 +2713,6 @@ class ModelExecutor:
                     decode_input_ids,
                     ngram_inputs=ngram_inputs,
                 )
-                if host_inputs is not None:
-                    host_inputs.prepare_inputs(
-                        forward_op, request_history_seeds, admission_ids
-                    )
                 if (
                     self.sampling_backend.config.synthetic_acceptance_length is not None
                     and decode_input_ids is not None
@@ -3069,7 +3063,7 @@ class ModelExecutor:
                     f"{mm_delta_count!s}",
                 )
 
-        result = ModelExecutionResult(
+        return ModelExecutionResult(
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
@@ -3089,9 +3083,6 @@ class ModelExecutor:
             output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
             output_token_cumulative_probs=output_cumulative_probs,
         )
-        if host_inputs is not None:
-            host_inputs.remember_result(forward_op, result, admission_ids)
-        return result
 
     def _input_logprob_rows(
         self,
