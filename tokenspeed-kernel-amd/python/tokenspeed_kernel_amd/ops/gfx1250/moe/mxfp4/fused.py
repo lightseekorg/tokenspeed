@@ -3128,12 +3128,9 @@ _PREFILL_DOWN_TILES = {
 # MXFP4 activations (A4W4) take eight warps, a two-buffer ring and the XCD
 # swizzle for both projections, and 128-column gate/up tiles. Against the
 # four-warp, three-buffer 256-column tile both projections used before, each
-# step added in that order measured faster or even, and the four together took
-# Qwen3.8 Flash TP2 from 164.7 to 133.0 us at 2048 requests and 242.0 to
-# 187.0 us at 4096, and DSV4.1 Flash TP4 from 264.2 to 225.5 us and 360.0 to
-# 309.3 us. From there a third buffer, four warps, 128-wide K steps, 32- or
-# 128-row tiles, a narrower swizzle and other down widths all measured slower
-# or even.
+# step added in that order measured faster or even. From there a third buffer,
+# four warps, 128-wide K steps, 32- or 128-row tiles, a narrower swizzle and
+# other down widths all measured slower or even.
 _PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES = {
     "block_n": 128,
     "block_k": 256,
