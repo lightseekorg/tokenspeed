@@ -186,11 +186,14 @@ class _WindowAttention:
         fused_decode_groups,
         out_rope_cache=None,
         key_rows,
+        fp8_out=None,
     ):
         if key_rows is not None:
             raise ValueError("DSpark window attention does not accept query sharding")
         if index_q is not None or index_weights is not None:
             raise ValueError("DSpark window attention has no indexer")
+        if fp8_out is not None and fused_decode_groups is None:
+            raise ValueError("An FP8 destination requires fused DSpark attention")
         if fused_decode_groups is not None and (
             not forward_mode.is_decode()
             or swa_rope_cache is None
@@ -218,6 +221,7 @@ class _WindowAttention:
                 fused_decode_groups,
                 kv.view(-1, 1, kv.shape[-1]),
                 self.selection.indices,
+                out=fp8_out,
             )
         if q.is_cuda and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
