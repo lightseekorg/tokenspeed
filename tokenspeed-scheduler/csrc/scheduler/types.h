@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -78,9 +79,10 @@ struct SchedulerConfig {
     enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
     HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
 
-    // The D role streams no ordinary Device cache entry to Host; its Host
-    // cache holds only the published pages of retracted requests (the image's
-    // L2 leg) until they are restored.
+    // Under write-through the D role streams no ordinary Device cache entry
+    // to Host: it would copy every landed prompt. Under write-back it writes
+    // back what its admissions evict, as every role does, and its remote
+    // admission loads a Host hit below the landing (ProbeDecodePrefix).
     bool StreamsDeviceCacheToHost() const {
         return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
     }
@@ -109,6 +111,9 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Sharing cached prefixes with other replicas
+    // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
+    std::optional<PeerConfig> peer_config;
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};

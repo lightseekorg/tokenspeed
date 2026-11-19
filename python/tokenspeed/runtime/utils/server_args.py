@@ -65,7 +65,11 @@ from tokenspeed.runtime.utils import (
     nullable_str,
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
-from tokenspeed.runtime.utils.network import is_port_available, join_host_port
+from tokenspeed.runtime.utils.network import (
+    is_port_available,
+    join_host_port,
+    split_host_port,
+)
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     BLOCK_SPEC_RULES,
@@ -622,6 +626,15 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
+    # this replica's endpoint binds (attention-DP rank r binds port + r);
+    # None turns it off.
+    peer_prefix_port: int | None = None
+    # The host other replicas and the router reach this replica's endpoint at;
+    # its name is host:port. None takes this host's detected address.
+    peer_prefix_host: str | None = None
+    peer_prefix_answer_timeout_ms: int = 50
+    peer_prefix_min_fetch_tokens: int = 256
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -660,11 +673,14 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    # Pack Qwen4-Exp target and draft cache fields into one physical plane.
+    qwen4_exp_flat_kv: bool = True
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
     # draw depends on its co-batch; "per-request" keys it by (request seed,
-    # position) through the Gumbel-max pool kernels. See
+    # position) through the Gumbel-max pool kernels and keys chain verify
+    # coins by the request seed and verify round's first position. See
     # docs/design/numerics.md, sampling.deterministic.
     sampling_stream: str = "batch"
     dp_sampling: bool = False
@@ -777,6 +793,7 @@ class ServerArgs:
     enable_prefix_caching: bool = True
     disable_kvstore: bool = False
     enforce_eager: bool = False
+    enable_dp_local_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_startup_requests: bool = False
@@ -932,8 +949,48 @@ class ServerArgs:
         self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate_output_cumulative_probs()
+        self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
         self.validate()
+
+    def validate_dp_local_cuda_graph(self):
+        if not self.enable_dp_local_cuda_graph:
+            return
+        if self.disaggregation_mode in ("prefill", "encode"):
+            raise ValueError("DP-local CUDA graphs require a decode-capable worker")
+        if self.enforce_eager:
+            raise ValueError("DP-local CUDA graphs require CUDA graphs")
+        if self.speculative_algorithm != "DSPARK":
+            raise ValueError("DP-local CUDA graphs currently require DSPARK")
+        mega_moe_backends = ("mega_moe", "deep_gemm_mega_moe")
+        if (
+            self.moe_backend not in mega_moe_backends
+            or (self.draft_moe_backend or self.moe_backend) not in mega_moe_backends
+        ):
+            raise ValueError(
+                "DP-local CUDA graphs require MegaMoE for both target and draft"
+            )
+        if (
+            self.mapping.attn.tp_size != 1
+            or self.mapping.dense.tp_size != 1
+            or self.mapping.moe.tp_size != 1
+            or self.mapping.lm_head.tp_size != 1
+            or self.mapping.attn.has_head_tp
+            or self.pipeline_parallel_size != 1
+            or self.kv_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.query_context_parallel_size != 1
+            or self.dp_sampling
+        ):
+            raise ValueError(
+                "DP-local CUDA graphs require attention/dense/MoE/LM-head TP1, "
+                "no head TP, PP1/KVP1/DCP1/QCP1 and no DP sampling"
+            )
+        if self.sampling_backend != "greedy" and not self.enable_dsv41_adaptive_dspark:
+            raise ValueError(
+                "DP-local CUDA graphs require greedy sampling "
+                "or adaptive DSpark sampling"
+            )
 
     def validate_dsv41_adaptive_dspark(self):
         if (
@@ -949,9 +1006,24 @@ class ServerArgs:
             raise ValueError("adaptive DSpark requires real acceptance")
         from tokenspeed.runtime.utils.env import envs
 
-        if self.speculative_algorithm != "DSPARK" or self.sampling_backend != "greedy":
+        if self.speculative_algorithm != "DSPARK" or self.sampling_backend not in (
+            "greedy",
+            "flashinfer",
+        ):
             raise ValueError(
-                "V4.1 adaptive verification requires DSPARK and greedy sampling"
+                "V4.1 adaptive verification requires DSPARK and greedy "
+                "or flashinfer sampling"
+            )
+        if self.sampling_backend == "flashinfer" and (
+            not self.enable_speculative_sampling
+            or self.sampling_stream != "per-request"
+            or self.mapping.attn.tp_size != 1
+            or self.speculative_rejection_sample_method != "standard"
+        ):
+            raise ValueError(
+                "sampled adaptive DSpark requires --enable-speculative-sampling, "
+                "--sampling-stream per-request, standard rejection sampling "
+                "and attention TP1"
             )
         if not self.disable_prefill_graph:
             raise ValueError(
@@ -974,17 +1046,20 @@ class ServerArgs:
             raise ValueError(
                 "adaptive DSpark requires head and vocabulary groups to follow attention TP"
             )
+        if self.enable_output_cumulative_probs:
+            raise ValueError(
+                "V4.1 adaptive verification does not support "
+                "--enable-output-cumulative-probs"
+            )
         if (
-            self.grammar_backend != "none"
-            or self.enable_output_logprobs
-            or self.enable_output_cumulative_probs
-            or self.enable_speculative_sampling
+            (self.enable_speculative_sampling and self.sampling_backend == "greedy")
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires plain greedy sampling, grammar none, and TP synchronization"
+                "V4.1 adaptive verification requires chain sampling "
+                "and TP synchronization"
             )
 
     def validate_output_cumulative_probs(self):
@@ -2502,7 +2577,48 @@ class ServerArgs:
                 "--kvstore-storage-backend"
             )
 
+    def validate_peer_prefix_options(self):
+        """``--peer-prefix-port`` and its settings: what peer prefix sharing
+        runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
+        if self.peer_prefix_port is None:
+            return
+        unsupported = [
+            setting
+            for setting, refused in (
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+                (
+                    "--query-context-parallel-size > 1",
+                    self.query_context_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--peer-prefix-port is not supported with " + ", ".join(unsupported)
+            )
+        last_port = self.peer_prefix_port + self.mapping.attn.dp_size - 1
+        if self.peer_prefix_port < 1 or last_port > 65535:
+            raise ValueError(
+                "--peer-prefix-port and one port per attention-DP rank after "
+                f"it must be valid ports; got {self.peer_prefix_port}"
+            )
+        if self.peer_prefix_answer_timeout_ms <= 0:
+            raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
+        if self.peer_prefix_min_fetch_tokens <= 0:
+            raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
+
     def validate_cache_options(self):
+        self.validate_peer_prefix_options()
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -2535,8 +2651,7 @@ class ServerArgs:
             ("write_through", "write_back"),
         )
         if self.kvstore_write_policy == "write_back":
-            # Decode's Host holds retraction images only, and L3 staging would
-            # split what is written back; pipeline stages and query context
+            # L3 staging would split what is written back; pipeline stages and query context
             # parallelism have not run write-back. Attention TP and
             # --kv-parallel-size need no refusal: a written-back segment
             # publishes once every rank of the replica has acknowledged it
@@ -2547,10 +2662,6 @@ class ServerArgs:
                 setting
                 for setting, refused in (
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
-                    (
-                        "--disaggregation-mode decode",
-                        self.disaggregation_mode == "decode",
-                    ),
                     (
                         "--kvstore-storage-backend",
                         self.kvstore_storage_backend is not None,
@@ -3449,8 +3560,10 @@ class ServerArgs:
             "prefill role caches. "
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
-            "the copy), so the two tiers hold mostly different pages. "
-            "write_back is refused with --disaggregation-mode decode, "
+            "the copy), so the two tiers hold mostly different pages; on "
+            "--disaggregation-mode decode a remote admission then loads its "
+            "Host hit and the prefill node sends only the rest. "
+            "write_back is refused with "
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with more than 64 cache groups; see "
@@ -3473,6 +3586,47 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--peer-prefix-port",
+            type=int,
+            default=ServerArgs.peer_prefix_port,
+            help="Share prefix caches with other replicas: a request the router "
+            "sends with a peer holder reads the prefix that replica caches, in "
+            "its Device or Host cache, over RDMA, instead of computing it, and "
+            "this replica serves its own cache the same way. Its endpoint binds "
+            "this port (attention-DP rank r binds this port + r). Needs the Host "
+            "tier (--enable-kvstore) and prefix caching; refused with "
+            "--kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
+            "A --disaggregation-mode decode replica serves the history it "
+            "decoded but never reads: its prefill node sends what it lacks. "
+            "Replicas share only with replicas of "
+            "the same model, cache layout, weights and parallel layout. RDMA "
+            "devices come from --disaggregation-ib-device. See "
+            "docs/rfcs/0004-peer-prefix-sharing.md.",
+        )
+        parser.add_argument(
+            "--peer-prefix-host",
+            type=str,
+            default=ServerArgs.peer_prefix_host,
+            help="The host other replicas and the router reach this replica's peer "
+            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "must name it exactly so. Defaults to this host's detected address.",
+        )
+        parser.add_argument(
+            "--peer-prefix-answer-timeout-ms",
+            type=int,
+            default=ServerArgs.peer_prefix_answer_timeout_ms,
+            help="How long a request waits for the peer holder's answer to each "
+            "step (lookup, pin, release) before it computes the prefix itself.",
+        )
+        parser.add_argument(
+            "--peer-prefix-min-fetch-tokens",
+            type=int,
+            default=ServerArgs.peer_prefix_min_fetch_tokens,
+            help="The fewest tokens past the local prefix hit worth reading from "
+            "a peer holder; a shorter peer hit is computed instead.",
         )
         # Retraction snapshot pool
         parser.add_argument(
@@ -3956,7 +4110,8 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`, "
+            "or `[fd00::2]:25000` for IPv6). "
             "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
@@ -4068,6 +4223,17 @@ class ServerArgs:
             "which runs no prefill, reserves no scratch.",
         )
         parser.add_argument(
+            "--qwen4-exp-flat-kv",
+            action=argparse.BooleanOptionalAction,
+            dest="qwen4_exp_flat_kv",
+            default=ServerArgs.qwen4_exp_flat_kv,
+            help="Qwen4-Exp layout (on by default): target/draft KV, recurrent, PLE "
+            "and QSA caches share one plane, preserving logical groups. "
+            "Full-history block IDs translate to contiguous atom pages; state "
+            "and recent windows use explicit strides. Requires PP=1 and non-MXFP8 KV. "
+            "Use --no-qwen4-exp-flat-kv for the plane-based layout.",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=[
@@ -4116,9 +4282,9 @@ class ServerArgs:
             "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
             "by the batch row, so a request's draw depends on its co-batch. "
             "'per-request': the Gumbel-max pool kernels keyed by the request's "
-            "seed and position, so a request samples the same tokens alone and "
-            "inside any batch (finite top_k is capped at 128). Folded to "
-            "per-request by --numerics rl-bitwise.",
+            "seed and position (finite top_k is capped at 128). Chain verify "
+            "coins are keyed by the request's seed and the round's first "
+            "target position. Folded to per-request by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--dp-sampling",
@@ -4334,20 +4500,29 @@ class ServerArgs:
 
         # Speculative decoding
         parser.add_argument(
+            "--enable-dp-local-cuda-graph",
+            action="store_true",
+            default=ServerArgs.enable_dp_local_cuda_graph,
+            help="Select decode CUDA graph capacities independently on attention-DP "
+            "ranks. Currently requires a supported DSPARK drafter, target and draft "
+            "MegaMoE, TP1 for attention/dense/MoE/LM head, and greedy or adaptive "
+            "DSpark sampling.",
+        )
+        parser.add_argument(
             "--enable-dsv41-adaptive-dspark",
             action="store_true",
             default=ServerArgs.enable_dsv41_adaptive_dspark,
             help="Adapt DeepSeek V4.1 DSpark verification capacity using confidence "
-            "and calibrated step costs. Requires greedy sampling and CUDA graphs.",
+            "and calibrated step costs. Requires CUDA graphs and greedy sampling "
+            "or flashinfer with --enable-speculative-sampling.",
         )
         parser.add_argument(
             "--dsv41-dspark-min-batch-size",
             type=int,
             default=ServerArgs.dsv41_dspark_min_batch_size,
-            help="Minimum actual decode batch size per attention rank for adaptive "
-            "DSpark, not global request concurrency. Smaller or padded batches "
-            "retain full verification; attention DP also requires equal local "
-            "decode batch sizes across ranks.",
+            help="Enable adaptive DSpark when the maximum actual local decode "
+            "batch size across attention ranks reaches this threshold. Uneven "
+            "or idle DP ranks share the selected physical query capacity.",
         )
         parser.add_argument(
             "--draft-model-path-use-base",
@@ -5386,11 +5561,13 @@ class PortArgs:
                 "Example: --dist-init-addr <head-node-ip>:20000"
             )
         else:
-            dist_init_addr = server_args.dist_init_addr.split(":")
-        if len(dist_init_addr) != 2:
-            raise ValueError(
-                "please provide --dist-init-addr as host:port of head node"
-            )
+            try:
+                dist_init_addr = split_host_port(server_args.dist_init_addr)
+            except ValueError:
+                raise ValueError(
+                    "please provide --dist-init-addr as host:port (or [ipv6]:port) "
+                    "of head node"
+                ) from None
 
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
@@ -5440,11 +5617,11 @@ class PortArgs:
             dist_init_port += 10
 
         return PortArgs(
-            tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
-            scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+            tokenizer_ipc_name=f"tcp://{join_host_port(dist_init_host, port_base)}",
+            scheduler_input_ipc_name=f"tcp://{join_host_port(dist_init_host, scheduler_input_port)}",
             nccl_port=port,
-            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
-            rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
-            metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
+            dist_init_addr=join_host_port(dist_init_host, dist_init_port),
+            rpc_ipc_name=f"tcp://{join_host_port(dist_init_host, rpc_port)}",
+            metrics_ipc_name=f"tcp://{join_host_port(dist_init_host, metrics_ipc_port)}",
             tokenizer_worker_ipc_name=None,
         )

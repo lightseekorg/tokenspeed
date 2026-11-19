@@ -542,6 +542,23 @@ def test_retained_shared_source(accepted):
     )
 
 
+@pytest.mark.skipif(not is_cdna5(), reason="gfx1250 uses 64-row panels")
+@pytest.mark.parametrize("batch", [8, 16], ids=["split", "whole-head"])
+def test_retained_gfx1250_wide_panels(batch):
+    """Check packed windows with one 64-row panel per split or two per head."""
+    _case(
+        8,
+        4,
+        3,
+        (2,),
+        cross_page=True,
+        strided=True,
+        projected=True,
+        lower_bound=-5.0,
+        lengths=[4, 2] + [1] * (batch - 2),
+    )
+
+
 @pytest.mark.skipif(not is_cdna4(), reason="gfx950 projection GEMM crossover")
 def test_retained_gfx950_large_projected_gate():
     _case(

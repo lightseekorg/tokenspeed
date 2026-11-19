@@ -86,7 +86,11 @@ fn run_scenario(directory: &Path) {
     engine.observe_request_time(1.5);
     engine.observe_decode_time(1.2);
     engine.observe_time_per_output_token(0.02);
+    engine.observe_e2e_time_per_output_token(0.03);
     engine.record_completion_tokens(5);
+    engine.observe_request_completion_tokens(0);
+    engine.observe_request_completion_tokens(5);
+    engine.record_decode_prefix_hits(100, 20);
     engine.record_grammar_queue(2);
     engine.record_prefix_hits(100, 40, 30, 10);
 

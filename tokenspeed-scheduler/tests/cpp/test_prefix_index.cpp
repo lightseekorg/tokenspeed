@@ -1232,7 +1232,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
     const std::vector<CacheKey> keys{KeyOf("matched")};
     const GroupPrefixProbe probe{.hits = {1}};
     PrefixMatch match =
-        index.AcquireMatched(pool, keys, /*begin_blocks=*/0, probe, /*access_epoch=*/40, /*session=*/nullptr);
+        index.AcquireMatched(pool, keys, /*begin_block=*/0, probe, /*access_epoch=*/40, /*session=*/nullptr);
     ASSERT_EQ(match.blocks.size(), 1u);
     match.blocks.clear();
 
@@ -1253,7 +1253,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, AppendsAtTheNewestEpochAndRemovesTheLast
         keys.push_back(KeyOf(std::to_string(i)));
     }
     for (int i = 0; i < 4; ++i) {
-        index.AcquireMatched(pool, std::vector<CacheKey>{keys[i]}, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+        index.AcquireMatched(pool, std::vector<CacheKey>{keys[i]}, /*begin_block=*/0, GroupPrefixProbe{.hits = {1}},
                              /*access_epoch=*/10 + i, /*session=*/nullptr);
     }
     EXPECT_EQ(DrainEvictionOrder(index, pool),
@@ -1628,4 +1628,92 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     EXPECT_EQ(DrainEvictionOrder(index, pool),
               (std::vector<CacheBlockLocation>{active_location, other_location, shared_location, exclusive_location}));
 }
+
+TEST(PrefixCacheIndexParentEntriesTest, MatchesAFullScanAcrossEveryEntryChange) {
+    constexpr std::int32_t kParents = 6;
+    constexpr std::int32_t kPacking = 4;
+    BlockPool pool(kParents, {kPacking});
+    PrefixCacheIndex index(kGroupId);
+    index.TrackParentEntries(pool);
+    std::mt19937 random(20261118);
+    std::vector<std::string> keys;
+    std::vector<CacheBlockRef> pins;
+    // Blocks a request holds unpublished: occupied, never entries.
+    std::vector<CacheBlockRef> private_blocks;
+    for (int iteration = 0; iteration < 4000; ++iteration) {
+        const bool has_room = pool.NumEmptyLcmBlocks() > 0 || pool.NumFreeSlots(kGroupId) > 0;
+        const CacheKey key = KeyOf(keys.empty() ? std::string{} : keys[random() % keys.size()]);
+        const std::optional<CacheBlockLocation> location = keys.empty() ? std::nullopt : index.LocationOf(pool, key);
+        switch (random() % 8) {
+            case 0:
+            case 1:
+                if (has_room) {
+                    keys.push_back(std::to_string(iteration));
+                    Cache(index, pool, keys.back(), random() % 9);
+                }
+                break;
+            case 2:  // republished at another epoch, newer or older
+                if (CacheBlockRef block = location ? index.Find(pool, key) : CacheBlockRef{}) {
+                    index.Register(pool, block, key, random() % 9, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
+                }
+                break;
+            case 3:  // a hit pins and touches it
+                if (location) {
+                    pins.push_back(index
+                                       .AcquireMatched(pool, std::vector<CacheKey>{key}, 0,
+                                                       GroupPrefixProbe{.hits = {1}}, random() % 9, nullptr)
+                                       .blocks.front());
+                }
+                break;
+            case 4:
+                if (location) {
+                    index.Demote(pool, key, random() % 3, /*write_back_holds=*/0);
+                }
+                break;
+            case 5:
+                if (location) {
+                    index.Evict(pool, *location);
+                }
+                break;
+            case 6:  // a compaction moves it onto a fresh block
+                if (location && has_room) {
+                    index.Relocate(pool, *location, pool.AcquireBlock(kGroupId));
+                }
+                break;
+            default:
+                if (!pins.empty() && random() % 2 == 0) {
+                    pins.erase(pins.begin() + static_cast<std::ptrdiff_t>(random() % pins.size()));
+                } else if (!private_blocks.empty() && random() % 2 == 0) {
+                    private_blocks.pop_back();
+                } else if (has_room) {
+                    private_blocks.push_back(pool.AcquireBlock(kGroupId));
+                }
+                break;
+        }
+        std::vector<PrefixCacheIndex::ParentEntries> expected(kParents + 1);
+        index.ForEachEntry(pool, [&](const CacheKey&, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
+            PrefixCacheIndex::ParentEntries& parent = expected[static_cast<std::size_t>(entry.location.lcm_block_id)];
+            const std::uint64_t epoch = entry.metadata.eviction.last_access_epoch;
+            if (parent.count++ == 0 || epoch > parent.newest_access_epoch) {
+                parent.newest_access_epoch = epoch;
+                parent.count_at_newest = 1;
+            } else if (epoch == parent.newest_access_epoch) {
+                ++parent.count_at_newest;
+            }
+        });
+        const std::span<const PrefixCacheIndex::ParentEntries> tracked = index.EntriesByParent(pool);
+        ASSERT_EQ(tracked.size(), expected.size());
+        for (std::size_t id = 1; id < expected.size(); ++id) {
+            ASSERT_EQ(tracked[id].count, expected[id].count) << iteration << " parent " << id;
+            if (expected[id].count > 0) {
+                ASSERT_EQ(tracked[id].newest_access_epoch, expected[id].newest_access_epoch)
+                    << iteration << " parent " << id;
+                ASSERT_EQ(tracked[id].count_at_newest, expected[id].count_at_newest) << iteration << " parent " << id;
+            }
+        }
+    }
+    pins.clear();
+    private_blocks.clear();
+}
+
 }  // namespace tokenspeed::test

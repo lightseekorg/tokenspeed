@@ -198,6 +198,7 @@ fn generate_text() {
             cache_session_id: Some(s("cache-session")),
             cache_group_id: Some(s("cache-group")),
             shared_prefix_tokens: vec![1, 3],
+            peer_holder: Some(s("10.0.0.2:7100")),
         },
     );
 }
@@ -461,6 +462,8 @@ fn output_slim() {
         kv_active_pages: 1000,
         kv_total_pages: 4096,
         kv_used_pages: 1500,
+        num_resident_tokens: Some(5_000_000_000),
+        num_waiting_uncached_tokens: Some(3_000_000_000),
         ..no_tail()
     };
     let frames = fixture("output_slim");
@@ -529,6 +532,8 @@ fn no_tail() -> BatchTokenIDOutSlim {
         output_token_logprobs_idx: vec![],
         output_token_cumulative_probs_val: vec![],
         reasoning_tokens: vec![],
+        num_resident_tokens: None,
+        num_waiting_uncached_tokens: None,
         engine_index: 0,
         num_running: 0,
         num_waiting: 0,
@@ -788,6 +793,8 @@ fn generate_from_an_older_client_preserves_session_and_tokens() {
     let Value::Array(mut fields) = decode_frames::<Value>(&frames[1..]).unwrap() else {
         panic!("generate messages must be arrays");
     };
+    assert_eq!(fields.pop(), Some(Value::from("10.0.0.2:7100")));
+    expected.peer_holder = None;
     assert_eq!(
         fields.pop(),
         Some(Value::Array(vec![Value::from(1), Value::from(3)]))

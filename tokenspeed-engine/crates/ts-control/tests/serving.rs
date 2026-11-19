@@ -29,6 +29,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, Once, PoisonError,
@@ -60,6 +61,7 @@ use ts_l3::{
     monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
     Namespace, Range, Store, StoreError,
 };
+use ts_metrics::{EngineLabels, EngineMetrics, Exporter, MetricsConfig};
 use ts_pd::{
     BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
     RemotePrefill, TransferPeer, TransferPoll,
@@ -139,6 +141,7 @@ fn new_scheduler(
     role: Role,
     kv_shard_count: usize,
     device_pages: usize,
+    resident_requests: usize,
 ) -> Scheduler {
     interpreter();
     let role = match role {
@@ -190,7 +193,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
-cfg.max_resident_requests = 8
+cfg.max_resident_requests = {resident_requests}
 cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
@@ -287,6 +290,8 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// Exported gauges checked against the actual dispatch.
+    metrics_dir: Option<PathBuf>,
     /// Every data-plane admission must already have a fresh identity.
     last_admission: u64,
     /// This rank; PD names it as a sender of a request's KV.
@@ -487,10 +492,11 @@ impl TransferPeer for FakePeer {
                     } else {
                         // The KV left this prefill rank, or arrived from
                         // every one.
-                        let sent = match role {
-                            Role::Prefill => room.sent_by.contains(&rank),
-                            _ => room.sent_by.len() == prefill_ranks,
-                        };
+                        let sent = room.preallocated.is_some()
+                            && match role {
+                                Role::Prefill => room.sent_by.contains(&rank),
+                                _ => room.sent_by.len() == prefill_ranks,
+                            };
                         if sent {
                             TransferPoll::Success
                         } else {
@@ -681,6 +687,18 @@ impl DataPlane for FakeDevice {
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
         let forward = dispatch.forward;
+        if let Some(directory) = &self.metrics_dir {
+            let gauges = exported_gauges(directory);
+            assert_eq!(
+                gauges["tokenspeed:num_requests_running"],
+                forward.map_or(0, |batch| batch.request_ids.len()) as f64,
+                "RunningBS must count only the dispatched requests"
+            );
+            assert!(
+                gauges["tokenspeed:num_requests_waiting"]
+                    >= gauges["tokenspeed:num_decode_ready_waiting_reqs"]
+            );
+        }
         if let Some(windows) = dispatch.ngram {
             let mut seen = self.ngram.lock().unwrap();
             seen.extend(
@@ -1256,6 +1274,10 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// A separate metrics directory for each rank.
+    metrics_dir: Option<PathBuf>,
+    /// Resident slots; decode can hold more requests than it forwards.
+    resident_requests: Option<usize>,
     /// The fake device exposes the collective NCCL sleep region.
     nccl_suspendable: bool,
     /// Override the ingress context limit to exercise native capacity errors.
@@ -1299,7 +1321,12 @@ struct Setup {
     /// The requests each engine serves itself before its frontend attaches,
     /// [`STARTUP_OUTPUT_TOKENS`] each.
     startup: Vec<startup::Phase>,
+    /// Receives the scheduler the loop runs over, as a peer servicer holds
+    /// it.
+    scheduler: Option<Arc<Mutex<Option<SharedScheduler>>>>,
 }
+
+type SharedScheduler = Arc<parking_lot::Mutex<Scheduler>>;
 
 const STARTUP_OUTPUT_TOKENS: usize = 3;
 
@@ -1357,7 +1384,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             } else {
                 vec!["kv_cache".to_owned(), "weights".to_owned()]
             },
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {
@@ -1417,12 +1444,15 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let Setup {
         device_pages,
+        metrics_dir,
+        resident_requests,
         pd,
         eplb,
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
         startup,
+        scheduler: scheduler_handle,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1465,8 +1495,18 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     // Attached once the startup requests ran, as the host does.
+    let scheduler = Arc::new(parking_lot::Mutex::new(new_scheduler(
+        tiers,
+        role,
+        kv_shard_count,
+        device_pages.unwrap_or(513),
+        resident_requests.unwrap_or(8),
+    )));
+    if let Some(handle) = scheduler_handle {
+        *handle.lock().unwrap() = Some(scheduler.clone());
+    }
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
+        scheduler,
         device,
         None,
         outputs,
@@ -1482,7 +1522,23 @@ fn run_rank<F: Frontend>(
                     awaiting: Vec::new(),
                 }) as Box<dyn EmbeddingReceiver + Send>
             }),
-            metrics: None,
+            metrics: metrics_dir.map(|directory| {
+                let directory = directory.join(rank.to_string());
+                std::fs::create_dir_all(&directory).unwrap();
+                let exporter = Exporter::new(&MetricsConfig {
+                    prometheus_dir: Some(directory),
+                    relay_endpoint: None,
+                })
+                .unwrap();
+                EngineMetrics::new(
+                    &exporter,
+                    &EngineLabels {
+                        model_name: "metrics-test".into(),
+                        app_key: String::new(),
+                        dp_rank: rank as i64,
+                    },
+                )
+            }),
             kv_events: None,
             eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
             grammars: grammar.then(|| {
@@ -1498,6 +1554,7 @@ fn run_rank<F: Frontend>(
             }),
             l3_metrics: None,
             l3: store.map(|store| l3_executor(store, rank)),
+            peer: None,
         },
     );
     if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {
@@ -1511,6 +1568,10 @@ fn run_rank<F: Frontend>(
 fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
     let (world, _, _) = layout.sizes();
     FakeDevice {
+        metrics_dir: setup
+            .metrics_dir
+            .as_ref()
+            .map(|dir| dir.join(rank.to_string())),
         last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
@@ -2241,6 +2302,8 @@ async fn idle_load_reports_preserve_resident_cache_capacity() {
     let load = snapshots[0].1;
     assert_eq!((load.num_running, load.num_waiting), (0, 0));
     assert_eq!(load.kv_active_pages, 0);
+    assert_eq!(load.num_resident_tokens, Some(0));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert!(load.kv_used_pages > 0, "reclaimable prefixes stay resident");
     assert_eq!(load.kv_total_pages, 512);
 }
@@ -2381,12 +2444,12 @@ async fn dropping_a_stream_aborts_the_request() {
             );
             // Cancellation produces no final output for the dropped stream,
             // but the frontend must still learn that the engine is idle.
-            if engine
-                .client
-                .loads()
-                .iter()
-                .all(|load| load.num_running == 0 && load.num_waiting == 0)
-            {
+            if engine.client.loads().iter().all(|load| {
+                load.num_running == 0
+                    && load.num_waiting == 0
+                    && load.num_resident_tokens == Some(0)
+                    && load.num_waiting_uncached_tokens == Some(0)
+            }) {
                 return;
             }
         }
@@ -3653,6 +3716,63 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
     }
 }
 
+/// A peer servicer answers from the scheduler between rounds. A loop waiting
+/// on a transfer -- here a decode engine waiting for its prefill peer's KV --
+/// runs neither a forward nor an idle frontend wait, the two points that
+/// release the scheduler, so it hands the scheduler to a waiting servicer
+/// once per round instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    let handle = Arc::new(Mutex::new(None));
+    let decode = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire: wire.clone(),
+            }),
+            scheduler: Some(handle.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _stream = decode
+        .client
+        .generate(disaggregated("waiting-kv", 70, 20, 4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while wire
+            .lock()
+            .unwrap()
+            .rooms
+            .get(&70)
+            .is_none_or(|room| room.preallocated.is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("decode allocated its KV landing pages and waits for them");
+
+    let scheduler = handle.lock().unwrap().clone().unwrap();
+    let held = tokio::task::spawn_blocking(move || {
+        scheduler.try_lock_for(Duration::from_secs(5)).is_some()
+    })
+    .await
+    .unwrap();
+    assert!(
+        held,
+        "the servicer waited past five seconds of empty rounds"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
     assert_pause_waits_for_pd_retirement("abort").await;
@@ -4725,6 +4845,9 @@ async fn an_abort_pause_aborts_what_runs_and_a_keep_pause_freezes_it() {
         before += 1;
     }
     assert!(before < 30, "the request kept running while frozen");
+    let load = engine.client.loads()[0];
+    assert_eq!(load.num_resident_tokens, Some(3 + before));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert_eq!(
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", true)]
@@ -5767,4 +5890,214 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         "no round of the {} before the device's was kept",
         device_round - opened
     );
+}
+
+/// Read the real Prometheus files without involving a server or GPU.
+fn exported_gauges(directory: &Path) -> HashMap<String, f64> {
+    Python::attach(|py| {
+        let globals = PyDict::new(py);
+        globals
+            .set_item("directory", directory.to_str().unwrap())
+            .unwrap();
+        py.run(c"import glob, json\nfrom prometheus_client.mmap_dict import MmapedDict\nvalues = {json.loads(key)[1]: value for path in glob.glob(directory + '/gauge_*.db') for key, value, *_ in MmapedDict.read_all_values_from_file(path)}", Some(&globals), None).unwrap();
+        globals
+            .get_item("values")
+            .unwrap()
+            .unwrap()
+            .extract()
+            .unwrap()
+    })
+}
+
+#[test]
+fn scheduler_metrics_follow_dispatched_forwards_and_return_to_zero() {
+    interpreter();
+    for role in [Role::Plain, Role::Prefill, Role::Decode] {
+        for depth in [0, 1] {
+            let directory = std::env::temp_dir().join(format!(
+                "ts-control-metrics-{}-{role:?}-{depth}",
+                std::process::id()
+            ));
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                rooms: (0..12)
+                    .map(|room| {
+                        (
+                            room,
+                            WireRoom {
+                                decode_registered: true,
+                                preallocated: (role == Role::Prefill).then_some(room as i32 + 1),
+                                sent: (role == Role::Decode).then_some(1000),
+                                sent_by: if role == Role::Decode {
+                                    vec![0]
+                                } else {
+                                    Vec::new()
+                                },
+                                ..WireRoom::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            }));
+            let mut script = vec![Vec::new(); 80];
+            for row in 0..12 {
+                let rid = format!("metrics-{row}");
+                let request = if role == Role::Plain {
+                    request(&rid, 80, budget(4))
+                } else {
+                    disaggregated(&rid, row, 80, 4)
+                };
+                script[0].push(EngineRequest::Add(Box::new(request)));
+            }
+            let ranks = run_scripted(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    metrics_dir: Some(directory.clone()),
+                    resident_requests: Some(if role == Role::Decode { 12 } else { 8 }),
+                    pd: (role != Role::Plain).then_some(Pd { role, wire }),
+                    ..Setup::default()
+                },
+                vec![script],
+                no_reaction,
+            );
+            assert_eq!(ranks[0].outcome, Ok(()));
+            assert_eq!(ranks[0].released.len(), 12);
+            assert!(ranks[0].forwards > 0);
+            let gauges = exported_gauges(&directory.join("0"));
+            for name in [
+                "num_requests_running",
+                "num_requests_waiting",
+                "num_requests_inflight",
+            ] {
+                assert_eq!(
+                    gauges[&format!("tokenspeed:{name}")],
+                    0.0,
+                    "{role:?}/{depth}/{name}"
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
+
+#[test]
+fn scheduler_metrics_count_ready_decode_requests_waiting_for_a_permit() {
+    interpreter();
+    let directory = std::env::temp_dir().join(format!("ts-metrics-ready-{}", std::process::id()));
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        rooms: (0..12)
+            .map(|room| {
+                (
+                    room,
+                    WireRoom {
+                        sent: Some(1000),
+                        sent_by: vec![0],
+                        ..WireRoom::default()
+                    },
+                )
+            })
+            .collect(),
+    }));
+    let mut script = vec![Vec::new(); 20];
+    script[0] = (0..12)
+        .map(|row| {
+            EngineRequest::Add(Box::new(disaggregated(
+                &format!("ready-{row}"),
+                row,
+                80,
+                100,
+            )))
+        })
+        .collect();
+    let ranks = run_scripted(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(directory.clone()),
+            resident_requests: Some(12),
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire,
+            }),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert_eq!(ranks[0].outcome, Ok(()));
+    let gauges = exported_gauges(&directory.join("0"));
+    assert_eq!(gauges["tokenspeed:num_requests_running"], 8.0);
+    assert_eq!(gauges["tokenspeed:num_decode_ready_waiting_reqs"], 4.0);
+    assert_eq!(gauges["tokenspeed:num_requests_waiting"], 4.0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn scheduler_metrics_keep_paused_queues_current_without_a_forward() {
+    interpreter();
+    let directory = std::env::temp_dir().join(format!("ts-metrics-paused-{}", std::process::id()));
+    let mut script = vec![Vec::new(); 6];
+    script[0].push(EngineRequest::Add(Box::new(request(
+        "running",
+        16,
+        budget(100),
+    ))));
+    script[1].push(EngineRequest::Control(Box::new(pause("keep"))));
+    script[2].push(EngineRequest::Add(Box::new(request(
+        "paused",
+        16,
+        budget(100),
+    ))));
+    let ranks = run_scripted(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(directory.clone()),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert_eq!(ranks[0].outcome, Ok(()));
+    let gauges = exported_gauges(&directory.join("0"));
+    assert_eq!(gauges["tokenspeed:num_requests_running"], 0.0);
+    assert_eq!(gauges["tokenspeed:num_requests_waiting"], 1.0);
+    assert_eq!(gauges["tokenspeed:num_requests_inflight"], 2.0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn scheduler_metrics_exclude_dp_idle_padding() {
+    interpreter();
+    let directory = std::env::temp_dir().join(format!("ts-metrics-dp-{}", std::process::id()));
+    let mut active = vec![Vec::new(); 20];
+    active[0].push(EngineRequest::Add(Box::new(request(
+        "active",
+        16,
+        budget(4),
+    ))));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(directory.clone()),
+            ..Setup::default()
+        },
+        vec![active, vec![Vec::new(); 20]],
+        no_reaction,
+    );
+    assert!(ranks[1].idle_forwards > 0);
+    assert_eq!(ranks[1].forwards, 0);
+    for (rank, outcome) in ranks.iter().enumerate() {
+        assert_eq!(outcome.outcome, Ok(()));
+        let gauges = exported_gauges(&directory.join(rank.to_string()));
+        assert_eq!(gauges["tokenspeed:num_requests_running"], 0.0);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }

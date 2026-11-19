@@ -42,6 +42,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -77,7 +78,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -143,6 +144,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     nn.Module.__init__(target)
     target.model = DeepseekV41Model.__new__(DeepseekV41Model)
     nn.Module.__init__(target.model)
+    target.model.mapping = _mapping(0, 1, 1)
     target.model.config = SimpleNamespace(
         num_hidden_layers=40,
         hidden_size=2,
@@ -151,7 +153,6 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         engram_max_ngram_size=4,
         engram_n_heads=1,
     )
-    target.model.mapping = _mapping(0, 1, 1)
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
@@ -588,7 +589,21 @@ def test_window_attention_kernel_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_draft_forward_graph_and_context_seeding(monkeypatch):
+@pytest.mark.parametrize(
+    "sampled",
+    [
+        pytest.param(False, id="greedy"),
+        pytest.param(
+            True,
+            id="sampled",
+            marks=pytest.mark.skipif(
+                not (torch.cuda.is_available() and current_platform().is_hopper_plus),
+                reason="sampled adaptive DSpark requires NVIDIA SM90+",
+            ),
+        ),
+    ],
+)
+def test_draft_forward_graph_and_context_seeding(monkeypatch, sampled):
     config = _draft_config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
@@ -651,7 +666,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     assert windows[:, 0].count_nonzero() == 0
 
     _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool)
-    _assert_drafts_follow_their_rows(adapter, windows, pool)
+    _assert_drafts_follow_their_rows(adapter, windows, pool, sampled=False)
 
     bonus = torch.tensor([3, 4], device="cuda:0")
     starts = torch.tensor([4, 4], device="cuda:0")
@@ -706,12 +721,13 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
         graph.reset()
     with monkeypatch.context() as adaptive:
         adaptive.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
+        adaptive.setitem(global_server_args_dict, "dsv41_dspark_min_batch_size", 1)
         _assert_adaptive_inputs_and_state(adapter)
-        _assert_drafts_follow_their_rows(adapter, windows, pool)
+        _assert_drafts_follow_their_rows(adapter, windows, pool, sampled=sampled)
 
 
 @torch.inference_mode()
-def _assert_drafts_follow_their_rows(adapter, windows, pool):
+def _assert_drafts_follow_their_rows(adapter, windows, pool, *, sampled):
     """Permuting a decode batch permutes its drafts: no row reads another's state.
 
     Three decode requests with different bonus tokens, accept lengths and
@@ -752,6 +768,40 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
             logits_processor=SimpleNamespace(tp_group=adapter.mapping.attn.tp_group),
         )
     )
+    if sampled:
+        from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+        from tokenspeed.runtime.sampling.backends.flashinfer import (
+            FlashInferSamplingBackend,
+        )
+        from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+        drafter.runtime_states.init_draft_probs(
+            spec_num_tokens=width, reject_threshold=2.0
+        )
+        sampler = FlashInferSamplingBackend(
+            SamplingBackendConfig(
+                synthetic_acceptance_length=None,
+                enable_speculative_sampling=True,
+                sampling_stream="per-request",
+                logprob_order="torch",
+                max_bs=n,
+                max_draft_tokens_per_req=width,
+                max_req_pool_size=8,
+                vocab_size=adapter.model.config.vocab_size,
+                device="cuda:0",
+            )
+        )
+        params = [
+            SamplingParams(temperature=0.8, top_k=-1, top_p=0.9, seed=i + 31)
+            for i in range(n)
+        ]
+        for i, param in enumerate(params):
+            param.resolve_seed(f"sampled-{i}")
+            param.normalize(None)
+        sampler.prepare_step(
+            [f"sampled-{i}" for i in range(n)], [1, 2, 3], params, width
+        )
+        drafter.bind_sampling_backend(sampler)
     torch.manual_seed(3)
     # The synthetic checkpoint's Markov weights are constants, which makes the
     # bigram bias the same for every anchor; random weights make the drafts
@@ -771,7 +821,7 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         0, adapter.model.config.vocab_size, (n, width), device="cuda:0"
     ).to(torch.int32)
 
-    def run(order, *, packed=False):
+    def run(order, *, packed=False, state_write_slots=None):
         lengths = [accepts[i] if packed else width for i in order]
         positions = torch.cat(
             [
@@ -804,28 +854,53 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
         windows.zero_()
         slots = torch.tensor([i + 1 for i in order], device="cuda:0")
-        ib.state_write_req_pool_indices_buf[:n].copy_(slots)
-        result = drafter.run(
-            base_ctx=ctx,
-            logits_output=SimpleNamespace(
-                hidden_states=torch.cat(
-                    [
-                        hidden[i, :length]
-                        for i, length in zip(order, lengths, strict=True)
-                    ]
-                )
-            ),
-            output_tokens=tokens[order].reshape(-1),
-            accept_lengths=torch.tensor(
-                [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
-            ),
-        ).clone()
+        write_slots = (
+            slots
+            if state_write_slots is None
+            else torch.tensor(state_write_slots, device="cuda:0")
+        )
+        ib.req_pool_indices_buf[:n].copy_(slots)
+        ib.state_write_req_pool_indices_buf[:n].copy_(write_slots)
+        logits_output = SimpleNamespace(
+            hidden_states=torch.cat(
+                [hidden[i, :length] for i, length in zip(order, lengths, strict=True)]
+            )
+        )
+        output_tokens = tokens[order].reshape(-1)
+        accept_lengths = torch.tensor(
+            [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
+        )
+
+        def draft():
+            return drafter.run(
+                base_ctx=ctx,
+                logits_output=logits_output,
+                output_tokens=output_tokens,
+                accept_lengths=accept_lengths,
+            )
+
+        result = draft().clone()
+        if sampled and order == [0, 1, 2] and not packed and state_write_slots is None:
+            expected_q = drafter.runtime_states.draft_probs[1:4, :block].clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = draft()
+            drafter.runtime_states.draft_probs[1:4, :block].zero_()
+            graph.replay()
+            torch.testing.assert_close(captured, result, rtol=0, atol=0)
+            torch.testing.assert_close(
+                drafter.runtime_states.draft_probs[1:4, :block],
+                expected_q,
+                rtol=0,
+                atol=0,
+            )
+            graph.reset()
         if drafter.confidence_scores is not None:
             expected = adapter.model.confidence_logits(
                 drafter.confidence_features[:n], result[:, :-1]
             )
             torch.testing.assert_close(
-                drafter.confidence_scores.index_select(0, slots),
+                drafter.confidence_scores.index_select(0, write_slots),
                 expected,
                 rtol=0,
                 atol=0,
@@ -833,6 +908,13 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         return result
 
     forward = run([0, 1, 2])
+    proposal_laws = None
+    if sampled:
+        proposal_laws = drafter.runtime_states.draft_probs[1:4, :block].clone()
+        torch.testing.assert_close(
+            proposal_laws.sum(-1), torch.ones(n, block, device="cuda:0")
+        )
+        assert (proposal_laws.gather(-1, forward[:, 1:, None].long()) > 0).all()
     forward_scores = (
         None
         if drafter.confidence_scores is None
@@ -846,6 +928,32 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
     )
     rotated = run([2, 0, 1])
     torch.testing.assert_close(rotated, forward[[2, 0, 1]], rtol=0, atol=0)
+    if proposal_laws is not None:
+        torch.testing.assert_close(
+            drafter.runtime_states.draft_probs[1:4, :block],
+            proposal_laws,
+            rtol=0,
+            atol=0,
+        )
+        # A masked state write must use the dummy slot without overwriting
+        # the original request's proposal state or changing its read-side RNG.
+        drafter.runtime_states.draft_probs[1].fill_(-17)
+        masked = run([0, 1, 2], state_write_slots=[0, 2, 3])
+        torch.testing.assert_close(masked, forward, rtol=0, atol=0)
+        assert (drafter.runtime_states.draft_probs[1] == -17).all()
+        torch.testing.assert_close(
+            drafter.runtime_states.draft_probs[0, :block],
+            proposal_laws[0],
+            rtol=0,
+            atol=0,
+        )
+        run([0, 1, 2])
+        torch.testing.assert_close(
+            drafter.runtime_states.draft_probs[1:4, :block],
+            proposal_laws,
+            rtol=0,
+            atol=0,
+        )
     if forward_scores is not None:
         torch.testing.assert_close(
             drafter.confidence_scores[1:4], forward_scores, rtol=0, atol=0
@@ -1276,8 +1384,12 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
     )
     _mock_loader_hardware(monkeypatch, mapping)
     monkeypatch.delitem(global_server_args_dict, "disaggregation_mode", raising=False)
+    config = _draft_config()
+    # Ordinary EP requires this alignment; use the same geometry for both
+    # loaded backends in the local-graph admission check below.
+    config.hidden_size = 256
     adapter = DeepseekV41ForCausalLMDSpark(
-        DeepseekV41Config(text_config=vars(_draft_config())), mapping, _quant()
+        DeepseekV41Config(text_config=vars(config)), mapping, _quant()
     )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     # The runner's GPU initialization is outside this CPU checkpoint test.
@@ -1316,6 +1428,27 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
         == adapter.model.markov_projection.weight.shape[0]
     )
     assert adapter.checkpoint_load_report["loaded"] > 0
+
+    # This loader fixture constructs real MegaMoE layers on CPU.
+    drafter.target_model = adapter
+    drafter.configure_decode_graph_scope(local=True)
+    drafter.configure_decode_graph_scope(local=False)
+    from tokenspeed.runtime.layers.moe import expert as expert_module
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+    from tokenspeed.runtime.models import deepseek_v41_moe as v4
+
+    with monkeypatch.context() as ordinary:
+        for module in (v41, v4, expert_module):
+            ordinary.setattr(module, "get_moe_backend", lambda: MoeBackend.TRITON)
+        layer = v41.DeepseekV41MoE(
+            adapter.model.config, mapping, _quant(), 0, "ordinary", None
+        )
+    adapter.model.layers[0].ffn = layer
+    with pytest.raises(ValueError, match="target and draft MegaMoE"):
+        drafter.configure_decode_graph_scope(local=True)
+    drafter.target_model = nn.Linear(1, 1)
+    with pytest.raises(ValueError, match="native V4.1 target model"):
+        drafter.configure_decode_graph_scope(local=True)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -1487,8 +1620,8 @@ def _assert_adaptive_inputs_and_state(adapter):
     torch.testing.assert_close(
         drafter.confidence_scores[2], drafter.confidence_scores[1]
     )
-    drafter.export_slot_state(1, image, stream, admission_id=104)
-    drafter.import_slot_state(0, image, stream, admission_id=104)
+    drafter.export_slot_state(1, image, stream, admission_id=999)
+    drafter.import_slot_state(0, image, stream, admission_id=999)
     assert torch.isposinf(drafter.confidence_scores[0]).all()
 
     ctx = prepare([103, 102], [1, 3])
@@ -1558,6 +1691,22 @@ def _assert_adaptive_inputs_and_state(adapter):
     drafter.set_decode_graph_query_extent(None)
 
 
+def test_packed_grammar_mask_gather_uses_published_verify_rows():
+    drafter = object.__new__(DeepseekV41DSpark)
+    drafter.device = torch.device("cpu")
+    drafter.spec_num_tokens = 4
+    drafter._verify_rows = torch.empty(12, dtype=torch.int64)
+    drafter._verify_indptr = torch.empty(4, dtype=torch.int64)
+    drafter._verify_layout_counts = None
+    drafter.prepare_verify_layout((2, 4, 1), num_tokens=9)
+
+    vocab_mask = torch.arange(48, dtype=torch.int32).reshape(12, 4)
+    packed = drafter.pack_grammar_vocab_mask(vocab_mask, num_tokens=9)
+    expected_rows = torch.tensor([0, 1, 4, 5, 6, 7, 8, 0, 0])
+    torch.testing.assert_close(packed, vocab_mask.index_select(0, expected_rows))
+    assert drafter._verify_indptr.tolist() == [0, 2, 6, 7]
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -1570,8 +1719,6 @@ def _assert_adaptive_inputs_and_state(adapter):
         ("query_context_parallel_size", 2),
         ("pipeline_parallel_size", 2),
         ("dp_sampling", True),
-        ("grammar_backend", "xgrammar"),
-        ("enable_output_logprobs", True),
         ("enable_output_cumulative_probs", True),
         ("enable_speculative_sampling", True),
         ("speculative_eagle_topk", 2),
@@ -1601,11 +1748,61 @@ def test_adaptive_v41_launch_contract(field, value):
     args.validate_dsv41_adaptive_dspark()
 
 
+def _adaptive_dp_local_cli(sampling_backend: str) -> list[str]:
+    argv = [
+        "--model",
+        "x",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--sampling-backend",
+        sampling_backend,
+        "--moe-backend",
+        "mega_moe",
+        "--enable-dp-local-cuda-graph",
+        "--enable-dsv41-adaptive-dspark",
+        "--disable-prefill-graph",
+        "--grammar-backend",
+        "xgrammar",
+        "--enable-output-logprobs",
+    ]
+    if sampling_backend == "flashinfer":
+        argv += [
+            "--enable-speculative-sampling",
+            "--sampling-stream",
+            "per-request",
+            "--speculative-rejection-sample-method",
+            "standard",
+        ]
+    return argv
+
+
+@pytest.mark.parametrize("sampling_backend", ["greedy", "flashinfer"])
+def test_adaptive_dp_local_accepts_xgrammar_and_output_logprobs(sampling_backend):
+    args = prepare_server_args(
+        _adaptive_dp_local_cli(sampling_backend)
+        + ["--data-parallel-size", "2", "--enable-expert-parallel"]
+    )
+    assert args.mapping.attn.dp_size == 2
+    assert args.enable_dp_local_cuda_graph
+    assert args.grammar_backend == "xgrammar"
+    assert args.enable_output_logprobs
+
+
+@pytest.mark.parametrize("sampling_backend", ["greedy", "flashinfer"])
+def test_adaptive_dp_local_still_rejects_cumulative_probs(sampling_backend):
+    with pytest.raises(ValueError, match="adaptive verification does not support"):
+        prepare_server_args(
+            _adaptive_dp_local_cli(sampling_backend)
+            + ["--enable-output-cumulative-probs"]
+        )
+
+
 @pytest.mark.parametrize(
     "bs,capacity", [(32, 128), (32, 144), (32, 192), (16, 64), (4, 16)]
 )
 def test_verify_graph_token_capacity(bs, capacity):
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.device = torch.device("cpu")
     drafter.spec_num_tokens = 6
     drafter.adaptive_min_batch_size = 1
@@ -1625,6 +1822,7 @@ def test_small_or_padded_batches_keep_full_verification(actual, padded):
     from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
 
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.spec_num_tokens = 6
     drafter.verify_budget_policy = VerifyBudgetPolicy(True, 32, 6, 0.02)
     drafter.draft_model = SimpleNamespace(mapping=_mapping(0, 1, 1))
@@ -1656,6 +1854,7 @@ def test_fine_verify_graph_capture_plan_and_keys():
     from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.device = torch.device("cpu")
     drafter.spec_num_tokens = 6
     drafter.adaptive_min_batch_size = 1
@@ -1663,6 +1862,7 @@ def test_fine_verify_graph_capture_plan_and_keys():
     drafter.confidence_scores = torch.empty(1)
     drafter.verify_graph_token_step = 8
     runner = object.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.disable = False
     runner.capture_bs = [1, 8, 16, 32]
     runner.sampling_backend = None
@@ -1720,6 +1920,7 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
 
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     from tokenspeed.runtime.execution.drafter.verify_calibration import (
         VerifyCalibration,
     )
@@ -1765,6 +1966,8 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter._verify_layout_counts = None
     drafter._verify_budget_graphs = {}
     drafter._verify_budget_buffers = {}
+    drafter._verify_budget_counts = {}
+    drafter._verify_budget_context_bounds = None
     stream = torch.cuda.Stream()
     pool = torch.cuda.graph_pool_handle()
     drafter.capture_round_graphs(2, stream=stream, pool=pool)
@@ -1772,6 +1975,13 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter.capture_round_graphs(4, stream=stream, pool=pool)
     graphs = dict(drafter._verify_budget_graphs)
     drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    assert drafter._verify_budget_graphs == graphs
+    oversized_bs = dsv41.VERIFY_LAYOUT_MAX_TOKENS // drafter.spec_num_tokens + 1
+    drafter.capture_round_graphs(oversized_bs, stream=stream, pool=pool)
+    assert oversized_bs not in drafter._verify_budget_buffers
+    assert drafter.decode_graph_query_capacities(oversized_bs) == (
+        oversized_bs * drafter.spec_num_tokens,
+    )
     assert drafter._verify_budget_graphs == graphs
     scores = torch.randn(4, 5, device="cuda")
     for capacity in (20, 4, 12, 8, 16, 12):

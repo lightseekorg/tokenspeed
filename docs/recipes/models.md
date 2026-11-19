@@ -743,6 +743,17 @@ Notes:
   sets `dflash_config.causal`). `--drafter-attention-backend tokenspeed_mla`,
   `mla` and `gluon` run causal blocks, the last two under KVP too; the other
   MLA drafter backends refuse the draft at startup.
+- The released Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark`) is
+  saved by the `speculators` library. TokenSpeed converts its config to the
+  DFlash layout at load time: draft layers from `transformer_layer_config`,
+  target taps one below each `aux_hidden_state_layer_ids` entry, and the mask
+  token, whose trained embedding row replaces the target's. Its five GQA
+  layers slide over a 2048-token window and attend causally within the block,
+  so serve it with `--drafter-attention-backend mha`, which also runs it
+  under KVP. Its `block_size` of 7 is
+  the number of drafted tokens, so the verify window is one larger
+  (`--speculative-num-draft-tokens 8`). Other `speculators` DSpark drafts
+  load the same way.
 - A checkpoint with a Python XTML encoder and no Jinja chat template needs
   its tokenizer's `apply_chat_template` to encode messages. Pass the token
   IDs as `input_ids` to the native `/generate` endpoint.
@@ -1221,6 +1232,40 @@ ts serve \
     --speculative-num-steps 3
 ```
 
+On SM107, also set `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` (FlashInfer
+0.7.4) in the server's environment. It changes which routing kernels FlashInfer
+runs for this model's routes (512 experts, top-10, softmax). By default, from
+32 to 256 tokens per MoE call, FlashInfer splits routing into a
+block-per-token top-k kernel and a permutation kernel; with the variable set,
+it runs one fused single-cluster kernel. With the variable set, from 257 to
+1024 tokens it uses the warp-per-token top-k kernel instead of the
+block-per-token one. Calls below 32
+or above 1024 tokens are unchanged, and the routed experts and weights are
+bit-identical either way. With MTP 3 steps, the target's MoE calls route 4
+tokens per request, so a batch of 8 requests makes 32-token calls.
+
+FlashInfer's default for this route comes from a routing-only sweep that
+covered SM100 and SM103 as well, and FlashInfer labels the variable a
+benchmarking override. The timings below were measured only on SM107, with the
+NVFP4 checkpoint at TP1 (BF16 router logits), so they are not a measurement of
+the FP8 command above; the token ranges, which depend only on the expert count,
+top-k and token count, are the same for it. FlashInfer reads the variable once
+per process for all of its custom (non-grouped) routing, whose default was
+tuned across expert counts and top-k, so set it only for this model.
+
+Routing per MoE layer below runs from the end of the hyper-connection mix to
+the start of FC1:
+
+| decode batch | routing per MoE layer | decode step |
+|---|---|---|
+| 1 | 4.4 -> 4.4 us | -0.6% (noise) |
+| 8 | 13.3 -> 9.2 us | -3.5% (median of 3 runs) |
+| 32 | 15.7 -> 12.0 us | -2.9% |
+| 64 | 18.3 -> 15.3 us | -1.3% |
+| 128 | 21.0 -> 20.7 us | -0.1% |
+
+A 16k-token prefill chunk is unchanged.
+
 ### AMD
 
 On AMD MI350X/MI355X (gfx950), serve the
@@ -1276,6 +1321,21 @@ object:
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
+
+### FlatKV cache
+
+Qwen4-Exp uses FlatKV by default, putting target and draft KV, GDN, PLE and QSA
+fields on one shared physical plane while preserving their logical groups.
+Qwen3.8-Flash-Next has five groups, with all GDN layers in one group. Each group
+packs pages according to its payload and alignment. Full-history K/V and
+compressed QSA use translated atom-page IDs; state and recent windows retain
+explicit strides. No KV gather is introduced.
+
+This requires PP=1, uniform K/V heads within each compute view and non-MXFP8
+KV. It reduces padding for partially filled groups; a full-attention parent
+that was already full keeps the same useful KV bytes per token. Use
+`--no-qwen4-exp-flat-kv` for the plane-based layout. L3 compatibility follows
+the resulting cache layout.
 
 ## GPT-OSS 20B / 120B
 

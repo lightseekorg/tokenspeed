@@ -61,7 +61,10 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+VERIFY_LAYOUT_MAX_TOKENS = 4096
+
 __all__ = [
+    "VERIFY_LAYOUT_MAX_TOKENS",
     "IndexKeyInput",
     "IndexQueryInput",
     "SelectionSlots",
@@ -1967,15 +1970,15 @@ def verify_layout(
     Requires GPU scores with unit column stride and B*(D+1) <= 4096.
     Unsupported layouts raise ValueError.
     All outputs have stable caller-owned storage and no host readback is used.
-    latest_scores [slots,D] and request_slots [B] select current GPU confidence
-    by request; pass None for both to use the history only. A non-finite latest
-    row uses the entire history row from scores. Supply both or neither; slot
-    indices must address the table.
+    latest_scores [slots,D] and request_slots [B] select current GPU
+    confidence by request; pass None for both to use the history only. A
+    non-finite latest row uses the entire history row from scores. Supply both
+    or neither; slot indices must address the table.
 
-    active_count, when not None, holds the live prefix length in a device
-    scalar. Its value must be in [0,B]. Padding retains one anchor but receives
-    no draft allocation; the caller masks its state writes and discards its
-    output.
+    active_count holds the live prefix length in a device scalar; pass None
+    when every request is live.
+    Its value must be in [0,B]. Padding retains one anchor but receives no draft
+    allocation; the caller masks its state writes and discards its output.
 
     Non-finite rows require full width. If the budget cannot cover them,
     valid_out is false and outputs describe anchor-only verification with
@@ -1993,9 +1996,10 @@ def verify_layout(
         and latest_scores.stride(1) != 1
     ):
         raise ValueError("verification scores require unit column stride")
-    if bs * (draft_width + 1) > 4096:
+    if bs * (draft_width + 1) > VERIFY_LAYOUT_MAX_TOKENS:
         raise ValueError(
-            "verification layout requires batch * (draft width + 1) <= 4096"
+            "verification layout requires batch * (draft width + 1) "
+            f"<= {VERIFY_LAYOUT_MAX_TOKENS}"
         )
     if (
         bs < 1

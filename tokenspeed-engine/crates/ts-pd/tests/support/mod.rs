@@ -221,12 +221,35 @@ pub(crate) fn pair_on_port(
     step_address: Option<usize>,
     port: u16,
 ) -> Pair {
+    pair_on_port_with_metrics(
+        library,
+        source,
+        destination,
+        bootstrap_timeout,
+        step_address,
+        port,
+        None,
+    )
+}
+
+pub(crate) fn pair_on_port_with_metrics(
+    library: PathBuf,
+    source: &[u8],
+    destination: &[u8],
+    bootstrap_timeout: Duration,
+    step_address: Option<usize>,
+    port: u16,
+    metrics: Option<std::sync::Arc<ts_metrics::KvTransferMetrics>>,
+) -> Pair {
     let server = BootstrapServer::start(port, Registry::CacheLayouts).unwrap();
     let port = server.port();
     let source_base = source.as_ptr() as u64;
     let parse = |wire: String| Contract::from_wire(wire.as_bytes()).unwrap();
     let (prefill, prefill_outbox) = PrefillPeer::start(PrefillConfig {
-        peer: peer_config(library.clone(), source),
+        peer: PeerConfig {
+            metrics,
+            ..peer_config(library.clone(), source)
+        },
         layout: PrefillLayout {
             local: parse(layout(Some(source_base))),
             wire: parse(layout(None)),

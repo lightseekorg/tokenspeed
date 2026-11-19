@@ -33,6 +33,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.pd.kv_events import (  # noqa: E402
+    MEDIUM_HOST,
     BlockRemoved,
     BlockStored,
     KVEventBatch,
@@ -51,6 +52,14 @@ def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
                     block_size=2,
                 ),
                 BlockRemoved(block_hashes=[123]),
+                BlockStored(
+                    block_hashes=[124],
+                    parent_block_hash=123,
+                    token_ids=[3, 4],
+                    block_size=2,
+                    medium=MEDIUM_HOST,
+                ),
+                BlockRemoved(block_hashes=[124], medium=MEDIUM_HOST),
             ],
             attn_dp_rank=2,
         )
@@ -58,11 +67,15 @@ def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
 
     decoded = msgspec.msgpack.decode(payload)
 
+    # vLLM's layout: a store's lora_id (None) then its medium, a removal's
+    # medium; None is the GPU cache.
     assert decoded == [
         1.5,
         [
-            ["BlockStored", [123], None, [1, 2], 2],
-            ["BlockRemoved", [123]],
+            ["BlockStored", [123], None, [1, 2], 2, None, None],
+            ["BlockRemoved", [123], None],
+            ["BlockStored", [124], 123, [3, 4], 2, None, "CPU_PINNED"],
+            ["BlockRemoved", [124], "CPU_PINNED"],
         ],
         2,
     ]

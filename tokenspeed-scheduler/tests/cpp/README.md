@@ -128,6 +128,37 @@ each revision with its matching headers/core, run the driver with `--module-dir`
 and `--output`, and compare the parsed JSON. This complements the C++ and
 Python behavioral suites; it does not expose or depend on hash-slot order.
 
+## Admission into an aged cache
+
+`tokenspeed_scheduler_aged_cache_benchmark` measures one prefill chunk's
+admission into a full Device cache whose LCM parents hold entries of many
+access epochs, the state a long-running server reaches. Build it like the
+full-cache benchmark (target `tokenspeed_scheduler_aged_cache_benchmark`); its
+arguments are
+
+```text
+PARENTS plain|dspark PREFIX_GRANULARITY HISTORY_TOKENS AGE_ROUNDS EVICT_PERCENT CHUNK_TOKENS WARMUPS REPEATS
+```
+
+- The geometry is DeepSeek V4.1 Flash's four cache groups, packed without
+  (`plain`) or with (`dspark`) DSpark (`deepseek_v41_geometry.py`): two cached
+  global groups beside the replayable SWA and compressor-tail windows, which
+  cache nothing, so a chunk's admission needs empty parents.
+- Fresh `HISTORY_TOKENS`-token histories are published into the cached groups
+  until the next would need eviction. Each of `AGE_ROUNDS` rounds evicts
+  `EVICT_PERCENT` of the cached blocks at random and fills up again; hole-first
+  placement puts the newer histories beside the older entries.
+- Each sample admits the first `CHUNK_TOKENS` chunk of a fresh prompt in every
+  group (`admit_including_eviction`), then releases its blocks unpublished and
+  refills the cache outside timing.
+
+For example, 43,231 parents with DSpark packing and 256-token pages:
+
+```bash
+taskset -c 2 tokenspeed-scheduler/build/full-cache/tokenspeed_scheduler_aged_cache_benchmark \
+  43231 dspark 256 32768 3 25 16384 1 20
+```
+
 ## Decode rounds with long contexts
 
 `tokenspeed_scheduler_decode_rounds_benchmark` measures the steady state of a

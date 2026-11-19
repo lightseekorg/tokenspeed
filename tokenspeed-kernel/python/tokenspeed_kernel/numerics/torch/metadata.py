@@ -71,3 +71,65 @@ def torch_expand_block_table_rows(
         row[:start] = 0
         row[start:end] = values[source : source + end - start]
         row[end:] = -1
+
+
+@register_kernel(
+    "metadata",
+    "prepare_decode_tables",
+    name="torch_prepare_decode_tables",
+    solution="torch",
+    signatures=format_signatures("tables", "dense", {torch.int32}),
+    priority=Priority.REFERENCE,
+)
+def torch_prepare_decode_tables(
+    sources: tuple[torch.Tensor, ...],
+    tables: torch.Tensor,
+    locations: torch.Tensor,
+    lengths: torch.Tensor,
+    actual_bs: int,
+    tokens_per_req: int,
+    ratios: tuple[int, ...],
+    atom_pages_per_block: tuple[int, ...],
+    pages: tuple[int, ...],
+    page_sizes: tuple[int, ...],
+    targets: tuple[tuple[torch.Tensor, torch.Tensor, int] | None, ...],
+) -> None:
+    """Torch implementation of ``prepare_decode_tables``' in-place contract."""
+    bs = lengths.numel()
+    if bs == 0:
+        return
+    steps = torch.arange(tokens_per_req, device=tables.device)
+    positions = (lengths.to(torch.int64)[:, None] - tokens_per_req + steps).clamp_min(0)
+    requests = torch.arange(bs, device=tables.device)[:, None]
+    for g, source in enumerate(sources):
+        dst = tables[g, :bs]
+        if actual_bs:
+            num_blocks = min(source.shape[1], -(-pages[g] // ratios[g]))
+            blocks = source[:actual_bs, :num_blocks].to(torch.int64).unsqueeze(-1)
+            offsets = torch.arange(ratios[g], device=blocks.device)
+            live = torch.where(
+                blocks > 0, blocks * atom_pages_per_block[g] + offsets, 0
+            ).reshape(actual_bs, -1)
+            num_pages = min(live.shape[1], pages[g])
+            dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])
+            dst[:actual_bs, num_pages:].zero_()
+        dst[actual_bs:].zero_()
+        page_index = positions // page_sizes[g]
+        page = dst[requests, page_index.clamp_max(dst.shape[1] - 1)].to(torch.int64)
+        slots = page * page_sizes[g] + positions % page_sizes[g]
+        slots = torch.where((page_index >= dst.shape[1]) | (page <= 0), 0, slots)
+        locations[g, : bs * tokens_per_req].copy_(slots.flatten())
+    copies = [(g, target) for g, target in enumerate(targets) if target is not None]
+    if copies:
+        floored = {
+            floor: lengths if floor <= 1 else lengths.clamp_min(floor)
+            for floor in {target[2] for _, target in copies}
+        }
+        torch._foreach_copy_(
+            [buf for _, target in copies for buf in target[:2]],
+            [
+                src
+                for g, target in copies
+                for src in (floored[target[2]], tables[g, :bs, : pages[g]])
+            ],
+        )

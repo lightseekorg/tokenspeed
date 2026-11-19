@@ -38,7 +38,10 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
+from tokenspeed.runtime.sampling.tree_verify import (
+    accepted_path_rows,
+    packed_accepted_path_rows,
+)
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -231,6 +234,7 @@ class GreedySamplingBackend(SamplingBackend):
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = True
+    supports_packed_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -295,9 +299,7 @@ class GreedySamplingBackend(SamplingBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if query_start_loc is not None and (
             tree is not None
-            or sampling_info.vocab_mask is not None
             or self.config.synthetic_acceptance_length is not None
-            or self.config.enable_output_logprobs
             or self.config.enable_output_cumulative_probs
         ):
             raise ValueError("packed greedy verification requires plain chain sampling")
@@ -312,8 +314,8 @@ class GreedySamplingBackend(SamplingBackend):
 
         logits = logits_output.next_token_logits
 
-        # Per-draft-position grammar bitmask: buffer shape
-        # [bs * num_tokens_per_req, V/32] matches the flat target logits.
+        # Per-draft-position grammar bitmask. Full-width masks are request-major;
+        # the executor has already gathered packed masks into target-logit order.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
                 logits=logits,
@@ -380,6 +382,11 @@ class GreedySamplingBackend(SamplingBackend):
             if tree is not None:
                 # predict is packed along the path; score it against the path's own rows.
                 logits = logits.index_select(0, accepted_path_rows(accept_index))
+            elif query_start_loc is not None:
+                logits = logits.index_select(
+                    0,
+                    packed_accepted_path_rows(accept_index, query_start_loc),
+                )
             logits_output.next_token_logprobs = gather_token_logprobs(
                 logits, predict, logprob_order=self.config.logprob_order
             )

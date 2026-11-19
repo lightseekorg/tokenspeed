@@ -234,3 +234,183 @@ fn blocked_write_retirement(cancel_decode: bool) {
     transfer_one(&mut pair, "next", 4243, &mut mesh, &group);
     assert!(landed(&destination, &source));
 }
+
+fn transfer_counter(directory: &std::path::Path, name: &str) -> f64 {
+    let result = std::process::Command::new("python3")
+        .env("PROMETHEUS_MULTIPROC_DIR", directory)
+        .arg("-c")
+        .arg("import sys; from prometheus_client import CollectorRegistry, multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r); print(sum(s.value for m in r.collect() for s in m.samples if s.name == sys.argv[1]))")
+        .arg(name)
+        .output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn room_end_metrics(name: &str, cancel_decode: Option<bool>) {
+    let directory =
+        std::env::temp_dir().join(format!("ts-pd-metrics-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let metrics = std::sync::Arc::new(ts_metrics::KvTransferMetrics::new(&exporter, "m", ""));
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair_on_port_with_metrics(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(120),
+        None,
+        0,
+        Some(metrics),
+    );
+    let (mut mesh, group) = single_rank();
+    prepare(&mut pair, "r", &mut mesh, &group);
+    match cancel_decode {
+        Some(true) => pair.decode.cancel("r"),
+        Some(false) => pair.prefill.cancel("r"),
+        None => {
+            pair.prefill.abort_room("r", pair.bootstrap.room);
+            pair.prefill.abort_room("r", pair.bootstrap.room);
+        }
+    }
+    expect_cancelled(&mut pair.prefill, "r", &mut mesh, &group);
+    expect_cancelled(&mut pair.decode, "r", &mut mesh, &group);
+    assert_eq!(
+        transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
+        if cancel_decode.is_some() { 0.0 } else { 1.0 }
+    );
+}
+
+#[test]
+fn explicit_prefill_cancel_does_not_increment_transfer_failures() {
+    room_end_metrics("prefill-cancel", Some(false));
+}
+
+#[test]
+fn remote_decode_cancel_does_not_increment_transfer_failures() {
+    room_end_metrics("decode-cancel", Some(true));
+}
+
+#[test]
+fn a_failed_room_increments_transfer_failures_once() {
+    room_end_metrics("failure", None);
+}
+
+fn replica_end_metrics(cause: &str) {
+    let library = native::NativeLibrary::new();
+    let listeners: Vec<_> = (0..2)
+        .map(|_| ts_collective::Listener::bind("127.0.0.1").unwrap())
+        .collect();
+    let addresses: Vec<_> = listeners
+        .iter()
+        .map(|l| format!("127.0.0.1:{}", l.port().unwrap()))
+        .collect();
+    let results = thread::scope(|scope| {
+        let workers: Vec<_> = listeners
+            .into_iter()
+            .enumerate()
+            .map(|(rank, listener)| {
+                let addresses = &addresses;
+                let library = library.path().to_path_buf();
+                scope.spawn(move || {
+                    let directory = std::env::temp_dir().join(format!(
+                        "ts-pd-replica-{cause}-{rank}-{}",
+                        std::process::id()
+                    ));
+                    std::fs::create_dir_all(&directory).unwrap();
+                    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+                        prometheus_dir: Some(directory.clone()),
+                        relay_endpoint: None,
+                    })
+                    .unwrap();
+                    let metrics =
+                        std::sync::Arc::new(ts_metrics::KvTransferMetrics::new(&exporter, "m", ""));
+                    let source = pattern();
+                    let destination = vec![0u8; BYTES];
+                    let timeout = if rank == 0 && cause == "timeout" {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(120)
+                    };
+                    let mut pair = pair_on_port_with_metrics(
+                        library,
+                        &source,
+                        &destination,
+                        timeout,
+                        None,
+                        0,
+                        Some(metrics),
+                    );
+                    pair.prefill.register("r", &pair.bootstrap).unwrap();
+                    // Only one rank has observed a terminal event when the real
+                    // collective runs; the other still waits for its manifest.
+                    if rank == 0 {
+                        match cause {
+                            "cancel" => pair.prefill.cancel("r"),
+                            "failure" => pair.prefill.abort_room("r", pair.bootstrap.room),
+                            "timeout" => {}
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut mesh = ts_collective::Mesh::connect(
+                        rank,
+                        listener,
+                        addresses,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap();
+                    let replica = ts_collective::Group::new(0, vec![0, 1], rank).unwrap();
+                    let events = pair.prefill.poll(&mut mesh, &replica).unwrap();
+                    assert_eq!(
+                        events,
+                        [PdEvent::Failed("r".into()), PdEvent::Stopped("r".into())]
+                    );
+                    assert!(pair.prefill.poll(&mut mesh, &replica).unwrap().is_empty());
+                    (
+                        transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
+                        transfer_counter(&directory, "tokenspeed:kv_transfer_timeouts_total"),
+                    )
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let expected = match cause {
+        "cancel" => vec![(0.0, 0.0), (0.0, 0.0)],
+        "timeout" => vec![(0.0, 1.0), (0.0, 0.0)],
+        "failure" => vec![(1.0, 0.0), (0.0, 0.0)],
+        _ => unreachable!(),
+    };
+    assert_eq!(results, expected);
+}
+
+#[test]
+fn replica_cancel_propagation_does_not_invent_a_transfer_failure() {
+    replica_end_metrics("cancel");
+}
+
+#[test]
+fn replica_timeout_propagation_keeps_timeout_separate_from_failure() {
+    replica_end_metrics("timeout");
+}
+
+#[test]
+fn replica_failure_propagation_counts_only_the_rank_that_detected_it() {
+    replica_end_metrics("failure");
+}

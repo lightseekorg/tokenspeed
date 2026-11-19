@@ -24,15 +24,8 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.moe._triton.common import _float32_to_ordered_key
 from tokenspeed_kernel.platform import Platform, current_platform
-
-
-@triton.jit
-def _float32_to_ordered_key(value):
-    bits = value.to(tl.uint32, bitcast=True)
-    sign = tl.full(bits.shape, 0x80000000, tl.uint32)
-    full = tl.full(bits.shape, 0xFFFFFFFF, tl.uint32)
-    return bits ^ tl.where((bits & sign) != 0, full, sign)
 
 
 @triton.jit
@@ -236,6 +229,9 @@ _SORTED_ROW_WORDS = 8
 _SORTED_MAX_ROWS = 32 * _SORTED_ROW_WORDS
 # Routes each sorting program places, one per thread.
 _SORTED_HELPER_ROUTES = 512
+# Through one mask word of rows, the row programs place their own routes once
+# every row has arrived, without sorting programs.
+_SELF_SORT_MAX_ROWS = 32
 # The shared-expert down projection a sorted launch can carry. Each program
 # writes a block of output columns of every row, reducing K in 256-wide steps:
 # 32 columns spread the weight over more CUs through 32 rows, and 64 halve the
@@ -250,8 +246,10 @@ def _shared_down_block_n(rows: int) -> int:
 
 
 def _sorted_scratch_words() -> int:
-    # [896 * ROW_WORDS] arrival masks, the arrival and sorted counters.
-    return 896 * _SORTED_ROW_WORDS + 16
+    # [896 * ROW_WORDS] arrival masks, the arrival and sorted counters; then
+    # the self-sorting launches' two [896] mask buffers, their two arrival
+    # counters and the launch epoch.
+    return 896 * _SORTED_ROW_WORDS + 16 + 2 * 896 + 16
 
 
 @triton.jit
@@ -360,6 +358,85 @@ def _kimi3_sorted_routes(
 
 
 @triton.jit
+def _kimi3_self_sorted_routes(
+    selected_ids,
+    selected_weights,
+    row,
+    rows,
+    masks,
+    epoch,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    BLOCK_SHIFT: tl.constexpr,
+):
+    """Place row ``row``'s routes in the block-aligned expert sort.
+
+    ``masks[e]`` has bit ``r`` set when row ``r < 32`` routes to expert
+    ``e``. As in _kimi3_sorted_routes, the routes before ``(row, e)`` in
+    expert ``e``'s run are its rows below ``row``, so each row derives the
+    expert offsets from the masks and places its own routes.
+
+    Every row arrived, and the caller's acquire invalidated this CU's caches,
+    so plain loads read the final masks.
+    """
+    num_experts: tl.constexpr = 896
+    padded_experts: tl.constexpr = 1024
+    topk: tl.constexpr = 16
+    block: tl.constexpr = 1 << BLOCK_SHIFT
+    expert = tl.arange(0, padded_experts)
+    expert_masks = tl.load(masks + expert, mask=expert < num_experts, other=0)
+    count = _popcount(expert_masks)
+    padded = ((count + block - 1) >> BLOCK_SHIFT) << BLOCK_SHIFT
+    first = tl.cumsum(padded, 0) - padded
+    if row == 0:
+        # Every row read the epoch before it arrived.
+        tl.atomic_add(epoch, 1, sem="relaxed", scope="gpu")
+        tl.store(num_valid_ids, tl.sum(padded, 0))
+        tl.store(num_valid_ids + 1, rows)
+
+    below = tl.gather(expert_masks, selected_ids, 0) & ((1 << row) - 1)
+    base = tl.gather(first, selected_ids, 0)
+    routed = tl.gather(count, selected_ids, 0)
+    target = base + _popcount(below)
+    slot = tl.arange(0, topk)
+    tl.store(sorted_ids + target, (slot << 24) | row)
+    tl.store(sorted_weights + target, selected_weights)
+    tl.store(
+        sorted_expert_ids + (target >> BLOCK_SHIFT),
+        selected_ids,
+        mask=(target & (block - 1)) == 0,
+    )
+    fill = base + routed
+    fill_end = base + (((routed + block - 1) >> BLOCK_SHIFT) << BLOCK_SHIFT)
+    padding = fill[:, None] + tl.arange(0, block)[None, :]
+    tl.store(
+        sorted_ids + padding,
+        tl.full([topk, block], topk << 24, tl.int32) | rows,
+        mask=(target + 1 == fill)[:, None] & (padding < fill_end[:, None]),
+    )
+
+
+@triton.jit
+def _await_arrivals(counter, rows):
+    # One thread polls; its acquire invalidates this CU's caches, and the
+    # barrier keeps every wave's loads after the last poll.
+    arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
+    while arrived < rows:
+        tl.inline_asm_elementwise(
+            asm="s_sleep 2",
+            constraints="=r",
+            args=[],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
+    tl.debug_barrier()
+
+
+@triton.jit
 def _kimi3_shared_down_tile(
     hidden,
     weight,
@@ -428,6 +505,7 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
     SHARED_BLOCK_M: tl.constexpr,
     SHARED_BLOCK_N: tl.constexpr,
     SHARED_BLOCK_K: tl.constexpr,
+    SELF_SORT: tl.constexpr,
 ):
     num_experts: tl.constexpr = 896
     topk: tl.constexpr = 16
@@ -436,6 +514,23 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
     sorted_count = counter + 1
     pid = tl.program_id(0)
     if pid < rows:
+        if SELF_SORT:
+            # Launches alternate between two mask buffers and counters, so
+            # none waits to zero the buffer its rows read: each zeroes the one
+            # its predecessor finished with, for its successor.
+            self_masks = counter + 16
+            epoch = self_masks + 2 * num_experts + 2
+            parity = tl.load(epoch) & 1
+            masks = self_masks + parity * num_experts
+            counter = self_masks + 2 * num_experts + parity
+            if pid == 0:
+                expert = tl.arange(0, 1024)
+                tl.store(
+                    self_masks + (1 - parity) * num_experts + expert,
+                    tl.zeros([1024], tl.int32),
+                    mask=expert < num_experts,
+                )
+                tl.store(self_masks + 2 * num_experts + 1 - parity, 0)
         # One program per row routes it exactly as
         # _kimi3_sigmoid_bias_topk_kernel and marks its experts' masks.
         selected_ids, selected_weights = _kimi3_route_row(
@@ -453,8 +548,12 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
         tl.store(
             topk_weights + pid * topk + offset, selected_weights, cache_modifier=".wt"
         )
+        if SELF_SORT:
+            mask_words = masks + selected_ids
+        else:
+            mask_words = masks + selected_ids * ROW_WORDS + pid // 32
         tl.atomic_or(
-            masks + selected_ids * ROW_WORDS + pid // 32,
+            mask_words,
             tl.full([topk], 1, tl.int32) << (pid % 32),
             sem="relaxed",
             scope="gpu",
@@ -472,25 +571,29 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
         )
         tl.debug_barrier()
         tl.atomic_add(counter, 1, sem="relaxed", scope="gpu")
+        if SELF_SORT:
+            # Every row arrives before it waits, so the rows wait only for
+            # each other's dispatch.
+            _await_arrivals(counter, rows)
+            _kimi3_self_sorted_routes(
+                selected_ids,
+                selected_weights,
+                pid,
+                rows,
+                masks,
+                epoch,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                BLOCK_SHIFT,
+            )
     else:
         helper = pid - rows - SHARED_TILES
         if helper >= 0:
             # The sorting programs come last in the grid, so every row program
-            # has dispatched before they wait for its arrival. One thread
-            # polls; its acquire invalidates this CU's caches, and the barrier
-            # keeps every wave's loads after the last poll.
-            arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
-            while arrived < rows:
-                tl.inline_asm_elementwise(
-                    asm="s_sleep 2",
-                    constraints="=r",
-                    args=[],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
-                arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
-            tl.debug_barrier()
+            # has dispatched before they wait for its arrival.
+            _await_arrivals(counter, rows)
             _kimi3_sorted_routes(
                 topk_ids,
                 topk_weights,
@@ -548,8 +651,8 @@ def kimi3_sorted_routing_accepts(router_logits: torch.Tensor) -> bool:
 def kimi3_sorted_routing_scratch(device: torch.device) -> torch.Tensor:
     """Allocate the zeroed scratch ``kimi3_sigmoid_bias_topk_sorted`` reuses.
 
-    Every launch leaves it zeroed again, so one buffer serves any number of
-    sequential (including graph-replayed) launches on one stream.
+    Every launch leaves it ready for the next, so one buffer serves any number
+    of sequential (including graph-replayed) launches on one stream.
     """
     return torch.zeros(_sorted_scratch_words(), dtype=torch.int32, device=device)
 
@@ -613,6 +716,8 @@ def kimi3_sigmoid_bias_topk_sorted(
     them wait for every row, then write the block-aligned expert sort of all
     routes in the format of the gfx950 MoE ``gluon_moe_sorting`` (896 local
     experts from zero), with each expert's routes in flat top-k order.
+    Through 32 rows, the row programs instead wait for each other and place
+    their own routes in the same sort.
     Given ``shared_down``, programs between the rows and the sort also write
     that independent projection, so it costs no launch of its own.
 
@@ -676,7 +781,8 @@ def kimi3_sigmoid_bias_topk_sorted(
         (triton.cdiv(capacity, block_size),), dtype=torch.int32, device=device
     )
     num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
-    helpers = triton.cdiv(routes, _SORTED_HELPER_ROUTES)
+    self_sort = rows <= _SELF_SORT_MAX_ROWS
+    helpers = 0 if self_sort else triton.cdiv(routes, _SORTED_HELPER_ROUTES)
     shared_block_m = 16
     shared_block_n = 32
     if shared_down is None:
@@ -724,7 +830,7 @@ def kimi3_sigmoid_bias_topk_sorted(
         BLOCK_SHIFT=block_size.bit_length() - 1,
         ROW_WORDS=_SORTED_ROW_WORDS,
         # Mask words the rows use, in power-of-two buckets: one binary each
-        # through 32, 64, 128 and 256 rows.
+        # through 32 (self-sorting), 64, 128 and 256 rows.
         WORDS=triton.next_power_of_2(triton.cdiv(rows, 32)),
         HELPER_ROUTES=_SORTED_HELPER_ROUTES,
         SHARED_TILES=shared_tiles,
@@ -732,6 +838,7 @@ def kimi3_sigmoid_bias_topk_sorted(
         SHARED_BLOCK_M=shared_block_m,
         SHARED_BLOCK_N=shared_block_n,
         SHARED_BLOCK_K=_SHARED_DOWN_BLOCK_K,
+        SELF_SORT=self_sort,
         num_warps=8,
         num_stages=1,
         waves_per_eu=1,

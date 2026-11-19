@@ -198,6 +198,11 @@ class SamplingBackend(ABC):
     # Admission checks this exclusive bound. None means the backend handles
     # every positive finite top_k itself, before writing device scalars.
     top_k_exclusive_max: int | None = 128
+    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
+    supports_tree_verify: bool = False
+    # Packed target rows use query_start_loc CSR offsets; candidates and
+    # outputs retain their fixed per-request width (see verify()).
+    supports_packed_verify: bool = False
 
     # Subclasses that hold per-pool-idx state (scalars like temperature /
     # top_k, plus large rows like _counts / _logit_bias) flip this to True
@@ -802,9 +807,6 @@ class SamplingBackend(ABC):
             cpu_pack[self._predict_max : self._predict_max + n_l],
         )
 
-    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
-    supports_tree_verify: bool = False
-
     @abstractmethod
     def sample(
         self,
@@ -820,7 +822,21 @@ class SamplingBackend(ABC):
         candidates: torch.Tensor,
         *,
         tree: TreeVerifyBatch | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Verify each request's draft window; ``tree`` is the draft tree
-        (``None`` for a chain) and needs ``supports_tree_verify``; a tree
-        verify leaves its agreed path in ``accepted_path``."""
+        """Verify each request's draft window.
+
+        ``tree`` is the draft tree (``None`` for a chain) and requires
+        ``supports_tree_verify``; tree verification leaves its agreed path
+        in ``accepted_path``.
+
+        Only backends declaring ``supports_packed_verify`` accept
+        ``query_start_loc``: ``[bs + 1]`` CSR offsets into the target logits.
+        Request i uses rows ``[query_start_loc[i], query_start_loc[i + 1])``;
+        trailing logits rows may be graph padding. Candidates remain
+        ``[bs, N]`` at the native width, and outputs remain flat ``[bs * N]``
+        tokens plus ``[bs]`` accepted lengths, including the residual or bonus
+        token. Only each output's accepted prefix is valid. Unsupported
+        backends must reject packed offsets rather than ignore them; callers
+        omit the keyword for backends that do not declare the capability.
+        """

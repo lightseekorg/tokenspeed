@@ -86,6 +86,7 @@ __all__ = [
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
     "trtllm_workspace_all_gather",
+    "trtllm_workspace_all_gather_serves",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -108,6 +109,7 @@ allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
 allreduce_sandwich_rmsnorm = error_fn
 trtllm_workspace_all_gather = error_fn
+trtllm_workspace_all_gather_serves = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -133,6 +135,7 @@ if current_platform().is_nvidia:
         ReduceScatterFusionPattern,
         _ar_should_use_oneshot,
         _load_trtllm_comm_module,
+        mnnvl_allgather_serves,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
@@ -1165,6 +1168,23 @@ if current_platform().is_nvidia:
         if gathered is not None:
             _mark_captured(manager, mnnvl)
         return gathered
+
+    def trtllm_workspace_all_gather_serves(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> bool:
+        """Whether ``trtllm_workspace_all_gather`` gathers rows of this shape.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            True when the group's mnnvl workspace serves the shape; it depends
+            on the shape only, so every rank of the group decides alike.
+        """
+        mnnvl = _manager_for_group(group).mnnvl_workspace
+        return mnnvl is not None and mnnvl_allgather_serves(input_tensor, mnnvl)
 
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,

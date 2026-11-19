@@ -98,31 +98,38 @@ head. It stands in only where `mm` selects the GEMV it reproduces bit for bit
 on the normed rows; `mv_rmsnorm_gated_sigmoid_supported` tells callers when to
 keep the gated norm and `mm` as two calls.
 
-On SM107, BF16 output projections whose weight shape is in the measured
-`_SM107_BF16_GEMM_SHAPES` set (the TP4 per-rank projections plus the TP1
-`[2560, 6144]` o_proj) run FlashInfer's CuTe DSL low-latency GEMM at M <= 4,
-pinned as the measured winner on every admitted shape; other shapes keep
-their existing path. Startup tuning covers M=1/2/4. The kernels accumulate
-in FP32 and return BF16; reduction order can change rounding relative to
-the original GEMM.
+On SM107, BF16 projections run FlashInfer's CuTe DSL low-latency GEMM at
+M <= 32, as on SM100 and SM103, when `_sm107_cute_dsl_bf16_admits` admits the
+weight: K a multiple of 128, and either at most 8192 output columns or
+K >= 2048 and at most 96 MiB. CuTe DSL is pinned there as the measured winner;
+other weights, such as an LM head or a wide projection with a short K, keep
+cuBLASLt, which measured faster on them at 16 to 32 rows. Startup tuning
+covers M=1/2/4/8/16/32. The kernels accumulate in FP32 and return BF16;
+reduction order can change rounding relative to the original GEMM.
 
 ## Decode GEMMs on small weights
 
-On SM100 and SM103, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV tile
-instead of cuBLASLt when all of these hold:
+On SM100, SM103 and SM107, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV
+tile instead of cuBLASLt when all of these hold:
 
 - No bias, BF16 output, and no plan, `solution`, override, scales, or `alpha`
 - `TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows
-  (`BF16_GEMM_MAX_M` on SM100 and SM103), `mm` takes FlashInfer's joint BF16
+  (`BF16_GEMM_MAX_M`), `mm` takes FlashInfer's joint BF16
   GEMM (`flashinfer_bf16_gemm`) instead, in which FlashInfer's tuner chooses
-  among its TGV and CuTe DSL tactics.
-- `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below)
-- This rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB).
-- One of the pinned tiles covers the GEMM in one wave (below).
+  among its TGV and CuTe DSL tactics (CuTe DSL only on SM107; above).
+- `TGV_DECODE_MIN_K <= K <=` the architecture's `max_k` in `TGV_DECODE_WINDOWS`
+  (2048 <= K <= 3072 on SM100 and SM103, up to 6144 on SM107; below)
+- This rank's weight takes at most the window's `max_weight_bytes` (16 MiB on
+  SM100 and SM103, 32 MiB on SM107).
+- On SM107, the weight has at least the window's `min_n` rows (512, the fewest
+  measured; below).
+- One of the pinned tiles covers the GEMM in one wave, or, on SM107, with at
+  most half as many CTAs as SMs (below).
 - PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
   off).
 - The operands meet the joint BF16 contract (`flashinfer_joint_bf16_supported`):
-  contiguous, 32-byte aligned, K a multiple of 8.
+  contiguous, 32-byte aligned, K a multiple of 8 (of 128 on SM107, where the
+  joint path pins CuTe DSL).
 - Serving has not started (`is_serving()`).
 
 Under PDL, TGV loads weight tiles while the producer kernel still runs and
@@ -131,15 +138,29 @@ producer finishes. FlashInfer's tactic profiling times each GEMM alone and
 cannot see that overlap, so `select_tgv_decode_tile` chooses the tile itself:
 of the 2-CTA tiles of 128 weight rows by 16, 32, or 64 activation rows, each
 with the most stages that fit in shared memory, the first whose grid has at
-most one CTA per SM. A GEMM for which none fits keeps cuBLASLt, and so does
+most one CTA per SM. SM107's larger shared memory fits more stages (18, 16 and
+13 against 12, 11 and 9), and there the first tile whose grid has at most one
+CTA per two SMs wins. A GEMM for which none fits keeps cuBLASLt, and so does
 every GEMM without PDL, which has no overlap to gain. The choice depends only
-on M, N, K, the weight size, the SM count, and the PDL setting.
+on the architecture, M, N, K, the weight size, the SM count, and the PDL
+setting.
 
 The K window is measured, not derived: on GB300, in a captured PDL chain of an
 RMSNorm and this GEMM on a weight cold in L2, TGV beat cuBLASLt on most shapes
 with K in the window, by up to 1.30x. Outside it TGV lost on many shapes, down
 to 0.73x cuBLASLt's speed, mainly at K of 512 to 1024 and at K >= 4096 with
 few weight rows; at K = 1536 it also lost on some shapes (down to 0.92x).
+
+SM107's window comes from the same chain on a 212-SM VR200, over M = 48 to 512,
+N = 512 to 8192 and K = 1536 to 8192. Below 512 weight rows TGV lost up to 26%
+at K = 5120 to 6144, so SM107 routes only measured row counts. With the SM107
+tiles and grids of at most half the SMs, TGV took 4.4% less time than cuBLASLt
+summed over the 96 shapes, up to 1.7x faster (2560 x 6144 at 96 rows), and lost
+at most 8% (1280 x 2560 at 192 rows). Grids of up to one wave instead lost up
+to 22% at many rows, and at K = 8192 with 512 weight rows TGV lost up to 28%.
+In the decode steps of a quantized model that keeps such projections in BF16,
+the routed GEMMs took 3.7% of the step less time at 64 rows and 1.9% at 128
+rows.
 
 The weight limit and the K window are bounds on shape, not a list of layers.
 On a quantized checkpoint, the BF16 GEMMs that reach them are the small
@@ -176,6 +197,59 @@ from cuBLASLt's, so its results are not bitwise identical to cuBLASLt's: a
 decode batch replayed from a captured graph and an eager call of the same
 shape after serving starts can differ in the last bits. Repeated TGV calls on
 the same inputs, eager or replayed, agree bit for bit.
+
+## Offline-tuned BLAS solutions with TunableOp (ROCm)
+
+Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`,
+which on ROCm takes hipBLASLt's heuristic solution. For skinny row counts, such
+as speculative-decoding verify steps, a measured solution can be much faster.
+TunableOp times both hipBLASLt and rocBLAS solutions, so a tuned file can list
+either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
+
+`hipblaslt.py` is the runtime entry point; the loader, the stack check and the
+tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
+`_hipblaslt/configs/`, one per GPU, named like the Triton kernel configs after
+`torch.cuda.get_device_name()` with spaces replaced by underscores, such as
+`device_name=AMD_Instinct_MI355X.csv`. Serving loads the file of its GPU
+automatically, through `hipblaslt.py`, once per process and before graph
+capture, and replays it read-only through PyTorch TunableOp. GEMMs the file
+does not list keep the default solution. Serving never rewrites the file, and
+tunes only with the opt-in switch below. A GPU without a file keeps the
+defaults.
+
+A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
+versions and the GPU architecture stamped in its `Validator` rows. On any
+mismatch the whole file is ignored with one warning and every GEMM keeps the
+default. Regenerate the file after changing the stack, on an idle GPU of the
+serving type, for each weight shape `N x K` and each row count to cover
+(captured verify or decode token counts):
+
+```bash
+python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
+    --shapes 14336x5120,5120x6144,16480x5120,34816x5120,5120x17408 \
+    --rows 64,128,192,256,384,512
+```
+
+Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
+the file exists with the running stack's stamp, its GEMMs are kept and only
+new ones are timed, so one file can cover several models; on another stack
+the tool stops, and the file must be deleted to re-tune. Tuning rotates
+weight copies through `--cold-bytes`, so each timing reads the weight from
+HBM as a serving step does. Another solution can sum K in another order, so
+results differ from the default within BF16 rounding.
+
+To cover GEMMs the file does not list without regenerating it, such as a new
+model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).
+During kernel warmup, before graph capture, serving then runs one eager
+decode step per captured batch size inside `hipblaslt_online_tuning()`:
+TunableOp times every solution of each GEMM it has no entry for, with the
+same rotating cold-weight buffer as the tool (512 MiB), and keeps the
+fastest. GEMMs the file lists are not re-timed, and a file from another stack
+is still ignored, so then every GEMM of those steps is tuned. Tuning stops
+before capture; the picks stay in the process and nothing is written, the
+committed file included. The cost is startup time on every start and every
+rank, and picks may differ between starts and ranks within BF16 rounding;
+commit the file with the tool above to fix them.
 
 ## Per-token/per-channel FP8
 
@@ -252,6 +326,9 @@ PDL, contiguous BF16 operands/output and 32-byte pointer alignment. This is a
 measured performance policy, not the implementation's shape contract. Other
 shapes and unaligned views keep the existing GEMM selection; explicit overrides
 remain authoritative. FlashInfer validates the callable's wider tile support.
+The small-N policy takes precedence over the startup BF16 shortcuts so CUDA
+graphs capture the registered projection. The registry still checks layout
+and alignment before selecting the kernel.
 
 The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
 and rejects unsupported scale arguments. Its cached callable uses runtime row

@@ -42,6 +42,7 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import (
     ForwardStepRunner,
@@ -64,10 +65,12 @@ def _runner(
     has_drafter: bool,
     consumers: tuple[str, ...],
     fail_forward: bool,
+    packed_query_tokens: int | None = None,
 ):
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
+    wrapper.dp_local_graph = False
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
     )
@@ -130,19 +133,17 @@ def _runner(
             commit_after_mtp_verify=lambda *args, **kwargs: events.append("draft_qsa")
         ),
     )
-    wrapper.drafter = (
-        SimpleNamespace(
-            attn_backend=draft_backend,
-            replay_decode_graph=lambda graph, *, bs, graph_bs: graph.replay(),
-            # Native draft width (4 = max_tokens_per_req): full padded extent.
-            prepare_decode_graph_token_layout=lambda ctx, *, actual_bs, padded_bs: (
-                padded_bs * 4
-            ),
-            decode_graph_query_capacities=lambda bs: (bs * 4,),
-        )
-        if has_drafter
-        else None
-    )
+    wrapper.drafter = None
+    if has_drafter:
+        drafter = object.__new__(DummyDrafter)
+        drafter.spec_num_tokens = 4
+        drafter.decode_overlap = None
+        drafter.attn_backend = draft_backend
+        if packed_query_tokens is not None:
+            drafter.prepare_decode_graph_token_layout = lambda ctx, **kwargs: (
+                packed_query_tokens
+            )
+        wrapper.drafter = drafter
     wrapper.max_tokens_per_req = 4
     wrapper.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
@@ -157,11 +158,11 @@ def _runner(
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._init_forward_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._cuda_graph_key = lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs)
-    wrapper._reported_query_graphs = set()
     wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
     wrapper._expert_load_rows = None
     wrapper._mega_moe_live_requests = None
     wrapper._graph_debug = False
+    wrapper._reported_query_graphs = set()
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
         torch.arange(16, dtype=torch.int32),
@@ -178,8 +179,9 @@ def _runner(
         return result[0][:8], result[1][:2], None, None, None
 
     wrapper._forward_func = lambda **kwargs: execute()
-    wrapper.graphs = {(CUDA_GRAPH_VARIANT_DEFAULT, 4): SimpleNamespace(replay=execute)}
-    wrapper.output_buffers = {(CUDA_GRAPH_VARIANT_DEFAULT, 4): result}
+    graph_key = (CUDA_GRAPH_VARIANT_DEFAULT, 4)
+    wrapper.graphs = {graph_key: SimpleNamespace(replay=execute)}
+    wrapper.output_buffers = {graph_key: result}
     return wrapper, events, commits
 
 
@@ -300,15 +302,14 @@ def test_padded_replay_marks_filler_rows_then_restores(fail_forward, has_drafter
     wrapper._expert_load_rows = load_rows
     wrapper.world_size = 1
     seen = []
-    replay = wrapper.graphs[(CUDA_GRAPH_VARIANT_DEFAULT, 4)].replay
+    graph_key = (CUDA_GRAPH_VARIANT_DEFAULT, 4)
+    replay = wrapper.graphs[graph_key].replay
 
     def recording_replay():
         seen.append((live_requests.tolist(), load_rows.rows(16).tolist()))
         return replay()
 
-    wrapper.graphs[(CUDA_GRAPH_VARIANT_DEFAULT, 4)] = SimpleNamespace(
-        replay=recording_replay
-    )
+    wrapper.graphs[graph_key] = SimpleNamespace(replay=recording_replay)
     with (
         pytest.raises(RuntimeError, match="forward failed")
         if fail_forward
@@ -319,6 +320,45 @@ def test_padded_replay_marks_filler_rows_then_restores(fail_forward, has_drafter
     # padded requests. The replay, even a failed one, restores (1, 1) and the
     # all-live mask, so later eager forwards route and count every row.
     assert seen == [([2, 4], [True] * 8 + [False] * 8)]
+    assert live_requests.tolist() == [1, 1]
+    assert load_rows.rows(16).tolist() == [True] * 16
+
+
+@pytest.mark.parametrize("fail_forward", [False, True])
+def test_packed_replay_does_not_apply_uniform_request_count_mask(fail_forward):
+    wrapper, _, _ = _runner(
+        use_graph=True,
+        has_drafter=True,
+        consumers=(),
+        fail_forward=fail_forward,
+        packed_query_tokens=6,
+    )
+    live_requests = torch.ones(2, dtype=torch.int32)
+    wrapper._mega_moe_live_requests = live_requests
+    load_rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1))
+    load_rows.reserve(16, "cpu")
+    load_rows.mask.zero_()
+    wrapper._expert_load_rows = load_rows
+    wrapper.world_size = 1
+    seen = []
+    graph_key = (CUDA_GRAPH_VARIANT_DEFAULT, 4)
+    replay = wrapper.graphs[graph_key].replay
+
+    def recording_replay():
+        seen.append((live_requests.tolist(), load_rows.rows(16).tolist()))
+        return replay()
+
+    wrapper.graphs[graph_key] = SimpleNamespace(replay=recording_replay)
+    with (
+        pytest.raises(RuntimeError, match="forward failed")
+        if fail_forward
+        else nullcontext()
+    ):
+        _run(wrapper, ForwardMode.DECODE)
+    # Packed rows have unequal query lengths, so a batch-size ratio cannot
+    # identify filler requests. Keep MegaMoE's all-live counts; the row mask
+    # still marks exactly the packed query rows for expert-load accounting.
+    assert seen == [([1, 1], [True] * 6 + [False] * 10)]
     assert live_requests.tolist() == [1, 1]
     assert load_rows.rows(16).tolist() == [True] * 16
 
@@ -406,6 +446,7 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
         enable_speculative_sampling=False,
+        enable_dp_local_cuda_graph=False,
         query_shard_size=1,
         query_shard_rank=0,
         enable_memory_saver=False,

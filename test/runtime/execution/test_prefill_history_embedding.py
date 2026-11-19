@@ -203,6 +203,7 @@ def _config():
         max_cudagraph_capture_size=2,
         model_is_mrope=False,
         autotune_cache_key=None,
+        enable_dp_local_cuda_graph=False,
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=[1],

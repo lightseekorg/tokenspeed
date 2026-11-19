@@ -182,6 +182,7 @@ def prepare_mha_decode(
         platform,
         ("q", "k_cache", "v_cache"),
         {
+            "block_draft": False,
             "q_len": q_len,
             "head_dim": head_dim,
             "page_size": page_size,
@@ -212,6 +213,7 @@ def prepare_mha_decode(
             window_left=window_left,
             solution=request.solution,
             override=request.registration,
+            block_draft=False,
         )
 
     return PreparedBenchmark(

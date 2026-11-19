@@ -298,3 +298,102 @@ def test_packed_anchors_replay_with_new_lengths():
             proposals, expected_bonus[:, None].expand_as(proposals)
         )
     graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("fail_measurement", [False, True])
+def test_startup_profile_restores_real_decode_metadata(fail_measurement):
+    from contextlib import nullcontext
+
+    from tokenspeed.runtime.execution.forward_step import (
+        DeepEPCudaGraphRunnerAdapter,
+        ForwardStepRunner,
+    )
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
+
+    backend = _verify_backend("cuda", 2, 4)
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
+    runner.device = "cuda"
+    runner.max_tokens_per_req = 4
+    runner.input_buffers = InputBuffers(2, 8, 32, device="cuda")
+    runner.input_buffers.req_pool_indices_buf[:2].copy_(
+        torch.tensor([3, 7], device="cuda")
+    )
+    runner.input_buffers.seq_lens_buf[:2].copy_(
+        torch.tensor([12, 24], dtype=torch.int32, device="cuda")
+    )
+    runner.attn_backend = backend
+    runner.draft_attn_backend = None
+    runner.sampling_backend = None
+    runner.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+    tables = _tables("cuda")
+    runner._placeholder_tables = {key: torch.zeros_like(t) for key, t in tables.items()}
+    runner._init_capture_metadata(2)
+    capture_slots = backend.query_metadata(ForwardMode.DECODE).swa_write_slots.clone()
+    expected_positions = torch.tensor([8, 9, 10, 11, 20, 21, 22, 23], device="cuda")
+
+    failure = (
+        pytest.raises(RuntimeError, match="measurement failed")
+        if fail_measurement
+        else nullcontext()
+    )
+    with failure:
+        with runner.decode_profile_metadata(
+            bs=2, variant=CUDA_GRAPH_VARIANT_DEFAULT, block_tables=tables
+        ) as prepare:
+            prepare()
+            metadata = backend.query_metadata(ForwardMode.DECODE)
+            assert not torch.equal(metadata.swa_write_slots, capture_slots)
+            torch.testing.assert_close(metadata.positions, expected_positions)
+            metadata.positions.fill_(-777)
+            prepare()
+            torch.testing.assert_close(
+                backend.query_metadata(ForwardMode.DECODE).positions, expected_positions
+            )
+            if fail_measurement:
+                raise RuntimeError("measurement failed")
+    torch.testing.assert_close(
+        backend.query_metadata(ForwardMode.DECODE).swa_write_slots, capture_slots
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_startup_profile_replays_the_requested_graph_capacity():
+    from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+    from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
+
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
+    runner.max_tokens_per_req = 4
+    runner.graphs = {}
+    result = torch.zeros(1, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for capacity in [8, 6]:
+        with torch.cuda.stream(stream):
+            result.fill_(capacity)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            result.fill_(capacity)
+        variant = (
+            CUDA_GRAPH_VARIANT_DEFAULT
+            if capacity == 8
+            else f"{CUDA_GRAPH_VARIANT_DEFAULT}:query6"
+        )
+        runner.graphs[(variant, 2)] = graph
+    for capacity in [6, 8, 6]:
+        graph = runner.decode_graph_for_profile(
+            bs=2, query_tokens=capacity, variant=CUDA_GRAPH_VARIANT_DEFAULT
+        )
+        assert graph is not None
+        graph.replay()
+        assert result.item() == capacity
+    assert (
+        runner.decode_graph_for_profile(
+            bs=2, query_tokens=5, variant=CUDA_GRAPH_VARIANT_DEFAULT
+        )
+        is None
+    )

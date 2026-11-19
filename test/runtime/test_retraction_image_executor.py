@@ -44,6 +44,8 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -142,7 +144,9 @@ class _Pool:
         self._layout = layout
         contract = _contract(layout, shard_counts)
         self.arena = SimpleNamespace(
-            cache_group_specs=contract.group_specs, runtime_contract=contract
+            cache_group_specs=contract.group_specs,
+            runtime_contract=contract,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
         )
         self.load_tracker = None
 
@@ -912,7 +916,7 @@ def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend
         assert num_blocks > 0, "the transport was asked for a zero-row transfer"
 
     with patch.object(lanes_module, "HostTransferWorkspace", Mock):
-        lane = HostTransferLane()
+        lane = HostTransferLane(TorchMemorySaverAdapter.create(enable=False))
     lane.workspace.load_block_transfers.side_effect = fake_load
     lane.workspace.commit_block_transfers.side_effect = fake_commit
     lane.workspace.prepare_backend.return_value = SimpleNamespace(
@@ -1076,7 +1080,9 @@ def _round_trip_two_ranks(io_backend, executors):
                 cache_transfer_layout=lambda layout=layout: layout,
                 register_layerwise_load_tracker=lambda tracker: None,
                 arena=SimpleNamespace(
-                    cache_group_specs=contract.group_specs, runtime_contract=contract
+                    cache_group_specs=contract.group_specs,
+                    runtime_contract=contract,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
                 ),
             )
             executors[rank] = HostCacheExecutor(

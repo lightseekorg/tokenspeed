@@ -77,15 +77,16 @@ def test_invalid_batch_does_not_change_state():
     assert history.snapshot() == ()
 
 
-def make_drafter():
+def make_drafter(device):
     # Model initialization requires weights and GPUs. Exercise the real
     # request-state and allocation methods with their existing tensor state.
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.verify_feedback = None
     drafter.confidence_scores = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device="cuda"
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device=device
     )
-    drafter._confidence_admission_ids = [1, 2, 3]
+    drafter._confidence_admission_ids = [101, 202, 303]
     return drafter
 
 
@@ -130,22 +131,48 @@ def check_allocation(drafter, slots, history, expected):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_allocation_uses_latest_scores_in_request_order():
-    drafter = make_drafter()
+    drafter = make_drafter(device="cuda")
     check_allocation(drafter, [2, 0], [[0, 0], [0, 0]], [[5, 6], [1, 2]])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_reused_slot_and_extend_do_not_leak_previous_predictions():
-    drafter = make_drafter()
-    drafter.prepare_request_state([4, 2], [0, 1], num_extends=0)
+    drafter = make_drafter(device="cuda")
+    drafter.prepare_request_state([404, 202], [0, 1], num_extends=0)
     check_allocation(drafter, [0, 1], [[-1, -2], [-3, -4]], [[-1, -2], [3, 4]])
-    drafter.prepare_request_state([2], [1], num_extends=1)
+    drafter.prepare_request_state([202], [1], num_extends=1)
     check_allocation(drafter, [1], [[-1, -2]], [[-1, -2]])
+
+
+def test_new_admission_with_reused_public_id_resets_slot_state():
+    drafter = make_drafter(device="cpu")
+    # Scheduler admission IDs change even if a caller reuses its public ID.
+    drafter.prepare_request_state([404], [0], num_extends=0)
+    assert drafter._confidence_admission_ids[0] == 404
+    assert torch.isinf(drafter.confidence_scores[0]).all()
+
+
+def test_slot_state_image_checks_admission_and_restores_identity():
+    drafter = make_drafter(device="cpu")
+    drafter.confidence_scores[0] = torch.tensor([7.0, 8.0])
+    mismatched = torch.empty(drafter.slot_state_bytes(), dtype=torch.uint8)
+    drafter.export_slot_state(0, mismatched, None, admission_id=404)
+    assert torch.isinf(mismatched.view(torch.float32)[:2]).all()
+
+    image = torch.empty(drafter.slot_state_bytes(), dtype=torch.uint8)
+    drafter.export_slot_state(0, image, None, admission_id=101)
+    drafter.confidence_scores[1].fill_(float("inf"))
+    drafter.import_slot_state(1, image, None, admission_id=101)
+    assert drafter._confidence_admission_ids[1] == 101
+    torch.testing.assert_close(drafter.confidence_scores[1], torch.tensor([7.0, 8.0]))
+
+    drafter.prepare_request_state([101], [1], num_extends=0)
+    torch.testing.assert_close(drafter.confidence_scores[1], torch.tensor([7.0, 8.0]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_nonfinite_prediction_falls_back_as_a_whole_row():
-    drafter = make_drafter()
+    drafter = make_drafter(device="cuda")
     drafter.confidence_scores[0, 1] = float("nan")
     drafter.confidence_scores[2, 0] = float("inf")
     check_allocation(

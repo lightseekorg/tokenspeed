@@ -73,6 +73,12 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import _n16_weight_offset
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
+    B_LAYOUT_GDOT128,
+    B_LAYOUT_MFMA16,
+    B_LAYOUT_N16,
+)
 
 _USES_FP32_ATOMIC: Optional[bool] = None
 _NUM_XCDS = 8
@@ -110,6 +116,24 @@ def _gdot128_weight_offset(k_pack, n_col, n_phys: gl.constexpr):
     n_tiles: gl.constexpr = n_phys // 128
     tile = (k_pack // 128) * n_tiles + (n_col // 128)
     return tile * (128 * 128) + in_tile
+
+
+@gluon.jit
+def _bank_weight_offset(
+    k_pack,
+    n_col,
+    N_PHYS: gl.constexpr,
+    K_PACKED_TOTAL: gl.constexpr,
+    B_LAYOUT: gl.constexpr,
+):
+    """Per-expert byte offset of W2 byte ``(n_col, k_pack)`` in a gdot128 or
+    N16 bank. Both store the same 16-byte vectors, so the loads fill the same
+    registers."""
+    if B_LAYOUT == B_LAYOUT_N16:
+        offset = _n16_weight_offset(n_col, k_pack, K_PACKED_TOTAL)
+    else:
+        offset = _gdot128_weight_offset(k_pack, n_col, N_PHYS)
+    return offset
 
 
 @gluon.jit
@@ -170,7 +194,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    B_GDOT128: gl.constexpr = False,
+    B_LAYOUT: gl.constexpr,
     USE_REDUCE: gl.constexpr = False,
     MFMA_STORE_LAYOUT: gl.constexpr = False,
     PERSISTENT: gl.constexpr = True,
@@ -230,7 +254,11 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     NUM_K_ITERS: gl.constexpr = K // BLOCK_K
     gl.static_assert(K % BLOCK_K == 0 and NUM_K_ITERS >= 2)
     gl.static_assert(K <= K_PACKED_TOTAL * 2)
-    gl.static_assert(K_PACKED_TOTAL % 128 == 0)
+    if B_LAYOUT == B_LAYOUT_N16:
+        # N16 rows end after their last real 64-byte K chunk.
+        gl.static_assert(K_PACKED_TOTAL % 64 == 0)
+    else:
+        gl.static_assert(K_PACKED_TOTAL % 128 == 0)
     NUM_BUFFERS: gl.constexpr = 2
     # 4 N-chunks of 64 cols each at BLOCK_N = 256. With warps_per_cta=[1, 4]
     # each wave owns 1/4 of a chunk = 16 cols, so per wave [128, 16] per chunk.
@@ -663,18 +691,34 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     + 3 * BLOCK_N_CHUNK
                     + gl.arange(0, BLOCK_N_CHUNK, layout=bn_slice)
                 )
-                if B_GDOT128:
-                    offs_b_c0 = _gdot128_weight_offset(
-                        offs_bk[:, None], offs_bn_c0[None, :], N_PHYS
+                if B_LAYOUT != B_LAYOUT_MFMA16:
+                    offs_b_c0 = _bank_weight_offset(
+                        offs_bk[:, None],
+                        offs_bn_c0[None, :],
+                        N_PHYS,
+                        K_PACKED_TOTAL,
+                        B_LAYOUT,
                     )
-                    offs_b_c1 = _gdot128_weight_offset(
-                        offs_bk[:, None], offs_bn_c1[None, :], N_PHYS
+                    offs_b_c1 = _bank_weight_offset(
+                        offs_bk[:, None],
+                        offs_bn_c1[None, :],
+                        N_PHYS,
+                        K_PACKED_TOTAL,
+                        B_LAYOUT,
                     )
-                    offs_b_c2 = _gdot128_weight_offset(
-                        offs_bk[:, None], offs_bn_c2[None, :], N_PHYS
+                    offs_b_c2 = _bank_weight_offset(
+                        offs_bk[:, None],
+                        offs_bn_c2[None, :],
+                        N_PHYS,
+                        K_PACKED_TOTAL,
+                        B_LAYOUT,
                     )
-                    offs_b_c3 = _gdot128_weight_offset(
-                        offs_bk[:, None], offs_bn_c3[None, :], N_PHYS
+                    offs_b_c3 = _bank_weight_offset(
+                        offs_bk[:, None],
+                        offs_bn_c3[None, :],
+                        N_PHYS,
+                        K_PACKED_TOTAL,
+                        B_LAYOUT,
                     )
                 else:
                     offs_b_c0 = (
@@ -767,7 +811,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     a_copy_offsets = offs_a
 
                 A_DATA_K_STEP: gl.constexpr = BLOCK_K_A
-                if B_GDOT128:
+                if B_LAYOUT != B_LAYOUT_MFMA16:
                     B_DATA_K_STEP1: gl.constexpr = 1024
                 else:
                     B_DATA_K_STEP1: gl.constexpr = (BLOCK_K_B // 32) * 512
@@ -1196,32 +1240,64 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                             ptr=a_scales_ptr, offsets=a_m_part + a_k_part_odd
                         )
 
-                        if B_GDOT128:
+                        if B_LAYOUT != B_LAYOUT_MFMA16:
                             b_even_k = pair_k * BLOCK_K_B + offs_bk
                             b_odd_k = (pair_k + 1) * BLOCK_K_B + offs_bk
-                            b_even_c0_off = _gdot128_weight_offset(
-                                b_even_k[:, None], offs_bn_c0[None, :], N_PHYS
+                            b_even_c0_off = _bank_weight_offset(
+                                b_even_k[:, None],
+                                offs_bn_c0[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_even_c1_off = _gdot128_weight_offset(
-                                b_even_k[:, None], offs_bn_c1[None, :], N_PHYS
+                            b_even_c1_off = _bank_weight_offset(
+                                b_even_k[:, None],
+                                offs_bn_c1[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_even_c2_off = _gdot128_weight_offset(
-                                b_even_k[:, None], offs_bn_c2[None, :], N_PHYS
+                            b_even_c2_off = _bank_weight_offset(
+                                b_even_k[:, None],
+                                offs_bn_c2[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_even_c3_off = _gdot128_weight_offset(
-                                b_even_k[:, None], offs_bn_c3[None, :], N_PHYS
+                            b_even_c3_off = _bank_weight_offset(
+                                b_even_k[:, None],
+                                offs_bn_c3[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_odd_c0_off = _gdot128_weight_offset(
-                                b_odd_k[:, None], offs_bn_c0[None, :], N_PHYS
+                            b_odd_c0_off = _bank_weight_offset(
+                                b_odd_k[:, None],
+                                offs_bn_c0[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_odd_c1_off = _gdot128_weight_offset(
-                                b_odd_k[:, None], offs_bn_c1[None, :], N_PHYS
+                            b_odd_c1_off = _bank_weight_offset(
+                                b_odd_k[:, None],
+                                offs_bn_c1[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_odd_c2_off = _gdot128_weight_offset(
-                                b_odd_k[:, None], offs_bn_c2[None, :], N_PHYS
+                            b_odd_c2_off = _bank_weight_offset(
+                                b_odd_k[:, None],
+                                offs_bn_c2[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_odd_c3_off = _gdot128_weight_offset(
-                                b_odd_k[:, None], offs_bn_c3[None, :], N_PHYS
+                            b_odd_c3_off = _bank_weight_offset(
+                                b_odd_k[:, None],
+                                offs_bn_c3[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
                         else:
                             b_even_c0_off = offs_b_c0 + pair_k * B_DATA_K_STEP1
@@ -1406,19 +1482,35 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         a_scale_tail = gl.amd.cdna4.buffer_load(
                             ptr=a_scales_ptr, offsets=a_m_part + a_k_part_tail
                         )
-                        if B_GDOT128:
+                        if B_LAYOUT != B_LAYOUT_MFMA16:
                             b_tail_k = tail_k * BLOCK_K_B + offs_bk
-                            b_tail_c0_off = _gdot128_weight_offset(
-                                b_tail_k[:, None], offs_bn_c0[None, :], N_PHYS
+                            b_tail_c0_off = _bank_weight_offset(
+                                b_tail_k[:, None],
+                                offs_bn_c0[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_tail_c1_off = _gdot128_weight_offset(
-                                b_tail_k[:, None], offs_bn_c1[None, :], N_PHYS
+                            b_tail_c1_off = _bank_weight_offset(
+                                b_tail_k[:, None],
+                                offs_bn_c1[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_tail_c2_off = _gdot128_weight_offset(
-                                b_tail_k[:, None], offs_bn_c2[None, :], N_PHYS
+                            b_tail_c2_off = _bank_weight_offset(
+                                b_tail_k[:, None],
+                                offs_bn_c2[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
-                            b_tail_c3_off = _gdot128_weight_offset(
-                                b_tail_k[:, None], offs_bn_c3[None, :], N_PHYS
+                            b_tail_c3_off = _bank_weight_offset(
+                                b_tail_k[:, None],
+                                offs_bn_c3[None, :],
+                                N_PHYS,
+                                K_PACKED_TOTAL,
+                                B_LAYOUT,
                             )
                         else:
                             b_tail_c0_off = offs_b_c0 + tail_k * B_DATA_K_STEP1
@@ -1741,13 +1833,20 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     use_non_temporal_load=False,
     dst_type=None,
     b_preshuffled: bool = False,
-    b_gdot128: bool = False,
     force_reduce: bool | None = None,
     input_sorted: bool = False,
     a_format: str = "e2m1",
     deferred_out: torch.Tensor | None = None,
+    *,
+    b_layout: int,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 2.
+
+    ``b_layout`` names the W2 bank layout (``B_LAYOUT_*`` of
+    ``prefill_stage1``): the MFMA16 shuffle, which this function applies
+    unless ``b_preshuffled``, or a gdot128 or N16 bank, which must be passed
+    preshuffled. An N16 bank stores only the real K bytes of each row; its
+    scales still fill whole 8-group panels, as gdot128's do.
 
     Computes, for each expert ``e``::
 
@@ -1831,8 +1930,14 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     # Step 2: shuffle w2 to MFMA-tile layout if the caller didn't.
     if not b_preshuffled:
         w2 = _b_preshuffle_3d(w2)
-    if b_gdot128 and not b_preshuffled:
-        raise ValueError("b_gdot128 requires a preshuffled gdot128 weight alias")
+    if b_layout not in (
+        B_LAYOUT_MFMA16.value,
+        B_LAYOUT_GDOT128.value,
+        B_LAYOUT_N16.value,
+    ):
+        raise ValueError(f"unknown stage2 W2 layout {b_layout}")
+    if b_layout != B_LAYOUT_MFMA16.value and not b_preshuffled:
+        raise ValueError("gdot128 and N16 W2 banks must be passed preshuffled")
     assert w2_scale is not None and w2_scale.dtype == torch.uint8
     assert a2_scale is not None and a2_scale.dtype == torch.uint8
     assert out.dtype == torch.bfloat16
@@ -1870,8 +1975,14 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         raise ValueError(
             f"sorted stage2 input has {M_padded} rows but routing requires {EM}"
         )
-    assert K_physical % 256 == 0, "physical K needs complete scale panels"
-    K_scale = K_physical // 32
+    K_scale = int(w2_scale.shape[2])
+    if b_layout == B_LAYOUT_N16.value:
+        # N16 rows keep whole 64-byte K chunks; the scale panels stay whole.
+        assert K_physical % 128 == 0, "N16 rows hold whole 64-byte K chunks"
+        assert K_scale % 8 == 0 and K_physical <= 32 * K_scale
+    else:
+        assert K_physical % 256 == 0, "physical K needs complete scale panels"
+        assert K_scale == K_physical // 32
     assert a2_scale.dim() == 2 and a2_scale.shape[1] == K_scale
     assert w2_scale.shape == (E_w, N, K_scale)
     assert sorted_weights.shape[0] == EM
@@ -2018,7 +2129,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         NUM_WARPS=NUM_WARPS,
-        B_GDOT128=bool(b_gdot128),
+        B_LAYOUT=int(b_layout),
         USE_REDUCE=_use_reduce,
         MFMA_STORE_LAYOUT=_mfma_store_layout,
         PERSISTENT=PERSISTENT,

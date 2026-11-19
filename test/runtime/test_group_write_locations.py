@@ -21,14 +21,13 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
+
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
-)
-from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-    CacheGroupGeometry,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
@@ -40,6 +39,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     extend_write_locations,
     window_write_locations,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 FULL = "full_attention"
 SWA = "sliding_attention"
@@ -175,20 +175,20 @@ class TestMtpReanchorTest:
             SWA: _StubLeaf(2, is_draft=True),
         }
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaves[gid],
             is_draft=True,
             spec_num_tokens=1,
             device="cpu",
             consumed_group_ids=None,
         )
-        geometry = CacheGroupGeometry(
-            granularities={FULL: 4, SWA: 4},
-            attn_kinds={FULL: "full_history", SWA: "sliding_window"},
-            full_history_group_id=FULL,
-            row_geometry={FULL: (4, 1), SWA: (4, 1)},
-            windows={FULL: None, SWA: 4},
+        pool = make_mha_pool_for_groups(
+            (
+                CacheGroupSpec(FULL, "full_history", 4, 1, replayable=False),
+                CacheGroupSpec(SWA, "sliding_window", 4, 1, 4, replayable=False),
+            ),
+            device="cpu",
         )
-        router.bind(geometry, leaves)
+        router.set_cache_pool(pool)
         router.init_cuda_graph_state(4)
         return router, leaves
 
@@ -244,7 +244,7 @@ if __name__ == "__main__":
 class TestInt32WriteSlots:
     def test_stacked_slots_refresh_and_pad_without_replacing_decode_storage(self):
         stacks = GroupTableStacks(
-            [GroupTableSpec("history", 128, 128, 2)],
+            [GroupTableSpec("history", 128, 128, 2, 1)],
             max_bs=1,
             max_tokens_per_req=4,
             max_extend_tokens=4,
@@ -298,7 +298,7 @@ class TestHostPageSizeMirror:
                     raise AssertionError("device page-size scalar read")
                 return func(*args, **(kwargs or {}))
 
-        specs = [GroupTableSpec("a", 2, 2, 3), GroupTableSpec("b", 4, 4, 3)]
+        specs = [GroupTableSpec("a", 2, 2, 3, 1), GroupTableSpec("b", 4, 4, 3, 1)]
         stacks = GroupTableStacks(
             specs, max_bs=3, max_tokens_per_req=4, max_extend_tokens=8, device=device
         )

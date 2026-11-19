@@ -257,6 +257,63 @@ def test_settings_separate_the_qsa_bf16_prefill_scratch(construction):
     assert with_scratch.deployment_id != without.deployment_id
 
 
+def test_settings_ignore_flat_kv_flag_for_an_unchanged_layout(construction):
+    args, model, _, factory_kwargs = construction
+    with_flat_kv = l3_settings(args, model, None, **factory_kwargs)
+    args.qwen4_exp_flat_kv = False
+    without_flat_kv = l3_settings(args, model, None, **factory_kwargs)
+    assert with_flat_kv.deployment_id == without_flat_kv.deployment_id
+
+
+def test_qwen4_flat_and_ordinary_layouts_have_distinct_namespaces(construction):
+    from test.runtime.test_flat_kv_cache import _qwen4_exp_pool
+
+    from tokenspeed.runtime.cache.l3.identity import (
+        cache_layout_signature,
+        storage_deployment_id,
+    )
+    from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
+
+    args, _, _, _ = construction
+    identities = {}
+    for flat in (False, True):
+        _, arena, (target, draft) = _qwen4_exp_pool(
+            flat=flat,
+            device="cpu",
+            kv_dtype=torch.bfloat16,
+            draft_num_kv_heads=2,
+        )
+        layout = combine_cache_transfer_layouts(
+            target.cache_transfer_layout(),
+            draft.cache_transfer_layout(),
+            group_ids=tuple(group.group_id for group in arena.plan.groups),
+        )
+        signature = cache_layout_signature(layout, cache_dtype="bfloat16")
+        for flag in (False, True):
+            args.qwen4_exp_flat_kv = flag
+            identities[flat, flag] = storage_deployment_id(
+                "qwen4-exp-test",
+                revision="checkpoint",
+                model_overrides={},
+                cache_signature=signature,
+                pipeline_rank=0,
+                attn_tp_size=1,
+                group_shard_counts=(1,) * len(layout.groups),
+                draft_model="qwen4-exp-draft-test",
+                draft_revision="checkpoint",
+                cache_quantization="bfloat16",
+                runtime_compat="test",
+                attention_backend="mha",
+                draft_attention_backend="mha",
+                skip_softmax_threshold=0.0,
+                eagle3_layers_to_capture=(),
+                kv_producer=_kv_producer_options(args, draft_dtype="bfloat16"),
+            )
+    assert identities[False, False] == identities[False, True]
+    assert identities[True, False] == identities[True, True]
+    assert identities[False, False] != identities[True, False]
+
+
 def test_settings_refuse_head_partitioned_payload_on_cyclic_owners(construction):
     args, model, _, factory_kwargs = construction
     ownership = BlockOwnerTranslation(

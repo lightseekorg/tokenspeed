@@ -130,6 +130,27 @@ void SchedulerConfig::Validate() const {
             throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
         }
     }
+    if (peer_config) {
+        peer_config->Validate();
+        // A holder exports what it caches, and a reader lands a prefix it
+        // caches next. The D role holds (the history it decoded) but never
+        // reads: its prompts come from its PD peer. A page-sharded group's
+        // pages are not whole on one rank.
+        if (disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing needs prefix caching");
+        }
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count != 1; })) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing supports replicated cache groups only");
+        }
+        // A replayable group is never cached, so no holder exports the
+        // suffix a landed prefix would have to replay.
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.replayable; })) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing excludes replayable cache groups");
+        }
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing excludes L3 storage");
+        }
+    }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
@@ -144,11 +165,6 @@ void SchedulerConfig::Validate() const {
     if (host_write_policy == HostWritePolicy::kWriteBack) {
         if (!HasHostCache()) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
-        }
-        if (role == Role::kD) {
-            throw std::invalid_argument(
-                "Scheduler: host_write_policy WriteBack is not available on the D role: its Host holds retraction "
-                "images only and remote admission probes the Device alone");
         }
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");

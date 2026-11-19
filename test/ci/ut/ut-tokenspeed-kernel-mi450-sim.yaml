@@ -81,6 +81,8 @@ env:
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_retained_commit_graph_refresh_and_layer_subset
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_retained_capability_requires_both_explicit_contracts
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_smoke_gfx1250
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_gfx1250_wide_panels[split]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_gfx1250_wide_panels[whole-head]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_bf16_materialization_smoke_gfx1250
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_output_norm_smoke_gfx1250
     # DeepSeek V4.1 index top-k: CSA2 scoring, reindexing, missing and

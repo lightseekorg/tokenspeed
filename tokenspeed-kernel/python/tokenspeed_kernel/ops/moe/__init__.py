@@ -43,6 +43,7 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "try_router_gemm_nvfp4",
     "bf16_moe_routes",
     "bf16_moe_routes_warmup",
     "gather_moe_routes",
@@ -81,6 +82,71 @@ __all__ = [
     "prepare_moe_sorted_down_weight",
     "warmup_moe_sorted_prefill",
 ]
+
+
+def try_router_gemm_nvfp4(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    quant_scale: torch.Tensor,
+    *,
+    override: str | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]] | None:
+    """Try a fused router projection and NVFP4 input producer.
+
+    Inputs are [tokens, hidden] activations, [experts, hidden] BF16 weights,
+    and a scalar FP32 *quantization-domain* global scale (as used by the MoE
+    consumer). Return BF16 logits and (packed E2M1 rows, linear E4M3 block
+    scales), or None when automatic selection has no matching implementation.
+    The caller retains routing and the unfused fallback. Explicit overrides
+    must execute or raise; they are never silently ignored.
+    """
+    if hidden_states.ndim != 2 or router_weight.ndim != 2:
+        raise ValueError("router projection requires 2D input and weights")
+    if router_weight.shape[1] != hidden_states.shape[1]:
+        raise ValueError("router weight width must match hidden states")
+    if quant_scale.numel() != 1 or quant_scale.dtype != torch.float32:
+        raise ValueError("router quantization scale must be a scalar FP32 tensor")
+    if any(t.device != hidden_states.device for t in (router_weight, quant_scale)):
+        raise ValueError("router inputs must be on the same device")
+    traits = {
+        "tokens": hidden_states.shape[0],
+        "hidden_size": hidden_states.shape[1],
+        "num_experts": router_weight.shape[0],
+        "inputs_contiguous": all(
+            t.is_contiguous() for t in (hidden_states, router_weight, quant_scale)
+        ),
+        "inputs_aligned_16": hidden_states.data_ptr() % 16
+        == router_weight.data_ptr() % 16
+        == 0,
+        "pdl_enabled": pdl_enabled(),
+    }
+    override = resolve_kernel_override("moe", "router_gemm_nvfp4", override)
+    try:
+        kernel = select_kernel(
+            "moe",
+            "router_gemm_nvfp4",
+            format_signature(
+                hidden_states=dense_tensor_format(hidden_states.dtype),
+                router_weight=dense_tensor_format(router_weight.dtype),
+            ),
+            traits=traits,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    ShapeCapture.get().record(
+        "moe", "router_gemm_nvfp4", kernel.name, hidden_states.dtype, traits
+    )
+    with kernel_scope(
+        "moe",
+        "router_gemm_nvfp4",
+        hidden_states.dtype,
+        kernel_name=kernel.name,
+        **traits,
+    ):
+        return kernel(hidden_states, router_weight, quant_scale)
 
 
 def plan_softmax_bias_topk(
@@ -172,7 +238,7 @@ def prepare_sm90_fp8_moe(
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.4, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.5, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
@@ -1587,6 +1653,7 @@ def _build_traits(
     expert_id_repeats: bool,
     fp8_scale_block_shape: tuple[int, int] | None,
     internal_activation_dtype: str | None,
+    expert_layout: str | None,
     with_bias: bool,
     combine_order: str,
 ) -> dict[str, Any]:
@@ -1594,6 +1661,9 @@ def _build_traits(
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    if expert_layout is not None:
+        # Seller-declared: excludes kernels declaring another bank layout.
+        traits["expert_layout"] = expert_layout
     # Unknown counts must not admit a kernel restricted to particular counts.
     traits["num_experts"] = num_experts
     traits["top_k"] = top_k
@@ -1655,10 +1725,14 @@ def _select_moe_apply(
             static_traits=traits,
             variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
             solution=solution,
-            declared_traits=(
-                frozenset({"combine_order"})
-                if traits["combine_order"] == "slot"
-                else frozenset()
+            # A kernel serves these requests only when it declares them.
+            declared_traits=frozenset(
+                name
+                for name, requested in (
+                    ("combine_order", traits["combine_order"] == "slot"),
+                    ("expert_layout", "expert_layout" in traits),
+                )
+                if requested
             ),
             ignore_layout=True,
         )
@@ -1959,6 +2033,7 @@ def moe_plan(
     top_k: int | None = None,
     fp8_scale_block_shape: tuple[int, int] | None = None,
     internal_activation_dtype: str | None = None,
+    expert_layout: str | None = None,
     with_bias: bool = False,
     process_group: object | None = None,
     deepep_mode: str | None = None,
@@ -2018,6 +2093,11 @@ def moe_plan(
             "input" is a special value that uses the whatever dtype the input
             activations have. "mxfp4" requests dynamic MXFP4 activation
             quantization. Defaults to "input" if not set.
+        expert_layout: Optional storage layout the selected kernel must read
+            the routed-expert banks in (for example "gdot128" or "n16" for the
+            gfx950 MXFP4 SiTU kernels). The selected kernel must declare it, or
+            planning raises ValueError. None leaves the layout to selection,
+            which keeps the default.
         with_bias: Whether the selected kernel must support expert bias tensors.
         process_group: Runtime-created process group for DeepEP or MegaMoE
             communication. Defaults to None for backends that do not use it.
@@ -2100,6 +2180,7 @@ def moe_plan(
         expert_id_repeats=expert_id_repeats,
         fp8_scale_block_shape=fp8_scale_block_shape,
         internal_activation_dtype=internal_activation_dtype,
+        expert_layout=expert_layout,
         with_bias=with_bias,
         combine_order=combine_order,
     )
@@ -2135,6 +2216,14 @@ def moe_plan(
     ):
         raise ValueError(
             f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
+        )
+    # Selection drops only kernels declaring another layout; one declaring none
+    # still matches, so a requested layout is checked on the selected kernel.
+    declared_layouts = apply_spec.traits.get("expert_layout", frozenset())
+    if expert_layout is not None and expert_layout not in declared_layouts:
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not read the requested "
+            f"{expert_layout!r} expert layout"
         )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
@@ -2172,6 +2261,9 @@ def moe_plan(
         )
     supports_prequantized_input = True in apply_spec.traits.get(
         "supports_prequantized_input", frozenset({False})
+    )
+    supports_fp8_per_tensor_input = True in apply_spec.traits.get(
+        "supports_fp8_per_tensor_input", frozenset({False})
     )
     sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
     sorted_route_block_sizes = apply_spec.traits.get(
@@ -2212,6 +2304,7 @@ def moe_plan(
         "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
+        "supports_fp8_per_tensor_input": supports_fp8_per_tensor_input,
         "sorted_route_rows": sorted_route_rows,
         "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
