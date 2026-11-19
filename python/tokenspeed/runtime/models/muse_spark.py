@@ -198,6 +198,35 @@ def _muse_all_reduce(
     return tuple(results)
 
 
+class _CopyEngineRows:
+    """Every rank's owned BF16 rows in symmetric memory, which peers pull on
+    the copy engine.
+
+    A gather writes this rank's rows into one of two parities and passes a
+    barrier before peers pull them. A rank rewrites a parity only after the
+    next gather's barrier, which every peer passes after its reads of this
+    one. Owned forwards gather twice per layer, so each starts on parity 0 and
+    a captured graph replays the parities it recorded.
+    """
+
+    def __init__(self, group: Group, rows: int, width: int) -> None:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        process_group = process_group_manager.get_device_process_group(group)
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.rank = dist.get_rank(process_group)
+        self.slots = symm_mem.empty(
+            (2, rows, width), dtype=torch.bfloat16, device=device
+        )
+        self.handle = symm_mem.rendezvous(self.slots, process_group.group_name)
+        self.peer_slots = [
+            self.handle.get_buffer(peer, self.slots.shape, torch.bfloat16)
+            for peer in range(len(group))
+        ]
+        self.stream = torch.cuda.Stream(device)
+        self.parity = 0
+
+
 class _NcclOwnedRows:
     """NCCL owned-row collectives for the sharded projections NVIDIA keeps.
 
@@ -208,9 +237,52 @@ class _NcclOwnedRows:
     def __init__(self, group: Group) -> None:
         self.group = group
         self.world_size = len(group)
+        # Bound by prepare_communication_runtime; owned forwards require it.
+        self.copy_engine: _CopyEngineRows | None = None
 
     def local_rows(self, rows: int) -> int:
         return (rows + self.world_size - 1) // self.world_size
+
+    def all_gather_mm(
+        self, x: torch.Tensor, rows: int, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """``all_gather_owned_rows(x, rows) @ weight.T``, projecting each
+        rank's rows as they land.
+
+        The copy engine pulls peers' rows while this rank's rows project, so
+        the gather leaves the SMs to the GEMMs.
+        """
+        gather = self.copy_engine
+        local_rows = x.shape[0]
+        assert gather is not None and local_rows <= gather.slots.shape[1]
+        assert rows > (self.world_size - 1) * local_rows
+        assert x.dtype == torch.bfloat16 and x.shape[1] == gather.slots.shape[2]
+        parity = gather.parity
+        gather.parity ^= 1
+        gather.slots[parity, :local_rows].copy_(x)
+        gather.handle.barrier(channel=0)
+        main = torch.cuda.current_stream()
+        gather.stream.wait_stream(main)
+        out = x.new_empty((rows, weight.shape[0]))
+        pulled = x.new_empty((self.world_size, local_rows, x.shape[1]))
+        landed = []
+        with torch.cuda.stream(gather.stream):
+            for step in range(1, self.world_size):
+                peer = (gather.rank + step) % self.world_size
+                valid = min(local_rows, rows - peer * local_rows)
+                pulled[peer, :valid].copy_(gather.peer_slots[peer][parity, :valid])
+                event = torch.cuda.Event()
+                event.record()
+                landed.append((peer, event))
+        first = gather.rank * local_rows
+        valid = min(local_rows, rows - first)
+        mm(x[:valid], weight, out=out[first : first + valid])
+        for peer, event in landed:
+            main.wait_event(event)
+            first = peer * local_rows
+            valid = min(local_rows, rows - first)
+            mm(pulled[peer, :valid], weight, out=out[first : first + valid])
+        return out
 
     def reduce_scatter_owned_rows(self, tensor: torch.Tensor) -> torch.Tensor:
         """Sum full ``[rows, width]`` partials into this rank's ``[L, width]`` rows."""
@@ -934,6 +1006,11 @@ class MuseSparkAttention(nn.Module):
             qk_norm=(self.q_norm, self.k_norm),
         )
         self.iris_state: MuseIrisState | None = None
+        self.nccl_owned_rows: _NcclOwnedRows | None = (
+            _NcclOwnedRows(mapping.attn.tp_group)
+            if self.tp_size > 1 and current_platform().is_nvidia
+            else None
+        )
 
     def _acquire_projection_output(self, x: torch.Tensor) -> torch.Tensor | None:
         """Borrow the all-reduce producer buffer for the projection, if compatible."""
@@ -975,12 +1052,15 @@ class MuseSparkAttention(nn.Module):
         owned_global_rows: int | None,
     ) -> tuple[torch.Tensor, int | None, int]:
         """Attend over rows already passed through ``normalize``."""
-        if owned_global_rows is not None:
+        # NVIDIA gathers owned rows into the projection; Iris projects them in place.
+        gathered = owned_global_rows is not None and self.nccl_owned_rows is not None
+        if owned_global_rows is not None and not gathered:
             projected = self.qkv_proj.project_owned_rows(normalized, owned_global_rows)
             iris = self.iris_state
             assert iris is not None
         if (
             owned_global_rows is not None
+            and not gathered
             and owned_global_rows >= MUSE_OWNED_QKVG_MIN_TOKENS
             and ctx.forward_mode.is_extend()
             and ctx.token_to_kv_pool.dtype == torch.bfloat16
@@ -1004,7 +1084,11 @@ class MuseSparkAttention(nn.Module):
             prepared = self.attn.store_prepared(q, k, v, ctx)
             output = self.attn.attend(prepared.q, prepared.k, prepared.v, ctx)
         else:
-            if owned_global_rows is not None:
+            if gathered:
+                qkv_gate = self.nccl_owned_rows.all_gather_mm(
+                    normalized, owned_global_rows, self.qkv_proj.weight
+                )
+            elif owned_global_rows is not None:
                 qkv_gate = iris.all_to_all_transpose_qkvg(projected, owned_global_rows)
             elif normalized.shape[0] == 0:
                 return normalized.new_empty((0, self.hidden_size)), None, 1
@@ -1701,10 +1785,15 @@ class MuseSparkMoE(nn.Module):
         )
         topk_ids = routes[:, : self.topk].contiguous()
         topk_weights = routes[:, self.topk :].contiguous().view(torch.float32)
-        hidden_states = owned.all_gather_owned_rows(hidden_states, rows)
+        projection = self.pre_expert_proj
+        compressed = all_gather(
+            owned.all_gather_mm(hidden_states, rows, projection.weight),
+            projection.group,
+            dim=-1,
+            backend=get_global_backend().nccl,
+        )
         norm = self.pre_expert_norm
         if self.expert_quant_kind == "nvfp4":
-            compressed = self.pre_expert_proj(hidden_states)
             compressed_quantized = rmsnorm_nvfp4_quant(
                 compressed,
                 norm.weight,
@@ -1715,7 +1804,7 @@ class MuseSparkMoE(nn.Module):
                 pdl_enabled(),
             )
         else:
-            compressed = self.pre_expert_proj.forward_rmsnorm(hidden_states, norm)
+            compressed = norm(compressed, compressed.dtype)
             compressed_quantized = None
         combined = self._experts_combined(
             compressed,
@@ -2399,10 +2488,9 @@ class MuseSparkDecoderLayer(nn.Module):
         if owned_global_rows is not None:
             iris = self.iris_state
             assert iris is not None or self.nccl_owned_rows is not None
-            # Layer zero receives full input; later large batches project owned rows (Iris only).
-            owned_qkvg = (
-                iris is not None
-                and self.comm_manager.layer_id > 0
+            # NVIDIA projects owned rows from layer zero; Iris past it at large batches.
+            owned_qkvg = iris is None or (
+                self.comm_manager.layer_id > 0
                 and owned_global_rows >= MUSE_OWNED_QKVG_MIN_TOKENS
             )
         else:
@@ -2616,16 +2704,11 @@ class MuseSparkDecoderLayer(nn.Module):
         if (
             owned_global_rows is not None
             and next_attention_input is not None
-            and (iris is None or owned_global_rows < MUSE_OWNED_QKVG_MIN_TOKENS)
+            and iris is not None
+            and owned_global_rows < MUSE_OWNED_QKVG_MIN_TOKENS
         ):
-            next_attention_input = (
-                iris.all_gather_owned_rows(
-                    next_attention_input, owned_global_rows, False
-                )
-                if iris is not None
-                else self.nccl_owned_rows.all_gather_owned_rows(
-                    next_attention_input, owned_global_rows
-                )
+            next_attention_input = iris.all_gather_owned_rows(
+                next_attention_input, owned_global_rows, False
             )
         return hidden_states, next_attention_input
 
@@ -2753,6 +2836,14 @@ class MuseSparkModel(BaseTransformerModel):
                 )
                 # The owned path gathers draft taps in BF16, as the Iris one does.
                 and self.embed_tokens.weight.dtype == torch.bfloat16
+                and self.nccl_owned_rows.copy_engine is not None
+                # Gathered rows feed the Q/K/V projection as a BF16 GEMM.
+                and all(
+                    isinstance(
+                        layer.self_attn.qkv_proj.quant_method, UnquantizedLinearMethod
+                    )
+                    for layer in self.layers
+                )
             )
         if not (
             current_platform().is_cdna4
@@ -2821,14 +2912,18 @@ class MuseSparkModel(BaseTransformerModel):
             ) // self.mapping.attn.tp_size
             first_row = self.mapping.attn.tp_rank * local_rows
             valid_rows = min(local_rows, max(0, rows - first_row))
-            norm = self.layers[0].input_layernorm
-            attention_input = norm(hidden_states, norm.weight.dtype)
             stream = torch.zeros(
                 (local_rows, width),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
             stream[:valid_rows].copy_(hidden_states[first_row : first_row + valid_rows])
+            norm = self.layers[0].input_layernorm
+            # Iris layer zero projects full rows; NVIDIA projects gathered owned rows.
+            attention_input = norm(
+                hidden_states if self.iris_state is not None else stream,
+                norm.weight.dtype,
+            )
             hidden_states = stream
         aux_hidden_states: list[torch.Tensor] = []
         # An idle forward captures no hidden states, as in the base model's loop.
@@ -3224,6 +3319,16 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         mapping = self.mapping
         backend = get_global_backend()
         group = mapping.attn.tp_group
+        owned = self.model.nccl_owned_rows
+        if owned is not None and max_num_tokens >= MUSE_NCCL_OWNED_ROWS_MIN_TOKENS:
+            gather = owned.copy_engine
+            rows = owned.local_rows(max_num_tokens)
+            if gather is None or gather.slots.shape[1] < rows:
+                gather = _CopyEngineRows(group, rows, self.config.hidden_size)
+            owned.copy_engine = gather
+            for layer in self.model.layers:
+                layer.self_attn.nccl_owned_rows.copy_engine = gather
+                layer.mlp.nccl_owned_rows.copy_engine = gather
         down_columns = any(
             layer.mlp.down_columns is not None for layer in self.model.layers
         )
