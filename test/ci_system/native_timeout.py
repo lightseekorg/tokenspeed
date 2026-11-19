@@ -22,9 +22,10 @@
 
 Python faulthandler identifies a blocked extension call but cannot distinguish
 the CUDA driver, NCCL and IPC waits inside it. The debugger is an explicit
-command prefix, e.g. ``--debugger 'sudo -n gdb'`` on a CI runner with ptrace
-access. A failed debugger attempt is reported without replacing the test's exit
-status or removing its timeout. All children share a process group that is
+command prefix, e.g. ``--debugger 'sudo -n timeout -k 5 20 gdb'`` on a CI runner
+with ptrace access. Privileged debuggers need their own timeout because the
+unprivileged wrapper cannot kill them. A failed attempt is reported without
+replacing the test's exit status or removing its timeout. All children share a process group that is
 killed on exit, including when the launcher fails before its workers finish.
 """
 
@@ -38,7 +39,26 @@ import time
 import psutil
 
 
-def run(command, *, dump_after, timeout, debugger):
+def run(
+    command: list[str], *, dump_after: float, timeout: float, debugger: list[str]
+) -> int:
+    """Run a command with native diagnostics and bounded process cleanup.
+
+    Args:
+        command: Executable and arguments to launch in a new process group.
+        dump_after: Seconds before attempting each child's native stack dump.
+        timeout: Command deadline in seconds, including time spent dumping.
+        debugger: Debugger command prefix. A privileged debugger must include
+            its own timeout, as in the module's example.
+
+    Returns:
+        The command's exit status, or 124 when it exceeds the deadline. Failed
+        stack dumps are reported without replacing that status. The command's
+        process group is killed on every exit path.
+
+    Raises:
+        ValueError: Unless 0 < dump_after < timeout.
+    """
     if not 0 < dump_after < timeout:
         raise ValueError("require 0 < dump_after < timeout")
     deadline = time.monotonic() + timeout
@@ -90,7 +110,8 @@ def run(command, *, dump_after, timeout, debugger):
             print(f"Command pid {process.pid} survived kill", flush=True)
 
 
-if __name__ == "__main__":
+def main() -> int:
+    """Parse the CI command and return its exit status."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dump-after", type=float, required=True)
     parser.add_argument("--timeout", type=float, required=True)
@@ -102,11 +123,13 @@ if __name__ == "__main__":
         command = command[1:]
     if not command:
         parser.error("a command is required after --")
-    raise SystemExit(
-        run(
-            command,
-            dump_after=args.dump_after,
-            timeout=args.timeout,
-            debugger=shlex.split(args.debugger),
-        )
+    return run(
+        command,
+        dump_after=args.dump_after,
+        timeout=args.timeout,
+        debugger=shlex.split(args.debugger),
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
