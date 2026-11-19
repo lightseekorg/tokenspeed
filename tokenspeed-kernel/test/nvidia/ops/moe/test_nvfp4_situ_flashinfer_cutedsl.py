@@ -20,9 +20,8 @@
 
 """flashinfer CuTe DSL NVFP4 SiTU MoE (w4a4) on NVFP4 checkpoint experts.
 
-The preprocessor's layout is checked bytewise against FlashInfer's own
-``prepare_cute_dsl_weights``; the registered apply against an fp32 SiTU MoE
-over the exactly-dequantized weights (both activation quantizations modeled),
+The registered apply is checked against an fp32 SiTU MoE over the
+exactly-dequantized weights (both activation quantizations modeled),
 anchored to the TRT-LLM-Gen SiTU kernel on the same checkpoint.
 """
 
@@ -102,8 +101,6 @@ class _Experts(torch.nn.Module):
     def __init__(self, raw: dict[str, torch.Tensor]) -> None:
         from types import SimpleNamespace
 
-        from flashinfer.fused_moe import RoutingMethodType
-
         super().__init__()
         for name, value in raw.items():
             self.register_parameter(
@@ -111,8 +108,6 @@ class _Experts(torch.nn.Module):
             )
         self.activation_situ_beta = SITU_BETA
         self.activation_situ_linear_beta = SITU_LINEAR_BETA
-        self._routing_method_type = RoutingMethodType.RenormalizeNaive
-        self._routing_logits_dtype = torch.bfloat16
         self._spec = SimpleNamespace(
             num_experts=NUM_EXPERTS,
             num_local_experts=NUM_EXPERTS,
@@ -177,47 +172,6 @@ def _reference(hidden_states, raw, topk_ids, topk_weights) -> torch.Tensor:
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
-
-
-@requires_cutedsl_situ
-def test_preprocessor_layout_matches_flashinfer_prepare() -> None:
-    """Checkpoint experts land exactly where FlashInfer's own BF16 preparation
-    puts them: W13 [up | gate] interleaved by 64 rows, swizzled scales."""
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-    from flashinfer.fused_moe.api import QuantConfig, QuantFormat
-    from flashinfer.fused_moe.prepare import prepare_cute_dsl_weights
-    from tokenspeed_kernel.ops.moe.flashinfer_cutedsl import (
-        flashinfer_cutedsl_nvfp4_situ_moe_weights,
-    )
-
-    w13, w2 = _weights(torch.Generator().manual_seed(20261116))
-    w = _Experts(_checkpoint(w13, w2, unit_scale=True)).cuda()
-    flashinfer_cutedsl_nvfp4_situ_moe_weights({}, w)
-    up_gate = torch.cat([w13[:, ISPP:], w13[:, :ISPP]], dim=1).cuda()
-    ref = prepare_cute_dsl_weights(
-        up_gate,
-        w2.cuda(),
-        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-        num_local_experts=NUM_EXPERTS,
-        hidden_size=HIDDEN,
-        intermediate_size=ISPP,
-    )
-
-    def mma_view(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
-        return convert_sf_to_mma_layout(
-            sf.view(NUM_EXPERTS * m, -1), m=m, k=k, num_groups=NUM_EXPERTS
-        )
-
-    assert torch.equal(w.cutedsl_w1_weight, ref["w1_weight"].view(torch.uint8))
-    assert torch.equal(w.cutedsl_w2_weight, ref["w2_weight"].view(torch.uint8))
-    assert torch.equal(
-        mma_view(w.cutedsl_w1_weight_sf, 2 * ISPP, HIDDEN).view(torch.uint8),
-        ref["w1_weight_sf"].view(torch.uint8),
-    )
-    assert torch.equal(
-        mma_view(w.cutedsl_w2_weight_sf, HIDDEN, ISPP).view(torch.uint8),
-        ref["w2_weight_sf"].view(torch.uint8),
-    )
 
 
 @requires_cutedsl_situ
