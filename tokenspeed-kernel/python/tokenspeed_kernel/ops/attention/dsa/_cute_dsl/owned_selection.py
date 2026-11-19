@@ -134,9 +134,10 @@ class OwnedSelect:
     def threshold(self, hist, info, scan, keys, own_keys, rank, tid, warp, lane):
         """Find the row's threshold key and this rank's tie quota at it.
 
-        Three radix digits run over the row's ``W`` live keys. Returns the
-        threshold, the ties to take at it, and this thread's first tie's rank
-        among them (lower ranks' ties first, then candidate order).
+        Three radix digits run over the row's live keys (more than ``W``
+        whenever this runs) to find the ``W``-th largest. Returns the threshold,
+        the ties to take at it, and this thread's first tie's rank among them
+        (lower ranks' ties first, then candidate order).
         """
         W = self.width
         self.digit(hist, info, keys, 21, 0x7FF, 32, Uint32(0), tid)
