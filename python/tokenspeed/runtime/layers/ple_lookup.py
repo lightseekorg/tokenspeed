@@ -392,6 +392,12 @@ class PLELookup(nn.Module):
         *,
         prescanned: bool,
     ) -> None:
+        """Copy or online-quantize one checkpoint shard into the table.
+
+        ``prescanned`` must be true once :meth:`set_online_scale` has run for
+        the table, which is required when ``split_parts`` is greater than 1;
+        raises ``ValueError`` when a split table was not prescanned.
+        """
         rows = self.shard_rows(weight, shard_index, split_parts)
         if self.needs_online_quantization(weight):
             if not prescanned:

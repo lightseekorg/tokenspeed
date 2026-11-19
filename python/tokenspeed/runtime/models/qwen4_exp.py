@@ -647,7 +647,19 @@ def _normalize_checkpoint_name(name: str) -> str:
 _PLE_SHARD_NAME = re.compile(r"^(.+)\.ngram_embedding(?:\.shard_(\d+))?\.weight$")
 
 
-def _prescan_ple_scale(lookup: PLELookup, root: Path, resolve_shard):
+def _prescan_ple_scale(
+    lookup: PLELookup,
+    root: Path,
+    resolve_shard: Callable[[str], tuple[int, int] | None],
+) -> None:
+    """Scan a safetensors checkpoint directory for PLE table shards.
+
+    ``resolve_shard`` maps a checkpoint tensor name to its ``(shard index,
+    split parts)`` tuple, or ``None`` for tensors outside the table. The
+    per-rank absolute maximum across the matching shards feeds
+    :meth:`PLELookup.set_online_scale`. Raises ``ValueError`` when ``root``
+    has no standard safetensors layout or no matching PLE table.
+    """
     index = root / "model.safetensors.index.json"
     if index.is_file():
         weight_map = json.loads(index.read_text())["weight_map"]
@@ -660,7 +672,8 @@ def _prescan_ple_scale(lookup: PLELookup, root: Path, resolve_shard):
         files = {"model.safetensors"}
     else:
         raise ValueError(
-            f"Split online PLE quantization needs a standard safetensors checkpoint in {root}"
+            f"Split online PLE quantization needs a standard safetensors "
+            f"checkpoint in {root}"
         )
 
     local_amax = 0.0
@@ -825,7 +838,8 @@ def load_qwen4_exp_weights(
                 ):
                     if module._checkpoint_dir is None:
                         raise ValueError(
-                            "Split online PLE quantization needs a standard safetensors checkpoint"
+                            "Split online PLE quantization needs a standard "
+                            "safetensors checkpoint"
                         )
                     _prescan_ple_scale(
                         lookup,
