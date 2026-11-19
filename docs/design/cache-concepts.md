@@ -1139,7 +1139,13 @@ Its responsibilities:
   checkpoint may sit on the Device's last page); when the Device alone
   resumes furthest the Host tier mirrors its boundary and claims nothing.
   The probe records the longest usable KV boundary even when its State is
-  missing, since admission uses that reach for the junction cut. Once it is
+  missing, since admission uses that reach for the junction cut; with a
+  State group the reach is at least the prefix-closed groups' coverage (on
+  the Host, their run past the Device's), rounded down to the checkpoint
+  grid, even where a sliding window is missing, because the chunk cut there
+  writes and publishes its own window. A sliding-only model and the D role's
+  probe (no State group in its order) keep the boundary every token-spanned
+  group accepts. Once it is
   known, shorter candidates missing a required State group are rejected
   before constructing their history hit arrays. This uses the same State
   predicate, including checkpoint granularity and mixed Device/Host hits;
@@ -2013,9 +2019,14 @@ from layer counts.
 Cache construction resolves ownership into explicit field IDs once:
 `cache_fields_by_stage` describes residency, and `producer_fields_by_step`
 describes the local readiness barriers. These sets cover resident fields
-exactly once. PD never derives placement from target/draft identities,
-execution-layer counts or contiguous layer windows. Noncontiguous field sets
-are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
+exactly once. A readiness barrier must follow the final write to every field
+it names. Hybrid backends propagate the producer counter to both attention
+children: state implementations may use it to publish staged prefill state
+before the wrapper records the step. Children dispatched through the wrapper's
+`forward` must not increment the same counter again, including decode dispatch
+with `record_kv_cache=True`. PD never derives placement from target/draft
+identities, execution-layer counts or contiguous layer windows. Noncontiguous
+field sets are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
 ranks must register the same complete placement and logical field plan.
 Old bootstrap peers without explicit placement must be upgraded together.
 

@@ -374,7 +374,6 @@ class ForwardStepRunner:
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
         self.disable_padding = config.disable_cuda_graph_padding
-        self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
         self.device_module = torch.get_device_module(self.device)
         # Decode graphs capture into the memory saver's ``cuda_graph`` region
@@ -591,36 +590,35 @@ class ForwardStepRunner:
             observer: Measured around each capture, for the same caller.
         """
         rank = self.global_rank
-        with freeze_gc(self.enable_cudagraph_gc):
-            # Capture backend-declared sampler variants explicitly.
-            ladders = self.capture_ladders(entries)
-            capture_items = [
-                (variant, ladders[f"decode:{variant}"].widths[i])
-                for variant in self.capture_plan
-                for i in ladders[f"decode:{variant}"].sampled
-            ]
-            capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
+        # Capture backend-declared sampler variants explicitly.
+        ladders = self.capture_ladders(entries)
+        capture_items = [
+            (variant, ladders[f"decode:{variant}"].widths[i])
+            for variant in self.capture_plan
+            for i in ladders[f"decode:{variant}"].sampled
+        ]
+        capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
+        if rank == 0:
+            batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
+            logger.info(f"Capturing batches: {batch_sizes!s}")
+        for variant, bs in capture_range:
             if rank == 0:
-                batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
-                logger.info(f"Capturing batches: {batch_sizes!s}")
-            for variant, bs in capture_range:
-                if rank == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.device, self.gpu_id, empty_cache=False
-                    )
-                    variant_desc = (
-                        ""
-                        if variant == CUDA_GRAPH_VARIANT_DEFAULT
-                        else f" variant={variant}"
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
-                    )
-                graph, output_buffers = self._capture_one(
-                    bs, variant=variant, observer=observer.measure(f"decode:{variant}")
+                avail_mem = get_available_gpu_memory(
+                    self.device, self.gpu_id, empty_cache=False
                 )
-                self.graphs[(variant, bs)] = graph
-                self.output_buffers[(variant, bs)] = output_buffers
+                variant_desc = (
+                    ""
+                    if variant == CUDA_GRAPH_VARIANT_DEFAULT
+                    else f" variant={variant}"
+                )
+                capture_range.set_description(
+                    f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
+                )
+            graph, output_buffers = self._capture_one(
+                bs, variant=variant, observer=observer.measure(f"decode:{variant}")
+            )
+            self.graphs[(variant, bs)] = graph
+            self.output_buffers[(variant, bs)] = output_buffers
 
     @property
     def capture_plan(self) -> dict[str, list[int]]:

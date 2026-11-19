@@ -224,6 +224,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # that dispatch, so its full-attention child needs the same counter.
         self.step_counter = step_counter
         self.full_attn_backend.register_step_counter(step_counter)
+        # State backends may publish staged prefill state before this wrapper
+        # records readiness. Children do not record a second step here.
+        self.linear_attn_backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
