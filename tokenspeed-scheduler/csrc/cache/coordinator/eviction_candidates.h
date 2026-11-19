@@ -165,6 +165,116 @@ public:
             std::ranges::count_if(cursors_, [](const auto& group) { return group.started; }));
     }
 
+    // The parents the traversal empties, in the order it empties them: each
+    // parent of a group that tracks them (PrefixCacheIndex::ParentEntries)
+    // whose occupants are all entries empties at its newest child. A parent
+    // with a child the traversal never offers, in use or protected, is left
+    // out. Non-owning, like the traversal.
+    class EmptiableParents {
+    public:
+        // cached marks the groups holding index entries. The others have no
+        // emptiable parents, so skip their parent-index scan.
+        EmptiableParents(const std::vector<CacheGroup>& groups, const std::vector<bool>& cached, const BlockPool& pool,
+                         const LocationSet& protected_locations)
+            : groups_{groups}, pool_{pool}, protected_locations_{protected_locations} {
+            _assert(cached.size() == groups.size(), "every group has a cached flag");
+            for (std::size_t i = 0; i < groups.size(); ++i) {
+                if (!cached[i]) {
+                    continue;
+                }
+                const std::span<const PrefixCacheIndex::ParentEntries> entries =
+                    groups[i].Index().EntriesByParent(pool);
+                for (std::size_t id = 1; id < entries.size(); ++id) {
+                    const auto lcm_block_id = static_cast<std::int32_t>(id);
+                    if (entries[id].count > 0 && entries[id].count == pool.OccupiedCount(lcm_block_id)) {
+                        heap_.push_back(Parent{.newest_access_epoch = entries[id].newest_access_epoch,
+                                               .lcm_block_id = lcm_block_id,
+                                               .group_id = static_cast<std::uint32_t>(i)});
+                    }
+                }
+            }
+            std::ranges::make_heap(heap_, EmptiesLater{children_});
+        }
+
+        // The earliest parent's children in candidate order; empty once no
+        // parent is left.
+        std::span<const Candidate> Earliest() {
+            while (!heap_.empty() && !heap_.front().read) {
+                Parent parent = pop();
+                const CacheGroup& group = groups_[parent.group_id];
+                std::vector<Candidate> children;
+                bool offered = true;
+                for (std::int32_t slot = 0; offered && slot < pool_.Packing(parent.group_id); ++slot) {
+                    const CacheBlockLocation location{.lcm_block_id = parent.lcm_block_id, .slot_index = slot};
+                    if (!pool_.IsOccupied(location)) {
+                        continue;
+                    }
+                    const auto entry = group.Index().UnpinnedCandidateAt(pool_, location);
+                    offered = entry && !protected_locations_.contains(location);
+                    if (offered) {
+                        children.push_back(MakeCandidate(group, *entry));
+                    }
+                }
+                if (!offered) {
+                    continue;
+                }
+                Sort(children);
+                _assert(children.back().rank_epoch == parent.newest_access_epoch,
+                        "a parent's newest child ranks at the parent's newest epoch");
+                parent.read = true;
+                parent.children = children_.size();
+                children_.push_back(std::move(children));
+                heap_.push_back(parent);
+                std::ranges::push_heap(heap_, EmptiesLater{children_});
+            }
+            return heap_.empty() ? std::span<const Candidate>{} : children_[heap_.front().children];
+        }
+
+        // Takes the parent Earliest returned out of the order.
+        void PopEarliest() {
+            _assert(!heap_.empty() && heap_.front().read, "Earliest read the parent it pops");
+            pop();
+        }
+
+    private:
+        struct Parent {
+            std::uint64_t newest_access_epoch;
+            std::int32_t lcm_block_id;
+            std::uint32_t group_id;
+            // Its children in candidate order, once read (children_).
+            std::size_t children{0};
+            bool read{false};
+        };
+        // The heap's order, earliest on top: by newest epoch, then, among
+        // parents at one epoch, an unread one first so that it is read, then
+        // by newest child.
+        struct EmptiesLater {
+            const std::vector<std::vector<Candidate>>& children;
+            bool operator()(const Parent& lhs, const Parent& rhs) const {
+                if (lhs.newest_access_epoch != rhs.newest_access_epoch) {
+                    return lhs.newest_access_epoch > rhs.newest_access_epoch;
+                }
+                if (lhs.read != rhs.read) {
+                    return lhs.read;
+                }
+                return lhs.read && Before(children[rhs.children].back(), children[lhs.children].back());
+            }
+        };
+
+        Parent pop() {
+            std::ranges::pop_heap(heap_, EmptiesLater{children_});
+            const Parent parent = heap_.back();
+            heap_.pop_back();
+            return parent;
+        }
+
+        const std::vector<CacheGroup>& groups_;
+        const BlockPool& pool_;
+        const LocationSet& protected_locations_;
+        std::vector<Parent> heap_;
+        std::vector<std::vector<Candidate>> children_;
+    };
+
 private:
     // A request release can precede the cache; never inspect a newer epoch.
     template <typename IsSelected>

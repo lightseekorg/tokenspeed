@@ -33,6 +33,8 @@
 //!
 //! Metrics never fail serving: an output that errors is logged and skipped.
 
+mod peer;
+pub use peer::{PeerMetrics, QueuedPeerRead};
 mod prom;
 mod relay;
 
@@ -394,6 +396,8 @@ const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 /// group's first rank.
 #[derive(Debug)]
 pub struct EngineMetrics {
+    /// Logical peer metrics for this DP owner.
+    pub peer: Arc<PeerMetrics>,
     labels: [String; 3],
     spec_decode_accept_length: Metric,
     prefix_cache_hit_ratio: Metric,
@@ -464,6 +468,7 @@ impl EngineMetrics {
     pub fn new(exporter: &Arc<Exporter>, labels: &EngineLabels) -> Self {
         let names = &ENGINE_LABELS;
         Self {
+            peer: Arc::new(PeerMetrics::new(exporter, labels)),
             spec_decode_accept_length: Metric::histogram(
                 exporter,
                 "tokenspeed:spec_decode_accept_length",

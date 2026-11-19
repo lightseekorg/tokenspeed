@@ -59,7 +59,7 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -164,6 +164,7 @@ from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.peer_weights import MoEPeerWeights
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
@@ -215,6 +216,11 @@ from tokenspeed.runtime.models.kimi_k3_projection import (
     validate_projection_settings,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
+from tokenspeed.runtime.moe.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -2475,6 +2481,64 @@ def _amd_moe_join_lane(like: torch.Tensor, width: int) -> torch.Tensor | None:
     return lane
 
 
+def _check_k3_expert_placement(
+    placement: ExpertLocationMetadata,
+    config: KimiLinearConfig,
+    mapping: Mapping,
+    layer_index: int,
+    peer_weights: MoEPeerWeights | None,
+) -> None:
+    """Refuse a placement this K3 MoE layer cannot route through.
+
+    Attention DP with EP-only MoE consumes one: each rank routes its own tokens
+    to this rank's static replica choice, and the dispatch delivers each route
+    to the rank owning that physical slot.
+    """
+    if placement.num_logical_experts != config.num_experts:
+        raise ValueError(
+            f"expert placement has {placement.num_logical_experts} logical experts, "
+            f"Kimi-K3 routes {config.num_experts}"
+        )
+    if not 0 <= layer_index < placement.num_layers:
+        raise ValueError(
+            f"Kimi-K3 MoE layer {layer_index} is outside the placement's "
+            f"{placement.num_layers} layers"
+        )
+    if placement.ep_size != mapping.moe.ep_size:
+        raise ValueError(
+            f"expert placement spans ep_size={placement.ep_size}, the MoE mapping "
+            f"has ep_size={mapping.moe.ep_size}"
+        )
+    if not (
+        mapping.attn.dp_size > 1
+        and mapping.moe.tp_size == 1
+        and mapping.moe.ep_size > 1
+    ):
+        raise ValueError(
+            "Kimi-K3 expert placement requires attention DP with MoE EP only "
+            "(moe tp_size 1)"
+        )
+    if peer_weights is not None:
+        raise ValueError(
+            "Kimi-K3 expert placement does not support --moe-weight-sharing-size"
+        )
+    if placement.physical_load is not None:
+        raise ValueError(
+            "Kimi-K3 expert placement does not support "
+            "--expert-distribution-recorder-mode or --enable-eplb: the "
+            "attention-DP MoE routes local rows only, which the load row mask "
+            "does not lay out, and online rebalancing needs "
+            "routed_experts_weights_of_layer"
+        )
+    algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+    if algorithm != "static":
+        raise ValueError(
+            "Kimi-K3 expert placement needs --ep-dispatch-algorithm static: the "
+            "router maps ids through this rank's static replica map, not "
+            f"{algorithm}"
+        )
+
+
 class KimiLinearMoE(nn.Module):
     """Kimi-K3 MoE block: sigmoid / noaux_tc router + Latent MoE + shared experts.
 
@@ -2546,12 +2610,31 @@ class KimiLinearMoE(nn.Module):
                 f"--all2all-backend {fused_all2all_backend.value}; "
                 "the fused kernel owns dispatch/combine."
             )
+        # The target's expert placement (None for drafts and plain serving):
+        # the routed experts hold P = E + R slots and the router emits slot ids.
+        self.expert_placement: ExpertLocationMetadata | None = (
+            get_global_expert_location_metadata()
+        )
+        if self.expert_placement is not None:
+            _check_k3_expert_placement(
+                self.expert_placement,
+                config,
+                mapping,
+                layer_index,
+                peer_weights,
+            )
         # Router (gate+topk) and shared experts run on this stream during
         # graph capture, overlapped with the main-stream routed chain
         # (down_proj -> fused SiTU MoE -> up_proj). Collectives stay on the default
         # stream (aux-stream collectives can deadlock across ranks).
         self.stream_fork = StreamFork(alt_stream)
         self.num_experts = config.num_experts
+        # Routed-expert slots: the router emits slot ids when a placement is set.
+        self.num_physical_experts = (
+            self.num_experts
+            if self.expert_placement is None
+            else self.expert_placement.num_physical_experts
+        )
         self.top_k = config.num_experts_per_token
         self.routed_scaling_factor = config.routed_scaling_factor
         # Latent MoE: routed experts run at routed_expert_hidden_size.
@@ -2584,7 +2667,7 @@ class KimiLinearMoE(nn.Module):
         # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
             top_k=self.top_k,
-            num_experts=self.num_experts,
+            num_experts=self.num_physical_experts,
             hidden_size=self.routed_hidden,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -2648,6 +2731,7 @@ class KimiLinearMoE(nn.Module):
         # MXFP4 SiTU and precomputed-TopK NVFP4 SiTU implementations).
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_index,
             renormalize=config.moe_renormalize,
             use_grouped_topk=config.use_grouped_topk,
             num_expert_group=config.num_expert_group,
@@ -2668,6 +2752,15 @@ class KimiLinearMoE(nn.Module):
                 else torch.float32
             ),
         )
+        self.expert_dispatch_info: ExpertLocationDispatchInfo | None = None
+        if self.expert_placement is not None:
+            self.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=layer_index,
+                ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                expert_location_metadata=self.expert_placement,
+                # Attention DP: each rank routes only its own tokens.
+                all_to_all_ep=True,
+            )
 
         # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
         self._shard_latent_projections = _shard_k3_latent_projection(
@@ -2803,7 +2896,7 @@ class KimiLinearMoE(nn.Module):
                     ),
                     hidden_size=self.routed_hidden,
                     top_k=self.top_k,
-                    num_experts=self.num_experts,
+                    num_experts=self.num_physical_experts,
                     dtype=self.gate.weight.dtype,
                 )
                 if (
@@ -3634,7 +3727,7 @@ class KimiLinearMoE(nn.Module):
                     router_logits,
                     output_format=TopKOutputFormat.STANDARD,
                     num_token_non_padded=None,
-                    expert_location_dispatch_info=None,
+                    expert_location_dispatch_info=self.expert_dispatch_info,
                     out=routing_out,
                 )
                 if fused_inputs is None:
@@ -3969,6 +4062,14 @@ def create_kimi_linear_moe(
         raise ValueError("Peer expert weights require the local MoE implementation")
     if expert_layout is not None and implementation is not KimiLinearMoE:
         raise ValueError("An expert bank layout requires the local MoE implementation")
+    if (
+        get_global_expert_location_metadata() is not None
+        and implementation is not KimiLinearMoE
+    ):
+        raise ValueError(
+            "Kimi-K3 expert placement requires the attention-DP MoE path, "
+            "not --all2all-backend deepep"
+        )
     peer_kwargs = {"peer_weights": peer_weights} if peer_weights is not None else {}
     layout_kwargs = (
         {"expert_layout": expert_layout} if expert_layout is not None else {}
@@ -4963,6 +5064,8 @@ class KimiLinearModel(nn.Module):
                 model_identity=f"{global_server_args_dict['model']}@{global_server_args_dict['revision']}",
                 pool_page_bytes=16 * 1024**2,
                 copy_implementation="simple",
+                # K3 NVFP4 uses fabric storage; POSIX is a storage API option.
+                handle_type="fabric",
                 solution="cuda",
             )
             self.peer_weights = MoEPeerWeights(partition=partition, store=store)
@@ -5520,6 +5623,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
     supports_aux_capture = True
+
+    @property
+    def expert_placement(self) -> ExpertLocationMetadata | None:
+        """The placement the MoE layers were built with; None routes trivially."""
+        for layer in self.model.layers:
+            if (
+                isinstance(layer, KimiLinearDecoderLayer)
+                and layer.is_moe_layer
+                and isinstance(layer.block_sparse_moe, KimiLinearMoE)
+            ):
+                return layer.block_sparse_moe.expert_placement
+        return None
 
     def post_quant_warmup(self) -> None:
         if self.model.peer_weights is not None:
@@ -6107,12 +6222,19 @@ class KimiLinearForCausalLM(BaseCausalLM):
             scale_param.weight_loader(scale_param, fused_s)
             return True
 
+        # Every placed slot is filled from the logical expert it holds,
+        # replicas included.
+        expert_placement = self.expert_placement
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
                 gate_proj_name="w1", up_proj_name="w3", down_proj_name="w2"
             ),
-            num_experts=config.num_experts,
+            num_experts=(
+                config.num_experts
+                if expert_placement is None
+                else expert_placement.num_physical_experts
+            ),
             ep_rank=(
                 self.mapping.moe_weight_group.index(self.mapping.rank)
                 if self.model.peer_weights is not None
@@ -6123,6 +6245,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 if self.model.peer_weights is not None
                 else self.mapping.moe.ep_size
             ),
+            expert_placement=expert_placement,
         )
 
         pp_start = self.model.pp_start_layer
@@ -6316,6 +6439,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
     Construction mirrors ``KimiK25ForConditionalGeneration``: a vision path plus
     a text ``language_model``. The text path is ``KimiLinearForCausalLM``.
     """
+
+    # The attention-DP MoE layers size their slots from the expert placement
+    # and route through it; ``_check_k3_expert_placement`` refuses it elsewhere.
+    supports_expert_placement: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -6584,6 +6711,18 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "is inactive.",
             )
         logger.debug(f"Loaded {loaded_vision_weights:d} Kimi-K3 vision tensors.")
+
+    @classmethod
+    def get_model_config_for_expert_location(
+        cls, config: KimiK3Config
+    ) -> ModelConfigForExpertLocation:
+        # One placement row per decoder layer: the layer id indexes it.
+        text_config = config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

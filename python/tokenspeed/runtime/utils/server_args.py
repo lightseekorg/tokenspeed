@@ -1535,10 +1535,6 @@ class ServerArgs:
                 raise ValueError(
                     "Peer expert weights currently require a prefill instance"
                 )
-            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
-                raise ValueError(
-                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
-                )
             if self.mapping.requires_forward_coordination:
                 raise ValueError(
                     "Peer expert weights require fully local execution groups"
