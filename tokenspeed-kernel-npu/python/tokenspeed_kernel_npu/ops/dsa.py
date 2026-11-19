@@ -25,10 +25,9 @@ from __future__ import annotations
 import os
 
 import torch
-import torch.distributed as dist
 import torch_npu
 from tokenspeed_kernel_npu._triton import tl, triton
-from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
+from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
 
 @triton.jit
@@ -71,7 +70,7 @@ def _current_page(token, seq_start, seq_end, prefix, total, degree, PAGE: tl.con
 
 
 @triton.jit
-def _prefill_metadata(
+def _qcp_prefill_metadata(
     Table,
     Cum,
     Prefix,
@@ -92,7 +91,7 @@ def _prefill_metadata(
     per_block,
     degree,
     local_pages,
-    send_rows,
+    current_rank_stride,
     history_pages,
     table_tiles,
     query_tiles,
@@ -144,7 +143,9 @@ def _prefill_metadata(
         tail_owner, tail_row, page_direct = _current_page(
             page_token, page_begin, page_end, page_prefix, total, degree, PAGE
         )
-        tail_page = history_pages + (tail_owner * send_rows + tail_row) // PAGE
+        tail_page = (
+            history_pages + (tail_owner * current_rank_stride + tail_row) // PAGE
+        )
         page_mapped = tl.where(page_direct, tail_page, page_mapped)
         tl.store(
             OutTable + page_compact * columns + page_col,
@@ -258,7 +259,6 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
 
 class AscendDSAKernels:
     def __init__(self):
-        import flash_ops
 
         library = os.environ.get("TOKENSPEED_LONGCAT_DSA_LIBRARY")
         if library:
@@ -275,26 +275,28 @@ class AscendDSAKernels:
         self._full_scan_chunks = {}
 
     @staticmethod
-    def prepare_prefill(
+    def prepare_qcp_prefill(
         kv_cache,
         index_cache,
         *,
         ranks,
         history_group,
         max_current_rows,
+        max_history_rows,
         history_null_rows,
     ):
-        return AscendDSAPrefill(
+        return AscendQCPPrefillTransport(
             kv_cache,
             index_cache,
             ranks=ranks,
             history_group=history_group,
             max_current_rows=max_current_rows,
+            max_history_rows=max_history_rows,
             history_null_rows=history_null_rows,
         )
 
     @staticmethod
-    def prefill_metadata(
+    def qcp_prefill_metadata(
         table,
         cumulative,
         prefixes,
@@ -305,7 +307,7 @@ class AscendDSAKernels:
         per_block,
         degree,
         local_pages,
-        send_rows,
+        current_rank_stride,
         page_size,
         topk,
         active_requests,
@@ -340,7 +342,9 @@ class AscendDSAKernels:
         block = 256
         table_tiles = active_requests * triton.cdiv(columns, block)
         query_tiles = triton.cdiv(rows, block)
-        _prefill_metadata[(table_tiles + 1 + query_tiles + triton.cdiv(total, block),)](
+        _qcp_prefill_metadata[
+            (table_tiles + 1 + query_tiles + triton.cdiv(total, block),)
+        ](
             table,
             cumulative,
             prefixes,
@@ -361,7 +365,7 @@ class AscendDSAKernels:
             per_block,
             degree,
             local_pages,
-            send_rows,
+            current_rank_stride,
             degree * local_pages if history_pages is None else history_pages,
             table_tiles,
             query_tiles,
@@ -687,7 +691,8 @@ class AscendDSAKernels:
             self._full_scan_chunks[key] = chunks
         return chunks
 
-    def scatter(self, x, cache, locations):
+    @staticmethod
+    def scatter(x, cache, locations):
         width = x.shape[-1]
         if x.dtype != torch.bfloat16 or cache.dtype != x.dtype:
             raise ValueError("LongCatDSA scatter requires BF16")

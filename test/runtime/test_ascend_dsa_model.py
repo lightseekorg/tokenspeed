@@ -20,6 +20,7 @@
 
 """Native DSA rejects old projection contracts before any device operation."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import pytest
@@ -37,10 +38,11 @@ def make_attention(
     config = PretrainedConfig(
         rms_norm_eps=1e-6,
         mla_use_nope=nope,
+        index_use_rope=False,
         mla_use_output_gate=False,
         mla_scale_q_lora=scale_q,
         cli_factor=1,
-        index_n_heads=2,
+        index_n_heads=16,
         index_head_dim=4,
         index_topk=4,
         index_init_tokens=0,
@@ -56,33 +58,15 @@ def make_attention(
         v_head_dim=4,
         q_lora_rank=4,
         kv_lora_rank=4,
-        max_position_embeddings=16,
         layer_id=0,
         lora_norm_eps=1e-6,
-        separate_mla_projections=separate,
-        independent_selection=independent,
         prefill_enabled=prefill_enabled,
     )
 
 
-def test_rotary_model_preserves_requested_positions():
-    attention = make_attention(nope=False, separate=True, independent=True)
-    rotary = attention.rotary_emb
-    positions = torch.tensor([0, 7], dtype=torch.int64)
-    # Exercise the actual rotary module's table construction with two positions.
-    coeff = rotary.cos_sin_cache[positions]
-    assert torch.equal(coeff[0, :2], torch.ones(2))
-    assert torch.equal(coeff[0, 2:], torch.zeros(2))
-    assert not torch.equal(coeff[0], coeff[1])
-    inverse = 1 / (rotary.base ** (torch.arange(0, 4, 2).double() / 4))
-    angles = positions.double()[:, None] * inverse
-    expected = torch.cat((angles.cos(), angles.sin()), -1)
-    torch.testing.assert_close(coeff.double(), expected, atol=1e-6, rtol=1e-6)
-
-
-def test_rejects_old_projection_layout():
-    with pytest.raises(ValueError, match="separate checkpoint"):
-        make_attention(nope=True, separate=False, independent=True)
+def test_rotary_model_rejected_at_initialization():
+    with pytest.raises(ValueError, match="RoPE disabled"):
+        make_attention(nope=False, separate=True, independent=True)
 
 
 def test_unprepared_weights_fail_before_device_execution():
@@ -96,18 +80,15 @@ def test_unprepared_weights_fail_before_device_execution():
         attention(None, torch.zeros((64, 4096)), Context(), None)
 
 
-def test_rejects_shared_cross_layer_selection():
-    with pytest.raises(ValueError, match="independent per-layer selection"):
-        make_attention(nope=True, separate=True, independent=False)
-
-
 def test_failed_native_initialization_releases_its_window(monkeypatch):
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as ascend,
+    )
 
     # Substitute only communication and its native window. The real fused
     # constructor rejects this small model after the resource has been acquired.
@@ -147,9 +128,11 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
     monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kwargs: resources)
     layer = make_attention(nope=True, separate=True, independent=True)
     with pytest.raises(ValueError, match="Unsupported fused DSA projection geometry"):
-        ascend.AscendDSARuntime([layer], Mapping(rank=0, world_size=8, attn_tp_size=8))
+        ascend.AscendDSATPKVPRuntime(
+            [layer], Mapping(rank=0, world_size=8, attn_tp_size=8)
+        )
     assert window.storage is None
-    assert layer._fused_decode_runtime is None
+    assert layer._fused_tp_kvp_decode_runtime is None
 
 
 @pytest.mark.parametrize("role", [None, "prefill", "decode"])
@@ -171,23 +154,11 @@ def test_prefill_weight_preparation_follows_model_opt_in(
                 )
             )
     attention.process_weights_after_loading()
-    if not prefill_enabled:
-        assert attention._prefill_weights is None
-    else:
-        weights = attention._prefill_weights
-        assert weights is not None
-        for actual, expected in zip(
-            weights,
-            (
-                attention.q_b_proj.weight,
-                attention.w_kc,
-                attention.w_vc,
-                attention.o_proj.weight,
-            ),
-        ):
-            torch.testing.assert_close(actual, expected)
-        attention.process_weights_after_loading()
-        assert attention._prefill_weights is weights
+    assert attention.q_b_proj.weight.shape == (16, 4)
+    assert attention.o_proj.weight.shape == (8, 8)
+    pointers = (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
+    attention.process_weights_after_loading()
+    assert pointers == (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
 
 
 @pytest.mark.parametrize("rows", [1, 1025, 2049])
@@ -198,7 +169,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     """The prologue's KV write alone cannot release a DSA producer step."""
     from tokenspeed_kernel.ops.attention.prologue.types import (
         LatentKVCache,
-        MLAPrologueOutput,
     )
 
     from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
@@ -210,7 +180,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend
     from tokenspeed.runtime.layers.dense import unquant
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -231,8 +200,8 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         # The device SFA/index kernels are unavailable. This leaf writes a real
         # index-cache tensor and publishes when its device work would finish.
         def __init__(self):
-            self._prefill_options = None
-            self._prefill_plan = QuerySpan()
+            self._prefill_layout = None
+            self._prefill = QuerySpan()
             self.step_counter = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
             self.counter_before_index = None
@@ -270,16 +239,11 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         forward_mode: ForwardMode = ForwardMode.EXTEND
         bs: int = 1
 
-    def cpu_prologue(query, q_pe, latent, *, cache, **kwargs):
-        assert cache is None
-        return MLAPrologueOutput(query=query, key=None, value=None, latent=latent)
-
     def cpu_rmsnorm(x, weight, eps, **kwargs):
         return torch.nn.functional.rms_norm(
             x.float(), (x.shape[-1],), weight.float(), eps
         ).to(x.dtype)
 
-    monkeypatch.setattr(ascend, "mla_prologue", cpu_prologue)
     monkeypatch.setattr(
         unquant,
         "kernel_mm",
@@ -352,10 +316,10 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     )
     expected_index_q = torch.nn.functional.linear(
         latent, attention.indexer.wq_b.weight
-    ).view(rows, 2, 4)
+    ).view(rows, 16, 4)
     expected_weights = torch.nn.functional.linear(
         hidden.float(), attention.indexer.weights_proj.weight
-    ) * (4**-0.5 * 2**-0.5)
+    ) * (4**-0.5 * 16**-0.5)
     torch.testing.assert_close(leaf.query, expected_query, atol=0, rtol=0)
     torch.testing.assert_close(leaf.index_query, expected_index_q, atol=0, rtol=0)
     torch.testing.assert_close(leaf.index_weights, expected_weights, atol=0, rtol=0)
@@ -373,7 +337,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     [
         (4096, 64, 1536, 16, False),
         (4096, 64, 1536, 32, True),
-        (4096, 64, 1536, 64, True),
+        (4096, 64, 1536, 64, False),
         (2048, 32, 768, 16, True),
         (2048, 32, 768, 32, False),
         (2048, 32, 768, 64, False),
@@ -382,7 +346,9 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
 def test_fused_support_uses_real_loaded_indexer_geometry(
     hidden, heads, query_rank, index_heads, supported
 ):
-    from tokenspeed.runtime.layers.attention.dsa.ascend import supports_fused_dsa_decode
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
+        supports_fused_dsa_tp_kvp_decode,
+    )
 
     config = PretrainedConfig(
         rms_norm_eps=1e-5,
@@ -397,7 +363,12 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
         index_local_tokens=1024,
         index_use_rope=False,
     )
-    with torch.device("meta"):
+    rejection = (
+        pytest.raises(NotImplementedError, match="supports only Indexer16/32")
+        if index_heads == 64
+        else nullcontext()
+    )
+    with torch.device("meta"), rejection:
         layer = AscendDSAAttention(
             config=config,
             mapping=Mapping(rank=0, world_size=8, attn_tp_size=8, attn_kvp_size=8),
@@ -408,14 +379,174 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
             v_head_dim=128,
             q_lora_rank=query_rank,
             kv_lora_rank=512,
-            max_position_embeddings=65536,
             layer_id=0,
             lora_norm_eps=1e-5,
-            separate_mla_projections=True,
-            independent_selection=True,
             prefill_enabled=False,
         ).bfloat16()
         layer.indexer.weights_proj.float()
-    assert supports_fused_dsa_decode(layer) == supported
+    if index_heads == 64:
+        return
+    assert supports_fused_dsa_tp_kvp_decode(layer) == supported
     layer.indexer.weights_proj.bfloat16()
-    assert not supports_fused_dsa_decode(layer)
+    assert not supports_fused_dsa_tp_kvp_decode(layer)
+
+
+@pytest.mark.parametrize("index_heads", [16, 32])
+def test_runtime_shares_projection_buffers_and_releases_bindings(
+    monkeypatch, index_heads
+):
+    """Real model resource owner with only native projection/communication replaced."""
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as ascend,
+    )
+
+    class Group:
+        def _get_backend(self, device):
+            return self
+
+        def get_hccl_comm_name(self, rank):
+            return "cpu-window"
+
+    class Layer:
+        def __init__(self):
+            self.num_heads = 32 if index_heads == 16 else 64
+            self.num_local_heads = self.num_heads // 8
+            self.indexer = SimpleNamespace(index_n_heads=index_heads)
+            self.q_a_proj = SimpleNamespace(weight=torch.zeros(1))
+            self.q_a_layernorm = self.kv_a_layernorm = SimpleNamespace(
+                variance_epsilon=1e-6
+            )
+            self.runtime = None
+
+        def configure_fused_tp_kvp_decode(self, runtime):
+            self.runtime = runtime
+
+    class CpuProjection:
+        # Device weight preparation/native execution are absent; this producer
+        # writes the actual buffers supplied by the real model resource owner.
+        def __init__(self, layer, *, outputs, **kwargs):
+            self.outputs = outputs
+            self.window = None
+
+    group = Group()
+    releases = []
+    window = object()
+    heads = 32 if index_heads == 16 else 64
+    resources = DSAResources(
+        window,
+        {
+            1: (
+                torch.empty(heads, 1, 512),
+                torch.empty(1, 1, heads),
+                torch.empty(1, 1, heads),
+            )
+        },
+        releases.append,
+    )
+    monkeypatch.setattr(pg, "get_dedicated_device_group", lambda *a: group)
+    monkeypatch.setattr(pg, "init_process_group", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "get_process_group", lambda *a: group)
+    monkeypatch.setattr(pg, "get_device_process_group", lambda *a: group)
+    monkeypatch.setattr(ascend.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(ascend.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(ascend.dist, "barrier", lambda *a, **k: None)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False
+    )
+    monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kw: resources)
+    monkeypatch.setattr(ascend, "_LayerDSATPKVPDecode", CpuProjection)
+    layers = [Layer() for _ in range(3)]
+    runtime = ascend.AscendDSATPKVPRuntime(
+        layers, Mapping(rank=0, world_size=8, attn_tp_size=8)
+    )
+    addresses = {
+        rows: tuple(t.data_ptr() for t in values)
+        for rows, values in runtime.projection_outputs.items()
+    }
+    unique_storage = set()
+    for number, layer in enumerate(layers):
+        for rows in (1, 8, 64, 512):
+            values = layer.runtime.outputs[rows]
+            assert tuple(t.data_ptr() for t in values) == addresses[rows]
+            for value in values:
+                value.fill_(number + rows)
+                unique_storage.add(value.untyped_storage().data_ptr())
+            torch.testing.assert_close(
+                layers[0].runtime.outputs[rows][0],
+                torch.full_like(values[0], number + rows),
+                rtol=0,
+                atol=0,
+            )
+            assert values[2].dtype == torch.float32
+    assert len(unique_storage) == 4 * 3
+
+    # A routing wrapper can disappear while its cache leaf is still referenced.
+    # Teardown must clear every successfully bound leaf, not just live roots.
+    class Router:
+        def __init__(self, children):
+            self.children = children
+
+        def child_backends(self):
+            return self.children
+
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
+        AscendDSABackend,
+    )
+
+    leaf = object.__new__(AscendDSABackend)
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as ascend_kvp_decode,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
+        AscendDSATPKVPDecode,
+    )
+
+    monkeypatch.setattr(
+        ascend_kvp_decode, "validate_dsa_context_parallel", lambda **kw: None
+    )
+    leaf._kvp_ranks = tuple(range(8))
+    leaf._decode = object.__new__(AscendDSATPKVPDecode)
+    leaf._decode._dcp = SimpleNamespace(ranks=tuple(range(8)), degree=8)
+    leaf._decode._indexer_spec = SimpleNamespace(
+        num_attention_heads=heads, kv_lora_rank=512
+    )
+    leaf._decode._fused_decode = None
+    leaf._dense_backend = Router(())
+    router = Router((leaf,))
+    runtime.bind_backend(router)
+    assert leaf._decode._fused_decode.group == "cpu-window"
+    del router
+    borrowed = layers[0].runtime
+    runtime.close()
+    runtime.close()
+    assert releases == [window]
+    assert all(layer.runtime is None for layer in layers)
+    assert leaf._decode._fused_decode is None
+    assert borrowed.window is None
+    assert not borrowed.outputs
+
+
+@pytest.mark.parametrize("index_heads", [0, 8, 48, 64])
+def test_indexer_head_count_is_rejected_at_initialization(index_heads):
+    config = PretrainedConfig(index_n_heads=index_heads)
+    with pytest.raises(NotImplementedError, match="supports only Indexer16/32"):
+        AscendDSAAttention(
+            config=config,
+            mapping=Mapping(rank=0),
+            hidden_size=8,
+            num_heads=2,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            q_lora_rank=4,
+            kv_lora_rank=4,
+            lora_norm_eps=1e-6,
+            prefill_enabled=True,
+        )
