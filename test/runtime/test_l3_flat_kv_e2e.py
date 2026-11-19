@@ -277,20 +277,28 @@ class TestL3FlatKvRoundTripTest:
             self._native_roundtrip(layout_kind="flat", io_backend=io_backend)
 
     @pytest.mark.parametrize("backend", ["memory", "mooncake"])
-    def test_qwen_packed_ssm_conv_restores_every_field(self, backend):
+    @pytest.mark.parametrize("layout_kind", ["qwen_gdn", "qwen4_flat"])
+    @pytest.mark.parametrize("io_backend", ["direct", "kernel"])
+    def test_qwen_packed_ssm_conv_restores_every_field(
+        self, backend, layout_kind, io_backend
+    ):
         if backend == "mooncake":
             raw = os.environ.get("MOONCAKE_GPU_TEST_CONFIG")
             if not raw:
                 pytest.skip("set MOONCAKE_GPU_TEST_CONFIG for a live storage owner")
             assert json.loads(raw)["global_segment_size"] == 0
-            self._native_roundtrip(layout_kind="qwen_gdn", io_backend="kernel")
+            self._native_roundtrip(layout_kind=layout_kind, io_backend=io_backend)
             return
 
         # The process's in-memory store keeps the objects between phases.
         namespace = f"qwen-packed-{uuid.uuid4().hex}"
         for phase in ("put", "get"):
             self._exercise_qwen(
-                phase=phase, namespace=namespace, mooncake=None, io_backend="kernel"
+                phase=phase,
+                namespace=namespace,
+                mooncake=None,
+                io_backend=io_backend,
+                layout_kind=layout_kind,
             )
 
     def _native_roundtrip(self, *, layout_kind, io_backend):
@@ -325,11 +333,12 @@ class TestL3FlatKvRoundTripTest:
         assert done[1] == expected
         assert done[2]
 
-    def _host_executor(self, pool, *, io_backend, host_ratio):
+    def _host_executor(self, pool, *, draft_pool, io_backend, host_ratio):
         from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
 
         return self.executor_module.HostCacheExecutor(
             pool,
+            draft_pool=draft_pool,
             l2_tier=True,
             snapshot_pool=RetractionPoolRequest(
                 host_gb=0.0,
@@ -359,8 +368,9 @@ class TestL3FlatKvRoundTripTest:
             pp_size=1,
         )
 
-    def _exercise_qwen(self, *, phase, namespace, mooncake, io_backend):
+    def _exercise_qwen(self, *, phase, namespace, mooncake, io_backend, layout_kind):
         from test.runtime.test_cache_setup import _qwen_gdn_setup
+        from test.runtime.test_flat_kv_cache import _qwen4_exp_pool
 
         from tokenspeed_engine.scheduler import StorageKind
 
@@ -372,39 +382,72 @@ class TestL3FlatKvRoundTripTest:
         )
 
         torch = self.torch
-        spec = _qwen_gdn_setup(2).spec
-        plan = spec.memory_plan
-        arena = create_cache_arena(spec, device="cuda", enable_memory_saver=False)
-        pool = HybridMHATokenToKVPool(
-            arena=arena,
-            dtype=torch.bfloat16,
-            head_num=1,
-            head_dim=128,
-            layer_num=len(spec.layer_types),
-            rank=0,
-            layer_types=spec.layer_types,
-        )
-        layout = pool.cache_transfer_layout()
-        groups = {group.group_id: index for index, group in enumerate(layout.groups)}
-        # Distinct parents keep different logical groups from aliasing each other.
-        source_blocks = {group_id: index + 1 for group_id, index in groups.items()}
-        destination_blocks = {group_id: index + 5 for group_id, index in groups.items()}
-        keys = [(index, f"qwen-{index}", 0) for index in groups.values()]
+        draft_pool = None
+        if layout_kind == "qwen4_flat":
+            _, arena, (pool, draft_pool) = _qwen4_exp_pool(
+                flat=True,
+                device="cuda",
+                kv_dtype=torch.bfloat16,
+                draft_num_kv_heads=2,
+            )
+        else:
+            spec = _qwen_gdn_setup(2).spec
+            arena = create_cache_arena(spec, device="cuda", enable_memory_saver=False)
+            pool = HybridMHATokenToKVPool(
+                arena=arena,
+                dtype=torch.bfloat16,
+                head_num=1,
+                head_dim=128,
+                layer_num=len(spec.layer_types),
+                rank=0,
+                layer_types=spec.layer_types,
+            )
+        plan = arena.plan
         payloads = {
-            field.field_id: (
-                torch.arange(field.payload_bytes, dtype=torch.int32) * 17 + index * 23
+            (field.field_id, child): (
+                torch.arange(field.payload_bytes, dtype=torch.int32) * 17
+                + index * 23
+                + child * 37
             )
             .remainder(251)
             .to(torch.uint8)
             for index, field in enumerate(plan.fields)
+            for child in range(2)
         }
         with ExitStack() as cleanup:
             executor = self._host_executor(
                 pool,
+                draft_pool=draft_pool,
                 io_backend=io_backend,
-                host_ratio=8 / plan.num_lcm_blocks,
+                host_ratio=(4 * len(plan.groups) + 2) / plan.num_lcm_blocks,
             )
             cleanup.callback(executor.shutdown)
+            layout = executor.layout
+            groups = {
+                group.group_id: index for index, group in enumerate(layout.groups)
+            }
+            # Distinct parents prevent cross-group aliasing. First and last
+            # children exercise Device packing; Host packing is independent.
+            pages = []
+            for group in plan.groups:
+                index = groups[group.group_id]
+                packing = group.cache_blocks_per_lcm_block
+                host_packing = executor.host_storage.group_packing[index]
+                for ordinal, child in enumerate(dict.fromkeys((0, packing - 1))):
+                    host_parent, host_child = divmod(ordinal, host_packing)
+                    pages.append(
+                        (
+                            index,
+                            ordinal,
+                            (index + 1) * packing + child,
+                            (len(groups) + index + 1) * packing + child,
+                            (2 * index + host_parent) * host_packing + host_child + 1,
+                            (2 * len(groups) + 2 * index + host_parent) * host_packing
+                            + host_child
+                            + 1,
+                        )
+                    )
+            keys = [(index, f"qwen-{index}-{child}", 0) for index, child, *_ in pages]
             l3 = host_storage_executor(
                 executor.host_storage,
                 shard_counts=(1,) * len(layout.groups),
@@ -418,57 +461,65 @@ class TestL3FlatKvRoundTripTest:
             executor.host_storage.host_buffer.fill_(0)
             arena.buffer.fill_(0xEE)
             if phase == "put":
-                for field in plan.fields:
-                    offset = plan.field_page_byte_offset(
-                        field.field_id, source_blocks[field.group_id]
-                    )
-                    arena.buffer[offset : offset + field.payload_bytes].copy_(
-                        payloads[field.field_id]
-                    )
+                for index, child, source, *_ in pages:
+                    for field in plan.fields:
+                        if groups[field.group_id] != index:
+                            continue
+                        offset = plan.field_page_byte_offset(field.field_id, source)
+                        arena.buffer[offset : offset + field.payload_bytes].copy_(
+                            payloads[field.field_id, child]
+                        )
                 executor._start_writing(  # pylint: disable=protected-access
                     [7],
                     [
-                        (index, source_blocks[group_id], source_blocks[group_id])
-                        for group_id, index in groups.items()
+                        (index, source, host_source)
+                        for index, _, source, _, host_source, _ in pages
                     ],
                     lane=executor._pinned_write_lane,
                     prerequisite_stream=torch.cuda.current_stream(),
                 )
                 executor.write_stream.synchronize()
                 assert [int(event.op_id) for event in executor.poll_results()] == [7]
-                put = StorageOp(1, StorageKind.Put, keys, list(source_blocks.values()))
-                self._complete(l3, put, expected=[True] * len(groups))
-                return
-
-            get = StorageOp(1, StorageKind.Get, keys, list(destination_blocks.values()))
-            self._complete(l3, get, expected=[True] * len(groups))
-            load_index = executor._start_loading(  # pylint: disable=protected-access
-                [9],
-                [
-                    (index, destination_blocks[group_id], destination_blocks[group_id])
-                    for group_id, index in groups.items()
-                ],
-                prerequisite_stream=torch.cuda.current_stream(),
-            )
-            assert load_index is not None
-            pool.layerwise_load_tracker.set_consumers(load_index)
-            for layer_id in range(len(spec.layer_types)):
-                pool.layerwise_load_tracker.wait_for_layer(layer_id)
-            torch.cuda.synchronize()
-            assert [int(event.op_id) for event in executor.poll_results()] == [9]
+                put = StorageOp(1, StorageKind.Put, keys, [page[4] for page in pages])
+                self._complete(l3, put, expected=[True] * len(pages))
+            else:
+                get = StorageOp(1, StorageKind.Get, keys, [page[5] for page in pages])
+                self._complete(l3, get, expected=[True] * len(pages))
+                load_index = (
+                    executor._start_loading(  # pylint: disable=protected-access
+                        [9],
+                        [
+                            (index, destination, host_destination)
+                            for index, _, _, destination, _, host_destination in pages
+                        ],
+                        prerequisite_stream=torch.cuda.current_stream(),
+                    )
+                )
+                assert load_index is not None
+                for view in (pool, draft_pool):
+                    if view is None:
+                        continue
+                    view.layerwise_load_tracker.set_consumers(load_index)
+                    for layer_id in range(view.layer_num):
+                        view.layerwise_load_tracker.wait_for_layer(layer_id)
+                torch.cuda.synchronize()
+                assert [int(event.op_id) for event in executor.poll_results()] == [9]
             expected = torch.full((plan.arena_bytes,), 0xEE, dtype=torch.uint8)
             # The oracle uses recipe fields, not the transfer descriptor under test.
             # Compare the entire allocation to catch missing conv/SSM bytes and
             # writes into padding, the null parent, or an unrelated block.
-            for field in plan.fields:
-                offset = plan.field_page_byte_offset(
-                    field.field_id, destination_blocks[field.group_id]
-                )
-                expected[offset : offset + field.payload_bytes] = payloads[
-                    field.field_id
-                ]
+            for index, child, source, destination, *_ in pages:
+                for field in plan.fields:
+                    if groups[field.group_id] != index:
+                        continue
+                    block = source if phase == "put" else destination
+                    offset = plan.field_page_byte_offset(field.field_id, block)
+                    expected[offset : offset + field.payload_bytes] = payloads[
+                        field.field_id, child
+                    ]
             assert torch.equal(arena.buffer.cpu(), expected)
-            assert l3.delete_namespace()
+            if phase == "get":
+                assert l3.delete_namespace()
 
     def _exercise(self, *, phase, io_backend, namespace, mooncake):
         with ExitStack() as cleanup:
@@ -508,7 +559,9 @@ class TestL3FlatKvRoundTripTest:
                     self.load_tracker = tracker
 
             pool = SyntheticPool()
-            executor = self._host_executor(pool, io_backend=io_backend, host_ratio=1.0)
+            executor = self._host_executor(
+                pool, draft_pool=None, io_backend=io_backend, host_ratio=1.0
+            )
             from tokenspeed_engine.scheduler import StorageKind
 
             cleanup.callback(executor.shutdown)
@@ -598,17 +651,18 @@ if __name__ == "__main__":
         parser.add_argument("--io-backend", choices=("direct", "kernel"), required=True)
         parser.add_argument("--namespace", required=True)
         parser.add_argument(
-            "--layout-kind", choices=("flat", "qwen_gdn"), required=True
+            "--layout-kind", choices=("flat", "qwen_gdn", "qwen4_flat"), required=True
         )
         args = parser.parse_args()
         case = TestL3FlatKvRoundTripTest()
         case.setup_method()
-        if args.layout_kind == "qwen_gdn":
+        if args.layout_kind in ("qwen_gdn", "qwen4_flat"):
             case._exercise_qwen(
                 phase=args.native_worker,
                 namespace=args.namespace,
                 mooncake=case._native_mooncake(),
                 io_backend=args.io_backend,
+                layout_kind=args.layout_kind,
             )
         else:
             case._exercise(

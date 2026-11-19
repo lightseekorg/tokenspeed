@@ -25,13 +25,15 @@
 
 #include "fsm/forward_states.h"
 #include "fsm/pd_states.h"
+#include "fsm/peer_states.h"
 #include "fsm/storage_states.h"
 
 // Put resources into each particular state
 namespace tokenspeed::fsm {
 
-using State = std::variant<Bootstrapping, Submitted, Prefetching, Prefilling, RemotePrefilling, PrefillAwaitingResult,
-                           PrefillDone, Decoding, PdTransferring, Retracted, Restoring, Finishing, Finished>;
+using State = std::variant<Bootstrapping, Submitted, Prefetching, PeerLooking, Prefilling, RemotePrefilling,
+                           PeerLanding, PrefillAwaitingResult, PrefillDone, Decoding, PdTransferring, Retracted,
+                           Restoring, Finishing, Finished>;
 
 inline State ToState(State state) {
     return state;

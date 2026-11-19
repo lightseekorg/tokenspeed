@@ -46,6 +46,7 @@ add_library(tokenspeed_scheduler_core STATIC
 
     csrc/fsm/forward_events.cpp
     csrc/fsm/pd_events.cpp
+    csrc/fsm/peer_events.cpp
 
     csrc/scheduler/operations/admission.cpp
     csrc/scheduler/operations/forward.cpp
@@ -76,7 +77,9 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
     csrc/cache/tier/storage_manager.cpp
+    csrc/cache/tier/peer_exports.cpp
     csrc/scheduler/operations/storage.cpp
+    csrc/scheduler/operations/peer.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -159,6 +162,8 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_checkpoint_retention.cpp
         tests/cpp/test_checkpoint_demotion.cpp
+        tests/cpp/test_peer_exports.cpp
+        tests/cpp/test_peer_scheduler.cpp
         tests/cpp/test_storage_query.cpp
         tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp

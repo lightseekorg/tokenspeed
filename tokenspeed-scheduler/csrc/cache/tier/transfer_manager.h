@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -201,6 +202,9 @@ public:
     RestoredSlots CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
+    // Device block ids still being filled by prefix loads, by cache group.
+    // Derived from the owning transfers; an all-rank ACK removes their rows.
+    std::vector<std::unordered_set<std::int32_t>> LoadBackDestinations() const;
     // Pinned stores hold Device capacity that returns by itself at the ACK;
     // the scheduler defers retraction while any is in flight rather than
     // sacrificing a request for capacity that is about to free.

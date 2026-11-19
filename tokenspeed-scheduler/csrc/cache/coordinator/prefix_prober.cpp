@@ -34,6 +34,7 @@
 
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_matcher.h"
+#include "cache/tier/peer.h"
 #include "core/profile_span.h"
 #include "utils.h"
 
@@ -463,6 +464,10 @@ bool PrefixProber::stateGroupsAcceptBoundary(std::span<const std::size_t> match_
     return true;
 }
 
+bool PrefixProber::probesStateGroup(std::span<const std::size_t> match_order) const {
+    return std::ranges::any_of(match_order, [&](std::size_t i) { return store_.GroupIsState(i); });
+}
+
 // The Device's probe: the aligned phase over the prefix-closed groups, then
 // the candidate phase -- longest first, a tail inside the page after the
 // closed coverage, the closed coverage itself, then every published tail and
@@ -576,6 +581,11 @@ PrefixProbe::Tier PrefixProber::ProbeTier(const PromptPrefix& prompt, std::span<
             : static_cast<std::int32_t>(std::min<std::int64_t>(
                   std::int64_t{aligned.num_common_tokens} + store_.PrefixGranularity() - 1, prompt.max_tokens));
     ForEachCandidateBoundary(prompt, /*floor_tokens=*/0, from_tokens, visit);
+    // A junction cut writes its own missing windows, so with a State group it reaches the closed coverage.
+    if (!closed_order.empty() && probesStateGroup(match_order)) {
+        out.kv_tokens = std::max(
+            out.kv_tokens, out.closed_kv_tokens / store_.CheckpointGranularity() * store_.CheckpointGranularity());
+    }
     if (out.num_common_tokens == 0) {
         // No boundary matched: no group claims anything on the Device.
         for (GroupPrefixProbe& hits : out.per_group) {
@@ -787,6 +797,12 @@ PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
             : static_cast<std::int32_t>(std::min<std::int64_t>(
                   std::int64_t{host_kv_end_tokens} + store_.PrefixGranularity() - 1, prompt.max_tokens));
     ForEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
+    // As on the Device: the closed groups' Host run past the Device's coverage is KV reach.
+    const std::int32_t host_reach =
+        host_kv_end_tokens / store_.CheckpointGranularity() * store_.CheckpointGranularity();
+    if (host_reach > device_kv_tokens && probesStateGroup(match_order)) {
+        host.kv_tokens = std::max(host.kv_tokens, host_reach);
+    }
     return HostSuffixProbe{.device = std::move(device), .host = std::move(host)};
 }
 
@@ -822,6 +838,73 @@ PrefixProbe PrefixProber::probePrefixWithOrder(const PromptPrefix& prompt, std::
         out.host.num_common_tokens = out.device.num_common_tokens;
         out.host.full_page_tokens = out.device.full_page_tokens;
         out.host.kv_tokens = host_kv_tokens;
+    }
+    return out;
+}
+
+PrefixProber::PrefixListing PrefixProber::ListPrefix(const PrefixProbe& probe) const {
+    PrefixListing out{.num_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens)};
+    if (out.num_tokens == 0) {
+        return out;
+    }
+    // The same blocks at the same slots as CacheCoordinator::ExportPrefix:
+    // the Device's full pages then its tail, from slot 0, when it resumes at
+    // all; the Host suffix's full pages from its floor, then its tail, after
+    // them; a State group's one checkpoint, the Device's first.
+    const bool device_claims = probe.device.num_common_tokens > 0;
+    const bool host_claims = store_.HostPool() != nullptr && !probe.host.per_group.empty();
+    const std::span<const std::vector<CacheKey>> group_keys = *probe.group_keys;
+    for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
+        if (store_.GroupIsReplayable(static_cast<std::int32_t>(i))) {
+            continue;
+        }
+        const PrefixCacheIndex& index = store_.Groups()[i].Index();
+        struct Run {
+            const BlockPool* pool;
+            CacheTier tier;
+            std::span<const CacheKey> keys;
+            std::int32_t begin_blocks;
+            const GroupPrefixProbe* hits;
+        };
+        std::vector<Run> runs;
+        const auto add_tier = [&](const PrefixProbe::Tier& tier, const BlockPool& pool, CacheTier which,
+                                  std::int32_t floor_tokens) {
+            const std::int32_t floor_pages =
+                store_.GroupIsState(i) ? 0 : floor_tokens / store_.Geometry()[i].BlockGranularity();
+            runs.push_back(Run{&pool, which, group_keys[i], floor_pages, &tier.per_group[i]});
+            if (tier.tail && !tier.tail->group_keys[i].empty()) {
+                runs.push_back(Run{&pool, which, tier.tail->group_keys[i], 0, &tier.tail->per_group[i]});
+            }
+        };
+        if (device_claims) {
+            add_tier(probe.device, store_.DevicePool(), CacheTier::kDevice, 0);
+        }
+        if (host_claims) {
+            add_tier(probe.host, *store_.HostPool(), CacheTier::kHost, probe.device.full_page_tokens);
+        }
+        std::int32_t slot = 0;
+        for (const Run& run : runs) {
+            const std::vector<CacheBlockLocation> locations =
+                index.MatchedLocations(*run.pool, run.keys, run.begin_blocks, *run.hits);
+            auto location = locations.begin();
+            for (std::size_t j = 0; j < run.hits->hits.size(); ++j, ++slot) {
+                if (run.hits->hits[j] == 0) {
+                    continue;
+                }
+                const CacheKey& key = run.keys[static_cast<std::size_t>(run.begin_blocks) + j];
+                const std::int32_t block_id = run.pool->ResolveCacheBlockId(store_.Groups()[i].Id(), *location++);
+                if (store_.GroupIsState(i)) {
+                    if (std::ranges::none_of(out.pages, [&](const ListedPage& page) {
+                            return page.key.group_id == store_.Groups()[i].Id();
+                        })) {
+                        out.pages.push_back(
+                            ListedPage{.key = key, .slot = kPeerStateSlot, .tier = run.tier, .block_id = block_id});
+                    }
+                    continue;
+                }
+                out.pages.push_back(ListedPage{.key = key, .slot = slot, .tier = run.tier, .block_id = block_id});
+            }
+        }
     }
     return out;
 }

@@ -68,6 +68,7 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
                 .session_id = std::string(spec.session_id),
                 .cache_group_id = std::string(spec.cache_group_id),
                 .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
+                .peer_holder = std::string(spec.peer_holder),
                 .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
                 .max_new_tokens = spec.max_new_tokens,
                 .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
@@ -75,6 +76,156 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
         }
     }
     scheduler.SubmitRequests(converted);
+}
+
+namespace {
+
+tokenspeed::PeerLeaseId FromView(const PeerLeaseView& lease) {
+    return tokenspeed::PeerLeaseId{.reader = std::string(lease.reader), .id = lease.id};
+}
+
+PeerLeaseView ToView(const tokenspeed::PeerLeaseId& lease) {
+    return PeerLeaseView{.reader = rust::String(lease.reader), .id = lease.id};
+}
+
+rust::Vec<PeerPageView> ToView(const std::vector<tokenspeed::PeerPage>& pages) {
+    rust::Vec<PeerPageView> out;
+    out.reserve(pages.size());
+    for (const tokenspeed::PeerPage& page : pages) {
+        out.push_back(PeerPageView{.group_id = page.group_id,
+                                   .slot = page.slot,
+                                   .host = page.tier == tokenspeed::CacheTier::kHost,
+                                   .block_id = page.block_id});
+    }
+    return out;
+}
+
+template <typename T>
+rust::Vec<T> ToRustVec(const std::vector<T>& values) {
+    rust::Vec<T> out;
+    out.reserve(values.size());
+    for (const T& value : values) {
+        out.push_back(value);
+    }
+    return out;
+}
+
+std::vector<tokenspeed::PeerPage> FromView(rust::Slice<const PeerPageView> pages) {
+    std::vector<tokenspeed::PeerPage> out;
+    out.reserve(pages.size());
+    for (const PeerPageView& page : pages) {
+        out.push_back(tokenspeed::PeerPage{.group_id = page.group_id,
+                                           .slot = page.slot,
+                                           .tier = page.host ? tokenspeed::CacheTier::kHost : tokenspeed::CacheTier::kDevice,
+                                           .block_id = page.block_id});
+    }
+    return out;
+}
+
+tokenspeed::cache::PeerLookup LookupFromView(const PeerEventView& event) {
+    std::vector<std::string> hashes;
+    hashes.reserve(event.prefix_hashes.size());
+    for (const rust::String& hash : event.prefix_hashes) {
+        hashes.emplace_back(hash);
+    }
+    return tokenspeed::cache::PeerLookup{
+        .lease = FromView(event.lease),
+        .prefix_hashes = std::move(hashes),
+        .tokens = std::vector<std::int32_t>(event.tokens.begin(), event.tokens.end()),
+        .max_tokens = event.max_tokens,
+    };
+}
+
+PeerAnswerView ToView(const tokenspeed::PeerAnswer& answer) {
+    const PeerAnswerKind kind = answer.kind == tokenspeed::PeerAnswerKind::kLookup ? PeerAnswerKind::Lookup
+                                : answer.kind == tokenspeed::PeerAnswerKind::kPin  ? PeerAnswerKind::Pin
+                                                                                    : PeerAnswerKind::Release;
+    return PeerAnswerView{.lease = ToView(answer.lease),
+                          .kind = kind,
+                          .num_tokens = answer.num_tokens,
+                          .pages = ToView(answer.pages),
+                          .held = answer.held};
+}
+
+rust::Vec<rust::String> ToRustStrings(const std::vector<std::string>& values) {
+    rust::Vec<rust::String> out;
+    out.reserve(values.size());
+    for (const std::string& value : values) {
+        out.push_back(rust::String(value));
+    }
+    return out;
+}
+
+}  // namespace
+
+void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events) {
+    // The agreed clock first, then the events in the order they arrived.
+    tokenspeed::ExecutionEvent execution_event;
+    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us});
+    for (const PeerEventView& event : events) {
+        switch (event.kind) {
+            case PeerEventKind::Lookup:
+                execution_event.With(LookupFromView(event));
+                break;
+            case PeerEventKind::Pin:
+                execution_event.With(tokenspeed::cache::PeerPin{
+                    .lease = FromView(event.lease),
+                    .num_tokens = event.num_tokens,
+                    .pages = FromView(rust::Slice<const PeerPageView>(event.pages.data(), event.pages.size()))});
+                break;
+            case PeerEventKind::Release:
+                execution_event.With(tokenspeed::cache::PeerRelease{.lease = FromView(event.lease), .demote = event.demote});
+                break;
+            case PeerEventKind::LookupAnswered:
+                execution_event.With(
+                    tokenspeed::cache::PeerLookupAnswered{.lease = FromView(event.lease), .num_tokens = event.num_tokens});
+                break;
+            case PeerEventKind::FetchDone:
+                execution_event.With(tokenspeed::cache::PeerFetchDone{.request_id = std::string(event.request_id),
+                                                                      .num_tokens = event.num_tokens});
+                break;
+        }
+    }
+    scheduler.Advance(execution_event);
+}
+
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup) {
+    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup)));
+}
+
+bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
+                      rust::Slice<const PeerPageView> pages) {
+    return scheduler.PeerPagesMatch(LookupFromView(lookup), num_tokens, FromView(pages));
+}
+
+bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
+    return scheduler.PeerLeaseHeld(FromView(lease));
+}
+
+std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.PlanCalls();
+}
+
+rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
+    rust::Vec<PeerLookupView> out;
+    for (const tokenspeed::PeerLookupRequest& lookup : scheduler.TakePeerLookups()) {
+        out.push_back(PeerLookupView{.lease = ToView(lookup.lease),
+                                     .holder = rust::String(lookup.holder),
+                                     .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
+                                     .tokens = ToRustVec(lookup.tokens),
+                                     .max_tokens = lookup.max_tokens});
+    }
+    return out;
+}
+
+PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::Scheduler::PeerStats stats = scheduler.GetPeerStats();
+    return PeerStatsView{.leases = stats.leases,
+                         .pinned_blocks = stats.pinned_blocks,
+                         .looking_requests = stats.looking_requests,
+                         .landing_requests = stats.landing_requests,
+                         .landed_tokens = stats.landed_tokens,
+                         .failed_landings = stats.failed_landings};
 }
 
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,
@@ -285,11 +436,12 @@ std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const 
     auto batch = std::make_unique<tokenspeed::KvEventBatch>();
     for (const auto& event : events) {
         const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
+        const auto medium = event.host ? tokenspeed::KvEventMedium::kHost : tokenspeed::KvEventMedium::kDevice;
         if (event.stored) {
             batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
-                         {event.token_ids.data(), event.token_ids.size()}, event.block_size);
+                         {event.token_ids.data(), event.token_ids.size()}, event.block_size, medium);
         } else {
-            batch->Remove(hashes);
+            batch->Remove(hashes, medium);
         }
     }
     return batch;
@@ -331,6 +483,11 @@ rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch&
 }
 rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch) {
     const auto values = batch.Tokens();
+    return {values.data(), values.size()};
+}
+
+rust::Slice<const std::uint8_t> kv_event_media(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Media();
     return {values.data(), values.size()};
 }
 
@@ -468,7 +625,10 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 }
 
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
-    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value()) {
+    // A peer landing's reads start from the fence the data plane reports for
+    // its plan, which may have no other device work: a prefill replica's
+    // landing prepays no decode room, so it zeroes nothing.
+    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value() || !plan.peer_fetches.empty()) {
         return true;
     }
     for (const auto& [group_id, pages] : plan.pages_to_zero) {
@@ -627,6 +787,19 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
 
 void set_profile_span_sink(bool installed) {
     tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
+}
+
+rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<PeerFetchView> out;
+    for (const tokenspeed::PeerFetchOperation& fetch : plan.peer_fetches) {
+        out.push_back(PeerFetchView{.request_id = rust::String(fetch.request_id),
+                                    .lease = ToView(fetch.lease),
+                                    .holder = rust::String(fetch.holder),
+                                    .begin_tokens = fetch.begin_tokens,
+                                    .end_tokens = fetch.end_tokens,
+                                    .destinations = ToView(fetch.destinations)});
+    }
+    return out;
 }
 
 }  // namespace ts_scheduler

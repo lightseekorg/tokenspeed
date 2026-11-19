@@ -27,6 +27,7 @@ Registered kernel numerics and graph execution require separate GPU tests.
 
 import os
 import sys
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
 from types import SimpleNamespace
 
 import pytest
@@ -40,12 +41,10 @@ from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.layers.attention.backends.paged import mha
-from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-    CacheGroupGeometry,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -179,24 +178,24 @@ def test_router_refreshes_both_real_leaves_and_padded_writes_across_mixed_rounds
         gid: _backend(width=width, page_size=size) for gid, size in groups.items()
     }
     router = CacheGroupRouter(
-        None,
+        lambda gid, grain: leaves[gid],
         is_draft=False,
         spec_num_tokens=width,
         device="cpu",
         consumed_group_ids=None,
     )
-    router.bind(
-        CacheGroupGeometry(
-            granularities={gid: 16 for gid in groups},
-            attn_kinds={
-                "full_attention": "full_history",
-                "sliding_attention": "sliding",
-            },
-            full_history_group_id="full_attention",
-            row_geometry={gid: (16, 1) for gid in groups},
-            windows={"full_attention": None, "sliding_attention": 512},
-        ),
-        leaves,
+    router.set_cache_pool(
+        make_mha_pool_for_groups(
+            (
+                CacheGroupSpec(
+                    "full_attention", "full_history", 16, 1, replayable=False
+                ),
+                CacheGroupSpec(
+                    "sliding_attention", "sliding_window", 16, 1, 512, replayable=False
+                ),
+            ),
+            device="cpu",
+        )
     )
     bucket = 64
     router.init_cuda_graph_state(4, max_extend_tokens=bucket)
@@ -340,12 +339,13 @@ def _stop_before_weights(*args, **kwargs):
 def _block_runtime():
     """Real metadata owners; omit only GPU execution and learned weights."""
     groups = ("full_attention", "sliding_attention", "draft_attention")
-    geometry = CacheGroupGeometry(
-        granularities=dict.fromkeys(groups, 16),
-        attn_kinds=dict(zip(groups, ("full_history", "sliding", "sliding"))),
-        full_history_group_id=groups[0],
-        row_geometry=dict.fromkeys(groups, (16, 1)),
-        windows=dict(zip(groups, (None, 512, 4096))),
+    pool = make_mha_pool_for_groups(
+        (
+            CacheGroupSpec(groups[0], "full_history", 16, 1, replayable=False),
+            CacheGroupSpec(groups[1], "sliding_window", 16, 1, 512, replayable=False),
+            CacheGroupSpec(groups[2], "sliding_window", 16, 1, 4096, replayable=False),
+        ),
+        device="cpu",
     )
     leaves = {
         gid: _backend(
@@ -359,13 +359,13 @@ def _block_runtime():
     routers = []
     for is_draft, selected in ((False, groups[:2]), (True, groups[2:])):
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaves[gid],
             is_draft=is_draft,
             spec_num_tokens=16,
             device="cpu",
             consumed_group_ids=selected,
         )
-        router.bind(geometry, {gid: leaves[gid] for gid in selected})
+        router.set_cache_pool(pool)
         router.init_cuda_graph_state(4, max_extend_tokens=64)
         routers.append(router)
     layers = {}

@@ -28,7 +28,7 @@
 
 namespace tokenspeed::fsm {
 
-std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
+std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling, PeerLanding>
 SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t prefix_granularity = state.PrefixGranularity();
@@ -59,6 +59,12 @@ SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
         // The peer prefills the whole prompt; this engine only holds the
         // destination pages until RemotePrefillDone.
         return RemotePrefilling{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
+    }
+    if (source_ == PrefillSource::kPeer) {
+        // Another replica's cache fills the window; this engine computes the
+        // rest of the prompt once it has landed.
+        _assert(window.begin + window.size < token_container->PrefillSize(), "a landing leaves a prompt to compute");
+        return PeerLanding{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
     }
     if (window.begin + window.size == token_container->PrefillSize()) {
         if (awaits_result_) {
