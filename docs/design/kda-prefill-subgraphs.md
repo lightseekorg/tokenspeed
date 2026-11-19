@@ -112,7 +112,7 @@ The shared server configuration supplies this setting to every TP worker.
 |---|---|
 | `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(8192, chunked-prefill size)`; `0` disables prefill graphs. |
 | `--prefill-graph-capture-token-sizes` | Shared token buckets for outer and KDA captures. There is no separate KDA bucket list. |
-| `--prefill-graph-capture-batch-sizes` | Request capacities captured with inline KDA; replay rounds up to a fitting capacity. Independent of the decode graph's batch-size list. |
+| `--prefill-graph-capture-batch-sizes` | Request capacities captured with inline KDA; replay rounds up to a fitting capacity. Unset: `4`, capped by `--max-num-seqs` per data-parallel rank. Independent of the decode graph's batch-size list. |
 
 The chunked-prefill size caps the token limit. The runtime sorts and
 deduplicates an explicit bucket list, excludes entries outside the positive
@@ -120,8 +120,9 @@ range up to that limit, and always includes the effective limit. Without an
 explicit list, the runtime builds a relative-spacing ladder with a 16-token
 minimum step and a 512-token maximum step.
 
-If you omit capture batch sizes, each token bucket uses the minimum request
-count needed to fit within the model context, usually one. Explicit counts must
+If you omit capture batch sizes, each token bucket captures 4 requests, capped
+by the scheduler's per-rank request limit and the bucket, and at least the count
+needed to fit within the model context. Explicit counts must
 fit the scheduler's per-rank request limit. For each bucket, the runtime skips
 a count that cannot fill the bucket with positive-length requests within the
 model context. This option does not change `--max-num-seqs` or force the

@@ -317,6 +317,8 @@ def block_scaled_moe_routes_plan(
     """
     if len(formats) != 2 or hidden <= 0 or intermediate <= 0:
         raise ValueError("Invalid block-scaled expert contract")
+    if device.type == "npu":
+        raise NotImplementedError("Block-scaled MoE routes are not supported on NPU")
     kernel = select_kernel(
         "moe",
         "block_scaled_routes",
@@ -569,7 +571,9 @@ def block_scaled_router_mm(
     return mm(x, weight, out_dtype=torch.float32)
 
 
-import tokenspeed_kernel.ops.moe._triton.block_scaled  # noqa: E402,F401
+# These GPU kernels require Triton features unavailable in Ascend Triton.
+if not current_platform().is_npu:
+    import tokenspeed_kernel.ops.moe._triton.block_scaled  # noqa: E402,F401
 
 if current_platform().is_nvidia:
     import tokenspeed_kernel.ops.moe._flashinfer.block_scaled  # noqa: E402,F401

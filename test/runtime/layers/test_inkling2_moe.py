@@ -46,8 +46,6 @@ def _fold(rows: torch.Tensor) -> torch.Tensor:
 def _config(use_gate_bias=True, hidden=64, intermediate=32):
     return Inkling2ModelConfig(
         model_max_length=128,
-        pre_norm_pre_affine=False,
-        final_norm_pre_affine=False,
         use_value_norm_no_gamma=True,
         qk_l2_clip_threshold=10.0,
         rel_l2_clip_threshold=8.0,

@@ -28,7 +28,7 @@ use std::{
 
 use tokio::signal::unix::{signal, SignalKind};
 
-use super::{finish_serving, parse_args, HostError, LauncherFailure, LoopError};
+use super::{finish_serving, HostError, LauncherFailure, LoopError};
 
 const CHILD: &str = "TS_HOST_SIGNAL_TEST_CHILD";
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -453,24 +453,4 @@ trace_provider = resolve
         assert!(super::trace_provider(module.as_any()).unwrap().is_none());
         modules.del_item("ts_context_test").unwrap();
     });
-}
-
-#[test]
-fn logging_mode_is_explicit_and_validated() {
-    let args = |mode: &str| {
-        [
-            "--python",
-            "python3",
-            "--control-fd",
-            "3",
-            "--enable-async-logging",
-            mode,
-        ]
-        .map(str::to_owned)
-        .into_iter()
-    };
-    assert!(parse_args(args("true")).unwrap().enable_async_logging);
-    assert!(!parse_args(args("false")).unwrap().enable_async_logging);
-    assert!(parse_args(args("yes")).is_err());
-    assert!(parse_args(args("true").take(4)).is_err());
 }

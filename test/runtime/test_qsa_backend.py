@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import replace
-from functools import partial
+from test.runtime.cache_pool_test_utils import make_qsa_pool_for_layers
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -43,7 +43,8 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
@@ -111,6 +112,7 @@ def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
         kernel_page_size=64,
         context_len=1024,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=4,
@@ -121,61 +123,15 @@ def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
     return config
 
 
-def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
-    groups = {
-        FULL_ATTENTION: 256,
-        QWEN4_EXP_QSA_CACHE_GROUP: 256,
-        QWEN4_EXP_QSA_RECENT_CACHE_GROUP: 64,
-    }
-    tensors = {}
-    # The adjacent draft layer must not get target staging or commits.
-    for local_layer in (1, 3, 4):
-        layer_id = layer_offset + local_layer
-        tensors[qsa_raw_key_field(layer_id)] = torch.zeros(
-            4, 4, 1, 8, dtype=torch.bfloat16, device=device
-        )
-        tensors[qsa_rope_position_field(layer_id)] = torch.zeros(
-            4, 3, dtype=torch.int64, device=device
-        )
-        tensors[qsa_compressed_field(layer_id)] = torch.zeros(
-            4, 64, 1, 8, dtype=torch.bfloat16, device=device
-        )
-    pool = SimpleNamespace(
-        arena=SimpleNamespace(
-            offload=None,
-            plan=SimpleNamespace(
-                fields=[
-                    SimpleNamespace(
-                        group_id=(
-                            QWEN4_EXP_QSA_CACHE_GROUP
-                            if name.endswith(".qsa.compressed_key")
-                            else QWEN4_EXP_QSA_RECENT_CACHE_GROUP
-                        ),
-                        field_id=name,
-                    )
-                    for name in tensors
-                ]
-            ),
-            field=tensors.__getitem__,
-            cache_group_specs=tuple(
-                SimpleNamespace(
-                    group_id=gid,
-                    block_granularity=granularity,
-                    attn_kind="full_history",
-                    rows_per_page=granularity,
-                    entry_stride_tokens=1,
-                    sliding_window_tokens=None,
-                )
-                for gid, granularity in groups.items()
-            ),
-        ),
-        paged_group_ids=tuple(groups),
-        layer_num=4,
-        _field_layer_offset=layer_offset,
-        field_layer_range=range(layer_offset, layer_offset + 4),
+def _qsa_pool(*, device: str, layer_offset: int) -> MHATokenToKVPool:
+    return make_qsa_pool_for_layers(
+        device=device,
+        layer_ids=tuple(layer_offset + local for local in (1, 3, 4)),
+        field_layer_offset=layer_offset,
+        num_layers=4,
+        num_lcm_blocks=3,
+        kv_head_dim=2,
     )
-    pool._field_layer_id = partial(CachePool._field_layer_id, pool)
-    return pool
 
 
 @pytest.fixture
@@ -245,14 +201,18 @@ def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
     router = root.attention_backend
     leaves = tuple(router.leaves.values())
     replacement = _qsa_pool(device="cpu", layer_offset=0)
-    replacement.arena.cache_group_specs = tuple(
+    replacement_specs = tuple(
         (
-            SimpleNamespace(**{**vars(spec), "block_granularity": 128})
+            replace(spec, rows_per_page=128)
             if spec.group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
             else spec
         )
         for spec in replacement.arena.cache_group_specs
     )
+    arena = CacheArena(
+        replacement.arena.plan, "cpu", cache_group_specs=replacement_specs
+    )
+    replacement = MHATokenToKVPool(arena, torch.bfloat16, 1, 2, 4, 0)
 
     with pytest.raises(RuntimeError, match="different geometry"):
         root.set_cache_pool(replacement)
@@ -264,11 +224,14 @@ def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
 def test_missing_qsa_fields_are_rejected_before_initial_binding() -> None:
     config = _qsa_config(max_bs=4, is_draft=False, device="cpu")
     pool = _qsa_pool(device="cpu", layer_offset=0)
-    pool.arena.plan.fields = [
-        field
-        for field in pool.arena.plan.fields
-        if field.group_id != QWEN4_EXP_QSA_RECENT_CACHE_GROUP
-    ]
+    pool.arena.plan = replace(
+        pool.arena.plan,
+        fields=tuple(
+            field
+            for field in pool.arena.plan.fields
+            if field.group_id != QWEN4_EXP_QSA_RECENT_CACHE_GROUP
+        ),
+    )
     router = create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
     indexer = QSAIndexerBackend(config, router)
     root = Qwen4ExpBackend(config, router, None, indexer)
@@ -738,6 +701,73 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
     assert next_layout.seq_lens.tolist() == [9, 11]
     root.fill_block_decode_seq_lens(2, torch.tensor([2, 9999], dtype=torch.int32))
     assert next_layout.seq_lens.tolist() == [4, 1024]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_qsa_split_key_writes_in_padded_tiles_match_one_write() -> None:
+    """Split-round index keys written tile by tile leave the caches one write leaves."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
+    from tokenspeed.runtime.layers.rotary_embedding import get_rope
+
+    device = "cuda"
+    torch.manual_seed(0)
+    config = PretrainedConfig(
+        hidden_size=16,
+        rms_norm_eps=1e-6,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=8,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    rotary = get_rope(8, rotary_dim=8, max_position=64, base=10000)
+    # BF16 keys, as the model's projection gives them and the raw cache stores them.
+    indexer = QSAIndexer(
+        config, layer_id=1, quant_config=None, prefix="indexer", rotary_emb=rotary
+    ).to(device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        indexer.index_qk_proj.weight.normal_()
+    pool = _qsa_pool(device=device, layer_offset=0)
+    # Two requests on pages 1 and 2, at positions 0..6 and 0..5.
+    logical = torch.cat((torch.arange(7), torch.arange(6))).to(device)
+    requests = torch.tensor([0] * 7 + [1] * 6, device=device)
+    pages = requests + 1
+    locations = (
+        logical,
+        requests,
+        (256 * pages + logical).to(torch.int32),
+        (64 * pages + logical).to(torch.int32),
+    )
+    hidden = torch.randn(logical.shape[0], 16, device=device, dtype=torch.bfloat16)
+
+    def write(tile: int) -> list[torch.Tensor]:
+        for cache in indexer.cache_fields(pool):
+            cache.zero_()
+        rows = hidden.shape[0]
+        with torch.inference_mode():
+            for start in range(0, rows, tile):
+                n = min(tile, rows - start)
+                # As the drafter stages a tile: padded rows are zero, locations too.
+                staged = []
+                for source in (hidden, logical, *locations):
+                    buf = source.new_zeros((tile, *source.shape[1:]))
+                    buf[:n] = source[start : start + n]
+                    staged.append(buf)
+                indexer.write_split_keys(staged[0], staged[1], tuple(staged[2:]), pool)
+        return [cache.clone() for cache in indexer.cache_fields(pool)]
+
+    whole = write(hidden.shape[0])
+    # Request 1's first compression group spans the second and third tiles.
+    tiled = write(4)
+    for name, one, tiles in zip(
+        ("raw", "compressed", "rope"), whole, tiled, strict=True
+    ):
+        assert torch.equal(one, tiles), (name, (one != tiles).nonzero().tolist())
+    raw, compressed, _ = whole
+    assert compressed[1, 0].any() and compressed[2, 0].any()
+    assert raw[1].any() and raw[2].any()
 
 
 if __name__ == "__main__":

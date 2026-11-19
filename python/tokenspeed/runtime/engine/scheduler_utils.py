@@ -22,13 +22,13 @@
 config, its cache geometry and groups, the cache ops a plan carries and
 their acknowledgments, and the block tables a forward reads."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import numpy as np
 import torch
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     Cache,
     CacheGroupConfig,
     SchedulerConfig,
@@ -112,12 +112,14 @@ def make_config(
     enable_l3_storage: bool,
     role: str,
     *,
+    max_resident_requests: int,
     num_snapshot_pages: int,
     host_group_packing: Sequence[int],
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
+    prefill_decode_min_interval: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -144,6 +146,8 @@ def make_config(
             oldest-request protection; False preserves submission order.
         max_batch_size: Per-rank batch slots -- the most requests this rank
             runs at once (``--max-num-seqs`` over the attention-DP ranks).
+        max_resident_requests: Per-rank requests that may own a request slot,
+            including requests waiting for remote KV or their first decode.
         prefix_granularity: Prefix-hash page size in tokens.
         num_host_pages: Host L2 LCM blocks including the null page; 0 without
             the L2 tier.
@@ -175,6 +179,10 @@ def make_config(
             owed to the running decodes after each round that schedules a
             prefill chunk, unless no decode can run, and the most rounds it
             holds any one prompt back in total; 0 is off. Fused role only.
+        prefill_decode_min_interval: ``--prefill-decode-min-interval``:
+            decode rounds owed after each round that schedules a prefill
+            chunk, unless no decode can run, even while an overdue prompt
+            suspends the interval; 0 is off. Fused role only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -258,6 +266,7 @@ def make_config(
     if max_kv_page_num:
         cfg.max_kv_page_num = max_kv_page_num
     cfg.max_batch_size = max_batch_size
+    cfg.max_resident_requests = max_resident_requests
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
@@ -303,6 +312,9 @@ def make_config(
         # Set only when on, like state_checkpoint_in_forward: a scheduler
         # wheel without the field still runs the default.
         cfg.prefill_decode_interval = prefill_decode_interval
+    if prefill_decode_min_interval:
+        # Set only when on, for the same reason.
+        cfg.prefill_decode_min_interval = prefill_decode_min_interval
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True
@@ -509,13 +521,16 @@ def _snapshot_batch_columns(op) -> tuple[Sequence, ...]:
     )
 
 
-def snapshot_ops_from_wire(op) -> list[SnapshotOp]:
+def snapshot_ops_from_wire(
+    op, *, request_admission: Callable[[str], int]
+) -> list[SnapshotOp]:
     """One ``SnapshotOp`` per request of a ``Cache.SnapshotOp`` batch."""
     rows = _check_batch_rows(op, _snapshot_batch_columns(op))
     return [
         SnapshotOp(
             op_id=int(op.op_ids[i]),
             request_id=str(op.request_ids[i]),
+            admission_id=request_admission(str(op.request_ids[i])),
             request_pool_index=int(op.request_pool_indices[i]),
             snapshot_slot=int(op.snapshot_slots[i]),
             transfers=_wire_transfers(
@@ -531,7 +546,9 @@ def snapshot_ops_from_wire(op) -> list[SnapshotOp]:
     ]
 
 
-def restore_ops_from_wire(op) -> list[RestoreOp]:
+def restore_ops_from_wire(
+    op, *, request_admission: Callable[[str], int]
+) -> list[RestoreOp]:
     """One ``RestoreOp`` per request of a ``Cache.RestoreOp`` batch."""
     rows = _check_batch_rows(
         op,
@@ -555,6 +572,7 @@ def restore_ops_from_wire(op) -> list[RestoreOp]:
             RestoreOp(
                 op_id=int(op.op_ids[i]),
                 request_id=str(op.request_ids[i]),
+                admission_id=request_admission(str(op.request_ids[i])),
                 request_pool_index=int(op.request_pool_indices[i]),
                 snapshot_slot=int(op.snapshot_slots[i]),
                 transfers=transfers,
@@ -588,13 +606,19 @@ class CacheOperations(NamedTuple):
     ]
 
 
-def cache_ops_from_plan(execution_plan) -> CacheOperations:
+def cache_ops_from_plan(
+    execution_plan, *, request_admission: Callable[[str], int]
+) -> CacheOperations:
     """Read and validate every cache op once before any owner submits work.
 
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
     tuple: the engine host's L3 executor runs them. Unknown kinds fail the
     whole conversion without partial submission.
+
+    ``request_admission`` resolves each snapshot/restore request while the
+    plan is adapted. The resulting op holds the identity, never a late lookup
+    of an external ID that another admission could reuse.
     """
     device: list = []
     storage: list = []
@@ -602,9 +626,13 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
         if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
             device.append(op)
         elif isinstance(op, Cache.SnapshotOp):
-            device.extend(snapshot_ops_from_wire(op))
+            device.extend(
+                snapshot_ops_from_wire(op, request_admission=request_admission)
+            )
         elif isinstance(op, Cache.RestoreOp):
-            device.extend(restore_ops_from_wire(op))
+            device.extend(
+                restore_ops_from_wire(op, request_admission=request_admission)
+            )
         elif isinstance(
             op,
             (

@@ -238,6 +238,7 @@ protected:
         // Force the candidates loop to break after exactly one push so the
         // tiebreaker decides which request wins.
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -553,7 +554,7 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
                            .cache_blocks_per_lcm_block = 1,
                            .block_granularity = 8}};
         auto coordinator = MakeCoordinator(specs, 8, device, false, &host, nullptr, false, false, 0);
-        const CacheKey boundary{.content_hash = "prefix"};
+        const CacheKey boundary{.content_hash = ContentHash{"prefix"}};
         std::vector<CacheKey> history;
         for (std::uint32_t group = 0; group < 2; ++group) {
             const auto granularity = specs[group].block_granularity;
@@ -568,23 +569,27 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
             for (const auto& key : history) {
                 complete &= coordinator.GroupPrefixIndex(key.group_id).Contains(device, key);
             }
-            EXPECT_EQ(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable, complete);
+            EXPECT_EQ(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).device_publishable, complete);
         };
         const auto store = [&](BlockPool& pool, const CacheKey& key) {
             auto block = pool.AcquireBlock(key.group_id);
             coordinator.GroupPrefixIndex(key.group_id)
                 .Register(pool, block, key, 1, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
         };
-        const auto remove = [&](const CacheKey& key) {
+        const auto remove_from = [&](BlockPool& pool, const CacheKey& key) {
             auto& index = coordinator.GroupPrefixIndex(key.group_id);
-            const auto entry = index.Inspect(device, key);
+            const auto entry = index.Inspect(pool, key);
             ASSERT_TRUE(entry.has_value());
-            EXPECT_TRUE(index.Evict(device, entry->location).has_value());
+            EXPECT_TRUE(index.Evict(pool, entry->location).has_value());
         };
+        const auto remove = [&](const CacheKey& key) { remove_from(device, key); };
         check();
+        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).host_publishable);
         for (const auto& key : history) store(host, key);
         check();  // Host history must not satisfy Device publication.
-        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        const auto on_host = coordinator.GetBoundaryEventStatus(boundary, tail_tokens);
+        EXPECT_TRUE(on_host.host_publishable) << "complete Host history publishes on the Host medium";
+        EXPECT_TRUE(on_host.retains_descriptor) << "a Host entry keeps the descriptor";
         const CacheKey state{.group_id = 2, .content_hash = boundary.content_hash};
         const CacheKey swa{.group_id = 3, .content_hash = boundary.content_hash};
         store(device, state);
@@ -594,12 +599,12 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
             store(device, key);
             check();
         }
-        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).device_publishable);
         remove(state);
         remove(swa);
         check();  // Complete history remains publishable without auxiliary state.
-        EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, tail_tokens),
-                  CacheCoordinator::BoundaryResidency::kPartial);
+        EXPECT_EQ(coordinator.Store().DeviceBoundaryResidency(boundary, tail_tokens),
+                  CacheStore::BoundaryResidency::kPartial);
         store(device, state);
         store(device, swa);
         // Removing any sub-block of either sharded Full group withdraws the
@@ -607,7 +612,7 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
         for (const auto& key : history) {
             remove(key);
             check();
-            EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+            EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).device_publishable);
             store(device, key);
             check();
         }
@@ -615,11 +620,16 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
             remove(key);
             check();
         }
-        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).retains_descriptor);
         remove(state);
         remove(swa);
         check();
-        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).retains_descriptor)
+            << "the Host history still holds the boundary";
+        for (const auto& key : history) remove_from(host, key);
+        const auto gone = coordinator.GetBoundaryEventStatus(boundary, tail_tokens);
+        EXPECT_FALSE(gone.host_publishable);
+        EXPECT_FALSE(gone.retains_descriptor);
     }
 }
 
@@ -1086,6 +1096,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = kBudget;
         cfg.max_batch_size = batch_;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = yield_;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -1720,6 +1731,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -1941,6 +1953,115 @@ TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantAdmittedPromptIsNotHeldBac
     EXPECT_EQ(Round(), "P:bc");
 }
 
+class PrefillDecodeMinIntervalSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_decode_min_interval = 1;
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeMinIntervalSuite, AnOverduePromptsChunksAlternateWithDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b has been held back two rounds and suspends the interval, but every
+    // chunk still owes the minimum's decode round.
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeMinIntervalSuite, TheMinimumAloneOwesItsRoundsAfterEveryChunk) {
+    auto cfg = MakeConfig();
+    cfg.prefill_decode_interval = 0;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeMinIntervalSuite, APromptRunsAtOnceWhenNoDecodeIsRunning) {
+    Submit(MakeRequestSpec("a", 6));
+    EXPECT_EQ(Round({"a"}), "P:a");
+    // The minimum owes a decode round, but a is the only request and has
+    // nothing to decode yet: its next chunk runs.
+    EXPECT_EQ(Round({"a"}), "P:a");
+    EXPECT_EQ(Round(), "P:a");
+    EXPECT_EQ(Round(), "D:a");
+}
+
+class MixedPrefillDecodeMinIntervalSuite : public PrefillDecodeMinIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeMinIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        // One decode token and a two-page chunk.
+        cfg.max_scheduled_tokens = 5;
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeMinIntervalSuite, AnOverduePromptsMixedRoundsAlternateWithDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:ba");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:ba");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:ba");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST(SchedulerConstructionTest, RefusesAPrefillDecodeMinIntervalOutsideTheFusedRole) {
+    const auto config = [](Role role, std::int32_t interval) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_min_interval = interval;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 2).Validate());
+    for (const auto& [role, interval] : {std::pair{Role::kP, 2}, std::pair{Role::kD, 2}, std::pair{Role::kFused, -1}}) {
+        try {
+            config(role, interval).Validate();
+            ADD_FAILURE() << "prefill_decode_min_interval " << interval << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_min_interval"), std::string::npos) << error.what();
+        }
+    }
+}
+
 TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole) {
     const auto config = [](Role role, std::int32_t interval) {
         SchedulerConfig cfg{};
@@ -1948,6 +2069,7 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.device_allocator.total_pages = 32;
         cfg.disable_l2_cache = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -2023,6 +2145,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     cfg.prefix_granularity = 2;
     cfg.max_scheduled_tokens = 64;
     cfg.max_batch_size = 8;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full_attention",
         .block_granularity = cfg.prefix_granularity,
@@ -2050,6 +2173,7 @@ TEST(SchedulerConstructionTest, PrefillChunkYieldIsAPrefillRoleOptionOfAtMostHal
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = budget;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
             .block_granularity = cfg.prefix_granularity,

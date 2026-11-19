@@ -23,7 +23,8 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import gc
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,7 @@ import torch.distributed as dist
 import tqdm
 from tokenspeed_kernel.workspace import capture_session
 
+from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
@@ -294,6 +296,31 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     )
 
 
+def mega_moe_stages_whole_batches(
+    *, attention_tp_size: int, moe_tp_ep_size: int
+) -> bool:
+    """Whether each rank's MegaMoE input is its attention-DP group's whole batch.
+
+    MegaMoE dispatches and combines across ranks itself, so a model hands it
+    the rows the attention output leaves on the rank. With attention TP 1
+    those are the rank's own batch. With attention TP equal to the MoE TP x EP
+    size the attention output is all-reduced, so every rank holds its group's
+    whole batch. Any other attention TP reduce-scatters the batch into
+    contiguous shards (Qwen3.5's DP4/TP2/EP8), and a shard's live rows are not
+    the live requests' share of its rows. A padded decode replay therefore
+    writes MegaMoE's live-request counts (``mega_moe_live_requests``) only
+    under the first two layouts.
+
+    Args:
+        attention_tp_size: The attention TP group size.
+        moe_tp_ep_size: The MoE TP x EP group size.
+
+    Returns:
+        True when every rank stages its group's whole padded batch.
+    """
+    return attention_tp_size in (1, moe_tp_ep_size)
+
+
 class ForwardStepRunner:
     """Owns one forward step end to end: metadata prep, then execution.
 
@@ -334,13 +361,19 @@ class ForwardStepRunner:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.drafter = drafter
+        self.dp_local_graph = config.enable_dp_local_cuda_graph
+        if self.dp_local_graph and drafter is None:
+            raise ValueError(
+                "--enable-dp-local-cuda-graph requires a supported drafter"
+            )
+        if drafter is not None:
+            drafter.configure_decode_graph_scope(local=self.dp_local_graph)
         self.sampling_backend = sampling_backend
         self.input_buffers = input_buffers
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
         self.disable_padding = config.disable_cuda_graph_padding
-        self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
         self.device_module = torch.get_device_module(self.device)
         # Decode graphs capture into the memory saver's ``cuda_graph`` region
@@ -384,25 +417,30 @@ class ForwardStepRunner:
         )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        attn_backend.init_cuda_graph_state(
-            self.max_decode_bs,
-            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
-            max_tokens_per_req=self.max_tokens_per_req,
-            overlap_schedule_depth=self.overlap_schedule_depth,
-            max_extend_tokens=config.prefill_graph_max_tokens,
-        )
-        if draft_attn_backend is not None:
-            draft_attn_backend.init_cuda_graph_state(
+        with self.memory_saver_adapter.named_region("attention_state"):
+            attn_backend.init_cuda_graph_state(
                 self.max_decode_bs,
-                cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
+                cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=(
-                    draft_token_to_kv_pool.arena.cache_group_page_counts
+                    token_to_kv_pool.arena.cache_group_page_counts
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
                 max_extend_tokens=config.prefill_graph_max_tokens,
             )
+            if draft_attn_backend is not None:
+                draft_attn_backend.init_cuda_graph_state(
+                    self.max_decode_bs,
+                    cache_group_specs=tuple(
+                        draft_token_to_kv_pool.arena.cache_group_specs
+                    ),
+                    cache_group_page_counts=(
+                        draft_token_to_kv_pool.arena.cache_group_page_counts
+                    ),
+                    max_tokens_per_req=self.max_tokens_per_req,
+                    overlap_schedule_depth=self.overlap_schedule_depth,
+                    max_extend_tokens=config.prefill_graph_max_tokens,
+                )
 
         # One placeholder table set serves capture, the idle replay and any
         # pre-contract warmup: per published group, a zero (null-page) table
@@ -433,6 +471,8 @@ class ForwardStepRunner:
         self.output_buffers: dict[tuple[str, int], tuple] = {}
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
+        self._reported_query_graphs: set[tuple[str, int, int | None]] = set()
+        self._decode_query_tokens: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
@@ -448,12 +488,87 @@ class ForwardStepRunner:
         self._expert_load_rows: ExpertLoadRowMask | None = (
             placement.load_rows if placement is not None else None
         )
+        # MegaMoE stages a padded replay's filler rows with no experts: the
+        # replay writes its (live, padded) request counts here and (1, 1)
+        # after, so eager and prefill-graph forwards route every row. It stays
+        # None, and MegaMoE routes every row, unless every rank stages its
+        # attention-DP group's whole batch.
+        self._mega_moe_live_requests: torch.Tensor | None = None
+        whole_batches = mega_moe_stages_whole_batches(
+            attention_tp_size=config.attention_tp_size,
+            moe_tp_ep_size=config.moe_tp_ep_size,
+        )
+        if torch.device(self.device).type == "cuda" and whole_batches:
+            # Imported here: layers.moe imports this module (latent.py). The
+            # pair is state of the DeepGEMM MegaMoE solution, not a kernel op.
+            # Hooks on a registered kernel (plan["warmup"]) are reached through
+            # a MoE layer's plan, and the runner holds no MoE layer; the pair
+            # is one buffer for every MegaMoE layer, target and drafter alike.
+            from tokenspeed_kernel.ops.moe.deep_gemm import mega_moe_live_requests
+
+            from tokenspeed.runtime.layers.moe.utils import get_moe_backend
+
+            if get_moe_backend().is_mega_moe():
+                self._mega_moe_live_requests = mega_moe_live_requests(self.device)
         # The capture side stream. Created here, not in capture(): the
         # prefill graph shares it (PrefillGraph._capture_bucket reads
         # decode_wrapper.stream), and a backend may declare
         # decode_graph=False while leaving the prefill graph on — decode
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
+        self.draft_overlap: DecodeGraphOverlap | None = None
+        overlap = os.environ.get("TOKENSPEED_DRAFT_GRAPH_OVERLAP")
+        if overlap not in (None, "0", "1"):
+            raise ValueError("TOKENSPEED_DRAFT_GRAPH_OVERLAP must be 0 or 1")
+        if overlap == "1":
+            self._enable_draft_overlap()
+        if self.drafter is not None:
+            self.drafter.decode_overlap = self.draft_overlap
+
+    def _enable_draft_overlap(self) -> None:
+        """Check stream and state ownership before enabling draft-tail overlap."""
+        from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+        config = self.config
+        if (
+            torch.device(self.device).type != "cuda"
+            or torch.version.hip is not None
+            or self.disable
+            or config.pp_size != 1
+            or self.dp_size != 1
+        ):
+            raise ValueError(
+                "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
+            )
+        drafter = self.drafter
+        if config.spec_algo != "MTP" or type(drafter) is not Eagle:
+            raise ValueError("Draft graph overlap requires the Eagle MTP drafter")
+        drafter.validate_decode_overlap()
+        if config.grammar_backend != "none":
+            raise ValueError("Draft graph overlap does not support grammar")
+        if (
+            self._expert_load_rows is not None
+            or self._mega_moe_live_requests is not None
+        ):
+            raise ValueError(
+                "Draft graph overlap does not support shared MoE row masks"
+            )
+        target_layers = set(self.token_to_kv_pool.field_layer_range)
+        draft_layers = (
+            set(self.draft_token_to_kv_pool.field_layer_range)
+            if self.draft_token_to_kv_pool is not None
+            else set()
+        )
+        if (
+            not target_layers
+            or not draft_layers
+            or not target_layers.isdisjoint(draft_layers)
+            or self.attn_backend is self.draft_attn_backend
+        ):
+            raise ValueError(
+                "Draft graph overlap requires separate target/draft cache layers and metadata"
+            )
+        self.draft_overlap = DecodeGraphOverlap()
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -475,36 +590,35 @@ class ForwardStepRunner:
             observer: Measured around each capture, for the same caller.
         """
         rank = self.global_rank
-        with freeze_gc(self.enable_cudagraph_gc):
-            # Capture backend-declared sampler variants explicitly.
-            ladders = self.capture_ladders(entries)
-            capture_items = [
-                (variant, ladders[f"decode:{variant}"].widths[i])
-                for variant in self.capture_plan
-                for i in ladders[f"decode:{variant}"].sampled
-            ]
-            capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
+        # Capture backend-declared sampler variants explicitly.
+        ladders = self.capture_ladders(entries)
+        capture_items = [
+            (variant, ladders[f"decode:{variant}"].widths[i])
+            for variant in self.capture_plan
+            for i in ladders[f"decode:{variant}"].sampled
+        ]
+        capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
+        if rank == 0:
+            batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
+            logger.info(f"Capturing batches: {batch_sizes!s}")
+        for variant, bs in capture_range:
             if rank == 0:
-                batch_sizes = list(dict.fromkeys(bs for _variant, bs in capture_items))
-                logger.info(f"Capturing batches: {batch_sizes!s}")
-            for variant, bs in capture_range:
-                if rank == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.device, self.gpu_id, empty_cache=False
-                    )
-                    variant_desc = (
-                        ""
-                        if variant == CUDA_GRAPH_VARIANT_DEFAULT
-                        else f" variant={variant}"
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
-                    )
-                graph, output_buffers = self._capture_one(
-                    bs, variant=variant, observer=observer.measure(f"decode:{variant}")
+                avail_mem = get_available_gpu_memory(
+                    self.device, self.gpu_id, empty_cache=False
                 )
-                self.graphs[(variant, bs)] = graph
-                self.output_buffers[(variant, bs)] = output_buffers
+                variant_desc = (
+                    ""
+                    if variant == CUDA_GRAPH_VARIANT_DEFAULT
+                    else f" variant={variant}"
+                )
+                capture_range.set_description(
+                    f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
+                )
+            graph, output_buffers = self._capture_one(
+                bs, variant=variant, observer=observer.measure(f"decode:{variant}")
+            )
+            self.graphs[(variant, bs)] = graph
+            self.output_buffers[(variant, bs)] = output_buffers
 
     @property
     def capture_plan(self) -> dict[str, list[int]]:
@@ -517,9 +631,11 @@ class ForwardStepRunner:
         if self.disable:
             return {}
         ladder = sorted(self.capture_bs, reverse=True)
-        return {
-            variant: list(ladder) for variant in self._cuda_graph_capture_variants()
-        }
+        plan: dict[str, list[int]] = {}
+        for bs in ladder:
+            for variant in self._cuda_graph_capture_variants(bs):
+                plan.setdefault(variant, []).append(bs)
+        return plan
 
     def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
         """Each variant's batch sizes off the plan, and the positions ``entries`` samples.
@@ -545,22 +661,50 @@ class ForwardStepRunner:
         """
         global global_graph_memory_pool
 
+        if self.draft_overlap is not None:
+            self.draft_overlap.release()
         self.graphs.clear()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
+        self._reported_query_graphs.clear()
         # The tables name no arena; only the graphs and their pool go.
         global_graph_memory_pool = None
 
-    def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
-        if self.sampling_backend is None:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        variants = self.sampling_backend.cuda_graph_capture_variants(
-            self.max_tokens_per_req
+    def _cuda_graph_capture_variants(self, bs: int) -> tuple[str, ...]:
+        variants = (CUDA_GRAPH_VARIANT_DEFAULT,)
+        if self.sampling_backend is not None:
+            variants = tuple(
+                dict.fromkeys(
+                    (
+                        CUDA_GRAPH_VARIANT_DEFAULT,
+                        *self.sampling_backend.cuda_graph_capture_variants(
+                            self.max_tokens_per_req
+                        ),
+                    )
+                )
+            )
+        drafter = self.drafter
+        capacities = (
+            (bs * self.max_tokens_per_req,)
+            if drafter is None
+            else drafter.decode_graph_query_capacities(bs)
         )
-        if not variants:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        deduped = tuple(dict.fromkeys((CUDA_GRAPH_VARIANT_DEFAULT, *variants)))
-        return deduped
+        return tuple(
+            self._query_variant(v, capacity, bs)
+            for capacity in reversed(capacities)
+            for v in variants
+        )
+
+    def _query_variant(self, variant: str, query_tokens: int, bs: int) -> str:
+        return (
+            variant
+            if query_tokens == bs * self.max_tokens_per_req
+            else f"{variant}:query{query_tokens}"
+        )
+
+    def _split_query_variant(self, variant: str, bs: int) -> tuple[str, int]:
+        base, sep, tokens = variant.rpartition(":query")
+        return (base, int(tokens)) if sep else (variant, bs * self.max_tokens_per_req)
 
     def _prepare_sampling_capture(self, bs: int, variant: str) -> None:
         if self.sampling_backend is None:
@@ -568,7 +712,7 @@ class ForwardStepRunner:
         self.sampling_backend.prepare_capture_variant(
             bs=bs,
             num_tokens_per_req=self.max_tokens_per_req,
-            variant=variant,
+            variant=self._split_query_variant(variant, bs)[0],
         )
 
     def _cuda_graph_replay_variant(self) -> str:
@@ -577,7 +721,11 @@ class ForwardStepRunner:
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
     def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
-        variant = self._cuda_graph_replay_variant()
+        variant = self._query_variant(
+            self._cuda_graph_replay_variant(),
+            self._decode_query_tokens or bs * self.max_tokens_per_req,
+            bs,
+        )
         key = (variant, bs)
         if key in self.graphs:
             return key
@@ -670,7 +818,7 @@ class ForwardStepRunner:
         # For DP mode, global_num_tokens must be set so that the MoE
         # all-gather comm layers know token counts for all DP ranks.
         # During capture, use uniform dummy counts across ranks.
-        if self.dp_size > 1:
+        if self.dp_size > 1 and not self.dp_local_graph:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
             # global_bs must ALSO be set at capture. The draft first step's
             # collective sizing (reported via report_collective_sizing) reads
@@ -724,6 +872,21 @@ class ForwardStepRunner:
             capturable=self.capturable_grammar,
             grammar_backend=self.grammar_backend,
         )
+
+        _, query_tokens = self._split_query_variant(variant, bs)
+        adaptive_layout = (
+            self.drafter is not None and query_tokens < bs * self.max_tokens_per_req
+        )
+        if adaptive_layout:
+            # Select the layout outside the graph. Runtime replay updates the
+            # same storage, while every graph records a fixed physical extent.
+            self.drafter.prepare_decode_graph_token_capture_layout(
+                bs=bs, query_tokens=query_tokens
+            )
+        if self.drafter is not None:
+            # Full capacity explicitly captures the native layout. None means
+            # eager policy selection and must not be used during graph capture.
+            self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
             # Dummy add_batch keeps grammar batches 1:1 with replays: the
@@ -798,7 +961,12 @@ class ForwardStepRunner:
             )
         with observer:
             # The kernel state captured launches need lives as long as the graph.
-            with capture_session(graph), graph_capture:
+            overlap_capture = (
+                self.draft_overlap.capture(graph)
+                if self.draft_overlap is not None
+                else nullcontext()
+            )
+            with overlap_capture, capture_session(graph), graph_capture:
                 out = run_once()
             # The drafter's own graphs at this batch share the pool and the measure.
             if self.drafter is not None and variant == CUDA_GRAPH_VARIANT_DEFAULT:
@@ -826,6 +994,8 @@ class ForwardStepRunner:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
             self._metadata_snapshots[(variant, bs)] = snapshots
 
+        if self.drafter is not None:
+            self.drafter.set_decode_graph_query_extent(None)
         return graph, out
 
     def warmup_decode_path(
@@ -865,7 +1035,7 @@ class ForwardStepRunner:
                         else CaptureHiddenMode.NULL
                     ),
                 )
-                if self.dp_size > 1:
+                if self.dp_size > 1 and not self.dp_local_graph:
                     ctx.global_num_tokens = [
                         bs * self.max_tokens_per_req
                     ] * self.world_size
@@ -941,6 +1111,47 @@ class ForwardStepRunner:
         allocation — address-stable across captures and replays.
         """
         return {gid: table[:bs] for gid, table in self._placeholder_tables.items()}
+
+    def decode_graph_for_profile(
+        self, *, bs: int, query_tokens: int, variant: str
+    ) -> torch.cuda.CUDAGraph | None:
+        """Look up a captured startup tier by its logical request/query extents.
+
+        None means the tier was not captured and must not be measured. Graph
+        keys and their native full-width encoding stay owned by the runner.
+        """
+        return self.graphs.get((self._query_variant(variant, query_tokens, bs), bs))
+
+    @contextmanager
+    def decode_profile_metadata(
+        self, *, bs: int, variant: str, block_tables: dict[str, torch.Tensor]
+    ) -> Iterator[Callable[[], None]]:
+        """Lend the normal metadata preparation path to startup measurements.
+
+        Before each replay, the caller fills the input buffers and invokes the
+        yielded callback. On exit, join GPU work and restore capture metadata,
+        including when measurement fails. Call only before live admission.
+        """
+
+        def prepare() -> None:
+            self._prepare_sampling_capture(bs=bs, variant=variant)
+            self._prepare_decode_metadata(
+                bs,
+                bs,
+                self.input_buffers.req_pool_indices_buf[:bs],
+                self.input_buffers.seq_lens_buf[:bs],
+                ForwardMode.DECODE,
+                use_graph=True,
+                settle=lambda: None,
+                block_tables=block_tables,
+            )
+            self.deepep_adapter.replay()
+
+        try:
+            yield prepare
+        finally:
+            torch.cuda.synchronize(self.device)
+            self._init_capture_metadata(bs)
 
     def _init_capture_metadata(self, bs: int):
         tables = self.placeholder_block_tables(bs)
@@ -1083,6 +1294,19 @@ class ForwardStepRunner:
             if global_bs is None or global_bs == 0:
                 return False
             if self.disable_padding:
+                if self.dp_local_graph:
+                    # Keep the graph/eager phase agreed even when graph shapes
+                    # differ. An idle peer uses the smallest captured graph.
+                    return all(
+                        n == 0
+                        or (
+                            n % self.max_tokens_per_req == 0
+                            and self._has_cuda_graph_for_bs(
+                                n // self.max_tokens_per_req
+                            )
+                        )
+                        for n in ctx.global_num_tokens
+                    )
                 return self._has_cuda_graph_for_bs(global_bs)
             return global_bs <= self.max_capture_bs
         if self.disable_padding:
@@ -1096,7 +1320,7 @@ class ForwardStepRunner:
         return self._padded_bs(bs, ctx)
 
     def _padded_bs(self, bs: int, ctx: ForwardContext) -> int:
-        graph_bs = self._global_graph_bs(ctx)
+        graph_bs = None if self.dp_local_graph else self._global_graph_bs(ctx)
         target_bs = graph_bs if graph_bs is not None else bs
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
@@ -1261,6 +1485,12 @@ class ForwardStepRunner:
                 block_tables_cpu=block_tables_cpu,
             )
 
+        self._decode_query_tokens = None
+        if use_graph and self.drafter is not None:
+            self._decode_query_tokens = self.drafter.prepare_decode_graph_token_layout(
+                ctx, actual_bs=bs, padded_bs=padded_bs
+            )
+
         if use_graph:
             # Runtime prepare() is called by ModelExecutor with per-request rids
             # BEFORE self.forward_step — we don't refill here to avoid clobbering
@@ -1269,6 +1499,29 @@ class ForwardStepRunner:
 
             graph_key = self._cuda_graph_key(padded_bs)
             graph = self.graphs[graph_key]
+            report_key = (*graph_key, self._decode_query_tokens)
+            if (
+                self.drafter is not None
+                and report_key not in self._reported_query_graphs
+                and (
+                    self.dp_local_graph
+                    or len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
+                )
+            ):
+                self._reported_query_graphs.add(report_key)
+                rank_info = (
+                    f"rank={self.global_rank}, live_requests={bs}, "
+                    if self.dp_local_graph
+                    else ""
+                )
+                logger.info(
+                    f"{'Local DP' if self.dp_local_graph else 'Adaptive'} "
+                    "decode graph replay: "
+                    f"{rank_info}request_capacity={padded_bs}, "
+                    f"target_query_capacity={(self._decode_query_tokens or padded_bs * self.max_tokens_per_req)}, "
+                    f"full_query_capacity={padded_bs * self.max_tokens_per_req}, "
+                    f"variant={graph_key[0]}"
+                )
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
@@ -1279,27 +1532,57 @@ class ForwardStepRunner:
                             {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
                         ]
                     )
+            query_tokens = (
+                self._decode_query_tokens or padded_bs * self.max_tokens_per_req
+            )
+            packed = query_tokens != padded_bs * self.max_tokens_per_req
             if self._expert_load_rows is not None:
-                # Every rank replays the same padded batch; the live rows are
-                # the DP-gathered live counts (this rank's own without DP).
-                self._expert_load_rows.mark_padded(
-                    padded_global_num_tokens=[padded_bs * self.max_tokens_per_req]
-                    * self.world_size,
-                    live_global_num_tokens=(
-                        ctx.global_num_tokens
-                        if ctx.global_num_tokens is not None
-                        else [ctx.input_num_tokens] * self.world_size
-                    ),
-                )
-            with (
-                torch.inference_mode() if self.device == "npu" else nullcontext()
-            ), nvtx_range("graph_replay", color="red"):
-                if self.drafter is not None:
-                    self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
+                if self.dp_local_graph:
+                    # This graph's MoE input contains only its local rows.
+                    # No peer physical query sizes are known or needed here.
+                    rows = self._expert_load_rows.rows(query_tokens)
+                    rows.fill_(True)
+                    if not packed:
+                        rows[bs * self.max_tokens_per_req :].fill_(False)
                 else:
-                    graph.replay()
-            if self._expert_load_rows is not None:
-                self._expert_load_rows.clear()
+                    self._expert_load_rows.mark_padded(
+                        padded_global_num_tokens=[query_tokens] * self.world_size,
+                        live_global_num_tokens=(
+                            [query_tokens] * self.world_size
+                            if packed
+                            else (
+                                ctx.global_num_tokens
+                                if ctx.global_num_tokens is not None
+                                else [ctx.input_num_tokens] * self.world_size
+                            )
+                        ),
+                    )
+            # MegaMoE's count pair assumes a uniform number of rows per
+            # request. Packed prefixes vary, so that mask could drop live rows.
+            live_requests = (
+                self._mega_moe_live_requests if padded_bs != bs and not packed else None
+            )
+            if live_requests is not None:
+                live_requests[0].fill_(bs)
+                live_requests[1].fill_(padded_bs)
+            try:
+                with (
+                    torch.inference_mode() if self.device == "npu" else nullcontext(),
+                    nvtx_range("graph_replay", color="red"),
+                ):
+                    if self.drafter is not None:
+                        self.drafter.replay_decode_graph(
+                            graph, bs=bs, graph_bs=padded_bs
+                        )
+                    else:
+                        graph.replay()
+            finally:
+                # Even after a failed replay: later eager forwards must not
+                # skip live rows, in MegaMoE or in the expert load counters.
+                if live_requests is not None:
+                    live_requests.fill_(1)
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.clear()
 
             result = live_graph_outputs(
                 self.output_buffers[graph_key], bs, self.max_tokens_per_req

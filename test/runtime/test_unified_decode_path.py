@@ -44,10 +44,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
+
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-    CacheGroupGeometry,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 MAX_DECODE_BS = 8
 LADDER_BS = 4  # capture ladder max, deliberately below MAX_DECODE_BS
@@ -87,27 +87,24 @@ class _RouterCase(_TorchCase):
         leaf.spec_num_tokens = 1
         leaf.is_draft = False
         leaf.draft_block_decode = False
+        leaf.draft_block_causal = False
         leaf.max_num_pages = MAX_NUM_PAGES
         leaf.max_context_len = MAX_NUM_PAGES * 2
         leaf.kernel_page_size = 2
         leaf.device = "cpu"
         leaf.tree_verify = None
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaf,
             is_draft=False,
             spec_num_tokens=1,
             device="cpu",
             consumed_group_ids=None,
         )
-        router.bind(
-            CacheGroupGeometry(
-                granularities={FULL: 2},
-                attn_kinds={FULL: "full_history"},
-                full_history_group_id=FULL,
-                row_geometry={FULL: (2, 1)},
-                windows={FULL: None},
-            ),
-            {FULL: leaf},
+        router.set_cache_pool(
+            make_mha_pool_for_groups(
+                (CacheGroupSpec(FULL, "full_history", 2, 1, replayable=False),),
+                device="cpu",
+            )
         )
         router.init_cuda_graph_state(MAX_DECODE_BS)
         self.router = router
@@ -435,6 +432,7 @@ class TestInklingConvTablesRefreshTest(_RouterCase):
             kernel_page_size=2,
             context_len=MAX_NUM_PAGES * 2,
             max_bs=MAX_DECODE_BS,
+            max_resident_requests=MAX_DECODE_BS,
         )
         text = InklingModelConfig(
             hidden_size=8,

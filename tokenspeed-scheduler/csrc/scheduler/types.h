@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -35,7 +36,8 @@ namespace tokenspeed {
 struct SchedulerConfig {
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
-        // Page 0 is the null placeholder, so usable = total - 1.
+        // Page 0 is the null placeholder, so usable = total - 1. Validate
+        // rejects a negative total_pages, which could wrap this.
         std::int32_t total_pages{};
         std::int32_t NumUsableBlocks() const { return total_pages - 1; }
     };
@@ -54,7 +56,8 @@ struct SchedulerConfig {
     // Test knob: every |N| plans the fused/D grammar retracts the oldest
     // quiescent Decoding request (N > 0) or the one Prefilling request
     // between its chunks (N < 0), bypassing ReserveCoversGeneration but not
-    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool.
+    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool;
+    // INT32_MIN, with no magnitude in int32, is rejected.
     // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
 
@@ -97,6 +100,8 @@ struct SchedulerConfig {
     // all local prefill requests in one batch. Zero leaves this unbounded.
     std::int32_t max_kv_page_num{0};
     std::int32_t max_batch_size{};
+    // Real request-pool rows, independently of the execution batch limit.
+    std::int32_t max_resident_requests{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports
@@ -105,12 +110,18 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Sharing cached prefixes with other replicas
+    // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
+    std::optional<PeerConfig> peer_config;
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
     // Fused role only: decode rounds owed after a local prefill round
     // (docs/design/scheduler.md §3.3). 0 is off.
     std::int32_t prefill_decode_interval{0};
+    // Fused role only: decode rounds every local prefill round owes even
+    // while an overdue prompt suspends the interval (§3.3). 0 is off.
+    std::int32_t prefill_decode_min_interval{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after

@@ -57,7 +57,7 @@ from tokenspeed_kernel.ops.attention.kda import (
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
     commit_state_pages,
-    verify_state_blocks,
+    verify_state_groups,
 )
 from tokenspeed_kernel.ops.conv import (
     PREFILL_QKV_CHANNEL_MULTIPLE,
@@ -502,6 +502,7 @@ class MambaAttnBackend(AttentionBackend):
     def _verify_state_blocks(
         self,
         bs: int,
+        padded_bs: int,
         block_tables: Mapping[str, torch.Tensor],
         *,
         pages_out: Mapping[str, torch.Tensor],
@@ -512,22 +513,27 @@ class MambaAttnBackend(AttentionBackend):
         Verify reads the committed state from the input slot (slot 0 when it
         holds a block, else the live slot 1); speculative outputs stay out of
         the state slab, and the accepted state is committed back to slot 1 by
-        ``commit_state_after_acceptance``. Writes each group's in
-        pages into ``pages_out[group][:bs]`` and returns the per-group tables
-        (kept for the commit's page resolve).
+        ``commit_state_after_acceptance``. Writes each group's in pages into
+        ``pages_out[group][:bs]`` and ``pad_slot_id`` into rows
+        ``[bs, padded_bs)``, in one launch for up to four groups on CUDA, and
+        returns the per-group tables (kept for the commit's page resolve).
         """
-        tables: dict[str, torch.Tensor] = {}
-        for group_id in self._state_groups():
-            rows = self._state_rows(block_tables, group_id)
-            verify_state_blocks(
-                rows,
-                batch_size=bs,
-                pages_out=pages_out[group_id],
-                live_pages_out=(
-                    None if live_pages_out is None else live_pages_out[group_id]
-                ),
-            )
-            tables[group_id] = rows
+        groups = self._state_groups()
+        tables = {
+            group_id: self._state_rows(block_tables, group_id) for group_id in groups
+        }
+        verify_state_groups(
+            [tables[group_id] for group_id in groups],
+            batch_size=bs,
+            padded_batch_size=padded_bs,
+            pages_out=[pages_out[group_id] for group_id in groups],
+            live_pages_out=(
+                None
+                if live_pages_out is None
+                else [live_pages_out[group_id] for group_id in groups]
+            ),
+            pad_page=self.pad_slot_id,
+        )
         return tables
 
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
@@ -1453,6 +1459,7 @@ class MambaAttnBackend(AttentionBackend):
                 # The commit runs before the next refresh, so it may read the captured pages.
                 verify_tables = self._verify_state_blocks(
                     real_bs,
+                    bs,
                     block_tables,
                     pages_out=state_in_blocks_by_group,
                     live_pages_out=state_out_blocks_by_group,
@@ -1465,12 +1472,9 @@ class MambaAttnBackend(AttentionBackend):
                 self._prepare_verify_records(real_bs, seq_lens, draft_token_num)
             else:
                 self._verify_commit_ctx = None
-            for group_id in self._state_groups():
-                if real_bs < bs:
-                    state_in_blocks_by_group[group_id][real_bs:].fill_(self.pad_slot_id)
-                    state_out_blocks_by_group[group_id][real_bs:].fill_(
-                        self.pad_slot_id
-                    )
+                for group_id in self._state_groups():
+                    state_in_blocks_by_group[group_id].fill_(self.pad_slot_id)
+                    state_out_blocks_by_group[group_id].fill_(self.pad_slot_id)
         elif self.state_paging_active:
             # The state block resolve runs once per state group over the real
             # rows. Padded rows get pad_slot_id (-1), which state kernels skip,

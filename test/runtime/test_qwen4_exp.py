@@ -24,6 +24,10 @@ import gc
 import logging
 import weakref
 from dataclasses import replace
+from test.runtime.cache_pool_test_utils import (
+    make_mha_pool_for_groups,
+    make_qsa_pool_for_layers,
+)
 from types import SimpleNamespace
 
 import pytest
@@ -56,9 +60,6 @@ from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-    CacheGroupGeometry,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
@@ -86,6 +87,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.qsa import (
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -499,7 +501,7 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
 
 
 def test_qwen4_exp_qsa_rejects_invalid_kernel_page_size() -> None:
-    with pytest.raises(ValueError, match="positive multiple"):
+    with pytest.raises(ValueError, match="not divisible by kernel page size"):
         _qsa_router(kernel_page_size=96, max_bs=4, spec=1)
 
 
@@ -556,6 +558,7 @@ def _qsa_config(*, kernel_page_size: int | None, max_bs: int, spec: int) -> Attn
         kernel_page_size=kernel_page_size,
         context_len=1024,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=spec,
@@ -572,22 +575,11 @@ def _qsa_router(
     router = attention_registry.create_paged_router(
         config, AttentionArch.MHA, backend_name="qsa"
     )
-    router.bind(
-        CacheGroupGeometry(
-            granularities=dict(_QSA_GROUP_GRANULARITIES),
-            attn_kinds={gid: "full_history" for gid in _QSA_GROUP_GRANULARITIES},
-            full_history_group_id=FULL_ATTENTION,
-            row_geometry={
-                gid: (granularity, 1)
-                for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
-            },
-            windows={gid: None for gid in _QSA_GROUP_GRANULARITIES},
-        ),
-        {
-            gid: router._leaf_factory(gid, granularity)
-            for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
-            if gid == FULL_ATTENTION
-        },
+    router.set_cache_pool(
+        make_mha_pool_for_groups(
+            (CacheGroupSpec(FULL_ATTENTION, "full_history", 256, 1, replayable=False),),
+            device="cpu",
+        )
     )
     router.init_cuda_graph_state(max_bs)
     return router
@@ -601,43 +593,13 @@ def _qsa_root(
     router = attention_registry.create_paged_router(
         config, AttentionArch.MHA, backend_name="qsa"
     )
-    fields = {
-        qsa_raw_key_field(3): torch.zeros((8, 4, 1, 8), dtype=torch.bfloat16),
-        qsa_rope_position_field(3): torch.zeros((8, 3), dtype=torch.int64),
-        qsa_compressed_field(3): torch.zeros((8, 64, 1, 8), dtype=torch.bfloat16),
-    }
-    pool = SimpleNamespace(
-        field_layer_range=range(4),
-        _field_layer_id=lambda layer_id: layer_id,
-        paged_group_ids=tuple(_QSA_GROUP_GRANULARITIES),
-        arena=SimpleNamespace(
-            offload=None,
-            field=fields.__getitem__,
-            plan=SimpleNamespace(
-                fields=[
-                    SimpleNamespace(
-                        field_id=field_id,
-                        group_id=(
-                            QWEN4_EXP_QSA_CACHE_GROUP
-                            if field_id == qsa_compressed_field(3)
-                            else QWEN4_EXP_QSA_RECENT_CACHE_GROUP
-                        ),
-                    )
-                    for field_id in fields
-                ]
-            ),
-            cache_group_specs=tuple(
-                SimpleNamespace(
-                    group_id=gid,
-                    block_granularity=granularity,
-                    attn_kind="full_history",
-                    rows_per_page=granularity,
-                    entry_stride_tokens=1,
-                    sliding_window_tokens=None,
-                )
-                for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
-            ),
-        ),
+    pool = make_qsa_pool_for_layers(
+        device="cpu",
+        layer_ids=(3,),
+        field_layer_offset=0,
+        num_layers=4,
+        num_lcm_blocks=7,
+        kv_head_dim=8,
     )
     backend = Qwen4ExpBackend(config, router, None, QSAIndexerBackend(config, router))
     backend.set_cache_pool(pool)
@@ -951,9 +913,11 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("projected", [False, True])
 def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     monkeypatch,
     hybrid,
+    projected,
 ) -> None:
     indexer = QSAIndexer.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
@@ -1030,7 +994,16 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
             input_num_tokens=rows,
             forward_mode=mode,
         )
-        result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
+        hidden = torch.ones((rows, 4))
+        assert indexer.can_overlap(ctx, num_rows=rows) == (
+            backend is target_backend and mode.is_decode()
+        )
+        assert not indexer.can_overlap(ctx, num_rows=rows + 1)
+        if projected:
+            raw_q, token_k = indexer._project_qk_raw(hidden)
+            result = indexer.forward_projected(raw_q, token_k, torch.arange(rows), ctx)
+        else:
+            result = indexer(hidden, torch.arange(rows), ctx)
         assert result.shape == (rows, 1)
 
     single_request_ctx = ForwardContext(
@@ -1184,8 +1157,12 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
 def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
     sparse, narrow, mode
 ) -> None:
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
     layer = object.__new__(qwen4_exp_nextn.Qwen4ExpDraftAttentionDecoderLayer)
     torch.nn.Module.__init__(layer)
+    layer.enable_fp8_attn_proj = False
+    layer.qsa_fork = StreamFork(None)
     q = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     k, v = q + 100, q + 200
     topk = torch.arange(12, dtype=torch.int32).reshape(6, 2)
@@ -2324,6 +2301,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),
@@ -2335,6 +2313,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
         enable_qsa_prefill_bf16_scratch=False,
+        qwen4_exp_flat_kv=False,
     )
 
     setup = prepare_cache_setup(
@@ -2400,7 +2379,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert fields[qsa_rope_position_field(1)].dtype == "int64"
 
     def group_pages(max_tokens: int) -> dict[str, int]:
-        from tokenspeed_scheduler import SchedulerConfig
+        from tokenspeed_engine.scheduler import SchedulerConfig
 
         specs = setup.spec.cache_group_specs
         model = capacity_model(
@@ -2414,7 +2393,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
             },
             limits=SchedulerLimits(
                 role=SchedulerConfig.Role.Fused,
-                max_live_requests=2,
+                max_batch_size=2,
+                max_resident_requests=2,
                 # A chunk must cover one PLE state checkpoint (256 tokens).
                 max_scheduled_tokens=256,
                 max_context_len=max_tokens,
@@ -2490,6 +2470,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),
@@ -2502,6 +2483,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         mamba_ssm_dtype="float32",
         mapping=Mapping(rank=0, world_size=1),
         enable_qsa_prefill_bf16_scratch=False,
+        qwen4_exp_flat_kv=False,
     )
     return prepare_cache_setup(
         family="qwen4_exp",
@@ -4305,3 +4287,147 @@ def test_hyperconnection_attention_residual_rows(
         actual_residuals, expected_residuals, strict=True
     ):
         torch.testing.assert_close(actual_value, expected_value)
+
+
+@_requires_cuda
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA graph ordering check")
+@pytest.mark.parametrize(
+    "hidden_size,num_heads,num_kv_heads,head_dim,index_heads,index_dim,bs",
+    [
+        (64, 2, 1, 32, 1, 32, 1),
+        (2560, 24, 4, 256, 4, 128, 1),
+        (2560, 24, 4, 256, 4, 128, 128),
+    ],
+    ids=["small", "tp1-full-width", "tp1-bs128"],
+)
+@torch.inference_mode()
+def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
+    monkeypatch,
+    hidden_size,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    index_heads,
+    index_dim,
+    bs,
+):
+    """Exercise the real layer and stream fork with tensor-only GPU kernels.
+
+    Index/cache kernels are replaced by deterministic tensor operations to
+    isolate stream ordering from the sparse-attention implementation. Model
+    projections, gating and output projection remain the real layer's path.
+    The full-width case keeps TP1 QKV/O and replicated index projection sizes;
+    this is an ordering regression, not a sparse-attention performance test.
+    """
+    from tokenspeed_kernel.ops.attention.prologue import GQAPrologueOutput
+
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=hidden_size,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        indexer_n_heads=index_heads,
+        indexer_kv_heads=1,
+        indexer_head_dim=index_dim,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config,
+            Mapping(rank=0, world_size=1),
+            1,
+            enable_fp8_attn_proj=False,
+        ).to(dtype=torch.bfloat16)
+    for parameter in layer.parameters():
+        parameter.normal_(std=0.05)
+    rows = bs * 4
+    backend = _qsa_root(kernel_page_size=64, max_bs=bs, spec=4, is_draft=False)
+
+    class Pool:
+        def __init__(self):
+            self.layerwise_load_tracker = None
+
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=Pool(),
+        bs=bs,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, bs, 4),
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.DECODE,
+    )
+    hidden = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(rows, device="cuda")
+    cache = torch.empty(
+        (rows, num_kv_heads, head_dim), device="cuda", dtype=hidden.dtype
+    )
+
+    def select(raw_q, token_k, positions, ctx):
+        # A slow branch makes a missing join observable in the attention output.
+        torch.cuda._sleep(100_000)
+        scores = raw_q.reshape(rows, index_heads, index_dim).sum(1) + token_k[:, 0, :]
+        slots = (scores.argmax(-1) + positions).int().view(-1, 1)
+        ctx.attn_backend.sparse_topk.qsa_selection = QSASelection(slots, slots, 4)
+        return slots
+
+    def prologue(q, k, v, positions, ctx):
+        cache.copy_((k + v).reshape_as(cache))
+        return GQAPrologueOutput(q=q * 2, k=None, v=None)
+
+    def attention(q, k, v, positions, ctx, *, topk_indices):
+        if k is not None:
+            q = prologue(q, k, v, positions, ctx).q
+        keys = cache.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        return (
+            q.reshape(rows, -1) + keys.reshape(rows, -1) + topk_indices
+        ).contiguous()
+
+    monkeypatch.setattr(layer.indexer, "forward_projected", select)
+    monkeypatch.setattr(layer.attn, "prologue", prologue)
+    monkeypatch.setattr(layer.attn, "forward", attention)
+    serial = layer.qsa_fork
+    parallel = StreamFork(torch.cuda.Stream())
+    layer.qsa_fork = parallel
+    assert layer._can_overlap_qsa(hidden, ctx)
+    oversized_ctx = replace(
+        ctx,
+        bs=129,
+        input_num_tokens=129 * 4,
+        output_layout=ForwardOutputLayout(0, 0, 129, 4),
+    )
+    oversized = hidden.new_empty((129 * 4, hidden_size))
+    assert not layer._can_overlap_qsa(oversized, oversized_ctx)
+    for _ in range(3):
+        layer.self_attention(positions, hidden, ctx)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured = layer.self_attention(positions, hidden, ctx)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    for delta in (0.1, -0.3, 0.7):
+        hidden.add_(delta)
+        positions.add_(1)
+        layer.qsa_fork = serial
+        expected = layer.self_attention(positions, hidden, ctx).clone()
+        expected_cache = cache.clone()
+        cache.fill_(-100)
+        layer.qsa_fork = parallel
+        eager = layer.self_attention(positions, hidden, ctx)
+        torch.testing.assert_close(eager, expected, atol=0, rtol=0)
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)
+        cache.fill_(-100)
+        graph.replay()
+        torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)

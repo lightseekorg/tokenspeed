@@ -337,6 +337,7 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max(kv_lens),
         max_seqlen_q=1,
+        block_draft=False,
     )
     assert out.shape == q_decode.shape
     assert not torch.isnan(out).any()
@@ -607,7 +608,7 @@ def test_head_norms_match_the_separate_clips_and_norm_bitwise(
         triton_l2_clip(q, 22.6, 1e-6, q_scale, tau),
         triton_l2_clip(k, 22.6, 1e-6, None, None),
         (
-            rmsnorm_precision(v, None, 1e-6, None, v.dtype, mean_by_reciprocal=False)
+            rmsnorm_precision(v, None, 1e-6, v.dtype, mean_by_reciprocal=False)
             if value_norm
             else v
         ),

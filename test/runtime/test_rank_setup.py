@@ -44,7 +44,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from test.runtime.cache_pool_test_utils import (  # noqa: E402
     make_layer_group_ids,
@@ -92,10 +92,12 @@ def _config(args: ServerArgs, specs):
         storage_config=storage_config,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
+        max_resident_requests=args.retraction_snapshot_max_requests or 8,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
+        peer_config=None,
     )
 
 
@@ -165,6 +167,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -175,6 +178,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         max_retracted_requests=0,
         storage_config=None,
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -197,6 +201,26 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
     assert cfg.prefill_decode_interval == 64
 
 
+def test_the_prefill_decode_min_interval_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "32",
+            "--prefill-decode-min-interval",
+            "2",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 32
+    assert cfg.prefill_decode_min_interval == 2
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
@@ -208,6 +232,22 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
         (
             ["--prefill-decode-interval", "64", "--disaggregation-mode", "decode"],
             "needs --disaggregation-mode null",
+        ),
+        (["--prefill-decode-min-interval", "-1"], "must be non-negative"),
+        (
+            ["--prefill-decode-min-interval", "2", "--disaggregation-mode", "decode"],
+            "needs --disaggregation-mode null",
+        ),
+        (
+            [
+                "--prefill-decode-min-interval",
+                "2",
+                "--prefill-attempt-interval",
+                "4",
+                "--prefill-any-attempt-interval",
+                "64",
+            ],
+            "--prefill-decode-min-interval cannot be combined",
         ),
     ],
 )
@@ -223,7 +263,18 @@ def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, err
         (["--prefill-decode-interval", "64"], None, 64),
         (
             ["--prefill-attempt-interval", "4", "--prefill-any-attempt-interval", "64"],
-            (4, 64),
+            (4, 64, False),
+            0,
+        ),
+        (
+            [
+                "--prefill-attempt-interval",
+                "4",
+                "--prefill-any-attempt-interval",
+                "64",
+                "--prefill-single-round",
+            ],
+            (4, 64, True),
             0,
         ),
     ],
@@ -254,6 +305,22 @@ def test_prefill_delay_rejects_an_incomplete_pair_at_construction(attempt, any_a
             prefill_attempt_interval=attempt,
             prefill_any_attempt_interval=any_attempt,
         )
+
+
+def test_prefill_single_round_requires_the_gate():
+    with pytest.raises(
+        ValueError, match="--prefill-single-round requires --prefill-attempt-interval"
+    ):
+        prepare_server_args(
+            ["--model", "x", "--max-num-seqs", "8", "--prefill-single-round"]
+        )
+
+
+def test_prefill_single_round_is_rejected_without_the_gate_after_changes():
+    args = ServerArgs(model="x", max_num_seqs=8)
+    args.prefill_single_round = True
+    with pytest.raises(ValueError, match="--prefill-single-round requires"):
+        _ = args.prefill_delay
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -702,18 +769,6 @@ def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeyp
         ),
         (
             [
-                "--attn-tp-size",
-                "8",
-                "--kv-parallel-size",
-                "8",
-                "--decode-context-parallel-size",
-                "8",
-                "--enable-mixed-batch",
-            ],
-            "Aggregated DCP does not support --enable-mixed-batch",
-        ),
-        (
-            [
                 "--disaggregation-mode",
                 "prefill",
                 "--attn-tp-size",
@@ -727,7 +782,7 @@ def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeyp
             "null or decode",
         ),
     ],
-    ids=["fused_kvp_without_dcp", "fused_dcp_mixed_batch", "prefill_dcp"],
+    ids=["fused_kvp_without_dcp", "prefill_dcp"],
 )
 def test_write_back_leaves_the_context_parallel_rules_as_they_are(flags, refused):
     # A fused engine writes back over sharded pages only as the DCP engine
@@ -979,6 +1034,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -990,6 +1046,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         storage_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (

@@ -62,11 +62,20 @@ from multiprocessing.connection import Connection
 import msgspec
 import torch
 import torch.distributed as dist
+from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
-from tokenspeed_scheduler import Scheduler
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
-from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
+from tokenspeed.runtime.cache.peer import (
+    QUARANTINE_S,
+    RECORD_LIFETIME_S,
+    PeerSharingSettings,
+    peer_endpoint_name,
+    peer_incarnation,
+    peer_scheduler_config,
+)
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
@@ -138,7 +147,13 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
-from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
+from tokenspeed.runtime.pd.host_peer import (
+    build_host_peer,
+    enable_mooncake_ipv6_for_host,
+    kv_bootstrap_address,
+    mooncake_library,
+    mooncake_protocol,
+)
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
 from tokenspeed.runtime.plugins.registry import (
     TraceProvider,
@@ -146,14 +161,22 @@ from tokenspeed.runtime.plugins.registry import (
 )
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
+from tokenspeed.runtime.utils import (
+    configure_logger,
+    get_colorful_logger,
+)
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.jit_compile_check import (
     install_jit_compile_check,
     mark_jit_compile_serving,
 )
-from tokenspeed.runtime.utils.network import get_ip, join_host_port
+from tokenspeed.runtime.utils.network import (
+    get_ip,
+    get_local_ip_by_remote,
+    join_host_port,
+    wildcard_host_for,
+)
 from tokenspeed.runtime.utils.process import set_parent_death_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
@@ -291,27 +314,28 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
-    # Set each native writer's fallback before the host initializes logging.
-    level = server_args.log_level.lower()
-    host_env = os.environ.copy()
-    host_env.setdefault(
-        "TS_HOST_LOG",
-        {
-            "warning": "warn",
-            "critical": "error",
-            "fatal": "error",
-            "notset": "trace",
-        }.get(level, level),
-    )
-    host_env.setdefault(
-        "SPDLOG_LEVEL",
-        {
-            "warn": "warning",
-            "fatal": "critical",
-            "notset": "trace",
-        }.get(level, level),
-    )
     with start_context:
+        # Capture launch-context environment changes (notably allocator LD_PRELOAD).
+        # Set each native writer's fallback before the host initializes logging.
+        level = server_args.log_level.lower()
+        host_env = os.environ.copy()
+        host_env.setdefault(
+            "TS_HOST_LOG",
+            {
+                "warning": "warn",
+                "critical": "error",
+                "fatal": "error",
+                "notset": "trace",
+            }.get(level, level),
+        )
+        host_env.setdefault(
+            "SPDLOG_LEVEL",
+            {
+                "warn": "warning",
+                "fatal": "critical",
+                "notset": "trace",
+            }.get(level, level),
+        )
         popen = subprocess.Popen(
             [
                 (
@@ -457,6 +481,13 @@ class HostConfig:
             the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
+        startup_requests: ``--enable-startup-requests``: the engine serves
+            requests of its own before it registers, sized from
+            ``max_batch_size``, ``chunked_prefill_size``, the cache and the
+            context limits (``EventLoop::warm_up``).
+        max_batch_size: The most requests a forward runs.
+        chunked_prefill_size: The most prompt tokens a forward runs.
+        prefix_granularity: Tokens per cache page.
         rank: This rank.
         replica_ranks: The ranks that mirror this rank's scheduler: its
             attention-TP group, across every pipeline stage. The first owns
@@ -525,8 +556,9 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
-        prefill_delay: The fused engine's prefill-delay gate intervals,
-            (attempt, any) rounds; None plans prefill every round
+        prefill_delay: The fused engine's prefill-delay gate,
+            (attempt, any) intervals in rounds and whether a window is one
+            prefill round; None plans prefill every round
             (``ServerArgs.prefill_delay``).
     """
 
@@ -549,6 +581,10 @@ class HostConfig:
     physical_context_len: int
     kv_total_pages: int
     kv_token_capacity: int
+    startup_requests: bool
+    max_batch_size: int
+    chunked_prefill_size: int
+    prefix_granularity: int
     rank: int
     replica_ranks: tuple[int, ...]
     pp_ranks: tuple[int, ...] | None
@@ -588,9 +624,9 @@ class HostConfig:
     grammar: GrammarSettings | None
     eager_grammar: bool
     # The fused engine's prefill-delay gate, (attempt, any) intervals in
-    # rounds; None plans prefill every round. See
+    # rounds and single_round; None plans prefill every round. See
     # ``ServerArgs.prefill_delay``.
-    prefill_delay: tuple[int, int] | None
+    prefill_delay: tuple[int, int, bool] | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
@@ -613,6 +649,7 @@ _L3_HOST_POOLS: list = []
 class _AdmittedRequest:
     """A request as the data plane holds it from admission to release."""
 
+    admission_id: int
     sampling_params: SamplingParams
     stop_criteria: StopCriteria
     # Read by ``multimodal_context_for_forward``; None for a text request.
@@ -650,8 +687,12 @@ class HostDataPlane:
         max_encoder_tokens: int | None,
         attn_tp_cpu_group,
         epd_publisher,
+        starting: bool,
     ) -> None:
         self._device = handle
+        # The engine serves its own startup requests (``HostConfig``'s
+        # ``startup_requests``) until ``finish_startup``.
+        self._starting = starting
         # The control plane exports the serving-time compilations.
         self._report_compiles = report_compiles
         self._profiler = profiler
@@ -687,6 +728,10 @@ class HostDataPlane:
         threading.current_thread().name = "tokenspeed::forward"
         self._device.bind_forward_thread()
 
+    def finish_startup(self) -> None:
+        """End the startup requests: the forwards from here on serve."""
+        self._starting = False
+
     def exit_forward_thread(self) -> None:
         """The forward thread's last call, once nothing more is queued:
         finish a drafter's pending round, then release the expert weights
@@ -698,16 +743,23 @@ class HostDataPlane:
 
     def admit(
         self,
-        requests: list[tuple[str, bytes, list[int], int, list | None]],
+        requests: list[tuple[str, int, bytes, list[int], int, list | None]],
     ) -> None:
-        """Register requests: ``(rid, sampling params, stop token ids, token
+        """Register requests: ``(rid, admission id, sampling params, stop token ids, token
         limit, multimodal frames)`` each. The control plane already resolved
         the parameters (``is_normalized`` is set), so decoding them changes
         nothing. The multimodal frames are a generate request on the wire
         carrying only the request's multimodal inputs, whose features this
         side owns from here on."""
         carriers = []
-        for rid, encoded, stop_token_ids, token_limit, multimodal in requests:
+        for (
+            rid,
+            admission_id,
+            encoded,
+            stop_token_ids,
+            token_limit,
+            multimodal,
+        ) in requests:
             carrier = (
                 zmq_wire.decode_request_frames(multimodal)[0]
                 if multimodal is not None
@@ -716,6 +768,7 @@ class HostDataPlane:
             if carrier is not None:
                 carriers.append(carrier)
             self._requests[rid] = _AdmittedRequest(
+                admission_id=admission_id,
                 sampling_params=_SAMPLING_PARAMS.decode(encoded),
                 stop_criteria=StopCriteria(
                     stop_token_ids=tuple(stop_token_ids), token_limit=token_limit
@@ -728,6 +781,9 @@ class HostDataPlane:
             # Every attention-TP rank admits the same requests in the same
             # order, so the shared-memory reachability exchange pairs up.
             prepare_shm_features(carriers, self._attn_tp_cpu_group)
+
+    def _admission_id(self, rid: str) -> int:
+        return self._requests[rid].admission_id
 
     def execute(
         self,
@@ -781,6 +837,7 @@ class HostDataPlane:
             input_rows, sampled_top_k = logprobs
             planned = PlannedForward(
                 forward_op=forward_op,
+                admission_ids=tuple(request.admission_id for request in requests),
                 sampling_params_list=[request.sampling_params for request in requests],
                 dp_metadata=dp_metadata,
                 grammar_inputs=(
@@ -834,10 +891,13 @@ class HostDataPlane:
         # Each op once, validated before any owner runs one: the Host copies
         # go to the device; the host's L3 executor took the storage
         # operations.
-        cache_ops = cache_ops_from_plan(plan)
-        results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
-        if idle_forward:
-            self._device.run_idle_forward(dp_metadata)
+        cache_ops = cache_ops_from_plan(plan, request_admission=self._admission_id)
+        # The engine's own startup requests let the kernels they reach
+        # prepare their compile variants, as model-only warmup does.
+        with kernel_warmup(enabled=self._starting):
+            results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+            if idle_forward:
+                self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
         if results is None:
             return None
@@ -1132,6 +1192,61 @@ class MemoryMetricSampler(threading.Thread):
                 )
 
 
+def _peer_sharing_settings(
+    server_args: ServerArgs,
+    model_config,
+    draft_model_config,
+    *,
+    host_cache,
+    geometry,
+) -> PeerSharingSettings:
+    """What the host starts this rank's peer sharing from. A collective of
+    the world (the namespace's checkpoint agreement) and of the attention-TP
+    group (one incarnation for the replica, whose members' schedulers must
+    agree on their lease ids)."""
+    mapping = server_args.mapping
+    world_group = (
+        pg_manager.get_process_group("gloo", mapping.world_group)
+        if mapping.world_size > 1
+        else None
+    )
+    deployment_id = cache_deployment_id(
+        server_args,
+        model_config,
+        draft_model_config,
+        host_cache=host_cache,
+        world_cpu_group=world_group,
+    )
+    incarnation = [peer_incarnation()]
+    if mapping.attn.tp_size > 1:
+        dist.broadcast_object_list(
+            incarnation,
+            src=mapping.attn.tp_group[0],
+            group=pg_manager.get_process_group("gloo", mapping.attn.tp_group),
+        )
+    local_ip = get_local_ip_by_remote()
+    enable_mooncake_ipv6_for_host(local_ip)
+    port = server_args.peer_prefix_port + mapping.attn.dp_rank
+    # The name a router's hint carries: the advertised host when given.
+    host = server_args.peer_prefix_host or local_ip
+    return PeerSharingSettings(
+        name=peer_endpoint_name(host, port),
+        bind_host="::" if ":" in local_ip else "0.0.0.0",
+        port=port,
+        incarnation=incarnation[0],
+        deployment_id=deployment_id,
+        weight_version=str(server_args.weight_version),
+        answer_timeout_s=server_args.peer_prefix_answer_timeout_ms / 1000,
+        quarantine_s=QUARANTINE_S,
+        record_lifetime_s=RECORD_LIFETIME_S,
+        library=mooncake_library(),
+        local_ip=local_ip,
+        protocol=mooncake_protocol(),
+        ib_device=server_args.disaggregation_ib_device or "",
+        geometry=geometry,
+    )
+
+
 class HostBootstrap:
     """One rank, built: the scheduler and config for the control thread, and
     the data plane the forward and control threads call."""
@@ -1148,11 +1263,12 @@ class HostBootstrap:
         pd_outbox,
         host_spans,
         metrics_relay_endpoint: str | None,
+        peer_outbox,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
         mapping = server_args.mapping
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        gpu_id = mapping.gpu_id
         self._gpu_id = gpu_id
         self._port_args = port_args
         self._memory_sampler: MemoryMetricSampler | None = None
@@ -1221,6 +1337,9 @@ class HostBootstrap:
             )
             # The scheduler's request slots are per attention-DP rank.
             max_batch_size = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+            max_resident_requests = (
+                max_batch_size + server_args.disaggregation_decode_extra_slots
+            )
             device = build_device_side(
                 server_args=server_args,
                 model_config=model_config,
@@ -1232,8 +1351,12 @@ class HostBootstrap:
                 overlap_schedule_depth=overlap_schedule_depth,
                 decode_input_tokens=decode_input_tokens,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 kv_transfer_builder=functools.partial(
                     build_host_peer, outbox=pd_outbox
+                ),
+                peer_outbox=(
+                    peer_outbox if server_args.peer_prefix_port is not None else None
                 ),
             )
             # The L3 tier the host runs over the shared Host pool; None
@@ -1254,6 +1377,24 @@ class HostBootstrap:
                 # I/O that cannot prove its retirement keeps it past close.
                 _L3_HOST_POOLS.append(device.host_cache.storage)
             storage_config = l3.runtime.scheduler if l3 is not None else None
+            #: With peer prefix sharing, what the host starts this rank's peer
+            #: endpoint and reads from (``cache/peer.py``); else None.
+            self.peer_sharing = None
+            peer_config = None
+            if device.peer_geometry is not None:
+                self.peer_sharing = _peer_sharing_settings(
+                    server_args,
+                    model_config,
+                    draft_model_config,
+                    host_cache=device.host_cache,
+                    geometry=device.peer_geometry,
+                )
+                peer_config = peer_scheduler_config(
+                    name=self.peer_sharing.name,
+                    incarnation=self.peer_sharing.incarnation,
+                    answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
+                    min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
+                )
             specs = device.specs
             geometry = specs.cache_geometry
             scheduler_config = scheduler_config_from_args(
@@ -1262,9 +1403,11 @@ class HostBootstrap:
                 storage_config=storage_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 enable_kv_cache_events=kv_events,
+                peer_config=peer_config,
                 prefix_replay_tokens=resolve_dspark_prefix_replay_tokens(
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
@@ -1274,6 +1417,7 @@ class HostBootstrap:
                     draft_model_config=draft_model_config,
                 ),
             )
+
             #: Driven by the control thread only, once the host takes it.
             self.scheduler = Scheduler(scheduler_config)
             self._max_single_request_tokens = self.scheduler.max_single_request_tokens()
@@ -1391,6 +1535,10 @@ class HostBootstrap:
                 ),
                 kv_total_pages=geometry.num_usable_pages,
                 kv_token_capacity=geometry.token_capacity,
+                startup_requests=server_args.enable_startup_requests,
+                max_batch_size=max_batch_size,
+                chunked_prefill_size=server_args.chunked_prefill_size,
+                prefix_granularity=geometry.prefix_granularity,
                 rank=global_rank,
                 # Every stage runs the same plan, so with a pipeline the replica
                 # is the world (ServerArgs refuses attention DP with one). Under
@@ -1412,8 +1560,11 @@ class HostBootstrap:
                     requires_forward_coordination=specs.requires_forward_coordination,
                     shared_l3=l3 is not None,
                 ),
-                # One node's ranks reach each other on loopback.
-                collective_bind_host="127.0.0.1" if mapping.nnodes == 1 else "0.0.0.0",
+                # One node's ranks reach each other on loopback; across nodes
+                # they dial get_ip(), so listen on its family's wildcard.
+                collective_bind_host=(
+                    "127.0.0.1" if mapping.nnodes == 1 else wildcard_host_for(get_ip())
+                ),
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
@@ -1544,6 +1695,7 @@ class HostBootstrap:
                 epd_publisher=(
                     epd_receive.publisher if epd_receive is not None else None
                 ),
+                starting=server_args.enable_startup_requests,
             )
             self._device = device.handle
 
@@ -1614,6 +1766,7 @@ class HostBootstrap:
     def enter_serving(self) -> None:
         """End startup: from here on a host synchronization or a kernel
         compilation on the data plane is a stall."""
+        self.data_plane.finish_startup()
         arm_data_plane_sync_debug(self._server_args.device)
         mark_jit_compile_serving()
         freeze_startup_heap()
@@ -1633,13 +1786,17 @@ def bootstrap(
     pd_outbox,
     weight_update_commit_protocol: int = 0,
     host_spans=None,
+    peer_outbox=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
     host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
     the host's span recording, which a profile merges into its trace
-    (``engine/profiler.py``); an older host binary passes none."""
+    (``engine/profiler.py``); an older host binary passes none. With peer
+    prefix sharing, ``peer_outbox`` is where the data plane tells the host a
+    plan's landings may be read (``cache/peer.py``); an older host binary
+    passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     # Reject an older host binary before constructing a model or process
@@ -1652,6 +1809,11 @@ def bootstrap(
             "Memory saver requires a ts-host binary with weight-update commit "
             "protocol 2; rebuild tokenspeed-engine together with this runtime"
         )
+    if server_args.peer_prefix_port is not None and peer_outbox is None:
+        raise RuntimeError(
+            "--peer-prefix-port requires a ts-host binary with peer prefix "
+            "sharing; rebuild tokenspeed-engine together with this runtime"
+        )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(
@@ -1661,6 +1823,7 @@ def bootstrap(
         pd_outbox,
         host_spans,
         metrics_relay_endpoint,
+        peer_outbox,
     )
 
 

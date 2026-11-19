@@ -387,7 +387,7 @@ def test_final_norm_reduces_the_last_row_parallel_mlp_output() -> None:
 
     with mock.patch.object(
         dspark_model_module,
-        "all_reduce",
+        "draft_all_reduce",
         side_effect=lambda hidden, group: hidden * 8,
     ) as reduce:
         out = model._finalize_hidden(local_hidden, residual)
@@ -547,18 +547,31 @@ class _LatentPool:
 def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
     """The per-layer context write the fused one replaced.
 
-    It runs F.linear over the KV rows, kv_a_layernorm, RoPE, then the latent
-    store.
+    It projects the KV rows the way the fused write does (one GEMM over the
+    stacked rows, else F.linear per layer), then runs kv_a_layernorm, RoPE and
+    the latent store layer by layer.
     """
+    from tokenspeed_kernel.ops.gemm import mm as kernel_mm
     from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
 
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
-    for layer, plane in zip(model.layers, planes, strict=True):
+    if model._kv_a_weight is not None:
+        projected = kernel_mm(rows, model._kv_a_weight)
+        projected = projected.view(rows.shape[0], len(model.layers), -1).unbind(1)
+    else:
+        projected = [
+            torch.nn.functional.linear(
+                rows,
+                layer.self_attn.fused_qkv_a_proj_with_mqa.weight[
+                    layer.self_attn.q_lora_rank :
+                ],
+            )
+            for layer in model.layers
+        ]
+    for layer, plane, latent in zip(model.layers, planes, projected, strict=True):
         attn = layer.self_attn
         rank = attn.kv_lora_rank
-        weight = attn.fused_qkv_a_proj_with_mqa.weight
-        latent = torch.nn.functional.linear(rows, weight[attn.q_lora_rank :])
         latent = torch.cat(
             (attn.kv_a_layernorm(latent[:, :rank].contiguous()), latent[:, rank:]),
             dim=-1,
@@ -578,37 +591,84 @@ def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("sanitize", [False, True])
-@pytest.mark.parametrize("rows", [1, 8, 40])
+# Seed 61 reproduced the MI355 rounding difference across an FP8 boundary.
+# Weights that don't stack keep the per-layer projections.
+@pytest.mark.parametrize(
+    ("rows", "seed", "stacked"),
+    [(1, 1, True), (8, 8, True), (40, 40, True), (40, 61, True), (8, 8, False)],
+)
 def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
-    dtype, sanitize, rows
+    dtype, sanitize, rows, seed, stacked
 ):
     from tokenspeed.runtime.distributed.mapping import Mapping
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
-    generator = torch.Generator(device="cuda").manual_seed(rows)
+    if not stacked:
+        model._kv_a_weight = None
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden = (torch.randn(rows, 256, device="cuda", generator=generator)).bfloat16()
     positions = torch.randint(4096, (rows,), device="cuda", generator=generator)
     slots = torch.randperm(127, device="cuda", generator=generator)[:rows] + 1
 
-    def planes():
+    def planes(cache_dtype):
         return [
-            torch.full((128, 1, 576), 3.0, device="cuda").to(dtype)
+            torch.full((128, 1, 576), 3.0, device="cuda").to(cache_dtype)
             for _ in model.layers
         ]
 
-    expected, actual = planes(), planes()
+    expected, actual = planes(dtype), planes(dtype)
     _chain_write(model, hidden, positions, slots, expected, None, sanitize)
     backend = SimpleNamespace(cache_placement=lambda layer: None)
     model.write_context_kv(
         hidden, positions, slots, _LatentPool(actual, sanitize), attn_backend=backend
     )
-    for got, want in zip(actual, expected, strict=True):
-        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    if torch.version.hip is None:
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+            assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
+        return
+
+    # Compare only the written RMSNorm values with tolerance. FP8 must
+    # still exactly encode the fused path's BF16 values.
+    bf16_expected, bf16_actual = expected, actual
+    if dtype != torch.bfloat16:
+        bf16_expected, bf16_actual = planes(torch.bfloat16), planes(torch.bfloat16)
+        _chain_write(model, hidden, positions, slots, bf16_expected, None, sanitize)
+        model.write_context_kv(
+            hidden,
+            positions,
+            slots,
+            _LatentPool(bf16_actual, sanitize),
+            attn_backend=backend,
+        )
+    written = torch.zeros(128, device=slots.device, dtype=torch.bool)
+    written[slots] = True
+    rank_width = model.layers[0].self_attn.kv_lora_rank
+    norm_bytes = rank_width * actual[0].element_size()
+    for got, want, got_bf16, want_bf16 in zip(
+        actual, expected, bf16_actual, bf16_expected, strict=True
+    ):
+        got_bytes = got.view(torch.uint8)
+        want_bytes = want.view(torch.uint8)
+        assert torch.equal(got_bytes[~written], want_bytes[~written])
+        assert torch.equal(got_bytes[..., norm_bytes:], want_bytes[..., norm_bytes:])
+        got_norm = got_bf16[slots, :, :rank_width].contiguous()
+        want_norm = want_bf16[slots, :, :rank_width].contiguous()
+        assert (
+            (got_norm.view(torch.int16).int() - want_norm.view(torch.int16).int()).abs()
+            <= 1
+        ).all()
+        if dtype != torch.bfloat16:
+            assert torch.equal(
+                got_bytes[slots, :, :norm_bytes], got_norm.to(dtype).view(torch.uint8)
+            )
         assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
-def test_context_kv_write_respects_dcp_ownership():
+# Seed 35 reproduced the one-ULP BF16 RMSNorm difference on MI355.
+@pytest.mark.parametrize("seed", [0, 35])
+def test_context_kv_write_respects_dcp_ownership(seed):
     """Under KV parallelism each rank stores only the rows it owns.
 
     A rank writes the rows whose pages it owns, at its local slots; padding
@@ -619,7 +679,10 @@ def test_context_kv_write_respects_dcp_ownership():
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
     slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1], device="cuda")
-    hidden = torch.randn(slots.numel(), 256, device="cuda").bfloat16()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = torch.randn(
+        slots.numel(), 256, device="cuda", generator=generator
+    ).bfloat16()
     positions = torch.arange(slots.numel(), device="cuda")
     owned_rows = 0
     for rank in range(4):
@@ -637,7 +700,48 @@ def test_context_kv_write_respects_dcp_ownership():
             attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         )
         for got, want in zip(actual, expected, strict=True):
-            assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+            got_bits = got.view(torch.int16)
+            want_bits = want.view(torch.int16)
+            if torch.version.hip is None:
+                assert torch.equal(got_bits, want_bits)
+                continue
+            written = (want != 0).any(dim=(1, 2))
+            assert torch.equal((got != 0).any(dim=(1, 2)), written)
+            assert torch.equal(got_bits[~written], want_bits[~written])
+            rank_width = model.layers[0].self_attn.kv_lora_rank
+            assert torch.equal(got_bits[..., rank_width:], want_bits[..., rank_width:])
+            # The fused RMSNorm uses FlashInfer's reduction order, which can
+            # round one BF16 value away from the AMD Triton reference.
+            got_norm = got_bits[written, :, :rank_width].int()
+            want_norm = want_bits[written, :, :rank_width].int()
+            assert ((got_norm - want_norm).abs() <= 1).all()
         owned_rows += int(actual[0].abs().sum(dim=(1, 2)).gt(0).sum())
     # Rows 128..896 are owned by exactly one rank each; 0, 1024 and -1 by none.
     assert owned_rows == 6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
+def test_stacked_kv_rows_follow_each_weight_load():
+    """The context write's stacked KV rows are every layer's, refreshed in
+    place on reload so captured graphs read the new weights."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    model = _tiny_draft(Mapping(rank=0, world_size=1))
+
+    def kv_rows():
+        return torch.cat(
+            [
+                layer.self_attn.fused_qkv_a_proj_with_mqa.weight[
+                    layer.self_attn.q_lora_rank :
+                ]
+                for layer in model.layers
+            ]
+        )
+
+    stacked = model._kv_a_weight
+    assert torch.equal(stacked, kv_rows())
+    for layer in model.layers:
+        layer.self_attn.fused_qkv_a_proj_with_mqa.weight.data.mul_(2.0)
+    model.post_load_weights()
+    assert model._kv_a_weight is stacked
+    assert torch.equal(stacked, kv_rows())

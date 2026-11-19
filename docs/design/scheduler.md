@@ -9,6 +9,39 @@ Companion documents: `event-loop.md` (the control/data plane split that
 consumes these plans), `cache-concepts.md` (the vocabulary below —
 prefix granularity, cache groups, LCM blocks).
 
+## Request slots and active decode capacity
+
+The rank-local max_batch_size bounds model forwards and, on a D role, active
+decode permits. The separate max_resident_requests bounds the shared request pool.
+On a D role, disaggregation-decode-extra-slots adds resident rows without
+enlarging model batches. RemotePrefilling and a PrefillDone waiting for its
+first decode hold a request row and KV pages but no execution permit. All
+these requests share one pool; extra rows are not a dedicated transfer pool.
+
+On a D role, the first local decode acquires a move-only permit and keeps it across rounds.
+Permit admission for a newly completed prefill does not displace an
+already streaming request; KV-capacity recovery follows the victim policy below.
+Restoring a Decoding request reserves a permit before issuing the restore;
+the transfer owns it until acknowledgement, including after cancellation.
+Finishing requests keep their request row, KV pages and any decode permit
+until outstanding results land.
+An abort drains those results without publishing its completed pages.
+This cancellation rule applies to all engine roles, including when the
+extra count is zero.
+Retraction relinquishes the permit once the existing in-flight guards allow
+the request to leave; readmission obtains a new one ahead of fresh work.
+
+A missing request row or decode permit is a scheduling wait, not a cache
+capacity failure. Only a failed KV admission enters the existing capacity
+recovery policy. Only the D role allocates decode permits, including during
+restore. The P role hands execution to its peer; the fused role already
+bounds resident requests by max_batch_size. Both roles report zero active
+decode permits and zero requests waiting for a permit.
+
+Forward resources belong to the request's current FSM state. Admission may
+reuse a reference to those resources within one attempt; the reference must
+not cross a state transition or outlive the request.
+
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local
@@ -76,15 +109,16 @@ local hits. Retraction remains an exact image restore, never an L3 re-prefill.
 The D role probes Device history and receives missing data from its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
-A first admission with no free request-pool row skips prefix hashing and
-matching. This is a slot constraint, not a KV capacity failure: it does not
-trigger retraction. Asynchronous L3 preparation runs before forward scheduling
-and can still fetch Host data while rows are full, because it owns no row.
-Resident prefill chunks and restore admissions keep their existing paths.
+A first admission with no free request-pool row skips prefix matching; with
+prefix caching, the prompt was hashed when it was submitted. This is a slot
+constraint, not a KV capacity failure: it does not trigger retraction.
+Asynchronous L3 preparation runs before forward scheduling and can still fetch
+Host data while rows are full, because it owns no row. Resident prefill chunks
+and restore admissions keep their existing paths.
 
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
-tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
+tail inside the page after them (`PrefixProber::ProbePromptPrefix`, see
 [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)):
 the hit boundary `T` is a token count, and `extend_prefix_lens` carries it
 as is. The probe is bounded
@@ -151,17 +185,40 @@ entry both prefill paths call), what each group demands for it in
 
 **Junction cut.** A chunk is never shortened to a page boundary: a prompt
 end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
-costs nothing. The one cut is the *junction* of a hybrid hit: when the KV
-groups' hit `T` reaches past the longest state checkpoint `T_s`
-(`AdmissionResult::junction_tokens`, kept in `CacheProgress::junction_tokens`
-until a chunk passes it), the first chunk after `T_s` ends exactly at `T`, so
-the natural checkpoint it leaves coincides with KV already cached and the next
-prompt sharing that prefix resumes at `T` in every group. The next chunk's
-admission publishes that checkpoint (`PublicationPoint::kStateCheckpoint`):
-the state under the junction's key, but not the KV there, which is cached
-already, so the owner keeps writing its partial block and needs no copy-in
-(`cache-concepts.md`, copy-in). Every other chunk end publishes only its
-completed full pages.
+costs nothing. The one cut is the *junction* of a hit: when the KV reach `T`
+lies past the hit `T_s` (`AdmissionResult::junction_tokens`, kept in
+`CacheProgress::junction_tokens` until a chunk passes it), the first chunk
+after `T_s` ends exactly at `T`, so the natural checkpoint it leaves coincides
+with KV already cached and the next prompt sharing that prefix resumes at `T`
+in every group. With restricted State groups (G > 1) chunk ends stay on the G
+grid, so an on-grid junction publishes only when a chunk end lands on it.
+With a State group, the KV reach is at least the
+prefix-closed groups' coverage, rounded down to the checkpoint grid (a
+restricted State group, `checkpoint_granularity` G > 1, publishes only on
+multiples of G, so a junction off that grid could never be resumed at):
+`T_s` falls short of it where a State checkpoint is missing, and also where a
+sliding window is -- a producer publishes its window only where its chunks
+end, so a prompt that diverges inside another prompt's chunk finds the full
+history cached but no window there. The chunk cut at `T` writes its own
+window and publishes it with the checkpoint, like any chunk end's completed
+pages. Without a State group (a sliding-only model) there is no checkpoint to
+publish, and the D role's probe leaves the State groups out (its prompt
+arrives by transfer): both keep the reach every token-spanned group accepts,
+as before. The next chunk's admission publishes that checkpoint
+(`PublicationPoint::kStateCheckpoint`): the state under the junction's key
+and the windows the chunk wrote under their own page keys, but not the
+full-history KV there, which is cached already, so the owner keeps writing its
+partial block and needs no copy-in (`cache-concepts.md`, copy-in). Every other chunk end publishes only
+its completed full pages.
+
+The trade-off: a junction publishes one checkpoint, and reaching past a
+missing window moves it from the producer's chunk end below the coverage
+(the last boundary with a window, where the cut used to land) up to the
+coverage itself. A later prompt diverging between the two finds neither and
+resumes at the next checkpoint below (for example, a producer chunk end at 8, a
+coverage of 10: a prompt diverging at 9 resumed at 8 before and now at 0).
+The common case it serves is the opposite one: siblings that share the whole
+prefix up to the coverage, which now resume there instead of a chunk earlier.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -356,8 +413,9 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — a `PublicationPoint` other than an ordinary chunk end
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1; the KV there is cached already, so only the state is
-published), and a finish or retraction on every role (`kFinal`: the P's
+junction (§1; the full-history KV there is cached already, so only the state
+and the sliding windows the chunk wrote are published), and a finish or
+retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
 except the dead prompt ends and finishes that the in-forward checkpoint
 skips (below). An ordinary chunk end or decode step publishes nothing for a State
@@ -402,6 +460,16 @@ which publishes it under the boundary's page hash, like a natural checkpoint,
 with the sliding window behind it as the endpoint's window, even at a chunk
 end, never as an unproven boundary that eviction takes first
 (`cache-concepts.md`).
+For restricted State groups (`checkpoint_granularity = G > 1`), the boundary
+instead is `floor((prompt_tokens - 1) / G) * G`, including prompts that fit
+within one chunk. A prompt of at most `G` tokens therefore has no positive
+input checkpoint. The P and fused roles require this flag, prefix caching,
+and a chunk budget of at least `G`; `G` must be a multiple of the prefix page
+size. The D role neither needs this flag nor publishes its transferred state
+as a reusable restricted checkpoint. An interior checkpoint does not mean
+that every shorter aligned prefix was saved: another request can reuse only
+a boundary whose State and all required KV dependencies remain present.
+
 A boundary a chunk ends on needs none (the chunk end's slot 1 is published
 there, as at a junction). The scan emits states only whole pages from a
 forward's start, and the budget a batch's decodes leave rarely ends on a page,
@@ -504,8 +572,12 @@ at admission like `promptEndCheckpoint`, is a possible follow-up.
 `Finishing` and nothing else; after every batch of events,
 `settleFinishedRequests` publishes the frontier of each `Finishing` request
 with no forward in flight (`kFinal`: KV tail and state, unless they are
-dead, above) and releases its pages (`ReleaseEvent`). One path for every
-schedule: a request that finished
+dead, above) and releases its pages (`ReleaseEvent`). This final publication
+advances the owner's `CacheProgress` in place: its hashes and checkpoint
+references remain alive through publication and Host-store pinning, then leave
+with `ReleaseEvent`. Finishing does not need a rollback copy of the history.
+Page-reference release still grows with the number of held pages. One path for
+every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
@@ -541,9 +613,11 @@ the KV is the Device's prefix plus a Host suffix, and each State group's
 checkpoint comes from whichever tier holds it, the Device first -- so Device
 KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
 groups reach further than the state (`kv_tokens >
-num_common_tokens`), the difference is the junction: the first chunk ends
-there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. For unrestricted
+num_common_tokens`; with a State group at least the prefix-closed groups'
+coverage on the checkpoint grid), the difference is the junction: the first
+chunk ends there and publishes the checkpoint and the sliding windows the
+cache lacked, so the next prompt that shares the prefix resumes at the KV
+boundary in every group. For unrestricted
 State groups no alignment is imposed on a chunk, and apart from the opt-in
 in-forward checkpoint above no checkpoint is produced inside a forward: a
 chunk's state output is its own natural checkpoint.
@@ -755,6 +829,10 @@ that input reserve is not subtracted again from the remaining output budget.
 the largest prompt whose worst-case working set — dense or sliding history
 with its decode reserve and overlap-depth protection, the blocks a tail
 handover holds for one admission, two slots per State group — fits the pool.
+However large the pool, it stops at `CapacityModel::MaxRequestTokenLimit`,
+the int32 token range less what the scheduler adds past a token limit (the
+decode windows and the rounding to a block or prefix page), which
+`SubmitRequests` enforces on every request.
 It is not a live check against currently free capacity; a prompt within the
 bound can still fail admission right now and waits. What it does promise,
 with the five exceptions at the end of this section, is that such a
@@ -771,10 +849,20 @@ evicts by whole segments, and a segment holding a block in use cannot leave
 — the request's own blocks included, such as the pages under the checkpoint
 it resumed from. So once whole segments cannot fund the admission of a
 request no other one holds pages beside, the blocks they passed over leave
-one by one (`cache-concepts.md`, `AdmissionPlanner`): alone, there is no
-release left to wait for. Only the admission's last variant takes them: an
-optional part of it — an in-forward checkpoint's block (§1.2) — is dropped
-first and never pays for such an eviction. Beside
+one by one (`LoneRequestAdmission::Admit`; `cache-concepts.md`,
+`AdmissionPlanner`): alone, there is no release left to wait for. Only the
+admission's last variant takes them: an optional part of it — an in-forward
+checkpoint's block (§1.2) — is dropped first and never pays for such an
+eviction, and neither does the optional retained input checkpoint: the
+ordinary admission lets it go and tries again first. Lone requests are kept
+out of the ordinary path. It calls the plain `Admit` and `Restore`, and hands
+over to `LoneRequestRecovery` (`scheduler/lone_request_recovery.h`) through one
+entry per kind (`AdmitFirstChunk`, `AdmitStep`, `Restore`) at the point
+its last attempt fails, not later in the build: an admission in between would
+leave the request no longer alone. A failed admission changes nothing, and
+`LoneRequestAdmission::Admit` plans as `Admit` does up to the block-by-block pass, so
+trying `Admit` first changes no outcome. The one trace lone requests leave on
+the ordinary path is the plan mark below (`ActedInPlan`). Beside
 another page holder no block leaves one by one: the request waits for that
 holder's release (on the P role, until its PD transfer is acknowledged),
 where write-through, which evicts block by block, could fund it at once.
@@ -804,9 +892,10 @@ pages beside its blocks frees holes for that group alone, never a parent for
 another. Nothing else moves a block, and a lone blocker is never retracted
 (§2). So when the block-by-block pass leaves the step unfunded, the request's
 own blocks are what stands in the way, and the last means is **lone-request
-compaction** (`CacheCoordinator::CompactLoneRequest`; from
-`admitWithKvEventTracking` after the retained-checkpoint retry, so for every
-later chunk and decode, and from the first admission): the request's blocks of
+compaction** (`LoneRequestAdmission::Compact`; from
+`LoneRequestRecovery::AdmitStep` after the retained-checkpoint retry, so for
+every later chunk and decode, and from `AdmitFirstChunk` at the first
+admission): the request's blocks of
 every packed, token-spanned group — at a first admission, the Device pages and
 tail blocks its prefix hit takes — are gathered into fewer parents, the
 parents they leave return to the empty FIFO, and the admission is retried once
@@ -868,7 +957,7 @@ each State group's prompt-end checkpoint too), is held through the
 compaction, and the retry still finds it. The cache in the vacated parents is
 left to the retry's own eviction, which can now take whole parents. A group's
 parents never increase, at most one compaction runs per plan, and each is
-counted by the coordinator (`HostCacheStats::lone_compactions`,
+counted by `LoneRequestAdmission` (`HostCacheStats::lone_compactions`,
 `lone_compaction_moves`) and logged. The plan a compaction ran in admits
 nothing more in its prefill phases, on any role (a chunk that gives way, §1.1,
 carries no whole prompt in it), and its capacity retraction takes no request
@@ -947,7 +1036,7 @@ The `CapacityModel` is deliberately **config-only**: it reads every
 recipes size a pool from the same model before the arena is allocated
 (`recipes/scheduler_bridge.py` builds an unsized config and asks
 `ConcurrentGroupPages(max_total_tokens, max_context_len)` for each group's
-demand at `max_batch_size` live requests), and then lets the `Scheduler`
+demand at max_resident_requests live requests), and then lets the Scheduler
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
 next verify window a speculative decode's draft steps write on the roles that
@@ -1128,7 +1217,7 @@ the image as the split planned:
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
 at it), the shallowest first, and the Host takes the leading boundaries that
-fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, using the shared
+fit whole (`HostCache::NumHostBoundariesThatFit`, using the shared
 eviction planner). All rows fit jointly against shadow capacity before any
 placement is committed; the retraction (`AcquireHostBoundaries`) evicts exactly the planned
 victims and places exactly those rows. The first boundary the Host cannot take
@@ -1517,7 +1606,7 @@ claimed by an extend forward, and the capacity model charges no prefill peak
 (§1.4).
 
 **What the D probe may claim.** The remote admission probes this node's own
-Device cache (`CacheCoordinator::ProbeDecodeDevicePrefix`) so the peer
+Device cache (`PrefixProber::ProbeDecodeDevicePrefix`) so the peer
 transfers only what is missing. For the token-spanned groups it is the
 ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
@@ -1540,10 +1629,14 @@ finish (and on the transfer ACK) the D publishes its own frontier like a
 fused engine: the KV tail and slot 1 (§1.2), which is how the exact
 prompt-end checkpoint of a repeated prompt comes to exist on this node.
 
-**Retraction and restore:** victims are chosen by the shared rule in §2 —
-everything resident is decode work (prompts the peer prefilled, in
-`PrefillDone` or `Decoding`); `RemotePrefilling` is pinned by the peer's
-in-flight prefill and never a victim. The image is taken from this node's own
+**Retraction and restore:** victims are chosen by the shared rule in §2.
+PrefillDone requests waiting for their first decode permit and Decoding
+requests are eligible, subject to the reserve exemption and in-flight guards.
+RemotePrefilling is pinned by the peer's in-flight prefill and never a victim.
+Ready-waiting requests have no separate victim priority: among eligible
+requests whose images fit, the rule favors more newly releasable blocks,
+then fewer generated tokens. Restoring PrefillDone does not acquire a
+permit; its first decode does. The image is taken from this node's own
 pages and nothing crosses the PD wire: the receiver and admission record were
 already released at `RemotePrefillDone`, and the bootstrap token lives in the
 request's token container, so a `PrefillDone` victim restored to `PrefillDone`
@@ -1604,6 +1697,18 @@ a decode blocks. A capacity grant that admits a prompt (mixed mode) still runs
 and starts a new interval. The counters follow the plans alone, so mirrored
 ranks agree; under attention DP each replica counts its own rounds. The P and
 D roles refuse the knob: neither runs local prefill and decode on one engine.
+
+**Minimum interval** (`prefill_decode_min_interval` `M`, either mode; `0` is
+off): a round that schedules a local prefill chunk also owes the running
+decodes `M` decode rounds, on the same terms, but no overdue prompt suspends
+them. A suspended interval's overdue chunks then alternate with `M` decode
+rounds instead of running back to back: while a decode can run, no prefill
+round directly follows another. The price is the time-to-first-token bound:
+on top of the interval's `N`, a prompt waits `M` decode steps per prefill
+chunk the engine runs before its last one, its own included. A round that `M`
+holds back counts toward `N` like the interval's own. With `M >= N` the
+interval owes nothing `M` does not; `M` alone bounds nothing. The P and D
+roles refuse it as well.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is
@@ -1706,9 +1811,10 @@ pages:
   key since — and protected from the planner's eviction like a prefix hit).
   Every other slot becomes one row of a single
   `SnapshotRestoreOperation`, tagged with its source tier (`HostTier::kL2`
-  rows carry their key, `kSnapshotPool` rows none). Under segment eviction,
-  or when no other request holds pages (§1.4), a restore whose claims leave
-  no plan plans again claiming nothing, so every slot is a row
+  rows carry their key, `kSnapshotPool` rows none). Under segment eviction
+  (`Restore`), or when no other request holds pages (`LoneRequestAdmission::Restore`,
+  §1.4), a restore whose claims leave no plan plans again claiming nothing,
+  so every slot is a row
   (`cache-concepts.md`, `AdmissionPlanner`). A copy fills its
   destination block whole, so — as for a Host hit's load-back — only the
   reserve pages appended beyond the imaged shape are listed in
@@ -1872,7 +1978,14 @@ with no request suspended both must read empty and zero.
 the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
 many rows plus the null row) are validated together. The P role refuses a
-snapshot pool. L3 addresses page-cyclic sharded groups through replica-stable
+snapshot pool. The runtime defaults the snapshot request cap to rank-local
+resident capacity C (B+E on D, B on fused); an explicit positive cap takes
+precedence. This is a budget for suspended images: retraction frees Device
+rows for new admissions, which can create further demand for images. The
+row budget does not guarantee enough Host space. Rows and image storage
+must both fit; when no eligible image fits, capacity recovery uses the abort
+policy in §2.
+L3 addresses page-cyclic sharded groups through replica-stable
 object keys ([cache concepts](cache-concepts.md)).
 `debug_force_retraction_interval` (§2) is the only
 knob that chooses victims outside capacity pressure, and it is refused
@@ -1957,7 +2070,7 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   Every source is read as it was when the plan was built. A copy destination
   is never zeroed: the zero would wipe the copy. A copy recorded after one
   that writes its source reads that copy's source instead
-  (`Scheduler::recordAdmittedPages`, which asserts as it records that no
+  (`RecordAdmittedPages`, which asserts as it records that no
   destination is zeroed or written twice), and one composed back onto its
   own source is dropped, so no copy reads a block an earlier copy of the
   plan writes and each destination is written once;

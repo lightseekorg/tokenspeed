@@ -49,7 +49,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     AttnKind,
     CacheGroupConfig,
     ExecutionEvent,
@@ -83,7 +83,13 @@ register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
 
 def _execute(handle, plan, planned):
-    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
+    return handle.execute(
+        plan,
+        planned,
+        cache_ops=cache_ops_from_plan(
+            plan, request_admission={f"r{i}": i for i in range(1, 10)}.__getitem__
+        ).device,
+    )
 
 
 @pytest.mark.parametrize(
@@ -257,7 +263,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             overlap_schedule_depth=0,
             decode_input_tokens=16,
             max_batch_size=16,
+            max_resident_requests=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
+            peer_outbox=None,
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
     assert events.count(("plan-check",)) == int(declares_padded_replay)
@@ -322,6 +330,7 @@ def _plan(
     cache=(),
     remote_decode=None,
     remote_prefill=None,
+    has_peer_fetches=False,
 ):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
     plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
@@ -338,6 +347,7 @@ def _plan(
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
+        has_peer_fetches=has_peer_fetches,
     )
 
 
@@ -428,6 +438,7 @@ def _planned(*, num_extends, label=None):
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
 
 
@@ -437,6 +448,7 @@ def _profile_batch(mode):
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 8
     config.max_batch_size = 4
+    config.max_resident_requests = 4
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.enable_mixed_prefill_decode = True
@@ -682,6 +694,75 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
     trace.clear()
     _execute(handle, _plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
     assert trace == [("zero", {"kv": (2,)}), ("load_backs", ())]
+
+
+class _PeerOutbox:
+    """The host's peer outbox: records when a plan's landings may be read."""
+
+    def __init__(self, trace: list) -> None:
+        self._trace = trace
+
+    def reads_ready(self) -> None:
+        self._trace.append("reads_ready")
+
+
+def _peer_handle(trace):
+    handle = _handle(trace, peer_outbox=_PeerOutbox(trace))
+    executor = handle._executor
+    executor.copy_cache_pages = lambda pairs: trace.append("copy")
+    executor.zero_cache_pages = lambda pages: trace.append("zero")
+
+    class _Event:
+        def record(self, stream) -> None:
+            trace.append(("record", stream))
+
+        def synchronize(self) -> None:
+            trace.append("wait_fence")
+
+    executor.device_module = SimpleNamespace(Event=_Event)
+    return handle
+
+
+@pytest.mark.parametrize("forwards", [True, False])
+def test_peer_reads_start_behind_the_plans_device_work(wire_ops, forwards):
+    """A landing's READs write the plan's blocks from outside the streams:
+    the fence they wait on is recorded on the default stream behind the
+    copies, the zeroing and the forwards in flight, and the host hears of it
+    only once it passed -- after the round's forward is launched, so the wait
+    never delays that launch."""
+    trace: list = []
+    handle = _peer_handle(trace)
+
+    _execute(
+        handle,
+        _plan(
+            pages_to_zero=[3],
+            pages_to_copy={"kv": [(3, 8)]},
+            has_peer_fetches=True,
+        ),
+        _planned(num_extends=1) if forwards else None,
+    )
+
+    assert trace == [
+        "copy",
+        "zero",
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
+        *(["forward"] if forwards else []),
+        "wait_fence",
+        "reads_ready",
+    ]
+
+
+def test_a_plan_without_peer_landings_reports_none(wire_ops):
+    """Only a plan with landings has a fence: the host counts one report
+    per such plan, in order."""
+    trace: list = []
+    handle = _peer_handle(trace)
+
+    _execute(handle, _plan(pages_to_zero=[3]), _planned(num_extends=1))
+
+    assert trace == ["zero", "forward"]
 
 
 def test_a_failed_page_copy_fails_the_plan(wire_ops):
@@ -1419,7 +1500,7 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             return ()
 
     plan = Plan()
-    prepared = cache_ops_from_plan(plan)
+    prepared = cache_ops_from_plan(plan, request_admission={}.__getitem__)
     trace = []
     handle = _handle(trace)
     handle.execute(plan, None, cache_ops=prepared.device)
@@ -1480,12 +1561,16 @@ class _SleepDeviceModule:
     def synchronize(self) -> None:
         self._trace.append("device.synchronize")
 
+    def empty_cache(self) -> None:
+        self._trace.append("device.empty_cache")
+
 
 class _SleepExecutor:
     """Only what the release/wake operations read off the executor."""
 
     def __init__(self, trace) -> None:
         self.device = "cpu"
+        self.config = SimpleNamespace(enforce_eager=False)
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
 
@@ -1549,7 +1634,19 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     ]
 
 
-def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
+@pytest.mark.parametrize(
+    "device_type,enforce_eager,hip",
+    [
+        ("cpu", False, None),
+        ("cuda", False, None),
+        ("cuda", True, None),
+        ("cuda", False, "6.4"),
+        ("cuda", True, "6.4"),
+    ],
+)
+def test_nccl_suspend_and_resume_reach_the_communicators(
+    monkeypatch, device_type, enforce_eager, hip
+):
     from tokenspeed.runtime.execution import device as device_module
 
     trace = []
@@ -1560,8 +1657,31 @@ def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
         device_module, "resume_nccl_communicators", lambda: trace.append("resume")
     )
     handle = DeviceHandle(_SleepExecutor(trace))
+    handle._forward_device = torch.device(device_type)
+    handle._executor.config.enforce_eager = enforce_eager
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(
+        torch._C,
+        "_cuda_clearCublasWorkspaces",
+        lambda: trace.append("cuBLAS.clear"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        device_module, "trim_cuda_stack", lambda: trace.append("stack.trim") or 2048
+    )
+    monkeypatch.setattr(
+        device_module,
+        "restore_cuda_stack",
+        lambda limit: trace.append(("stack.restore", limit)),
+    )
 
     handle.suspend_nccl()
     handle.resume_nccl()
 
-    assert trace == ["suspend", "resume"]
+    expected = ["device.synchronize", "suspend"]
+    if device_type == "cuda" and enforce_eager:
+        expected += ["device.synchronize", "cuBLAS.clear"]
+    expected.append("device.empty_cache")
+    if device_type == "cuda" and hip is None:
+        expected += ["stack.trim", ("stack.restore", 2048)]
+    assert trace == [*expected, "resume"]

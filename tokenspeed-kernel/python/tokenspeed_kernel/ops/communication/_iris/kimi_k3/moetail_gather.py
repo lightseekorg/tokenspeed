@@ -41,6 +41,9 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 
 # Each row's block starts on its own pair of 512-element Lamport tiles.
 K3_GATHER_ROW_STRIDE = 1024
+_ROW_STRIDE = gl.constexpr(K3_GATHER_ROW_STRIDE)
+# _attnres_combine_kernel's chunk: two cover a 7168-wide row.
+_MIX_BLOCK = gl.constexpr(4096)
 
 
 @gluon.jit
@@ -239,6 +242,7 @@ def _k3moe_mfma_send(
     HAS_NORM: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    ROW_LAYOUT: gl.constexpr,
 ):
     """Project a 16x16 tile of rows and columns into slot RANK of every mailbox.
 
@@ -246,7 +250,8 @@ def _k3moe_mfma_send(
     it copies their weights to LDS, loads their latent and moves it into MFMA
     operand registers, and runs one MFMA chain over them; the subgroups'
     partial tiles are then summed. A tile's whole weight block is in flight
-    at once.
+    at once. ``ROW_LAYOUT`` stores each row of the tile in that row's block,
+    as ``_k3moe_gather_send`` does, instead of the tile as one block.
     """
     gl.static_assert(K % (NUM_WARPS * CHUNK) == 0)
     STEPS: gl.constexpr = K // (NUM_WARPS * CHUNK)
@@ -312,10 +317,15 @@ def _k3moe_mfma_send(
         mask=valid,
         other=0.0,
     )
-    # One contiguous 256-element tile: 512-byte stores per peer, in one Lamport tile.
-    block = program * 256
-    elements = block + tile_rows[:, None] * 16 + tile_columns[None, :]
-    stage = gl.load(epochs + block // 512).to(gl.uint32) % 3
+    if ROW_LAYOUT:
+        # 16 columns never span the 512-column tile boundary of a row's block.
+        elements = out_rows[:, None] * _ROW_STRIDE + out_columns[None, :]
+        stage = gl.load(epochs + elements // 512, mask=valid, other=0).to(gl.uint32) % 3
+    else:
+        # One contiguous 256-element tile: 512-byte stores per peer, in one Lamport tile.
+        block = program * 256
+        elements = block + tile_rows[:, None] * 16 + tile_columns[None, :]
+        stage = gl.load(epochs + block // 512).to(gl.uint32) % 3
 
     # Load latent as whole 128-byte lines and move it to the operand layout through LDS.
     latent_layout: gl.constexpr = gl.BlockedLayout(
@@ -581,6 +591,151 @@ def _k3moe_tile_gather_reduce(
     gl.store(epochs + tile + 1, ((high_stage + 1) % 3).to(gl.int32))
 
 
+@gluon.jit
+def _k3moe_row_slots(
+    columns,
+    row,
+    low_stage,
+    high_stage,
+    WORLD_SIZE: gl.constexpr,
+    LOCAL_WIDTH: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+):
+    """Mailbox elements of ``row``'s output ``columns``, eight a lane: column c
+    is item c % LOCAL_WIDTH of slot c // LOCAL_WIDTH's row block."""
+    local = columns % LOCAL_WIDTH
+    stage = gl.where(local < 512, low_stage, high_stage)
+    slots = (
+        (stage * (WORLD_SIZE * MAX_ELEMENTS)).to(gl.int32)
+        + (columns // LOCAL_WIDTH) * MAX_ELEMENTS
+        + row * _ROW_STRIDE
+        + local
+    )
+    # A lane's eight columns share a slot and a tile, so its loads stay 16-byte words.
+    return gl.max_contiguous(gl.multiple_of(slots, 8), 8)
+
+
+@gluon.jit
+def _k3moe_row_missing(values, columns, mask):
+    """One flag a lane: whether any of its words still holds the empty marker."""
+    # Payloads exclude -0.0 and words are whole, so a high half of 0x8000 means empty.
+    empty = mask & (columns % 2 == 1) & (values.to(gl.uint16, bitcast=True) == 0x8000)
+    return gl.max(gl.reshape(empty.to(gl.int32), [columns.shape[0] // 8, 8]), axis=1)
+
+
+@gluon.jit
+def _k3moe_mix_finish(
+    region,
+    epochs,
+    out_ptr,
+    row,
+    mix_weight_ptr,
+    mix_norm_ptr,
+    mix_m_ptr,
+    mix_s_ptr,
+    mix_acc_ptr,
+    mixed_ptr,
+    mix_eps,
+    WORLD_SIZE: gl.constexpr,
+    LOCAL_WIDTH: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Gather ``row`` as ``_k3moe_gather_reduce`` does, then mix it into the
+    next layer's attention input.
+
+    The mix is ``_attnres_combine_kernel``'s with one term, the rounded mix
+    and the out-norm, in that kernel's 4096-wide chunks, layout and operation
+    order, so its bits match: weights ``mix_weight_ptr``, out-norm weights
+    ``mix_norm_ptr`` and the block partial (``mix_m_ptr``, ``mix_s_ptr``,
+    ``mix_acc_ptr``) by row.
+    """
+    HIDDEN: gl.constexpr = WORLD_SIZE * LOCAL_WIDTH
+    gl.static_assert(_MIX_BLOCK < HIDDEN and HIDDEN <= 2 * _MIX_BLOCK)
+    gl.static_assert(LOCAL_WIDTH % 8 == 0 and LOCAL_WIDTH <= _ROW_STRIDE)
+    gl.static_assert(8 * 64 * NUM_WARPS == _MIX_BLOCK)
+    layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
+    col0 = gl.arange(0, _MIX_BLOCK, layout=layout)
+    col1 = _MIX_BLOCK + col0
+    mask0 = col0 < HIDDEN
+    mask1 = col1 < HIDDEN
+    row_offsets = row * HIDDEN
+    # None of the mix operands depends on the gather.
+    wp0 = gl.amd.cdna4.buffer_load(mix_weight_ptr, col0, mask=mask0, other=0.0)
+    wp1 = gl.amd.cdna4.buffer_load(mix_weight_ptr, col1, mask=mask1, other=0.0)
+    ow0 = gl.amd.cdna4.buffer_load(mix_norm_ptr, col0, mask=mask0, other=0.0)
+    ow1 = gl.amd.cdna4.buffer_load(mix_norm_ptr, col1, mask=mask1, other=0.0)
+    m_b = gl.load(mix_m_ptr + row)
+    s_b = gl.load(mix_s_ptr + row)
+    a0 = gl.amd.cdna4.buffer_load(
+        mix_acc_ptr, row_offsets + col0, mask=mask0, other=0.0
+    )
+    a1 = gl.amd.cdna4.buffer_load(
+        mix_acc_ptr, row_offsets + col1, mask=mask1, other=0.0
+    )
+
+    low_stage = gl.load(epochs + 2 * row).to(gl.uint32) % 3
+    high_stage = gl.load(epochs + 2 * row + 1).to(gl.uint32) % 3
+    slots0 = _k3moe_row_slots(
+        col0, row, low_stage, high_stage, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS
+    )
+    slots1 = _k3moe_row_slots(
+        col1, row, low_stage, high_stage, WORLD_SIZE, LOCAL_WIDTH, MAX_ELEMENTS
+    )
+    v0 = gl.amd.cdna4.buffer_load(region, slots0, mask=mask0, other=0.0, cache=".cv")
+    v1 = gl.amd.cdna4.buffer_load(region, slots1, mask=mask1, other=0.0, cache=".cv")
+    while _iris_subgroup_any(
+        _k3moe_row_missing(v0, col0, mask0) | _k3moe_row_missing(v1, col1, mask1)
+    ):
+        v0 = gl.amd.cdna4.buffer_load(
+            region, slots0, mask=mask0, other=0.0, cache=".cv"
+        )
+        v1 = gl.amd.cdna4.buffer_load(
+            region, slots1, mask=mask1, other=0.0, cache=".cv"
+        )
+    sentinel = (
+        gl.where(col0 % 2 == 0, 0, 0x8000).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    )
+    gl.amd.cdna4.buffer_store(sentinel, region, slots0, mask=mask0, cache=".wt")
+    gl.amd.cdna4.buffer_store(sentinel, region, slots1, mask=mask1, cache=".wt")
+    gl.amd.cdna4.buffer_store(v0, out_ptr, row_offsets + col0, mask=mask0)
+    gl.amd.cdna4.buffer_store(v1, out_ptr, row_offsets + col1, mask=mask1)
+    # All subgroups have left the poll, so local senders have read this row's stages.
+    gl.barrier()
+    gl.store(epochs + 2 * row, ((low_stage + 1) % 3).to(gl.int32))
+    gl.store(epochs + 2 * row + 1, ((high_stage + 1) % 3).to(gl.int32))
+
+    v0 = v0.to(gl.float32)
+    v1 = v1.to(gl.float32)
+    square_sum = gl.sum(v0 * v0, axis=0) + gl.sum(v1 * v1, axis=0)
+    dot = gl.sum(v0 * wp0.to(gl.float32), axis=0) + gl.sum(
+        v1 * wp1.to(gl.float32), axis=0
+    )
+    logit = dot * gl.rsqrt(square_sum / HIDDEN + mix_eps)
+    maximum = gl.maximum(m_b, logit)
+    correction = gl.exp(m_b - maximum)
+    weight = gl.exp(logit - maximum)
+    inverse_sum = 1.0 / (s_b * correction + weight)
+    mix0 = ((a0 * correction + weight * v0) * inverse_sum).to(gl.bfloat16)
+    mix1 = ((a1 * correction + weight * v1) * inverse_sum).to(gl.bfloat16)
+    mix0 = mix0.to(gl.float32)
+    mix1 = mix1.to(gl.float32)
+    mix_square_sum = gl.sum(mix0 * mix0, axis=0) + gl.sum(mix1 * mix1, axis=0)
+    inverse_rms = gl.rsqrt(gl.div_rn(mix_square_sum, HIDDEN) + mix_eps)
+    gl.amd.cdna4.buffer_store(
+        (mix0 * inverse_rms * ow0.to(gl.float32)).to(mixed_ptr.dtype.element_ty),
+        mixed_ptr,
+        row_offsets + col0,
+        mask=mask0,
+    )
+    gl.amd.cdna4.buffer_store(
+        (mix1 * inverse_rms * ow1.to(gl.float32)).to(mixed_ptr.dtype.element_ty),
+        mixed_ptr,
+        row_offsets + col1,
+        mask=mask1,
+    )
+
+
 @gluon.jit(do_not_specialize=("M", "latent_stride", "prefix_stride", "shared_stride"))
 def iris_k3moe_gemv_lamport_gather(
     latent_ptr,
@@ -688,6 +843,13 @@ def iris_k3moe_mfma_lamport_gather(
     prefix_stride,
     shared_stride,
     eps,
+    mix_weight_ptr,
+    mix_norm_ptr,
+    mix_m_ptr,
+    mix_s_ptr,
+    mix_acc_ptr,
+    mixed_ptr,
+    mix_eps,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
     K: gl.constexpr,
@@ -697,6 +859,7 @@ def iris_k3moe_mfma_lamport_gather(
     HAS_NORM: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    HAS_MIX: gl.constexpr,
 ):
     """Normalize, project, add and gather M decode rows of the K3 tail with MFMA.
 
@@ -707,23 +870,48 @@ def iris_k3moe_mfma_lamport_gather(
     16-column tile and stores it as a contiguous 256-element block of its
     slot (tile ``t`` at ``t * 256``), and each of the rest gathers 1024
     elements of every slot.
+
+    ``HAS_MIX`` (``M * 1024 <= MAX_ELEMENTS``, grid ``(cdiv(M, 16) *
+    LOCAL_WIDTH // 16 + M,)``) also writes the next layer's AttnRes attention
+    input to ``mixed_ptr``: senders store rows in the GEMV senders' row
+    blocks, and each of the last M programs gathers one row and mixes it as
+    ``_k3moe_mix_finish`` does. The ``mix_*`` operands are unused otherwise.
     """
     gl.static_assert(LOCAL_WIDTH % 32 == 0)
     senders = (LOCAL_WIDTH // 16) * ((M + 15) // 16)
     program = gl.program_id(0)
     # Reducers are the last programs, so every sender dispatches before they spin.
     if program >= senders:
-        _k3moe_tile_gather_reduce(
-            region,
-            epochs,
-            out_ptr,
-            program - senders,
-            M,
-            WORLD_SIZE,
-            LOCAL_WIDTH,
-            MAX_ELEMENTS,
-            NUM_WARPS,
-        )
+        if HAS_MIX:
+            _k3moe_mix_finish(
+                region,
+                epochs,
+                out_ptr,
+                program - senders,
+                mix_weight_ptr,
+                mix_norm_ptr,
+                mix_m_ptr,
+                mix_s_ptr,
+                mix_acc_ptr,
+                mixed_ptr,
+                mix_eps,
+                WORLD_SIZE,
+                LOCAL_WIDTH,
+                MAX_ELEMENTS,
+                NUM_WARPS,
+            )
+        else:
+            _k3moe_tile_gather_reduce(
+                region,
+                epochs,
+                out_ptr,
+                program - senders,
+                M,
+                WORLD_SIZE,
+                LOCAL_WIDTH,
+                MAX_ELEMENTS,
+                NUM_WARPS,
+            )
     else:
         _k3moe_mfma_send(
             latent_ptr,
@@ -748,4 +936,5 @@ def iris_k3moe_mfma_lamport_gather(
             HAS_NORM,
             NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE,
+            HAS_MIX,
         )

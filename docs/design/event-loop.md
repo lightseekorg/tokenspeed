@@ -59,6 +59,9 @@ handshake socket. An EPD encode node's ranks run the host's encode mode instead
 event loop. Their first rank dials the frontend the same way and takes
 encode requests.
 
+The launcher snapshots each rank's environment inside its start context so
+allocator preload hooks reach the child along with the native logging defaults.
+
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the
 field order of the positional structs on its wire, its role and, for a
@@ -95,6 +98,22 @@ An id in that interval receives a 409 refusal before data-plane admission.
 The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
+
+Each accepted request gets a monotonically increasing admission identity
+before data-plane registration. The output processor allocates it once;
+the Python request record, planned forwards and snapshot/restore operations
+carry that same value. External `rid` remains the wire and scheduler lookup
+key. Reusing it after retirement creates a new admission, while chunks,
+decode steps and retraction keep the existing admission identity. Slot-state
+owners compare admissions so a recycled row cannot retain a previous
+request's stop criteria or sampling state. Identity allocation is independent
+of the sampling seed and does not retain a history of external request IDs.
+
+Cache-op adaptation resolves the admission while the host still holds the
+request record and stores it in the immutable operation. No asynchronous
+completion resolves a potentially recycled `rid` to infer slot ownership.
+The identity is local to the engine lifetime, like its slot-state images;
+it is not a cross-engine or persistent-cache key.
 
 The Rust/C++ submission bridge returns `Result`: native validation exceptions
 must never escape a `noexcept` bridge. The scheduler validates a complete
@@ -420,6 +439,17 @@ alive. An EPD encode rank does the same and counts its vision-tower batches,
 which every rank of its attention-TP group forms alike. The young
 generations still collect automatically.
 
+Graph capture runs before that mark and collects for its own reason: a
+collection inside a capture would run CUDA graph destructors on a capturing
+stream, so each prefill and drafter capture (`BreakableCapture`) collects on
+entry and keeps automatic collection off until it exits. Decode captures
+(`torch.cuda.graph`) collect on entry only under PyTorch's
+`force_cudagraph_gc`. When the decode or the prefill graph captures,
+`ModelExecutor.capture_graphs` freezes the heap once around all captures, so
+those collections, and any automatic one during a decode capture, walk only
+what the captures created; an enforce-eager boot runs none of this.
+`--enable-cudagraph-gc` keeps the heap unfrozen.
+
 ### Profiling the issuing thread
 
 Profiling must include the forward thread that issues device work. Batch and
@@ -587,6 +617,24 @@ order, as one batch. The batch is the round's net change: a block evicted and
 cached again within the round produces no event. Do not add per-mutation
 publish calls. They only fragment batches.
 
+The control thread drains an independent, contiguous event snapshot. The
+publisher takes ownership of that batch; its thread encodes MessagePack, frees
+the snapshot, and sends the payload. It cannot read the scheduler or retain cache
+blocks. Timestamps are taken when the control thread submits the batch, and
+sequence numbers and replay-buffer updates stay with the publisher in FIFO order.
+The Python event-list API and the published wire format remain compatible.
+
+The publisher keeps the existing bounded **batch-count** queue and blocking
+backpressure. A full queue delays its caller; accepted batches are never discarded
+to make room. Eliminating that wait would require an explicit loss/resynchronization
+protocol. A disconnected publisher logs the failed send. Its diagnostic progress
+handle counts outstanding snapshots (including a blocked producer and the active
+worker), their logical bytes and high-water marks, and enqueue-call time. These
+bytes stay charged until the send completes, even after encoding frees a snapshot.
+They exclude allocator slack and encoded replay buffers; process RSS measures
+those separately. The ownership guard releases counts on failed sends and dropped
+queued work as well as normal completion.
+
 The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
@@ -700,8 +748,16 @@ idle forwards while a peer drains. An idle but unpaused peer prevents release:
 it could admit a request in the next round. Release intent rides the head
 gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
-no collective. Readiness is MIN-reduced over the replica and then attention DP
+no collective. An NCCL release also requires a pending NCCL release on every
+rank: a previously completed KV release does not authorize that collective.
+Other memory regions retain their local release semantics. Readiness is
+MIN-reduced over the replica and then attention DP
 before any release runs on the forward thread.
+
+A resume containing NCCL uses the same-round operation gate: it waits until
+every attention-DP engine holds its resume before entering device collectives.
+Other regions still resume locally. A pending collective resume refuses a
+second memory resume until it finishes.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission
@@ -732,7 +788,11 @@ final result on all forward threads before replying. Under the discard
 policy, local loading success is pending: only the successful replica-wide
 commit marks parameters usable. A failed load invalidates every rank,
 including ranks that loaded locally; KV wake and forwarding remain blocked
-until deployment restart. The same gate carries the online expert
+until deployment restart. Discard requires both the model and its resolved
+quantization configuration to opt in; quantized post-load derivation must
+rebuild codes and scales in place from the complete new checkpoint, never
+reuse discarded values or mark remapped storage usable on its own.
+The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at
@@ -969,6 +1029,9 @@ tracks slot ownership by admission, not by client request id, and seeds a
 new owner's prefix before its first forward. Consecutive chunks on the
 same owned row append their inputs without reseeding. Prefix-cache hits,
 PD landings, slot reuse and recovery into another slot use this same path.
+Only the most recently used slot can hold a request's current history. Moving
+to another slot invalidates the old ownership claim: a later restore into
+that old slot must seed again, even if no other request has used it.
 
 A model profile may declare `request_token_history_lookback`: the maximum
 number of committed tokens it reads behind its write frontier. Omission
@@ -1109,6 +1172,32 @@ Later distinct failures and cleanup errors remain visible without replacing
 the original serving error.
 Failures outside generation serving use the same native notifier when
 they reach the host's final error handler; their cleanup timing is unchanged.
+
+### Startup requests
+
+Model warmup runs the model alone on a probe cache. It never reaches the
+request bookkeeping (input preparation, accepted-state commits), and the
+final cache can change kernel specializations it did prepare. With
+`--enable-startup-requests` the host closes both gaps before it registers:
+the loop starts with no frontend and `EventLoop::warm_up` serves requests of
+its own through the ordinary rounds (admission, planning, the data plane,
+commits), on every rank of the replica as a frontend's would be.
+
+`startup::Limits::phases` sizes them from the engine's limits alone: one
+one-token request, one each of a thirty-second of a prefill chunk, a
+sixteenth, one token more, and three sixteenths (the partial forwards that
+short prompts and a long prompt's last chunk run, aligned and not), one of a
+whole chunk, then `max_num_seqs` requests whose prompts cross one chunk
+boundary, each cut to what ingress
+admits and so the whole batch fits the cache. Each phase runs until every
+rank is idle, then its prefixes are flushed, so serving starts from an
+empty cache. Their outputs go nowhere and kernels prepare their compile
+variants as in model warmup. Only
+then does the host complete the frontend handshake and report ready: no
+client request waits behind them or is timed with them.
+
+A disaggregated node is refused (its requests need a peer), and so is an
+L3 store (the flush would delete its shared namespace).
 
 ## Checklist for extending the loop
 

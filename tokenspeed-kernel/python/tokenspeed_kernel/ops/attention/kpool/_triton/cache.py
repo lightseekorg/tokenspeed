@@ -22,6 +22,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    index_k_scale_word,
+)
 
 
 @triton.jit
@@ -47,12 +52,14 @@ def _kpool_hadamard_128(x):
 
 
 @triton.jit
-def _kpool_quantize(x):
+def _kpool_quantize(x, UE8M0: tl.constexpr):
+    """E4M3 codes of the Hadamard-rotated pool and its scale word in the
+    plane's encoding (``kvcache/index_k_scale.py``)."""
     x = x.to(tl.bfloat16).to(tl.float32)
     x = _kpool_hadamard_128(x).to(tl.bfloat16).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-    scale = absmax / 448.0
-    return tl.minimum(tl.maximum(x / scale, -448.0), 448.0), scale
+    scale, word = index_k_scale_word(absmax / 448.0, UE8M0)
+    return tl.minimum(tl.maximum(x / scale, -448.0), 448.0), word
 
 
 @triton.jit
@@ -76,6 +83,7 @@ def _kpool_prefill_write_kernel(
     INDEX_NUM_PAGES: tl.constexpr,
     POOL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    UE8M0: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -120,7 +128,7 @@ def _kpool_prefill_write_kernel(
         ).to(tl.float32)
         acc += k * prob
 
-    quantized, scale = _kpool_quantize(acc / denom)
+    quantized, scale = _kpool_quantize(acc / denom, UE8M0)
 
     write_slot = tl.load(write_slots_ptr + row).to(tl.int64)
     page = write_slot // INDEX_ROWS_PER_PAGE
@@ -151,7 +159,8 @@ def _triton_kpool_prefill_write_impl(
         slot_score: Matching BF16 or FP32 per-channel scores.
         write_slots: Flattened physical index-cache slots.
         index_values: Paged FP8 pool values, updated in place.
-        index_scales: Paged FP32 pool scales, updated in place.
+        index_scales: Paged pool scale words in the plane's encoding
+            (``kvcache/index_k_scale.py``), updated in place.
         ape: FP32 intra-pool bias shaped ``[pool_size, 128]``.
     Returns:
         None. Completed pools are written directly to the cache.
@@ -190,13 +199,14 @@ def _triton_kpool_prefill_write_impl(
         index_values,
         index_values.stride(0),
         index_values.stride(1),
-        index_scales,
+        index_scales.view(torch.int32),
         index_scales.stride(0),
         index_scales.stride(1),
         INDEX_ROWS_PER_PAGE=index_values.shape[1],
         INDEX_NUM_PAGES=index_values.shape[0],
         POOL_SIZE=pool_size,
         HEAD_DIM=head_dim,
+        UE8M0=index_k_scale_ue8m0(),
         BLOCK_D=triton.next_power_of_2(head_dim),
         num_warps=4,
         num_stages=1,
@@ -402,6 +412,7 @@ def _kpool_decode_append_kernel(
     POOL_SIZE: tl.constexpr,
     TAIL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    UE8M0: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_TABLE_COLS: tl.constexpr,
     TAIL_NUM_REQUESTS: tl.constexpr,
@@ -499,7 +510,7 @@ def _kpool_decode_append_kernel(
                 )
                 acc += k_value * prob
 
-            quantized, scale = _kpool_quantize(acc / denom)
+            quantized, scale = _kpool_quantize(acc / denom, UE8M0)
 
             pool_id = safe_before // POOL_SIZE
             table_col = pool_id // INDEX_ROWS_PER_PAGE
@@ -554,7 +565,8 @@ def _triton_kpool_decode_append_impl(
         request_slots: Stable tail row per request.
         index_block_table: Logical-to-physical index-page mapping.
         index_values: Paged FP8 pool values.
-        index_scales: Paged FP32 pool scales.
+        index_scales: Paged pool scale words in the plane's encoding
+            (``kvcache/index_k_scale.py``).
         ape: FP32 intra-pool bias shaped ``[pool_size, 128]``.
     Returns:
         None. Cache tensors are updated in place.
@@ -583,7 +595,7 @@ def _triton_kpool_decode_append_impl(
         gate.dtype != torch.bfloat16
         or ape.dtype != torch.float32
         or index_values.dtype != torch.float8_e4m3fn
-        or index_scales.dtype != torch.float32
+        or index_scales.dtype != index_k_scale_dtype()
     ):
         raise TypeError("invalid KPool decode cache dtype")
     if seq_lens.numel() < requests or request_slots.numel() < requests:
@@ -605,7 +617,7 @@ def _triton_kpool_decode_append_impl(
         request_slots,
         index_block_table,
         index_values,
-        index_scales,
+        index_scales.view(torch.int32),
         ape,
         k.stride(0),
         k.stride(1),
@@ -623,6 +635,7 @@ def _triton_kpool_decode_append_impl(
         POOL_SIZE=pool_size,
         TAIL_SIZE=tail_size,
         HEAD_DIM=head_dim,
+        UE8M0=index_k_scale_ue8m0(),
         BLOCK_D=triton.next_power_of_2(head_dim),
         INDEX_TABLE_COLS=index_block_table.shape[1],
         TAIL_NUM_REQUESTS=tail_k.shape[0],

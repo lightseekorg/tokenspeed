@@ -146,14 +146,18 @@ def test_attention_matches_the_regular_path_math(
 
 # Long contexts, once each: the served shape (one request's verify on the
 # FP8 cache, the key groups) at a long agentic context (~14 key chunks a
-# split), a single decode row there (the splits without key groups), and two
-# requests over several key chunks a split.
+# split, the last one masked), a single decode row there (the splits without
+# key groups), two requests over several key chunks a split, and just past
+# LONG_KEYS on a BF16 cache, whose whole-page splits leave the last non-empty
+# split a single (masked) chunk and the splits after it none: the key-group
+# loop's first chunk, set up before the loop, is then also its last.
 @pytest.mark.parametrize(
     "length,rows,requests,kv_dtype",
     [
         (230000, 8, 1, torch.float8_e4m3fn),
         (230000, 1, 1, torch.float8_e4m3fn),
         (50000, 8, 2, torch.bfloat16),
+        (33000, 8, 1, torch.bfloat16),
     ],
 )
 def test_long_context_attention_matches_the_regular_path_math(

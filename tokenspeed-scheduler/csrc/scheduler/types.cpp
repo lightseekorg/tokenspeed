@@ -66,6 +66,10 @@ void SchedulerConfig::Validate() const {
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }
+    // 0 or 1 is no Host pool; a negative count is no pool size at all.
+    if (host_allocator.total_pages < 0) {
+        throw std::invalid_argument("Scheduler: host_allocator.total_pages (num_host_pages) must be >= 0");
+    }
     for (const CacheGroupConfig& group : cache_groups) {
         group.Validate();
         // A grain only shapes where the checkpoint lands; the capability to write it stays a hard requirement, so
@@ -126,6 +130,26 @@ void SchedulerConfig::Validate() const {
             throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
         }
     }
+    if (peer_config) {
+        peer_config->Validate();
+        // A holder exports what it caches, and a reader lands a prefix it
+        // caches next; the D role computes no prompt, and a page-sharded
+        // group's pages are not whole on one rank.
+        if (role == Role::kD || disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing needs prefix caching outside the D role");
+        }
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count != 1; })) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing supports replicated cache groups only");
+        }
+        // A replayable group is never cached, so no holder exports the
+        // suffix a landed prefix would have to replay.
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.replayable; })) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing excludes replayable cache groups");
+        }
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: peer prefix sharing excludes L3 storage");
+        }
+    }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
@@ -180,6 +204,12 @@ void SchedulerConfig::Validate() const {
     }
     // The knob retracts through the same path capacity pressure uses, and
     // that path needs somewhere to put the image.
+    // Its magnitude is the period; INT32_MIN has none in int32.
+    if (debug_force_retraction_interval == std::numeric_limits<std::int32_t>::min()) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) must be in "
+            "[-INT32_MAX, INT32_MAX]");
+    }
     if (debug_force_retraction_interval != 0 && !HasSnapshotPool()) {
         throw std::invalid_argument(
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
@@ -188,11 +218,20 @@ void SchedulerConfig::Validate() const {
     if (prefill_decode_interval < 0) {
         throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
     }
+    if (prefill_decode_min_interval < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) must be >= 0");
+    }
     // Only the fused role runs local prefill rounds and decodes on one engine.
     if (prefill_decode_interval != 0 && role != Role::kFused) {
         throw std::invalid_argument(
             "Scheduler: prefill_decode_interval (--prefill-decode-interval) applies to the fused role only: a P "
             "node runs no decodes and a D node no local prefill");
+    }
+    if (prefill_decode_min_interval != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
+            "a P node runs no decodes and a D node no local prefill");
     }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
@@ -223,6 +262,14 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     }
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
+    }
+    if (max_resident_requests < max_batch_size ||
+        max_resident_requests > std::numeric_limits<std::int32_t>::max() - 2) {
+        throw std::invalid_argument(
+            "Scheduler: max_resident_requests must cover max_batch_size and leave room for null and padding rows");
+    }
+    if (role != Role::kD && max_resident_requests != max_batch_size) {
+        throw std::invalid_argument("Scheduler: extra resident requests require the decode role");
     }
     if (checkpoint_retention_requests &&
         (*checkpoint_retention_requests < 0 || *checkpoint_retention_requests > kMaxCheckpointRetentionRequests)) {
@@ -273,7 +320,8 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         // A prefix hit re-feeds up to one replay window and must still carry
         // the prompt's final window whole, or at least a prefix page of new
         // tokens when the window is smaller than a page.
-        if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
+        if (max_scheduled_tokens <
+            std::int64_t{replay_window_tokens} + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
                 "plus max(that window, prefix_granularity)");

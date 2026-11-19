@@ -32,7 +32,7 @@ from tokenspeed_kernel.signature import (
 )
 
 # ===-----------------------------------------------------------------------===#
-# Scaled FP8: PyTorch row-wise scaled GEMM (NVIDIA SM100)
+# Scaled FP8: PyTorch row-wise scaled GEMM (NVIDIA SM100+)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -48,7 +48,6 @@ TORCH_FP8_SCALED_MIN_M = 65
     solution="torch",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 0),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=format_signatures(

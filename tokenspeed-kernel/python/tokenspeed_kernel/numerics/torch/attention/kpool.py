@@ -25,6 +25,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.numerics.torch.transform import sylvester_hadamard
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    encode_index_k_scale,
+    round_index_k_scale,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -38,7 +42,8 @@ def kpool_compress(
 
     The keys mix by the softmax over the pool of ``gates + ape``; the BF16
     mix is Hadamard-rotated (``/ sqrt(dim)``), rounded to BF16 again, and
-    quantized to FP8 E4M3 with one ``amax / 448`` scale (``amax >= 1e-4``).
+    quantized to FP8 E4M3 with one ``amax / 448`` scale (``amax >= 1e-4``),
+    rounded as the plane stores it (``kvcache/index_k_scale.py``).
 
     Args:
         keys: ``[pools, pool, dim]``.
@@ -55,6 +60,8 @@ def kpool_compress(
     hadamard = sylvester_hadamard(dim, keys.device)
     pooled = ((pooled @ hadamard) / dim**0.5).to(torch.bfloat16).float()
     scale = pooled.abs().amax(dim=-1).clamp(min=1e-4) / _FP8_MAX
+    # The scale the plane stores: rounded up to a power of two on Blackwell.
+    scale = round_index_k_scale(scale)
     values = (pooled / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX)
     return values.to(torch.float8_e4m3fn), scale
 
@@ -112,7 +119,9 @@ def torch_kpool_decode_append(
             pool_id = position // pool
             page = int(index_block_table[req, pool_id // rows_per_page])
             index_values[page, pool_id % rows_per_page] = pooled[0]
-            index_scales[page, pool_id % rows_per_page, 0] = pooled_scale[0]
+            index_scales[page, pool_id % rows_per_page, 0] = encode_index_k_scale(
+                pooled_scale[0]
+            )
 
 
 @register_kernel(

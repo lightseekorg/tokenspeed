@@ -243,7 +243,7 @@ def test_missing_native_file_does_not_fall_back_to_target(tmp_path: Path):
 def _bind(model):
     torch.manual_seed(51)
     lookup = nn.Embedding(64, 32, dtype=torch.bfloat16)
-    norm = PrecisionRMSNorm(32, 1e-6, False, torch.bfloat16, True, True)
+    norm = PrecisionRMSNorm(32, 1e-6, torch.bfloat16, True, True)
     norm.weight.data.fill_(3)
     head = ParallelLMHead(
         64,
@@ -588,7 +588,7 @@ def test_model_rejects_other_attention_and_anchor_semantics(field):
 
 
 def test_residual_statistics_precede_the_bf16_residual_store():
-    norm = PrecisionRMSNorm(32, 1e-6, False, torch.bfloat16, True, True)
+    norm = PrecisionRMSNorm(32, 1e-6, torch.bfloat16, True, True)
     hidden = torch.linspace(0.003, 0.2, 32).bfloat16().reshape(1, 32)
     residual = torch.ones_like(hidden)
     output, stored = _add_norm(hidden, residual, norm)

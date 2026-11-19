@@ -33,12 +33,3 @@ jobs:
       stage: scheduler-publish
       previous: scheduler-version
     secrets: inherit
-
-  dependency:
-    name: Update TokenSpeed dependency
-    needs: publish
-    uses: ./.github/workflows/weekly-release-stage.yml
-    with:
-      stage: scheduler-dependency
-      previous: scheduler-publish
-    secrets: inherit

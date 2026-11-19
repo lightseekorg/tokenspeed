@@ -106,6 +106,7 @@ from tokenspeed.runtime.utils.common import (
     get_available_gpu_memory,
     maybe_inference_mode,
 )
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -132,6 +133,9 @@ PREFILL_BUCKET_MAX_STEP: int = 512
 
 # Replays between two logs of the per-route replay counts.
 PREFILL_ROUTE_LOG_INTERVAL: int = 256
+
+# Requests each bucket captures inline when unset; fewer requests replay it padded.
+PREFILL_DEFAULT_CAPTURE_REQUESTS: int = 4
 
 
 def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
@@ -227,7 +231,7 @@ def resolve_prefill_capture_batch_sizes(
     """Resolve defaults, validate limits and select BS candidates for this bucket.
 
     Each request must have at least one token and fit the model context.
-    Unset configuration retains the minimum count required by the bucket.
+    Unset captures ``PREFILL_DEFAULT_CAPTURE_REQUESTS``, clamped into the valid range.
     Counts outside a particular bucket's range are skipped, not padded with
     empty sequences. Invalid configured counts fail before capture. The result
     is sorted and deduplicated; backend support is checked separately.
@@ -236,7 +240,9 @@ def resolve_prefill_capture_batch_sizes(
     maximum = config.max_num_seqs // config.data_parallel_size
     sizes = config.prefill_graph_capture_batch_sizes
     if sizes is None:
-        sizes = [minimum]
+        sizes = [
+            max(minimum, min(PREFILL_DEFAULT_CAPTURE_REQUESTS, maximum, token_bucket))
+        ]
     if any(size <= 0 or size > maximum for size in sizes):
         raise ValueError(
             "prefill graph capture batch sizes must be positive and no larger "
@@ -436,6 +442,7 @@ class PrefillGraph:
         token_to_kv_pool: KV pool the dummy batch points at (reserved dummy slot).
         input_buffers: The shared static input buffers the graphs read from.
         config: Model-executor config (buckets, DP/world topology, device).
+        memory_saver_adapter: Executor-owned adapter for persistent graph metadata.
         drafter: If present, aux-hidden capture (EAGLE3/MTP) is baked into the
             captured graphs.
     """
@@ -447,6 +454,7 @@ class PrefillGraph:
         token_to_kv_pool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
+        memory_saver_adapter: TorchMemorySaverAdapter,
         drafter=None,
         num_warmup: int = 3,
         graph_supported: bool = True,
@@ -472,6 +480,7 @@ class PrefillGraph:
         self.token_to_kv_pool = token_to_kv_pool
         self.input_buffers = input_buffers
         self.config = config
+        self.memory_saver_adapter = memory_saver_adapter
         self.drafter = drafter
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
@@ -614,11 +623,12 @@ class PrefillGraph:
         self._encoders.clear()
         self._decoders.clear()
         self._captured_load_tracker = self.token_to_kv_pool.layerwise_load_tracker
-        self.attn_backend.init_prefill_graph_state(
-            max_num_tokens=max(self.capture_buckets),
-            max_bs=int(self.config.max_num_seqs)
-            // max(int(self.config.data_parallel_size), 1),
-        )
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.init_prefill_graph_state(
+                max_num_tokens=max(self.capture_buckets),
+                max_bs=int(self.config.max_num_seqs)
+                // max(int(self.config.data_parallel_size), 1),
+            )
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper, entries, observer)
             if self._narrowing is not None:

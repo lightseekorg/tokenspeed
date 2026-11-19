@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.native import MV_FP8_WEIGHT_SIGNATURES
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -94,19 +95,34 @@ if platform.is_amd:
         supports_gluon_mm_bf16_fp32_gfx950 as _supports_mm_bf16_fp32,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_gated_norm_gemv_a16w16_gfx950 as _gated_norm_gemv_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w8_gfx950 as _gemv_a16w8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_rmsnorm_gemv_a16w16_gfx950 as _rmsnorm_gemv_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        prefers_gluon_rmsnorm_gemv_a16w16_gfx950 as _prefers_rmsnorm_gemv,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_gated_norm_gemv_a16w16_gfx950 as _supports_gated_norm_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gemv_a16w8_gfx950 as _supports_gemv_a16w8,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gemv_a16w16_gfx950 as _supports_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_rmsnorm_gemv_a16w16_gfx950 as _supports_rmsnorm_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
@@ -487,7 +503,14 @@ if platform.is_amd:
             dtype=torch.int32,
             device=x.device,
         )
-        return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
+        return _mm_a16w16_decode_impl(
+            x,
+            weight,
+            x.dtype,
+            counters=counters,
+            out=out,
+            warm_variants=is_warming_up(),
+        )
 
     @register_kernel(
         "gemm",
@@ -671,6 +694,77 @@ if platform.is_amd:
         if out is None:
             out = x.new_empty((x.shape[0], weight.shape[0]))
         return _gemv_a16w16_impl(x, weight, out)
+
+    def _gated_norm_gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        # Heads are 128 wide, so K fixes the head count.
+        return _supports_gated_norm_gemv(m, n, k, k // 128, 128)
+
+    @register_kernel(
+        "gemm",
+        "mv_rmsnorm_gated_sigmoid",
+        name="gluon_gated_norm_gemv_a16w16_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    gate=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_gated_norm_gemv_a16w16_filter}),
+            "head_dim": frozenset({128}),
+        },
+    )
+    def gluon_gated_norm_gemv_a16w16_gfx950(
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Dispatch gated decode rows to the gfx950 MFMA GEMV."""
+        return _gated_norm_gemv_a16w16_impl(x, gate, norm_weight, weight, out, eps)
+
+    def _rmsnorm_gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        return _prefers_rmsnorm_gemv(m, n, k) and _supports_rmsnorm_gemv(m, n, k)
+
+    @register_kernel(
+        "gemm",
+        "mv_rmsnorm",
+        name="gluon_rmsnorm_gemv_a16w16_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={"mnk_problem_filter": frozenset({_rmsnorm_gemv_a16w16_filter})},
+    )
+    def gluon_rmsnorm_gemv_a16w16_gfx950(
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        x_norm: torch.Tensor,
+        eps: float,
+        kv: torch.Tensor | None = None,
+        kv_norm_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch normalized decode rows to the gfx950 MFMA GEMV."""
+        return _rmsnorm_gemv_a16w16_impl(
+            x, norm_weight, weight, out, x_norm, eps, kv, kv_norm_weight
+        )
 
     @register_kernel(
         "gemm",
@@ -1644,7 +1738,11 @@ if platform.is_amd:
     def gluon_linear_attnres_partials_gfx950(**kwargs):
         return _linear_attnres_partials_impl(**kwargs)
 
-    # 5-16 tokens reuse the decode GEMV tiles, matching the unfused path bit for bit.
+    # 5-16 tokens reuse the decode GEMV tiles, matching the GEMV and the
+    # standalone partials bit for bit. The MLA projection's unfused path runs
+    # hipBLASLt instead, which the fusion beats by dropping the partials launch.
+    # 3808 is K3.1's DSA decode projection, the MLA one with the indexer's key
+    # and head-weight rows stacked below it.
     @register_kernel(
         "gemm",
         "linear_attnres_partials",
@@ -1667,7 +1765,7 @@ if platform.is_amd:
         traits={
             "tokens": frozenset(range(5, 17)),
             "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
-            "output_size": frozenset({KIMI3_QKVFAB_SIZE}),
+            "output_size": frozenset({3648, 3808, KIMI3_QKVFAB_SIZE}),
             "num_blocks": frozenset(range(1, 12)),
             "inputs_contiguous": frozenset({True}),
         },

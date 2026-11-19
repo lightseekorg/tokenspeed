@@ -83,7 +83,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, assert_warmup_covers
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -2624,12 +2624,14 @@ def test_mla_token_count_reuses_compiled_tiles():
 
 
 def test_mla_token_count_needs_one_binary_per_token_tile():
-    """The token count is unspecialized: one count per token tile size warms
-    every count of that tile, including 1 and multiples of 16."""
+    """The token count is unspecialized: one launch under kernel warmup
+    prepares every token tile for every count, including 1 and multiples of
+    16."""
     from tokenspeed_kernel.ops.embedding.triton import (
         _mla_rope_set_kv_buffer_kernel,
         select_mla_kv_block_n,
     )
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
 
     heads, rank, rope = 4, 512, 64
     table = cos_sin_cache(rope)
@@ -2652,17 +2654,14 @@ def test_mla_token_count_needs_one_binary_per_token_tile():
         assert bytes_equal(out.query[..., :rank], q_nope)
         assert bytes_equal(cache[:count, 0, :rank], latent[:, :rank])
 
-    # Warm counts are neither 1 nor multiples of 16, a class the sweep never hits.
-    warm = (33, 257, 449, 673, 897, 1121)
+    def warm():
+        with kernel_warmup(enabled=True):
+            run(33)
+
     sweep = (1, 16, 48, 208, 224, 256, 320, 432, 448, 512, 640, 672, 768, 880, 896)
     sweep += (960, 1088, 1120, 1280, 1536)
-    tiles = {select_mla_kv_block_n(count, heads) for count in warm}
-    assert {select_mla_kv_block_n(count, heads) for count in sweep} <= tiles
-    for count in warm:
-        run(count)
-    with assert_no_triton_compile(_mla_rope_set_kv_buffer_kernel):
-        for count in sweep:
-            run(count)
+    assert {select_mla_kv_block_n(count, heads) for count in sweep} == set(range(1, 7))
+    assert_warmup_covers((_mla_rope_set_kv_buffer_kernel,), warm, run, sweep)
 
 
 @pytest.mark.parametrize("fused", ["composite", "triton"])

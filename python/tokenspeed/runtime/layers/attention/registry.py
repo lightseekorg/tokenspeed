@@ -45,7 +45,10 @@ from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
 from tokenspeed.runtime.layers.attention.configs.dots3_note import (
     Dots3NoteAttentionConfig,
 )
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_kvp_history_prefill,
+)
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
     Mamba2Config,
@@ -68,6 +71,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
     cache_field_placement,
     pipeline_cache_ownership,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
@@ -76,6 +82,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     STATE_LAYER_TYPES,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.visualization import (
+    format_cache_layout,
 )
 from tokenspeed.runtime.layers.attention.utils import (
     check_probe_cache_fits,
@@ -158,9 +167,10 @@ def _resolve_heterogeneous_draft_family(
     if draft_family is None or draft_family == target_family:
         return None
     if target_family == "kimi_k3":
-        if draft_family != "mla":
+        if draft_family not in ("mla", "mha"):
             raise RuntimeError(
-                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+                "Kimi-K3 unified cache hosts MLA or MHA draft views, got "
+                f"{draft_family!r}"
             )
         return draft_family
     if target_family == "inkling":
@@ -1052,38 +1062,39 @@ def _create_target_components(
     )
     if backend is not None:
         return backend, pool
-    if linear_attention is not None:
-        backend = _create_hybrid_linear_attn_backend(
-            server_args,
-            model_config,
+    with arena.memory_saver_adapter.named_region("attention_state"):
+        if linear_attention is not None:
+            backend = _create_hybrid_linear_attn_backend(
+                server_args,
+                model_config,
+                config,
+                pool=pool,
+                full_attn_backend_name=full_attn_backend_name,
+                linear_attention=linear_attention,
+            )
+            return backend, pool
+
+        backend = _create_attn_backend(model_config.attention_arch, config)
+        if not is_inkling:
+            return backend, pool
+
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+
+        text_config = model_config.hf_config.get_text_config()
+        backend = InklingAttnBackend.from_config(
+            backend,
+            text_config,
             config,
-            pool=pool,
-            full_attn_backend_name=full_attn_backend_name,
-            linear_attention=linear_attention,
+            num_layers=text_config.num_hidden_layers,
+            is_draft=False,
+            enable_layerwise_cache_ready=(
+                server_args.disaggregation_mode == "prefill"
+                and server_args.disaggregation_layerwise_interval > 0
+            ),
         )
         return backend, pool
-
-    backend = _create_attn_backend(model_config.attention_arch, config)
-    if not is_inkling:
-        return backend, pool
-
-    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
-        InklingAttnBackend,
-    )
-
-    text_config = model_config.hf_config.get_text_config()
-    backend = InklingAttnBackend.from_config(
-        backend,
-        text_config,
-        config,
-        num_layers=text_config.num_hidden_layers,
-        is_draft=False,
-        enable_layerwise_cache_ready=(
-            server_args.disaggregation_mode == "prefill"
-            and server_args.disaggregation_layerwise_interval > 0
-        ),
-    )
-    return backend, pool
 
 
 def _create_draft_components(
@@ -1128,36 +1139,37 @@ def _create_draft_components(
     )
     if backend is not None:
         return backend, draft_pool
-    if linear_attention is not None:
-        backend = _create_hybrid_linear_attn_backend(
-            server_args,
-            model_config,
-            config,
-            pool=draft_pool,
-            full_attn_backend_name=full_attn_backend_name,
-            linear_attention=linear_attention,
-        )
+    with pool.arena.memory_saver_adapter.named_region("attention_state"):
+        if linear_attention is not None:
+            backend = _create_hybrid_linear_attn_backend(
+                server_args,
+                model_config,
+                config,
+                pool=draft_pool,
+                full_attn_backend_name=full_attn_backend_name,
+                linear_attention=linear_attention,
+            )
+            return backend, draft_pool
+
+        backend = _create_attn_backend(model_config.attention_arch, config)
+        if is_inkling:
+            from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+                InklingAttnBackend,
+            )
+
+            # Depth layers carry conv checkpoint fields as continuation tenants
+            # of the target's kvconv/hiddenconv groups; the draft gets the same
+            # paged bridges (publish/restore) the target wrapper gets.
+            text_config = model_config.hf_config.get_text_config()
+            backend = InklingAttnBackend.from_config(
+                backend,
+                text_config,
+                config,
+                num_layers=num_layers,
+                is_draft=True,
+                enable_layerwise_cache_ready=False,
+            )
         return backend, draft_pool
-
-    backend = _create_attn_backend(model_config.attention_arch, config)
-    if is_inkling:
-        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
-            InklingAttnBackend,
-        )
-
-        # Depth layers carry conv checkpoint fields as continuation tenants
-        # of the target's kvconv/hiddenconv groups; the draft gets the same
-        # paged bridges (publish/restore) the target wrapper gets.
-        text_config = model_config.hf_config.get_text_config()
-        backend = InklingAttnBackend.from_config(
-            backend,
-            text_config,
-            config,
-            num_layers=num_layers,
-            is_draft=True,
-            enable_layerwise_cache_ready=False,
-        )
-    return backend, draft_pool
 
 
 def _prepare_fixed_workspaces(
@@ -1175,9 +1187,10 @@ def _prepare_fixed_workspaces(
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
 
     The verify workspaces of the paged-state families, Qwen4-Exp's QSA BF16
-    prefill scratch (``qsa_bf16_scratch``, the target's) and the
-    query-context-parallel history gather workspace of GPU DSA: the target
-    tree allocates the latter once and the draft tree gathers into the same
+    prefill scratch (``qsa_bf16_scratch``, the target's) and the history
+    gather workspace of GPU DSA, under query context parallelism or a KVP
+    prefill over gathered histories: the target tree allocates the latter
+    once and a query-context-parallel draft tree gathers into the same
     buffers (the draft's extend step follows the target's forward on the
     same stream), so the plan budgets one workspace.
     """
@@ -1189,8 +1202,11 @@ def _prepare_fixed_workspaces(
     width = int(server_args.speculative_num_draft_tokens or 1)
     allocated = False
     actual_bytes = 0
+    if dsa_kvp_history_prefill(config):
+        actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
+        allocated = True
     if isinstance(backend, Qwen4ExpBackend) or (
-        uses_paged_state_verify and expected_bytes
+        uses_paged_state_verify and expected_bytes > actual_bytes
     ):
         actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
         allocated = True
@@ -1261,22 +1277,69 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
         )
 
 
-def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
-    """Validate declared storage, independent of recipe name or inheritance."""
+def _draft_only_group_ids(
+    spec: CachePoolSpec, *, num_target_layers: int
+) -> frozenset[str]:
+    """Cache groups whose every field belongs to a draft layer."""
+    target, draft = set(), set()
+    for field in spec.memory_plan.fields:
+        owner = (
+            draft
+            if cache_field_layer_id(field.field_id) >= num_target_layers
+            else target
+        )
+        owner.add(field.group_id)
+    return frozenset(draft - target)
+
+
+def _validate_hybrid_kvp_cache(
+    spec: CachePoolSpec, *, kvp_size: int, num_target_layers: int
+) -> None:
+    """Validate declared storage, independent of recipe name or inheritance.
+
+    A sliding-window group is a draft's own window (``num_target_layers``
+    tells draft layers apart), which every rank keeps whole.
+    """
     groups = spec.cache_group_specs
     if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
+    draft_groups = _draft_only_group_ids(spec, num_target_layers=num_target_layers)
     for group in groups:
-        if group.attn_kind == "sliding_window":
+        if group.attn_kind == "sliding_window" and group.group_id not in draft_groups:
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} "
                 "must be a full-history group"
             )
-        expected = kvp_size if group.attn_kind != "state" else 1
+        expected = kvp_size if group.attn_kind == "full_history" else 1
         if group.shard_count != expected:
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} ({group.attn_kind}) "
                 f"requires shard_count={expected}, got {group.shard_count}"
+            )
+
+
+def _validate_unsharded_draft_storage(
+    spec: CachePoolSpec, *, num_target_layers: int
+) -> None:
+    """A draft configured without KVP must not land in a page-sharded group.
+
+    Its K/V head rows cannot be transferred out of one by PD (ts-pd
+    layout/route.rs), and its attention reads every page as local.
+    """
+    shard_counts = {
+        group.group_id: group.shard_count for group in spec.cache_group_specs
+    }
+    for field in spec.memory_plan.fields:
+        if cache_field_layer_id(field.field_id) < num_target_layers:
+            continue
+        if shard_counts[field.group_id] > 1:
+            raise ValueError(
+                "--kv-parallel-size > 1 page-shards cache group "
+                f"{field.group_id!r}, which holds this draft's K/V head rows; "
+                "PD cannot transfer those from a page-sharded group. Launch "
+                "with --kv-parallel-size 1, or use a draft its recipe hosts "
+                "in an unsharded group (Kimi-K3: a GQA block draft whose every "
+                "layer slides)"
             )
 
 
@@ -1464,7 +1527,19 @@ def create_attn_components(
         check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
     spec = cache_setup.spec
     if config.kvp_size > 1 and target.is_hybrid_linear:
-        _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
+        _validate_hybrid_kvp_cache(
+            spec,
+            kvp_size=config.kvp_size,
+            num_target_layers=num_target_cache_layers,
+        )
+    if (
+        config.kvp_size > 1
+        and draft_attn_config is not None
+        and draft_attn_config.kvp_size == 1
+    ):
+        _validate_unsharded_draft_storage(
+            spec, num_target_layers=num_target_cache_layers
+        )
     cache_fields_by_stage, stage_schedules = cache_field_placement(
         spec.memory_plan, owners
     )
@@ -1528,6 +1603,15 @@ def create_attn_components(
         f"fixed_workspace_bytes={fixed_workspace_bytes}, "
         f"budget_bytes={cache_budget_bytes}",
     )
+    layout_log_level = logging.DEBUG if probe_batch_rows is not None else logging.INFO
+    if logger.isEnabledFor(layout_log_level):
+        build = "probe" if probe_batch_rows is not None else "serving"
+        logger.log(
+            layout_log_level,
+            f"CacheRecipe {type(recipe).__name__} ({spec.family}): "
+            f"build={build}, pp_rank={server_args.mapping.pp_rank}\n"
+            f"{format_cache_layout(spec.memory_plan)}",
+        )
     arena = create_cache_arena(
         spec,
         device=config.device,
@@ -1567,21 +1651,25 @@ def create_attn_components(
     # their group geometry (and buffer sizing) from the pool's published
     # specs. Every LCM pool publishes a cache contract, so there is no
     # separate contract-marking step.
-    for side_backend, side_pool in ((backend, pool), (draft_attn_backend, draft_pool)):
-        if side_backend is None or side_pool is None:
-            continue
-        side_backend.set_cache_pool(side_pool)
+    with arena.memory_saver_adapter.named_region("attention_state"):
+        for side_backend, side_pool in (
+            (backend, pool),
+            (draft_attn_backend, draft_pool),
+        ):
+            if side_backend is None or side_pool is None:
+                continue
+            side_backend.set_cache_pool(side_pool)
 
-    _prepare_fixed_workspaces(
-        server_args=server_args,
-        config=config,
-        backend=backend,
-        draft_backend=draft_attn_backend,
-        uses_paged_state_verify=cache_setup.uses_paged_state_verify,
-        is_inkling=cache_family == "inkling",
-        qsa_bf16_scratch=qsa_bf16_scratch,
-        expected_bytes=fixed_workspace_bytes,
-    )
+        _prepare_fixed_workspaces(
+            server_args=server_args,
+            config=config,
+            backend=backend,
+            draft_backend=draft_attn_backend,
+            uses_paged_state_verify=cache_setup.uses_paged_state_verify,
+            is_inkling=cache_family == "inkling",
+            qsa_bf16_scratch=qsa_bf16_scratch,
+            expected_bytes=fixed_workspace_bytes,
+        )
 
     cache_storage = _cache_storage_report(
         configured_cache_bytes=cache_budget_bytes,

@@ -38,7 +38,6 @@ def _check_rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor | None,
     eps: float,
-    pre_weight: torch.Tensor | None,
     output_dtype: torch.dtype,
 ) -> None:
     if (
@@ -50,24 +49,22 @@ def _check_rmsnorm(
         raise ValueError("RMSNorm needs floating rows and a floating output dtype")
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError("RMSNorm epsilon must be finite and positive")
-    for parameter in (weight, pre_weight):
-        if parameter is not None and (
-            parameter.shape != (x.shape[-1],)
-            or parameter.device != x.device
-            or parameter.dtype not in _FLOAT_DTYPES
-            or not parameter.is_contiguous()
-        ):
-            raise ValueError(
-                "RMSNorm weights must be contiguous floating vectors matching "
-                "the input width and device"
-            )
+    if weight is not None and (
+        weight.shape != (x.shape[-1],)
+        or weight.device != x.device
+        or weight.dtype not in _FLOAT_DTYPES
+        or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            "RMSNorm weights must be contiguous floating vectors matching "
+            "the input width and device"
+        )
 
 
 def rmsnorm_precision(
     x: torch.Tensor,
     weight: torch.Tensor | None,
     eps: float,
-    pre_weight: torch.Tensor | None,
     output_dtype: torch.dtype,
     *,
     mean_by_reciprocal: bool,
@@ -80,7 +77,6 @@ def rmsnorm_precision(
             slice, say) is read without a copy.
         weight: Optional learned gain [width], applied after normalization.
         eps: Finite positive epsilon for the mean square.
-        pre_weight: Optional scale [width], applied in FP32 before statistics.
         output_dtype: Explicit floating output dtype, including BF16 for FP32 x.
         mean_by_reciprocal: Take the mean square as a multiply by FP32
             ``1 / width``, not a correctly rounded divide.
@@ -88,7 +84,7 @@ def rmsnorm_precision(
     Returns:
         A contiguous tensor with x's shape in output_dtype.
     """
-    _check_rmsnorm(x, weight, eps, pre_weight, output_dtype)
+    _check_rmsnorm(x, weight, eps, output_dtype)
     if x.is_cuda:
         kernel = select_kernel(
             "layernorm",
@@ -99,13 +95,10 @@ def rmsnorm_precision(
             x,
             weight,
             eps,
-            pre_weight,
             output_dtype,
             mean_by_reciprocal=mean_by_reciprocal,
         )
     values = x.float()
-    if pre_weight is not None:
-        values = values * pre_weight.float()
     squares = values.square().sum(dim=-1, keepdim=True)
     # An elementwise tensor divisor divides; a scalar one may become a reciprocal.
     mean = (
@@ -124,7 +117,6 @@ def add_rmsnorm_precision(
     residual: torch.Tensor,
     weight: torch.Tensor | None,
     eps: float,
-    pre_weight: torch.Tensor | None,
     output_dtype: torch.dtype,
     sum_dtype: torch.dtype,
     *,
@@ -138,7 +130,6 @@ def add_rmsnorm_precision(
         residual: Floating rows shaped like ``x``.
         weight: Optional learned gain [width], applied after normalization.
         eps: Finite positive epsilon for the mean square.
-        pre_weight: Optional scale [width], applied in FP32 before statistics.
         output_dtype: Floating dtype of the normalized rows.
         sum_dtype: Floating dtype the sum is stored in.
         mean_by_reciprocal: As in ``rmsnorm_precision``.
@@ -146,7 +137,7 @@ def add_rmsnorm_precision(
     Returns:
         Contiguous ``(normalized, summed)``, both shaped like ``x``.
     """
-    _check_rmsnorm(x, weight, eps, pre_weight, output_dtype)
+    _check_rmsnorm(x, weight, eps, output_dtype)
     if (
         residual.shape != x.shape
         or residual.device != x.device
@@ -160,7 +151,6 @@ def add_rmsnorm_precision(
             residual.contiguous(),
             weight,
             eps,
-            pre_weight,
             output_dtype,
             sum_dtype,
             mean_by_reciprocal=mean_by_reciprocal,
@@ -171,7 +161,6 @@ def add_rmsnorm_precision(
             summed,
             weight,
             eps,
-            pre_weight,
             output_dtype,
             mean_by_reciprocal=mean_by_reciprocal,
         ),

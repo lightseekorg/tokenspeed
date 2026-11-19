@@ -23,7 +23,9 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -68,7 +70,7 @@ BoundaryTree::Hold Publish(BoundaryTree& tree, const std::vector<std::string>& p
 }
 
 const Node& NodeOf(const BoundaryTree& tree, const std::string& hash) {
-    const Node* node = tree.Find(hash);
+    const Node* node = tree.Find(ContentHash{hash});
     EXPECT_NE(node, nullptr) << hash;
     return *node;
 }
@@ -76,7 +78,7 @@ const Node& NodeOf(const BoundaryTree& tree, const std::string& hash) {
 std::vector<std::string> Children(const Node& node) {
     std::vector<std::string> hashes;
     for (const Node* child = node.first_child; child != nullptr; child = child->next_sibling) {
-        hashes.push_back(*child->hash);
+        hashes.push_back(child->hash.ToString());
     }
     return hashes;
 }
@@ -84,7 +86,7 @@ std::vector<std::string> Children(const Node& node) {
 std::vector<std::string> HostLeaves(const BoundaryTree& tree) {
     std::vector<std::string> hashes;
     for (const Node* leaf = tree.FirstHostLeaf(); leaf != nullptr; leaf = leaf->next_host_leaf) {
-        hashes.push_back(*leaf->hash);
+        hashes.push_back(leaf->hash.ToString());
     }
     return hashes;
 }
@@ -93,7 +95,8 @@ TEST(BoundaryTreeTest, APublicationLinksPagesUnderTheirParentsAndTheTailUnderIts
     BoundaryTree tree{TreeConfig(/*closed_blocks_per_page=*/1, /*queue_dead_candidates=*/false),
                       /*checkpoints=*/nullptr};
     const std::vector<std::string> pages{"page0", "page1"};
-    BoundaryTree::Hold publication = Publish(tree, pages, 0, TailPublication{.tail_tokens = 2, .hash = "tail"});
+    BoundaryTree::Hold publication =
+        Publish(tree, pages, 0, TailPublication{.tail_tokens = 2, .hash = ContentHash{"tail"}});
     const Node& page0 = NodeOf(tree, "page0");
     const Node& page1 = NodeOf(tree, "page1");
     const Node& tail = NodeOf(tree, "tail");
@@ -111,7 +114,7 @@ TEST(BoundaryTreeTest, APublicationLinksPagesUnderTheirParentsAndTheTailUnderIts
     EXPECT_EQ(Children(page0), std::vector<std::string>{"page1"});
     EXPECT_EQ(Children(page1), std::vector<std::string>{"tail"});
     EXPECT_TRUE(Children(tail).empty());
-    EXPECT_EQ(tree.Find("absent"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"absent"}), nullptr);
     for (const Node* node : {&page0, &page1, &tail}) {
         EXPECT_EQ(node->checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 0}));
         EXPECT_FALSE(node->OnDevice());
@@ -119,7 +122,8 @@ TEST(BoundaryTreeTest, APublicationLinksPagesUnderTheirParentsAndTheTailUnderIts
     }
 
     // A hash published again keeps its node, links and boundary.
-    BoundaryTree::Hold again = Publish(tree, {"page0"}, 0, TailPublication{.tail_tokens = 3, .hash = "tail"});
+    BoundaryTree::Hold again =
+        Publish(tree, {"page0"}, 0, TailPublication{.tail_tokens = 3, .hash = ContentHash{"tail"}});
     EXPECT_EQ(&again.node(), &tail);
     EXPECT_EQ(tail.parent, &page1);
     EXPECT_EQ(tail.boundary_tokens, 10);
@@ -134,6 +138,105 @@ TEST(BoundaryTreeTest, APublicationLinksPagesUnderTheirParentsAndTheTailUnderIts
     EXPECT_EQ(tree.Size(), 0u);
 }
 
+TEST(BoundaryTreeTest, NodesAndKeysStayStableAcrossIndexGrowthDeletionAndSlotReuse) {
+    BoundaryTree tree{TreeConfig(1, false), nullptr};
+    auto root_publication = Publish(tree, {"root"}, 0, std::nullopt);
+    auto root_hold = tree.HoldEntry(ContentHash{"root"}, kDeviceKv);
+    root_publication.reset();
+    const Node* root = tree.Find(ContentHash{"root"});
+    const ContentHash* root_key = &root->hash;
+    std::vector<BoundaryTree::Hold> holds;
+    for (int i = 0; i < 2048; ++i) {
+        const auto hash = "child-" + std::to_string(i);
+        auto publication = Publish(tree, {"root", hash}, 1, std::nullopt);
+        holds.push_back(tree.HoldEntry(ContentHash{hash}, kDeviceKv));
+    }
+    const Node* survivor = tree.Find(ContentHash{"child-1"});
+    EXPECT_EQ(tree.Find(ContentHash{"root"}), root);
+    EXPECT_EQ(&root->hash, root_key);
+    EXPECT_EQ(*root_key, ContentHash("root"));
+    std::vector<std::string> expected;
+    for (int i = 0; i < 2048; ++i) {
+        if (i % 2 == 0)
+            holds[i].reset();
+        else
+            expected.push_back("child-" + std::to_string(i));
+    }
+    EXPECT_EQ(Children(*root), expected);
+    for (int i = 0; i < 2048; i += 2) {
+        const auto hash = "child-" + std::to_string(i);
+        EXPECT_EQ(tree.Find(ContentHash{hash}), nullptr);
+        auto publication = Publish(tree, {"root", hash}, 1, std::nullopt);
+        holds[i] = tree.HoldEntry(ContentHash{hash}, kDeviceKv);
+        expected.push_back(hash);
+    }
+    EXPECT_EQ(tree.Find(ContentHash{"child-1"}), survivor);
+    EXPECT_EQ(survivor->parent, root);
+    EXPECT_EQ(Children(*root), expected);
+    holds.clear();
+    EXPECT_EQ(tree.Size(), 1);
+    root_hold.reset();
+    EXPECT_EQ(tree.Size(), 0);
+}
+
+// Every hash shares the eight leading bytes the node index hashes, all ones,
+// so every node probes one cluster that wraps around the end of the table at
+// each capacity. A leaving node takes out only its own slot: the rest keep
+// their nodes and keys, down a chain and in any release order.
+TEST(BoundaryTreeTest, NodesWithCollidingIndexHashesLeaveOneByOne) {
+    BoundaryTree tree{TreeConfig(1, false), nullptr};
+    const auto colliding = [](int i) {
+        std::string hex = std::string(16, 'f') + std::string(48, '0');
+        hex[62] = "0123456789abcdef"[i / 16];
+        hex[63] = "0123456789abcdef"[i % 16];
+        return hex;
+    };
+    std::vector<std::string> chain;
+    std::vector<BoundaryTree::Hold> chain_holds;
+    for (int i = 0; i < 40; ++i) chain.push_back(colliding(i));
+    {
+        BoundaryTree::Hold publication = Publish(tree, chain, 0, std::nullopt);
+        for (const auto& hash : chain) chain_holds.push_back(tree.HoldEntry(ContentHash{hash}, kDeviceKv));
+    }
+    std::map<std::string, const Node*> roots;
+    std::vector<BoundaryTree::Hold> root_holds;
+    for (int i = 40; i < 120; ++i) {
+        const auto hash = colliding(i);
+        BoundaryTree::Hold publication = Publish(tree, {hash}, 0, std::nullopt);
+        root_holds.push_back(tree.HoldEntry(ContentHash{hash}, kDeviceKv));
+        roots.emplace(hash, tree.Find(ContentHash{hash}));
+    }
+    ASSERT_EQ(tree.Size(), 120u);
+    const auto expect_roots = [&] {
+        for (const auto& [hash, node] : roots) {
+            EXPECT_EQ(tree.Find(ContentHash{hash}), node);
+            EXPECT_EQ(node->hash, ContentHash(hash));
+        }
+    };
+
+    // Each page stays under its child until the leaf leaves and takes the
+    // whole chain with it.
+    for (std::size_t i = 0; i + 1 < chain.size(); ++i) {
+        chain_holds[i].reset();
+        EXPECT_EQ(tree.Size(), 120u);
+    }
+    chain_holds.back().reset();
+    EXPECT_EQ(tree.Size(), 80u);
+    for (const auto& hash : chain) EXPECT_EQ(tree.Find(ContentHash{hash}), nullptr);
+    expect_roots();
+
+    std::vector<int> order(root_holds.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), std::mt19937(77));
+    for (const int k : order) {
+        root_holds[static_cast<std::size_t>(k)].reset();
+        roots.erase(colliding(40 + k));
+        EXPECT_EQ(tree.Find(ContentHash{colliding(40 + k)}), nullptr);
+        expect_roots();
+    }
+    EXPECT_EQ(tree.Size(), 0u);
+}
+
 // A node started without a known parent (a Host entry no publication linked)
 // is linked once a publication through its hash names its parent: it becomes
 // the parent's child with its boundary, and the parent counts the checkpoint
@@ -141,9 +244,9 @@ TEST(BoundaryTreeTest, APublicationLinksPagesUnderTheirParentsAndTheTailUnderIts
 // the link.
 TEST(BoundaryTreeTest, APublicationLinksANodeStartedWithoutAParent) {
     BoundaryTree tree{TreeConfig(1, false), /*checkpoints=*/nullptr};
-    BoundaryTree::Hold page1_checkpoint = tree.HoldEntry("page1", kHostCheckpoint);
+    BoundaryTree::Hold page1_checkpoint = tree.HoldEntry(ContentHash{"page1"}, kHostCheckpoint);
     const Node& page1 = page1_checkpoint.node();
-    BoundaryTree::Hold page0_kv = tree.HoldEntry("page0", kHostKv);
+    BoundaryTree::Hold page0_kv = tree.HoldEntry(ContentHash{"page0"}, kHostKv);
     const Node& page0 = page0_kv.node();
     ASSERT_EQ(page1.parent, nullptr);
     ASSERT_EQ(page1.boundary_tokens, 0);
@@ -151,7 +254,7 @@ TEST(BoundaryTreeTest, APublicationLinksANodeStartedWithoutAParent) {
 
     const std::vector<std::string> pages{"page0", "page1", "page2"};
     BoundaryTree::Hold publication = Publish(tree, pages, /*first_new_page=*/0, std::nullopt);
-    BoundaryTree::Hold page2_checkpoint = tree.HoldEntry("page2", kDeviceCheckpoint);
+    BoundaryTree::Hold page2_checkpoint = tree.HoldEntry(ContentHash{"page2"}, kDeviceCheckpoint);
     publication.reset();
     EXPECT_EQ(page0.parent, nullptr);
     EXPECT_EQ(page0.boundary_tokens, 4) << "page 0 gets its boundary";
@@ -164,26 +267,26 @@ TEST(BoundaryTreeTest, APublicationLinksANodeStartedWithoutAParent) {
     EXPECT_EQ(page0.children_on_host, 1);
     EXPECT_EQ(HostLeaves(tree), std::vector<std::string>{"page1"}) << "page0 has a child on the Host now";
 
-    BoundaryTree::Hold page1_kv = tree.HoldEntry("page1", kDeviceKv);
+    BoundaryTree::Hold page1_kv = tree.HoldEntry(ContentHash{"page1"}, kDeviceKv);
     EXPECT_EQ(page1.parent, &page0) << "a registration keeps the link";
     EXPECT_EQ(page1.boundary_tokens, 8);
 
     // A tail under the empty prior has no parent to link it to: its
     // publication gives it its boundary alone.
-    BoundaryTree::Hold tail_kv = tree.HoldEntry("tail", kDeviceKv);
-    Publish(tree, {}, 0, TailPublication{.tail_tokens = 3, .hash = "tail"});
+    BoundaryTree::Hold tail_kv = tree.HoldEntry(ContentHash{"tail"}, kDeviceKv);
+    Publish(tree, {}, 0, TailPublication{.tail_tokens = 3, .hash = ContentHash{"tail"}});
     EXPECT_EQ(tail_kv.node().parent, nullptr);
     EXPECT_EQ(tail_kv.node().boundary_tokens, 3);
     EXPECT_EQ(tail_kv.node().tail_tokens, 3);
     tail_kv.reset();
-    EXPECT_EQ(tree.Find("tail"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"tail"}), nullptr);
 
     // The subtree leaves again, its counts with it.
     page2_checkpoint.reset();
-    EXPECT_EQ(tree.Find("page2"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"page2"}), nullptr);
     page1_kv.reset();
     page1_checkpoint.reset();
-    EXPECT_EQ(tree.Find("page1"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"page1"}), nullptr);
     EXPECT_EQ(page0.checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 0}));
     EXPECT_EQ(page0.children_on_host, 0);
     EXPECT_TRUE(Children(page0).empty());
@@ -195,7 +298,7 @@ TEST(BoundaryTreeTest, ACheckpointCountsInEveryAncestor) {
     BoundaryTree tree{TreeConfig(1, false), /*checkpoints=*/nullptr};
     const std::vector<std::string> pages{"page0", "page1", "page2", "page3", "page4"};
     BoundaryTree::Hold publication = Publish(tree, pages, 0, std::nullopt);
-    BoundaryTree::Hold first = tree.HoldEntry("page4", kDeviceCheckpoint);
+    BoundaryTree::Hold first = tree.HoldEntry(ContentHash{"page4"}, kDeviceCheckpoint);
     for (const std::string& hash : pages) {
         const Node& node = NodeOf(tree, hash);
         EXPECT_EQ(node.checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0})) << hash;
@@ -203,7 +306,7 @@ TEST(BoundaryTreeTest, ACheckpointCountsInEveryAncestor) {
     }
     // Another State group's checkpoint at the same boundary: a checkpoint
     // boundary counts once.
-    BoundaryTree::Hold second = tree.HoldEntry("page4", kDeviceCheckpoint);
+    BoundaryTree::Hold second = tree.HoldEntry(ContentHash{"page4"}, kDeviceCheckpoint);
     EXPECT_EQ(NodeOf(tree, "page0").checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
 
     // A branch off page2 with a Device checkpoint boundary of its own: the
@@ -211,8 +314,8 @@ TEST(BoundaryTreeTest, ACheckpointCountsInEveryAncestor) {
     // alone.
     const std::vector<std::string> branch_pages{"page0", "page1", "page2", "branch"};
     BoundaryTree::Hold branch_publication = Publish(tree, branch_pages, 3, std::nullopt);
-    BoundaryTree::Hold branch = tree.HoldEntry("branch", kDeviceCheckpoint);
-    BoundaryTree::Hold host = tree.HoldEntry("page3", kHostCheckpoint);
+    BoundaryTree::Hold branch = tree.HoldEntry(ContentHash{"branch"}, kDeviceCheckpoint);
+    BoundaryTree::Hold host = tree.HoldEntry(ContentHash{"page3"}, kHostCheckpoint);
     EXPECT_EQ(NodeOf(tree, "page0").checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{2, 1}));
     EXPECT_EQ(NodeOf(tree, "page1").checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{2, 1}));
     EXPECT_EQ(NodeOf(tree, "page2").checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{2, 1}));
@@ -234,8 +337,8 @@ TEST(BoundaryTreeTest, DroppingTheLastCheckpointUncountsItInEveryAncestor) {
     const std::vector<std::string> fork{"a", "b", "e"};
     BoundaryTree::Hold chain_publication = Publish(tree, chain, 0, std::nullopt);
     BoundaryTree::Hold fork_publication = Publish(tree, fork, 2, std::nullopt);
-    BoundaryTree::Hold d = tree.HoldEntry("d", kDeviceCheckpoint);
-    BoundaryTree::Hold e = tree.HoldEntry("e", kDeviceCheckpoint);
+    BoundaryTree::Hold d = tree.HoldEntry(ContentHash{"d"}, kDeviceCheckpoint);
+    BoundaryTree::Hold e = tree.HoldEntry(ContentHash{"e"}, kDeviceCheckpoint);
     const Node& a = NodeOf(tree, "a");
     const Node& b = NodeOf(tree, "b");
     const Node& c = NodeOf(tree, "c");
@@ -249,13 +352,13 @@ TEST(BoundaryTreeTest, DroppingTheLastCheckpointUncountsItInEveryAncestor) {
 
     // A checkpoint boundary with a deeper one under it: dropping it leaves
     // that one.
-    BoundaryTree::Hold at_b = tree.HoldEntry("b", kDeviceCheckpoint);
+    BoundaryTree::Hold at_b = tree.HoldEntry(ContentHash{"b"}, kDeviceCheckpoint);
     at_b.reset();
     EXPECT_EQ(b.checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0})) << "e is still under b";
 
     // A checkpoint boundary on the other tier keeps the node's subtree
     // counted.
-    BoundaryTree::Hold e_on_host = tree.HoldEntry("e", kHostCheckpoint);
+    BoundaryTree::Hold e_on_host = tree.HoldEntry(ContentHash{"e"}, kHostCheckpoint);
     e.reset();
     EXPECT_EQ(a.checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 1}));
     EXPECT_TRUE(a.HasCheckpointBoundaryInSubtree());
@@ -267,10 +370,10 @@ TEST(BoundaryTreeTest, DroppingTheLastCheckpointUncountsItInEveryAncestor) {
 TEST(BoundaryTreeTest, TheLastHolderTakesItsNodeAndTheParentsLeftEmpty) {
     BoundaryTree tree{TreeConfig(1, false), /*checkpoints=*/nullptr};
     std::vector<BoundaryTree::Hold> leaves;
-    for (const char* leaf : {"x", "y", "z"}) {
+    for (const std::string leaf : {"x", "y", "z"}) {
         const std::vector<std::string> pages{"parent", leaf};
         BoundaryTree::Hold publication = Publish(tree, pages, 1, std::nullopt);
-        leaves.push_back(tree.HoldEntry(leaf, kDeviceKv));
+        leaves.push_back(tree.HoldEntry(ContentHash{leaf}, kDeviceKv));
     }
     const Node& parent = NodeOf(tree, "parent");
     const Node& x = NodeOf(tree, "x");
@@ -278,7 +381,7 @@ TEST(BoundaryTreeTest, TheLastHolderTakesItsNodeAndTheParentsLeftEmpty) {
     EXPECT_EQ(Children(parent), (std::vector<std::string>{"x", "y", "z"})) << "siblings follow insertion";
 
     leaves[1].reset();
-    EXPECT_EQ(tree.Find("y"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"y"}), nullptr);
     EXPECT_EQ(Children(parent), (std::vector<std::string>{"x", "z"}));
     EXPECT_EQ(x.next_sibling, &z);
     EXPECT_EQ(z.prev_sibling, &x);
@@ -287,7 +390,7 @@ TEST(BoundaryTreeTest, TheLastHolderTakesItsNodeAndTheParentsLeftEmpty) {
     BoundaryTree::Hold moved = std::move(leaves[0]);
     EXPECT_FALSE(leaves[0]);
     leaves[0].reset();
-    EXPECT_EQ(tree.Find("x"), &x);
+    EXPECT_EQ(tree.Find(ContentHash{"x"}), &x);
     moved.reset();
     EXPECT_EQ(parent.first_child, &z);
     EXPECT_EQ(z.prev_sibling, nullptr);
@@ -308,11 +411,11 @@ TEST(BoundaryTreeTest, HostLeavesFollowPresence) {
     // Page by page down the chain, only the deepest page is a leaf.
     std::vector<BoundaryTree::Hold> on_host;
     for (const std::string& page : chain) {
-        on_host.push_back(tree.HoldEntry(page, kHostKv));
+        on_host.push_back(tree.HoldEntry(ContentHash{page}, kHostKv));
         EXPECT_EQ(HostLeaves(tree), std::vector<std::string>{page});
     }
     // A write-back on its way to the Host puts the branch there too.
-    BoundaryTree::Hold store = tree.HoldPendingStore(*tree.Find("branch"), /*checkpoint=*/false);
+    BoundaryTree::Hold store = tree.HoldPendingStore(*tree.Find(ContentHash{"branch"}), /*checkpoint=*/false);
     EXPECT_EQ(HostLeaves(tree), (std::vector<std::string>{"page3", "branch"}));
     EXPECT_EQ(NodeOf(tree, "page1").children_on_host, 2);
 
@@ -336,14 +439,15 @@ TEST(BoundaryTreeTest, HostLeavesFollowPresence) {
 TEST(BoundaryTreeTest, ANodeLeavesWithItsTailHint) {
     BoundaryTree tree{TreeConfig(1, false), /*checkpoints=*/nullptr};
     const std::vector<std::string> pages{"page0"};
-    BoundaryTree::Hold publication = Publish(tree, pages, 0, TailPublication{.tail_tokens = 2, .hash = "tail"});
-    BoundaryTree::Hold tail_kv = tree.HoldEntry("tail", kDeviceKv);
+    BoundaryTree::Hold publication =
+        Publish(tree, pages, 0, TailPublication{.tail_tokens = 2, .hash = ContentHash{"tail"}});
+    BoundaryTree::Hold tail_kv = tree.HoldEntry(ContentHash{"tail"}, kDeviceKv);
     publication.reset();
-    EXPECT_FALSE(tree.RecordTail("page0", 2, "tail").has_value());
-    ASSERT_TRUE(tree.Tails().Contains("tail"));
+    EXPECT_FALSE(tree.RecordTail(ContentHash{"page0"}, 2, ContentHash{"tail"}).has_value());
+    ASSERT_TRUE(tree.Tails().Contains(ContentHash{"tail"}));
 
     tail_kv.reset();
-    EXPECT_FALSE(tree.Tails().Contains("tail"));
+    EXPECT_FALSE(tree.Tails().Contains(ContentHash{"tail"}));
     EXPECT_EQ(tree.Size(), 0u) << "the page above held nothing either";
 }
 
@@ -355,13 +459,13 @@ TEST(BoundaryTreeTest, DuplicatePreflightPrunesPendingAndIncompletePrefixesAcros
     BoundaryTree::Hold chain_publication = Publish(tree, chain, 0, std::nullopt);
     BoundaryTree::Hold other_publication = Publish(tree, other_page, 0, std::nullopt);
     std::map<std::string, std::array<BoundaryTree::Hold, 2>> kv;
-    for (const char* hash : {"root", "left", "leaf", "other"}) {
-        kv[hash][0] = tree.HoldEntry(hash, kDeviceKv);
-        kv[hash][1] = tree.HoldEntry(hash, kDeviceKv);
+    for (const std::string hash : {"root", "left", "leaf", "other"}) {
+        kv[hash][0] = tree.HoldEntry(ContentHash{hash}, kDeviceKv);
+        kv[hash][1] = tree.HoldEntry(ContentHash{hash}, kDeviceKv);
     }
     kv["leaf"][0].SetPaired(true);
     ASSERT_TRUE(tree.HasHostKvDuplicateCandidate());
-    BoundaryTree::Hold root_store = tree.HoldPendingStore(*tree.Find("root"), /*checkpoint=*/false);
+    BoundaryTree::Hold root_store = tree.HoldPendingStore(*tree.Find(ContentHash{"root"}), /*checkpoint=*/false);
     EXPECT_FALSE(tree.HasHostKvDuplicateCandidate());
     kv["other"][0].SetPaired(true);
     EXPECT_TRUE(tree.HasHostKvDuplicateCandidate()) << "another root is not covered";
@@ -371,7 +475,7 @@ TEST(BoundaryTreeTest, DuplicatePreflightPrunesPendingAndIncompletePrefixesAcros
     EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
     kv["root"][1].reset();
     EXPECT_FALSE(tree.HasHostKvDuplicateCandidate()) << "the Device gap also covers the descendant";
-    kv["root"][1] = tree.HoldEntry("root", kDeviceKv);
+    kv["root"][1] = tree.HoldEntry(ContentHash{"root"}, kDeviceKv);
     EXPECT_TRUE(tree.HasHostKvDuplicateCandidate());
 
     // The first root leaves; the next one still counts.
@@ -379,8 +483,8 @@ TEST(BoundaryTreeTest, DuplicatePreflightPrunesPendingAndIncompletePrefixesAcros
     for (const char* hash : {"leaf", "left", "root"}) {
         kv.erase(hash);
     }
-    ASSERT_EQ(tree.Find("root"), nullptr);
-    kv["other"][1] = tree.HoldEntry("other", kDeviceKv);
+    ASSERT_EQ(tree.Find(ContentHash{"root"}), nullptr);
+    kv["other"][1] = tree.HoldEntry(ContentHash{"other"}, kDeviceKv);
     EXPECT_TRUE(tree.HasHostKvDuplicateCandidate()) << "removing the first root keeps the next";
 }
 
@@ -390,8 +494,8 @@ TEST(BoundaryTreeTest, DuplicatePreflightCountsEachPairOnce) {
     const std::vector<std::string> second_page{"second"};
     BoundaryTree::Hold first_publication = Publish(tree, first_page, 0, std::nullopt);
     BoundaryTree::Hold second_publication = Publish(tree, second_page, 0, std::nullopt);
-    BoundaryTree::Hold first = tree.HoldEntry("first", kDeviceKv);
-    BoundaryTree::Hold second = tree.HoldEntry("second", kDeviceKv);
+    BoundaryTree::Hold first = tree.HoldEntry(ContentHash{"first"}, kDeviceKv);
+    BoundaryTree::Hold second = tree.HoldEntry(ContentHash{"second"}, kDeviceKv);
     first_publication.reset();
     second_publication.reset();
 
@@ -415,14 +519,14 @@ TEST(BoundaryTreeTest, LinkingAPendingRootAppliesBothStoreHolds) {
         BoundaryTree tree{TreeConfig(1, false), /*checkpoints=*/nullptr};
         // A node started without a parent, whole on the Device with a Host
         // copy, and a store on its way to the Host.
-        BoundaryTree::Hold detached = tree.HoldEntry("detached", kDeviceKv);
+        BoundaryTree::Hold detached = tree.HoldEntry(ContentHash{"detached"}, kDeviceKv);
         detached.SetPaired(true);
         BoundaryTree::Hold detached_store = tree.HoldPendingStore(detached.node(), /*checkpoint=*/false);
         EXPECT_FALSE(tree.HasHostKvDuplicateCandidate()) << "a node without its boundary backs nothing";
 
         const std::vector<std::string> pages{"root", "detached"};
         BoundaryTree::Hold publication = Publish(tree, pages, 0, std::nullopt);
-        BoundaryTree::Hold root = tree.HoldEntry("root", kDeviceKv);
+        BoundaryTree::Hold root = tree.HoldEntry(ContentHash{"root"}, kDeviceKv);
         BoundaryTree::Hold root_store = tree.HoldPendingStore(root.node(), /*checkpoint=*/false);
         publication.reset();
         ASSERT_EQ(detached.node().parent, &root.node());
@@ -445,9 +549,9 @@ TEST(BoundaryTreeTest, DroppingAHolderQueuesTheNodesThatMayHaveDied) {
     BoundaryTree::Hold publication = Publish(tree, pages, 0, std::nullopt);
     std::vector<BoundaryTree::Hold> kv;
     for (const std::string& page : pages) {
-        kv.push_back(tree.HoldEntry(page, kDeviceKv));
+        kv.push_back(tree.HoldEntry(ContentHash{page}, kDeviceKv));
     }
-    BoundaryTree::Hold checkpoint = tree.HoldEntry("page2", kDeviceCheckpoint);
+    BoundaryTree::Hold checkpoint = tree.HoldEntry(ContentHash{"page2"}, kDeviceCheckpoint);
     publication.reset();
     EXPECT_EQ(tree.PopDeadCandidate(), std::nullopt) << "page2 still holds a checkpoint boundary";
 
@@ -461,15 +565,15 @@ TEST(BoundaryTreeTest, DroppingAHolderQueuesTheNodesThatMayHaveDied) {
 
     // A page no prefix-closed group holds on either tier is a gap, whatever
     // else holds it.
-    BoundaryTree::Hold window = tree.HoldEntry("page1", kDeviceWindow);
+    BoundaryTree::Hold window = tree.HoldEntry(ContentHash{"page1"}, kDeviceWindow);
     kv[1].reset();
     EXPECT_EQ(tree.PopDeadCandidate(), std::optional<ContentHash>{"page1"});
 
     // A hash at the back is not queued again, and a node that is gone not at
     // all.
-    tree.QueueDeadCandidate("page0");
-    tree.QueueDeadCandidate("page0");
-    tree.QueueDeadCandidate("absent");
+    tree.QueueDeadCandidate(ContentHash{"page0"});
+    tree.QueueDeadCandidate(ContentHash{"page0"});
+    tree.QueueDeadCandidate(ContentHash{"absent"});
     EXPECT_EQ(tree.PopDeadCandidate(), std::optional<ContentHash>{"page0"});
     EXPECT_EQ(tree.PopDeadCandidate(), std::nullopt);
 }
@@ -478,12 +582,12 @@ TEST(BoundaryTreeTest, NothingIsQueuedWithoutCollection) {
     BoundaryTree tree{TreeConfig(1, /*queue_dead_candidates=*/false), /*checkpoints=*/nullptr};
     const std::vector<std::string> pages{"page0", "page1"};
     BoundaryTree::Hold publication = Publish(tree, pages, 0, std::nullopt);
-    BoundaryTree::Hold kv = tree.HoldEntry("page1", kDeviceKv);
-    BoundaryTree::Hold checkpoint = tree.HoldEntry("page1", kDeviceCheckpoint);
+    BoundaryTree::Hold kv = tree.HoldEntry(ContentHash{"page1"}, kDeviceKv);
+    BoundaryTree::Hold checkpoint = tree.HoldEntry(ContentHash{"page1"}, kDeviceCheckpoint);
     publication.reset();
     checkpoint.reset();
     kv.reset();
-    tree.QueueDeadCandidate("page0");
+    tree.QueueDeadCandidate(ContentHash{"page0"});
     EXPECT_EQ(tree.PopDeadCandidate(), std::nullopt);
 }
 
@@ -496,31 +600,31 @@ TEST(BoundaryTreeTest, AStateCheckpointsResidencyFollowsItsHolds) {
     // when a publication observes it, as the coordinator does.
     const std::vector<std::int32_t> tokens{1, 2, 3, 4};
     const std::vector<std::string> pages{"page0"};
-    BoundaryTree::Hold first = tree.HoldEntry("page0", kDeviceCheckpoint);
+    BoundaryTree::Hold first = tree.HoldEntry(ContentHash{"page0"}, kDeviceCheckpoint);
     ASSERT_TRUE(checkpoints.Observe(tokens, pages, std::nullopt, /*access_epoch=*/1));
-    checkpoints.Update("page0", tree.CheckpointResidency(first.node()));
-    EXPECT_EQ(checkpoints.Distance("page0"), std::nullopt) << "complete on no tier yet";
+    checkpoints.Update(ContentHash{"page0"}, tree.CheckpointResidency(first.node()));
+    EXPECT_EQ(checkpoints.Distance(ContentHash{"page0"}), std::nullopt) << "complete on no tier yet";
 
-    BoundaryTree::Hold second = tree.HoldEntry("page0", kDeviceCheckpoint);
-    EXPECT_EQ(checkpoints.Distance("page0"), std::optional<std::int32_t>{0}) << "complete on the Device";
+    BoundaryTree::Hold second = tree.HoldEntry(ContentHash{"page0"}, kDeviceCheckpoint);
+    EXPECT_EQ(checkpoints.Distance(ContentHash{"page0"}), std::optional<std::int32_t>{0}) << "complete on the Device";
     // A store on its way to the Host keeps it once the Device lets it go.
     BoundaryTree::Hold store = tree.HoldPendingStore(first.node(), /*checkpoint=*/true);
     first.reset();
     second.reset();
-    EXPECT_EQ(checkpoints.Distance("page0"), std::optional<std::int32_t>{0});
+    EXPECT_EQ(checkpoints.Distance(ContentHash{"page0"}), std::optional<std::int32_t>{0});
     store.reset();
-    EXPECT_FALSE(checkpoints.Contains("page0")) << "nothing holds it any more";
+    EXPECT_FALSE(checkpoints.Contains(ContentHash{"page0"})) << "nothing holds it any more";
 }
 
 TEST(BoundaryTreeTest, AClearedCacheLeavesNoNodeAndDropsTheHintsLeft) {
     BoundaryTree tree{TreeConfig(1, true), /*checkpoints=*/nullptr};
     {
-        BoundaryTree::Hold kv = tree.HoldEntry("page0", kDeviceKv);
+        BoundaryTree::Hold kv = tree.HoldEntry(ContentHash{"page0"}, kDeviceKv);
         EXPECT_THROW(tree.ClearAfterCacheClear(), std::runtime_error);
     }
     // A tail published with nothing registered under it leaves a hint no
     // node backs.
-    EXPECT_FALSE(tree.RecordTail("", 2, "tail").has_value());
+    EXPECT_FALSE(tree.RecordTail(ContentHash{""}, 2, ContentHash{"tail"}).has_value());
     ASSERT_EQ(tree.Tails().Size(), 1u);
     tree.ClearAfterCacheClear();
     EXPECT_EQ(tree.Tails().Size(), 0u);

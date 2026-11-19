@@ -25,7 +25,7 @@ import contextlib
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import torch_mm
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, assert_warmup_covers, is_cdna4
 
 if not is_cdna4():
     pytest.skip(
@@ -490,30 +490,98 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
-    # Only the Muse TP8 pre-expert projection is measured past 64 rows.
+    # Past 64 rows only the listed buckets serve: the Muse TP8 pre-expert
+    # projection and the K3.1 TP8 verify shapes.
     assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
     assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
 
 
-# Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
-# 64-row bucket splits K.
-@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192)])
-def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
+# The K3.1 TP8 speculative-verify buckets at ragged and full row counts, twice
+# each so split-K counters reset between calls.
+_K31_VERIFY_BUCKETS = [
+    ((6288, 7168), (36, 100)),
+    ((1536, 7168), (68, 128)),
+    ((7168, 768), (100, 132, 192)),
+    ((8448, 7168), (36, 64)),
+    ((7168, 4224), (44, 64)),
+    ((160, 7168), (100, 132, 192)),
+    ((6400, 1536), (36, 60)),
+    ((1536, 128), (36, 100, 192)),
+    ((2112, 7168), (60, 100, 188)),
+    ((1536, 1536), (44, 100)),
+]
+
+# The K3.1 DSpark drafters' TP8 buckets: the preview drafter's q_a with kv_a
+# at draft-block rows and its stacked context kv_a, and the released GQA
+# drafter's q|k|v, stacked context k|v and MLP gate/up; both share the MLP
+# down projection's and the context projection's rows.
+_K31_DSPARK_BUCKETS = [
+    ((2112, 7168), (7, 14, 28)),
+    ((7168, 1792), (6, 7, 16, 28)),
+    ((2880, 7168), (14, 32, 56)),
+    ((896, 35840), (6, 7, 16, 28)),
+    ((1024, 7168), (6, 16, 28, 48)),
+    ((1280, 7168), (6, 16, 28, 48)),
+    ((3584, 7168), (6, 8)),
+]
+
+
+@pytest.mark.parametrize(
+    "n,k,rows",
+    [
+        pytest.param(n, k, rows, id=f"{n}x{k}-{rows[0]}")
+        for (n, k), rows in _K31_VERIFY_BUCKETS + _K31_DSPARK_BUCKETS
+    ],
+)
+def test_decode_gemm_k31_buckets(n: int, k: int, rows: tuple[int, ...]) -> None:
+    torch.manual_seed(0)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for m in rows:
+        assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+        for _ in range(2):
+            a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+            torch.testing.assert_close(
+                _decode(a, b, torch.bfloat16),
+                _decode_reference(a, b, torch.bfloat16),
+                atol=1e-4,
+                rtol=_RTOL,
+            )
+
+
+# Kimi K3 shared gate/up, the Muse TP8 pre-expert projection, whose 64-row
+# bucket splits K, and the indexer wq_b, which has only a 32-row and a 64-row
+# tile.
+@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192), (4096, 1536)])
+def test_decode_gemm_warmup_compiles_every_row_bucket(n: int, k: int) -> None:
     torch.manual_seed(0)
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    counters = zeroed_state(
+        gluon_mm_a16w16_decode_num_counters_gfx950(64, n, k),
+        dtype=torch.int32,
+        device=a.device,
+    )
 
     def run(rows):
-        out = _decode(a[:rows], b, torch.bfloat16)
-        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+        if supports_gluon_mm_a16w16_decode_gfx950(rows, n, k):
+            out = _decode(a[:rows], b, torch.bfloat16)
+            torch.testing.assert_close(
+                out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL
+            )
 
-    # Warm both integer classes (divisible by 16 or not) of each bucket.
-    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
-        run(rows)
-    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
-            run(rows)
+    # The row count itself does not specialize, so one launch per bucket
+    # covers every count in it, multiples of 16 included.
+    assert_warmup_covers(
+        (gluon_mm_a16w16_medium_gfx950,),
+        lambda: launch_gluon_mm_a16w16_decode_gfx950(
+            a, b, torch.bfloat16, counters=counters, warm_variants=True
+        ),
+        run,
+        (2, 6, 7, 12, 14, 16, 20, 27, 32, 40, 48, 61, 64),
+    )
 
 
 @pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
@@ -556,10 +624,11 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
             a[:rows], b, addend[:rows], addend[:rows]
         )
 
-    for rows in (3, 4, 5, 8, 9, 16, 17, 32):
+    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
+    for rows in (3, 4, 5, 8, 9, 17):
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 20, 27, 31):
+        for rows in (2, 6, 7, 12, 14, 16, 20, 27, 31, 32):
             run(rows)
 
 

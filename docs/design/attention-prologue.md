@@ -68,6 +68,30 @@ native cache is bf16 (`--kv-cache-dtype auto`). An fp16 model's rows round to
 it at the store, as the pool converted them on write, and its activations stay
 fp16.
 
+## QSA index overlap
+
+The Qwen QSA target can prepare its sparse selection alongside the main
+attention projections and prologue. The layer projects index Q/K on the main
+stream, then forks the indexer's existing cache-write/selection tail onto its
+auxiliary stream. Main computes Q/K/V and calls `PagedAttention.prologue` once.
+It joins the selection before core attention consumes either result, passing
+`k = v = None` to preserve the prepared-query contract. Output gating and
+projection use the same path as serial attention.
+
+The current latency policy covers up to 128 target requests on TP1 and one
+request on other TP sizes, with four verify rows per request. Prefill and mixed
+rounds, draft narrowing, layerwise load-backs, FP8 attention projections and
+prefill graph breaks retain serial ordering. A layer without an auxiliary
+stream is serial too. Index geometry is derived from the
+indexer, not a fixed model width or TP topology. Eager forwards record the
+cross-stream temporary lifetimes; graph capture records fork/join dependencies
+and keeps graph-pool storage. There is no new persistent request or cache state.
+
+The model owns the batch/shape performance policy and disables the fork at
+construction for FP8 projections. `QSAIndexer.can_overlap` owns the execution
+constraints: a complete target verify batch, no live-row graph break, and no
+layerwise load-back. The model does not inspect indexer backend internals.
+
 ## Accepted inputs
 
 The entries validate each request once, from metadata only, and raise
@@ -204,7 +228,10 @@ the round's extend span, then the decode window. A forward asks for one slot
 per row it carries through `padded_write_locations(layer, mode, rows)`: the
 extend span, then a MIXED round's decode rows, then the dummy slot 0 for the
 padding. Per-mode callers, such as MLA models that split a MIXED round, keep
-using `write_locations`.
+using `write_locations`. A split draft's K/V writer
+(`PagedAttention.write_kv_at`) runs the prologue's head steps over an extend's
+rows and writes to slots its caller stages: the extend's padded write
+locations, tile by tile, and slot 0 for a padded row.
 
 Sparse KV offloading keeps `write_locations` as the authoritative-history
 accessor. Before the latent write, the caller supplies selection and positions
@@ -286,13 +313,12 @@ the store. Its captured expanded pass is spent. The backends' own breaks nest
 inside these and pass through, and remain for callers that reach a backend
 directly. Prefill graphs capture the target model and replay a round with
 draft narrowing eagerly, so draft layers need no break. A narrowed draft
-step writes every row itself and skips the pre-break prologue. The drafter
-prefill graph (`--enable-drafter-prefill-graph`, see
-[unified_path.md](unified_path.md#drafter-prefill-graphs)) records a draft's
-extend step only when the draft model declares
-`supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
-in the captured segment and attends at `PagedAttention.attend`, like the
-target.
+step writes every row itself and skips the pre-break prologue. A split draft
+(a `SplitExtendDraft`: the MTP heads of Qwen3.5 and Qwen4-Exp, see
+[unified_path.md](unified_path.md#drafter-prefill-graphs)) stores every row's
+K/V of an extend round through `write_kv_at` from the drafter's K/V writer
+graph, with no break, and step 0 then runs from each request's last row as a
+decode step.
 
 ## Formats and scales
 

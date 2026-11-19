@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch as _torch
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
+from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -45,9 +46,11 @@ __all__ = [
     "vocab_shard_draft_stats",
     "vocab_shard_draft_stats_width",
     "vocab_shard_topk",
+    "vocab_shard_topk_chunks",
     "vocab_shard_topk_supports",
     "vocab_topk_merge",
     "vocab_topk_merge_supports",
+    "write_synthetic_verify_outputs",
 ]
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
@@ -239,12 +242,16 @@ def eagle4_candidate_tail(
     )
 
 
-# A shard column rides in the low 15 bits of a 32-bit selection key next to
-# its 16-bit value key, so a shard holds at most this many columns.
-_VOCAB_TOPK_MAX_SHARD_COLUMNS = 1 << 15
+# A column rides in the low 15 bits of a 32-bit selection key next to its
+# 16-bit value key, so one selection program takes at most this many columns.
+_VOCAB_TOPK_MAX_PROGRAM_COLUMNS = 1 << 15
 # The merge holds every candidate of a row in one program, its rank-major
 # slot in 16 bits next to a 32-bit value key.
 _VOCAB_TOPK_MAX_MERGE_CANDIDATES = 1 << 12
+# Columns one program selects from. A whole vocab shard in one program leaves
+# most CUs idle at a few rows; chunks select in parallel, then one program per
+# row merges their candidates.
+_VOCAB_TOPK_CHUNK_COLUMNS = 2048
 
 
 def vocab_shard_topk_supports(dtype: _torch.dtype, shard_columns: int, k: int) -> bool:
@@ -257,8 +264,29 @@ def vocab_shard_topk_supports(dtype: _torch.dtype, shard_columns: int, k: int) -
     """
     return (
         dtype in (_torch.bfloat16, _torch.float16)
-        and 1 <= k <= shard_columns <= _VOCAB_TOPK_MAX_SHARD_COLUMNS
+        and 1 <= k <= shard_columns
+        and (
+            shard_columns <= _VOCAB_TOPK_MAX_PROGRAM_COLUMNS
+            or vocab_shard_topk_chunks(shard_columns, k) > 1
+        )
     )
+
+
+def vocab_shard_topk_chunks(shard_columns: int, k: int) -> int:
+    """Selection programs ``vocab_shard_topk`` splits each shard row over.
+
+    Chunks of about ``_VOCAB_TOPK_CHUNK_COLUMNS`` columns, as long as each
+    chunk holds ``k`` columns and the merge takes every chunk's ``k``
+    candidates; otherwise 1, the whole row in one program.
+
+    Args:
+        shard_columns: Columns in the shard.
+        k: Candidates kept per row.
+    """
+    chunks = -(-shard_columns // _VOCAB_TOPK_CHUNK_COLUMNS)
+    if -(-shard_columns // chunks) < k or not vocab_topk_merge_supports(chunks, k):
+        return 1
+    return chunks
 
 
 def vocab_topk_merge_supports(ranks: int, k: int) -> bool:
@@ -384,7 +412,7 @@ def vocab_shard_draft_stats(
         temperature_pool: ``[P]`` temperature by slot (floored at 1e-20).
         seed_pool: ``[P]`` int64 Philox seed by slot.
         offsets_pool: ``[P]`` int64 Philox offset by slot.
-        out: ``[>= M, vocab_shard_draft_stats_width(N)]`` fp32 partials.
+        out: ``[>= M, >= vocab_shard_draft_stats_width(N)]`` fp32 partials.
         logit_scale: The logits processor's multiplier, rounded to the
             logits' dtype, or None.
         softcap: The processor's final logit softcap ``c * tanh(x / c)``,

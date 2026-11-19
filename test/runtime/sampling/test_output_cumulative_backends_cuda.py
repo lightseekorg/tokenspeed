@@ -105,7 +105,7 @@ def _prepare(backend, *, step, with_bias):
         for seed in (73, 74)
     ]
     backend.prepare_step(
-        [f"shared-cumulative-a-{step}", f"shared-cumulative-b-{step}"],
+        [2 * step + 1, 2 * step + 2],
         [3, 1],
         params,
         num_tokens_per_req=1,

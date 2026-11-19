@@ -87,10 +87,12 @@ def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
         storage_config=None,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.max_num_seqs,
+        max_resident_requests=args.max_num_seqs,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
+        peer_config=None,
     )
     assert config.enable_mixed_prefill_decode is mixed
     assert config.max_batch_size == 16

@@ -18,12 +18,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The C++ scheduler for a binary that embeds the Python data plane.
+//! The C++ scheduler shared by the native host and Python data plane.
 //!
-//! The scheduler core and its nanobind module are compiled into the binary.
-//! [`register_builtin_module`] makes the module a built-in of the embedded
-//! interpreter, so the data plane's `import tokenspeed_scheduler` resolves to
-//! this build: an [`ExecutionPlan`] the control thread gets from the
+//! The scheduler core and its nanobind module are compiled into the host.
+//! [`python_module`] imports that module into the running interpreter, so
+//! the data plane and Rust use the same build: an [`ExecutionPlan`] the control thread gets from the
 //! scheduler is the same C++ type the Python side reads, and crosses over by
 //! moving into a Python object ([`ExecutionPlan::into_python`]).
 //!
@@ -51,6 +50,13 @@ mod ffi {
         request_id: String,
         /// Router-only cache retention identity, empty when untracked.
         session_id: String,
+        /// Shared cache owner, empty to retain session ownership.
+        cache_group_id: String,
+        /// Candidate shared-store checkpoints within this prompt.
+        shared_prefix_tokens: Vec<i32>,
+        /// The replica expected to hold this prompt's prefix, empty for
+        /// none (peer prefix sharing).
+        peer_holder: String,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -375,6 +381,14 @@ mod ffi {
         has_decode_work: bool,
     }
 
+    /// Bounded historical shared-store publication proof.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedPrefixPublication {
+        status: String,
+        confirmed_prefix_tokens: i32,
+        cache_epoch: u64,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -382,6 +396,12 @@ mod ffi {
         /// whose prefill is done, and decodes. Remote prefilling, waiting and
         /// retracted requests are not running.
         running: usize,
+        /// Resident requests holding a request-pool slot.
+        allocated_request_slots: usize,
+        /// Decode permits held by requests or their in-flight operations.
+        active_decode_slots: usize,
+        /// Resident requests whose KV is ready but that have no decode permit.
+        ready_waiting: usize,
         /// Requests awaiting admission or restore.
         waiting: usize,
         /// Requests prefilling.
@@ -415,6 +435,147 @@ mod ffi {
         token_ids: Vec<i32>,
         /// Stored: tokens per block.
         block_size: i32,
+        /// The event concerns the Host cache; else the Device.
+        host: bool,
+    }
+
+    /// A peer lease's name: its reader and the reader's own counter
+    /// (`tokenspeed::PeerLeaseId`).
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    struct PeerLeaseView {
+        /// The reader replica's name.
+        reader: String,
+        /// The reader's counter.
+        id: u64,
+    }
+
+    /// One block of a peer prefix (`tokenspeed::PeerPage`): a holder's
+    /// cached block, or a reader's destination.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PeerPageView {
+        /// The cache group.
+        group_id: u32,
+        /// The block's slot in the group's request table.
+        slot: i32,
+        /// Whether the block is in the Host pool rather than the Device's.
+        host: bool,
+        /// The scheduler block id on its tier.
+        block_id: i32,
+    }
+
+    /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerLookupView {
+        /// The lease the lookup opens.
+        lease: PeerLeaseView,
+        /// The holder's name.
+        holder: String,
+        /// The prompt's full-page chain hashes below `max_tokens`.
+        prefix_hashes: Vec<String>,
+        /// The prompt's tokens up to `max_tokens`.
+        tokens: Vec<i32>,
+        /// The bound on the prefix.
+        max_tokens: i32,
+    }
+
+    /// What a holder's answer answers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PeerAnswerKind {
+        /// A lookup's answer.
+        Lookup,
+        /// A pin's answer.
+        Pin,
+        /// A release's answer.
+        Release,
+    }
+
+    /// A holder's answer, to send to the lease's reader (`tokenspeed::PeerAnswer`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerAnswerView {
+        /// The lease.
+        lease: PeerLeaseView,
+        /// What it answers.
+        kind: PeerAnswerKind,
+        /// Lookup and pin: the boundary held, 0 for none.
+        num_tokens: i32,
+        /// Pin: the pinned blocks.
+        pages: Vec<PeerPageView>,
+        /// Release: whether the hard pin held for its whole life.
+        held: bool,
+    }
+
+    /// A reader's landing in a plan (`tokenspeed::PeerFetchOperation`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerFetchView {
+        /// The landing request.
+        request_id: String,
+        /// The lease it reads under.
+        lease: PeerLeaseView,
+        /// The holder's name.
+        holder: String,
+        /// Where the landed tokens begin: the local hit.
+        begin_tokens: i32,
+        /// Where they end: the holder's boundary.
+        end_tokens: i32,
+        /// The blocks it fills.
+        destinations: Vec<PeerPageView>,
+    }
+
+    /// The kind of a [`PeerEventView`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PeerEventKind {
+        /// Holder: a reader's lookup (`cache::PeerLookup`).
+        Lookup,
+        /// Holder: a reader's pin (`cache::PeerPin`).
+        Pin,
+        /// Holder: a reader's release (`cache::PeerRelease`).
+        Release,
+        /// Reader: a holder's answer to a lookup (`cache::PeerLookupAnswered`).
+        LookupAnswered,
+        /// Reader: a landing's outcome (`cache::PeerFetchDone`).
+        FetchDone,
+    }
+
+    /// A peer event the replica agreed on. Fields other kinds do not use
+    /// are left empty.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerEventView {
+        /// What happened.
+        kind: PeerEventKind,
+        /// The lease it concerns (all but FetchDone).
+        lease: PeerLeaseView,
+        /// Lookup: the prompt's full-page chain hashes.
+        prefix_hashes: Vec<String>,
+        /// Lookup: the prompt's tokens up to `max_tokens`.
+        tokens: Vec<i32>,
+        /// Lookup: the bound on the prefix.
+        max_tokens: i32,
+        /// Pin: the pages the holder's answer named.
+        pages: Vec<PeerPageView>,
+        /// Release: the reader has the whole prefix.
+        demote: bool,
+        /// Pin: the boundary the holder's answer named; LookupAnswered: the
+        /// holder's boundary; FetchDone: the boundary confirmed.
+        num_tokens: i32,
+        /// FetchDone: the landing request.
+        request_id: String,
+    }
+
+    /// The scheduler's peer sharing observations (`Scheduler::PeerStats`).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct PeerStatsView {
+        /// Holder: leases held.
+        leases: usize,
+        /// Holder: blocks hard pins hold.
+        pinned_blocks: usize,
+        /// Reader: requests waiting for a lookup's answer.
+        looking_requests: usize,
+        /// Reader: requests landing.
+        landing_requests: usize,
+        /// Reader: tokens landed so far.
+        landed_tokens: u64,
+        /// Reader: landings given up so far.
+        failed_landings: u64,
     }
 
     /// One cache group's page counts.
@@ -448,18 +609,59 @@ mod ffi {
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
         ) -> Result<()>;
+        fn advance_peer(
+            scheduler: Pin<&mut Scheduler>,
+            now_us: i64,
+            events: &[PeerEventView],
+        ) -> Result<()>;
+        fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
+        fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
+        fn peer_pages_match(
+            scheduler: &Scheduler,
+            lookup: &PeerEventView,
+            num_tokens: i32,
+            pages: &[PeerPageView],
+        ) -> bool;
+        fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
+        fn plan_calls(scheduler: &Scheduler) -> i64;
+        fn peer_stats(scheduler: &Scheduler) -> PeerStatsView;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
             session_ids: &[String],
             ended: bool,
         ) -> usize;
         fn demote_session(scheduler: Pin<&mut Scheduler>, session_id: &str, ended: bool) -> usize;
+        fn demote_cache_groups(
+            scheduler: Pin<&mut Scheduler>,
+            cache_group_ids: &[String],
+            ended: bool,
+        ) -> usize;
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
+        fn shared_prefix_storage_enabled(scheduler: &Scheduler) -> bool;
+        fn shared_prefix_publication(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            max_prefix_tokens: i32,
+        ) -> Result<SharedPrefixPublication>;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
-        fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
+        #[namespace = "tokenspeed"]
+        type KvEventBatch;
+        fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> UniquePtr<KvEventBatch>;
+        fn make_kv_event_batch(events: &[KvEventView]) -> UniquePtr<KvEventBatch>;
+        fn kv_event_batch_size(batch: &KvEventBatch) -> usize;
+        fn kv_event_batch_bytes(batch: &KvEventBatch) -> usize;
+        fn kv_event_stored(batch: &KvEventBatch) -> &[u8];
+        fn kv_event_has_parent(batch: &KvEventBatch) -> &[u8];
+        fn kv_event_parents(batch: &KvEventBatch) -> &[u64];
+        fn kv_event_block_sizes(batch: &KvEventBatch) -> &[i32];
+        fn kv_event_hash_offsets(batch: &KvEventBatch) -> &[usize];
+        fn kv_event_token_offsets(batch: &KvEventBatch) -> &[usize];
+        fn kv_event_hashes(batch: &KvEventBatch) -> &[u64];
+        fn kv_event_tokens(batch: &KvEventBatch) -> &[i32];
+        fn kv_event_media(batch: &KvEventBatch) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
@@ -480,6 +682,7 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+        fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
         /// Install the scheduler's profile span sink, which forwards to
         /// [`record_scheduler_span`], or remove it.
@@ -494,10 +697,11 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
-    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
+    PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
+    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
+    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -519,41 +723,62 @@ extern "C" {
     fn ts_scheduler_plan_into_python(plan: *mut ffi::ExecutionPlan) -> *mut pyffi::PyObject;
 }
 
-/// The built-in module's name; the package imports it as a submodule.
-const MODULE_NAME: &str = "tokenspeed_scheduler_ext";
-const PACKAGE_MODULE_NAME: &str = "tokenspeed_scheduler.tokenspeed_scheduler_ext";
-
-/// Register the scheduler's module as a built-in of the interpreter this
-/// process is about to start.
-///
-/// # Panics
-///
-/// If the interpreter is already running: built-ins are fixed at start.
-pub fn register_builtin_module() {
-    // SAFETY: plain reads of interpreter state; registration only touches the
-    // inittab, which is valid before initialization.
+// Execute through a Python frame, as a normal extension import does. nanobind
+// installs a Python-level atexit hook using the current frame's globals; native
+// Rust callers do not otherwise have such a frame.
+#[pyo3::pyfunction]
+fn execute_scheduler_module(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+    // SAFETY: the callable holds the GIL, and the linked initializer returns
+    // this module's static definition. FromDefAndSpec2 has created the module.
     unsafe {
-        assert_eq!(
-            pyffi::Py_IsInitialized(),
-            0,
-            "register the scheduler module before the interpreter starts"
-        );
-        let status = pyffi::PyImport_AppendInittab(
-            c"tokenspeed_scheduler_ext".as_ptr(),
-            Some(PyInit_tokenspeed_scheduler_ext),
-        );
-        assert_eq!(status, 0, "PyImport_AppendInittab failed");
+        let definition = PyInit_tokenspeed_scheduler_ext().cast::<pyffi::PyModuleDef>();
+        if definition.is_null() || pyffi::PyModule_ExecDef(module.as_ptr(), definition) != 0 {
+            return Err(PyErr::fetch(module.py()));
+        }
     }
+    Ok(())
 }
 
-/// Make `import tokenspeed_scheduler` use the built-in module rather than
-/// any compiled copy on `sys.path`. Call once, right after the interpreter
-/// starts and before anything imports the package.
-pub fn alias_builtin_module(py: Python<'_>) -> PyResult<()> {
-    let module = py.import(MODULE_NAME)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item(PACKAGE_MODULE_NAME, module)
+/// Import the scheduler linked into the host, once per interpreter.
+///
+/// nanobind uses multi-phase initialization. The same module owns the Python
+/// types and the C++ objects driven by the Rust control loop.
+pub fn python_module(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyModule>> {
+    const NAME: &str = "tokenspeed_engine._scheduler";
+    let modules = py.import("sys")?.getattr("modules")?;
+    if modules.contains(NAME)? {
+        return Ok(modules.get_item(NAME)?.cast_into()?);
+    }
+    let spec = py
+        .import("importlib.util")?
+        .call_method1("spec_from_loader", (NAME, py.None()))?;
+    // SAFETY: the GIL is held. nanobind >=2.13 returns a static PyModuleDef,
+    // and FromDefAndSpec2 returns a new module reference owned by Bound.
+    let module = unsafe {
+        let definition = PyInit_tokenspeed_scheduler_ext().cast::<pyffi::PyModuleDef>();
+        if definition.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let api = if cfg!(feature = "abi3") {
+            3
+        } else {
+            pyffi::PYTHON_API_VERSION
+        };
+        let module = Bound::from_owned_ptr_or_err(
+            py,
+            pyffi::PyModule_FromDefAndSpec2(definition, spec.as_ptr(), api),
+        )?;
+        module.cast_into::<pyo3::types::PyModule>()?
+    };
+    let scope = pyo3::types::PyDict::new(py);
+    scope.set_item("module", &module)?;
+    scope.set_item(
+        "execute",
+        pyo3::wrap_pyfunction!(execute_scheduler_module, py)?,
+    )?;
+    py.run(c"execute(module)", Some(&scope), None)?;
+    modules.set_item(NAME, &module)?;
+    Ok(module)
 }
 
 /// A scheduler owned by a Python `tokenspeed_scheduler.Scheduler` object and
@@ -644,14 +869,82 @@ impl Scheduler {
         )
     }
 
+    /// Feed the round head's peer events back: the agreed peer clock, then
+    /// the events in the order the replica agreed on (peer prefix sharing,
+    /// `docs/rfcs/0004-peer-prefix-sharing.md`).
+    pub fn advance_peer(
+        &mut self,
+        now_us: i64,
+        events: &[PeerEventView],
+    ) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::advance_peer");
+        ffi::advance_peer(self.pinned(), now_us, events)
+    }
+
+    /// A reader's lookups since the last take, to send to their holders.
+    pub fn take_peer_lookups(&mut self) -> Vec<PeerLookupView> {
+        ffi::take_peer_lookups(self.pinned())
+    }
+
+    /// A holder's answer to `lookup` (a [`PeerEventKind::Lookup`] event),
+    /// read from the cache as it stands; it changes nothing.
+    pub fn answer_peer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView {
+        ffi::answer_peer_lookup(self.get(), lookup)
+    }
+
+    /// Whether `lookup`'s prompt, up to `num_tokens`, still resolves to
+    /// exactly `pages`.
+    pub fn peer_pages_match(
+        &self,
+        lookup: &PeerEventView,
+        num_tokens: i32,
+        pages: &[PeerPageView],
+    ) -> bool {
+        ffi::peer_pages_match(self.get(), lookup, num_tokens, pages)
+    }
+
+    /// Whether `lease`'s pin holds its pages now.
+    pub fn peer_lease_held(&self, lease: &PeerLeaseView) -> bool {
+        ffi::peer_lease_held(self.get(), lease)
+    }
+
+    /// Plans built so far: no cache entry leaves between two plans.
+    pub fn plan_calls(&self) -> i64 {
+        ffi::plan_calls(self.get())
+    }
+
+    /// The scheduler's peer sharing observations.
+    pub fn peer_stats(&self) -> PeerStatsView {
+        ffi::peer_stats(self.get())
+    }
+
     /// Apply one batch with a single scan of each cache index.
     pub fn demote_sessions(&mut self, session_ids: &[String], ended: bool) -> usize {
         ffi::demote_sessions(self.pinned(), session_ids, ended)
     }
 
+    /// Lower only these groups' exclusive cache entries; never invalidates active blocks.
+    pub fn demote_cache_groups(&mut self, cache_group_ids: &[String], ended: bool) -> usize {
+        ffi::demote_cache_groups(self.pinned(), cache_group_ids, ended)
+    }
+
     /// Lower only this session's exclusive cache entries in the eviction order.
     pub fn demote_session(&mut self, session_id: &str, ended: bool) -> usize {
         ffi::demote_session(self.pinned(), session_id, ended)
+    }
+
+    /// Whether this rank has the complete prefix publication path configured.
+    pub fn shared_prefix_storage_enabled(&self) -> bool {
+        ffi::shared_prefix_storage_enabled(self.get())
+    }
+
+    /// Query exact prefix receipts without waiting or acquiring cache references.
+    pub fn shared_prefix_publication(
+        &self,
+        input_ids: &[i32],
+        max_prefix_tokens: i32,
+    ) -> Result<ffi::SharedPrefixPublication, cxx::Exception> {
+        ffi::shared_prefix_publication(self.get(), input_ids, max_prefix_tokens)
     }
 
     /// Poll native capacity; token_step must be positive.
@@ -713,9 +1006,9 @@ impl Scheduler {
 
     /// The prefix-cache mutations since the last drain, in order; empty
     /// unless the scheduler was configured to record them.
-    pub fn drain_kv_events(&mut self) -> Vec<KvEventView> {
+    pub fn drain_kv_events(&mut self) -> KvEventBatch {
         let _span = profile::span("Scheduler::drain_kv_events");
-        ffi::drain_kv_events(self.pinned())
+        KvEventBatch(ffi::drain_kv_events(self.pinned()))
     }
 
     /// Drop the Device L1 and Host L2 prefix indexes (the public flush).
@@ -738,6 +1031,114 @@ impl Scheduler {
     /// The most tokens one request can hold in the cache.
     pub fn max_single_request_tokens(&self) -> i32 {
         ffi::max_single_request_tokens(self.get())
+    }
+}
+
+/// An owned, immutable cache-event snapshot in contiguous native columns.
+/// It has no reference to a request, scheduler, or cache allocation and may be
+/// moved to the publisher for encoding and destruction without holding the GIL.
+/// A null native pointer is the allocation-free empty batch.
+pub struct KvEventBatch(cxx::UniquePtr<ffi::KvEventBatch>);
+
+impl Default for KvEventBatch {
+    fn default() -> Self {
+        Self(cxx::UniquePtr::null())
+    }
+}
+
+// SAFETY: this uniquely owned snapshot contains only vectors of scalar data.
+// Native mutation is not exposed, and no scheduler/Python/Device pointer is held.
+unsafe impl Send for KvEventBatch {}
+
+/// One borrowed row; its slices live as long as the batch that owns them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvEvent<'a> {
+    /// A stored boundary, otherwise a removal.
+    pub stored: bool,
+    /// Block hashes, including all hashes in a compatible multi-hash event.
+    pub block_hashes: &'a [u64],
+    /// Whether the parent hash is present (zero itself is a valid hash).
+    pub has_parent: bool,
+    /// The parent when `has_parent` is true.
+    pub parent_block_hash: u64,
+    /// Token ids carried by a store.
+    pub token_ids: &'a [i32],
+    /// Tokens in a full block.
+    pub block_size: i32,
+    /// The memory the event concerns.
+    pub medium: KvEventMedium,
+}
+
+/// The memory a KV event concerns (`tokenspeed::KvEventMedium`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvEventMedium {
+    /// The GPU cache.
+    Device,
+    /// The pinned Host cache (Host L2).
+    Host,
+}
+impl KvEventBatch {
+    /// Copy independent event rows into an owned batch, preserving wire fields.
+    /// Serving receives the already-flat native snapshot from `drain_kv_events`.
+    ///
+    /// Panics if an absent parent carries a hash, or a removal carries store
+    /// fields that the wire cannot represent.
+    pub fn from_events(events: &[KvEventView]) -> Self {
+        for event in events {
+            assert!(
+                event.has_parent || event.parent_block_hash == 0,
+                "an absent parent must not carry a hash"
+            );
+            assert!(
+                event.stored
+                    || (!event.has_parent && event.token_ids.is_empty() && event.block_size == 0),
+                "a removal must not carry a store payload"
+            );
+        }
+        Self(ffi::make_kv_event_batch(events))
+    }
+    /// Number of events in this snapshot.
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, ffi::kv_event_batch_size)
+    }
+    /// Whether this snapshot has no events.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Logical column bytes; allocated capacity and allocator metadata are excluded.
+    pub fn byte_size(&self) -> usize {
+        self.0.as_ref().map_or(0, ffi::kv_event_batch_bytes)
+    }
+    /// Iterate without allocating per-row vectors or copying token/hash data.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = KvEvent<'_>> {
+        let columns = self.0.as_ref();
+        let stored = columns.map_or(&[][..], ffi::kv_event_stored);
+        let parents = columns.map_or(&[][..], ffi::kv_event_parents);
+        let has_parent = columns.map_or(&[][..], ffi::kv_event_has_parent);
+        let block_sizes = columns.map_or(&[][..], ffi::kv_event_block_sizes);
+        let hash_offsets = columns.map_or(&[][..], ffi::kv_event_hash_offsets);
+        let token_offsets = columns.map_or(&[][..], ffi::kv_event_token_offsets);
+        let hashes = columns.map_or(&[][..], ffi::kv_event_hashes);
+        let tokens = columns.map_or(&[][..], ffi::kv_event_tokens);
+        let media = columns.map_or(&[][..], ffi::kv_event_media);
+        (0..stored.len()).map(move |i| KvEvent {
+            stored: stored[i] != 0,
+            block_hashes: &hashes[hash_offsets[i]..hash_offsets[i + 1]],
+            has_parent: has_parent[i] != 0,
+            parent_block_hash: parents[i],
+            token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
+            block_size: block_sizes[i],
+            medium: if media[i] == 0 {
+                KvEventMedium::Device
+            } else {
+                KvEventMedium::Host
+            },
+        })
+    }
+}
+impl std::fmt::Debug for KvEventBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -807,6 +1208,11 @@ impl ExecutionPlan {
     /// runs them on the cache owners' storage executors.
     pub fn storage_ops(&self) -> Vec<StorageOpView> {
         ffi::plan_storage_ops(&self.0)
+    }
+
+    /// The peer prefix landings the plan admitted, in plan order.
+    pub fn peer_fetches(&self) -> Vec<PeerFetchView> {
+        ffi::plan_peer_fetches(&self.0)
     }
 
     /// Hand the plan to Python as a `tokenspeed_scheduler.ExecutionPlan`.

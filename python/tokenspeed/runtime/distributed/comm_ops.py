@@ -446,6 +446,34 @@ def prepare_shard_exchange(
     return backend.prepare_shard_exchange(group, channels, max_rows, dtype)
 
 
+def prepare_small_exchange(
+    group: Group,
+    cap_bytes: int,
+    timeout_ns: int,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a one-hop exchange for small payloads before graph capture.
+
+    It serves ``all_gather_single``, ``all_gather`` and equal-split
+    ``all_to_all_single`` calls.
+
+    Collective: every rank of ``group`` calls in the same order with the same
+    arguments. Larger or unaligned calls keep the generic collectives.
+
+    Args:
+        group: Global ranks of the exchange.
+        cap_bytes: Largest per-rank payload the exchange serves, a multiple of 16.
+        timeout_ns: Bound of every in-kernel wait for a peer.
+        backend: Backend to prepare, or ``None`` for the global backend.
+
+    Returns:
+        Whether the backend prepared a dedicated exchange.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_small_exchange(group, cap_bytes, timeout_ns)
+
+
 def prepare_all_reduce_buffers(
     group: Group,
     *,
@@ -533,6 +561,49 @@ def acquire_all_reduce_outputs(
     if backend is None:
         backend = get_global_backend()
     return backend.acquire_all_reduce_outputs(shapes, like, group, op=op)
+
+
+def acquire_exchange_input(
+    nbytes: int,
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Acquire ``nbytes`` (uint8) for a producer to fill, then send with
+    :func:`all_gather_single`, an even :func:`all_to_all_single` or
+    :func:`try_combine_records`. Launches nothing.
+
+    A backend that pulls inputs in place lends its storage, which the next
+    such exchange's producer may overwrite: fill and exchange it before
+    acquiring again. Every rank of ``group`` asks for the same size.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_exchange_input(nbytes, like, group)
+
+
+def try_combine_records(
+    records: torch.Tensor,
+    group: Group,
+    *,
+    head_dim: int,
+    partial_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | None:
+    """Exchange DCP attention ``records`` (int32 ``[len(group), tokens,
+    local_heads, words + 1]``, row ``r`` for group rank ``r``) and combine
+    this rank's in one step, as ``CommBackend.try_combine_records``; None
+    where the backend has no such step."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_combine_records(
+        records,
+        group,
+        head_dim=head_dim,
+        partial_dtype=partial_dtype,
+        output_dtype=output_dtype,
+    )
 
 
 def all_gather(

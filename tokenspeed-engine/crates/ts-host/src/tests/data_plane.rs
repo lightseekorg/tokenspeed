@@ -34,7 +34,7 @@ mod cpu_benchmark;
 mod result_buffers;
 
 /// Start the interpreter once per test process, with the scheduler
-/// module built in and the repository's `tokenspeed_scheduler` package
+/// module loaded and the repository's `tokenspeed_scheduler` package
 /// importable.
 fn interpreter() {
     static START: Once = Once::new();
@@ -42,10 +42,15 @@ fn interpreter() {
         // The test binary is not in a Python prefix; point at the one the
         // crate was built against.
         std::env::set_var("PYTHONHOME", env!("TS_HOST_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package_dir = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"
@@ -106,6 +111,7 @@ class Guard:
 class Plane:
     def __init__(self):
         self.calls = []
+        self.admissions = []
         self.next_token = 100
         self.held = None
         self.unblock = threading.Event()
@@ -124,6 +130,9 @@ class Plane:
 
     def exit_forward_thread(self):
         self.note("exit_forward_thread")
+
+    def admit(self, rows):
+        self.admissions.extend(rows)
 
     def execute(self, plan, dp, ngram, grammar_advance, logprobs, history):
         self.note("execute")
@@ -162,6 +171,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = 64
 cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
 cfg.num_device_pages = 64
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [
@@ -226,6 +236,53 @@ fn this_thread() -> u64 {
             .extract()
             .unwrap()
     })
+}
+
+#[test]
+fn admission_identity_and_stop_criteria_reach_python_together() {
+    let (plane, _) = plane();
+    let mut data_plane = start(&plane);
+    let mut state = ts_control::request::RequestState::new(
+        vec![1, 2, 3],
+        8,
+        std::collections::BTreeSet::from([9]),
+        true,
+        None,
+        false,
+    );
+    state.admission = 42;
+    let request = Admission {
+        rid: "reused".to_owned(),
+        spec: ts_scheduler::RequestSpec {
+            request_id: "reused".to_owned(),
+            session_id: String::new(),
+            cache_group_id: String::new(),
+            shared_prefix_tokens: Vec::new(),
+            peer_holder: String::new(),
+            tokens: vec![1, 2, 3],
+            max_new_tokens: 8,
+            max_cached_prefix_tokens: i32::MAX,
+        },
+        state,
+        sampling_params: ts_wire::SamplingParams::default(),
+        bootstrap: None,
+        multimodal: None,
+        embeddings: Vec::new(),
+        grammar: None,
+    };
+    data_plane.admit(&[request]).unwrap();
+    data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
+    Python::attach(|py| {
+        let rows = plane.bind(py).getattr("admissions").unwrap();
+        let row = rows.get_item(0).unwrap();
+        assert_eq!(
+            row.get_item(0).unwrap().extract::<String>().unwrap(),
+            "reused"
+        );
+        assert_eq!(row.get_item(1).unwrap().extract::<u64>().unwrap(), 42);
+        assert_eq!(row.get_item(3).unwrap().extract::<Vec<i32>>().unwrap(), [9]);
+        assert_eq!(row.get_item(4).unwrap().extract::<i64>().unwrap(), 11);
+    });
 }
 
 #[test]

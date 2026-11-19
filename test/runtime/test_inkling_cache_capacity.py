@@ -25,7 +25,7 @@ from pathlib import Path
 from test.runtime.models.test_inkling2_config import _checkpoint
 
 import pytest
-from tokenspeed_scheduler import CapacityModel
+from tokenspeed_engine.scheduler import CapacityModel
 
 from tokenspeed.runtime.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
 from tokenspeed.runtime.configs.inkling_config import InklingMMConfig
@@ -115,8 +115,6 @@ def _recipe(
             log_scaling_n_floor=128000,
             log_scaling_alpha=0.1,
             final_logit_softcapping=30.0,
-            pre_norm_pre_affine=False,
-            final_norm_pre_affine=False,
             use_value_norm_no_gamma=True,
             qk_l2_clip_threshold=22.627416997969522,
             rel_l2_clip_threshold=8.0,

@@ -780,7 +780,7 @@ def _check_native_topk_edge(graph, enabled, rows, columns, topk):
 def test_dsa_persistent_decode_preserves_global_pdl(
     enabled, rows, columns, restore_pdl, monkeypatch
 ):
-    for package in ("deep_gemm", "deep_ep", "trtllm_kernel"):
+    for package in ("deep_gemm", "deep_ep"):
         pytest.importorskip(package)
     from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa
 

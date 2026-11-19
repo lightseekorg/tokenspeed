@@ -82,9 +82,7 @@ def worker_main(rank: int, port: int) -> None:
         ]
 
         def bf16_norm():
-            return PrecisionRMSNorm(
-                width, 1e-6, False, torch.bfloat16, True, False
-            ).cuda()
+            return PrecisionRMSNorm(width, 1e-6, torch.bfloat16, True, False).cuda()
 
         attention_norms = [
             tuple(bf16_norm() for _ in range(3 if layer in (5, 11) else 1))

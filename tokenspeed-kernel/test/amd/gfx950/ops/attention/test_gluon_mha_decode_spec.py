@@ -169,11 +169,14 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     inputs = make_inputs(case)
     expected = reference(inputs)
     for solution in ("triton", "gluon"):
-        check_output(mha_decode_with_kvcache(**inputs, solution=solution), expected)
+        check_output(
+            mha_decode_with_kvcache(**inputs, solution=solution, block_draft=False),
+            expected,
+        )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = mha_decode_with_kvcache(**inputs, solution="gluon")
+        actual = mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False)
     graph.replay()
     check_output(actual, expected)
     changed_inputs(inputs)
@@ -186,7 +189,10 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     ):
         # Eager dispatch under the guard verifies dynamic values do not become
         # specialization keys; graph replay alone could not establish that.
-        check_output(mha_decode_with_kvcache(**inputs, solution="gluon"), expected)
+        check_output(
+            mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False),
+            expected,
+        )
         graph.replay()
         check_output(actual, expected)
     assert torch.cuda.max_memory_allocated() < 8 * 1024**3

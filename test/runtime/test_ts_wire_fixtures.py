@@ -129,3 +129,20 @@ def test_engine_decodes_abort_fixture() -> None:
 def test_frontend_decodes_output_fixtures(file_name: str) -> None:
     batch = MsgpackDecoder(BatchTokenIDOutSlim).decode(_frames(file_name))
     assert len(batch.output_ids) == len(batch.rids)
+
+
+def test_admission_group_capability_is_explicit_and_legacy_defaults_to_zero() -> None:
+    import msgspec
+
+    payload = _frames("control_output_admission")[0]
+    output = zmq_wire.decode_control_output(payload)
+    assert output.cache_group_contract == 1
+    fields = msgspec.msgpack.decode(payload)
+    assert fields.pop() is True
+    assert fields.pop() == 1
+    assert fields.pop() == 1
+    legacy = zmq_wire.decode_control_output(msgspec.msgpack.encode(fields))
+    assert legacy.cache_group_contract == 0
+    assert legacy.shared_prefix_publication_contract == 0
+    assert legacy.shared_prefix_storage_enabled is False
+    assert legacy.capacity_blocks == output.capacity_blocks

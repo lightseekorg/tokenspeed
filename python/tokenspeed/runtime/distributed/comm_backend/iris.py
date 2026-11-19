@@ -38,6 +38,10 @@ if TYPE_CHECKING:
         ProducerAllReduce,
     )
     from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
@@ -57,6 +61,8 @@ class IrisBackend(CommBackend):
         self._gathers: dict[tuple[Group, torch.dtype], IrisAllGather] = {}
         self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._ordinary_all_reduces: dict[Group, ProducerAllReduce] = {}
+        self._pull_exchanges: dict[Group, IrisPullExchange] = {}
+        self._word_maxes: dict[Group, LamportWordMax] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -119,6 +125,43 @@ class IrisBackend(CommBackend):
             return None
         return reduction
 
+    def install_pull_exchange(self, group: Group, state: "IrisPullExchange") -> None:
+        """Bind a prepared pull exchange without replacing captured storage."""
+        previous = self._pull_exchanges.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris pull exchange")
+        self._pull_exchanges[group] = state
+
+    def acquire_exchange_input(
+        self, nbytes: int, like: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Borrow the group's pull exchange input when it holds ``nbytes``."""
+        state = self._pull_exchanges.get(group)
+        borrowed = None if state is None else state.input(nbytes)
+        if borrowed is None:
+            return super().acquire_exchange_input(nbytes, like, group)
+        return borrowed
+
+    def try_combine_records(
+        self,
+        records: torch.Tensor,
+        group: Group,
+        *,
+        head_dim: int,
+        partial_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Pull and combine records borrowed from the group's pull exchange."""
+        state = self._pull_exchanges.get(group)
+        if state is None or not state.can_combine_records(
+            records,
+            head_dim=head_dim,
+            partial_dtype=partial_dtype,
+            output_dtype=output_dtype,
+        ):
+            return None
+        return state.combine_records(records, head_dim=head_dim)
+
     def get_prepared_all_gather(
         self, group: Group, dtype: torch.dtype
     ) -> "IrisAllGather | None":
@@ -129,6 +172,31 @@ class IrisBackend(CommBackend):
         if state is None or not state.can_run(tensor):
             return False
         state.run(tensor)
+        return True
+
+    def install_word_max(self, group: Group, state: "LamportWordMax") -> None:
+        """Bind a prepared word MAX without replacing captured mailboxes."""
+        previous = self._word_maxes.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris word max")
+        self._word_maxes[group] = state
+
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        state = self._word_maxes.get(group)
+        if (
+            state is None
+            or words.dtype != torch.int64
+            or words.dim() != 1
+            or not 0 < words.numel() <= state.max_rows
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.iris import iris_lamport_word_max
+
+        # Layout is fixed up locally; every rank still runs the same launch.
+        if words.is_contiguous():
+            iris_lamport_word_max(state, words, out=words)
+        else:
+            words.copy_(iris_lamport_word_max(state, words.contiguous()))
         return True
 
     def _create(
@@ -370,6 +438,10 @@ class IrisBackend(CommBackend):
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
+        # An input borrowed from the group's pull exchange is pulled in place.
+        state = self._pull_exchanges.get(group)
+        if state is not None and state.can_all_gather(output, input):
+            return state.all_gather(output, input)
         return self._fallback.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
@@ -383,6 +455,14 @@ class IrisBackend(CommBackend):
         output_split_sizes: list[int] | None = None,
         input_split_sizes: list[int] | None = None,
     ) -> None:
+        state = self._pull_exchanges.get(group)
+        if (
+            output_split_sizes is None
+            and input_split_sizes is None
+            and state is not None
+            and state.can_all_to_all(output, input)
+        ):
+            return state.all_to_all(output, input)
         return self._fallback.all_to_all_single(
             output,
             input,

@@ -48,6 +48,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.ops.metadata.decode_tables import prepare_decode_tables
 
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
@@ -68,12 +69,23 @@ class GroupTableSpec:
             divide ``block_granularity``.
         max_num_pages: Kernel pages per request the leaf reads
             (``leaf.max_num_pages``).
+        atom_pages_per_block: Physical atom pages per scheduler block. Equals
+            ``block_granularity / kernel_page_size`` for tightly packed fields;
+            a shared plane folds its field page stride into this multiplier.
     """
 
     group_id: str
     block_granularity: int
     kernel_page_size: int
     max_num_pages: int
+    atom_pages_per_block: int
+
+    def __post_init__(self) -> None:
+        if self.atom_pages_per_block < self.ratio:
+            raise ValueError(
+                f"cache group {self.group_id!r}: atom pages per block "
+                f"{self.atom_pages_per_block} is below kernel subpages {self.ratio}"
+            )
 
     @property
     def ratio(self) -> int:
@@ -98,7 +110,8 @@ def _unpack_row(
     live,  # whether the row is a live request
     num_blocks,  # scheduler blocks per request (the raw table's column count)
     src_stride_b,
-    ratio,  # kernel pages per scheduler block
+    ratio,  # logical kernel subpages per scheduler block
+    atom_pages_per_block,  # physical atom pages per scheduler block
     max_num_pages,  # kernel pages per request the leaf reads
     dst_stride_b,
     stack_max_num_pages,  # the stack's column count (widest group)
@@ -118,8 +131,9 @@ def _unpack_row(
             src_ptr + b.to(tl.int64) * src_stride_b + block, mask=in_table, other=0
         )
         # Holes and ragged padding (id <= 0) collapse onto the dummy page 0;
-        # a real block expands to its ratio consecutive kernel pages.
-        page = tl.maximum(raw, 0).to(tl.int64) * ratio + col % ratio
+        # A real block covers ratio logical columns; its physical atom pages
+        # are spaced by the field's stride-derived atom multiplier.
+        page = tl.maximum(raw, 0).to(tl.int64) * atom_pages_per_block + col % ratio
         page = tl.where(raw > 0, page, 0)
         vals = tl.where(in_table, page, 0)
         tl.store(
@@ -139,6 +153,7 @@ def _unpack_group_kernel(
     num_blocks,
     src_stride_b,
     ratio,
+    atom_pages_per_block,
     max_num_pages,
     dst_stride_b,
     stack_max_num_pages,
@@ -157,6 +172,7 @@ def _unpack_group_kernel(
         num_blocks,
         src_stride_b,
         ratio,
+        atom_pages_per_block,
         max_num_pages,
         dst_stride_b,
         stack_max_num_pages,
@@ -196,6 +212,7 @@ def _unpack_packed_groups_kernel(
     stack_max_num_pages,
     actual_bs,
     RATIOS: tl.constexpr,
+    ATOM_PAGES: tl.constexpr,
     MAX_NUM_PAGES: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
@@ -221,6 +238,7 @@ def _unpack_packed_groups_kernel(
                 blocks[i],
                 blocks[i],
                 RATIOS[i],
+                ATOM_PAGES[i],
                 MAX_NUM_PAGES[i],
                 dst_stride_b,
                 stack_max_num_pages,
@@ -284,6 +302,7 @@ class GroupTableStacks:
         self._specs = {spec.group_id: spec for spec in groups}
         self._index = {gid: i for i, gid in enumerate(self.group_ids)}
         self._ratios = tuple(spec.ratio for spec in groups)
+        self._atom_pages = tuple(spec.atom_pages_per_block for spec in groups)
         self._max_num_pages = tuple(spec.max_num_pages for spec in groups)
         self.page_sizes_cpu = tuple(int(spec.kernel_page_size) for spec in groups)
         if any(size <= 0 for size in self.page_sizes_cpu):
@@ -347,12 +366,13 @@ class GroupTableStacks:
         fill, for leaves that count page ownership on the host."""
         i = self._index[group_id]
         ratio = self._ratios[i]
+        atom_pages = self._atom_pages[i]
         src = block_table_cpu[:num_requests].to(torch.int64).clamp_min(0)
-        if ratio != 1:
+        if atom_pages != 1:
             offsets = torch.arange(ratio, dtype=torch.int64)
-            src = (src.unsqueeze(-1) * ratio + offsets).reshape(num_requests, -1)
+            src = (src.unsqueeze(-1) * atom_pages + offsets).reshape(num_requests, -1)
             # Page 0 stays 0 across its ratio slots.
-            src = torch.where(src >= ratio, src, torch.zeros_like(src))
+            src = torch.where(src >= atom_pages, src, torch.zeros_like(src))
         return src.to(torch.int32)
 
     def decode_locations(
@@ -429,6 +449,7 @@ class GroupTableStacks:
                     stack_max_num_pages,
                     actual_bs,
                     RATIOS=self._ratios,
+                    ATOM_PAGES=self._atom_pages,
                     MAX_NUM_PAGES=self._max_num_pages,
                     NUM_GROUPS=len(srcs),
                     BLOCK_COLS=block_cols,
@@ -443,6 +464,7 @@ class GroupTableStacks:
                     src.shape[1],
                     src.stride(0),
                     self._ratios[i],
+                    self._atom_pages[i],
                     self._max_num_pages[i],
                     self.tables.stride(1),
                     stack_max_num_pages,
@@ -451,6 +473,58 @@ class GroupTableStacks:
                 )
             return
         self._fill_torch(bs, actual_bs, srcs)
+
+    def fill_decode(
+        self,
+        bs: int,
+        actual_bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+        seq_lens: torch.Tensor,
+        tokens_per_req: int,
+        *,
+        targets: Mapping[str, tuple[torch.Tensor, torch.Tensor, int]],
+    ) -> None:
+        """Refresh tables, write slots and disjoint leaf buffers in place.
+
+        Targets map group IDs to (lengths, table, floor), as advertised by
+        ``decode_buffer_targets``. Leaves without copy-only refreshes are absent.
+        The existing buffers remain graph-stable; no intermediate table read
+        is needed to derive write slots from the scheduler blocks.
+        """
+        if not 0 <= actual_bs <= bs <= self.max_bs:
+            raise RuntimeError(f"invalid decode batch {actual_bs=} {bs=}")
+        if not 1 <= tokens_per_req <= self.max_tokens_per_req:
+            raise RuntimeError(f"invalid decode width {tokens_per_req}")
+        if bs == 0:
+            return
+        # An idle batch has no delivered source tables. The masked kernel
+        # never reads these placeholders, including during graph warmup.
+        sources = tuple(
+            block_tables[gid] if actual_bs else self.tables[i]
+            for i, gid in enumerate(self.group_ids)
+        )
+        for gid, source in zip(self.group_ids, sources):
+            if (
+                source.ndim != 2
+                or source.dtype != torch.int32
+                or source.shape[0] < actual_bs
+            ):
+                raise RuntimeError(
+                    f"cache group {gid!r} needs a 2-D int32 table covering {actual_bs} rows"
+                )
+        prepare_decode_tables(
+            sources,
+            self.tables,
+            self.decode_locs,
+            seq_lens[:bs],
+            actual_bs=actual_bs,
+            tokens_per_req=tokens_per_req,
+            ratios=self._ratios,
+            atom_pages_per_block=self._atom_pages,
+            pages=self._max_num_pages,
+            page_sizes=self.page_sizes_cpu,
+            targets=tuple(targets.get(gid) for gid in self.group_ids),
+        )
 
     def _fill_torch(
         self, bs: int, actual_bs: int, srcs: Sequence[torch.Tensor]
@@ -461,15 +535,18 @@ class GroupTableStacks:
             dst = self.tables[i, :bs]
             max_num_pages = self._max_num_pages[i]
             ratio = self._ratios[i]
+            atom_pages = self._atom_pages[i]
             # Only the scheduler blocks whose expansion lands inside the
             # leaf's max_num_pages are read.
             num_blocks = min(src.shape[1], -(-max_num_pages // ratio))
             live = src[:actual_bs, :num_blocks].clamp_min(0)
-            if ratio != 1:
+            if atom_pages != 1:
                 offsets = torch.arange(ratio, dtype=live.dtype, device=live.device)
-                live = (live.unsqueeze(-1) * ratio + offsets).reshape(actual_bs, -1)
+                live = (live.unsqueeze(-1) * atom_pages + offsets).reshape(
+                    actual_bs, -1
+                )
                 live = torch.where(
-                    live >= ratio, live, torch.zeros_like(live)
+                    live >= atom_pages, live, torch.zeros_like(live)
                 )  # page 0 stays 0 across its ratio slots
             num_pages = min(live.shape[1], max_num_pages)
             dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])

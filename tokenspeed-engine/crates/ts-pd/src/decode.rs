@@ -446,6 +446,7 @@ impl Shared {
     /// look up the route, register with its ranks the first time the route
     /// is used, and mark the room bootstrapped.
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let cache_id = {
             let state = self.state();
             if !state.awaiting_connection(room) {
@@ -454,6 +455,14 @@ impl Shared {
             state.cache_id.clone()
         };
         let route = self.route(addr)?;
+        if let Some(started) = started {
+            tracing::debug!(
+                room,
+                bootstrap_addr = addr,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "event=ts_decode_route_resolved"
+            );
+        }
         let dp_group = room % route.prefill_dp_size.max(1) as u64;
         let key: ConnectionKey = (addr.to_owned(), dp_group, route.target_tp_ranks.clone());
         let known = self.state().connections.get(&key).cloned();
@@ -533,7 +542,12 @@ impl Shared {
             state.connections.insert(key, targets.clone());
         }
         if state.attach(room, addr, &route, targets) {
-            tracing::debug!(room, "connected");
+            tracing::debug!(
+                room,
+                bootstrap_addr = addr,
+                elapsed_ms = started.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                "event=ts_decode_connected"
+            );
         }
         Ok(())
     }
@@ -731,7 +745,7 @@ impl DecodeOutbox {
             request_pool_index,
             targets = targets.len(),
             manifest_bytes = manifest.len(),
-            "pre-allocation sent"
+            "event=ts_decode_manifest_queued"
         );
     }
 }

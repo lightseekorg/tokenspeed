@@ -34,6 +34,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
+
 from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
@@ -54,6 +56,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroup
 from tokenspeed.runtime.layers.attention.configs.base import (
     resolve_speculative_num_tokens,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -843,7 +846,9 @@ def _dspark_context_drafter(
     server_args = SimpleNamespace(
         speculative_num_draft_tokens=4, speculative_algorithm="DSPARK"
     )
-    query_width = resolve_speculative_num_tokens(server_args, is_draft=True)
+    query_width = resolve_speculative_num_tokens(
+        server_args, is_draft=True, sample_from_anchor=True
+    )
     router = CacheGroupRouter(
         None,
         is_draft=True,
@@ -860,6 +865,12 @@ def _dspark_context_drafter(
             windows={"full_attention": None},
         ),
         {"full_attention": _DraftLeaf(query_width)},
+    )
+    router.set_cache_pool(
+        make_mha_pool_for_groups(
+            (CacheGroupSpec("full_attention", "full_history", 4, 1, replayable=False),),
+            device="cpu",
+        )
     )
     router.init_cuda_graph_state(2)
 
@@ -1110,3 +1121,21 @@ def test_a_draft_takes_the_decode_monokernels_only_for_a_target_they_serve(
     assert not draft_takes_decode_monokernel(switch, muse, ["DFlashDraftModel"])
     assert not draft_takes_decode_monokernel(switch, muse, ["LlamaForCausalLMEagle3"])
     assert not draft_takes_decode_monokernel(switch, muse, [])
+
+
+@pytest.mark.parametrize("initial_rows", [0, 2])
+def test_draft_capture_does_not_replace_persistent_residual(monkeypatch, initial_rows):
+    model = DFlashDraftModel.__new__(DFlashDraftModel)
+    buffer = torch.full((initial_rows, 8), 3.0) if initial_rows else None
+    model._residual_buffer = buffer
+    # CPU tensors stand in for unavailable device graph capture.
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.dflash.is_current_stream_capturing",
+        lambda device: True,
+    )
+    residual = model._zeroed_residual(torch.ones(4, 8))
+    assert model._residual_buffer is buffer
+    assert residual.shape == (4, 8)
+    assert not residual.any()
+    if buffer is not None:
+        assert torch.all(buffer == 3)

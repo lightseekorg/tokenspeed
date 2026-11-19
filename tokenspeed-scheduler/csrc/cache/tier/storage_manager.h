@@ -56,15 +56,21 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
+    // Historical successful, replica-agreed, retired PUT/accepted GET receipts. They
+    // do not pin Host memory or guarantee residence after external eviction.
+    bool WasPublished(const CacheKey& key) const { return published_.contains(key); }
+    std::size_t NumPublishedKeys() const { return published_.size(); }
+    std::uint64_t PublicationEpoch() const { return publication_epoch_; }
     // Returns an empty lease when nothing was started.
     StorageLease StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens);
     bool Completed(std::uint64_t id) const;
     bool IsQuery(std::uint64_t id) const;
-    // Successful query hits, and the cumulative tokens they cover. Each hit counts once per operation.
-    std::vector<CacheKey> QueryHits(std::uint64_t id);
+    // Return successful query hits and record their token counts. Repeated calls
+    // return the same surviving hits, counting each key at most once per operation.
+    std::vector<CacheKey> RecordQueryHits(std::uint64_t id);
     std::uint64_t QueryHitTokens() const { return query_hit_tokens_; }
     // Returns an empty lease when nothing was started.
-    StorageLease StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
+    StorageLease StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits);
     void Complete(const cache::StorageDone& event);
     void QueueBackups(std::span<const CacheKey> keys);
     void StartBackups();
@@ -84,21 +90,28 @@ private:
         std::vector<std::uint8_t> success;
         ContentHash tail_prior;
         std::optional<TailPublication> tail;
-        bool completed{false};
         bool detached{false};
         bool quarantined{false};
+
+        // Every admitted L3 operation has keys. Even an all-failed completion
+        // supplies one result per key; no results means the operation is pending.
+        bool Completed() const { return !success.empty(); }
     };
     std::uint64_t nextId();
     // What dropping the operation's lease does.
     void detach(std::uint64_t id) noexcept;
     void rememberNegative(const CacheKey& key);
+    void rememberPublished(const CacheKey& key);
     std::size_t availableHostCredits() const;
     CacheCoordinator& coordinator_;
-    StorageConfig config_;
+    const StorageConfig config_;
     std::map<std::uint64_t, Ticket> operations_;
     std::deque<CacheKey> backup_candidates_;
     std::unordered_set<CacheKey, CacheKeyHash> negative_;
     std::deque<CacheKey> negative_order_;
+    std::unordered_set<CacheKey, CacheKeyHash> published_;
+    std::deque<CacheKey> published_order_;
+    std::uint64_t publication_epoch_{1};
     std::vector<StorageOperation> commands_;
     std::uint64_t next_id_{1};
     bool pressure_gate_closed_{false};

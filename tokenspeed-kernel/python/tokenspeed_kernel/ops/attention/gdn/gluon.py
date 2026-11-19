@@ -56,6 +56,7 @@ if current_platform().is_amd:
             "head_dim": frozenset({128}),
             "padding_safe": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def gluon_gdn_decode_step_gfx950(
@@ -112,6 +113,7 @@ if current_platform().is_amd:
             "tree": frozenset({False}),
             "separate_output_state": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def gluon_gdn_decode_mtp_gfx950(

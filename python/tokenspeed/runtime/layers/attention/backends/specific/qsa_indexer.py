@@ -115,6 +115,9 @@ class QSAIndexerBackend(AttentionBackend):
                 kernel_page_size=specs[gid].block_granularity,
                 max_num_pages=(self.max_context_len + specs[gid].block_granularity - 1)
                 // specs[gid].block_granularity,
+                atom_pages_per_block=cache_pool.atom_pages_per_block(
+                    gid, specs[gid].block_granularity
+                ),
             )
             for gid in groups
         )

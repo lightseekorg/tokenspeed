@@ -490,6 +490,7 @@ def _ar_worker_main(
                 token_counts=(1, 2, 4, 7, 8, 16, 24, 32),
                 reference=state,
             )
+            _check_gated_projection_attnres(lamport_k3, rank, device)
     finally:
         dist.destroy_process_group()
 
@@ -764,7 +765,25 @@ def _check_all_reduce_residual_attnres(
             torch.testing.assert_close(
                 actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
             )
-            # Lamport plus row epilogue must equal the fused push one-shot bit for bit.
+            # The Lamport all-reduce plus row epilogue, the fused Lamport
+            # two-shot, and the fused push one-shot agree bit for bit.
+            reduced = k3_state.reduce_attention(local)
+            if reduced is not None:
+                split_hidden, split_residual = k3_state.attnres.epilogue(
+                    reduced, residual, score_weight, output_weight, scratch, 1e-6
+                )
+                torch.testing.assert_close(
+                    split_hidden.view(torch.int16),
+                    actual_hidden.view(torch.int16),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    split_residual.view(torch.int16),
+                    actual_residual.view(torch.int16),
+                    atol=0,
+                    rtol=0,
+                )
             if num_tokens > k3_state.attnres.max_rows:
                 continue
             fused_hidden, fused_residual = k3_state.attnres.run(
@@ -830,6 +849,121 @@ def _check_all_reduce_residual_attnres(
                 atol=2e-2,
                 rtol=2e-2,
             )
+
+
+def _check_gated_projection_attnres(k3_state, rank: int, device) -> None:
+    """KDA's gated o-projection, projected and reduced in one launch, against
+    the gated GEMV followed by ``attnres_combine``."""
+    from tokenspeed_kernel.ops.activation.triton import attnres_partial
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_gated_norm_gemv_a16w16_gfx950,
+    )
+
+    hidden, heads, head_dim = 7168, 12, 128
+    k = heads * head_dim
+
+    def check(actual, expected) -> None:
+        actual_hidden, actual_residual = actual
+        expected_hidden, expected_residual = expected
+        torch.testing.assert_close(
+            actual_residual.view(torch.int16),
+            expected_residual.view(torch.int16),
+            atol=0,
+            rtol=0,
+        )
+        # The finishers sum in another order, and the mix rounds to BF16 before
+        # the output norm: an element can move by a BF16 step of the mix and
+        # one of its own, or by more only where cancellation leaves it tiny.
+        torch.testing.assert_close(
+            actual_hidden.float(), expected_hidden.float(), atol=1e-3, rtol=2**-6
+        )
+
+    for num_tokens in (2, 5, 8):
+        torch.manual_seed(211 + num_tokens)
+        blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
+        output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(
+            torch.bfloat16
+        )
+        residual = (torch.randn(num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        norm_weight = (torch.randn(head_dim, device=device) * 0.2 + 1).to(
+            torch.bfloat16
+        )
+        scratch = (
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, hidden, device=device, dtype=torch.float32),
+        )
+        attnres_partial(blocks, score_weight, 1e-6, scratch)
+        # Each rank projects its own heads through its own weight shard; the
+        # gate is a strided view of the input projection.
+        generator = torch.Generator(device=device).manual_seed(
+            20261115 + 31 * rank + num_tokens
+        )
+        x = (torch.randn((num_tokens, k), device=device, generator=generator) * 0.5).to(
+            torch.bfloat16
+        )
+        gate = torch.randn((num_tokens, 3 * k), device=device, generator=generator).to(
+            torch.bfloat16
+        )[:, k : 2 * k]
+        weight = (torch.randn((hidden, k), device=device, generator=generator) / 32).to(
+            torch.bfloat16
+        )
+        operands = (
+            x,
+            gate,
+            norm_weight,
+            weight,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+        )
+        assert k3_state.attnres_projection_supported(*operands)
+        assert not k3_state.attnres_projection_supported(
+            x[:1], gate[:1], *operands[2:4], residual[:1], *operands[5:]
+        )
+        partial = torch.empty(num_tokens, hidden, dtype=torch.bfloat16, device=device)
+
+        def unfused():
+            launch_gluon_gated_norm_gemv_a16w16_gfx950(
+                x, gate, norm_weight, weight, partial, 1e-5
+            )
+            return k3_state.attnres_combine(
+                partial, residual, score_weight, output_weight, scratch, eps=1e-6
+            )
+
+        # Interleaved with the unfused path, which shares the mailboxes and
+        # the rows' stage counters.
+        for _ in range(4):
+            expected = unfused()
+            check(
+                k3_state.attnres_projection_combine(*operands, norm_eps=1e-5, eps=1e-6),
+                expected,
+            )
+
+        graph = torch.cuda.CUDAGraph()
+        dist.barrier()
+        with torch.cuda.graph(graph):
+            graph_outputs = k3_state.attnres_projection_combine(
+                *operands, norm_eps=1e-5, eps=1e-6
+            )
+        dist.barrier()
+        for replay in range(3):
+            x.copy_(
+                torch.randn(x.shape, device=device, generator=generator) * (replay + 1)
+            )
+            expected = unfused()
+            dist.barrier()
+            if rank == replay:
+                time.sleep(0.005)
+            graph.replay()
+            torch.cuda.synchronize()
+            check(graph_outputs, expected)
 
 
 def _run_ar_test(world_size: int, allocator_type: str | None) -> None:

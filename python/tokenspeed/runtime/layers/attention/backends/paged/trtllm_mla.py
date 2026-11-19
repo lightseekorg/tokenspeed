@@ -24,7 +24,6 @@ MLA attention leaf using fused kernels optimized for SM100 (Blackwell) GPUs.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -36,11 +35,8 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
 from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
-    PagedAttentionBackend,
+    PagedMLABackend,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeCascadeRows,
@@ -196,7 +192,7 @@ class TRTLLMMLADecodeMetadata:
     _dsa_kv_seq_lens: torch.Tensor | None = None
 
 
-class TRTLLMMLABackend(PagedAttentionBackend):
+class TRTLLMMLABackend(PagedMLABackend):
     """trtllm_mla leaf using fused kernels."""
 
     default_kernel_page_size = TRTLLM_MLA_DEFAULT_PAGE_SIZE
@@ -246,58 +242,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         self.forward_prefill_metadata = None
         self.chunked_prefill_metadata = None
 
-    def init_forward_metadata(
-        self,
-        bs: int,
-        num_extends: int,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        forward_mode: ForwardMode,
-        *,
-        extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
-        **kwargs,
-    ):
-        reject_query_shard(query_shard, "TRTLLMMLABackend")
-        del page_table_cpu
-        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
-            raise RuntimeError(
-                "trtllm_mla decode metadata goes through refresh_decode_metadata; "
-                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
-            )
-        if forward_mode.is_extend_or_mixed():
-            self._init_prefill_metadata(
-                seq_lens[:num_extends],
-                page_table=page_table[:num_extends],
-                extend_prefix_lens=extend_prefix_lens[:num_extends],
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
-                extend_seq_lens=extend_seq_lens[:num_extends],
-                extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
-            )
-        # Target mixed/idle batches carry decode rows whose metadata this
-        # init must cover; the same in-place refresh serves them. A draft's
-        # decode metadata instead comes from the wrapper's refresh after this
-        # init (the unified draft contract).
-        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
-            self.refresh_decode_metadata(
-                bs, bs, seq_lens, page_table, num_extends=num_extends
-            )
-
-    @contextmanager
-    def override_num_extends(self, num_extends: int):
-        assert self.forward_decode_metadata is not None
-        prev = self.forward_decode_metadata.num_extends
-        self.forward_decode_metadata.num_extends = num_extends
-        try:
-            yield
-        finally:
-            self.forward_decode_metadata.num_extends = prev
-
     def _init_prefill_metadata(
         self,
         seq_lens: torch.Tensor,
@@ -306,7 +250,10 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        *,
+        page_table_cpu: torch.Tensor | None,
     ):
+        del page_table_cpu
         max_seq_len = self.max_context_len
         cum_seq_lens = torch.zeros(
             len(seq_lens) + 1, dtype=torch.int32, device=seq_lens.device
@@ -397,7 +344,9 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         # start after the extend rows, so publish this round's split.
         metadata.num_extends = num_extends
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        torch.clamp_min(
+            seq_lens[:bs], metadata.q_len_per_req, out=self.seq_lens_buf[:bs]
+        )
         self._refresh_tree_prefix(bs, self.seq_lens_buf)
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel

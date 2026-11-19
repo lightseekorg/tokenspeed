@@ -66,6 +66,9 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
             converted.push_back(tokenspeed::RequestSpec{
                 .request_id = std::string(spec.request_id),
                 .session_id = std::string(spec.session_id),
+                .cache_group_id = std::string(spec.cache_group_id),
+                .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
+                .peer_holder = std::string(spec.peer_holder),
                 .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
                 .max_new_tokens = spec.max_new_tokens,
                 .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
@@ -73,6 +76,156 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
         }
     }
     scheduler.SubmitRequests(converted);
+}
+
+namespace {
+
+tokenspeed::PeerLeaseId FromView(const PeerLeaseView& lease) {
+    return tokenspeed::PeerLeaseId{.reader = std::string(lease.reader), .id = lease.id};
+}
+
+PeerLeaseView ToView(const tokenspeed::PeerLeaseId& lease) {
+    return PeerLeaseView{.reader = rust::String(lease.reader), .id = lease.id};
+}
+
+rust::Vec<PeerPageView> ToView(const std::vector<tokenspeed::PeerPage>& pages) {
+    rust::Vec<PeerPageView> out;
+    out.reserve(pages.size());
+    for (const tokenspeed::PeerPage& page : pages) {
+        out.push_back(PeerPageView{.group_id = page.group_id,
+                                   .slot = page.slot,
+                                   .host = page.tier == tokenspeed::CacheTier::kHost,
+                                   .block_id = page.block_id});
+    }
+    return out;
+}
+
+template <typename T>
+rust::Vec<T> ToRustVec(const std::vector<T>& values) {
+    rust::Vec<T> out;
+    out.reserve(values.size());
+    for (const T& value : values) {
+        out.push_back(value);
+    }
+    return out;
+}
+
+std::vector<tokenspeed::PeerPage> FromView(rust::Slice<const PeerPageView> pages) {
+    std::vector<tokenspeed::PeerPage> out;
+    out.reserve(pages.size());
+    for (const PeerPageView& page : pages) {
+        out.push_back(tokenspeed::PeerPage{.group_id = page.group_id,
+                                           .slot = page.slot,
+                                           .tier = page.host ? tokenspeed::CacheTier::kHost : tokenspeed::CacheTier::kDevice,
+                                           .block_id = page.block_id});
+    }
+    return out;
+}
+
+tokenspeed::cache::PeerLookup LookupFromView(const PeerEventView& event) {
+    std::vector<std::string> hashes;
+    hashes.reserve(event.prefix_hashes.size());
+    for (const rust::String& hash : event.prefix_hashes) {
+        hashes.emplace_back(hash);
+    }
+    return tokenspeed::cache::PeerLookup{
+        .lease = FromView(event.lease),
+        .prefix_hashes = std::move(hashes),
+        .tokens = std::vector<std::int32_t>(event.tokens.begin(), event.tokens.end()),
+        .max_tokens = event.max_tokens,
+    };
+}
+
+PeerAnswerView ToView(const tokenspeed::PeerAnswer& answer) {
+    const PeerAnswerKind kind = answer.kind == tokenspeed::PeerAnswerKind::kLookup ? PeerAnswerKind::Lookup
+                                : answer.kind == tokenspeed::PeerAnswerKind::kPin  ? PeerAnswerKind::Pin
+                                                                                    : PeerAnswerKind::Release;
+    return PeerAnswerView{.lease = ToView(answer.lease),
+                          .kind = kind,
+                          .num_tokens = answer.num_tokens,
+                          .pages = ToView(answer.pages),
+                          .held = answer.held};
+}
+
+rust::Vec<rust::String> ToRustStrings(const std::vector<std::string>& values) {
+    rust::Vec<rust::String> out;
+    out.reserve(values.size());
+    for (const std::string& value : values) {
+        out.push_back(rust::String(value));
+    }
+    return out;
+}
+
+}  // namespace
+
+void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events) {
+    // The agreed clock first, then the events in the order they arrived.
+    tokenspeed::ExecutionEvent execution_event;
+    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us});
+    for (const PeerEventView& event : events) {
+        switch (event.kind) {
+            case PeerEventKind::Lookup:
+                execution_event.With(LookupFromView(event));
+                break;
+            case PeerEventKind::Pin:
+                execution_event.With(tokenspeed::cache::PeerPin{
+                    .lease = FromView(event.lease),
+                    .num_tokens = event.num_tokens,
+                    .pages = FromView(rust::Slice<const PeerPageView>(event.pages.data(), event.pages.size()))});
+                break;
+            case PeerEventKind::Release:
+                execution_event.With(tokenspeed::cache::PeerRelease{.lease = FromView(event.lease), .demote = event.demote});
+                break;
+            case PeerEventKind::LookupAnswered:
+                execution_event.With(
+                    tokenspeed::cache::PeerLookupAnswered{.lease = FromView(event.lease), .num_tokens = event.num_tokens});
+                break;
+            case PeerEventKind::FetchDone:
+                execution_event.With(tokenspeed::cache::PeerFetchDone{.request_id = std::string(event.request_id),
+                                                                      .num_tokens = event.num_tokens});
+                break;
+        }
+    }
+    scheduler.Advance(execution_event);
+}
+
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup) {
+    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup)));
+}
+
+bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
+                      rust::Slice<const PeerPageView> pages) {
+    return scheduler.PeerPagesMatch(LookupFromView(lookup), num_tokens, FromView(pages));
+}
+
+bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
+    return scheduler.PeerLeaseHeld(FromView(lease));
+}
+
+std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.PlanCalls();
+}
+
+rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
+    rust::Vec<PeerLookupView> out;
+    for (const tokenspeed::PeerLookupRequest& lookup : scheduler.TakePeerLookups()) {
+        out.push_back(PeerLookupView{.lease = ToView(lookup.lease),
+                                     .holder = rust::String(lookup.holder),
+                                     .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
+                                     .tokens = ToRustVec(lookup.tokens),
+                                     .max_tokens = lookup.max_tokens});
+    }
+    return out;
+}
+
+PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::Scheduler::PeerStats stats = scheduler.GetPeerStats();
+    return PeerStatsView{.leases = stats.leases,
+                         .pinned_blocks = stats.pinned_blocks,
+                         .looking_requests = stats.looking_requests,
+                         .landing_requests = stats.landing_requests,
+                         .landed_tokens = stats.landed_tokens,
+                         .failed_landings = stats.failed_landings};
 }
 
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill,
@@ -84,50 +237,57 @@ std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Sched
 
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events) {
     tokenspeed::ExecutionEvent execution_event;
-    for (const ForwardEvent& event : events) {
-        std::string request_id(event.request_id);
-        switch (event.kind) {
-            case ForwardEventKind::ExtendResult:
-                execution_event.With(tokenspeed::forward::ExtendResult{
-                    .request_id = std::move(request_id),
-                    .tokens = to_std({event.tokens.data(), event.tokens.size()}),
-                    .spec_candidate_ids =
-                        to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
-                });
-                break;
-            case ForwardEventKind::Finish:
-                execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
-                break;
-            case ForwardEventKind::Abort:
-                execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
-                break;
-            case ForwardEventKind::UpdateReserveNumTokens:
-                execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
-                    .request_id = std::move(request_id),
-                    .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
-                });
-                break;
-            case ForwardEventKind::PdBootstrapped:
-                execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdFailed:
-                execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdTransferStopped:
-                execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdSucceeded:
-                execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdRemotePrefillDone:
-                execution_event.With(
-                    tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
-                break;
-            default:
-                throw std::invalid_argument("unknown forward event kind");
+    {
+        tokenspeed::ProfileSpan conversion{"SchedulerBridge::convertForwardEvents"};
+        for (const ForwardEvent& event : events) {
+            std::string request_id(event.request_id);
+            switch (event.kind) {
+                case ForwardEventKind::ExtendResult:
+                    execution_event.With(tokenspeed::forward::ExtendResult{
+                        .request_id = std::move(request_id),
+                        .tokens = to_std({event.tokens.data(), event.tokens.size()}),
+                        .spec_candidate_ids =
+                            to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
+                    });
+                    break;
+                case ForwardEventKind::Finish:
+                    execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::Abort:
+                    execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::UpdateReserveNumTokens:
+                    execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
+                        .request_id = std::move(request_id),
+                        .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
+                    });
+                    break;
+                case ForwardEventKind::PdBootstrapped:
+                    execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdFailed:
+                    execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdTransferStopped:
+                    execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdSucceeded:
+                    execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdRemotePrefillDone:
+                    execution_event.With(
+                        tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
+                    break;
+                default:
+                    throw std::invalid_argument("unknown forward event kind");
+            }
         }
     }
     scheduler.Advance(execution_event);
+    {
+        tokenspeed::ProfileSpan destruction{"SchedulerBridge::destroyForwardEvents"};
+        execution_event = {};
+    }
 }
 
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
@@ -193,8 +353,25 @@ std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const 
     return scheduler.DemoteSessions(session_ids, ended);
 }
 
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> group_ids;
+    for (const auto& id : ids) group_ids.emplace_back(id);
+    return scheduler.DemoteCacheGroups(group_ids, ended);
+}
+
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended) {
     return scheduler.DemoteSession(std::string(session_id), ended);
+}
+
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.SharedPrefixStorageEnabled();
+}
+
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens) {
+    const auto result = scheduler.GetSharedPrefixPublication({input_ids.data(), input_ids.size()}, max_prefix_tokens);
+    return SharedPrefixPublication{rust::String(result.status), result.confirmed_prefix_tokens, result.cache_epoch};
 }
 
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step) {
@@ -216,6 +393,9 @@ AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
     return SchedulerSizes{
         .running = scheduler.RunningSize(),
+        .allocated_request_slots = static_cast<std::size_t>(scheduler.AllocatedRequestSlots()),
+        .active_decode_slots = static_cast<std::size_t>(scheduler.ActiveDecodeSlots()),
+        .ready_waiting = scheduler.ReadyWaitingSize(),
         .waiting = scheduler.WaitingSize(),
         .prefilling = scheduler.PrefillSize(),
         .decoding = scheduler.DecodingSize(),
@@ -245,25 +425,70 @@ CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::
     };
 }
 
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler) {
-    rust::Vec<KvEventView> views;
-    for (auto& event : scheduler.DrainKvEvents()) {
-        KvEventView view{};
-        if (auto* stored = std::get_if<tokenspeed::KvBlockStoredEvent>(&event)) {
-            view.stored = true;
-            for (auto hash : stored->block_hashes) view.block_hashes.push_back(hash);
-            view.has_parent = stored->parent_block_hash.has_value();
-            view.parent_block_hash = stored->parent_block_hash.value_or(0);
-            for (auto token : stored->token_ids) view.token_ids.push_back(token);
-            view.block_size = stored->block_size;
+std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler) {
+    auto batch = scheduler.DrainKvEventBatch();
+    if (batch.Empty()) return nullptr;
+    return std::make_unique<tokenspeed::KvEventBatch>(std::move(batch));
+}
+
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events) {
+    if (events.empty()) return nullptr;
+    auto batch = std::make_unique<tokenspeed::KvEventBatch>();
+    for (const auto& event : events) {
+        const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
+        const auto medium = event.host ? tokenspeed::KvEventMedium::kHost : tokenspeed::KvEventMedium::kDevice;
+        if (event.stored) {
+            batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
+                         {event.token_ids.data(), event.token_ids.size()}, event.block_size, medium);
         } else {
-            const auto& removed = std::get<tokenspeed::KvBlockRemovedEvent>(event);
-            view.stored = false;
-            for (auto hash : removed.block_hashes) view.block_hashes.push_back(hash);
+            batch->Remove(hashes, medium);
         }
-        views.push_back(std::move(view));
     }
-    return views;
+    return batch;
+}
+
+std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch) {
+    return batch.Size();
+}
+std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch) {
+    return batch.ByteSize();
+}
+rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Stored();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HasParent();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Parents();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_block_sizes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.BlockSizes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_hash_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HashOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_token_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.TokenOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Hashes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Tokens();
+    return {values.data(), values.size()};
+}
+
+rust::Slice<const std::uint8_t> kv_event_media(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Media();
+    return {values.data(), values.size()};
 }
 
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {
@@ -400,7 +625,10 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 }
 
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
-    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value()) {
+    // A peer landing's reads start from the fence the data plane reports for
+    // its plan, which may have no other device work: a prefill replica's
+    // landing prepays no decode room, so it zeroes nothing.
+    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value() || !plan.peer_fetches.empty()) {
         return true;
     }
     for (const auto& [group_id, pages] : plan.pages_to_zero) {
@@ -511,7 +739,7 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
         views.reserve(cache_keys.size());
         for (const tokenspeed::CacheKey& key : cache_keys) {
             views.push_back(StorageKeyView{.group_id = key.group_id,
-                                           .content_hash = rust::String(key.content_hash),
+                                           .content_hash = rust::String(key.content_hash.ToString()),
                                            .page_offset = key.page_offset});
         }
         return views;
@@ -559,6 +787,19 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
 
 void set_profile_span_sink(bool installed) {
     tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
+}
+
+rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<PeerFetchView> out;
+    for (const tokenspeed::PeerFetchOperation& fetch : plan.peer_fetches) {
+        out.push_back(PeerFetchView{.request_id = rust::String(fetch.request_id),
+                                    .lease = ToView(fetch.lease),
+                                    .holder = rust::String(fetch.holder),
+                                    .begin_tokens = fetch.begin_tokens,
+                                    .end_tokens = fetch.end_tokens,
+                                    .destinations = ToView(fetch.destinations)});
+    }
+    return out;
 }
 
 }  // namespace ts_scheduler

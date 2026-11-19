@@ -61,6 +61,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         launch_gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_query_rows_gfx950 as _mla_decode_query_rows_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.extend import (
         launch_gluon_mla_extend_gfx950 as _mla_extend_gfx950_impl,
     )
@@ -93,6 +96,9 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
         launch_gluon_mla_decode_query_blocks_gfx1250 as _mla_decode_query_blocks_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        launch_gluon_mla_decode_query_blocks_projected_value_gfx1250 as _mla_decode_query_blocks_projected_value_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.extend import (
         launch_gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
@@ -288,6 +294,39 @@ if current_platform().is_amd:
     )
     def gluon_mla_decode_fp8_query_blocks_gfx950(*args, **kwargs):
         return _mla_decode_fp8_query_blocks_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_query_rows",
+        name="gluon_mla_decode_query_rows_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(kv_dtype),
+            )
+            for q_dtype, kv_dtype in (
+                (torch.bfloat16, torch.float8_e4m3fn),
+                (torch.bfloat16, torch.float8_e5m2),
+                (torch.float8_e4m3fn, torch.float8_e4m3fn),
+            )
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset(range(1, 17)),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_decode_query_rows_gfx950(*args, **kwargs):
+        return _mla_decode_query_rows_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -662,6 +701,59 @@ if current_platform().is_amd:
     )
     def gluon_mla_decode_projected_value_gfx1250(*args, **kwargs):
         return _mla_decode_projected_value_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_projected_value",
+        name="gluon_mla_decode_query_blocks_projected_value_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e4m3fn),
+                    kv_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    value_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e5m2),
+                    kv_cache=dense_tensor_format(torch.float8_e5m2),
+                    value_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Every (token, head) row reloads its value-weight slice, so past
+            # 16 rows the batched projection GEMM wins.
+            "batch_size": frozenset({1, 2, 3, 4}),
+            "q_len": frozenset({2, 3, 4}),
+            "num_q_heads": frozenset(range(1, 129)),
+            "value_head_dim": frozenset({128}),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "gate_kind": frozenset({"none", "sigmoid"}),
+            "logit_cap": frozenset({False}),
+            "sliding_window": frozenset({False}),
+            "block_on_query_axis": frozenset({True}),
+            "noncausal_block_size": frozenset({1}),
+        },
+    )
+    def gluon_mla_decode_query_blocks_projected_value_gfx1250(*, q, **kwargs):
+        counters = zeroed_state(
+            q.shape[0] * q.shape[1] * q.shape[2], dtype=torch.int32, device=q.device
+        )
+        return _mla_decode_query_blocks_projected_value_gfx1250_impl(
+            q=q, counters=counters, **kwargs
+        )
 
     @register_kernel(
         "attention",

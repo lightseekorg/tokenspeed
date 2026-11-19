@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -115,7 +116,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
     // r2: same 8-token prefix, 12-token prefill target -> 4 NEW tokens.
     {
-        const CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
+        const PrefixProbe prefix = coordinator.Prober().ProbePrefix(hashes8);
         ASSERT_EQ(prefix.device.num_common_tokens, 8);
         ASSERT_EQ(std::ranges::count(prefix.device.per_group[1].hits, std::uint8_t{1}), 4)
             << "W=16 must keep every SWA prefix page real";
@@ -124,7 +125,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     // Claimed pages carry no available capacity: the next allocation starts a fresh block.
     {
         std::vector<BlockTable> probe(coordinator.NumGroups());
-        ASSERT_TRUE(AdmitForTest(coordinator, probe, coordinator.ProbePrefix(hashes8), GroupDemand{}));
+        ASSERT_TRUE(AdmitForTest(coordinator, probe, coordinator.Prober().ProbePrefix(hashes8), GroupDemand{}));
         EXPECT_EQ(probe[0].AvailableTokens(), 0);
         EXPECT_EQ(probe[1].AvailableTokens(), 0);
         EXPECT_EQ(coordinator.GroupBlocksNeededFor(0, probe[0], /*num_tokens=*/4), 2);
@@ -134,7 +135,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     std::vector<BlockTable> r2(coordinator.NumGroups());
-    CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
+    PrefixProbe prefix = coordinator.Prober().ProbePrefix(hashes8);
     ASSERT_TRUE(AdmitForTest(coordinator, r2, std::move(prefix), GroupDemand{.extent = DenseGrowth{4}}));
 
     // Per-group table: 4 claimed prefix pages + ceil(4 new / 2) = 2 fresh = 6.
@@ -226,10 +227,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     // free before four fresh pages are acquired, for a net cost of two.
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[0]}}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[1]}}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[2]}}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[3]}}));
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
@@ -473,6 +478,7 @@ SchedulerConfig MakeValidConfig() {
     config.device_allocator.total_pages = 32;
     config.max_scheduled_tokens = 1024;
     config.max_batch_size = 8;
+    config.max_resident_requests = config.max_batch_size;
     CacheGroupConfig group;
     group.group_id = "full";
     group.block_granularity = 128;
@@ -659,6 +665,33 @@ TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingWindowGroup) {
     ExpectRejectedNamingGroup(config, "swa");
 }
 
+TEST(SchedulerConfigValidateTest, RejectsASlidingWindowThatABlockTakesPastInt32) {
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig& group = config.cache_groups[0];
+    group.group_id = "long_window";
+    group.attn_kind = AttnKind::kSlidingWindow;
+    group.sliding_window_tokens = std::numeric_limits<std::int32_t>::max() - group.block_granularity;
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    group.sliding_window_tokens = std::numeric_limits<std::int32_t>::max() - group.block_granularity + 1;
+    ExpectRejectedNamingGroup(config, "long_window");
+}
+
+TEST(SchedulerConfigValidateTest, ReplayBudgetPastInt32IsRejected) {
+    // A replayable window of 1.5 * 2^30 tokens: a hit chunk needs replay plus
+    // a window, 3 * 2^30 tokens, which no int32 budget holds.
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig swa;
+    swa.group_id = "swa";
+    swa.block_granularity = 64;
+    swa.total_pages = config.device_allocator.total_pages;
+    swa.attn_kind = AttnKind::kSlidingWindow;
+    swa.sliding_window_tokens = 3 << 29;
+    swa.replayable = true;
+    config.cache_groups.push_back(swa);
+    config.max_scheduled_tokens = std::numeric_limits<std::int32_t>::max();
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+}
+
 TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig swa;
@@ -809,6 +842,31 @@ TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.debug_force_retraction_interval = 0;
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+}
+
+TEST(SchedulerConfigValidateTest, ForcedRetractionIntervalHasAnInt32Magnitude) {
+    // Its magnitude is the period in plans; INT32_MIN has none in int32.
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t interval :
+         {std::numeric_limits<std::int32_t>::max(), -std::numeric_limits<std::int32_t>::max()}) {
+        config.debug_force_retraction_interval = interval;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate()) << interval;
+    }
+    config.debug_force_retraction_interval = std::numeric_limits<std::int32_t>::min();
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+}
+
+TEST(SchedulerConfigValidateTest, RejectsANegativeHostPageCount) {
+    // 0 and the null page alone both mean no Host pool.
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t pages : {0, 1}) {
+        config.host_allocator.total_pages = pages;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate()) << pages;
+    }
+    for (const std::int32_t pages : {-1, std::numeric_limits<std::int32_t>::min()}) {
+        config.host_allocator.total_pages = pages;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << pages;
+    }
 }
 
 TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {

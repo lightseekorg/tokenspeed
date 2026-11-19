@@ -179,10 +179,6 @@ class VocabParallelEmbeddingShardIndices:
         return self.num_org_elements_padded - self.num_org_elements
 
     @property
-    def num_added_vocab_padding(self) -> int:
-        return self.num_added_elements_padded - self.num_added_elements
-
-    @property
     def num_elements_padded(self) -> int:
         return self.num_org_elements_padded + self.num_added_elements_padded
 
@@ -421,71 +417,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             added_vocab_end_index,
         )
 
-    def get_sharded_to_full_mapping(self) -> list[int] | None:
-        """Get a mapping that can be used to reindex the gathered
-        logits for sampling.
-
-        During sampling, we gather logits from all ranks. The relationship
-        of index->token_id will follow the same format as outlined in the class
-        docstring. However, after the gather, we want to reindex the final
-        logits tensor to map index->token_id one-to-one (the index is always
-        equal the token_id it corresponds to). The indices returned by this
-        method allow us to do that.
-        """
-        if self.tp_size < 2:
-            return None
-
-        base_embeddings: list[int] = []
-        added_embeddings: list[int] = []
-        padding: list[int] = []
-        for tp_rank in range(self.tp_size):
-            shard_indices = self._get_indices(
-                self.num_embeddings_padded,
-                self.org_vocab_size_padded,
-                self.num_embeddings,
-                self.org_vocab_size,
-                tp_rank,
-                self.tp_size,
-            )
-            range_start = self.num_embeddings_per_partition * tp_rank
-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
-            base_embeddings.extend(
-                range(range_start, range_start + shard_indices.num_org_elements)
-            )
-            padding.extend(
-                range(
-                    range_start + shard_indices.num_org_elements,
-                    range_start + shard_indices.num_org_elements_padded,
-                )
-            )
-            added_embeddings.extend(
-                range(
-                    range_start + shard_indices.num_org_elements_padded,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                )
-            )
-            padding.extend(
-                range(
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements,
-                    range_start
-                    + shard_indices.num_org_elements_padded
-                    + shard_indices.num_added_elements_padded,
-                )
-            )
-            assert (
-                range_start
-                + shard_indices.num_org_elements_padded
-                + shard_indices.num_added_elements_padded
-                == range_end
-            )
-        ret = base_embeddings + added_embeddings + padding
-        assert len(ret) == self.num_embeddings_padded
-        return ret
-
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
@@ -723,11 +654,6 @@ class ParallelLMHead(VocabParallelEmbedding):
             )
         else:
             self.register_parameter("bias", None)
-
-    def tie_weights(self, embed_tokens: VocabParallelEmbedding):
-        """Tie the weights with word embeddings."""
-        self.weight = embed_tokens.weight
-        return self
 
     def forward(self, input_):
         del input_

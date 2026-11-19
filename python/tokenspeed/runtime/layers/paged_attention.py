@@ -58,7 +58,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_write_slots
 from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
     V_CACHE_SCALE_SUFFIXES,
@@ -333,6 +333,30 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def write_kv_at(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> None:
+        """The prologue's head steps, writing K/V to ``slots`` (0 for a padded row)."""
+        norm, rotary = self._steps(positions)
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=rotary,
+            cache=self._local_target(slots, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
+            return_kv=False,
+            solution=None,
+            override=None,
+        )
+
     def relative_prologue(
         self,
         q: torch.Tensor,
@@ -412,8 +436,9 @@ class PagedAttention(nn.Module):
         self, slots: torch.Tensor, ctx: ForwardContext
     ) -> HeadKVCache | LatentKVCache:
         """The pool's target for ``slots``, local to this rank's shard under KVP."""
-        slots, owned = resolve_cache_slots(
-            slots, ctx.attn_backend.cache_placement(self)
+        placement = ctx.attn_backend.cache_placement(self)
+        slots, owned = resolve_write_slots(
+            slots, placement, ctx.attn_backend.sparse_topk
         )
         target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
         if (
@@ -697,7 +722,7 @@ def _check_visibility_within_retention(
             f"sink tokens but cache group {spec.group_id!r} retains {spec.sink_tokens}."
         )
     # The scheduler keeps the last `retained - 1` computed tokens ahead of
-    # the next position (GroupGeometry::ExpiredBlocksAt), exactly the HF
+    # the next position (GroupGeometry::ExpiredBlockEndAt), exactly the HF
     # window minus the current token.
     if retained is None or window_left + 1 > retained:
         raise ValueError(

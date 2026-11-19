@@ -32,9 +32,18 @@ from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
 )
 from tokenspeed_triton.language.core import _aggregate as aggregate
 
+
+def compile_ahead(kernel, *args, **kwargs) -> None:
+    """Compile and load ``kernel`` for these arguments without launching it."""
+    compiled = kernel.warmup(*args, **kwargs, grid=(1,))
+    if compiled is not None:
+        compiled._init_handles()
+
+
 __all__ = [
     "aggregate",
     "cdna4_async_copy",
+    "compile_ahead",
     "gl",
     "gluon",
     "gluon_builtin",
