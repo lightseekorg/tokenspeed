@@ -1081,13 +1081,14 @@ Before benchmarking:
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
 
-DWDP requires the CUDA 13 toolkit.
+DWDP supports the CUDA 12.8 and 13 toolkits.
 
 The initial K3 configuration (NVFP4 or MXFP4 experts on the FlashInfer TRT-LLM
 kernels; pass `--moe-backend flashinfer_trtllm` for MXFP4, where `auto` may
 select another kernel) requires `--attn-tp-size 1 --moe-tp-size 1
---ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
-`--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
+--ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`, and a
+fixed prefill token budget. Eager execution and ordinary breakable prefill
+graphs are supported.
 The weight-sharing size must divide the instance size. Shared-expert and
 attention-projection TP overrides must also remain local. The additional
 staging memory is allocated before KV cache sizing. Live checkpoint replacement

@@ -19,7 +19,7 @@ a `PreparedExpertWeights` manifest: a layout identity, processed expert-major
 tensors, and an explicit distinction
 between streamed weights and small per-expert constants. Non-expert state stays
 on the layer. In particular, the loader must preserve the existing layer-wide
-input-scale maximum across all logical experts. The initial FlashInfer TRTLLM
+input-scale maximum across all logical experts. The initial FlashInfer TRT-LLM
 NVFP4 and MXFP4 SiTU paths supply this manifest directly. MXFP4 experts store no
 input scale; the kernel quantizes their activations on each forward.
 
