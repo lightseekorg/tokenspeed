@@ -52,7 +52,10 @@ count and seconds) carry `tokenspeed.` prefixes. The span is a SERVER
 span; an aborted or transfer-failed request carries the error status. The
 lifecycle points ride as time-stamped events
 (`tokenspeed.request.scheduled`, `…prefill_done`, `…first_token`)
-between the span's start (received) and end (finished).
+between the span's start (received) and end (finished). On a decode role
+`prefill_done` is the remote KV landing and `first_token` is the first local
+decode output; the span's TTFT therefore includes the wait for a decode
+execution permit, and `decode_process` / `tpot` start after it.
 
 ## What stays out
 
