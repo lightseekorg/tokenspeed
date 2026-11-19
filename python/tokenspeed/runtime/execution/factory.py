@@ -300,7 +300,7 @@ def create_model_executor(
     draft_attn_backend: AttentionBackend | None = None,
     draft_token_to_kv_pool: CachePool | None = None,
 ) -> ModelExecutor:
-    """Create the model executor with its sampler configuration."""
+    """Create the executor with CPU-backed, address-stable sampler buffers."""
     if server_args.enable_nvtx:
         set_nvtx_enabled(True)
 
@@ -310,17 +310,18 @@ def create_model_executor(
         config.spec_num_tokens if config.spec_algo is not None else 1
     )
 
-    sampling_backend = create_sampling_backend(
-        server_args,
-        hf_config=model_runner.model_config.hf_text_config,
-        max_bs=max_bs,
-        max_draft_tokens_per_req=max_draft_tokens_per_req,
-        device=config.device,
-        max_req_pool_size=config.max_req_pool_size,
-        vocab_size=config.vocab_size,
-        # Same TP group as LogitsProcessor.
-        tp_group=model_runner.mapping.attn.tp_group,
-    )
+    with token_to_kv_pool.arena.memory_saver_adapter.named_region("runtime_states"):
+        sampling_backend = create_sampling_backend(
+            server_args,
+            hf_config=model_runner.model_config.hf_text_config,
+            max_bs=max_bs,
+            max_draft_tokens_per_req=max_draft_tokens_per_req,
+            device=config.device,
+            max_req_pool_size=config.max_req_pool_size,
+            vocab_size=config.vocab_size,
+            # Same TP group as LogitsProcessor.
+            tp_group=model_runner.mapping.attn.tp_group,
+        )
 
     return ModelExecutor(
         config=config,

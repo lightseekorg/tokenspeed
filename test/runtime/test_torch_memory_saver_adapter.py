@@ -20,8 +20,9 @@
 
 """CPU checks for managed versus resident native allocation scopes."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from test.ci_system.ci_register import register_cuda_ci
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -168,6 +169,43 @@ def test_disabled_adapter_initializes_communication_immediately(memory):
     assert outputs[0].item() == 23
 
 
+def test_graph_rng_storage_survives_sleep_before_graph_replay(
+    memory, buffers, monkeypatch
+):
+    class CudaGraph:
+        """Replace unavailable CUDA capture, retaining its RNG Tensor owners."""
+
+        def __init__(self):
+            self.seed = None
+            self.offset = None
+
+        def register_generator_state(self, generator):
+            self.seed = buffers.allocate(17)
+            self.offset = buffers.allocate(29)
+
+    @contextmanager
+    def capture(**kwargs):
+        assert not buffers.active
+        yield
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "default_generators", (object(),))
+    monkeypatch.setattr(memory, "cuda_graph", capture, raising=False)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    graph = CudaGraph()
+    with saver.cuda_graph(graph, pool=None, stream=None, tag="cuda_graph"):
+        temporary = memory.allocate(41)
+    tensors = (graph.seed, graph.offset)
+    addresses = [tensor.data_ptr() for tensor in tensors]
+    for _ in range(3):
+        saver.pause(tag="weights")
+        assert all(tensor.item() == 0 for tensor in tensors)
+        saver.resume(tag="weights")
+        assert [tensor.data_ptr() for tensor in tensors] == addresses
+        assert [tensor.item() for tensor in tensors] == [17, 29]
+        assert temporary.item() == 41
+
+
 @pytest.mark.parametrize(
     "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
 )
@@ -229,3 +267,263 @@ def test_unknown_named_region_is_rejected(memory, enabled):
     with pytest.raises(KeyError, match="unknown_owner"):
         with saver.named_region("unknown_owner"):
             pytest.fail("unknown region entered its allocation scope")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
+    memory, buffers, monkeypatch, enabled
+):
+    from tokenspeed.runtime.cache.transfer import lanes
+
+    class Workspace:
+        """CPU-backed stand-in for device allocations at the kernel boundary."""
+
+        def __init__(self):
+            self.bindings = None
+            self.rows = None
+            self.capacity = 0
+
+        def load_block_transfers(self, transfers, *, geometry):
+            return len(transfers), ()
+
+        def prepare_backend(self, *args, **kwargs):
+            if self.bindings is None:
+                self.bindings = buffers.allocate(17)
+            return SimpleNamespace(uses_device_tables=True)
+
+        def commit_block_transfers(self, count, device, *, non_blocking):
+            if count > self.capacity:
+                self.rows = buffers.allocate(count)
+                self.capacity = count
+
+    class Event:
+        def record(self, stream):
+            pass
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(lanes, "HostTransferWorkspace", Workspace)
+    monkeypatch.setattr(
+        lanes,
+        "device_module",
+        SimpleNamespace(stream=lambda stream: nullcontext(), Event=Event),
+    )
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    lane = lanes.HostTransferLane(saver)
+    for count in (1, 257):
+        assert (
+            lane._stage(
+                [(0, 1, 1)] * count,
+                device_buffers=(SimpleNamespace(device="cuda"),),
+                host_buffer=object(),
+                geometry=object(),
+                stream=object(),
+                backend="auto",
+            )
+            == count
+        )
+        tensors = (lane.workspace.bindings, lane.workspace.rows)
+        pointers = [tensor.data_ptr() for tensor in tensors]
+        expected = [tensor.clone() for tensor in tensors]
+        for tensor in tensors:
+            allocation = next(row for row in buffers.allocations if row[1] is tensor)
+            assert allocation[0] == ("weights" if enabled else None)
+            assert allocation[2] is enabled
+        buffers.pause(tag="weights")
+        if enabled:
+            assert all(tensor.item() == 0 for tensor in tensors)
+        buffers.resume(tag="weights")
+        assert [tensor.data_ptr() for tensor in tensors] == pointers
+        for tensor, reference in zip(tensors, expected):
+            torch.testing.assert_close(tensor, reference, rtol=0, atol=0)
+
+
+def test_cache_arena_geometry_survives_sleep_with_its_original_address(
+    memory, buffers, monkeypatch
+):
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheFieldSpec,
+        pack,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    group = CacheGroupSpec(
+        group_id="full_attention",
+        attn_kind="full_history",
+        rows_per_page=8,
+        entry_stride_tokens=1,
+        transfer_policy="full_suffix",
+        replayable=False,
+    )
+    layout = pack(
+        (
+            (
+                group,
+                (CacheFieldSpec("layer.0.kv", "layer.0.kv", (8, 1, 32), "bfloat16"),),
+            ),
+        ),
+        prefix_granularity=8,
+        cache_blocks_per_lcm_block={group.group_id: 1},
+        alignment=256,
+        max_padding_fraction=0.25,
+    )
+    real_tensor = torch.tensor
+
+    def allocate(*args, **kwargs):
+        tensor = real_tensor(*args, **kwargs)
+        if buffers.active:
+            buffers.allocations.append((buffers.tag, tensor, buffers.cpu_backup))
+        return tensor
+
+    # Only the unavailable pausable CUDA allocator is replaced. Arena ownership,
+    # geometry construction, Torch storage and adapter dispatch remain real.
+    monkeypatch.setattr(torch, "tensor", allocate)
+    arena = CacheArena(
+        layout.bind(2), "cpu", cache_group_specs=(group,), enable_memory_saver=True
+    )
+    table = arena._zero_field_tables[group.group_id][1]
+    address = table.data_ptr()
+    expected = table.clone()
+    assert any(
+        t.data_ptr() == address and backup for _, t, backup in buffers.allocations
+    )
+    for _ in range(2):
+        arena.memory_saver_adapter.pause(tag="weights")
+        assert not table.count_nonzero()
+        arena.memory_saver_adapter.resume(tag="weights")
+        assert table.data_ptr() == address
+        torch.testing.assert_close(table, expected)
+
+
+@pytest.mark.parametrize("with_draft", [False, True])
+def test_capture_metadata_survives_sleep_for_target_and_draft(
+    memory, buffers, with_draft
+):
+    from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+
+    class CpuAttentionMetadata:
+        """Replace GPU metadata construction, retaining the allocated Tensor owner."""
+
+        def __init__(self):
+            self.tensor = None
+
+        def init_forward_metadata_capture_cuda_graph(self, batch_size, *args, **kwargs):
+            self.tensor = buffers.allocate(batch_size)
+
+    # The capture runner's allocation scope stays real; GPU inputs/backends are
+    # replaced because this test verifies CPU allocator ownership and recovery.
+    runner = object.__new__(ForwardStepRunner)
+    runner.memory_saver_adapter = adapter.TorchMemorySaverAdapter.create(enable=True)
+    runner.attn_backend = CpuAttentionMetadata()
+    runner.draft_attn_backend = CpuAttentionMetadata() if with_draft else None
+    runner.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.arange(2),
+        seq_lens_buf=torch.ones(2, dtype=torch.int32),
+    )
+    runner._placeholder_tables = {}
+    runner.max_tokens_per_req = 1
+    runner.drafter = SimpleNamespace(round_block_tables=None) if with_draft else None
+    runner._init_capture_metadata(2)
+    tensors = [runner.attn_backend.tensor]
+    if with_draft:
+        tensors.append(runner.draft_attn_backend.tensor)
+        assert runner.drafter.round_block_tables == {}
+    addresses = [tensor.data_ptr() for tensor in tensors]
+    for _ in range(2):
+        runner.memory_saver_adapter.pause(tag="weights")
+        assert all(tensor.item() == 0 for tensor in tensors)
+        runner.memory_saver_adapter.resume(tag="weights")
+        assert [tensor.data_ptr() for tensor in tensors] == addresses
+        assert all(tensor.item() == 2 for tensor in tensors)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
+    memory, buffers, monkeypatch, enabled
+):
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.layers.attention.backends import cache_metadata
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+        CacheRuntimeContract,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    class ForwardInputsUnavailable(Exception):
+        """Stop at the GPU input-fill boundary after real metadata construction."""
+
+    tensors = []
+
+    def pack(op, device, **kwargs):
+        # Replace only the GPU table-packing boundary. The executor, metadata
+        # validation, shared-storage views and pool dispatch stay real.
+        tensor = buffers.allocate(len(op.request_ids))
+        tensors.append(tensor)
+        return SimpleNamespace(
+            tables={"full": tensor.expand(len(op.request_ids), 1)}, tables_cpu={}
+        )
+
+    def fill_inputs(**kwargs):
+        raise ForwardInputsUnavailable
+
+    monkeypatch.setattr(cache_metadata, "packed_block_tables_from_forward_op", pack)
+    group = CacheGroupSpec(
+        group_id="full",
+        attn_kind="full_history",
+        rows_per_page=1,
+        entry_stride_tokens=1,
+        transfer_policy="full_suffix",
+        replayable=False,
+    )
+    # The full executor needs GPU model construction; retain its real forward
+    # prologue and replace the unavailable device/stream and input-fill boundary.
+    executor = object.__new__(ModelExecutor)
+    executor.log_step = 0
+    executor.forward_step = SimpleNamespace(draft_overlap=None)
+    executor.device = torch.device("cpu")
+    executor.execution_stream = SimpleNamespace(wait_stream=lambda stream: None)
+    executor.default_stream = object()
+    executor.device_module = SimpleNamespace(stream=lambda stream: nullcontext())
+    executor.nan_guard = SimpleNamespace(reset=lambda count: None)
+    executor.runtime_states = SimpleNamespace(bind_stop_criteria=lambda *args: None)
+    executor.input_buffers = SimpleNamespace(fill_input_buffers=fill_inputs)
+    executor.memory_saver_adapter = adapter.TorchMemorySaverAdapter.create(
+        enable=enabled
+    )
+    executor._validate_page_ids = True
+    executor._cache_runtime_contract = CacheRuntimeContract(
+        prefix_granularity=1,
+        num_lcm_blocks=4,
+        token_capacity=4,
+        group_specs=(group,),
+        group_page_counts={"full": 5},
+        group_packing={"full": 1},
+    )
+    for count in (1, 3):
+        op = SimpleNamespace(
+            num_extends=lambda: 0,
+            input_lengths=[1] * count,
+            request_ids=list(range(count)),
+            request_pool_indices=list(range(count)),
+        )
+        with pytest.raises(ForwardInputsUnavailable):
+            executor.execute_forward_op(
+                op,
+                [],
+                ngram_inputs=None,
+                request_history_seeds=None,
+                input_logprob_plan=None,
+                sampled_top_k=0,
+                stop_criteria=[],
+                admission_ids=list(range(count)),
+            )
+        tensor = tensors[-1]
+        address = tensor.data_ptr()
+        allocation = next(row for row in buffers.allocations if row[1] is tensor)
+        assert allocation[0] == ("weights" if enabled else None)
+        executor.memory_saver_adapter.pause(tag="weights")
+        assert tensor.item() == (0 if enabled else count)
+        executor.memory_saver_adapter.resume(tag="weights")
+        assert tensor.data_ptr() == address
+        assert tensor.item() == count

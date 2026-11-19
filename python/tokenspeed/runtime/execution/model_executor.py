@@ -864,7 +864,10 @@ class ModelExecutor:
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
         self._prev_decode_bs: int = 0
-        self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self._sentinel_neg1 = torch.tensor(
+                -1, device=self.device, dtype=torch.int64
+            )
         self.mm_runtime = MultimodalRuntime(
             model_is_mrope=config.model_is_mrope,
             input_buffers=self.input_buffers,
@@ -2609,6 +2612,7 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        """Run a scheduled forward with cache tables in the restorable metadata pool."""
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2655,15 +2659,16 @@ class ModelExecutor:
             if bs > 0:
                 # Check the per-group tables' structure and pack them once for
                 # this batch; the page IDs only under the diagnostic.
-                cache_metadata = CacheBatchMetadata.from_forward_op(
-                    forward_op,
-                    device=self.device,
-                    contract=self._cache_runtime_contract,
-                    num_requests=bs,
-                    validate_page_ids=self._validate_page_ids,
-                    # Only an extend plans from host tables.
-                    host_tables=num_extends > 0,
-                )
+                with self.memory_saver_adapter.named_region("attention_state"):
+                    cache_metadata = CacheBatchMetadata.from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        contract=self._cache_runtime_contract,
+                        num_requests=bs,
+                        validate_page_ids=self._validate_page_ids,
+                        # Only an extend plans from host tables.
+                        host_tables=num_extends > 0,
+                    )
                 block_tables = dict(cache_metadata.tables(active_forward_op=forward_op))
                 if num_extends > 0:
                     block_tables_cpu = dict(

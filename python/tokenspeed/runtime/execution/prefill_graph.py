@@ -1352,25 +1352,26 @@ class PrefillGraph:
             query_shard=query_shard,
             **extra_metadata_kwargs,
         )
-        self.attn_backend.init_forward_metadata(
-            bs=bs,
-            num_extends=bs,
-            req_pool_indices=ib.req_pool_indices_buf[:bs],
-            seq_lens=ib.seq_lens_buf[:bs],
-            forward_mode=ForwardMode.EXTEND,
-            **extend_kwargs,
-        )
-        if draft_attn_backend is not None:
-            prepare_draft_extend_metadata(
-                draft_attn_backend,
-                self.drafter,
-                padded_bs=bs,
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.init_forward_metadata(
+                bs=bs,
                 num_extends=bs,
                 req_pool_indices=ib.req_pool_indices_buf[:bs],
                 seq_lens=ib.seq_lens_buf[:bs],
                 forward_mode=ForwardMode.EXTEND,
                 **extend_kwargs,
             )
+            if draft_attn_backend is not None:
+                prepare_draft_extend_metadata(
+                    draft_attn_backend,
+                    self.drafter,
+                    padded_bs=bs,
+                    num_extends=bs,
+                    req_pool_indices=ib.req_pool_indices_buf[:bs],
+                    seq_lens=ib.seq_lens_buf[:bs],
+                    forward_mode=ForwardMode.EXTEND,
+                    **extend_kwargs,
+                )
         return ctx
 
     # ------------------------------------------------------------------

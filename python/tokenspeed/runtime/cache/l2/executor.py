@@ -220,6 +220,7 @@ class HostCacheExecutor:
             raise ValueError("a snapshot pool needs the slot-state exporters")
         self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
+        self._memory_saver_adapter = device_pool.arena.memory_saver_adapter
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
             draft_pool.cache_transfer_layout() if draft_pool is not None else None
@@ -443,23 +444,24 @@ class HostCacheExecutor:
         self.load_stream = new_cache_stream(load_stream_priority())
         # Both streams consume these immutable tables; the kernel backend
         # publishes them to the Device once. One geometry per Host buffer.
-        if l2_tier:
-            self._transfer_geometry = build_transfer_geometry(
-                self.layout, self.host_storage, io_backend=io_backend
-            )
-        if snapshot_lcm_blocks:
-            self._snapshot_geometry = build_transfer_geometry(
-                self.layout, self.snapshot_storage, io_backend=io_backend
-            )
+        with self._memory_saver_adapter.named_region("workspace"):
+            if l2_tier:
+                self._transfer_geometry = build_transfer_geometry(
+                    self.layout, self.host_storage, io_backend=io_backend
+                )
+            if snapshot_lcm_blocks:
+                self._snapshot_geometry = build_transfer_geometry(
+                    self.layout, self.snapshot_storage, io_backend=io_backend
+                )
         # One staging lane per submission kind a round may make, so none
         # waits on another's pinned metadata tables: the stream-ordered and
         # pinned L2 write-backs, the snapshot store, and the restore's two
         # tiers.
-        self._ordered_write_lane = HostTransferLane()
-        self._pinned_write_lane = HostTransferLane()
-        self._snapshot_write_lane = HostTransferLane()
-        self._restore_l2_lane = HostTransferLane()
-        self._restore_pool_lane = HostTransferLane()
+        self._ordered_write_lane = HostTransferLane(self._memory_saver_adapter)
+        self._pinned_write_lane = HostTransferLane(self._memory_saver_adapter)
+        self._snapshot_write_lane = HostTransferLane(self._memory_saver_adapter)
+        self._restore_l2_lane = HostTransferLane(self._memory_saver_adapter)
+        self._restore_pool_lane = HostTransferLane(self._memory_saver_adapter)
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
@@ -511,7 +513,10 @@ class HostCacheExecutor:
                 (self.write_stream, write_workspaces),
                 (self.load_stream, load_workspaces),
             ):
-                with device_module.stream(stream):
+                with (
+                    device_module.stream(stream),
+                    self._memory_saver_adapter.named_region("workspace"),
+                ):
                     for workspace in workspaces:
                         workspace.prepare_backend(
                             self.layout.buffers,
@@ -1117,7 +1122,10 @@ class HostCacheExecutor:
             )
             layer_slices = self._transfer_geometry.layer_slices
             # Resolve the transport before choosing the consumer wait protocol.
-            with device_module.stream(self.load_stream):
+            with (
+                device_module.stream(self.load_stream),
+                self._memory_saver_adapter.named_region("workspace"),
+            ):
                 mode = workspace.prepare_backend(
                     self.layout.buffers,
                     self.host_storage.host_buffer,
