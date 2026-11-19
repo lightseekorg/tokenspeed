@@ -291,7 +291,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
 
     forward()
     torch.cuda.synchronize()
-    ordinary = BreakableCapture()
+    ordinary = BreakableCapture(run_segments_while_capturing=False)
     with ordinary:
         forward()
     assert ordinary.num_segments == 7  # Three eager breaks + four graphs.
@@ -299,7 +299,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     retained = leaf.forward_metadata
     forward()
     torch.cuda.synchronize()
-    merged = BreakableCapture()
+    merged = BreakableCapture(run_segments_while_capturing=False)
     with merged:
         output = forward()
     assert merged.num_segments == 3  # Only full attention remains an eager break.
@@ -1473,7 +1473,7 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
     leaf.prepare_prefill_metadata(_BUCKET, 1, ForwardMode.EXTEND, capture=True)
     forward()
     torch.cuda.synchronize()
-    inline = BreakableCapture()
+    inline = BreakableCapture(run_segments_while_capturing=False)
     with maybe_inference_mode(), inline:
         inline_output = forward()
     assert inline.num_segments == 1

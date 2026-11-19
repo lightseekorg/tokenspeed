@@ -1202,7 +1202,7 @@ def _padded_replay_worker(rank, degree, rendezvous):
             # Capture as PrefillGraph._capture_bucket does, then replay once unpadded.
             backend.begin(capture_table, capture_prefill, device)
             dummy = extend_ctx(backend, pool, capture_prefill)
-            capture = BreakableCapture()
+            capture = BreakableCapture(run_segments_while_capturing=False)
             capture.stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
                 with torch.cuda.stream(capture.stream):

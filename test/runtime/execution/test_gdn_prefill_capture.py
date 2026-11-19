@@ -679,7 +679,7 @@ def test_qwen4_exp_composite_captures_gdn_inline_around_full_attention():
     def capture():
         forward()
         torch.cuda.synchronize()
-        graph = BreakableCapture()
+        graph = BreakableCapture(run_segments_while_capturing=False)
         with active_forward(ctx), graph:
             output = forward()
         return graph, output

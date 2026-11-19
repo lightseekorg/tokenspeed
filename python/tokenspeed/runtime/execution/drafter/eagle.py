@@ -1089,7 +1089,9 @@ class Eagle(HiddenStateDrafter):
                 ctx, tile.ids, tile.positions, tile.hidden, tile.locations
             )
 
+        # Breaks read the pre-zeroed, capture-external tile inputs, not segment outputs.
         cap = BreakableCapture(
+            run_segments_while_capturing=False,
             pool=self._extend_graph_pool,
             stream=capture.stream,
             handoff_storage=self._extend_graph_handoffs,

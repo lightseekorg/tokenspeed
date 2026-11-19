@@ -186,7 +186,7 @@ class BreakableCapture:
 
     Usage::
 
-        cap = BreakableCapture(pool=shared_pool)
+        cap = BreakableCapture(pool=shared_pool, run_segments_while_capturing=False)
         with cap:
             model_forward(...)        # attention calls hit break_here()
         # later, after copying live inputs into the static buffers:
@@ -229,7 +229,7 @@ class BreakableCapture:
         stream: torch.cuda.Stream | None = None,
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
         *,
-        run_segments_while_capturing: bool = False,
+        run_segments_while_capturing: bool,
     ) -> None:
         self.pool = pool
         self._run_segments_while_capturing = run_segments_while_capturing

@@ -3804,7 +3804,7 @@ def _capture_padded_prefill(router, pool, forward):
     positions = torch.arange(_PADDED_BUCKET, device="cuda")
     hidden = torch.randn(_PADDED_BUCKET, 256, device="cuda", dtype=torch.bfloat16)
     dummy = _extend_ctx(router, pool, [3], [0], [_PADDED_BUCKET], [1])
-    capture = BreakableCapture()
+    capture = BreakableCapture(run_segments_while_capturing=False)
     # Warm up where the capture runs: on the capture stream, behind this one's writes.
     capture.stream.wait_stream(torch.cuda.current_stream())
     with torch.no_grad():
