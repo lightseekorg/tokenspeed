@@ -862,6 +862,23 @@ def test_reject_unbounded_candidate_input(device):
         )
 
 
+def test_allocate_fp8_output_zeroed_layout():
+    rows, groups = 5, 8
+    codes, scales = dsv41.allocate_fp8_output(
+        torch.device("cpu"), groups, rows, zeroed=True
+    )
+    assert codes.dtype == torch.float8_e4m3fn
+    assert codes.shape == (rows, groups, 64 * 512 // groups)
+    assert codes.is_contiguous()
+    assert scales.dtype == torch.int32
+    assert scales.shape == (rows, groups, 64 * 512 // groups // 128)
+    # Rows are the fastest dimension, over storage padded to four rows.
+    assert scales.stride(0) == 1
+    assert scales.stride(1) == (rows + 3) // 4 * 4 * scales.shape[2]
+    assert not codes.view(torch.uint8).any()
+    assert not scales.any()
+
+
 @pytest.mark.parametrize(
     "zeroed,selector,expected",
     [
