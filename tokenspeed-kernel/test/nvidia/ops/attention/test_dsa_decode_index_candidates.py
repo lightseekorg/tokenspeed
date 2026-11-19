@@ -23,7 +23,8 @@
 Both score the same FP32 logits over a rank's compact owned pages, so every
 row's sorted candidate scores must match bit for bit, and so must the
 positions above the row's k-th score; ties at it may resolve differently, in
-equal number. Rows of 1, 4 and 8 per request, skewed ownership, short and
+equal number. A row that fits the top-k over every rank keeps all its local
+keys, scored 0. Rows of 1, 4 and 8 per request, skewed ownership, short and
 empty rows, and a send buffer's rows as the scores' storage.
 """
 
@@ -93,8 +94,19 @@ def _inputs(requests, group, lengths, degree, rank, seed):
     return plane, table, row_requests, causal, q.bfloat16(), weights.bfloat16()
 
 
-def _check_rows(positions, scores, ref_positions, ref_scores):
+def _check_rows(positions, scores, ref_positions, ref_scores, causal):
     for row in range(positions.shape[0]):
+        if causal[row] <= TOPK:
+            # Every key the DeepGEMM leaf scores, in key order and scored 0.
+            live = ref_scores[row] > -float("inf")
+            count = int(live.sum())
+            assert (scores[row, :count] == 0).all(), row
+            assert sorted(positions[row, :count].tolist()) == sorted(
+                ref_positions[row][live].tolist()
+            ), row
+            assert (positions[row, count:] == -1).all(), row
+            assert (scores[row, count:] == -float("inf")).all(), row
+            continue
         got, order = scores[row].sort(descending=True)
         want, ref_order = ref_scores[row].sort(descending=True)
         assert torch.equal(got.view(torch.int32), want.view(torch.int32)), row
@@ -116,8 +128,9 @@ def _check_rows(positions, scores, ref_positions, ref_scores):
 @pytest.mark.parametrize("degree,rank", [(1, 0), (8, 3)])
 def test_kvp_decode_candidates_match_the_deep_gemm_candidates(group, degree, rank):
     # Long, past-topk, short (fewer keys than topk on this rank) and empty
-    # requests; a window past a page edge.
-    lengths = [40000, 2048 * degree + 77, 900, group, 130 * PAGE + 3]
+    # requests; a window past a page edge; one whose earlier rows fit the top-k
+    # over every rank and later ones do not.
+    lengths = [40000, 2048 * degree + 77, 900, group, 130 * PAGE + 3, TOPK + 3]
     plane, table, requests, causal, q, weights = _inputs(
         len(lengths), group, lengths, degree, rank, seed=group * 10 + degree
     )
@@ -146,6 +159,7 @@ def test_kvp_decode_candidates_match_the_deep_gemm_candidates(group, degree, ran
         weights,
         plane,
         pages,
+        row_lengths=causal,
         query_group_size=group,
         page_size=PAGE,
         topk=TOPK,
@@ -156,7 +170,7 @@ def test_kvp_decode_candidates_match_the_deep_gemm_candidates(group, degree, ran
     )
     assert scores.data_ptr() == buffer[:, 2:-2].data_ptr()
     assert (buffer[:, :2] == 11.0).all() and (buffer[:, -2:] == 11.0).all()
-    _check_rows(positions, scores, ref_positions, ref_scores)
+    _check_rows(positions, scores, ref_positions, ref_scores, causal.tolist())
 
 
 def test_kvp_decode_candidates_compile_once_across_batches():
@@ -174,6 +188,7 @@ def test_kvp_decode_candidates_compile_once_across_batches():
             weights,
             plane,
             pages,
+            row_lengths=causal,
             query_group_size=8,
             page_size=PAGE,
             topk=TOPK,

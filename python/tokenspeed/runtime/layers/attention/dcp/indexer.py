@@ -341,7 +341,7 @@ def build_dcp_index_metadata(
     """
     local_table = _local_index_table(page_table, placement, page_size)
     query_requests = query_requests.contiguous()
-    causal_lens = causal_lens.contiguous()
+    causal_lens = causal_lens.to(torch.int32).contiguous()
     columns = _owned_columns(
         columns, q, weights, index_k_cache, local_table, page_size, index_k_format
     )
@@ -662,6 +662,7 @@ def _score_owned_rows(
             weights,
             index_k_cache,
             pages,
+            row_lengths=metadata.causal_lens,
             query_group_size=query_group_size,
             page_size=page_size,
             topk=topk,

@@ -332,7 +332,8 @@ def fused_decode_topk_scores(
         index_k_cache,
         block_table,
         seq_lens,
-        seq_lens,
+        seq_lens,  # row ends: the decode window's, from the request length
+        seq_lens,  # global ends: read under KVP only
         logits,
         tops,
     )
@@ -944,6 +945,7 @@ if _fused_indexer is not None:
         index_k_cache: torch.Tensor,
         pages: DSAIndexCandidatePages,
         *,
+        row_lengths: torch.Tensor,
         query_group_size: int,
         page_size: int,
         topk: int,
@@ -1030,6 +1032,7 @@ if _fused_indexer is not None:
             pages.pages[group - 1 :: group],
             row_ends[group - 1 :: group],
             row_ends,
+            row_lengths,
             logits,
             tops,
         )
@@ -1038,6 +1041,7 @@ if _fused_indexer is not None:
             tops,
             row_ends[group - 1 :: group],
             row_ends,
+            row_lengths,
             pages.positions[group - 1 :: group],
             positions,
             scores,

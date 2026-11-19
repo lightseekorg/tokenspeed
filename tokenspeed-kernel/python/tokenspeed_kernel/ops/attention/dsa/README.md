@@ -380,7 +380,8 @@ where it refuses.
 On SM100-SM103 the `cute_dsl` leaf runs the fused decode top-k's kernels in a
 KVP mode after the shared query quantization (`compile_candidates`):
 
-- The scorer scores every request, as a rank's share of the merged top-k is
+- The scorer scores every request whose last row sees more than `topk` keys
+  over every rank (`row_lengths`), as a rank's share of the merged top-k is
   unknown before the merge, over the request's compact pages: its last row's,
   of which every earlier row sees a prefix. Each row stops at its own local
   length, as rows of one verify window can end on different ranks' pages.
@@ -389,7 +390,9 @@ KVP mode after the shared query quantization (`compile_candidates`):
 - The select keeps each row's exact top-k (ties at the threshold to the lowest
   keys) and writes each key's logical position through the request's logical
   page columns and its logit, recovered from its order key. A row of at most
-  `topk` keys takes all of them with their logits.
+  `topk` keys takes all of them with their logits. A row whose `row_lengths`
+  fit `topk` takes all its keys in key order, scored 0, without logits: the
+  merged selection keeps every one of them anyway.
 - Rows, requests, columns and strides are runtime values: one compile per
   `query_group_size`. At most 4096 requests per call; `topk` 1024-4096 in
   steps of 1024.

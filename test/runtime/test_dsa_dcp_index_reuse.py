@@ -178,7 +178,11 @@ def test_consecutive_indexer_layers_build_once(recorded):
     assert first.dcp_capturing is False
     # Verify row j of a request sees its history up to its own position.
     requests = torch.arange(3 * q_len, dtype=torch.int32) // q_len
-    causal = seq_lens[requests.long()] - (q_len - 1) + torch.arange(3 * q_len) % q_len
+    causal = (
+        seq_lens[requests.long()]
+        - (q_len - 1)
+        + torch.arange(3 * q_len, dtype=torch.int32) % q_len
+    )
     torch.testing.assert_close(builds[0].query_requests, requests)
     torch.testing.assert_close(builds[0].causal_lens, causal)
     assert builds[0].page_table is page_table

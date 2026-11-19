@@ -1743,6 +1743,7 @@ def dsa_decode_index_candidates(
     index_k_cache: torch.Tensor,
     pages: DSAIndexCandidatePages,
     *,
+    row_lengths: torch.Tensor,
     query_group_size: int,
     page_size: int,
     topk: int,
@@ -1763,6 +1764,7 @@ def dsa_decode_index_candidates(
         weights: Head weights ``[rows, index_heads]``.
         index_k_cache: This rank's packed ``fp8_scaled`` Index-K plane.
         pages: The rows' compact owned pages (``plan_dsa_index_candidates``).
+        row_lengths: Int32 ``[rows]`` keys each row sees over every rank.
         query_group_size: Consecutive rows of one request.
         page_size: Tokens per Index-K page.
         topk: Candidates per row.
@@ -1776,13 +1778,20 @@ def dsa_decode_index_candidates(
         Int32 ``[rows, topk]`` logical positions and FP32 ``[rows, topk]``
         scores (``scores_out`` when given), ``-1`` and ``-inf`` for invalid
         candidates, in an unspecified order: each row's exact local top-k of
-        the FP32 logits ``dsa_index_candidates`` scores.
+        the FP32 logits ``dsa_index_candidates`` scores. A row whose
+        ``row_lengths`` fit ``topk`` keeps every local key, in key order,
+        scored 0 and unscored: the merged selection takes all of them.
     """
     rows = q.shape[0]
-    if rows % query_group_size or pages.lengths.shape[0] != rows:
+    if (
+        rows % query_group_size
+        or pages.lengths.shape[0] != rows
+        or row_lengths.shape != (rows,)
+        or row_lengths.dtype != torch.int32
+    ):
         raise ValueError(
             f"{rows} decode rows do not group by {query_group_size} or do not "
-            "match their pages"
+            "match their pages and int32 lengths"
         )
     kernel = select_kernel(
         "attention",
@@ -1806,6 +1815,7 @@ def dsa_decode_index_candidates(
             weights,
             index_k_cache,
             pages,
+            row_lengths=row_lengths,
             query_group_size=query_group_size,
             page_size=page_size,
             topk=topk,
