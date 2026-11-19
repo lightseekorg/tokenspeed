@@ -29,9 +29,9 @@ from tokenspeed_kernel.ops.attention.prologue import HeadKVCache, LatentKVCache
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    FLAT_KV_PLANE,
     cache_field_layer_id,
     cache_field_plane,
+    is_flat_kv_plane,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -290,7 +290,7 @@ class CachePool(ABC):
                 is None
             ):
                 continue
-            if field.plane_id != FLAT_KV_PLANE:
+            if not is_flat_kv_plane(field.plane_id):
                 multipliers.add(ratio)
                 continue
             if field.shape[0] != spec.rows_per_page or field.shape[0] % ratio:

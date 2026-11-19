@@ -65,7 +65,6 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.ple_lookup import (
     PendingLookup,
     PLELookup,
-    quantize_ple_embedding_rows,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
@@ -1229,5 +1228,4 @@ __all__ = [
     "Qwen4ExpPLELayer",
     "qwen4_exp_ple_context_field",
     "qwen4_exp_ple_conv_field",
-    "quantize_ple_embedding_rows",
 ]

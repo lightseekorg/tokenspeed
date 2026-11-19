@@ -158,6 +158,13 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return active_region()
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
+        """Back up graph RNG state before capturing discardable graph buffers."""
+        # PyTorch creates seed/offset storage when the generator is first
+        # registered, before graph capture enters its private allocator pool.
+        with self.named_region("runtime_states"):
+            graph.register_generator_state(
+                torch.cuda.default_generators[torch.cuda.current_device()]
+            )
         # Requires the library's preload hook mode, which configure_subprocess
         # sets up for the scheduler processes.
         return _primary_memory_saver.cuda_graph(

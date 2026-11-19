@@ -59,7 +59,7 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -91,6 +91,15 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials_available,
     mv_rmsnorm_gated_sigmoid,
     mv_rmsnorm_gated_sigmoid_supported,
+)
+from tokenspeed_kernel.ops.model.kimi_k3 import (
+    KimiK3MoeTailLayer,
+    KimiK3MoeTailShape,
+    KimiK3NextMix,
+    kimi_k3_moe_tail,
+    kimi_k3_moe_tail_expert_layout,
+    pack_kimi_k3_moe_tail_layer,
+    prepare_kimi_k3_moe_tail,
 )
 from tokenspeed_kernel.ops.moe import (
     kimi3_sigmoid_bias_topk_sorted,
@@ -143,7 +152,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer, moe_expert_weight_dtype
 from tokenspeed.runtime.layers.moe.latent import (
     DOWN_MAILBOX_MAX_TOKENS,
     Kimi3LatentProjection,
@@ -155,6 +164,7 @@ from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.peer_weights import MoEPeerWeights
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
@@ -206,6 +216,11 @@ from tokenspeed.runtime.models.kimi_k3_projection import (
     validate_projection_settings,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
+from tokenspeed.runtime.moe.expert_location import (
+    ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -1146,6 +1161,99 @@ def _decode_graph_rows() -> set[int]:
         )
     )
     return {batch * per_request for batch in ladder}
+
+
+def _moe_tail_shape(
+    config: KimiLinearConfig, mapping: Mapping, weight_dtype: str
+) -> KimiK3MoeTailShape | None:
+    """The sizes a fused MoE layer tail would serve here, or None where the
+    deployment rules one out.
+
+    The tail runs a whole layer after attention as one launch per rank of a
+    tensor-parallel group, so attention and the experts must share that group
+    with no attention data, expert or pipeline parallelism. Its rows are one
+    request's decode step (``_decode_verify_width``); a prefill-only role
+    never decodes. The tail reduces across the ranks in its own order and
+    fuses the residual add and the norms, so the deterministic-collective and
+    unfused-norm modes keep the regular path. ``weight_dtype`` is the routed
+    experts' stored format.
+    """
+    args = global_server_args_dict
+    if (
+        config.num_experts is None
+        or config.routed_expert_hidden_size is None
+        or mapping.pp_size != 1
+        or mapping.attn.dp_size != 1
+        or mapping.moe.ep_size != 1
+        or mapping.attn.tp_group != mapping.moe.tp_ep_group
+        or args["disaggregation_mode"] == "prefill"
+        or args["force_deterministic_rsag"]
+        or args["batch_invariant_collectives"]
+        or args["layer_boundary_norm"] == "unfused"
+    ):
+        return None
+    return KimiK3MoeTailShape(
+        rows=_decode_verify_width(),
+        hidden_size=config.hidden_size,
+        tp_size=mapping.attn.tp_size,
+        num_heads=config.num_attention_heads,
+        head_dim=config.v_head_dim,
+        num_experts=config.num_experts,
+        top_k=config.num_experts_per_token,
+        latent_size=config.routed_expert_hidden_size,
+        intermediate_size=config.moe_intermediate_size,
+        shared_intermediate_size=config.moe_intermediate_size
+        * config.num_shared_experts,
+        weight_dtype=weight_dtype,
+        num_expert_groups=config.num_expert_group,
+        topk_groups=config.topk_group,
+        scoring_func=config.moe_router_activation_func,
+        routed_scaling_factor=config.routed_scaling_factor,
+        renormalize=config.moe_renormalize,
+        situ_beta=config.activation_situ_beta,
+        situ_linear_beta=config.activation_situ_linear_beta,
+    )
+
+
+def _moe_tail_expert_layout(
+    config: KimiLinearConfig, mapping: Mapping, weight_dtype: str
+) -> str | None:
+    """The routed-expert bank layout the MoE tail reads, when a tail serves
+    this deployment; the MoE layers store their banks in it."""
+    shape = _moe_tail_shape(config, mapping, weight_dtype)
+    return None if shape is None else kimi_k3_moe_tail_expert_layout(shape)
+
+
+def _moe_tail_reads_layer(layer: "KimiLinearDecoderLayer") -> bool:
+    """Whether the MoE tail reads ``layer``'s weights as the layer stores
+    them: unquantized, unsplit attention projections whose o-projection
+    input is gated (the tail takes it in BF16), BF16 router, latent and
+    shared-expert weights, and a whole latent down projection with its norm.
+    Otherwise the model keeps the regular path, whose kernels read the tail's
+    expert bank layout too."""
+    attn, moe = layer.self_attn, layer.block_sparse_moe
+    kda = isinstance(attn, KimiLinearKDA)
+    # An ungated MLA layer may have no fused projection to read.
+    projection = (
+        () if kda or not attn.use_output_gate else attn.decode_projection_parts()
+    )
+    dense = (
+        attn.o_proj.weight,
+        *projection,
+        moe.gate.weight,
+        moe.routed_expert_down_proj.weight,
+        moe.routed_expert_up_proj.weight,
+        moe.shared_experts.gate_up_proj.weight,
+        moe.shared_experts.down_proj.weight,
+    )
+    return (
+        attn.qkv_parallel is None
+        and attn.output_parallel is None
+        and (kda or attn.use_output_gate)
+        and all(weight.dtype == torch.bfloat16 for weight in dense)
+        and moe.routed_expert_norm is not None
+        and not moe.routed_expert_down_proj.narrowed
+    )
 
 
 def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
@@ -2373,6 +2481,64 @@ def _amd_moe_join_lane(like: torch.Tensor, width: int) -> torch.Tensor | None:
     return lane
 
 
+def _check_k3_expert_placement(
+    placement: ExpertLocationMetadata,
+    config: KimiLinearConfig,
+    mapping: Mapping,
+    layer_index: int,
+    peer_weights: MoEPeerWeights | None,
+) -> None:
+    """Refuse a placement this K3 MoE layer cannot route through.
+
+    Attention DP with EP-only MoE consumes one: each rank routes its own tokens
+    to this rank's static replica choice, and the dispatch delivers each route
+    to the rank owning that physical slot.
+    """
+    if placement.num_logical_experts != config.num_experts:
+        raise ValueError(
+            f"expert placement has {placement.num_logical_experts} logical experts, "
+            f"Kimi-K3 routes {config.num_experts}"
+        )
+    if not 0 <= layer_index < placement.num_layers:
+        raise ValueError(
+            f"Kimi-K3 MoE layer {layer_index} is outside the placement's "
+            f"{placement.num_layers} layers"
+        )
+    if placement.ep_size != mapping.moe.ep_size:
+        raise ValueError(
+            f"expert placement spans ep_size={placement.ep_size}, the MoE mapping "
+            f"has ep_size={mapping.moe.ep_size}"
+        )
+    if not (
+        mapping.attn.dp_size > 1
+        and mapping.moe.tp_size == 1
+        and mapping.moe.ep_size > 1
+    ):
+        raise ValueError(
+            "Kimi-K3 expert placement requires attention DP with MoE EP only "
+            "(moe tp_size 1)"
+        )
+    if peer_weights is not None:
+        raise ValueError(
+            "Kimi-K3 expert placement does not support --moe-weight-sharing-size"
+        )
+    if placement.physical_load is not None:
+        raise ValueError(
+            "Kimi-K3 expert placement does not support "
+            "--expert-distribution-recorder-mode or --enable-eplb: the "
+            "attention-DP MoE routes local rows only, which the load row mask "
+            "does not lay out, and online rebalancing needs "
+            "routed_experts_weights_of_layer"
+        )
+    algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+    if algorithm != "static":
+        raise ValueError(
+            "Kimi-K3 expert placement needs --ep-dispatch-algorithm static: the "
+            "router maps ids through this rank's static replica map, not "
+            f"{algorithm}"
+        )
+
+
 class KimiLinearMoE(nn.Module):
     """Kimi-K3 MoE block: sigmoid / noaux_tc router + Latent MoE + shared experts.
 
@@ -2401,6 +2567,7 @@ class KimiLinearMoE(nn.Module):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
         peer_weights: MoEPeerWeights | None = None,
+        expert_layout: str | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2443,12 +2610,31 @@ class KimiLinearMoE(nn.Module):
                 f"--all2all-backend {fused_all2all_backend.value}; "
                 "the fused kernel owns dispatch/combine."
             )
+        # The target's expert placement (None for drafts and plain serving):
+        # the routed experts hold P = E + R slots and the router emits slot ids.
+        self.expert_placement: ExpertLocationMetadata | None = (
+            get_global_expert_location_metadata()
+        )
+        if self.expert_placement is not None:
+            _check_k3_expert_placement(
+                self.expert_placement,
+                config,
+                mapping,
+                layer_index,
+                peer_weights,
+            )
         # Router (gate+topk) and shared experts run on this stream during
         # graph capture, overlapped with the main-stream routed chain
         # (down_proj -> fused SiTU MoE -> up_proj). Collectives stay on the default
         # stream (aux-stream collectives can deadlock across ranks).
         self.stream_fork = StreamFork(alt_stream)
         self.num_experts = config.num_experts
+        # Routed-expert slots: the router emits slot ids when a placement is set.
+        self.num_physical_experts = (
+            self.num_experts
+            if self.expert_placement is None
+            else self.expert_placement.num_physical_experts
+        )
         self.top_k = config.num_experts_per_token
         self.routed_scaling_factor = config.routed_scaling_factor
         # Latent MoE: routed experts run at routed_expert_hidden_size.
@@ -2481,7 +2667,7 @@ class KimiLinearMoE(nn.Module):
         # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
             top_k=self.top_k,
-            num_experts=self.num_experts,
+            num_experts=self.num_physical_experts,
             hidden_size=self.routed_hidden,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -2521,6 +2707,7 @@ class KimiLinearMoE(nn.Module):
                     else None
                 )
             ),
+            expert_layout=expert_layout,
         )
 
         if mapping.attn.dp_size > 1:
@@ -2544,6 +2731,7 @@ class KimiLinearMoE(nn.Module):
         # MXFP4 SiTU and precomputed-TopK NVFP4 SiTU implementations).
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_index,
             renormalize=config.moe_renormalize,
             use_grouped_topk=config.use_grouped_topk,
             num_expert_group=config.num_expert_group,
@@ -2564,6 +2752,15 @@ class KimiLinearMoE(nn.Module):
                 else torch.float32
             ),
         )
+        self.expert_dispatch_info: ExpertLocationDispatchInfo | None = None
+        if self.expert_placement is not None:
+            self.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=layer_index,
+                ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                expert_location_metadata=self.expert_placement,
+                # Attention DP: each rank routes only its own tokens.
+                all_to_all_ep=True,
+            )
 
         # AMD replicates both: no folded AR→GEMM→AR, and its native tail packs the weight.
         self._shard_latent_projections = _shard_k3_latent_projection(
@@ -2699,9 +2896,8 @@ class KimiLinearMoE(nn.Module):
                     ),
                     hidden_size=self.routed_hidden,
                     top_k=self.top_k,
-                    num_experts=self.num_experts,
+                    num_experts=self.num_physical_experts,
                     dtype=self.gate.weight.dtype,
-                    weights_dtype=self.topk.topk_config.topk_weights_dtype,
                 )
                 if (
                     self.moe_alltoall is None
@@ -3531,7 +3727,7 @@ class KimiLinearMoE(nn.Module):
                     router_logits,
                     output_format=TopKOutputFormat.STANDARD,
                     num_token_non_padded=None,
-                    expert_location_dispatch_info=None,
+                    expert_location_dispatch_info=self.expert_dispatch_info,
                     out=routing_out,
                 )
                 if fused_inputs is None:
@@ -3585,10 +3781,8 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.owns_ep_communication:
                 pass
             elif self.moe_alltoall is not None:
-                routed_input, topk_ids, topk_weights, combine_offset = (
-                    self.moe_alltoall.dispatch(
-                        routed_input, topk_ids, topk_weights, max_tokens
-                    )
+                routed_input, topk_ids, topk_weights = self.moe_alltoall.dispatch(
+                    routed_input, topk_ids, topk_weights, max_tokens
                 )
             else:
                 prequantized = isinstance(routed_input, tuple)
@@ -3652,9 +3846,7 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.owns_ep_communication:
                 pass
             elif self.moe_alltoall is not None:
-                routed_output = self.moe_alltoall.combine(
-                    routed_output, num_tokens, max_tokens, combine_offset
-                )
+                routed_output = self.moe_alltoall.combine(routed_output)
             else:
                 routed_output = reduce_scatter(
                     routed_output.contiguous(), group=self.mapping.moe.ep_group
@@ -3851,11 +4043,15 @@ def create_kimi_linear_moe(
     prefix: str,
     alt_stream: torch.cuda.Stream | None,
     peer_weights: MoEPeerWeights | None = None,
+    *,
+    expert_layout: str | None,
 ) -> nn.Module:
     """Construct K3 MoE with the token ownership required by its transport.
 
     Arguments match the K3 MoE constructor; the returned module preserves the
     checkpoint parameter names and the common model-forward interface.
+    ``expert_layout`` is the routed-expert bank layout to store (None leaves
+    it to kernel selection).
     """
     implementation = KimiLinearMoE
     if get_all2all_backend().is_deepep():
@@ -3864,9 +4060,23 @@ def create_kimi_linear_moe(
         implementation = KimiLinearMoEDeepEP
     if peer_weights is not None and implementation is not KimiLinearMoE:
         raise ValueError("Peer expert weights require the local MoE implementation")
+    if expert_layout is not None and implementation is not KimiLinearMoE:
+        raise ValueError("An expert bank layout requires the local MoE implementation")
+    if (
+        get_global_expert_location_metadata() is not None
+        and implementation is not KimiLinearMoE
+    ):
+        raise ValueError(
+            "Kimi-K3 expert placement requires the attention-DP MoE path, "
+            "not --all2all-backend deepep"
+        )
     peer_kwargs = {"peer_weights": peer_weights} if peer_weights is not None else {}
+    layout_kwargs = (
+        {"expert_layout": expert_layout} if expert_layout is not None else {}
+    )
     return implementation(
         **peer_kwargs,
+        **layout_kwargs,
         config=config,
         mapping=mapping,
         layer_index=layer_index,
@@ -3876,6 +4086,31 @@ def create_kimi_linear_moe(
         prefix=prefix,
         alt_stream=alt_stream,
     )
+
+
+@dataclass(frozen=True)
+class _MoeTailBinding:
+    """A MoE layer bound to the fused MoE layer tail (``kimi_k3_moe_tail``).
+
+    Attributes:
+        layer: The packed layer.
+        projection_weight: The packed attention input projection that
+            ``o_proj_input`` takes on an MLA layer
+            (``pack_decode_projection``); None on a KDA layer, whose merged
+            projection serves.
+        next_layer: The next layer when the tail also writes its attention
+            input, which it then reads instead of mixing; else None.
+    """
+
+    layer: KimiK3MoeTailLayer
+    projection_weight: torch.Tensor | None
+    next_layer: "KimiLinearDecoderLayer | None"
+
+    def serves(self, rows: int, ctx: "ForwardContext") -> bool:
+        """Whether this forward runs the tail: a decode step of the tail's
+        rows. Every rank of the group decides alike, so every rank launches
+        the same layers' tails."""
+        return ctx.forward_mode.is_decode() and rows == self.layer.tail.shape.rows
 
 
 class KimiLinearDecoderLayer(nn.Module):
@@ -3958,6 +4193,7 @@ class KimiLinearDecoderLayer(nn.Module):
         if self.is_moe_layer:
             # Named for the checkpoint index; not aliased as self.mlp (double
             # registration would duplicate every MoE param in state_dict).
+            moe_prefix = add_prefix("block_sparse_moe", prefix)
             self.block_sparse_moe = create_kimi_linear_moe(
                 moe_block_count=_k3_local_moe_blocks(config, mapping),
                 config=config,
@@ -3965,9 +4201,14 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_index=layer_id,
                 model_scope=model_scope,
                 quant_config=quant_config,
-                prefix=add_prefix("block_sparse_moe", prefix),
+                prefix=moe_prefix,
                 alt_stream=alt_stream,
                 peer_weights=peer_weights,
+                # The fused MoE tail reads the banks in place, so every
+                # forward's experts read its layout where a tail serves.
+                expert_layout=_moe_tail_expert_layout(
+                    config, mapping, moe_expert_weight_dtype(quant_config, moe_prefix)
+                ),
             )
         else:
             self.mlp = KimiLinearMLP(
@@ -4024,6 +4265,9 @@ class KimiLinearDecoderLayer(nn.Module):
         # Our attention input, mixed by the previous layer's MoE tail; the
         # next forward consumes it.
         self._premixed_input = None
+        # The fused MoE layer tail that runs this layer's decode steps after
+        # attention; bound by prepare_communication_runtime.
+        self.moe_tail: _MoeTailBinding | None = None
         # Whether the next layer's mlp-side partial rides our sweep too.
         self._hoist_next_mlp = False
         self._mlp_slot = _attnres_mlp_slot(layer_id)
@@ -4437,6 +4681,113 @@ class KimiLinearDecoderLayer(nn.Module):
         else:
             attnres_partial(*args)
 
+    def _forward_moe_tail(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        block_residual: torch.Tensor,
+        premixed: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A decode step through the fused MoE layer tail: the AttnRes entry
+        and attention up to the o-projection input as ``forward`` runs them,
+        then one launch for the rest of the layer (``kimi_k3_moe_tail``)."""
+        tail = self.moe_tail
+        if self._fused_attnres_graph_available(hidden_states, block_residual):
+            # The previous layer left no split partial for this entry: mix from
+            # the whole blocks, as the fused forward does.
+            h = _apply_attn_res(
+                hidden_states,
+                block_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.prev_valid_blocks,
+                out_norm=self.input_layernorm,
+                block_write_idx=(
+                    self.block_write_idx if self.is_block_write_layer else -1
+                ),
+            )
+            stream = None if self.is_block_write_layer else hidden_states
+        else:
+            h, stream = self._mix_into_attention(
+                hidden_states, block_residual, premixed
+            )
+        attn_output = self.self_attn.o_proj_input(
+            positions,
+            h,
+            ctx,
+            self.comm_manager,
+            projection=self._moe_tail_projection(hidden_states, block_residual, h, ctx),
+        )
+        next_layer = tail.next_layer
+        next_mix = None
+        if next_layer is not None:
+            next_mix = KimiK3NextMix(
+                score_weight=next_layer._attn_wp,
+                input_norm=next_layer.input_layernorm.weight,
+                # The next layer's attention-side block partial, which this
+                # layer's input projection produced above.
+                partial=_sliced_scratch(hidden_states, 1, hidden_states.shape[0]),
+                out=torch.empty_like(hidden_states),
+            )
+            next_layer._premixed_input = next_mix.out
+        out = kimi_k3_moe_tail(
+            tail.layer,
+            attn_output,
+            stream,
+            block_residual,
+            torch.empty_like(hidden_states),
+            next_mix=next_mix,
+        )
+        return out, block_residual
+
+    def _moe_tail_projection(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        h: torch.Tensor,
+        ctx: "ForwardContext",
+    ):
+        """The attention input projection for ``o_proj_input`` on the tail
+        path. It also produces the next layer's AttnRes block partials where
+        one launch can (``linear_attnres_partials``), as ``forward``'s
+        projection does; otherwise they get their own launch first. The tail
+        stores no snapshot, so the blocks they read are final here."""
+        attn = self.self_attn
+        packed = self.moe_tail.projection_weight
+        partials = self._next_fallback_attnres_partial_args(
+            hidden_states, block_residual
+        )
+        weight = None
+        if partials is not None and len(partials) == 6:
+            blocks, weight_a, weight_b, eps, scratch_a, scratch_b = partials
+            weight = (
+                attn.precomputable_projection_weight() if packed is None else packed
+            )
+            if weight is not None and not linear_attnres_partials_available(
+                h, weight, blocks, weight_a, weight_b, scratch_a, scratch_b, eps=eps
+            ):
+                weight = None
+        if weight is not None:
+
+            def projection(x: torch.Tensor) -> torch.Tensor:
+                return linear_attnres_partials(
+                    x,
+                    weight,
+                    blocks,
+                    weight_a,
+                    weight_b,
+                    scratch_a,
+                    scratch_b,
+                    eps=eps,
+                )
+
+            return projection
+        self._prepare_next_fallback_attnres_partial(hidden_states, block_residual)
+        if packed is None:
+            return lambda x: attn.qkvgb_proj(x, ctx=ctx)[0]
+        return lambda x: F.linear(x, packed)
+
     @torch.no_grad()
     def forward(
         self,
@@ -4447,6 +4798,12 @@ class KimiLinearDecoderLayer(nn.Module):
         residual_stream: _ShardedResidualStream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         premixed, self._premixed_input = self._premixed_input, None
+        if self.moe_tail is not None and self.moe_tail.serves(
+            hidden_states.shape[0], ctx
+        ):
+            return self._forward_moe_tail(
+                positions, hidden_states, ctx, block_residual, premixed
+            )
         stream = residual_stream
         rows = stream.activation if stream is not None and stream.sharded else None
         if self._fused_attnres_graph_available(
@@ -4707,6 +5064,8 @@ class KimiLinearModel(nn.Module):
                 model_identity=f"{global_server_args_dict['model']}@{global_server_args_dict['revision']}",
                 pool_page_bytes=16 * 1024**2,
                 copy_implementation="simple",
+                # K3 NVFP4 uses fabric storage; POSIX is a storage API option.
+                handle_type="fabric",
                 solution="cuda",
             )
             self.peer_weights = MoEPeerWeights(partition=partition, store=store)
@@ -5265,6 +5624,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
     model_cls = KimiLinearModel
     supports_aux_capture = True
 
+    @property
+    def expert_placement(self) -> ExpertLocationMetadata | None:
+        """The placement the MoE layers were built with; None routes trivially."""
+        for layer in self.model.layers:
+            if (
+                isinstance(layer, KimiLinearDecoderLayer)
+                and layer.is_moe_layer
+                and isinstance(layer.block_sparse_moe, KimiLinearMoE)
+            ):
+                return layer.block_sparse_moe.expert_placement
+        return None
+
     def post_quant_warmup(self) -> None:
         if self.model.peer_weights is not None:
             self.model.peer_weights.finalize()
@@ -5342,7 +5713,118 @@ class KimiLinearForCausalLM(BaseCausalLM):
         if attn_comm is not None:
             prepared = attn_comm.prepare_staged_projection(max_num_tokens) or prepared
         prepared = self._prepare_decode_chain() or prepared
+        prepared = self._prepare_moe_tail() or prepared
         return bool(shared_mlps) or prepared
+
+    def _prepare_moe_tail(self) -> bool:
+        """Bind every MoE layer to the fused MoE layer tail where one serves;
+        the MoE layers then already store their expert banks in its layout
+        (``_moe_tail_expert_layout``). Collective over the attention
+        tensor-parallel group, before graph capture."""
+        model, mapping = self.model, self.mapping
+        moe_layers = [
+            (index, layer)
+            for index, layer in enumerate(model.layers)
+            if isinstance(layer, KimiLinearDecoderLayer) and layer.is_moe_layer
+        ]
+        if not moe_layers:
+            return False
+        shape = _moe_tail_shape(
+            self.config,
+            mapping,
+            moe_layers[0][1].block_sparse_moe.experts.plan["weight_dtype"],
+        )
+        if (
+            shape is None
+            or kimi_k3_moe_tail_expert_layout(shape) is None
+            or not all(_moe_tail_reads_layer(layer) for _, layer in moe_layers)
+        ):
+            return False
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager,
+        )
+
+        tail = prepare_kimi_k3_moe_tail(
+            shape,
+            rank=mapping.attn.tp_rank,
+            # The ranks exchange their buffer addresses over it.
+            cpu_group=process_group_manager.get_process_group(
+                "gloo", mapping.attn.tp_group
+            ),
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+        starts_step = True
+        for index, layer in moe_layers:
+            moe = layer.block_sparse_moe
+            next_layer = self._moe_tail_next_layer(layer, shape.rows)
+            experts = moe.experts
+            eps = {
+                "mlp_res": layer.mlp_res_norm.variance_epsilon,
+                "post_attention": layer.post_attention_layernorm.variance_epsilon,
+                "latent": moe.routed_expert_norm.variance_epsilon,
+            }
+            if next_layer is not None:
+                eps["next_mix"] = next_layer.self_attention_res_norm.variance_epsilon
+            packed = pack_kimi_k3_moe_tail_layer(
+                tail,
+                layer_index=index,
+                starts_step=starts_step,
+                num_blocks=layer.prev_valid_blocks + int(layer.is_block_write_layer),
+                restarts_prefix=layer.is_block_write_layer,
+                eps=eps,
+                tensors={
+                    "o_proj": layer.self_attn.o_proj.weight,
+                    "mlp_res_norm": layer.mlp_res_norm.weight,
+                    "mlp_res_proj": layer.mlp_res_proj.weight.view(-1),
+                    "post_attention_norm": layer.post_attention_layernorm.weight,
+                    "router": moe.gate.weight,
+                    "router_bias": moe.gate.e_score_correction_bias,
+                    "latent_down": moe.routed_expert_down_proj.weight,
+                    "latent_norm": moe.routed_expert_norm.weight,
+                    "latent_up": moe.routed_expert_up_proj.weight,
+                    "shared_gate_up": moe.shared_experts.gate_up_proj.weight,
+                    "shared_down": moe.shared_experts.down_proj.weight,
+                    "w13": experts.w13_weight,
+                    "w13_scale": experts.w13_weight_scale,
+                    "w2": experts.w2_weight,
+                    "w2_scale": experts.w2_weight_scale,
+                },
+                writes_next_mix=next_layer is not None,
+            )
+            layer.moe_tail = _MoeTailBinding(
+                layer=packed,
+                projection_weight=(
+                    None
+                    if isinstance(layer.self_attn, KimiLinearKDA)
+                    else layer.self_attn.pack_decode_projection()
+                ),
+                next_layer=next_layer,
+            )
+            starts_step = False
+        return True
+
+    def _moe_tail_next_layer(
+        self, layer: KimiLinearDecoderLayer, rows: int
+    ) -> KimiLinearDecoderLayer | None:
+        """The next layer, when ``layer``'s tail writes its attention input:
+        where that layer would mix its input on the fast path from a block
+        partial that ``layer`` prepares, which the tail then combines with its
+        output instead of the next layer doing it."""
+        if layer._next_attn_mix is None:
+            return None
+        candidate = layer._next_attn_mix[0]
+        if candidate.is_block_write_layer:
+            return None
+        hidden = self.config.hidden_size
+        # Path selection depends on shapes, strides and the device, never on
+        # values; these tensors are made before graph capture.
+        probe = candidate.input_layernorm.weight.new_empty((rows, hidden))
+        bank = probe.new_empty((candidate.prev_valid_blocks, rows, hidden))
+        if candidate._fast_attention_mix(
+            probe
+        ) and not candidate._fused_attnres_graph_available(probe, bank):
+            return candidate
+        return None
 
     def _kvp_decode_exchange_bytes(self) -> int:
         """The most bytes a rank sends in one KVP decode exchange of any
@@ -5740,12 +6222,19 @@ class KimiLinearForCausalLM(BaseCausalLM):
             scale_param.weight_loader(scale_param, fused_s)
             return True
 
+        # Every placed slot is filled from the logical expert it holds,
+        # replicas included.
+        expert_placement = self.expert_placement
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
                 gate_proj_name="w1", up_proj_name="w3", down_proj_name="w2"
             ),
-            num_experts=config.num_experts,
+            num_experts=(
+                config.num_experts
+                if expert_placement is None
+                else expert_placement.num_physical_experts
+            ),
             ep_rank=(
                 self.mapping.moe_weight_group.index(self.mapping.rank)
                 if self.model.peer_weights is not None
@@ -5756,6 +6245,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 if self.model.peer_weights is not None
                 else self.mapping.moe.ep_size
             ),
+            expert_placement=expert_placement,
         )
 
         pp_start = self.model.pp_start_layer
@@ -5949,6 +6439,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
     Construction mirrors ``KimiK25ForConditionalGeneration``: a vision path plus
     a text ``language_model``. The text path is ``KimiLinearForCausalLM``.
     """
+
+    # The attention-DP MoE layers size their slots from the expert placement
+    # and route through it; ``_check_k3_expert_placement`` refuses it elsewhere.
+    supports_expert_placement: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -6217,6 +6711,18 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "is inactive.",
             )
         logger.debug(f"Loaded {loaded_vision_weights:d} Kimi-K3 vision tensors.")
+
+    @classmethod
+    def get_model_config_for_expert_location(
+        cls, config: KimiK3Config
+    ) -> ModelConfigForExpertLocation:
+        # One placement row per decoder layer: the layer id indexes it.
+        text_config = config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

@@ -3160,6 +3160,10 @@ def _decode_down_n_tiles(
 _DECODE_EPILOGUE_SCALE_ROW_ALIGN = 256
 
 
+def _raw(tensor: torch.Tensor | Tensor) -> torch.Tensor:
+    return tensor.storage.data if isinstance(tensor, Tensor) else tensor
+
+
 def gluon_mxfp_precomputed_mxfp4_fused_moe(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -3210,6 +3214,9 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         situ_beta: SiTU gate clamp.
         situ_linear_beta: SiTU linear-branch clamp.
         decode: Select the small-M decode kernel for both MoE projections.
+            With FP8 activations, each projection runs on the warp-pipelined
+            kernels instead where ``select_warp_pipelined_gemms`` measured
+            them more than 10% faster.
         block_m: Optional row-tile override; unset values resolve per projection.
         out: Optional destination tensor for the finalized expert output.
         partial_tdm: Fuse each projection's operand loads into one TDM
@@ -3323,6 +3330,28 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         else:
             gate_up_tiles = down_tiles = _PREFILL_MXFP4_ACTIVATION_TILES
     launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
+    use_wp_gate_up = use_wp_down = False
+    # Pinned tiles or a decode choice other than the measured one select the
+    # A8W4 kernels as given.
+    tokens, top_k = map(int, topk_ids.shape)
+    measured_decode = 0 < tokens * top_k <= 16 * num_experts
+    if (
+        activation_dtype == "fp8"
+        and block_m is None
+        and not partial_tdm
+        and decode == measured_decode
+    ):
+        # Imported here because warp_pipelined imports this module.
+        from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import warp_pipelined
+
+        use_wp_gate_up, use_wp_down = warp_pipelined.select_warp_pipelined_gemms(
+            num_experts,
+            int(hidden_states.shape[-1]),
+            int(w13_raw.shape[-1]) // 2,
+            top_k,
+            activation == "situ",
+            tokens,
+        )
     if activation_dtype == "mxfp4":
         intermediate, intermediate_mx_scale = gluon_mxfp_ragged_matmul(
             x_mxfp4,
@@ -3349,36 +3378,70 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         # divides by that scale and casts in its epilogue. Quantizing
         # separately would re-read and rewrite the whole intermediate for no
         # other reason.
-        intermediate = gluon_mxfp_ragged_matmul(
-            x_fp8,
-            w13_weight,
-            w13_bias,
-            w_mx_scale=w13_mx_scale,
-            x_format="e4m3",
-            x_global_scale=w13_weight.act_scale,
-            y_global_scale=w2_weight.act_scale,
+        if use_wp_gate_up:
+            intermediate = warp_pipelined.launch_warp_pipelined_gate_up(
+                x_fp8,
+                w13_raw,
+                _raw(w13_mx_scale),
+                w13_bias,
+                ragged_metadata,
+                gather_indx,
+                x_global_scale=w13_weight.act_scale,
+                y_global_scale=w2_weight.act_scale,
+                activation=warp_pipelined.make_activation(
+                    activation,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_beta=swiglu_beta,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                ),
+                decode=decode,
+            )
+        else:
+            intermediate = gluon_mxfp_ragged_matmul(
+                x_fp8,
+                w13_weight,
+                w13_bias,
+                w_mx_scale=w13_mx_scale,
+                x_format="e4m3",
+                x_global_scale=w13_weight.act_scale,
+                y_global_scale=w2_weight.act_scale,
+                a_ragged_metadata=ragged_metadata,
+                gather_indx=gather_indx,
+                out_dtype=torch.float8_e4m3fn,
+                fused_activation=fused_activation,
+                scale_preshuffle=True,
+                **gate_up_tiles,
+                **launch,
+            )
+        stage2_kwargs = dict(x_format="e4m3", x_global_scale=w2_weight.act_scale)
+    if use_wp_down:
+        flat = warp_pipelined.launch_warp_pipelined_down(
+            intermediate,
+            _raw(w2_weight),
+            _raw(w2_mx_scale),
+            w2_bias,
+            ragged_metadata,
+            scatter_indx,
+            x_global_scale=w2_weight.act_scale,
+            out_dtype=out_dtype,
+            decode=decode,
+        )
+    else:
+        flat = gluon_mxfp_combine(
+            intermediate,
+            w2_weight,
+            w2_mx_scale,
+            **stage2_kwargs,
+            bias=w2_bias,
             a_ragged_metadata=ragged_metadata,
-            gather_indx=gather_indx,
-            out_dtype=torch.float8_e4m3fn,
-            fused_activation=fused_activation,
-            scale_preshuffle=True,
-            **gate_up_tiles,
+            scatter_indx=scatter_indx,
+            out_dtype=out_dtype,
+            **down_tiles,
+            scale_load_mode="swizzle",
             **launch,
         )
-        stage2_kwargs = dict(x_format="e4m3", x_global_scale=w2_weight.act_scale)
-    flat = gluon_mxfp_combine(
-        intermediate,
-        w2_weight,
-        w2_mx_scale,
-        **stage2_kwargs,
-        bias=w2_bias,
-        a_ragged_metadata=ragged_metadata,
-        scatter_indx=scatter_indx,
-        out_dtype=out_dtype,
-        **down_tiles,
-        scale_load_mode="swizzle",
-        **launch,
-    )
     return _weighted_topk_reduce_gfx1250(
         flat,
         topk_weights,

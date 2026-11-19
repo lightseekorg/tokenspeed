@@ -38,7 +38,6 @@ def get_flashinfer_moe_alltoall(
     top_k: int,
     num_experts: int,
     dtype: torch.dtype,
-    weights_dtype: torch.dtype,
 ) -> FlashInferMoeAlltoAll | None:
     """Create one workspace per model/group, or return None without a shared NVLink fabric.
 
@@ -50,7 +49,6 @@ def get_flashinfer_moe_alltoall(
         top_k: Number of selected experts per token.
         num_experts: Global expert count.
         dtype: Routed activation/output dtype.
-        weights_dtype: Precomputed routing-weight dtype.
 
     Returns:
         A shared transport for sequential layers of this model, or None for the AG/RS fallback.
@@ -59,10 +57,10 @@ def get_flashinfer_moe_alltoall(
     if not current_platform().is_nvidia or not group_has_fabric(ranks):
         return None
     transport = FlashInferMoeAlltoAll(
-        group, max_tokens, hidden_size, top_k, num_experts, dtype, weights_dtype
+        group, max_tokens, hidden_size, top_k, num_experts, dtype
     )
     logger.info(
-        f"K3 MoE communication: FlashInfer MNNVL all-to-all scope={model_scope!s} ep="
+        f"K3 MoE communication: FlashInfer NVLink one-sided all-to-all scope={model_scope!s} ep="
         f"{group.size():d} capacity={max_tokens:d} width={hidden_size:d}",
     )
     return transport

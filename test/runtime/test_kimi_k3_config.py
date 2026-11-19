@@ -711,6 +711,7 @@ class TestKimiK3RegistrationTests:
             quant_config=None,
             prefix="block_sparse_moe",
             alt_stream=None,
+            expert_layout=None,
         )
 
     def test_shard_predicate_requires_a_divisible_multi_rank_nvidia_group(self):

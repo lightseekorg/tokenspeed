@@ -91,6 +91,8 @@ def _recipe(
         hf_config=SimpleNamespace(text_config=text_config),
         hf_text_config=text_config,
         num_attention_layers=len(layer_types),
+        num_hidden_layers=len(layer_types),
+        model_profile=None,
     )
     spec = MHAConfig(
         backend_name="qsa",
@@ -411,7 +413,7 @@ def _flat_kv_recipe() -> Qwen4ExpRecipe:
         layer_types=(FULL_ATTENTION, FULL_ATTENTION), speculative=False, width=1
     )
     recipe.server_args.qwen4_exp_flat_kv = True
-    recipe.server_args.mapping = SimpleNamespace(pp_size=1)
+    recipe.server_args.mapping = Mapping(rank=0, world_size=1)
     recipe.cache_budget_bytes = 16 << 20
     return recipe
 
@@ -529,15 +531,17 @@ def test_flat_kv_rejects_a_stride_that_is_not_whole_atom_pages() -> None:
         pool.atom_pages_per_block(FULL_ATTENTION, 64)
 
 
-def test_flat_kv_rejects_pipeline_parallelism() -> None:
+def test_flat_kv_reduces_resident_bytes_under_pp_without_gdn() -> None:
     recipe = _flat_kv_recipe()
-    recipe.server_args.mapping.pp_size = 2
-    with pytest.raises(NotImplementedError, match=r"PP=1.*--no-qwen4-exp-flat-kv"):
-        recipe.setup()
-    recipe.server_args.qwen4_exp_flat_kv = False
-    assert FLAT_KV_PLANE not in {
-        plane.plane_id for plane in recipe.setup().spec.memory_plan.planes
-    }
+    whole = recipe.setup().spec.memory_plan
+    recipe.server_args.mapping = Mapping(rank=0, world_size=2, pp_size=2)
+    plan = recipe.setup().spec.memory_plan
+    stages = [plan.narrow_to_layers(layer, layer + 1) for layer in range(2)]
+    for resident in stages:
+        assert resident.groups == plan.groups
+        assert len(resident.planes) == 1
+        assert resident.resident_block_bytes <= whole.lcm_block_bytes
+    assert min(stage.resident_block_bytes for stage in stages) < whole.lcm_block_bytes
 
 
 def test_flat_kv_rejects_mxfp8_draft_scale_addressing() -> None:
