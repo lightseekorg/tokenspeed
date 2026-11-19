@@ -172,9 +172,12 @@ public:
     // out. Non-owning, like the traversal.
     class EmptiableParents {
     public:
+        // cached marks the groups holding index entries. The others have no
+        // emptiable parents, so skip their parent-index scan.
         EmptiableParents(const std::vector<CacheGroup>& groups, const std::vector<bool>& cached, const BlockPool& pool,
                          const LocationSet& protected_locations)
             : groups_{groups}, pool_{pool}, protected_locations_{protected_locations} {
+            _assert(cached.size() == groups.size(), "every group has a cached flag");
             for (std::size_t i = 0; i < groups.size(); ++i) {
                 if (!cached[i]) {
                     continue;
