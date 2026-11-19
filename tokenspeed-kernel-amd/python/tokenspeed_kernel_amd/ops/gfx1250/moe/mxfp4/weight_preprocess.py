@@ -23,8 +23,10 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import _DECODE_LONG_K
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (
     _PREFILL_DOWN_TILES,
+    _PREFILL_MXFP4_ACTIVATION_DOWN_TILES,
     PrecisionConfig,
     decode_tile_config,
 )
@@ -226,23 +228,29 @@ def kplane_mxfp4_weight_gfx1250(weight: torch.Tensor, plane_bytes: int) -> torch
     otherwise stream as 64-byte pieces of 192-byte rows, which TDM reads at a
     fraction of the contiguous bandwidth.
 
-    The returned tensor keeps the ``(E, K_packed, N)`` shape and the expert and
-    N strides kernels read, but its K addressing is only meaningful to kernels
-    honouring the ``kplane_rows``/``kplane_bytes`` attributes it carries.
+    A K that is not a whole number of planes gets a last plane padded with
+    zero bytes, which are zero weights.
+
+    The returned tensor keeps the ``(E, K_packed, N)`` shape and the N stride
+    kernels read, and an expert stride of whole planes, but its K addressing
+    is only meaningful to kernels honouring the ``kplane_rows``/
+    ``kplane_bytes`` attributes it carries.
     """
     experts, k_packed, n = weight.shape
-    if k_packed % plane_bytes:
-        raise ValueError(f"K_packed {k_packed} is not a multiple of {plane_bytes}")
     rows = weight.transpose(1, 2)
     if not rows.is_contiguous():
         raise ValueError("expected an N-major (E, K_packed, N) weight")
+    num_planes = math.ceil(k_packed / plane_bytes)
+    padded = num_planes * plane_bytes
+    if padded != k_packed:
+        rows = torch.nn.functional.pad(rows, (0, padded - k_packed))
     planes = (
-        rows.reshape(experts, n, k_packed // plane_bytes, plane_bytes)
+        rows.reshape(experts, n, num_planes, plane_bytes)
         .permute(0, 2, 1, 3)
         .contiguous()
     )
     view = torch.as_strided(
-        planes, (experts, k_packed, n), (k_packed * n, 1, plane_bytes)
+        planes, (experts, k_packed, n), (padded * n, 1, plane_bytes)
     )
     view.act_scale = getattr(weight, "act_scale", None)
     # Kernels read the K-plane layout only from these attributes, which any
@@ -266,7 +274,8 @@ def preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(
     w2 = w.w2_weight_triton_tensor
     k = int(w2.shape[1]) * 2
     n = int(w2.shape[2])
-    decode = decode_tile_config(k)
+    # The short-K tile does not depend on the row tile.
+    decode = decode_tile_config(k, True, 16)
     block_k = decode["block_k"]
     if (
         block_k == _PREFILL_DOWN_TILES["block_k"]
@@ -280,9 +289,43 @@ def preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(
         torch.cuda.empty_cache()
 
 
+def preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights(
+    plan: dict,
+    w: torch.nn.Module,
+) -> None:
+    """:func:`preprocess_gluon_mxfp4_gfx1250_moe_weights` for the SwiGLU MoE.
+
+    With MXFP4 activations that MoE runs a short-K down projection in
+    128-wide K steps, which read a row-major weight as 64-byte pieces of
+    every N row. The down weight is then stored in K planes of that width,
+    and its decode and prefill tiles step K by one plane: Muse Spark TP8
+    measured 56.1 -> 52.6 us at 64 requests, 73.7 -> 69.5 us at 256 and 148.0
+    -> 140.9 us at 2048.
+    """
+    preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
+    if plan.get("internal_activation_dtype") == "fp8":
+        return
+    w2 = w.w2_weight_triton_tensor
+    k = int(w2.shape[1]) * 2
+    n = int(w2.shape[2])
+    # The tile decode takes over a weight stored in K planes.
+    decode = decode_tile_config(k, True, 16)
+    block_k = decode["block_k"]
+    if (
+        k < _DECODE_LONG_K
+        and k > block_k
+        and n % decode["block_n"] == 0
+        and n % _PREFILL_MXFP4_ACTIVATION_DOWN_TILES["block_n"] == 0
+    ):
+        w.w2_weight_triton_tensor = kplane_mxfp4_weight_gfx1250(w2, block_k // 2)
+        w._gluon_w2_is_kplane = True
+        torch.cuda.empty_cache()
+
+
 __all__ = [
     "kplane_mxfp4_weight_gfx1250",
     "preprocess_gluon_mxfp4_gfx1250_situ_moe_weights",
+    "preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights",
     "preprocess_gluon_mxfp4_gfx1250_moe_weights",
     "_make_k_packed_mxfp4_weight",
 ]

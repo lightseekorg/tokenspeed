@@ -1450,7 +1450,24 @@ if platform.is_amd:
 
 
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
+# Average routed rows per expert up to which gfx1250 takes the decode GEMMs.
+# Decode streams an expert's weights once per 32-row block, so it stays ahead
+# of the prefill GEMMs until experts start needing a second block; where the
+# two cross depends on the model. With MXFP4 activations decode against
+# prefill measured 97.9 vs 103.3 us at 17.5 rows an expert and even at 20 on
+# Qwen3.8 Flash TP2, but 194.1 vs 184.3 us at 16 rows and even at 12 on
+# DSV4.1 Flash TP4.
 _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
+# The A8W4 SiTU GEMMs cross later: on Kimi K3 TP8 decode measured 195.9 vs
+# 208.2 us at 20.6 rows an expert, 209.2 vs 215.4 us at 22.9, and even at 25.
+_GFX1250_A8W4_SITU_DECODE_MAX_AVERAGE_BPE = 24
+# So do the MXFP4-activation GEMMs over a down weight stored in K planes,
+# where the decode down projection streams contiguous tiles. Decode against
+# prefill at 20 rows an expert: DSV4.1 Flash TP4 161.3 vs 169.2 us, Qwen3.8
+# Flash TP2 88.4 vs 97.1 us, Muse Spark TP8 93.2 vs 103.7 us. At 24 rows Muse
+# Spark measured 95.5 vs 102.8 us and DSV4.1 Flash 173.9 vs 172.4 us; at 32
+# rows DSV4.1 Flash measured 195.8 vs 186.0 us.
+_GFX1250_KPLANE_DECODE_MAX_AVERAGE_BPE = 24
 _warmed_a4w4_ep_families: set[tuple] = set()
 
 
@@ -1478,12 +1495,11 @@ def _select_gfx950_grouped_block_m(
     return 128
 
 
-def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
+def _use_gfx1250_moe_decode(
+    num_routed_rows: int, num_experts: int, max_average_bpe: int
+) -> bool:
     # Compare the average batch per expert without a division or device sync.
-    return (
-        0 < num_routed_rows
-        and num_routed_rows <= _GFX1250_DECODE_MAX_AVERAGE_BPE * num_experts
-    )
+    return 0 < num_routed_rows and num_routed_rows <= max_average_bpe * num_experts
 
 
 if platform.is_amd:
@@ -1529,8 +1545,8 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
-        preprocess_gluon_mxfp4_gfx1250_moe_weights,
         preprocess_gluon_mxfp4_gfx1250_situ_moe_weights,
+        preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights,
     )
 
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
@@ -1554,7 +1570,7 @@ if platform.is_amd:
         preprocess_n16_mxfp4_weights(w)
 
     def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
-        return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
+        return preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights(plan, w)
 
     def gluon_mxfp4_gfx1250_situ_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(plan, w)
@@ -2598,7 +2614,9 @@ if platform.is_amd:
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         decode = _use_gfx1250_moe_decode(
-            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
+            topk_ids.numel(),
+            w.w13_weight_triton_tensor.shape[0],
+            _GFX1250_A8W4_SITU_DECODE_MAX_AVERAGE_BPE,
         )
 
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
@@ -2625,6 +2643,9 @@ if platform.is_amd:
             situ_beta=situ_beta,
             situ_linear_beta=float(situ_linear_beta),
             decode=decode,
+            # Decode programs wait on their first tile loads, so each weight
+            # tile and its scales go out as one load.
+            partial_tdm=decode,
             out=getattr(w, "_situ_output_buffer", None),
         )
 
@@ -2680,12 +2701,25 @@ if platform.is_amd:
         activation_dtype = (
             "fp8" if plan.get("internal_activation_dtype") == "fp8" else "mxfp4"
         )
+        if getattr(w, "_gluon_w2_is_kplane", False) and not getattr(
+            w.w2_weight_triton_tensor, "kplane_rows", 0
+        ):
+            raise ValueError(
+                "gfx1250 MXFP4 MoE down weight lost its K-plane layout "
+                "attributes after preprocessing"
+            )
 
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         decode = _use_gfx1250_moe_decode(
-            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
+            topk_ids.numel(),
+            w.w13_weight_triton_tensor.shape[0],
+            (
+                _GFX1250_KPLANE_DECODE_MAX_AVERAGE_BPE
+                if getattr(w.w2_weight_triton_tensor, "kplane_rows", 0)
+                else _GFX1250_DECODE_MAX_AVERAGE_BPE
+            ),
         )
 
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
@@ -2711,6 +2745,9 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             decode=decode,
+            # Decode programs wait on their first tile loads, so each weight
+            # tile and its scales go out as one load.
+            partial_tdm=decode,
             activation_dtype=activation_dtype,
         )
 

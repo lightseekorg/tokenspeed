@@ -62,6 +62,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (
     _matmul_decode,
+    decode_resident_tile_config,
     decode_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
@@ -89,7 +90,9 @@ class _OptFlags:
     block_m: int
     block_n: int
     block_k: int
-    group_m: int = 8
+    # Programs walk one row block's N tiles in order: the program-id mapping is
+    # a single division, and consecutive programs read the same expert.
+    group_m: int = 1
     xcd_swizzle: int = 1
     split_k: int = 1
 
@@ -743,23 +746,17 @@ def _matmul_launch_metadata(grid, kernel, args):
 
 @gluon.jit(launch_metadata=_matmul_launch_metadata)
 def _matmul(
-    Y,
-    stride_y_k,
-    stride_y_z,
-    stride_y_m,
-    stride_y_n,
-    YGlobalScale,
-    YMxScale,
-    stride_y_mx_m,
-    XGlobalScale,
-    X,
-    stride_x_z,
-    stride_x_m,
-    stride_x_k,
-    XMxScale,
-    stride_x_mx_z,
-    stride_x_mx_m,
-    stride_x_mx_k,
+    # Operands are ordered by when a program first needs them: the block
+    # metadata and grid for its first load, then the weight operands, then the
+    # activation operands, then the output. Only the leading arguments arrive in
+    # the preloaded argument registers; the rest wait for a kernel-argument load.
+    XBlockOffs,
+    batch_size,
+    grid_m,
+    grid_n,
+    XBlockSchedule,
+    XSliceOffs,
+    XSliceSizes,
     W,
     stride_w_e,
     stride_w_k,
@@ -769,32 +766,42 @@ def _matmul(
     stride_w_mx_e,
     stride_w_mx_k,
     stride_w_mx_n,
-    B,
-    stride_b_e,  # Bias
-    M,
     N,
     K,
-    KW,  # shapes
+    KW,
     GatherIndx,
+    XSpareRow,
+    X,
+    stride_x_z,
+    stride_x_m,
+    stride_x_k,
+    XMxScale,
+    stride_x_mx_z,
+    stride_x_mx_m,
+    stride_x_mx_k,
+    M,
+    XGlobalScale,
+    Y,
+    stride_y_k,
+    stride_y_z,
+    stride_y_m,
+    stride_y_n,
+    YGlobalScale,
+    YMxScale,
+    stride_y_mx_m,
+    B,
+    stride_b_e,
     WriteBackIndx,
     writeback_size,
-    RAGGED_DIMENSION: gl.constexpr,  #
-    XSliceSizes,
-    XSliceOffs,
-    XBlockOffs,
-    XBlockSchedule,
+    RAGGED_DIMENSION: gl.constexpr,
     X_EXPECTED_SLICE_SIZE: gl.constexpr,
-    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
+    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
     WSliceSizes,
     WSliceOffs,
     WBlockOffs,
     WBlockSchedule,
     W_EXPECTED_SLICE_SIZE: gl.constexpr,
-    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
-    # true grid size
-    batch_size,
-    grid_m,
-    grid_n,
+    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
     DO_SWIGLU: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -992,6 +999,19 @@ def _matmul(
         GatherIndx,
         start_m,
     )
+    if cfg.USE_GATHER and RAGGED_DIMENSION == "M":
+        # Row slots past the expert's rows gather their own spare rows, not
+        # the rows of the neighbouring routes: a gather that repeats a row is
+        # slow (see _GATHER_SPARE_ROWS).
+        SLOT_LAYOUT: gl.constexpr = gl.SliceLayout(
+            0, get_tdm_gather_scatter_idx_layout(BLOCK_M, cfg.NUM_WARPS)
+        )
+        slot = gl.arange(0, BLOCK_M, SLOT_LAYOUT)
+        gathered_m = gl.where(
+            (off_m + slot < eM) | (XSpareRow < 0),
+            gathered_m,
+            (XSpareRow + slot - 1).to(gathered_m.dtype),
+        )
 
     Y_ptr = Y + start_z_out.to(address_index_type) * stride_y_z
 
@@ -1285,6 +1305,22 @@ def _validate_schedule(
             raise ValueError("pingpong requires num_buffers=3")
 
 
+# Average rows per expert from which decode takes 32-row tiles. Every row
+# block of an expert streams the expert's weights again and decode is
+# HBM-bound, so an expert with 17 to 32 rows should be one 32-row program, not
+# two 16-row programs. Random routes start filling second 16-row blocks well
+# before the average reaches 16 rows; below about seven rows an expert the
+# wider tile only moves more activation bytes. 32-row against 16-row tiles at
+# eight rows an expert: DSV4.1 Flash TP4 157.4 vs 165.1 us, Qwen3.8 Flash TP2
+# (8.75 rows) 80.5 vs 84.1 us, Kimi K3 TP8 158.8 vs 157.3 us; at 16 rows
+# Kimi K3 181.7 vs 204.3 us.
+#
+# Decode stops at 32 rows: a 64-row tile's LDS footprint leaves one program
+# resident on a CU where the 32-row tile has two, and measured 10 to 30%
+# slower than the 32-row tile on Kimi K3 from 512 to 1792 requests.
+_DECODE_WIDE_BLOCK_M_ROWS_PER_EXPERT = 8
+
+
 def _resolve_block_m(
     decode: bool,
     m: int,
@@ -1293,8 +1329,9 @@ def _resolve_block_m(
     """Use stage defaults for prefill and expert occupancy for decode."""
     if not decode:
         return 64
-    rows_per_expert = max(1, m // num_experts)
-    return max(16, min(triton.next_power_of_2(rows_per_expert), 128))
+    if m >= _DECODE_WIDE_BLOCK_M_ROWS_PER_EXPERT * num_experts:
+        return 32
+    return 16
 
 
 # TDM zero-extends 16-bit indices when packing them (TDMUtility.cpp), so gl.int16
@@ -1360,7 +1397,7 @@ def matmul(
     block_m: int,
     block_n: int = 128,
     block_k: int = 256,
-    group_m: int = 8,
+    group_m: int = 1,
     xcd_swizzle: int = 1,
     w_transpose: bool = True,
     scale_preshuffle: bool | None = None,
@@ -1370,6 +1407,8 @@ def matmul(
     decode: bool = False,
     partial_tdm: bool,
     n_tiles: int = 1,
+    block_indexed: bool = False,
+    x_spare_row: int = -1,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1550,14 +1589,13 @@ def matmul(
         if (
             kplane_rows != N
             or plane_bytes != block_k // (2 if b_torch.dtype == torch.uint8 else 1)
-            or K % block_k
             or N % block_n
             or schedule != "baseline"
             or pingpong
         ):
             raise ValueError(
                 f"K-plane weights with {plane_bytes}-byte planes of {kplane_rows} "
-                f"rows need block_k covering one plane, whole K and N tiles and the "
+                f"rows need block_k covering one plane, whole N tiles and the "
                 f"baseline schedule; got N={N}, K={K}, block_n={block_n}, "
                 f"block_k={block_k}, schedule={schedule}, pingpong={pingpong}"
             )
@@ -1584,37 +1622,99 @@ def matmul(
     y_global_scale = _as_scalar_scale(y_global_scale, "y_global_scale", a.device)
 
     target_kernel = _matmul_decode if decode else _matmul
+    stride_y_k, stride_y_z, stride_y_m, stride_y_n = out_matmul.stride()
+    stride_x_z, stride_x_m, stride_x_k = a_strides
+    stride_x_mx_z, stride_x_mx_m, stride_x_mx_k = a_scale_strides
+    stride_w_e, stride_w_k, stride_w_n = b_storage.data.stride()
+    stride_w_mx_e, stride_w_mx_k, stride_w_mx_n = b_scale_strides
+    operands = dict(
+        Y=c_storage.data,
+        stride_y_k=stride_y_k,
+        stride_y_z=stride_y_z,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        YGlobalScale=y_global_scale,
+        YMxScale=y_mx_scale,
+        stride_y_mx_m=None if y_mx_scale is None else y_mx_scale.stride(0),
+        XGlobalScale=x_global_scale,
+        X=a_storage.data,
+        stride_x_z=stride_x_z,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        XMxScale=a_scale,
+        stride_x_mx_z=stride_x_mx_z,
+        stride_x_mx_m=stride_x_mx_m,
+        stride_x_mx_k=stride_x_mx_k,
+        W=b_storage.data,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        W_TRANSPOSE=w_transpose,
+        WMxScale=b_scale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_k=stride_w_mx_k,
+        stride_w_mx_n=stride_w_mx_n,
+        B=bias,
+        stride_b_e=bias_stride,
+        M=M,
+        XSpareRow=x_spare_row,
+        N=N,
+        K=K,
+        KW=K_W,
+        GatherIndx=gather_indx,
+        WriteBackIndx=scatter_indx,
+        writeback_size=None if scatter_indx is None else scatter_indx.shape[0],
+        RAGGED_DIMENSION=ragged_dimension,
+        **dict(
+            zip(
+                [
+                    "XSliceSizes",
+                    "XSliceOffs",
+                    "XBlockOffs",
+                    "XBlockSchedule",
+                    "X_EXPECTED_SLICE_SIZE",
+                    "X_SLICE_SIZES_DIVISIBILITY",
+                ],
+                expt_data_x,
+            )
+        ),
+        **dict(
+            zip(
+                [
+                    "WSliceSizes",
+                    "WSliceOffs",
+                    "WBlockOffs",
+                    "WBlockSchedule",
+                    "W_EXPECTED_SLICE_SIZE",
+                    "_W_SLICE_SIZES_DIVISIBILITY",
+                ],
+                expt_data_w,
+            )
+        ),
+        batch_size=batch_size,
+        grid_m=grid_m,
+        grid_n=grid_n,
+    )
+    block_indexed = (
+        block_indexed
+        and decode
+        and ragged_dimension == "M"
+        and opt_flags.block_m == 16
+        and a_ragged_metadata.block16_rows is not None
+    )
+    if block_indexed:
+        # The slice-offset slot carries the per-block row ranges: a program
+        # reads its expert's rows by its own block index, along with the
+        # schedule entry, instead of by the expert id that entry holds.
+        operands["XSliceOffs"] = a_ragged_metadata.block16_rows
+    # Each kernel lists these operands in the order its programs first need them.
+    leading = target_kernel.arg_names[: len(operands)]
+    if set(leading) != set(operands):
+        raise ValueError(
+            f"{target_kernel.__name__} does not lead with the shared GEMM operands"
+        )
     kernel = target_kernel[(grid,)](
-        c_storage.data,
-        *out_matmul.stride(),
-        y_global_scale,
-        y_mx_scale,
-        None if y_mx_scale is None else y_mx_scale.stride(0),
-        x_global_scale,
-        a_storage.data,
-        *a_strides,
-        a_scale,
-        *a_scale_strides,
-        b_storage.data,
-        *b_storage.data.stride(),
-        w_transpose,
-        b_scale,
-        *b_scale_strides,
-        bias,
-        bias_stride,
-        M,
-        N,
-        K,
-        K_W,
-        gather_indx,
-        scatter_indx,
-        None if scatter_indx is None else scatter_indx.shape[0],
-        ragged_dimension,
-        *expt_data_x,
-        *expt_data_w,
-        batch_size,
-        grid_m,
-        grid_n,
+        *(operands[name] for name in leading),
         do_swiglu,
         swiglu_alpha,
         swiglu_limit,
@@ -1639,7 +1739,7 @@ def matmul(
         PINGPONG=pingpong,
         NUM_WARPS=num_warps,
         PARTIAL_TDM=partial_tdm,
-        **({"N_TILES": n_tiles} if decode else {}),
+        **({"N_TILES": n_tiles, "BLOCK_INDEXED": block_indexed} if decode else {}),
         W_KPLANE_ROWS=kplane_rows,
         num_warps=num_warps,
     )
@@ -1696,6 +1796,7 @@ def gluon_mxfp_combine(
     decode: bool = False,
     partial_tdm: bool,
     n_tiles: int = 1,
+    block_indexed: bool = False,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1736,6 +1837,7 @@ def gluon_mxfp_combine(
         decode=decode,
         partial_tdm=partial_tdm,
         n_tiles=n_tiles,
+        block_indexed=block_indexed,
     )
     if n_expts_act is not None and int(n_expts_act) > 1:
         if n_tokens is None:
@@ -1771,7 +1873,9 @@ def _fp8_quantize_kernel(
 def _quantize_fp8_activation(
     x: torch.Tensor,
     scale: torch.Tensor | None,
+    spare_rows: int,
 ) -> torch.Tensor:
+    """Cast ``x`` to FP8; ``spare_rows`` unwritten rows follow a cast result."""
     if x.dtype is torch.float8_e4m3fn:
         return x.contiguous()
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -1781,7 +1885,11 @@ def _quantize_fp8_activation(
         if scale.numel() != 1:
             raise ValueError("FP8 activation scale must be scalar")
         scale = scale.contiguous()
-    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    out = torch.empty(
+        (int(x.shape[0]) + spare_rows, int(x.shape[1])),
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
+    )
     block_size = 4096
     _fp8_quantize_kernel[(triton.cdiv(x.numel(), block_size),)](
         x,
@@ -1987,6 +2095,7 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     QUANT_BLOCK_K: gl.constexpr = 512,
     QUANT_FP8: gl.constexpr = False,
     fp8_scale_ptr=None,
+    block16_rows_ptr=None,
 ):
     """Stable counting sort of contiguous ``[M, TOPK]`` ids by expert.
 
@@ -2087,10 +2196,10 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     counts_smem.atomic_scatter_add(increment, key, axis=0)
     counts = counts_smem.load(expert_layout)
     histogram = counts & 0xFFFF
-    exclusive = gl.cumsum(histogram, 0) - histogram
     expert = gl.arange(0, EP, layout=expert_layout)
 
     if is_chunk:
+        exclusive = gl.cumsum(histogram, 0) - histogram
         row_key = gl.where((row_ids >= 0) & (row_ids < E), row_ids, E)
         # Every lane needs every key of the chunk; an LDS broadcast avoids a
         # uniform global load per column.
@@ -2112,17 +2221,24 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
         gl.store(gate_scale_ptr + position, weight.to(OUTPUT_DTYPE), mask=row_mask)
     else:
         block_size_index = pid - n_chunks
+        log2_block = 4 + block_size_index
+        expert_blocks = gl.where(
+            expert < E, (histogram + ((1 << log2_block) - 1)) >> log2_block, 0
+        )
+        # One prefix sum yields both offsets: rows in the low 16 bits, blocks
+        # in the high 16 (G < 2^15, and an expert has no more blocks than
+        # rows). A prefix sum is a chain of LDS round trips, and this program
+        # is the launch's longest.
+        packed = histogram + (expert_blocks << 16)
+        packed_exclusive = gl.cumsum(packed, 0) - packed
+        exclusive = packed_exclusive & 0xFFFF
+        block_exclusive = packed_exclusive >> 16
         if block_size_index == 0:
             gl.store(slice_sizes_ptr + expert, histogram, mask=expert < E)
             # Bin E is the invalid-id bin, so exclusive[E] is the valid total.
             # Storing it apart keeps the expert-range store vectorized.
             gl.store(slice_offsets_ptr + expert, exclusive, mask=expert < E)
             gl.store(slice_offsets_ptr + expert, exclusive, mask=expert == E)
-        log2_block = 4 + block_size_index
-        expert_blocks = gl.where(
-            expert < E, (histogram + ((1 << log2_block) - 1)) >> log2_block, 0
-        )
-        block_exclusive = gl.cumsum(expert_blocks, 0) - expert_blocks
         active_blocks, max_expert_blocks = gl.reduce(
             (expert_blocks, expert_blocks), 0, _sum_and_max
         )
@@ -2148,14 +2264,41 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
                 (expert_block << 16) | expert,
                 mask=expert_block < expert_blocks,
             )
+            if block16_rows_ptr is not None:
+                # The expert's row range again, at the block's own index, so a
+                # decode program reads it along with its schedule entry.
+                gl.store(
+                    block16_rows_ptr + block_exclusive + expert_block,
+                    (histogram << 16) | exclusive,
+                    mask=(expert_block < expert_blocks) & (block_size_index == 0),
+                )
 
 
 _SMALL_ROUTE_MAX_TOKENS = 512
 _SMALL_ROUTE_MAX_GATES = 2048
-# A route that also quantizes the MoE input keeps the one-launch kernel up to
-# its token limit: from 342 to 512 DSV4.1 tokens it beat the staged route, with
-# the quantize on its stage 4, by 5-9 us per layer.
-_MXFP4_SMALL_ROUTE_MAX_GATES = 3072
+# A route that also quantizes the MoE input keeps the one-launch kernel much
+# further. Past it the apply launches the four stages of the staged route,
+# and with FP8 activations the cast as well; each launch costs about 1.1 us
+# before its programs do anything. One launch against those measured, per
+# apply: Kimi K3 TP8 112.9 vs 122.9 us at 144 requests, 121.1 vs 136.6 us at
+# 256, 138.7 vs 156.9 us at 512 and 168.1 vs 184.7 us at 1024; Qwen3.8 Flash
+# TP2 67.7 vs 78.2 us at 384 and 78.5 vs 89.9 us at 768; Muse Spark TP8 86.1
+# vs 96.6 us at 512; DSV4.1 Flash TP4 155.8 vs 168.0 us at 640.
+#
+# Every program of the one-launch route works over the routed rows rounded up
+# to a power of two, so just past 8192 rows it does twice the work for the
+# same rows: from there to 12288 rows it measured even on Kimi K3 and 4%
+# slower on Qwen3.8 Flash, and that stretch stays on the staged route. Past
+# 16384 rows it measured 11% slower than baseline on Kimi K3.
+_QUANT_SMALL_ROUTE_MAX_TOKENS = 1024
+_QUANT_SMALL_ROUTE_MAX_GATES = 16384
+_QUANT_SMALL_ROUTE_STAGED_GATES = (8192, 12288)
+# Tokens up to which the FP8 cast rides on the staged route's last stage. It
+# saves the cast's own launch: Kimi K3 TP8 measured 161.2 -> 159.7 us at 640
+# requests, 190.0 -> 186.9 us at 1152 and 200.4 -> 197.4 us at 1280. From
+# 1536 requests it measured within 1.3 us either way, and at 2560, 4096 and
+# 8192 the standalone cast was 2.8 to 4.0 us faster.
+_STAGED_ROUTE_FP8_CAST_MAX_TOKENS = 1280
 _SMALL_ROUTE_NUM_WARPS = 4
 # Rows per placement program. Every program rebuilds the full histogram, while
 # the in-chunk rank costs CHUNK^2 compares; 64 rows measured fastest from 4 to
@@ -2174,6 +2317,7 @@ def _precomputed_topk_route_small_m_gfx1250(
     quantize_fp8_into: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
     ) = None,
+    block_indexed: bool = False,
 ) -> tuple[
     RaggedTensorMetadata,
     torch.Tensor,
@@ -2185,6 +2329,8 @@ def _precomputed_topk_route_small_m_gfx1250(
     ``quantize_into`` is ``(x, packed, scale)`` for MXFP4 activations and
     ``quantize_fp8_into`` is ``(x, out, act_scale)`` for FP8 activations
     divided by the scalar ``act_scale`` tensor (or not scaled when ``None``).
+    ``block_indexed`` also writes ``block16_rows`` of the metadata; the
+    single-token canonical route does not produce it.
     """
     if quantize_into is not None and quantize_fp8_into is not None:
         raise ValueError("choose one of quantize_into and quantize_fp8_into")
@@ -2198,12 +2344,14 @@ def _precomputed_topk_route_small_m_gfx1250(
         raise ValueError("unsupported gfx1250 small-M precomputed route")
     tokens, topk = map(int, topk_ids.shape)
     gates = tokens * topk
-    if not (1 <= tokens <= _SMALL_ROUTE_MAX_TOKENS and 0 < topk <= num_experts <= 1024):
+    if not (
+        1 <= tokens <= _QUANT_SMALL_ROUTE_MAX_TOKENS and 0 < topk <= num_experts <= 1024
+    ):
         raise ValueError("unsupported gfx1250 small-M route shape")
-    if gates > _MXFP4_SMALL_ROUTE_MAX_GATES:
+    if gates > _QUANT_SMALL_ROUTE_MAX_GATES:
         raise ValueError(
             "gfx1250 small-M route supports at most "
-            f"{_MXFP4_SMALL_ROUTE_MAX_GATES} rows"
+            f"{_QUANT_SMALL_ROUTE_MAX_GATES} rows"
         )
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
@@ -2229,6 +2377,7 @@ def _precomputed_topk_route_small_m_gfx1250(
     gather_indices = torch.empty(gates, dtype=torch.int32, device=device)
     scatter_indices = torch.empty(gates, dtype=torch.int32, device=device)
     gate_scale = torch.empty(gates, dtype=topk_weights.dtype, device=device)
+    block16_rows = None
     quant_args = {}
     quant_programs = 0
     if quantize_into is not None:
@@ -2300,6 +2449,9 @@ def _precomputed_topk_route_small_m_gfx1250(
     else:
         num_warps = _SMALL_ROUTE_NUM_WARPS
         lanes = 32 * num_warps
+        if block_indexed:
+            block16_rows = torch.empty(max_blocks, dtype=torch.int32, device=device)
+            quant_args = dict(quant_args, block16_rows_ptr=block16_rows)
         _precomputed_topk_route_small_m_gfx1250_kernel[
             (triton.cdiv(gates, _SMALL_ROUTE_CHUNK) + _ROUTE_NB + quant_programs,)
         ](
@@ -2334,6 +2486,7 @@ def _precomputed_topk_route_small_m_gfx1250(
         slice_offsets,
         block_offsets,
         block_schedule,
+        block16_rows=block16_rows,
     )
     return ragged_metadata, gather_indices, scatter_indices, gate_scale
 
@@ -2553,32 +2706,54 @@ def _precomputed_topk_route_large_stage4_gfx1250_kernel(
     QUANT_K: gl.constexpr = 0,
     QUANT_BLOCK_M: gl.constexpr = 8,
     QUANT_BLOCK_K: gl.constexpr = 512,
+    QUANT_FP8: gl.constexpr = False,
+    fp8_scale_ptr=None,
 ):
     """Materialize schedules and scatter valid routes into compact slices.
 
     With ``x_ptr``, programs from ``ROUTE_PROGRAMS`` on quantize the MoE
-    input, ``G // TOPK`` rows of ``QUANT_K`` values, to MXFP4, one
+    input, ``G // TOPK`` rows of ``QUANT_K`` values, one
     ``QUANT_BLOCK_M x QUANT_BLOCK_K`` tile each, beside the latency-bound
-    routing programs.
+    routing programs: to MXFP4, or with ``QUANT_FP8`` to FP8 divided by the
+    scalar at ``fp8_scale_ptr``.
     """
     pid = gl.program_id(0)
     if x_ptr is not None:
         quant_tile = pid - ROUTE_PROGRAMS
         if quant_tile >= 0:
-            quantize_mxfp4_rows_tile_gfx1250(
-                x_ptr,
-                stride_x,
-                q_ptr,
-                stride_q,
-                q_scale_ptr,
-                stride_q_scale,
-                G // TOPK,
-                quant_tile,
-                QUANT_K,
-                QUANT_BLOCK_M,
-                QUANT_BLOCK_K,
-                NUM_WARPS,
-            )
+            if QUANT_FP8:
+                if fp8_scale_ptr is not None:
+                    inv_scale = 1.0 / gl.load(fp8_scale_ptr).to(gl.float32)
+                else:
+                    inv_scale = gl.to_tensor(1.0)
+                quantize_fp8_rows_tile_gfx1250(
+                    x_ptr,
+                    stride_x,
+                    q_ptr,
+                    stride_q,
+                    inv_scale,
+                    G // TOPK,
+                    quant_tile,
+                    QUANT_K,
+                    QUANT_BLOCK_M,
+                    QUANT_BLOCK_K,
+                    NUM_WARPS,
+                )
+            else:
+                quantize_mxfp4_rows_tile_gfx1250(
+                    x_ptr,
+                    stride_x,
+                    q_ptr,
+                    stride_q,
+                    q_scale_ptr,
+                    stride_q_scale,
+                    G // TOPK,
+                    quant_tile,
+                    QUANT_K,
+                    QUANT_BLOCK_M,
+                    QUANT_BLOCK_K,
+                    NUM_WARPS,
+                )
             return
     layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
     offset = gl.arange(0, ROUTE_BLOCK, layout=layout)
@@ -2661,6 +2836,9 @@ def _precomputed_topk_route_large_m_gfx1250(
     topk_ids: torch.Tensor,
     num_experts: int,
     quantize_into: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    quantize_fp8_into: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
+    ) = None,
 ) -> tuple[
     RaggedTensorMetadata,
     torch.Tensor,
@@ -2779,6 +2957,24 @@ def _precomputed_topk_route_large_m_gfx1250(
             QUANT_BLOCK_M=_LARGE_ROUTE_QUANT_BLOCK_M,
             QUANT_BLOCK_K=_LARGE_ROUTE_QUANT_BLOCK_K,
         )
+    elif quantize_fp8_into is not None:
+        x, out, act_scale = quantize_fp8_into
+        quant_k = int(x.shape[1])
+        quant_programs = triton.cdiv(tokens, _LARGE_ROUTE_QUANT_BLOCK_M) * triton.cdiv(
+            quant_k, _LARGE_ROUTE_QUANT_BLOCK_K
+        )
+        quant_args = dict(
+            ROUTE_PROGRAMS=route_programs,
+            x_ptr=x,
+            stride_x=x.stride(0),
+            q_ptr=out,
+            stride_q=out.stride(0),
+            QUANT_K=quant_k,
+            QUANT_BLOCK_M=_LARGE_ROUTE_QUANT_BLOCK_M,
+            QUANT_BLOCK_K=_LARGE_ROUTE_QUANT_BLOCK_K,
+            QUANT_FP8=True,
+            fp8_scale_ptr=act_scale,
+        )
     _precomputed_topk_route_large_stage4_gfx1250_kernel[
         (route_programs + quant_programs,)
     ](
@@ -2877,15 +3073,19 @@ def _weighted_topk_reduce_gfx1250_kernel(
             weights_ptr + pid_m.to(gl.int64) * stride_wm + slot * stride_wk
         ).to(gl.float32)
         weight = gl.where(route_valid, weight, 0.0)
+        # Every (token, slot) has a row in ``flat``, so the row loads go out
+        # without waiting for the scalar route metadata; an invalid route's
+        # row is dropped after it arrives.
         values = gl.amd.cdna5.buffer_load(
             flat_ptr,
             (
                 (pid_m.to(gl.int64) * TOPK + slot) * stride_fm
                 + offsets_n.to(gl.int64) * stride_fn
             ).to(gl.int32),
-            mask=mask & route_valid,
+            mask=mask,
             other=0.0,
         ).to(gl.float32)
+        values = gl.where(route_valid, values, 0.0)
         accumulator += values * weight
     gl.amd.cdna5.buffer_store(
         accumulator.to(output_ptr.dtype.element_ty),
@@ -3020,6 +3220,24 @@ def _uses_small_route(
     )
 
 
+def _uses_quantizing_small_route(topk_ids: torch.Tensor, num_experts: int) -> bool:
+    """Whether a route that also quantizes the MoE input takes one launch."""
+    gates = topk_ids.numel()
+    staged_from, staged_below = _QUANT_SMALL_ROUTE_STAGED_GATES
+    return (
+        0 < topk_ids.shape[0] <= _QUANT_SMALL_ROUTE_MAX_TOKENS
+        and gates <= _QUANT_SMALL_ROUTE_MAX_GATES
+        and not staged_from < gates < staged_below
+        and num_experts <= 1024
+    )
+
+
+def _gather_spare_row(x: torch.Tensor, hidden_states: torch.Tensor) -> int:
+    """First spare row of a quantized MoE input, or -1 when it has none."""
+    tokens = int(hidden_states.shape[0])
+    return tokens if int(x.shape[0]) > tokens else -1
+
+
 def _uses_staged_route(topk_ids: torch.Tensor, num_experts: int) -> bool:
     return (
         topk_ids.shape[0] > 16
@@ -3033,41 +3251,57 @@ def _precomputed_topk_route_mxfp4(
     topk_ids: torch.Tensor,
     num_experts: int,
     hidden_states: torch.Tensor,
+    *,
+    block_indexed: bool,
+    spare_rows: int,
 ):
     """Route and quantize the MoE input to MXFP4.
 
     Returns the ``_precomputed_topk_route`` tuple followed by the packed
     values and scales of ``launch_triton_quantize_mxfp4_activation_gfx1250``.
-    Multi-token routes quantize in extra programs of a routing launch: the
-    one-launch route up to its token limit, then stage 4 of the staged route.
-    Other batches launch the standalone quantizer.
+    Routes quantize in extra programs of a routing launch: the one-launch
+    route up to its token limit, then stage 4 of the staged route. That
+    includes a single token, where the standalone quantizer is one more launch
+    (Qwen3.8 Flash TP2, one request: 15.8 -> 14.4 us). Other batches launch the
+    standalone quantizer.
     """
     tokens, k = map(int, hidden_states.shape)
     if (
-        tokens > 1
-        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
         and hidden_states.stride(1) == 1
         and k % MXFP4_BLOCK == 0
     ):
-        if _uses_small_route(topk_ids, num_experts, _MXFP4_SMALL_ROUTE_MAX_GATES):
+        if _uses_quantizing_small_route(topk_ids, num_experts):
             route_fn = _precomputed_topk_route_small_m_gfx1250
         elif _uses_staged_route(topk_ids, num_experts):
             route_fn = _precomputed_topk_route_large_m_gfx1250
         else:
             route_fn = None
         if route_fn is not None:
+            # ``spare_rows`` extra rows follow the quantized ones, unwritten.
             packed = torch.empty(
-                (tokens, k // 2), dtype=torch.uint8, device=hidden_states.device
+                (tokens + spare_rows, k // 2),
+                dtype=torch.uint8,
+                device=hidden_states.device,
             )
-            scale = empty_mxfp4_activation_scale(tokens, k, hidden_states.device)
+            scale = empty_mxfp4_activation_scale(
+                tokens + spare_rows, k, hidden_states.device
+            )
             route = route_fn(
                 topk_weights,
                 topk_ids,
                 num_experts,
                 quantize_into=(hidden_states, packed, scale),
+                **(
+                    {"block_indexed": block_indexed}
+                    if route_fn is _precomputed_topk_route_small_m_gfx1250
+                    else {}
+                ),
             )
             return (*route, packed, scale)
-    route = _precomputed_topk_route(topk_weights, topk_ids, num_experts)
+    route = _precomputed_topk_route(
+        topk_weights, topk_ids, num_experts, block_indexed=block_indexed
+    )
     return (*route, *launch_triton_quantize_mxfp4_activation_gfx1250(hidden_states))
 
 
@@ -3075,12 +3309,15 @@ def _precomputed_topk_route(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     num_experts: int,
+    *,
+    block_indexed: bool,
 ):
     if _uses_small_route(topk_ids, num_experts):
         return _precomputed_topk_route_small_m_gfx1250(
             topk_weights,
             topk_ids,
             num_experts,
+            block_indexed=block_indexed,
         )
     if _uses_staged_route(topk_ids, num_experts):
         return _precomputed_topk_route_large_m_gfx1250(
@@ -3125,33 +3362,52 @@ _PREFILL_DOWN_TILES = {
     "xcd_swizzle": 8,
 }
 
-# The tiles above were measured only with FP8 activations. MXFP4 activations
-# (A4W4) keep the original prefill tile until they are measured on that path.
-_PREFILL_MXFP4_ACTIVATION_TILES = {
+# MXFP4 activations (A4W4) take eight warps, a two-buffer ring and the XCD
+# swizzle for both projections, and 128-column gate/up tiles. Against the
+# four-warp, three-buffer 256-column tile both projections used before, each
+# step measured faster on its own and the four together took Qwen3.8 Flash TP2
+# from 153.2 to 122.2 us at 2048 requests and 226.9 to 176.9 us at 4096, and
+# DSV4.1 Flash TP4 from 251.9 to 208.4 us and 344.7 to 283.5 us. From there a
+# third buffer, four warps, 128-wide K steps, 32- or 128-row tiles, a narrower
+# swizzle and other down widths all measured slower or even.
+_PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES = {
+    "block_n": 128,
+    "block_k": 256,
+    "num_warps": 8,
+    "num_buffers": 2,
+    "xcd_swizzle": 8,
+}
+_PREFILL_MXFP4_ACTIVATION_DOWN_TILES = {
     "block_n": 256,
     "block_k": 256,
-    "num_warps": 4,
-    "num_buffers": 3,
+    "num_warps": 8,
+    "num_buffers": 2,
+    "xcd_swizzle": 8,
 }
 
-# Programs per CU from which a decode down projection pairs its N tiles. Many
-# experts with a row or two each launch tens of 26 KB programs per CU; one
-# program streaming two N tiles through one TDM ring measured 35.0 -> 31.8 us
-# at 16 Kimi K3 requests, while a single request has too few programs to pair.
-_DECODE_PAIR_N_TILES_PROGRAMS_PER_CU = 16
+# Row blocks a queued decode gate/up launch interleaves in program order. A
+# launch that stays resident keeps an expert's N tiles in consecutive programs
+# (group_m=1); once programs queue, walking eight row blocks per N tile
+# measured 1 to 2% faster on DSV4.1 Flash TP4 and Muse Spark TP8 from 16
+# requests up, 0.6 to 1% faster on Kimi K3 TP8 from 256 and within 1% either
+# way on Qwen3.8 Flash TP2, while resident launches of all four measured 1.2
+# to 1.8% slower with it. The down projection measured faster ungrouped.
+_DECODE_QUEUED_GATE_UP_GROUP_M = 8
 
+# Spare activation rows a gate/up launch gathers in the row slots its blocks
+# do not use, one fewer than the widest row tile needs. A gather that repeats
+# a row is slow, and unused slots otherwise name the rows of the neighbouring
+# routes: a single request names its one row in every slot. The rows are
+# never written and their products are never stored. Kimi K3 TP8 measured
+# 15.7 -> 15.0 us at one request, 19.1 -> 17.9 us at four, 121.0 -> 119.4 us at
+# 256 and 167.7 -> 165.0 us at 896.
+_GATHER_SPARE_ROWS = 64
 
-def _decode_down_n_tiles(
-    rows: int, num_experts: int, n: int, block_n: int, device: torch.device
-) -> int:
-    block_m = _resolve_block_m(True, rows, num_experts)
-    n_tiles = triton.cdiv(n, block_n)
-    programs = RaggedTensorMetadata.n_blocks(num_experts, rows, block_m) * n_tiles
-    cus = torch.cuda.get_device_properties(device).multi_processor_count
-    if n_tiles % 2 == 0 and programs >= _DECODE_PAIR_N_TILES_PROGRAMS_PER_CU * cus:
-        return 2
-    return 1
-
+# Gate/up programs per CU up to which a decode launch reads its row ranges by
+# block index. On Kimi K3 TP8 that measured 16.5 -> 16.2 us at two requests
+# and 19.2 -> 18.9 us at four, nearly all of it in the down projection; with
+# four programs per CU allowed it cost 0.9 us at eight requests.
+_DECODE_BLOCK_INDEXED_PROGRAMS_PER_CU = 2
 
 # Row pitch in bytes of the scales the decode GEMM epilogue writes. Every
 # N tile stores a few bytes into each row; with packed 18-byte rows those
@@ -3243,6 +3499,29 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         device=hidden_states.device, dtype=torch.float32
     ).contiguous()
 
+    # A decode launch small enough that its programs rarely share a CU waits
+    # on each program's chain of metadata loads. The route then also writes
+    # every block's row range at the block's index, and both projections read
+    # it there along with the schedule entry.
+    block_indexed = False
+    if decode and block_m is None:
+        rows = int(topk_ids.numel())
+        if _resolve_block_m(True, rows, num_experts) == 16:
+            gate_up_n_tiles = triton.cdiv(
+                int(w13_raw.shape[-1]),
+                decode_tile_config(
+                    int(hidden_states.shape[-1]), activation_dtype == "fp8", 16
+                )["block_n"],
+            )
+            block_indexed = (
+                RaggedTensorMetadata.n_blocks(num_experts, rows, 16) * gate_up_n_tiles
+                <= _DECODE_BLOCK_INDEXED_PROGRAMS_PER_CU
+                * torch.cuda.get_device_properties(
+                    hidden_states.device
+                ).multi_processor_count
+            )
+
+    spare_rows = _GATHER_SPARE_ROWS
     if activation_dtype == "mxfp4":
         (
             ragged_metadata,
@@ -3252,23 +3531,54 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             x_mxfp4,
             x_mx_scale,
         ) = _precomputed_topk_route_mxfp4(
-            topk_weights, topk_ids, num_experts, hidden_states
+            topk_weights,
+            topk_ids,
+            num_experts,
+            hidden_states,
+            block_indexed=block_indexed,
+            spare_rows=spare_rows,
         )
     else:
         x_fp8 = None
         tokens = int(hidden_states.shape[0])
         act_scale = getattr(w13_weight, "act_scale", None)
-        if (
-            tokens > 1
-            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        castable = (
+            hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.stride(1) == 1
             and (act_scale is None or isinstance(act_scale, torch.Tensor))
-            and _uses_small_route(topk_ids, num_experts)
-        ):
-            # The routing launch's spare programs cast the input as well.
-            x_fp8 = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+        )
+        if castable and _uses_quantizing_small_route(topk_ids, num_experts):
+            # The routing launch's spare programs cast the input as well. A
+            # single token takes this route too: a separate cast is one more
+            # launch (Kimi K3 TP8, one request: 16.6 -> 15.7 us).
+            x_fp8 = torch.empty(
+                (tokens + spare_rows, int(hidden_states.shape[1])),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
             ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
                 _precomputed_topk_route_small_m_gfx1250(
+                    topk_weights,
+                    topk_ids,
+                    num_experts,
+                    quantize_fp8_into=(hidden_states, x_fp8, act_scale),
+                    block_indexed=block_indexed,
+                )
+            )
+        elif (
+            castable
+            and tokens <= _STAGED_ROUTE_FP8_CAST_MAX_TOKENS
+            and _uses_staged_route(topk_ids, num_experts)
+        ):
+            # Past the one-launch route the cast rides on the staged route's
+            # last stage, as the MXFP4 quantization does.
+            x_fp8 = torch.empty(
+                (tokens + spare_rows, int(hidden_states.shape[1])),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
+            ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
+                _precomputed_topk_route_large_m_gfx1250(
                     topk_weights,
                     topk_ids,
                     num_experts,
@@ -3277,7 +3587,9 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             )
         else:
             ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
-                _precomputed_topk_route(topk_weights, topk_ids, num_experts)
+                _precomputed_topk_route(
+                    topk_weights, topk_ids, num_experts, block_indexed=block_indexed
+                )
             )
 
     if activation == "situ":
@@ -3301,28 +3613,68 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             f"'swiglu', or 'situ', got {activation!r}"
         )
     if decode:
-        gate_up_tiles = decode_tile_config(int(hidden_states.shape[-1]))
+        fp8_activation = activation_dtype == "fp8"
+        gate_up_k = int(hidden_states.shape[-1])
         # The down projection reduces over the activation's half of W13's N.
-        down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
-        if activation_dtype == "fp8":
-            # Pairing is tuned on FP8 activations; MXFP4 keeps one tile.
-            w2_raw = (
-                w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
+        down_k = int(w13_raw.shape[-1]) // 2
+        rows = int(topk_ids.numel())
+        decode_block_m = (
+            _resolve_block_m(True, rows, num_experts) if block_m is None else block_m
+        )
+        w2_raw = w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
+        gate_up_tiles = decode_tile_config(gate_up_k, fp8_activation, decode_block_m)
+        down_tiles = decode_tile_config(
+            down_k,
+            fp8_activation or bool(getattr(w2_raw, "kplane_bytes", 0)),
+            decode_block_m,
+        )
+        gate_up_group_m = _DECODE_QUEUED_GATE_UP_GROUP_M
+        if block_m is None and decode_block_m == 16:
+            # Residency is measured with decode's 16-row tile; other row tiles
+            # keep the tiles above.
+            blocks = RaggedTensorMetadata.n_blocks(num_experts, rows, 16)
+            cus = torch.cuda.get_device_properties(
+                hidden_states.device
+            ).multi_processor_count
+            resident = decode_resident_tile_config(
+                gate_up_k, int(w13_raw.shape[-1]), blocks, cus, fp8_activation
             )
-            down_tiles["n_tiles"] = _decode_down_n_tiles(
-                int(topk_ids.numel()),
-                num_experts,
-                int(w2_raw.shape[-1]),
-                down_tiles["block_n"],
-                hidden_states.device,
+            if resident is not None:
+                gate_up_tiles = resident
+                gate_up_group_m = 1
+            resident = decode_resident_tile_config(
+                down_k, int(w2_raw.shape[-1]), blocks, cus, fp8_activation
             )
+            if resident is not None:
+                down_tiles = resident
+        gate_up_tiles = {**gate_up_tiles, "group_m": gate_up_group_m}
     else:
         if activation_dtype == "fp8":
             gate_up_tiles = _PREFILL_GATE_UP_TILES
             down_tiles = _PREFILL_DOWN_TILES
         else:
-            gate_up_tiles = down_tiles = _PREFILL_MXFP4_ACTIVATION_TILES
-    launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
+            gate_up_tiles = _PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
+            down_tiles = _PREFILL_MXFP4_ACTIVATION_DOWN_TILES
+            w2_raw = (
+                w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
+            )
+            plane_bytes = int(getattr(w2_raw, "kplane_bytes", 0))
+            if plane_bytes:
+                # A down weight stored in K planes is read one plane a K step;
+                # the narrower steps take a third buffer (DSV4.1 Flash TP4
+                # 187.5 -> 185.8 us at 2048 requests, Qwen3.8 Flash TP2 114.2
+                # -> 113.0 us).
+                down_tiles = {
+                    **down_tiles,
+                    "block_k": 2 * plane_bytes,
+                    "num_buffers": 3,
+                }
+    launch = dict(
+        block_m=block_m,
+        decode=decode,
+        partial_tdm=partial_tdm,
+        block_indexed=block_indexed,
+    )
     if activation_dtype == "mxfp4":
         intermediate, intermediate_mx_scale = gluon_mxfp_ragged_matmul(
             x_mxfp4,
@@ -3336,6 +3688,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             fused_activation=fused_activation,
             scale_preshuffle=True,
             mxfp4_output=True,
+            x_spare_row=_gather_spare_row(x_mxfp4, hidden_states),
             **gate_up_tiles,
             **launch,
         )
@@ -3344,7 +3697,9 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         )
     else:
         if x_fp8 is None:
-            x_fp8 = _quantize_fp8_activation(hidden_states, w13_weight.act_scale)
+            x_fp8 = _quantize_fp8_activation(
+                hidden_states, w13_weight.act_scale, spare_rows
+            )
         # The second matmul wants its activation in FP8, so the first one
         # divides by that scale and casts in its epilogue. Quantizing
         # separately would re-read and rewrite the whole intermediate for no
@@ -3362,6 +3717,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             out_dtype=torch.float8_e4m3fn,
             fused_activation=fused_activation,
             scale_preshuffle=True,
+            x_spare_row=_gather_spare_row(x_fp8, hidden_states),
             **gate_up_tiles,
             **launch,
         )
@@ -3440,6 +3796,8 @@ def gluon_mxfp_ragged_matmul(
         "decode",
         "partial_tdm",
         "n_tiles",
+        "block_indexed",
+        "x_spare_row",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
     launch_kwargs.setdefault("partial_tdm", False)
@@ -3457,6 +3815,7 @@ def gluon_mxfp_ragged_matmul(
             "decode",
             "partial_tdm",
             "n_tiles",
+            "block_indexed",
         }
     }
     unsupported = sorted(extra_kwargs)
