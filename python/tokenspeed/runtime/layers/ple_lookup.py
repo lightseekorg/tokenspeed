@@ -320,7 +320,12 @@ class PLELookup(nn.Module):
         return embeddings.flatten(-2)
 
     def set_online_scale(self, local_amax: float) -> None:
-        """Derive the shared BF16 scale once for the logical PLE table."""
+        """Derive the shared BF16 scale once for the logical PLE table.
+
+        Every rank of the table group must call it: the per-rank maxima are
+        all-reduced into the table-wide maximum, and the resulting BF16 scale
+        is stored on the lookup as ``_checkpoint_weight_scale``.
+        """
         peak = torch.tensor(
             local_amax, dtype=torch.float32, device=self._compute_device
         )
@@ -342,6 +347,11 @@ class PLELookup(nn.Module):
         return max(abs(lo.item()), abs(hi.item()))
 
     def quantize_shard(self, source: torch.Tensor, target: torch.Tensor) -> None:
+        """Quantize source rows into target with the stored checkpoint scale.
+
+        Rows are quantized in chunks bounded by ``_PLE_QUANT_CHUNK_ELEMENTS``;
+        a zero checkpoint scale writes zeros.
+        """
         scale = self._checkpoint_weight_scale
         chunk_rows = max(1, _PLE_QUANT_CHUNK_ELEMENTS // source.shape[1])
         for start in range(0, len(source), chunk_rows):
@@ -358,6 +368,9 @@ class PLELookup(nn.Module):
     def shard_slices(
         self, row_count: int, shard_index: int, split_parts: int
     ) -> tuple[slice, slice]:
+        """Return the (checkpoint source, table target) row slices where the
+        given shard overlaps this rank's partition.
+        """
         embedding = self.ngram_embedding
         row_start = shard_index * self._checkpoint_shard_size(split_parts)
         row_end = row_start + row_count
@@ -373,6 +386,9 @@ class PLELookup(nn.Module):
     def shard_rows(
         self, weight: torch.Tensor, shard_index: int, split_parts: int
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the (checkpoint weight rows, table target rows) pair for the
+        shard, or ``None`` when the shard does not overlap this rank.
+        """
         src, dst = self.shard_slices(len(weight), shard_index, split_parts)
         if src.stop > src.start:
             return weight[src], self.ngram_embedding.weight.data[dst]

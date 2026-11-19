@@ -981,6 +981,7 @@ def pt_weights_iterator(
 
 
 def bind_checkpoint_dir(model: torch.nn.Module, checkpoint_dir: str) -> None:
+    """Record the checkpoint directory on the model for the weight-loading pass."""
     model._checkpoint_dir = checkpoint_dir
 
 
