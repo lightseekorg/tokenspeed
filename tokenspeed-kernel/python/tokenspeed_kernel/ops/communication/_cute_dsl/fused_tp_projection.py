@@ -87,7 +87,8 @@ class FusedTPProjectionState:
     ) -> None:
         device_arch = torch.cuda.get_device_capability(device)
         column_96 = (
-            not quantized
+            device_arch == (10, 3)
+            and not quantized
             and not row_parallel
             and group.size() == 4
             and output_size % (group.size() * 96) == 0
@@ -128,8 +129,6 @@ class FusedTPProjectionState:
         self.active_ctas = torch.cuda.get_device_properties(
             device
         ).multi_processor_count
-        if not quantized and (device_arch != (10, 3) or self.active_ctas != 152):
-            raise ValueError("BF16 fused TP projection requires SM103 with 152 SMs")
         # Reserve a control cache line before CTA flags and align the peer epoch banks.
         flag_words = 16 + self.active_ctas
         epoch_offset = (flag_words + 15) // 16 * 16
@@ -288,8 +287,10 @@ class FusedTPProjectionState:
         dist.barrier(group=group)
         self.compiled = {}
         cluster_ctas = self.active_ctas
+        # Use SM103 cooperative schedules for the tuned TP4 projection shapes.
         cooperative_projection = (
-            not quantized
+            device_arch == (10, 3)
+            and not quantized
             and self.world_size == 4
             and (
                 (not row_parallel and input_size == 7168 and output_size == 14592)
@@ -298,12 +299,6 @@ class FusedTPProjectionState:
         )
         cooperative_cluster_n = (
             2 if not row_parallel and self.input_multicast_ptr else 1
-        )
-        column_512_cooperative = (
-            cooperative_projection
-            and not row_parallel
-            and bool(self.input_multicast_ptr)
-            and 512 in self.row_views
         )
         if cooperative_projection and capacity >= 128:
             cluster_size = 2 * cooperative_cluster_n
@@ -316,14 +311,24 @@ class FusedTPProjectionState:
             active = torch.tensor(active, dtype=torch.int32, device=device)
             dist.all_reduce(active, op=dist.ReduceOp.MIN, group=group)
             cluster_ctas = int(active.item()) // 4 * 4
-        column_512_ctas = self.active_ctas
-        if column_512_cooperative:
+        column_512_ctas = 0
+        if (
+            cooperative_projection
+            and not row_parallel
+            and self.input_multicast_ptr
+            and 512 in self.row_views
+        ):
             active_pairs = utils.HardwareInfo(
                 device_id=device.index
             ).get_max_active_clusters(2)
             active = torch.tensor(active_pairs * 2, dtype=torch.int32, device=device)
             dist.all_reduce(active, op=dist.ReduceOp.MIN, group=group)
-            column_512_ctas = int(active.item()) // self.world_size * self.world_size
+            column_512_ctas = min(
+                self.active_ctas,
+                int(active.item()) // self.world_size * self.world_size,
+            )
+        # The tiled 512-row column schedule distributes work across 76 CTA pairs.
+        column_512_cooperative = column_512_ctas == 152
         self.can_borrow_column_512 = (
             column_512_cooperative and column_512_ctas == self.active_ctas
         )

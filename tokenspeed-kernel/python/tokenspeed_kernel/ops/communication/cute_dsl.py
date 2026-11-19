@@ -180,30 +180,27 @@ def fused_tp_column_projection_supported(
         and group_size in (2, 4, 8)
         and max_rows >= 1
         and dtype == torch.bfloat16
+        and input_size >= 128
+        and input_size % 128 == 0
+        and output_size >= group_size * 128
     ):
         return False
+    device_arch = torch.cuda.get_device_capability(device)
+    if device_arch not in ((10, 0), (10, 3)):
+        return False
+    aligned_output = output_size % (group_size * 128) == 0
     if weight_dtype == torch.float8_e4m3fn:
-        return (
-            input_size >= 128
-            and input_size % 128 == 0
-            and output_size >= group_size * 128
-            and output_size % (group_size * 128) == 0
-            and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
-        )
+        return aligned_output
+    # BF16 TP4 DSA QKV-A uses 96-channel alignment for each output shard.
+    dsa_tp4_shape = (
+        device_arch == (10, 3)
+        and group_size == 4
+        and (input_size, output_size) == (7168, 14592)
+    )
     return (
         weight_dtype == torch.bfloat16
         and group_size in (2, 4)
-        and input_size == 7168
-        and (
-            output_size
-            in {
-                ((rows + group_size * 128 - 1) // (group_size * 128)) * group_size * 128
-                for rows in (49376, 14400)
-            }
-            or (group_size == 4 and output_size == 14592)
-        )
-        and torch.cuda.get_device_capability(device) == (10, 3)
-        and torch.cuda.get_device_properties(device).multi_processor_count == 152
+        and (aligned_output or dsa_tp4_shape)
     )
 
 
@@ -232,28 +229,18 @@ def fused_tp_row_projection_supported(
         Whether this fixed schedule can be prepared. The caller must separately
         agree on peer-memory reachability and eligibility across the group.
     """
-    if not (
+    return (
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4)
         and max_rows >= 1
         and dtype == torch.bfloat16
-    ):
-        return False
-    if weight_dtype == torch.float8_e4m3fn:
-        return (
-            input_size >= group_size * 128
-            and input_size % (group_size * 128) == 0
-            and output_size >= group_size * 128
-            and output_size % (group_size * 128) == 0
-            and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
-        )
-    return (
-        weight_dtype == torch.bfloat16
-        and input_size == 12288
-        and output_size == 7168
-        and torch.cuda.get_device_capability(device) == (10, 3)
-        and torch.cuda.get_device_properties(device).multi_processor_count == 152
+        and weight_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and input_size >= group_size * 128
+        and input_size % (group_size * 128) == 0
+        and output_size >= group_size * 128
+        and output_size % (group_size * 128) == 0
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
     )
 
 
@@ -640,7 +627,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_fused_bf16_dp_column_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -684,7 +671,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_fused_bf16_dp_row_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),

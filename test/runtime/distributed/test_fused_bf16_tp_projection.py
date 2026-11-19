@@ -45,10 +45,7 @@ def _worker(
         cute_dsl_fused_fp8_dp_row_linear,
     )
 
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.comm_backend.projection import (
-        ProjectionBackend,
-    )
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_ops import (
         ProjectionSpec,
         prepare_projection_collectives,
@@ -198,15 +195,7 @@ def _worker(
                 (128,) * world_size,
                 (0, 32, 1, 30)[:world_size],
             ]
-        state = create(
-            dist.group.WORLD,
-            device,
-            capacity,
-            input_size,
-            output_size,
-            weight_dtype=weight_dtype,
-        )
-        backend = NcclBackend()
+        backend = AutoBackend()
         workspace = prepare_projection_collectives(
             ProjectionSpec(
                 group=tuple(range(world_size)),
@@ -220,21 +209,35 @@ def _worker(
             ),
             backend,
         )
-        # Native-state tests use smaller widths than automatic eligibility.
-        # Install that real state to exercise the runtime's format dispatch too.
-        if kind == "column":
-            workspace.fused_column = state
-        else:
-            workspace.fused_row = state
-        dispatcher = ProjectionBackend(backend)
+        state = workspace.fused_column if kind == "column" else workspace.fused_row
+        assert state is not None, (
+            kind,
+            world_size,
+            weight_dtype,
+            input_size,
+            output_size,
+        )
+        assert state.quantized == quantized
+        dispatch_rows = 64 if quantized else 32
+
+        def project(x, counts, out):
+            if kind == "column":
+                fused = backend.try_fused_dp_column_linear(
+                    x, weight, weight_scales, counts, out, workspace
+                )
+            else:
+                fused = backend.try_fused_dp_row_linear(
+                    x, None, weight, weight_scales, counts, out, workspace
+                )
+            assert fused == (max(counts) >= dispatch_rows), (kind, counts)
+            if not fused:
+                # Keep native coverage for batches below the runtime cutoff.
+                run(state, x, weight, weight_scales, counts, out)
+
         inputs = [values((counts[rank], input_size)) for counts in counts_list]
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         skew_ranks = not quantized and (kind == "row" or capacity >= 512)
-        dispatch_rows = 64 if quantized else 32
-        dispatch_counts = {(dispatch_rows,) * world_size}
-        if kind == "row":
-            dispatch_counts.add((64, 0) if quantized else (0, 65))
 
         retained = []
         # Check eager outputs on the stream used for graph warmup.
@@ -244,28 +247,9 @@ def _worker(
                 if skew_ranks:
                     torch.cuda._sleep(25000 * ((rank + case_index) % world_size))
                 out = torch.full_like(expected, float("nan"))
-                actual = run(state, x, weight, weight_scales, counts, out)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                project(x, counts, out)
                 torch.testing.assert_close(out, expected, rtol=0, atol=0)
                 retained.append((out, expected))
-                if counts in dispatch_counts:
-                    dispatched = torch.full_like(expected, float("nan"))
-                    if kind == "column":
-                        fused = dispatcher.try_fused_dp_column_linear(
-                            x, weight, weight_scales, counts, dispatched, workspace
-                        )
-                    else:
-                        fused = dispatcher.try_fused_dp_row_linear(
-                            x,
-                            None,
-                            weight,
-                            weight_scales,
-                            counts,
-                            dispatched,
-                            workspace,
-                        )
-                    assert fused
-                    torch.testing.assert_close(dispatched, expected, rtol=0, atol=0)
 
         stream.synchronize()
         graph_outputs = [
@@ -287,7 +271,7 @@ def _worker(
                 ):
                     if skew_ranks:
                         torch.cuda._sleep(25000 * ((rank + case_index) % world_size))
-                    run(state, x, weight, weight_scales, counts, out)
+                    project(x, counts, out)
         finally:
             if gc_was_enabled:
                 gc.enable()
@@ -334,11 +318,12 @@ def _worker(
     (("column", 2), ("column", 4), ("row", 2)),
 )
 def test_native_bf16_tp_projection(tmp_path, kind, world_size):
-    if torch.cuda.device_count() < world_size or torch.cuda.get_device_capability() != (
-        10,
-        3,
+    supported_arches = ((10, 0), (10, 3))
+    if (
+        torch.cuda.device_count() < world_size
+        or torch.cuda.get_device_capability() not in supported_arches
     ):
-        pytest.skip(f"requires {world_size} node-local GB300 GPUs")
+        pytest.skip(f"requires {world_size} node-local SM100 or SM103 GPUs")
     mp.spawn(
         _worker,
         args=(
@@ -369,7 +354,7 @@ def test_native_fp8_tp_projection_smoke(tmp_path, kind):
 
 def test_native_bf16_dsa_column_projection(tmp_path):
     if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("requires 4 node-local GB300 GPUs")
+        pytest.skip("requires 4 node-local SM103 GPUs")
     mp.spawn(
         _worker,
         args=(

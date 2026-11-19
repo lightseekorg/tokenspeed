@@ -345,15 +345,19 @@ batch bound including speculative tokens; larger batches retain NCCL.
 Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
-Block-FP8 projection fusion supports aligned widths on SM100 and SM103 when
-the subgroup maximum is at least 64 physical rows. On GB300, node-local TP2 and
-TP4 can also fuse BF16 KDA and sparse-MLA QKV and output projections, starting
-at a subgroup maximum of 32 physical rows. BF16 QKV shards normally align to 128 channels. TP4 sparse-MLA shards
-use 96-channel alignment, padding 14400 logical outputs to 14592 stored channels.
-Checkpoint loading and returned logical outputs keep their original order and
-width. BF16 fusion uses BF16 operands directly. Row GEMM partials round to BF16,
-then sum in FP32 rank order before final BF16 rounding. Unsupported BF16
-configurations use the ordinary projection collectives.
+Automatic projection fusion uses TP2 or TP4. Column fusion requires input
+widths and output shard widths aligned to 128 channels. Row fusion requires
+input and output widths aligned to `TP × 128` channels. BF16 TP4 sparse-MLA QKV-A
+can fuse with 96-channel shard alignment on SM103. This layout pads 14400
+logical outputs to 14592 stored channels and preserves the original order and
+width of the checkpoint and returned logical outputs.
+
+Block-FP8 fusion supports SM100 and SM103 at a subgroup maximum of at least 64
+physical rows. BF16 fusion supports node-local SM100 and SM103 groups at a
+subgroup maximum of at least 32 physical rows. SM100 uses the same aligned
+shapes for both formats. BF16 fusion uses BF16 operands directly.
+Row GEMM partials round to BF16, then sum in FP32 rank order before final BF16
+rounding. Unsupported configurations use the ordinary projection collectives.
 
 These projection settings apply to DEP; DWDP still requires them to be `1`.
 Shared-expert TP requires BF16 weights.
