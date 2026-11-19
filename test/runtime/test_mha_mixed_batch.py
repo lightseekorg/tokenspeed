@@ -405,7 +405,6 @@ def _block_runtime():
     # wire_target's choice for a one-rank layout: the lookup is the input.
     drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
-    # Metadata preparation enters the runner's allocation region even on CPU.
     runner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     runner.dp_local_graph = False
     runner.attn_backend, runner.draft_attn_backend = routers
