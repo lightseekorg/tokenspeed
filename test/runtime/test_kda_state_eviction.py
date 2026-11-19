@@ -55,6 +55,7 @@ from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     _LOWER_BOUND,
     _assert_close,
     _KDAHarness,
+    _logical_checkpoint,
     _naive_kda_scan,
     _stub_contract,
     _StubContractPool,
@@ -271,7 +272,7 @@ class _ScheduledKDA:
                 stream["beta_raw"][begin:end],
             )
             output = (
-                self.kernel.extend(*inputs, bs=1)
+                self.kernel.extend(*inputs, bs=1, forward_mode=ForwardMode.EXTEND)
                 if is_prefill
                 else self.kernel.decode(*inputs, bs=1)
             )
@@ -282,9 +283,11 @@ class _ScheduledKDA:
             stream = streams[layer]
             state_block = tables[group][0][STATE_LIVE_SLOT]
             for component in _COMPONENTS:
-                states[layer, component] = self.pool.get_component(layer, component)[
-                    state_block
-                ].clone()
+                states[layer, component] = (
+                    _logical_checkpoint(self.pool, layer, state_block)
+                    if component == "recurrent_state"
+                    else self.pool.get_component(layer, component)[state_block].clone()
+                )
             # Convolution stores raw projections, not the post-convolution
             # values. This independent check also detects a wrong read/write id.
             expected_conv = stream["mixed"][
@@ -328,7 +331,13 @@ class _ScheduledKDA:
                 tables[group][0][slot]
             ].clone()
             for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
-            for component in _COMPONENTS
+            for component in (
+                *_COMPONENTS,
+                "replay_correction",
+                "replay_key",
+                "replay_decay",
+                "replay_length",
+            )
         }
 
 
@@ -380,8 +389,11 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
                 for row in rows
                 for block in row
             )
+            # The unaligned prompt holds one full-history copy-in block
+            # outside these tables until its first decode publishes the tail.
+            prompt_tail_copy_in = 1
             assert active.scheduler.empty_lcm_blocks() == (
-                _USABLE_BLOCKS - materialized
+                _USABLE_BLOCKS - materialized - prompt_tail_copy_in
             )
             assert all(len(active.released[group]) == 2 for group in KIMI_STATE_GROUPS)
 

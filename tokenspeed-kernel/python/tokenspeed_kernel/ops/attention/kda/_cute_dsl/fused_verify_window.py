@@ -56,7 +56,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, const_expr, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
-from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm, KdaRetainedHistory
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (
     _DTYPES,
     CONV_TAPS,
@@ -90,6 +90,19 @@ GATE_RANK = 128
 MAX_WINDOW = 16
 # The head's value channels in groups of one warp; the norm adds their sums in order.
 NORM_GROUPS = DIM // 32
+
+
+from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
+    consolidate_history,
+)
+from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
+    fake_retained_arguments,
+    initialize_tile,
+    retained_arguments,
+    retained_length,
+    retained_page,
+)
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
 
 @dsl_user_op
@@ -318,8 +331,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
         a_log: cute.Tensor,
         dt_bias: cute.Tensor,
         state: cute.Tensor,
+        retained: tuple,
+        ring_capacity: Int64,
         correction: cute.Tensor,
-        key_gate: cute.Tensor,
+        normalized_key: cute.Tensor,
         original: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
@@ -354,8 +369,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
             a_log.iterator,
             dt_bias.iterator,
             state.iterator,
+            retained,
+            ring_capacity,
             correction.iterator,
-            key_gate.iterator,
+            normalized_key.iterator,
             original.iterator,
             out.iterator,
             query_start_loc.iterator,
@@ -375,9 +392,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
             correction.stride[0],
             correction.stride[1],
             correction.stride[2],
-            key_gate.stride[0],
-            key_gate.stride[1],
-            key_gate.stride[2],
+            normalized_key.stride[0],
+            normalized_key.stride[1],
+            normalized_key.stride[2],
             original.stride[0],
             out.stride[0],
             gate_token_stride,
@@ -402,8 +419,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
         a_log,
         dt_bias,
         state,
+        retained: tuple,
+        ring_capacity: Int64,
         correction,
-        key_gate,
+        normalized_key,
         original,
         out,
         query_start_loc,
@@ -423,9 +442,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
         correction_slot_stride: Int64,
         correction_head_stride: Int64,
         correction_position_stride: Int64,
-        key_gate_slot_stride: Int64,
-        key_gate_head_stride: Int64,
-        key_gate_position_stride: Int64,
+        normalized_key_slot_stride: Int64,
+        normalized_key_head_stride: Int64,
+        normalized_key_position_stride: Int64,
         original_token_stride: Int64,
         out_token_stride: Int64,
         gate_token_stride: Int64,
@@ -447,7 +466,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         token_start = Int64(_load(query_start_loc, request))
         valid_tokens = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
-        live = (page > 0) & (valid_tokens > 0)
+        live = (page > 0) & (retained_page(retained, request) > 0) & (valid_tokens > 0)
         if tidx == 0:
             cute.arch.mbarrier_init(shared.state_barrier, 1)
             cute.arch.mbarrier_init(shared.weight_barrier, 1)
@@ -480,20 +499,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     VT * GATE_RANK * 2,
                     Int32(shared.weight_barrier.toint()),
                 )
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    shared.state_barrier, VT * K * 4
-                )
-                tile_src = state + (
-                    page * state_page_stride
-                    + head * state_head_stride
-                    + value_start * K
-                )
-                _bulk_load(
-                    shared.tile_addr,
-                    tile_src.toint(),
-                    VT * K * 4,
-                    Int32(shared.state_barrier.toint()),
-                )
+            initialize_tile(
+                shared.tile, retained, request, head, value_start, VT, K, tidx, THREADS
+            )
+            if tidx == 0:
+                cute.arch.mbarrier_arrive(shared.state_barrier)
 
         # Issued here and first used after the wait, so no load stalls before it.
         channels = []
@@ -590,7 +600,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     # The v tile is this CTA's own plain stores.
                     cute.arch.barrier()
                 # Reduce the 64-bit start before narrowing so ring positions stay exact.
-                ring_start = Int32(start % self.capacity)
+                ring_start = Int32(start % ring_capacity)
                 if tidx < W:
                     shared.sums[self.sums.beta + tidx] = _div(
                         Float32(1.0), Float32(1.0) + _exp(-raw_beta.to(Float32))
@@ -606,8 +616,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         stamp = cute.make_tensor(
                             stamps
                             + (
-                                slot * self.capacity
-                                + (ring_start + tidx) % self.capacity
+                                slot * ring_capacity
+                                + (ring_start + tidx) % ring_capacity
                             )
                             * 2,
                             cute.make_layout((2,)),
@@ -622,9 +632,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     gate_bias,
                     gate_scale,
                     lower_bound,
-                    key_gate
-                    + (slot * key_gate_slot_stride + head * key_gate_head_stride),
-                    key_gate_position_stride,
+                    retained,
+                    retained_page(retained, request),
+                    head,
+                    retained_length(retained, retained_page(retained, request)),
                     Int32(value_tile == 0),
                     valid_tokens,
                     ring_start,
@@ -650,14 +661,16 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     token_start * out_token_stride + head * V + value_start + channel
                 )
                 correction_row = correction + (
-                    slot * correction_slot_stride
+                    retained_page(retained, request) * correction_slot_stride
                     + head * correction_head_stride
                     + value_start
                     + channel
                 )
                 for t in cutlass.range_constexpr(W):
                     stored = owner & Int32(t < valid_tokens)
-                    position = (ring_start + t) % self.capacity
+                    position = (
+                        retained_length(retained, retained_page(retained, request)) + t
+                    )
                     _store_if(
                         stored,
                         (out_row + t * out_token_stride).toint(),
@@ -917,6 +930,8 @@ def _compile(
     window: int,
     value_tile_rows: int,
     capacity: int,
+    state_dtype: torch.dtype,
+    live_dtype: torch.dtype,
     bounded_gate: bool,
     factored: bool,
     has_metadata: bool,
@@ -942,9 +957,13 @@ def _compile(
     beta = make_fake_tensor(_DTYPES[beta_dtype], (tokens, heads))
     a_log = make_fake_tensor(_DTYPES[param_dtype], (heads,))
     dt_bias = make_fake_tensor(_DTYPES[bias_dtype], (heads * DIM,))
-    state = make_fake_tensor(Float32, (cute.sym_int(), heads, DIM, DIM), divisibility=4)
+    state = make_fake_tensor(
+        _DTYPES[state_dtype], (cute.sym_int(), heads, DIM, DIM), divisibility=4
+    )
     correction = make_fake_tensor(Float32, (slots, heads, capacity, DIM))
-    key_gate = make_fake_tensor(BFloat16, (slots, heads, capacity, 2 * DIM))
+    normalized_key = make_fake_tensor(
+        Float32, (slots, heads, capacity, DIM), leading_dim=None
+    )
     original = make_fake_tensor(BFloat16, (tokens, 3 * width))
     out = make_fake_tensor(BFloat16, (tokens, width))
     query_start_loc = make_fake_tensor(_DTYPES[start_dtype], (cute.sym_int(),))
@@ -952,11 +971,19 @@ def _compile(
     metadata = stamps = None
     if has_metadata:
         metadata = make_fake_tensor(Int64, (batch, 3))
-        stamps = make_fake_tensor(Int64, (slots, capacity, 2))
+        stamps = make_fake_tensor(Int64, (cute.sym_int(), cute.sym_int(), 2))
     gate = norm_weight = None
     if norm_dtype is not None:
         gate = make_fake_tensor(BFloat16, (tokens, width))
         norm_weight = make_fake_tensor(_DTYPES[norm_dtype], (DIM,))
+    retained = fake_retained_arguments(
+        state,
+        correction,
+        normalized_key,
+        slots=slots,
+        batch=batch,
+        live_dtype=_DTYPES[live_dtype],
+    )
     kernel = FusedVerifyWindow(
         heads,
         window,
@@ -979,8 +1006,10 @@ def _compile(
         a_log,
         dt_bias,
         state,
+        retained,
+        Int64(0),
         correction,
-        key_gate,
+        normalized_key,
         original,
         out,
         query_start_loc,
@@ -1024,6 +1053,7 @@ def fused_verify_window_supported(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     checkpoint_state: torch.Tensor,
+    retained_history: KdaRetainedHistory,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     num_heads: int,
@@ -1043,8 +1073,9 @@ def fused_verify_window_supported(
         beta_logits: ``[tokens, num_heads]`` beta logits.
         A_log: ``[num_heads]`` gate decay logarithms.
         dt_bias: ``[num_heads * head_dim]`` gate bias.
-        checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
+        checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32/BF16
             checkpoint in value-major layout.
+        retained_history: Accepted records and per-request live pages.
         query_start_loc: ``[batch + 1]`` token offset of each request.
         state_indices: ``[batch]`` checkpoint and convolution page of each
             request.
@@ -1054,29 +1085,25 @@ def fused_verify_window_supported(
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
 
     Returns:
-        True when the one-token kernel's conditions hold, the window has 2 to
-        16 tokens and the batch layout is dense INT32 or INT64.
+        True when the one-token kernel's layout conditions hold and the window
+        has 2 to 16 tokens.
     """
-    return (
-        2 <= window <= MAX_WINDOW
-        and fused_verify_step_supported(
-            mixed_qkv,
-            conv_weights,
-            conv_states,
-            f_a_out,
-            f_b_weight,
-            beta_logits,
-            A_log,
-            dt_bias,
-            checkpoint_state,
-            num_heads,
-            head_dim,
-            lower_bound,
-        )
-        and all(
-            x.dtype in (torch.int32, torch.int64) and x.stride(0) == 1
-            for x in (query_start_loc, state_indices)
-        )
+    return 2 <= window <= MAX_WINDOW and fused_verify_step_supported(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        checkpoint_state,
+        retained_history,
+        query_start_loc,
+        state_indices,
+        num_heads,
+        head_dim,
+        lower_bound,
     )
 
 
@@ -1091,8 +1118,7 @@ def fused_verify_window(
     dt_bias: torch.Tensor,
     lower_bound: float | None,
     checkpoint_state: torch.Tensor,
-    correction_cache: torch.Tensor,
-    kg_cache: torch.Tensor,
+    retained_history,
     original_qkv: torch.Tensor,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
@@ -1120,10 +1146,8 @@ def fused_verify_window(
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
         checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
             committed checkpoint in value-major layout; read only.
-        correction_cache: ``[slots, num_heads, capacity, head_dim]`` FP32
-            correction records; written.
-        kg_cache: ``[slots, num_heads, capacity, 2 * head_dim]`` BF16 key and
-            raw-gate records; written.
+        retained_history: Page-owned FP32 U/normalized-K/decay and accepted
+            lengths. Candidates append after each live page's accepted prefix.
         original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
             the pre-convolution rows for commit.
         query_start_loc: ``[batch + 1]`` token offset of each request; a
@@ -1153,6 +1177,7 @@ def fused_verify_window(
             record layout, or the output norm's gate or weight are laid out
             otherwise.
     """
+    correction_cache = retained_history.correction
     if mixed_qkv.shape[0] == 0:
         return out
     if not fused_verify_window_supported(
@@ -1165,6 +1190,7 @@ def fused_verify_window(
         A_log,
         dt_bias,
         checkpoint_state,
+        retained_history,
         query_start_loc,
         state_indices,
         num_heads,
@@ -1187,6 +1213,8 @@ def fused_verify_window(
         window,
         value_tile_rows,
         correction_cache.shape[2],
+        checkpoint_state.dtype,
+        retained_history.live_state_indices.dtype,
         bounded,
         bounded and window * abs(lower_bound) <= FACTORED_DECAY,
         record_metadata is not None,
@@ -1198,6 +1226,10 @@ def fused_verify_window(
         state_indices.dtype,
         _smem_floor(ctas, mixed_qkv.device),
     )
+    consolidate_history(
+        checkpoint_state, retained_history, state_indices, query_start_loc
+    )
+    reset_retained_history(retained_history, state_indices, query_start_loc)
     kernel(
         mixed_qkv,
         conv_weights,
@@ -1208,8 +1240,14 @@ def fused_verify_window(
         A_log,
         dt_bias.reshape(-1),
         checkpoint_state,
+        retained_arguments(checkpoint_state, retained_history),
+        (
+            record_stamps.shape[1]
+            if record_stamps is not None
+            else correction_cache.shape[2]
+        ),
         correction_cache,
-        kg_cache,
+        retained_history.key,
         original_qkv,
         out,
         query_start_loc,

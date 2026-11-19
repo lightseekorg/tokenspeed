@@ -189,7 +189,15 @@ def _partition_for_field(
 
     linear_config = getattr(text_config, "linear_attn_config", None)
     if (
-        suffix in ("conv_state", "conv_state_channels_last", "recurrent_state")
+        suffix
+        in (
+            "conv_state",
+            "conv_state_channels_last",
+            "recurrent_state",
+            "replay_correction",
+            "replay_key",
+            "replay_decay",
+        )
         and linear_config is not None
     ):
         num_heads = int(linear_config["num_heads"])

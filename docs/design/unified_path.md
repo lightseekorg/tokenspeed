@@ -318,8 +318,8 @@ from one first bound to that pool:
   pool's specs, page counts, and request-slot capacity), `init_cuda_graph_state`,
   `init_prefill_graph_state` and `preallocate_verify_workspace` again after
   a rebind, as after a first bind. A probe pool must still hold `max_bs`
-  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
-  slab. The backend tree covers only itself: the executor's own pool
+  state rows: retained KDA verification addresses live checkpoint fields in
+  the bound arena. The backend tree covers only itself: the executor's own pool
   references (`token_to_kv_pool`, its cache runtime contract, the drafter's
   pool) and the layer-to-group stamps `bind_cache_groups` writes on the
   model are the caller's to re-publish, as are the graph owners' own pool

@@ -38,6 +38,7 @@ if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 pytest.importorskip("cutlass")
 pytest.importorskip("quack")
+from tokenspeed_kernel.ops.attention.kda import KdaRetainedHistory
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
     vllm_triton_kda_recoverssm_verify,
 )
@@ -179,63 +180,47 @@ def _repitch(x, extra):
 
 
 def _destinations(inputs):
-    """Sentinel-filled outputs and records; serving records view padded payload rows."""
     _, tokens, heads, key_dim = inputs["q"].shape
     value_dim = inputs["v"].shape[-1]
+    pages = inputs["checkpoint_state"].shape[0]
     cap, slots = inputs["capacity"], inputs["slots"]
-    device = inputs["q"].device
     out_rows = torch.full(
         (1, tokens + OUT_GUARD_ROWS, heads, value_dim),
         OUT_FILL,
-        device=device,
+        device="cuda",
         dtype=torch.bfloat16,
     )
-    result = dict(out_rows=out_rows, out=out_rows[:, :tokens])
-    if inputs["serving_records"]:
-        width = inputs["spec_query_len"]
-        correction_rows = torch.full(
-            (slots * width, heads * value_dim + CORRECTION_ROW_PAD),
-            CORRECTION_FILL,
-            device=device,
-        )
-        key_gate_rows = torch.full(
-            (slots * width, 2 * heads * key_dim + KEY_GATE_ROW_PAD),
-            KEY_GATE_FILL,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        # As in serving: [slot, head, position, channel] views of payload rows.
-        result["correction_rows"] = correction_rows
-        result["key_gate_rows"] = key_gate_rows
-        result["correction_cache"] = (
-            correction_rows[:, : heads * value_dim]
-            .view(slots, width, heads, value_dim)
-            .transpose(1, 2)
-        )
-        result["kg_cache"] = (
-            key_gate_rows[:, : 2 * heads * key_dim]
-            .view(slots, width, heads, 2 * key_dim)
-            .transpose(1, 2)
-        )
-        stamp_pool = torch.full(
-            (2, slots + 2, cap, 2), STAMP_FILL, device=device, dtype=torch.int64
-        )
-        result["stamp_pool"] = stamp_pool
-        result["record_stamps"] = stamp_pool[1, :slots]
-    else:
-        result["correction_cache"] = torch.full(
-            (slots, heads, cap, value_dim), CORRECTION_FILL, device=device
-        )
-        result["kg_cache"] = torch.full(
-            (slots, heads, cap, 2 * key_dim),
-            KEY_GATE_FILL,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        result["record_stamps"] = torch.full(
-            (slots, cap, 2), STAMP_FILL, device=device, dtype=torch.int64
-        )
-    return result
+    correction_rows = torch.full(
+        (pages * cap, heads * value_dim + CORRECTION_ROW_PAD),
+        CORRECTION_FILL,
+        device="cuda",
+    )
+    key_gate_rows = torch.full(
+        (pages * cap, heads * key_dim + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
+    )
+    decay_rows = torch.full_like(key_gate_rows, KEY_GATE_FILL)
+    stamp_pool = torch.full(
+        (2, slots + 2, cap, 2), STAMP_FILL, device="cuda", dtype=torch.int64
+    )
+    return dict(
+        out_rows=out_rows,
+        out=out_rows[:, :tokens],
+        correction_rows=correction_rows,
+        key_gate_rows=key_gate_rows,
+        decay_rows=decay_rows,
+        correction_cache=correction_rows[:, : heads * value_dim]
+        .view(pages, cap, heads, value_dim)
+        .transpose(1, 2),
+        kg_cache=key_gate_rows[:, : heads * key_dim]
+        .view(pages, cap, heads, key_dim)
+        .transpose(1, 2),
+        decay_cache=decay_rows[:, : heads * key_dim]
+        .view(pages, cap, heads, key_dim)
+        .transpose(1, 2),
+        length=torch.zeros(pages, 1, device="cuda", dtype=torch.int32),
+        stamp_pool=stamp_pool,
+        record_stamps=stamp_pool[1, :slots],
+    )
 
 
 def _run(verify, inputs, with_stamps=True, dest=None, **overrides):
@@ -251,8 +236,13 @@ def _run(verify, inputs, with_stamps=True, dest=None, **overrides):
         args["A_log"],
         args["dt_bias"],
         checkpoint_state=args["checkpoint_state"],
-        correction_cache=result["correction_cache"],
-        kg_cache=result["kg_cache"],
+        retained_history=KdaRetainedHistory(
+            result["correction_cache"],
+            result["kg_cache"],
+            result["decay_cache"],
+            result["length"],
+            args["state_indices"],
+        ),
         query_start_loc=args["query_start_loc"],
         state_indices=args["state_indices"],
         spec_query_len=args["spec_query_len"],
@@ -275,8 +265,13 @@ def _supported(inputs, result, **overrides):
         args["A_log"],
         args["dt_bias"],
         args["checkpoint_state"],
-        result["correction_cache"],
-        result["kg_cache"],
+        KdaRetainedHistory(
+            result["correction_cache"],
+            result["kg_cache"],
+            result["decay_cache"],
+            result["length"],
+            args["state_indices"],
+        ),
         args["query_start_loc"],
         args["state_indices"],
         args["spec_query_len"],
@@ -362,30 +357,35 @@ def _check_outputs(inputs, cute, ref_out):
 
 
 def _check_records(inputs, cute, triton, ref_corr, with_stamps):
-    assert torch.equal(cute["kg_cache"], triton["kg_cache"]), _first_difference(
-        cute["kg_cache"], triton["kg_cache"]
-    )
-    assert torch.equal(
-        cute["record_stamps"], triton["record_stamps"]
-    ), _first_difference(cute["record_stamps"], triton["record_stamps"])
-    key_dim = inputs["q"].shape[-1]
+    for field in ("kg_cache", "decay_cache"):
+        torch.testing.assert_close(cute[field], triton[field], atol=2e-7, rtol=2e-6)
+    assert torch.equal(cute["record_stamps"], triton["record_stamps"])
     starts = inputs["query_start_loc"].tolist()
     meta = inputs["record_metadata"].tolist()
     cap = inputs["capacity"]
     written = torch.zeros(cute["correction_cache"].shape[0], cap, dtype=torch.bool)
     scale = max([float(c.abs().max()) for c in ref_corr.values()] + [0.0])
-    for (b, t), c in ref_corr.items():
+    stamp_written = torch.zeros_like(cute["record_stamps"][..., 0], dtype=torch.bool)
+    for (b, t), correction in ref_corr.items():
+        page = int(inputs["state_indices"][b])
         slot, generation, start = meta[b] if with_stamps else (b, 0, 0)
-        pos = (start + t) % cap
-        written[slot, pos] = True
-        got = cute["correction_cache"][slot, :, pos].double()
-        error = float((got - c).abs().max())
+        written[page, t] = True
+        got = cute["correction_cache"][page, :, t].double()
+        error = float((got - correction).abs().max())
         assert error <= CORRECTION_TOLERANCE * scale + 1e-9, (b, t, error)
-        kg = cute["kg_cache"][slot, :, pos]
-        assert torch.equal(kg[:, :key_dim], inputs["k"][0, starts[b] + t]), (b, t)
-        assert torch.equal(kg[:, key_dim:], inputs["raw_g"][0, starts[b] + t]), (b, t)
+        raw_key = inputs["k"][0, starts[b] + t].float()
+        normalized = raw_key * torch.rsqrt(
+            raw_key.square().sum(-1, keepdim=True) + 1e-6
+        )
+        torch.testing.assert_close(
+            cute["kg_cache"][page, :, t], normalized, atol=2e-7, rtol=2e-6
+        )
         if with_stamps:
+            pos = (start + t) % cap
+            stamp_written[slot, pos] = True
             assert cute["record_stamps"][slot, pos].tolist() == [start + t, generation]
+    if with_stamps:
+        assert bool((cute["record_stamps"][~stamp_written] == STAMP_FILL).all())
     _check_untouched(inputs, cute, written, with_stamps)
 
 
@@ -395,7 +395,8 @@ def _check_untouched(inputs, cute, written, with_stamps):
     for name, records, fill in (
         ("correction", cute["correction_cache"].transpose(1, 2), CORRECTION_FILL),
         ("key/gate", cute["kg_cache"].transpose(1, 2), KEY_GATE_FILL),
-    ) + ((("stamp", cute["record_stamps"], STAMP_FILL),) if with_stamps else ()):
+        ("decay", cute["decay_cache"].transpose(1, 2), KEY_GATE_FILL),
+    ):
         changed = (records != fill).flatten(2).any(-1) & untouched
         assert not bool(
             changed.any()
@@ -618,6 +619,7 @@ def test_cute_dsl_recoverssm_verify_replays_in_cuda_graph(
         ("out", OUT_FILL),
         ("correction_cache", CORRECTION_FILL),
         ("kg_cache", KEY_GATE_FILL),
+        ("decay_cache", KEY_GATE_FILL),
         ("record_stamps", STAMP_FILL),
     ):
         cute[name].fill_(fill)
@@ -675,7 +677,6 @@ UNADDRESSABLE_INPUTS = {
 }
 UNADDRESSABLE_RECORDS = {
     "strided_correction_channels": "correction_cache",
-    "strided_key_gate_channels": "kg_cache",
 }
 
 
@@ -695,8 +696,25 @@ def _strided_record_channels(inputs, name):
 
 
 def _assert_same_results(cute, triton):
-    for name in ("out", "correction_cache", "kg_cache", "record_stamps"):
+    for name in ("out", "correction_cache", "kg_cache", "decay_cache", "record_stamps"):
         assert torch.equal(cute[name], triton[name]), name
+
+
+def test_strided_normalized_key_channels_match_reference() -> None:
+    inputs = _inputs(batch=16, width=8, lower_bound=-5.0, seed=5)
+    snapshot = inputs["checkpoint_state"].clone()
+    triton = _run(
+        vllm_triton_kda_recoverssm_verify,
+        inputs,
+        dest=_strided_record_channels(inputs, "kg_cache"),
+    )
+    cute = _run(
+        cute_dsl_kda_recoverssm_verify,
+        inputs,
+        dest=_strided_record_channels(inputs, "kg_cache"),
+    )
+    assert _supported(inputs, cute)
+    _check(inputs, cute, triton, snapshot)
 
 
 @pytest.mark.parametrize("layout", [*UNADDRESSABLE_INPUTS, *UNADDRESSABLE_RECORDS])
@@ -753,7 +771,7 @@ def test_fp16_gate_parameters() -> None:
         (torch.bfloat16, 80, 8, torch.float32, "vllm_triton_kda_recoverssm_verify"),
         (torch.bfloat16, 160, 8, torch.float32, "vllm_triton_kda_recoverssm_verify"),
         (torch.float16, 128, 8, torch.float32, "vllm_triton_kda_recoverssm_verify"),
-        (torch.bfloat16, 128, 8, torch.bfloat16, "vllm_triton_kda_recoverssm_verify"),
+        (torch.bfloat16, 128, 8, torch.bfloat16, "cute_dsl_kda_recoverssm_verify"),
     ],
 )
 def test_recoverssm_verify_selection(

@@ -285,3 +285,94 @@ def test_kda_generator_builds_kimi_k3_cache_arena_state_pages() -> None:
     assert state_pool.shape == (3, 12, 128, 128)
     assert state_pool.stride() == (221184, 16384, 128, 1)
     assert conv_pool.data_ptr() - state_pool.data_ptr() == 12 * 128 * 128 * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    ("mode", "window", "history_length"),
+    [
+        ("kda_fused_paged_verify", 1, 0),
+        ("kda_fused_paged_verify", 4, 8),
+        ("kda_retained_commit", 1, 0),
+        ("kda_retained_commit", 4, 0),
+    ],
+)
+def test_retained_benchmark_repetitions_restore_mutable_state(
+    monkeypatch, mode, window, history_length
+):
+    from tokenspeed_kernel.platform import current_platform
+
+    parameters = dict(
+        model_profile="kimi_k3_tp8",
+        heads=12,
+        key_dim=128,
+        value_dim=128,
+        dtype="bfloat16",
+        lower_bound=-5.0,
+        recurrent_layout="v_major",
+        batch=1,
+        draft_token_num=window,
+        conv_kernel_size=4,
+        state_pages=3,
+        state_page_bytes=884736,
+    )
+    if mode == "kda_retained_commit":
+        parameters.update(accepted_length=window, layers=2, state_groups=1)
+    else:
+        parameters["history_length"] = history_length
+    request = BenchmarkRequest(
+        family="attention",
+        mode=mode,
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=False,
+        seed=47,
+    )
+    layers = []
+    original_prepare = kda_generator._retained_benchmark_layer
+
+    def capture_layer(*args):
+        layer = original_prepare(*args)
+        layers.append(layer)
+        return layer
+
+    monkeypatch.setattr(kda_generator, "_retained_benchmark_layer", capture_layer)
+    prepare = (
+        kda_generator.prepare_kda_fused_paged_verify
+        if mode == "kda_fused_paged_verify"
+        else kda_generator.prepare_kda_retained_commit
+    )
+    prepared = prepare(request, current_platform())
+    assert prepared.invocation.reset is not None
+    snapshots = None
+    for _ in range(3):
+        prepared.invocation.reset()
+        output = prepared.invocation.invoke()
+        current = []
+        if isinstance(output, torch.Tensor):
+            current.append(output)
+        for layer in layers:
+            history = layer["records"].history
+            current.extend(
+                [
+                    layer["state"],
+                    layer["conv"],
+                    history.length,
+                    history.correction,
+                    history.key,
+                    history.decay,
+                ]
+            )
+            expected_length = (
+                window if mode == "kda_retained_commit" else history_length
+            )
+            live = history.live_state_indices.long()
+            assert history.length[live, 0].tolist() == [expected_length]
+            if history_length:
+                assert torch.count_nonzero(history.correction[live, :, :history_length])
+        if snapshots is None:
+            snapshots = [value.clone() for value in current]
+        else:
+            for value, saved in zip(current, snapshots):
+                torch.testing.assert_close(value, saved, atol=0, rtol=0)

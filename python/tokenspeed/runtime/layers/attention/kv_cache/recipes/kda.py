@@ -18,22 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""KDA state helpers shared by the Kimi-K3 and GLM cache recipes."""
+"""KDA checkpoint fields and transient verify workspace."""
 
 import torch
 
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    cache_dtype_name,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
 )
 
 
 def kda_recurrent_state_dtype(server_args) -> torch.dtype:
-    """KDA recurrent-state dtype selected by ``--mamba-ssm-dtype``.
+    """Return the dense-base dtype selected by ``--mamba-ssm-dtype``.
 
-    The scans accumulate in FP32 either way; BF16 only narrows what is stored
-    between steps, halving the state pages.
+    Retained history and accumulation remain FP32. The selected dtype rounds
+    the logical state only when materialization writes a new dense base.
     """
     return {
         "float32": torch.float32,
@@ -41,22 +45,101 @@ def kda_recurrent_state_dtype(server_args) -> torch.dtype:
     }[server_args.mamba_ssm_dtype]
 
 
-def kda_replay_supported(config: AttnConfig) -> bool:
-    """Return whether the target's dtype and recurrent geometry support replay."""
+def kda_state_fields(
+    layer_id: int,
+    plane_id: str,
+    *,
+    conv_shape: tuple[int, int],
+    recurrent_shape: tuple[int, int, int],
+    recurrent_state_dtype: torch.dtype,
+    history_capacity: int,
+) -> tuple[CacheFieldSpec, ...]:
+    """Declare a layer's convolution state and recurrent checkpoint.
+
+    Args:
+        layer_id: Model layer owning every field.
+        plane_id: Arena plane that packs this layer's state fields.
+        conv_shape: Per-rank convolution history shape.
+        recurrent_shape: Per-rank (heads, value dimension, key dimension).
+        recurrent_state_dtype: Dense-base storage dtype (FP32 or BF16).
+            History and logical-state accumulation remain FP32.
+        history_capacity: Total slots shared by accepted history and the
+            current verify candidates; capacity must be positive.
+            A direct-write consumer must reserve its entire candidate window
+            inside this capacity before verify; it must fit even at length zero.
+
+    Returns:
+        Fields belonging to one scheduler-owned state block. With history,
+        the recurrent field is a dense base. FP32 corrections, normalized
+        keys and multiplicative decays reconstruct its accepted endpoint in
+        token order. The INT32 length publishes only the accepted prefix;
+        candidate writes beyond it do not change the logical checkpoint.
+        Verify writes into a private live page, consolidating the accepted
+        history first when the candidate window would exceed capacity. Commit
+        publishes the accepted length without copying these record fields.
+        The next verify starts at that length, reusing rejected candidate slots.
+        Copying or transferring a checkpoint must carry every field together.
+    """
+    if history_capacity <= 0:
+        raise ValueError("KDA checkpoints require positive retained history capacity")
+    fields = (
+        CacheFieldSpec(
+            f"layer.{layer_id}.conv_state",
+            plane_id,
+            conv_shape,
+            cache_dtype_name(torch.bfloat16),
+            exact_page_stride=False,
+        ),
+        CacheFieldSpec(
+            f"layer.{layer_id}.recurrent_state",
+            plane_id,
+            recurrent_shape,
+            cache_dtype_name(recurrent_state_dtype),
+            exact_page_stride=False,
+        ),
+    )
+    heads, value_dim, key_dim = recurrent_shape
+    fields += tuple(
+        CacheFieldSpec(
+            f"layer.{layer_id}.{name}",
+            plane_id,
+            shape,
+            cache_dtype_name(dtype),
+            exact_page_stride=False,
+        )
+        for name, shape, dtype in (
+            (
+                "replay_correction",
+                (heads, history_capacity, value_dim),
+                torch.float32,
+            ),
+            ("replay_key", (heads, history_capacity, key_dim), torch.float32),
+            ("replay_decay", (heads, history_capacity, key_dim), torch.float32),
+            ("replay_length", (1,), torch.int32),
+        )
+    )
+    return fields
+
+
+def kda_retained_supported(config: AttnConfig) -> bool:
+    """Probe the complete retained verify/commit geometry at startup."""
     from tokenspeed_kernel.ops.attention.kda import (
         kda_recurrent_layout,
-        kda_replay_commit_supported,
+    )
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_retained_supported as kernel_retained_supported,
     )
 
     linear = config.component(LinearAttnConfig)
-    heads, head_dim, _ = linear.temporal_state_shape
-    return bool(
-        kda_replay_commit_supported(
-            config.dtype,
-            recurrent_layout=kda_recurrent_layout(),
-            num_heads=heads,
-            head_dim=head_dim,
-        )
+    heads, head_dim, key_dim = linear.temporal_state_shape
+    if head_dim != key_dim:
+        return False
+    return kernel_retained_supported(
+        config.dtype,
+        recurrent_layout=kda_recurrent_layout(),
+        num_heads=heads,
+        head_dim=head_dim,
+        conv_kernel_size=linear.conv_kernel_size,
     )
 
 
@@ -65,22 +148,22 @@ def kda_verify_workspace_bytes(
     groups: tuple[CacheGroupDeclaration, ...],
     *,
     draft_token_num: int,
-    replay_kda: bool,
 ) -> int:
-    """Return KDA verify staging bytes outside the cache arena.
+    """Return retained KDA verify workspace bytes outside the cache arena.
 
     Args:
-        config: The target's dimensions, dtype and serving batch capacity.
-        groups: Cache declarations containing the target's KDA state fields;
-            history fields, including draft history, are ignored.
-        draft_token_num: The target's effective verify width.
-        replay_kda: Replay capability cached by the recipe. Otherwise verify
-            retains the full convolution and recurrent state for each position.
+        config: Target attention configuration with model dimensions,
+            activation dtype, and maximum serving batch size.
+        groups: Cache declarations containing the target's KDA state fields.
+        draft_token_num: Effective verify width per request. Use 1 for
+            ordinary single-token decode.
 
     Returns:
-        Transient convolution rows and captured replay payloads, or the dense
-        state tape. Records metadata is required for both fused and split
-        producers. Callers decide whether this engine verifies.
+        Required runtime-owned workspace in bytes for the maximum batch size.
+        Includes original QKV, nine-column commit descriptors, page routing,
+        and generation/position stamps. Cache-owned
+        checkpoint fields, including dense recurrent state and retained
+        history, are budgeted separately in the cache arena.
     """
     state_fields = tuple(
         field
@@ -88,40 +171,22 @@ def kda_verify_workspace_bytes(
         if spec.attn_kind == "state"
         for field in fields
     )
-    if not replay_kda:
-        return (
-            config.max_bs
-            * (draft_token_num + 1)
-            * sum(field.payload_bytes for field in state_fields)
-        )
-
     from tokenspeed_kernel.ops.attention.kda import (
-        kda_replay_payload_specs,
+        KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS,
     )
 
     linear = config.component(LinearAttnConfig)
-    heads, head_dim, _ = linear.temporal_state_shape
     conv_fields = tuple(
         field for field in state_fields if field.field_id.endswith(".conv_state")
     )
-    conv_bytes = config.max_bs * sum(field.payload_bytes for field in conv_fields)
-    row_bytes = sum(
-        channels * payload_dtype.itemsize
-        for channels, payload_dtype in kda_replay_payload_specs(
-            config.dtype,
-            conv_channels=linear.conv_state_shape[0],
-            num_heads=heads,
-            head_dim=head_dim,
-        )
-    )
+    row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
     group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
-    metadata_bytes = len(conv_fields) * (10 * 8 + 4)
+    descriptor_columns = KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
+    metadata_bytes = len(conv_fields) * (descriptor_columns * 8 + 4)
     metadata_bytes += group_count * 4 * 8
     metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
     metadata_bytes += config.max_bs * 3 * 8
     metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
     return (
-        conv_bytes
-        + len(conv_fields) * config.max_bs * draft_token_num * row_bytes
-        + metadata_bytes
+        len(conv_fields) * config.max_bs * draft_token_num * row_bytes + metadata_bytes
     )

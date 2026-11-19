@@ -1560,6 +1560,31 @@ class MambaAttnBackend(AttentionBackend):
 
     # ---- Forward ----
 
+    def _prepare_prefill_state_inputs(
+        self,
+        layer_id,
+        conv_states,
+        recurrent_states,
+        source_indices,
+        live_indices,
+        *,
+        dtype: torch.dtype,
+    ):
+        """Gather the checkpoint that starts this layer's prefill scan."""
+        return _prepare_cache_prefill_state_inputs(
+            conv_states,
+            recurrent_states,
+            source_indices,
+            live_indices,
+            dtype=dtype,
+        )
+
+    def _store_prefill_state(
+        self, layer_id, final_state, recurrent_states, live_indices
+    ):
+        """Publish the final dense checkpoint after the scan finishes."""
+        store_state_rows(final_state, recurrent_states, live_indices)
+
     def layer_state(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1779,9 +1804,8 @@ class MambaAttnBackend(AttentionBackend):
 
         GDN has no fused conv+gate+scan kernel, so the base returns None and
         the caller runs the shared conv update / qkv split / scan flow. KDA
-        overrides this with a kernel that absorbs all three stages and may
-        itself decline (unsupported shape or platform), which is why the
-        sentinel is "not handled, continue" rather than a family switch.
+        uses deferred retained verification for one-token decode and does
+        not enter this hook.
 
         Args:
             mixed_qkv: Packed ``[T, key+key+value]`` conv input.
@@ -1827,11 +1851,9 @@ class MambaAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Single-token recurrent scan over the split, conv'd projections.
 
-        The boundary sits right after the shared split/reshape because that is
-        where the families stop agreeing: GDN consumes scalar-per-head decay
-        ``a``/``b`` through ``gdn_decode_step``, KDA a per-channel gate
-        ``g_raw`` plus raw beta logits through ``kda_paged_decode``. Both
-        return this backend's ``[1, B, Hv, V]`` decode-output convention.
+        GDN consumes scalar-per-head decay ``a``/``b`` through
+        ``gdn_decode_step`` and returns ``[1, B, Hv, V]``. KDA uses deferred
+        retained verification and does not enter this scan.
 
         Args:
             query: ``[B, 1, H, K]`` conv'd, split query.
@@ -1992,18 +2014,13 @@ class MambaAttnBackend(AttentionBackend):
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
-            output_indices = self.forward_metadata.mamba_output_indices
             state_in_blocks, _, conv_comp, ssm_comp = self.layer_state(layer_id)
-            conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             fused_out = self._verify(
                 mixed_qkv,
                 conv_weights,
                 conv_comp,
-                conv_scratch,
                 ssm_comp,
-                ssm_scratch,
                 state_in_blocks,
-                output_indices,
                 layer_id=layer_id,
                 bias=bias,
                 g_raw=g_raw,
@@ -2022,6 +2039,8 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
+            output_indices = self.forward_metadata.mamba_output_indices
+            conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             if self.tree_verify is None and not self._verify_packed_qkv_views:
                 # A chain verifies through the dense MTP kernels (FlashInfer's).
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
@@ -2068,7 +2087,8 @@ class MambaAttnBackend(AttentionBackend):
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
                 self.layer_state(layer_id)
             )
-            recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
+            recurrent_state, has_initial_states = self._prepare_prefill_state_inputs(
+                layer_id,
                 conv_states,
                 ssm_states,
                 state_in_blocks,
@@ -2263,9 +2283,12 @@ class MambaAttnBackend(AttentionBackend):
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
             # masked writer drops; it skips unused checkpoint slots alike.
-            store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
+            self._store_prefill_state(
+                layer_id, last_recurrent_state, ssm_states, state_out_blocks
+            )
             if metadata.state_checkpoints is not None:
-                store_state_rows(
+                self._store_prefill_state(
+                    layer_id,
                     metadata.scan_state_checkpoints.states[
                         metadata.scan_checkpoint_rows
                     ],
@@ -2313,11 +2336,8 @@ class MambaAttnBackend(AttentionBackend):
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
         conv_comp: torch.Tensor,
-        conv_scratch: torch.Tensor,
         ssm_comp: torch.Tensor,
-        ssm_scratch: torch.Tensor,
         state_in_blocks: torch.Tensor,
-        output_indices: torch.Tensor,
         *,
         layer_id: int,
         bias: torch.Tensor | None,
@@ -2337,23 +2357,20 @@ class MambaAttnBackend(AttentionBackend):
     ) -> torch.Tensor | None:
         """Whole-round verify attempt; ``None`` falls through to the shared flow.
 
-        Sits before the scratch seeding because a family's kernel may seed
-        (or skip) the scratch itself.
+        Runs before the caller accesses per-position scratch.
 
         GDN has no fused verify kernel, so the base returns None and the caller
         seeds the verify scratch and runs the shared conv update. KDA overrides
         this to prepare its convolution and gate inputs and run verification.
-        Its record path reads committed state without seeding a state tape.
+        Its retained path reconstructs the accepted endpoint without seeding
+        a state tape and raises if the configuration is unsupported.
 
         Args:
             mixed_qkv: Packed ``[T, key+key+value]`` conv input.
             conv_weights: Depthwise conv filters.
             conv_comp: Conv-window component of this layer's state slab.
-            conv_scratch: Per-position conv-window verify scratch.
             ssm_comp: Recurrent component of this layer's state slab.
-            ssm_scratch: Per-position recurrent verify scratch.
             state_in_blocks: Per-request committed-state page ids.
-            output_indices: ``[bs, T]`` verify scratch row grid.
             layer_id: Model layer whose verify payload is being processed.
             bias: Optional convolution bias before activation.
             g_raw: Precomputed raw per-channel gate (KDA), when supplied.

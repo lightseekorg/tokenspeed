@@ -54,12 +54,10 @@ from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     KdaOutputNorm,
-    KdaReplayRecords,
+    KdaRetainedHistory,
+    KdaRetainedRecords,
+    kda_fused_paged_verify,
     kda_fused_paged_verify_fuses_producers,
-    try_kda_fused_paged_verify,
-)
-from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (  # noqa: E402
-    fused_verify_step_supported,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     fused_kda_verify_conv_update,
@@ -117,64 +115,75 @@ def _inputs(batch, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0):
     )
 
 
-def _records(x, *, original):
-    """Sentinel destinations; records view padded payload rows as serving does."""
-    slots, rows = x["slots"], x["mixed_qkv"].shape[0]
+def _records(x, *, original, capacity=1, correction_stride=1):
+    """Sentinel-filled page-owned FP32 records, with padding around each page."""
+    pages, rows = x["state_pool"].shape[0], x["mixed_qkv"].shape[0]
     correction_rows = torch.full(
-        (slots, WIDTH + CORRECTION_ROW_PAD), CORRECTION_FILL, device="cuda"
+        (pages, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
+        CORRECTION_FILL,
+        device="cuda",
     )
     key_gate_rows = torch.full(
-        (slots, 2 * WIDTH + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
-    ).bfloat16()
-    stamps = torch.full((slots, 1, 2), STAMP_FILL, device="cuda", dtype=torch.int64)
+        (pages, capacity * 2 * WIDTH + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
+    )
+    packed = (
+        key_gate_rows[:, : capacity * 2 * WIDTH]
+        .view(pages, capacity, HEADS, 2 * DIM)
+        .transpose(1, 2)
+    )
+    history = KdaRetainedHistory(
+        correction_rows[:, : capacity * WIDTH * correction_stride]
+        .view(pages, capacity, HEADS, DIM * correction_stride)
+        .transpose(1, 2)[..., ::correction_stride],
+        packed[..., :DIM],
+        packed[..., DIM:],
+        torch.zeros(pages, 1, dtype=torch.int32, device="cuda"),
+        x["state_indices"],
+    )
+    stamps = torch.full(
+        (x["slots"], capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
+    )
     retained = torch.full(
         (rows, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
     ).bfloat16()
-    records = KdaReplayRecords(
+    records = KdaRetainedRecords(
         original_qkv=retained[:, : 3 * WIDTH] if original else None,
+        history=history,
         metadata=x["record_metadata"],
         stamps=stamps if x["record_metadata"] is not None else None,
-        correction=correction_rows[:, :WIDTH]
-        .view(slots, 1, HEADS, DIM)
-        .transpose(1, 2),
-        key_gate=key_gate_rows[:, : 2 * WIDTH]
-        .view(slots, 1, HEADS, 2 * DIM)
-        .transpose(1, 2),
         query_start_loc=x["query_start_loc"],
     )
     return records, (correction_rows, key_gate_rows, stamps, retained)
 
 
-def _verify(x, records, output_norm, **producers):
-    return try_kda_fused_paged_verify(
+def _verify(x, records, output_norm, *, override=None, **producers):
+    return kda_fused_paged_verify(
         x["mixed_qkv"],
         x["conv_weights"],
         x["conv_states"],
-        None,
         x["f_a_out"],
         x["f_b_weight"],
         x["beta_logits"],
         x["A_log"],
         x["dt_bias"],
         state_pool=x["state_pool"],
-        state_scratch=None,
         read_indices=x["state_indices"],
-        write_indices=x["state_indices"],
         num_heads=HEADS,
         head_dim=DIM,
         draft_token_num=1,
         lower_bound=x["lower_bound"],
-        store_states=False,
         recurrent_layout="v_major",
-        replay_records=records,
+        retained_records=records,
         output_norm=output_norm,
+        override=override,
+        solution=None,
         **producers,
     )
 
 
-def _split(x):
+def _split(x, prepared=None):
     """The serving split producers, then the registered record verify."""
-    records, buffers = _records(x, original=False)
+    records, buffers = _records(x, original=False) if prepared is None else prepared
     conv_qkv = fused_kda_verify_conv_update(
         x["mixed_qkv"],
         x["conv_weights"],
@@ -184,6 +193,7 @@ def _split(x):
         head_dim=DIM,
         draft_token_num=1,
         original_qkv=buffers[3][:, : 3 * WIDTH],
+        query_start_loc=x["query_start_loc"],
     )
     g_raw = F.linear(x["f_a_out"], x["f_b_weight"])
     return _verify(x, records, None, g_raw=g_raw, conv_qkv=conv_qkv), buffers
@@ -202,7 +212,9 @@ def _assert_matches(expected, actual):
     key_cols = torch.cat(
         [torch.arange(h * 2 * DIM, h * 2 * DIM + DIM) for h in range(HEADS)]
     ).cuda()
-    assert torch.equal(kg[:, key_cols], kg_ref[:, key_cols])
+    torch.testing.assert_close(
+        kg[:, key_cols], kg_ref[:, key_cols], atol=1e-7, rtol=2e-6
+    )
     assert torch.equal(kg[:, 2 * WIDTH :], kg_ref[:, 2 * WIDTH :])
     gate_cols = key_cols + DIM
     gates, gates_ref = kg[:, gate_cols].float(), kg_ref[:, gate_cols].float()
@@ -228,6 +240,74 @@ def test_fused_step_matches_split_producers(batch, lower_bound):
     _assert_matches(_split(x), _fused(x))
     assert torch.equal(x["state_pool"], state)
     assert torch.equal(x["conv_states"], history)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("raw_gate_only", [False, True])
+def test_retained_prefix_append_preserves_base_and_publishes_on_commit(
+    state_dtype, raw_gate_only
+):
+    from kda_retained_reference import check_fused_retained_append
+
+    x = _inputs(2, seed=140)
+    x["state_pool"] = x["state_pool"].to(state_dtype)
+    records = _records(x, original=True, capacity=8)[0]
+    expected = _records(x, original=True, capacity=8)[0]
+    check_fused_retained_append(
+        x, records, expected, _verify, width=1, raw_gate_only=raw_gate_only
+    )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_step_matches_split_with_mixed_retained_lengths(state_dtype):
+    x = _inputs(13, seed=147)
+    x["state_pool"] = x["state_pool"].to(state_dtype)
+    x["state_indices"].copy_(
+        torch.tensor([1, 0, -1, *range(2, 12)], device="cuda", dtype=torch.int32)
+    )
+    records, _ = _records(x, original=True, capacity=32)
+    reference, buffers = _records(x, original=False, capacity=32)
+    live = x["state_indices"].clone()
+    live[-1] = 12
+    records = dataclasses.replace(
+        records, history=dataclasses.replace(records.history, live_state_indices=live)
+    )
+    reference = dataclasses.replace(
+        reference,
+        history=dataclasses.replace(reference.history, live_state_indices=live),
+    )
+    history = records.history
+    history.length[1:12, 0] = torch.tensor(
+        [0, 1, 2, 3, 8, 9, 15, 16, 17, 32, 8], device="cuda"
+    )
+    gen = torch.Generator(device="cuda").manual_seed(149)
+    for field, peer, scale, bias in (
+        (history.correction, reference.history.correction, 0.02, 0.0),
+        (history.key, reference.history.key, 0.08, 0.0),
+        (history.decay, reference.history.decay, 0.2, 0.7),
+    ):
+        field.copy_(
+            torch.rand(field.shape, device="cuda", generator=gen) * scale + bias
+        )
+        peer.copy_(field)
+    reference.history.length.copy_(history.length)
+    ref_x = dict(x, state_pool=x["state_pool"].clone())
+    expected, _ = _split(ref_x, (reference, buffers))
+    actual = _verify(x, records, None, override="cute_dsl_kda_fused_paged_verify_step")
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-4, rtol=1e-2)
+    for field, peer in (
+        (history.correction, reference.history.correction),
+        (history.key, reference.history.key),
+        (history.decay, reference.history.decay),
+    ):
+        torch.testing.assert_close(field, peer, atol=5e-5, rtol=2e-3)
+    assert torch.equal(records.stamps, reference.stamps)
+    assert torch.equal(records.original_qkv, buffers[3][:, : 3 * WIDTH])
+    assert history.length[1:13, 0].tolist() == [0, 1, 2, 3, 8, 9, 15, 16, 17, 0, 8, 0]
+    assert torch.equal(history.length, reference.history.length)
+    torch.testing.assert_close(
+        x["state_pool"].float(), ref_x["state_pool"].float(), atol=2e-6, rtol=2e-5
+    )
 
 
 def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
@@ -257,7 +337,9 @@ def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
         )
     )
     assert torch.equal(far[0], near[0])
-    for got, want in zip(far[1], near[1]):
+    for got, want in zip(far[1][:2], near[1][:2]):
+        assert torch.equal(got[far_indices.long()], want[rows])
+    for got, want in zip(far[1][2:], near[1][2:]):
         assert torch.equal(got, want)
 
 
@@ -281,28 +363,26 @@ def test_strided_replay_records_are_rejected(strided):
         _verify(x, records, None)
 
 
-@pytest.mark.parametrize("unaligned", ["f_a rows", "conv weights"])
-def test_unaligned_inputs_fall_back_to_split_producers(unaligned):
-    x = _inputs(3, seed=41, f_a_pitch=int(unaligned == "f_a rows"))
-    if unaligned == "conv weights":
+@pytest.mark.parametrize(
+    "layout", ["f_a rows", "conv weights", "request indices", "correction channels"]
+)
+def test_strided_or_unaligned_inputs_match_split_producers(layout):
+    x = _inputs(3, seed=41, f_a_pitch=int(layout == "f_a rows"))
+    if layout == "conv weights":
         weights = x["conv_weights"]
         shifted = torch.empty(weights.numel() + 1, device="cuda", dtype=weights.dtype)
         x["conv_weights"] = shifted[1:].view_as(weights).copy_(weights)
-    assert not fused_verify_step_supported(
-        x["mixed_qkv"],
-        x["conv_weights"],
-        x["conv_states"],
-        x["f_a_out"],
-        x["f_b_weight"],
-        x["beta_logits"],
-        x["A_log"],
-        x["dt_bias"],
-        x["state_pool"],
-        HEADS,
-        DIM,
-        x["lower_bound"],
+    if layout == "request indices":
+        for name in ("state_indices", "query_start_loc"):
+            values = x[name]
+            interleaved = values.new_zeros(2 * values.numel())
+            x[name] = interleaved[::2].copy_(values)
+    correction_stride = 2 if layout == "correction channels" else 1
+    expected = _split(
+        x, _records(x, original=False, correction_stride=correction_stride)
     )
-    expected, actual = _split(x), _fused(x)
+    records, buffers = _records(x, original=True, correction_stride=correction_stride)
+    actual = _verify(x, records, None), buffers
     # The fallback runs the reference producers, so every result is exact.
     assert torch.equal(expected[0], actual[0])
     for ref, got in zip(expected[1], actual[1]):

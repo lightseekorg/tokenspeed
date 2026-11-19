@@ -61,7 +61,8 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, const_expr, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
-from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
+from tokenspeed_kernel.ops.attention.gdn._cute_dsl.wy import _mma_tf32
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm, KdaRetainedHistory
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     GATE_FLOOR,
     _asm,
@@ -86,6 +87,19 @@ _DTYPES = {
     torch.int32: Int32,
     torch.int64: Int64,
 }
+
+
+from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
+    consolidate_history,
+)
+from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
+    fake_retained_arguments,
+    load_element,
+    retained_arguments,
+    retained_length,
+    retained_page,
+)
+from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
 
 @dsl_user_op
@@ -166,6 +180,7 @@ class FusedVerifyStep:
         bounded_gate: bool,
         has_metadata: bool,
         gated_norm: bool,
+        fp32_checkpoint: bool,
     ) -> None:
         self.key_dim = self.value_dim = self.gate_rank = THREADS
         self.heads = heads
@@ -173,10 +188,12 @@ class FusedVerifyStep:
         self.bounded_gate = bounded_gate
         self.has_metadata = has_metadata
         self.gated_norm = gated_norm
+        self.fp32_checkpoint = fp32_checkpoint
         self.width = heads * THREADS
         # The checkpoint, then raw keys, raw queries, decays and values, then
         # the four cross-warp sum partials; 128 bytes cover the mbarrier.
         self.smem_bytes = 4 * (THREADS * THREADS + 4 * THREADS + 4 * WARPS) + 128
+        self.smem_bytes += 4 * 4 * _TENSOR_HISTORY * _HISTORY_STRIDE
 
     @cute.jit
     def __call__(
@@ -190,8 +207,10 @@ class FusedVerifyStep:
         a_log: cute.Tensor,
         dt_bias: cute.Tensor,
         state: cute.Tensor,
+        retained: tuple,
+        ring_capacity: Int64,
         correction: cute.Tensor,
-        key_gate: cute.Tensor,
+        normalized_key: cute.Tensor,
         original: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
@@ -226,8 +245,10 @@ class FusedVerifyStep:
             a_log.iterator,
             dt_bias.iterator,
             state.iterator,
+            retained,
+            ring_capacity,
             correction.iterator,
-            key_gate.iterator,
+            normalized_key.iterator,
             original.iterator,
             out.iterator,
             query_start_loc.iterator,
@@ -247,9 +268,9 @@ class FusedVerifyStep:
             correction.stride[0],
             correction.stride[1],
             correction.stride[2],
-            key_gate.stride[0],
-            key_gate.stride[1],
-            key_gate.stride[2],
+            normalized_key.stride[0],
+            normalized_key.stride[1],
+            normalized_key.stride[2],
             original.stride[0],
             out.stride[0],
             gate_token_stride,
@@ -273,8 +294,10 @@ class FusedVerifyStep:
         a_log,
         dt_bias,
         state,
+        retained: tuple,
+        ring_capacity: Int64,
         correction,
-        key_gate,
+        normalized_key,
         original,
         out,
         query_start_loc,
@@ -294,9 +317,9 @@ class FusedVerifyStep:
         correction_slot_stride: Int64,
         correction_head_stride: Int64,
         correction_position_stride: Int64,
-        key_gate_slot_stride: Int64,
-        key_gate_head_stride: Int64,
-        key_gate_position_stride: Int64,
+        normalized_key_slot_stride: Int64,
+        normalized_key_head_stride: Int64,
+        normalized_key_position_stride: Int64,
         original_token_stride: Int64,
         out_token_stride: Int64,
         gate_token_stride: Int64,
@@ -329,6 +352,11 @@ class FusedVerifyStep:
             Float32, cute.make_layout((4 * WARPS,)), byte_alignment=16
         )
         barrier = smem.allocate_array(Int64, num_elems=1)
+        history_layout = cute.make_layout((_TENSOR_HISTORY * _HISTORY_STRIDE,))
+        u_high = smem.allocate_tensor(Float32, history_layout, byte_alignment=128)
+        u_low = smem.allocate_tensor(Float32, history_layout, byte_alignment=128)
+        k_high = smem.allocate_tensor(Float32, history_layout, byte_alignment=128)
+        k_low = smem.allocate_tensor(Float32, history_layout, byte_alignment=128)
         tile_addr = Int32(tile.iterator.toint())
         raw_keys_addr = Int32(raw_keys.iterator.toint())
         raw_queries_addr = Int32(raw_queries.iterator.toint())
@@ -360,19 +388,65 @@ class FusedVerifyStep:
         token_start = Int64(_load(query_start_loc, request))
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
-        live = (page > 0) & (valid > 0)
+        live = (page > 0) & (retained_page(retained, request) > 0) & (valid > 0)
 
         if live:
             if tidx == 0:
                 cute.arch.mbarrier_init(barrier, 1)
             cute.arch.mbarrier_init_fence()
             cute.arch.barrier()
-            if tidx == 0:
-                cute.arch.mbarrier_arrive_and_expect_tx(barrier, V * K * 4)
-                tile_src = state + (page * state_page_stride + head * state_head_stride)
-                _bulk_load(
-                    tile_addr, tile_src.toint(), V * K * 4, Int32(barrier.toint())
+            live_page = retained_page(retained, request)
+            accepted = retained_length(retained, live_page)
+            tensor_replay = (accepted >= 3) & (accepted <= _TENSOR_HISTORY)
+            if const_expr(self.fp32_checkpoint):
+                if ((accepted == 0) | tensor_replay) & (tidx == 0):
+                    size = V * K * 4
+                    cute.arch.mbarrier_arrive_and_expect_tx(barrier, size)
+                    tile_src = state + (
+                        live_page * state_page_stride + Int64(head) * state_head_stride
+                    )
+                    _bulk_load(
+                        tile_addr, tile_src.toint(), size, Int32(barrier.toint())
+                    )
+            if accepted == 0:
+                if const_expr(not self.fp32_checkpoint):
+                    _load_empty_step_tile(
+                        tile, retained[0], live_page, head, tidx, V, K
+                    )
+                    if tidx == 0:
+                        cute.arch.mbarrier_arrive(barrier)
+            elif tensor_replay:
+                _replay_tensor_tile(
+                    tile,
+                    u_high,
+                    u_low,
+                    k_high,
+                    k_low,
+                    decays,
+                    retained,
+                    live_page,
+                    head,
+                    tidx,
+                    accepted,
+                    V,
+                    K,
+                    barrier,
+                    self.fp32_checkpoint,
                 )
+                if const_expr(not self.fp32_checkpoint):
+                    if tidx == 0:
+                        cute.arch.mbarrier_arrive(barrier)
+            else:
+                if accepted <= 2:
+                    _replay_step_tile(
+                        tile, retained, live_page, head, tidx, accepted, V, K, True
+                    )
+                else:
+                    _replay_step_tile(
+                        tile, retained, live_page, head, tidx, accepted, V, K, False
+                    )
+                if tidx == 0:
+                    cute.arch.mbarrier_arrive(barrier)
         # Padding pages see a zero history, as the split producer's do.
         history = conv_states + page * conv_page_stride
         channels = [q_channel, k_channel, v_channel]
@@ -423,11 +497,11 @@ class FusedVerifyStep:
                     slot = Int64(_load(metadata, request * 3))
                     generation = Int64(_load(metadata, request * 3 + 1))
                     start = Int64(_load(metadata, request * 3 + 2))
-                position = Int64(start % self.capacity)
+                position = Int64(start % ring_capacity)
                 if const_expr(self.has_metadata):
                     if (head == 0) & (tidx == 0):
                         stamp = cute.make_tensor(
-                            stamps + (slot * self.capacity + position) * 2,
+                            stamps + (slot * ring_capacity + position) * 2,
                             cute.make_layout((2,)),
                         )
                         stamp[0] = start
@@ -459,13 +533,6 @@ class FusedVerifyStep:
                 if step < Float32(GATE_FLOOR):
                     step = Float32(GATE_FLOOR)
                 decays[tidx] = _exp(step)
-                record = key_gate + (
-                    slot * key_gate_slot_stride
-                    + head * key_gate_head_stride
-                    + position * key_gate_position_stride
-                )
-                _store_bf16_if(Int32(1), (record + tidx).toint(), key_value)
-                _store_bf16_if(Int32(1), (record + K + tidx).toint(), gate)
                 beta_raw = _load(beta, token_start * beta_token_stride + head).to(
                     Float32
                 )
@@ -481,6 +548,22 @@ class FusedVerifyStep:
                 ]
                 key_scale = _rsqrt(totals[0] + Float32(1e-6))
                 query_scale = _rsqrt(totals[1] + Float32(1e-6)) * Float32(K**-0.5)
+                page_out = retained_page(retained, request)
+                position_out = retained_length(retained, page_out)
+                for field, value in (
+                    (retained[2], key_value * key_scale),
+                    (retained[3], decays[tidx]),
+                ):
+                    dst_offset = (
+                        page_out * field.stride[0]
+                        + Int64(head) * field.stride[1]
+                        + Int64(position_out) * field.stride[2]
+                        + Int64(tidx) * field.stride[3]
+                    )
+                    cute.make_tensor(
+                        field.iterator + dst_offset, cute.make_layout((1,))
+                    )[0] = value
+
                 output_coeff = query_scale * key_scale * totals[2]
                 lane_decays = _lds_f32x4(decays_addr + 16 * lane)
                 lane_keys = _lds_f32x4(raw_keys_addr + 16 * lane)
@@ -530,9 +613,10 @@ class FusedVerifyStep:
                 dst = out + (token_start * out_token_stride + head * V + tidx)
                 _store_if(Int32(1), dst.toint(), output, True)
                 entry = correction + (
-                    slot * correction_slot_stride
+                    retained_page(retained, request) * correction_slot_stride
                     + head * correction_head_stride
-                    + position * correction_position_stride
+                    + Int64(retained_length(retained, retained_page(retained, request)))
+                    * correction_position_stride
                     + tidx
                 )
                 _store_if(Int32(1), entry.toint(), corrected, False)
@@ -542,10 +626,247 @@ class FusedVerifyStep:
                 _store_if(Int32(1), dst.toint(), Float32(0.0), True)
 
 
+@cute.jit
+def _load_empty_step_tile(
+    tile,
+    state,
+    page,
+    head,
+    tidx,
+    rows: cutlass.Constexpr[int],
+    keys: cutlass.Constexpr[int],
+):
+    for value in cutlass.range_constexpr(rows):
+        tile[value * keys + tidx] = load_element(state, page, head, value, tidx)
+    cute.arch.barrier()
+
+
+@dsl_user_op
+def _update_step_state(current, decay, u, key, *, loc=None, ip=None):
+    # Match the original replay's rounding: round the decay multiply, then
+    # accumulate the correction with one FP32 FMA.
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(current), Float32(decay), Float32(u), Float32(key)],
+            "{ .reg .f32 decayed; mul.rn.f32 decayed, $1, $2; "
+            "fma.rn.f32 $0, $3, $4, decayed; }",
+            "=f,f,f,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@cute.jit
+def _replay_step_record(
+    history, page, head, position, first, key, decay, s0, s1, s2, s3
+):
+    u0 = load_element(history[1], page, head, position, first)
+    u1 = load_element(history[1], page, head, position, first + 1)
+    u2 = load_element(history[1], page, head, position, first + 2)
+    u3 = load_element(history[1], page, head, position, first + 3)
+    return (
+        _update_step_state(s0, decay, u0, key),
+        _update_step_state(s1, decay, u1, key),
+        _update_step_state(s2, decay, u2, key),
+        _update_step_state(s3, decay, u3, key),
+    )
+
+
+@cute.jit
+def _replay_step_tile(
+    tile,
+    history,
+    page,
+    head,
+    tidx,
+    count,
+    rows: cutlass.Constexpr[int],
+    keys: cutlass.Constexpr[int],
+    short_history: cutlass.Constexpr[bool],
+):
+    if const_expr(short_history):
+        key0 = load_element(history[2], page, head, 0, tidx)
+        decay0 = load_element(history[3], page, head, 0, tidx)
+        key1 = Float32(0.0)
+        decay1 = Float32(0.0)
+        if count == 2:
+            key1 = load_element(history[2], page, head, 1, tidx)
+            decay1 = load_element(history[3], page, head, 1, tidx)
+
+    # One thread keeps four value rows for the same key channel.
+    for group in cutlass.range(rows // 4, unroll=1):
+        first = group * 4
+        s0 = load_element(history[0], page, head, first, tidx)
+        s1 = load_element(history[0], page, head, first + 1, tidx)
+        s2 = load_element(history[0], page, head, first + 2, tidx)
+        s3 = load_element(history[0], page, head, first + 3, tidx)
+        if const_expr(short_history):
+            s0, s1, s2, s3 = _replay_step_record(
+                history, page, head, 0, first, key0, decay0, s0, s1, s2, s3
+            )
+            if count == 2:
+                s0, s1, s2, s3 = _replay_step_record(
+                    history, page, head, 1, first, key1, decay1, s0, s1, s2, s3
+                )
+        else:
+            for position in cutlass.range(count, unroll=1):
+                key = load_element(history[2], page, head, position, tidx)
+                decay = load_element(history[3], page, head, position, tidx)
+                s0, s1, s2, s3 = _replay_step_record(
+                    history, page, head, position, first, key, decay, s0, s1, s2, s3
+                )
+        tile[first * keys + tidx] = s0
+        tile[(first + 1) * keys + tidx] = s1
+        tile[(first + 2) * keys + tidx] = s2
+        tile[(first + 3) * keys + tidx] = s3
+    cute.arch.barrier()
+
+
+# One history position per scratch row. Eight extra columns distribute
+# consecutive reduction lanes across distinct shared-memory banks.
+_TENSOR_HISTORY = 16
+_HISTORY_STRIDE = 136
+
+
+@dsl_user_op
+def _round_tf32(value, *, loc=None, ip=None):
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(value)],
+            "{ .reg .b32 tf; cvt.rn.tf32.f32 tf, $1; mov.b32 $0, tf; }",
+            "=f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@cute.jit
+def _load_history_fragments(
+    u_high, u_low, k_high, k_low, decay_total, history, page, head, tidx, count, limit
+):
+    suffix = Float32(1.0)
+    for i in cutlass.range(limit, unroll=1):
+        position = limit - 1 - i
+        u = Float32(0.0)
+        weighted_k = Float32(0.0)
+        if position < count:
+            u = load_element(history[1], page, head, position, tidx)
+            weighted_k = load_element(history[2], page, head, position, tidx) * suffix
+            suffix *= load_element(history[3], page, head, position, tidx)
+        u_hi = _round_tf32(u)
+        k_hi = _round_tf32(weighted_k)
+        offset = position * _HISTORY_STRIDE + tidx
+        u_high[offset] = u_hi
+        u_low[offset] = _round_tf32(u - u_hi)
+        k_high[offset] = k_hi
+        k_low[offset] = _round_tf32(weighted_k - k_hi)
+    decay_total[tidx] = suffix
+    cute.arch.barrier()
+
+
+@cute.jit
+def _replay_tensor_tile(
+    tile,
+    u_high,
+    u_low,
+    k_high,
+    k_low,
+    decay_total,
+    history,
+    page,
+    head,
+    tidx,
+    count,
+    rows: cutlass.Constexpr[int],
+    keys: cutlass.Constexpr[int],
+    checkpoint_barrier,
+    preloaded_base: cutlass.Constexpr[bool],
+):
+    limit = ((count + 7) // 8) * 8
+    _load_history_fragments(
+        u_high,
+        u_low,
+        k_high,
+        k_low,
+        decay_total,
+        history,
+        page,
+        head,
+        tidx,
+        count,
+        limit,
+    )
+    if const_expr(preloaded_base):
+        cute.arch.mbarrier_wait(checkpoint_barrier, 0)
+    warp = tidx // 32
+    lane = tidx % 32
+    group = lane // 4
+    subgroup = lane % 4
+    accumulator = cute.make_rmem_tensor((4,), Float32)
+    for step in cutlass.range((rows // 16) * (keys // 8) // WARPS, unroll=1):
+        output_tile = step * WARPS + warp
+        value = (output_tile // (keys // 8)) * 16 + group
+        key_tile = (output_tile % (keys // 8)) * 8
+        accumulator.fill(0.0)
+        for chunk in cutlass.range(limit // 8, unroll=1):
+            offset = (chunk * 8 + subgroup) * _HISTORY_STRIDE
+            partner = offset + 4 * _HISTORY_STRIDE
+            a0, a1, a2, a3 = (
+                offset + value,
+                offset + value + 8,
+                partner + value,
+                partner + value + 8,
+            )
+            b0, b1 = offset + key_tile + group, partner + key_tile + group
+            uh0, uh1 = u_high[a0], u_high[a1]
+            uh2, uh3 = u_high[a2], u_high[a3]
+            kh0, kh1 = k_high[b0], k_high[b1]
+            accumulator.store(
+                _mma_tf32(
+                    u_low[a0],
+                    u_low[a1],
+                    u_low[a2],
+                    u_low[a3],
+                    kh0,
+                    kh1,
+                    accumulator,
+                    True,
+                    True,
+                )
+            )
+            accumulator.store(
+                _mma_tf32(
+                    uh0, uh1, uh2, uh3, k_low[b0], k_low[b1], accumulator, True, True
+                )
+            )
+            accumulator.store(
+                _mma_tf32(uh0, uh1, uh2, uh3, kh0, kh1, accumulator, True, True)
+            )
+        key = key_tile + 2 * subgroup
+        for i in cutlass.range_constexpr(4):
+            v = value + 8 * (i // 2)
+            k = key + i % 2
+            offset = v * keys + k
+            if const_expr(preloaded_base):
+                base = tile[offset]
+            else:
+                base = load_element(history[0], page, head, v, k)
+            tile[offset] = base * decay_total[k] + accumulator[i]
+    cute.arch.barrier()
+
+
 @functools.cache
 def _compile(
     heads: int,
     capacity: int,
+    state_dtype: torch.dtype,
+    live_dtype: torch.dtype,
     bounded_gate: bool,
     has_metadata: bool,
     norm_dtype: torch.dtype | None,
@@ -571,10 +892,14 @@ def _compile(
     a_log = make_fake_tensor(_DTYPES[param_dtype], (heads,))
     dt_bias = make_fake_tensor(_DTYPES[bias_dtype], (heads * key_dim,))
     state = make_fake_tensor(
-        Float32, (cute.sym_int(), heads, value_dim, key_dim), divisibility=4
+        _DTYPES[state_dtype],
+        (cute.sym_int(), heads, value_dim, key_dim),
+        divisibility=4,
     )
     correction = make_fake_tensor(Float32, (slots, heads, capacity, value_dim))
-    key_gate = make_fake_tensor(BFloat16, (slots, heads, capacity, 2 * key_dim))
+    normalized_key = make_fake_tensor(
+        Float32, (slots, heads, capacity, key_dim), leading_dim=None
+    )
     original = make_fake_tensor(BFloat16, (tokens, 3 * width))
     out = make_fake_tensor(BFloat16, (tokens, heads * value_dim))
     query_start_loc = make_fake_tensor(_DTYPES[start_dtype], (cute.sym_int(),))
@@ -582,13 +907,26 @@ def _compile(
     metadata = stamps = None
     if has_metadata:
         metadata = make_fake_tensor(Int64, (batch, 3))
-        stamps = make_fake_tensor(Int64, (slots, capacity, 2))
+        stamps = make_fake_tensor(Int64, (cute.sym_int(), cute.sym_int(), 2))
     gate = norm_weight = None
     if norm_dtype is not None:
         gate = make_fake_tensor(BFloat16, (tokens, heads * value_dim))
         norm_weight = make_fake_tensor(_DTYPES[norm_dtype], (value_dim,))
+    retained = fake_retained_arguments(
+        state,
+        correction,
+        normalized_key,
+        slots=slots,
+        batch=batch,
+        live_dtype=_DTYPES[live_dtype],
+    )
     kernel = FusedVerifyStep(
-        heads, capacity, bounded_gate, has_metadata, norm_dtype is not None
+        heads,
+        capacity,
+        bounded_gate,
+        has_metadata,
+        norm_dtype is not None,
+        state_dtype == torch.float32,
     )
     return cute.compile(
         kernel,
@@ -601,8 +939,10 @@ def _compile(
         a_log,
         dt_bias,
         state,
+        retained,
+        Int64(0),
         correction,
-        key_gate,
+        normalized_key,
         original,
         out,
         query_start_loc,
@@ -628,6 +968,9 @@ def fused_verify_step_supported(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     checkpoint_state: torch.Tensor,
+    retained_history: KdaRetainedHistory,
+    query_start_loc: torch.Tensor,
+    state_indices: torch.Tensor,
     num_heads: int,
     head_dim: int,
     lower_bound: float | None,
@@ -644,16 +987,19 @@ def fused_verify_step_supported(
         beta_logits: ``[tokens, num_heads]`` beta logits.
         A_log: ``[num_heads]`` gate decay logarithms.
         dt_bias: ``[num_heads * head_dim]`` gate bias.
-        checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
+        checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32/BF16
             checkpoint in value-major layout.
+        retained_history: Accepted records and per-request live pages.
+        query_start_loc: Packed request token boundaries.
+        state_indices: Per-request source pages.
         num_heads: Per-rank head count.
         head_dim: Head width.
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
 
     Returns:
         True when the shapes, dtypes, strides and base alignments fit the
-        kernel: head width and gate rank 128, BF16 activations, an FP32
-        checkpoint, 16-byte aligned rows and a non-positive lower bound.
+        kernel: head width and gate rank 128, BF16 activations, 16-byte aligned
+        projection rows, dense request vectors and unit-stride correction channels.
     """
     width = num_heads * head_dim
     rank = f_a_out.shape[-1]
@@ -663,7 +1009,7 @@ def fused_verify_step_supported(
         and conv_weights.dtype == torch.bfloat16
         and conv_states.dtype == torch.bfloat16
         and f_a_out.dtype == f_b_weight.dtype == torch.bfloat16
-        and checkpoint_state.dtype == torch.float32
+        and checkpoint_state.dtype in (torch.float32, torch.bfloat16)
         and mixed_qkv.shape[-1] == 3 * width
         and conv_weights.shape == (3 * width, CONV_TAPS)
         and conv_weights.is_contiguous()
@@ -689,6 +1035,15 @@ def fused_verify_step_supported(
         and checkpoint_state.stride(0) % 4 == 0
         and checkpoint_state.stride(1) % 4 == 0
         and checkpoint_state.data_ptr() % 16 == 0
+        and retained_history.correction.stride(-1) == 1
+        and all(
+            x.ndim == 1 and x.dtype in (torch.int32, torch.int64) and x.stride(0) == 1
+            for x in (
+                query_start_loc,
+                state_indices,
+                retained_history.live_state_indices,
+            )
+        )
     )
 
 
@@ -707,13 +1062,13 @@ def _check_records(
         raise ValueError("record metadata and stamps must be supplied together")
     if record_metadata is None:
         return
-    if record_metadata.shape != (batch, 3) or record_stamps.shape != (
-        correction_cache.shape[0],
-        correction_cache.shape[2],
-        2,
+    if (
+        record_metadata.shape != (batch, 3)
+        or record_stamps.ndim != 3
+        or record_stamps.shape[-1] != 2
     ):
         raise ValueError(
-            "replay metadata needs [batch, 3] and stamps [slots, capacity, 2]"
+            "retained metadata needs [batch,3] and stamps [slots,capacity,2]"
         )
     if any(
         x.dtype != torch.int64
@@ -765,8 +1120,7 @@ def fused_verify_step(
     dt_bias: torch.Tensor,
     lower_bound: float | None,
     checkpoint_state: torch.Tensor,
-    correction_cache: torch.Tensor,
-    kg_cache: torch.Tensor,
+    retained_history,
     original_qkv: torch.Tensor,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
@@ -793,10 +1147,8 @@ def fused_verify_step(
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
         checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
             committed checkpoint in value-major layout; read only.
-        correction_cache: ``[slots, num_heads, capacity, head_dim]`` FP32
-            correction records; written.
-        kg_cache: ``[slots, num_heads, capacity, 2 * head_dim]`` BF16 key and
-            raw-gate records; written.
+        retained_history: Page-owned FP32 U/normalized-K/decay and accepted
+            lengths. Candidates append after each live page's accepted prefix.
         original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
             the pre-convolution rows for commit.
         query_start_loc: ``[batch + 1]`` token offset of each request.
@@ -823,6 +1175,7 @@ def fused_verify_step(
             record metadata and stamps are not dense INT64 views of the record
             layout, or the output norm's gate or weight are laid out otherwise.
     """
+    correction_cache = retained_history.correction
     if mixed_qkv.shape[0] == 0:
         return out
     if not fused_verify_step_supported(
@@ -835,6 +1188,9 @@ def fused_verify_step(
         A_log,
         dt_bias,
         checkpoint_state,
+        retained_history,
+        query_start_loc,
+        state_indices,
         num_heads,
         head_dim,
         lower_bound,
@@ -848,6 +1204,8 @@ def fused_verify_step(
     kernel = _compile(
         num_heads,
         correction_cache.shape[2],
+        checkpoint_state.dtype,
+        retained_history.live_state_indices.dtype,
         bounded,
         record_metadata is not None,
         None if output_norm is None else output_norm.weight.dtype,
@@ -857,6 +1215,10 @@ def fused_verify_step(
         query_start_loc.dtype,
         state_indices.dtype,
     )
+    consolidate_history(
+        checkpoint_state, retained_history, state_indices, query_start_loc
+    )
+    reset_retained_history(retained_history, state_indices, query_start_loc)
     kernel(
         mixed_qkv,
         conv_weights,
@@ -867,8 +1229,14 @@ def fused_verify_step(
         A_log,
         dt_bias.reshape(-1),
         checkpoint_state,
+        retained_arguments(checkpoint_state, retained_history),
+        (
+            record_stamps.shape[1]
+            if record_stamps is not None
+            else correction_cache.shape[2]
+        ),
         correction_cache,
-        kg_cache,
+        retained_history.key,
         original_qkv,
         out,
         query_start_loc,

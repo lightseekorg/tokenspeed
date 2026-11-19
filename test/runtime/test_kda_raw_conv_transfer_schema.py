@@ -21,12 +21,13 @@
 """KDA transfer schemas shared with the Rust planner byte-level tests."""
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from test.runtime.cache_pd_test_utils import group, layout, segment
 
 import pytest
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
     build_cache_transfer_schema,
 )
@@ -90,10 +91,13 @@ def test_schema_matches_the_rust_planner_fixture(tp, axis, padding):
     partition = actual.transfer_schema.partition_for(conv_field(axis))
     assert partition.axis == axis
     assert partition.global_parts == (8192, 8192, 8192)
-    assert (
-        json.loads(actual.to_wire_bytes())
-        == fixtures[f"tp{tp}-axis{axis}-padding{padding}"]
-    )
+    expected = fixtures[f"tp{tp}-axis{axis}-padding{padding}"]
+    # Rust parse_spec treats absent checkpoint/sink fields as None/0. The
+    # real group's matching defaults preserve a full wire-field/value check.
+    expected["group_specs"] = [
+        asdict(CacheGroupSpec(**spec)) for spec in expected["group_specs"]
+    ]
+    assert json.loads(actual.to_wire_bytes()) == expected
 
 
 def test_real_tp8_conv_and_recurrent_schema():
@@ -119,3 +123,44 @@ def test_channels_last_axis_must_exist_in_field_shape():
         build_cache_transfer_schema(malformed, model_config=ModelFacts()).validate(
             malformed
         )
+
+
+@pytest.mark.parametrize("tp", [4, 8, 16])
+@pytest.mark.parametrize("recurrent_state_dtype", ["float32", "bfloat16"])
+def test_retained_checkpoint_transfer_owns_all_fields(tp, recurrent_state_dtype):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+        kda_state_fields,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    fields = kda_state_fields(
+        0,
+        "state.0",
+        conv_shape=(3 * 64 * 128 // tp, 3),
+        recurrent_shape=(64 // tp, 128, 128),
+        recurrent_state_dtype=recurrent_state_dtype,
+        history_capacity=16,
+    )
+    groups = (
+        (CacheGroupSpec(group_id="state", attn_kind="state", replayable=False), fields),
+    )
+    plan = pack(
+        groups,
+        prefix_granularity=64,
+        cache_blocks_per_lcm_block={"state": 1},
+        max_padding_fraction=float("inf"),
+    ).bind(2)
+    schema = build_cache_transfer_schema(plan, model_config=ModelFacts())
+    schema.validate(plan)
+    assert len(plan.fields) == 6
+    for suffix in (
+        "recurrent_state",
+        "replay_correction",
+        "replay_key",
+        "replay_decay",
+    ):
+        partition = schema.partition_for(f"layer.0.{suffix}")
+        assert partition.axis == 0
+        assert partition.global_extent == 64
+    # Accepted length is replicated together with the sharded checkpoint.
+    assert schema.partition_for("layer.0.replay_length") is None
