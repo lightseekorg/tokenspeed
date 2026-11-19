@@ -25,20 +25,31 @@ arguments it runs with."""
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 import torch
-from ci_system.ci_register import register_cuda_ci
 
-from tokenspeed.runtime.cache.host_storage import HostCacheStorage
-from tokenspeed.runtime.cache.peer import build_peer_geometry, peer_incarnation
-from tokenspeed.runtime.cache.transfer.layout import (
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+from tokenspeed.runtime.cache.host_storage import HostCacheStorage  # noqa: E402
+from tokenspeed.runtime.cache.peer import (  # noqa: E402
+    build_peer_geometry,
+    peer_incarnation,
+)
+from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
     CacheGroupLayout,
     CacheTransferLayout,
 )
-from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    CacheGroupSpec,
+)
+from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 

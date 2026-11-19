@@ -72,8 +72,6 @@ const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 pub struct PeerSettings {
     /// The replica's name: its endpoint, `host:port`.
     pub name: String,
-    /// The host the endpoint binds.
-    pub bind_host: String,
     /// The process's incarnation.
     pub incarnation: u64,
     /// The cache namespace's deployment id: everything that shapes a
@@ -107,6 +105,9 @@ pub enum PeerError {
     /// The endpoint did not start.
     #[error("the peer endpoint: {0}")]
     Net(#[from] ts_pd::NetError),
+    /// Only the first member owns the replica's listener.
+    #[error("the first peer member must own a listener, and other members must not")]
+    Listener,
     /// A thread did not start.
     #[error("starting a peer thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -189,6 +190,28 @@ struct Layout {
     ranks: Vec<RankGeometry>,
 }
 
+/// A bound peer endpoint, owned continuously from binding through startup.
+pub struct PeerListener {
+    net: Arc<PeerNet>,
+    received: mpsc::Receiver<Vec<Bytes>>,
+}
+
+impl PeerListener {
+    /// Bind on `host` at `port` (0 lets the OS choose) and return the listener.
+    /// Its port stays reserved while the caller prepares the replica's name
+    /// and scheduler, then moves the listener into `Peer::start`.
+    pub fn bind(host: &str, port: u16) -> Result<Self, PeerError> {
+        let (incoming, received) = mpsc::channel();
+        let net = Arc::new(PeerNet::start(host, port, incoming)?);
+        Ok(Self { net, received })
+    }
+
+    /// Return the bound port, including the OS-selected port when binding to 0.
+    pub fn port(&self) -> u16 {
+        self.net.port()
+    }
+}
+
 /// The first member's endpoint and the threads around it.
 struct Endpoint {
     net: Arc<PeerNet>,
@@ -242,25 +265,26 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// One member of a replica of `members`; the first (`member` 0) binds
-    /// the endpoint at `port` and serves `scheduler` as a holder, with every
-    /// member's geometry in `replica`.
+    /// Start one member with every member's geometry in `replica`.
+    /// The first (`member` 0) must supply the bound `listener` and serves
+    /// `scheduler` as a holder; other members must supply `None`.
     pub fn start(
         settings: PeerSettings,
         member: usize,
         replica: Vec<RankGeometry>,
-        port: u16,
+        listener: Option<PeerListener>,
         scheduler: Arc<Mutex<Scheduler>>,
         reader: Arc<dyn PageReader>,
     ) -> Result<Self, PeerError> {
         let members = replica.len();
         let geometry = replica.get(member).cloned().ok_or(PeerError::Report)?;
+        if listener.is_some() != (member == 0) {
+            return Err(PeerError::Listener);
+        }
         let (fence, fenced_plans) = mpsc::channel();
-        let endpoint = if member == 0 {
-            Some(start_endpoint(&settings, replica, port, scheduler)?)
-        } else {
-            None
-        };
+        let endpoint = listener
+            .map(|listener| start_endpoint(&settings, replica, listener, scheduler))
+            .transpose()?;
         Ok(Self {
             identity: settings.identity(),
             settings,
@@ -620,11 +644,10 @@ impl Peer {
 fn start_endpoint(
     settings: &PeerSettings,
     replica: Vec<RankGeometry>,
-    port: u16,
+    listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
 ) -> Result<Endpoint, PeerError> {
-    let (incoming, received) = mpsc::channel::<Vec<Bytes>>();
-    let net = Arc::new(PeerNet::start(&settings.bind_host, port, incoming)?);
+    let PeerListener { net, received } = listener;
     let holder = Arc::new(Mutex::new(Holder::new(
         Stamp {
             name: settings.name.clone(),

@@ -202,10 +202,8 @@ def test_host_write_policy_round_trips():
     assert cfg.host_write_policy == policy.WriteBack
     assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
     cfg.role = ts.SchedulerConfig.Role.D
-    with pytest.raises(
-        ValueError, match="host_write_policy WriteBack is not available on the D role"
-    ):
-        ts.Scheduler(cfg)
+    # Decode history uses the same Host write-back tier as other roles.
+    assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
     cfg.role = ts.SchedulerConfig.Role.Fused
     cfg.host_write_policy = policy.WriteThrough
     assert cfg.host_write_policy == policy.WriteThrough

@@ -282,6 +282,9 @@ servicer's endpoint (`host:port`, one per attention-DP replica), which the
 router's hint carries; on first contact a reader fetches the holder's layout:
 its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
+The first member owns the bound listener continuously through startup. A
+caller using an OS-selected port binds before constructing the replica's name
+and scheduler, then moves that listener into the peer without rebinding.
 Until the shim's NVLink path is wired, replicas on one node also read over
 RDMA (the NIC's loopback); only the router's cost model tells the two apart.
 
