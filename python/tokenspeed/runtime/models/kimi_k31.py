@@ -903,6 +903,9 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         )
         return q_norm, projected_q, index_query, (q_fp8, weights)
 
+    def owned_decode_value_weight(self) -> torch.Tensor | None:
+        return self.w_vc if self.absorbed_weights_k_major else None
+
     def project_latent_values(
         self,
         attn_output: torch.Tensor,

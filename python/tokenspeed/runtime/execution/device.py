@@ -1608,6 +1608,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
+    from tokenspeed.runtime.models.glm5 import GlmDsaSparseAttentionMixin
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
@@ -1642,6 +1643,15 @@ def build_device_side(
             torch.device(server_args.device, gpu_id),
         )
         if server_args.mapping.attn.has_kvp:
+            # A fused decode value tail for the attentions that project as they merge.
+            value_heads = {
+                module.num_local_heads
+                for runner in (target, draft)
+                if runner is not None
+                for module in runner.model.modules()
+                if isinstance(module, GlmDsaSparseAttentionMixin)
+                and module.owned_decode_value_weight() is not None
+            }
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
                 (
@@ -1649,6 +1659,8 @@ def build_device_side(
                     if server_args.distributed_timeout_seconds is not None
                     else DistributedConfig.distributed_timeout_seconds
                 ),
+                value_heads=value_heads.pop() if len(value_heads) == 1 else None,
+                decode_rows=max_batch_size * decode_input_tokens,
             )
     if communication_first:
         prepare_multimodal()
