@@ -59,5 +59,8 @@ back-to-back calls, microseconds per call:
 | 8 | 10.5 | 12.2 | 23.8 |
 | 32 | 14.5 | 20.9 | 28.9 |
 | 64 | 18.6 | 33.2 | 39.7 |
-| 128 | 28.3 | | 57.3 |
-| 512 | 100.3 | | 163.5 |
+| 128 | 28.3 | Not applicable | 57.3 |
+| 512 | 100.3 | Not applicable | 163.5 |
+
+The LL all-to-all takes up to 64 rows (its 1 MiB per-rank cap); larger
+batches take NCCL.
