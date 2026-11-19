@@ -1307,6 +1307,39 @@ At DEBUG, the native client logs the chosen engine and routing policy by request
 ID. Scheduler diagnostics (`SPDLOG_LEVEL=debug`) report restore and decode
 preallocation waits, and link L3 prefetch queries, reads and timeouts to the request ID.
 
+### Selected cache eviction diagnostics
+
+Off by default. Set `TOKENSPEED_CACHE_EVICTION_HASH` to one lowercase SHA-256 hash,
+or select a request tag and token boundary with prefix caching enabled:
+
+```bash
+unset TOKENSPEED_CACHE_EVICTION_HASH
+export TOKENSPEED_CACHE_EVICTION_REQUEST_TAG='watch'
+export TOKENSPEED_CACHE_EVICTION_PREFIX_TOKENS='4096'
+```
+
+Give selected requests a dash-delimited ID component, such as `<request-id>-watch`;
+`watchful` does not match. Tags allow letters, digits and underscores. Tag an early
+request containing the target prefix; earlier evictions cannot be recovered.
+The boundary must be a positive int32 multiple of prefix granularity. The first
+matching prompt long enough to include that complete page (including its last page)
+binds on submission after batch validation, before planning or waiting for a slot.
+`event=bind` identifies the selected hash; it does not establish a cache hit.
+
+Use one prefix family and a fresh process per replay: different content selected
+by the same tag reports an error and disables observation. Configuration is read
+once; the two selection methods are mutually exclusive. Unset all three variables
+before starting the process to disable this diagnostic.
+
+`[CacheEvictionDiagnostic] event=evict` uses the existing info logger and records
+Device/Host removal reasons, including State cascades and flushes. `demoted` and
+`last_access_epoch` describe the entry before removal; epoch is logical order, not
+time. Presence flags and `eviction_writeback_pending` describe local indexes and
+pending eviction write-back after removal, not copy completion or lasting loss.
+Publication and write-back completion are not logged; one hash does not cover all
+sliding-window dependencies. Logger filtering or failures can omit records without
+interrupting cache operations. Use uninstrumented runs for performance measurements.
+
 ### Sampled PD first-output logs
 
 Set `--ttft-trace-sampling-percentage 1` on both roles to select approximately
