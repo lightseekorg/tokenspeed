@@ -779,7 +779,6 @@ def load_qwen4_exp_weights(
     )
     split_parts = int(getattr(config, "split_ngram_parts", 512))
     scanned = set()
-    module._checkpoint_dir = None
 
     def checkpoint_shard(original_name, table_name):
         candidate = remap_name(original_name) if remap_name else original_name
@@ -894,6 +893,7 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
     ) -> None:
         text_config = getattr(config, "text_config", config)
         super().__init__(text_config, mapping, quant_config, prefix)
+        self._checkpoint_dir: str | None = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(
@@ -945,6 +945,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             is_multimodal_active,
             mm_attention_backend,
         )
+        self._checkpoint_dir: str | None = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(

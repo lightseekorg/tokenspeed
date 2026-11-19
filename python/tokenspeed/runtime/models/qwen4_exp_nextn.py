@@ -236,6 +236,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self._checkpoint_dir: str | None = None
         config = copy.deepcopy(getattr(config, "text_config", config))
         quant_config = _resolve_mtp_quant_config(quant_config)
         config.num_hidden_layers = 1
