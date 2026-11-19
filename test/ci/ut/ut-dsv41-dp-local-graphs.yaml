@@ -14,15 +14,19 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps.sh
+  - sudo apt-get install -y gdb
 ut:
   commands:
+    - python3 -m pytest -q test/ci_system/test_native_timeout.py
     - >-
       python3 -m torch.distributed.run --standalone --nproc_per_node=2
       -m pytest -q --import-mode=importlib --disable-warnings --maxfail=1
       test/runtime/test_adaptive_dspark_dp_runtime.py
-    # Dump rank stacks before a stalled collective consumes the job's budget.
+    # Python stacks stop at rendezvous; native stacks distinguish CUDA/NCCL/IPC waits.
     - >-
-      timeout -k 30 600 python3 -m torch.distributed.run --standalone --nproc_per_node=2
+      python3 test/ci_system/native_timeout.py --dump-after 210 --timeout 600
+      --debugger 'sudo -n timeout -k 5 20 gdb' --
+      python3 -m torch.distributed.run --standalone --nproc_per_node=2
       -m pytest -q -s --import-mode=importlib --disable-warnings --maxfail=1
       -o faulthandler_timeout=180
       tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py::test_heterogeneous_dp_graph_replay_with_shared_expert

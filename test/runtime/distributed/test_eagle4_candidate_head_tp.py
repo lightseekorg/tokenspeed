@@ -211,7 +211,14 @@ def _stop_workers(processes):
         if process.poll() is None:
             process.kill()
     for process in processes:
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A driver wait can survive SIGKILL. Keep the original failure and
+            # still reap the other ranks before reporting this survivor.
+            print(
+                f"worker pid {process.pid} survived kill", file=sys.stderr, flush=True
+            )
 
 
 def test_worker_failure_does_not_wait_for_a_stuck_peer():
@@ -224,7 +231,7 @@ def test_worker_failure_does_not_wait_for_a_stuck_peer():
             subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
         )
         with pytest.raises(RuntimeError, match="rank 0 exited with code 7"):
-            _wait_for_workers(processes, JOIN_SECONDS)
+            _wait_for_workers(processes, 5)
         assert processes[1].poll() is None
     finally:
         _stop_workers(processes)
