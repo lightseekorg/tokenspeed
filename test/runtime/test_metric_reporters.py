@@ -488,10 +488,15 @@ def test_kv_transfer_size_keeps_each_transfer_separate_from_total():
     assert sum(e.value for e in sink.events if e.operation == "inc") == 3072
 
 
-def test_weighted_observations_preserve_exact_totals():
+def test_weighted_observations_preserve_exact_prometheus_totals():
     registry = CollectorRegistry()
+    sink = ListSink()
     metrics = EngineMetrics(
-        LABELS, enabled=True, reporters=["prometheus"], registry=registry
+        LABELS,
+        enabled=True,
+        reporters=["prometheus", "test_reporter"],
+        registry=registry,
+        event_sink=sink,
     )
     metrics.record_prefix_hits(
         prompt_tokens=49, device_hit_tokens=1, host_hit_tokens=1, l3_hit_tokens=0
@@ -507,6 +512,10 @@ def test_weighted_observations_preserve_exact_totals():
         ("decode_prefix_cache_hit_ratio", 1.0),
         ("spec_decode_accept_length", 53.0),
     ):
+        raw = [event for event in sink.events if event.metric == f"tokenspeed:{name}"]
+        assert len(raw) == 1
+        assert raw[0].value == total / 49
+        assert raw[0].weight == 49
         assert registry.get_sample_value(f"tokenspeed:{name}_sum", LABELS) == total
         assert registry.get_sample_value(f"tokenspeed:{name}_count", LABELS) == 49
         assert (

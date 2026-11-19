@@ -146,7 +146,8 @@ class Metric:
         """Emit an atomic weighted sample and update Prometheus without a loop.
 
         The sample is an aggregate mean, not a distribution of individual values.
-        Supply the original total to avoid rounding when reconstructing value * weight.
+        Supply the original total to keep the Prometheus sum exact. Raw events
+        carry only value and weight; sinks reconstructing their product may round.
         """
         self._check_operation("observe")
         if weight <= 0:

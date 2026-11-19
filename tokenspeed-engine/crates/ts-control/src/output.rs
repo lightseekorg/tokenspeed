@@ -1095,7 +1095,6 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
-        self.log_finished(rid, &state);
         let output = Self::stream_state(
             rid,
             &mut state,
@@ -1104,6 +1103,7 @@ impl OutputProcessor {
             Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
         );
         self.collect_stream_end(&state, wall_seconds());
+        self.log_finished(rid, &state);
         output.into_iter().collect()
     }
 
@@ -2194,6 +2194,56 @@ mod tests {
         assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
         assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
         assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
+    fn admission_failure_emits_one_ttft_breakdown() {
+        use std::{io::Read, os::unix::net::UnixStream};
+        for role in [Role::Prefill, Role::Decode] {
+            let (writer, mut reader) = UnixStream::pair().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.try_clone().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let mut processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled: true,
+                        request_stats: false,
+                        ttft_percentage: 100,
+                    },
+                    true,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                state.abort("invalid request", true, Some(400));
+                let outputs = processor.publish_finished_at_admission("rejected", state);
+                assert_eq!(outputs.len(), 1);
+                assert!(processor.rids().is_empty());
+                let metrics = processor.take_request_metrics();
+                assert!(metrics.tpot_seconds.is_empty());
+                assert!(metrics.e2e_tpot_seconds.is_empty());
+            });
+            let mut log = String::new();
+            reader.read_to_string(&mut log).unwrap();
+            assert_eq!(log.matches("TTFTBreakdown ").count(), 1, "{log}");
+            assert_eq!(log.matches("event=ts_request_finished").count(), 1, "{log}");
+            assert!(log.contains("\"status\":\"abort\""), "{log}");
+        }
     }
 
     #[test]

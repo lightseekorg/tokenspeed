@@ -886,6 +886,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let cache_ops = plan.cache_ops();
             self.cache_ops.dispatched(&cache_ops);
             self.dispatch_peer(&plan);
+            // The storage tick disabled forward planning: scheduler aborts arise
+            // only in that build, and frozen rounds reset the no-progress streak.
             self.record_scheduler_metrics(None, &cache_ops, 0);
             busy |= plan.needs_device();
             if plan.needs_device() {

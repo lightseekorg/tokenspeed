@@ -351,6 +351,8 @@ impl Metric {
         self.observe_weighted(labels, interval / num_tokens as f64, interval, num_tokens);
     }
 
+    // Only the Prometheus sum retains total exactly. Raw events carry the mean
+    // and weight; reconstructing their product can introduce floating-point rounding.
     fn observe_weighted(&self, labels: &[&str], value: f64, total: f64, weight: i64) {
         assert_eq!(
             self.kind,

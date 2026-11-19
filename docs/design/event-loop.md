@@ -644,7 +644,10 @@ count for routing and must not substitute for batch size. `num_requests_waiting`
 adds `sizes.waiting` (admission, prefetch and retraction/restore) and
 `sizes.ready_waiting` (KV-ready D requests without a decode permit), plus
 admissions withheld during a pause. Frozen rounds use the same recorder with
-no forward, so RunningBS becomes zero and queue gauges continue updating. Bootstrap,
+no forward, so RunningBS becomes zero and queue gauges continue updating. The
+storage tick disables the scheduler's forward builder in those rounds. That
+builder is the source of capacity aborts, and the no-progress streak resets
+when forwards are forbidden, so a frozen plan has no scheduler aborts. Bootstrap,
 KV reception and grammar compilation retain their separate queue gauges;
 `num_requests_inflight` covers all unfinished requests, including those waits.
 Queue subcategories overlap the total and must not be added to it again.
@@ -1287,7 +1290,12 @@ cached-token usage. A zero-hit admission must still emit a weighted zero.
 Speculative accept length includes the bonus token: `(accepted_draft + slots) /
 slots`, weighted by verify request-slots. Its aggregation window belongs to the
 reporter. These aggregate observations preserve means and sums, not individual
-request/token quantiles. Completion-token samples, in contrast, preserve one
+request/token quantiles. Prometheus sums use the original totals exactly; raw
+metric events carry only mean and weight, so reconstructing their product can
+introduce floating-point rounding. Python's weighted Prometheus updates use
+`prometheus_client` histogram internals; the supported minor version is bounded
+in `python/pyproject.toml` and upgrades must pass the reporter tests.
+Completion-token samples, in contrast, preserve one
 sample per ended engine request (including zero output), separate from the sum;
 they retain role boundaries, including prefill's bootstrap output. Frontend
 end-to-end samples represent client-facing request distributions.
@@ -1329,5 +1337,15 @@ clock, and single-chunk requests have neither metric. These clocks are the
 engine's role-local output boundary; the native frontend exposes the same
 formulas at its client-facing output boundary, including transport overhead.
 Both observations preserve their distributions without window averaging.
+With `stream_interval=1`, the raw TPOT rate is the number of noninitial
+output chunks: approximately active decode requests times decode steps per
+second, summed across ranks. Do not replace a round's distinct samples with
+`observe_batched` of their mean: that preserves the sum but loses quantiles.
+Capacity checks must cover the relay and the chosen sink separately; a slow
+sink can fill the relay queue even when transport alone sustains the rate.
 Each output observation pairs its sample destination and timestamp together;
 disabled metrics and prefill output do not create an observation.
+
+Admission failures prepare their final output before logging completion, as the
+other terminal paths do. Preparing that output consumes a sampled TTFT trace;
+completion logging therefore emits no second breakdown for the same request.
