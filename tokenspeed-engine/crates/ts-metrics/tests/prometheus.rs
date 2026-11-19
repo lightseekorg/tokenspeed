@@ -71,6 +71,8 @@ fn run_scenario(directory: &Path) {
     engine.record_scheduler_iteration(3, 5, 2, 10, 40, 17);
     engine.record_scheduler_iteration(1, 4, 0, 4, 40, 0);
     engine.record_spec_decode_step(4, 5, 3);
+    engine.observe_request_spec_decode_accept_length(2.0);
+    engine.observe_request_spec_decode_accept_length(3.0);
     engine.record_jit_compiles(2, 0.5);
     engine.record_nan_abort();
     engine.record_capacity_abort();
