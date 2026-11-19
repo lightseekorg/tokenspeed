@@ -93,11 +93,23 @@ impl Reads {
                     let Ok(job) = job else {
                         return;
                     };
+                    let started = std::time::Instant::now();
+                    tracing::debug!(
+                        request = job.request_id,
+                        spans = job.spans.lengths.len(),
+                        "peer read started"
+                    );
                     let outcome = if job.spans.is_empty() {
                         Ok(())
                     } else {
                         reader.read(&job.session, &job.spans)
                     };
+                    tracing::debug!(
+                        request = job.request_id,
+                        ok = outcome.is_ok(),
+                        elapsed_us = started.elapsed().as_micros() as u64,
+                        "peer read ended"
+                    );
                     if let Err(error) = &outcome {
                         let spans = &job.spans;
                         tracing::warn!(

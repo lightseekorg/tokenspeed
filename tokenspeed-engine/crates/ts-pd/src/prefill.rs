@@ -480,12 +480,21 @@ impl Shared {
     /// Fail a room and tell every destination that pre-allocated for it
     /// (`abort_room`).
     fn abort_room(&self, room: u64, reason: &str) {
+        self.end_room(room, reason, true);
+    }
+
+    /// Cancellation uses the same retirement fence, without reporting a transfer error.
+    fn cancel_room(&self, room: u64, reason: &str) {
+        self.end_room(room, reason, false);
+    }
+
+    fn end_room(&self, room: u64, reason: &str, failed: bool) {
         let routes: Vec<_> = {
             let mut state = self.state();
             // Once per room: a room's later chunks fail here again.
             let counted = state.rooms.get(room) == Some(TransferPoll::Failed)
                 || state.rooms.has_failure(room);
-            if let (false, Some(metrics)) = (counted, &self.metrics) {
+            if let (true, false, Some(metrics)) = (failed, counted, &self.metrics) {
                 metrics.record_failure();
             }
             // Timeout/failure must reject manifests arriving after this
@@ -554,7 +563,7 @@ impl Shared {
         // A superseded cache has already passed the registration write gate.
         // Its delayed cancellation must not cancel a newer cache's request.
         if active {
-            self.abort_room(room, "Decode cancelled the KV receive");
+            self.cancel_room(room, "Decode cancelled the KV receive");
         }
         self.flush_cancellations();
     }
@@ -1935,8 +1944,10 @@ impl TransferPeer for PrefillPeer {
                 let sender = self.senders.get_mut(rid).expect("tracked");
                 sender.concluded = Some(TransferPoll::Failed);
                 if self.shared.state().rooms.get(sender.room) != Some(TransferPoll::Failed) {
+                    // The detecting rank already counted its local error or
+                    // timeout. Replica convergence only cancels remaining work.
                     self.shared
-                        .abort_room(sender.room, "replica transfer failed");
+                        .cancel_room(sender.room, "replica transfer failed");
                 }
             }
         }
@@ -2028,7 +2039,7 @@ impl TransferPeer for PrefillPeer {
             sender.concluded = Some(TransferPoll::Failed);
             self.shared.state().cancel_room(sender.room, None);
             self.shared
-                .abort_room(sender.room, "Prefill request cancelled");
+                .cancel_room(sender.room, "Prefill request cancelled");
         }
     }
 

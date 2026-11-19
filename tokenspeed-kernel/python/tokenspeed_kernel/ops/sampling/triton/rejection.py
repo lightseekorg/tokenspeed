@@ -38,10 +38,14 @@ Noise streams for a request with seed ``s`` and verify offset ``o``:
   token_id)``;
 * block verification's coins: ``rand(randint(s, BLOCK_COIN_OFFSET_SALT + o),
   j)``, ``j = 0`` for the residual / bonus draw and ``j = 1 + i`` for prefix
-  ``i``.
+  ``i``;
+* FlashInfer chain verification's coins: ``randint(s, (1 << 63) | (o << 32) | j)``
+  mapped to ``(0, 1)``, with ``j = 0`` for the residual / bonus draw and
+  ``j = 1 + i`` for candidate ``i`` (see ``verify_coins.py``).
 
-Plain offsets stay below ``2**40``, draft offsets below ``2**41`` and coin
-offsets below ``2**42``, so the four streams never share a draw.
+The first four streams use offsets with bit 63 clear. Chain verification sets
+that bit and packs the first target position into bits 32 through 62, keeping
+its Philox counters disjoint from the other streams.
 
 Block verification's accepted length depends on every prefix coin, so a coin
 past it is conditioned high. Its coins are therefore keyed by the step's first
