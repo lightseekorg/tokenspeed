@@ -780,7 +780,7 @@ private:
     void schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                               bool new_prompts_sealed);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                  bool new_prompts_sealed, bool blocked_prompt_seals, std::int32_t decode_reserve);
+                                  bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;

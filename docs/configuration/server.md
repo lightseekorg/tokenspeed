@@ -1084,9 +1084,8 @@ allocated. `deferred` requires attention TP 1, `--kv-parallel-size 1`,
 (or `--language-model-only`); anything else is refused at startup.
 
 Under `deferred`, computed prompts waiting for their destination hold
-prefill pages. While one waits, a new prompt that does not fit in the pages
-left holds back the new prompts behind it, so that smaller prompts that keep
-fitting do not starve a larger one.
+prefill pages. New prompts are admitted meanwhile as under `early`, so on a
+tight prefill pool smaller prompts that keep fitting can delay a larger one.
 
 The two servers keep one order under `deferred`: a request takes every page
 it needs on the prefill server before its Decode server allocates its

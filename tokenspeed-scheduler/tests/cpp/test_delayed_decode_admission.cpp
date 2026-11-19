@@ -341,94 +341,6 @@ TEST_F(DeferredAllocationTest, DecodeFailureWhileAwaitingGrantReleasesAllSourceG
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-// One history group of 12 usable pages. A prompt's last chunk also takes the
-// two pages its first decode window may fill: a 4-token prompt holds 4
-// pages, an 8-token one 6 and a 16-token one 10.
-class DeferredAllocationSealTest : public DeferredAllocationTest {
-protected:
-    SchedulerConfig MakeConfig() override {
-        auto cfg = DeferredAllocationTest::MakeConfig();
-        cfg.cache_groups.resize(1);
-        cfg.device_allocator.total_pages = 13;
-        cfg.cache_groups.front().total_pages = 13;
-        cfg.disable_prefix_cache = true;
-        cfg.max_scheduled_tokens = 16;
-        return cfg;
-    }
-};
-
-// While a computed prompt waits for its destination, a new prompt that does
-// not fit stops the new prompts behind it, so the pages a waiting prompt
-// returns reach it first.
-TEST_F(DeferredAllocationSealTest, ANewPromptThatDoesNotFitStopsLaterNewPromptsWhileAComputedPromptWaits) {
-    SubmitPrompt("first", 4);
-    SubmitPrompt("second", 4, 50);
-    Admit("first");
-    Admit("second");
-    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, (std::vector<std::string>{"first", "second"}));
-    SendForwardDone("first", {42});
-    SendForwardDone("second", {43});
-    ASSERT_EQ(scheduler_->AwaitingDestinationSize(), 2u);
-
-    // 4 pages are free: `small` would fit, `large` does not.
-    SubmitPrompt("large", 8, 100);
-    SubmitPrompt("small", 4, 200);
-    Admit("large");
-    Admit("small");
-    for (int i = 0; i < 3; ++i) {
-        EXPECT_TRUE(FindForwardBatch(PlanOnce())->request_ids.empty());
-        EXPECT_EQ(scheduler_->WaitingSize(), 2u);
-    }
-
-    Grant("first");
-    const auto send = PlanOnce();
-    ASSERT_TRUE(send.remote_decode.has_value());
-    EXPECT_TRUE(FindForwardBatch(send)->request_ids.empty());
-    Ack("first");
-    EXPECT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"large"});
-}
-
-// A prompt the transfer peer has not admitted is not probed: it reports no
-// capacity failure and stops nothing, though it would not fit.
-TEST_F(DeferredAllocationSealTest, APromptThePeerHasNotAdmittedNeitherBlocksNorSeals) {
-    SubmitPrompt("waiting", 4);
-    Admit("waiting");
-    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"waiting"});
-    SendForwardDone("waiting", {42});
-    ASSERT_EQ(scheduler_->AwaitingDestinationSize(), 1u);
-
-    SubmitPrompt("large", 16, 100);
-    SubmitPrompt("small", 4, 200);
-    Admit("small");
-    EXPECT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"small"});
-    EXPECT_EQ(scheduler_->BootstrappingSize(), 1u);
-    // Admitted, it does not fit and stops the prompts behind it.
-    SendForwardDone("small", {43});
-    SubmitPrompt("next", 4, 300);
-    Admit("large");
-    Admit("next");
-    EXPECT_TRUE(FindForwardBatch(PlanOnce())->request_ids.empty());
-    EXPECT_EQ(scheduler_->WaitingSize(), 2u);
-}
-
-// With no computed prompt waiting for its destination a smaller prompt passes
-// one that does not fit, as under early allocation.
-TEST_F(DeferredAllocationSealTest, WithoutAWaitingPromptASmallerPromptPassesOneThatDoesNotFit) {
-    SubmitPrompt("sending", 4);
-    Admit("sending");
-    Grant("sending");
-    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"sending"});
-    SendForwardDone("sending", {42});
-    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
-    ASSERT_EQ(scheduler_->AwaitingDestinationSize(), 0u);
-
-    SubmitPrompt("large", 16, 100);
-    SubmitPrompt("small", 4, 200);
-    Admit("large");
-    Admit("small");
-    EXPECT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"small"});
-}
-
 // Under early allocation the one event admits the prompt with its
 // destination allocated: its KV is sent as soon as it is computed, and the
 // destination's own event changes nothing. A config without a policy, as a
@@ -721,35 +633,6 @@ TEST_F(PrefillDecodeOrderTest, ALongPromptAndCarriedShortPromptsComplete) {
 
     setup.notice = Notice::kAtArrival;
     EXPECT_FALSE(Run(setup, prompts, 200).contains("Z"));
-}
-
-// A larger prompt W arrives while small prompts stream in faster than D's two
-// request slots take them, so computed small prompts fill P. Each destination
-// D allocates returns one small prompt's pages; W gets them, not the small
-// prompts behind it, and finishes while the stream still arrives.
-TEST_F(PrefillDecodeOrderTest, ALargerPromptIsNotStarvedByLaterSmallPrompts) {
-    std::vector<Prompt> prompts;
-    for (int i = 0; i < 60; ++i) {
-        prompts.push_back({.id = "s" + std::to_string(i),
-                           .tokens = 4,
-                           .max_new_tokens = 8,
-                           .decode_rounds = 6,
-                           .arrival = i,
-                           .destination = 0});
-        if (i == 10) {
-            prompts.push_back(
-                {.id = "W", .tokens = 32, .max_new_tokens = 4, .decode_rounds = 2, .arrival = 10, .destination = 0});
-        }
-    }
-    const Setup setup{.prefill_pages = 25,
-                      .decode_pages = {65},
-                      .decode_requests = 2,
-                      .chunk_tokens = 64,
-                      .yield_tokens = 0,
-                      .notice = Notice::kPagesComplete};
-    const auto finished = Run(setup, prompts, 1000);
-    ASSERT_EQ(finished.size(), prompts.size());
-    EXPECT_LT(finished.at("W"), 59);
 }
 
 }  // namespace tokenspeed::test

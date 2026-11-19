@@ -1980,9 +1980,7 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // becoming the capacity blocker (retracting a victim for it is pure thrash
 // -- the two simply do not fit together), but it does seal new-prompt
 // admission (new_prompts_sealed): a newcomer taking the pages it is waiting
-// for would starve it. With blocked_prompt_seals (buildPrefillWorkerPlan), a
-// new prompt that fails for capacity stops the new prompts behind it too. A
-// lone-request compaction ends the plan's prefill
+// for would starve it. A lone-request compaction ends the plan's prefill
 // phases: a block it moved that nothing holds -- the probe's tail block once
 // the retry copied it, a hit page of a retry that failed -- gets its bytes
 // from the plan's copies, which the runtime runs after the plan's stores
@@ -2003,7 +2001,7 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // they would be later admissions in the compaction's plan.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
-                                         bool blocked_prompt_seals, std::int32_t decode_reserve) {
+                                         std::int32_t decode_reserve) {
     ProfileSpan profile_span{"Scheduler::scheduleLocalPrefillWork"};
     std::optional<std::vector<WholePrompt>> whole_prompts;
     for (const bool resident : {true, false}) {
@@ -2109,7 +2107,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             } else if (feedback.admission_failed) {
                 spdlog::debug("[Scheduler] prefill {} blocked on capacity", request->Id());
                 feedback.NoteCapacityBlocked(request);
-                if (resident || blocked_prompt_seals) {
+                if (resident) {
                     return;
                 }
             }
@@ -2173,17 +2171,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
     }
 
     schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
-    // Deferred decode allocation: a computed prompt waiting for its
-    // destination holds pages that only the Decode node's allocation, or the
-    // transfer peer's timeout, gives back. While one waits, a new prompt that
-    // fails for capacity stops the new prompts behind it: smaller prompts
-    // that kept fitting would take every page the waiting ones return, and
-    // the larger prompt would wait for all of them to drain.
-    const bool prompt_awaits_destination =
-        config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
-        AwaitingDestinationSize() > 0;
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false,
-                             /*blocked_prompt_seals=*/prompt_awaits_destination, config_.decode_input_tokens);
+    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2299,8 +2287,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
         schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
-        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, /*blocked_prompt_seals=*/false,
-                                 config_.decode_input_tokens);
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

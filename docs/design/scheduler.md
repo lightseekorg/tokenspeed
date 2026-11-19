@@ -1541,12 +1541,10 @@ prompts waiting are bounded by the request pool's slots (`max_batch_size`) as
 well as by the pages they hold.
 
 A prompt waiting for its destination holds pages that only the Decode node's
-allocation, or its transfer's failure, gives back. While one waits, a new
-prompt that fails for capacity stops the new prompts behind it
-(`scheduleLocalPrefillWork`, `blocked_prompt_seals`): smaller prompts that
-kept fitting would take every page the waiting prompts return, and a larger
-one would wait until all of them drained. With no prompt waiting, a smaller
-prompt passes one that does not fit, as under `early`.
+allocation, or its transfer's failure, gives back. New prompts are admitted
+meanwhile as under `early`: a smaller prompt passes one that does not fit, so
+on a tight pool a larger prompt can wait until the smaller ones behind it stop
+arriving.
 
 The scheduler decides neither when the peer admits a request nor when the
 Decode node may allocate. What keeps the two nodes from waiting for each
@@ -2095,9 +2093,8 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
 - On the P role a request is a candidate only after `pd::BootstrappedEvent`,
   and under `deferred` decode allocation its KV is sent only after
   `pd::DestinationReadyEvent` (§3.1). A computed prompt waiting for that event
-  is never retracted or computed again, and while one waits a new prompt that
-  fails for capacity stops the new prompts behind it. The Decode node must
-  learn of a request only after this role admitted its last chunk.
+  is never retracted or computed again. The Decode node must learn of a
+  request only after this role admitted its last chunk.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only
