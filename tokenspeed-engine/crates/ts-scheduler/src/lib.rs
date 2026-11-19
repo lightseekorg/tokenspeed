@@ -470,6 +470,10 @@ mod ffi {
     /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerLookupView {
+        /// Request owning this lookup.
+        request_id: String,
+        /// Deadline on the agreed scheduler clock.
+        deadline_us: i64,
         /// The lease the lookup opens.
         lease: PeerLeaseView,
         /// The holder's name.
@@ -565,7 +569,18 @@ mod ffi {
         request_id: String,
     }
 
-    /// The scheduler's peer sharing observations (`Scheduler::PeerStats`).
+    /// Duration and deadline headroom of a completed hard pin.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct PinSampleView {
+        /// Time between applying and releasing the hard pin, in microseconds.
+        held_us: i64,
+        /// Signed microseconds left until the deadline at release.
+        remaining_us: i64,
+        /// Whether the holder reclaimed the pin on expiry.
+        expired: bool,
+    }
+
+    /// The scheduler's peer sharing observations.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct PeerStatsView {
         /// Holder: leases held.
@@ -628,6 +643,7 @@ mod ffi {
         ) -> bool;
         fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn plan_calls(scheduler: &Scheduler) -> i64;
+        fn take_peer_pin_samples(scheduler: Pin<&mut Scheduler>) -> Vec<PinSampleView>;
         fn peer_stats(scheduler: &Scheduler) -> PeerStatsView;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
@@ -703,7 +719,7 @@ pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
-    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
     SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
     StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
@@ -917,7 +933,12 @@ impl Scheduler {
         ffi::plan_calls(self.get())
     }
 
-    /// The scheduler's peer sharing observations.
+    /// Drain hard pins released or expired since the last sample.
+    pub fn take_peer_pin_samples(&mut self) -> Vec<PinSampleView> {
+        ffi::take_peer_pin_samples(self.pinned())
+    }
+
+    /// Current holder and reader state.
     pub fn peer_stats(&self) -> PeerStatsView {
         ffi::peer_stats(self.get())
     }
