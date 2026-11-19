@@ -455,6 +455,11 @@ which backend disabled which graph.
 
 ### Absorbed MLA
 
+A model backend that supplies both attention kernels can use
+`MLAMetadataBackend` for paged request lengths, page tables and graph buffers.
+It follows the launch's numerical policy when preparing these inputs.
+The backend that executes attention selects the numerical kernels.
+
 Under a bitwise envelope, `MLAAttnBackend` plans the standard
 `mla_extend_with_kvcache` and `mla_decode_with_kvcache` operators with the
 `batch_invariant` requirement. Initial prefill and cached extend both prepare

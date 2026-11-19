@@ -138,8 +138,8 @@ class MLADecodeMetadata:
         return self.seq_lens
 
 
-class MLAAttnBackend(PagedAttentionBackend):
-    """Unified MLA leaf routed through tokenspeed_kernel MLA APIs."""
+class MLAMetadataBackend(PagedAttentionBackend):
+    """Prepare MLA cache and graph metadata for a backend that supplies attention."""
 
     supports_mla_projected_value_decode = True
     supports_mla_dcp = True
@@ -192,58 +192,9 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         self.extend_kernel_plan = None
         self.decode_kernel_plan = None
-        if self.batch_invariant:
-            if spec.sliding_window_tokens is not None:
-                raise ValueError(
-                    "Absorbed MLA extend does not yet carry a sliding-window mask"
-                )
-            signature = format_signature(
-                q=dense_tensor_format(self.q_data_type),
-                kv_cache=dense_tensor_format(self.data_type),
-            )
-            traits = {
-                "num_q_heads": self.num_local_heads,
-                "qk_nope_head_dim": self.qk_nope_head_dim,
-                "kv_lora_rank": self.kv_lora_rank,
-                "qk_rope_head_dim": self.qk_rope_head_dim,
-                "page_size": self.kernel_page_size,
-                "logit_cap": False,
-                "return_lse": False,
-            }
-            variable_traits = frozenset({"batch_size", "max_seqlen_q", "max_seqlen_k"})
-            self.extend_kernel_plan = KernelPlan.select(
-                "attention",
-                "mla_extend_with_kvcache",
-                signature,
-                features=frozenset({"batch_invariant"}),
-                static_traits={**traits, "is_causal": True},
-                variable_traits=variable_traits,
-                solution=self.kernel_solution,
-                declared_traits=frozenset(),
-                ignore_layout=False,
-            )
-            self.decode_kernel_plan = KernelPlan.select(
-                "attention",
-                "mla_decode_with_kvcache",
-                signature,
-                features=frozenset({"batch_invariant"}),
-                static_traits={
-                    **traits,
-                    "q_len": 1,
-                    "sliding_window": False,
-                    "noncausal_block_size": 1,
-                },
-                variable_traits=variable_traits,
-                solution=self.kernel_solution,
-                declared_traits=frozenset(),
-                ignore_layout=False,
-            )
         # The strict arithmetic materializes latent output before value projection.
         self.supports_mla_projected_value_decode = not self.batch_invariant
         self.supports_layer_sliding_window = not self.batch_invariant
-        self.cuda_graph_support = CudaGraphSupport.from_plans(
-            prefill=self.extend_kernel_plan, decode=self.decode_kernel_plan
-        )
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -765,6 +716,68 @@ class MLAAttnBackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
+    def forward_decode(self, *args, **kwargs):
+        raise NotImplementedError("MLA metadata delegates cannot compute attention")
+
+    def forward_extend(self, *args, **kwargs):
+        raise NotImplementedError("MLA metadata delegates cannot compute attention")
+
+
+class MLAAttnBackend(MLAMetadataBackend):
+    """Run MLA attention with the provider selected for this numerical policy."""
+
+    def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
+        super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        if self.batch_invariant:
+            if spec.sliding_window_tokens is not None:
+                raise ValueError(
+                    "Absorbed MLA extend does not yet carry a sliding-window mask"
+                )
+            signature = format_signature(
+                q=dense_tensor_format(self.q_data_type),
+                kv_cache=dense_tensor_format(self.data_type),
+            )
+            traits = {
+                "num_q_heads": self.num_local_heads,
+                "qk_nope_head_dim": self.qk_nope_head_dim,
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "page_size": self.kernel_page_size,
+                "logit_cap": False,
+                "return_lse": False,
+            }
+            variable_traits = frozenset({"batch_size", "max_seqlen_q", "max_seqlen_k"})
+            self.extend_kernel_plan = KernelPlan.select(
+                "attention",
+                "mla_extend_with_kvcache",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={**traits, "is_causal": True},
+                variable_traits=variable_traits,
+                solution=self.kernel_solution,
+                declared_traits=frozenset(),
+                ignore_layout=False,
+            )
+            self.decode_kernel_plan = KernelPlan.select(
+                "attention",
+                "mla_decode_with_kvcache",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={
+                    **traits,
+                    "q_len": 1,
+                    "sliding_window": False,
+                    "noncausal_block_size": 1,
+                },
+                variable_traits=variable_traits,
+                solution=self.kernel_solution,
+                declared_traits=frozenset(),
+                ignore_layout=False,
+            )
+        self.cuda_graph_support = CudaGraphSupport.from_plans(
+            prefill=self.extend_kernel_plan, decode=self.decode_kernel_plan
+        )
 
     def forward_decode(
         self,
