@@ -934,6 +934,7 @@ class ModelExecutor:
         """Publish the bound pools to the backends and the model's layers."""
         with self.memory_saver_adapter.named_region("attention_state"):
             self.attn_backend.configure_runtime(
+                model=self.model_runner.model,
                 request_slot_capacity=self.config.max_req_pool_size + 1,
                 cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=_cache_arena_attr(
@@ -942,6 +943,7 @@ class ModelExecutor:
             )
             if self.draft_attn_backend is not None:
                 self.draft_attn_backend.configure_runtime(
+                    model=self._draft_model_runner.model,
                     request_slot_capacity=self.config.max_req_pool_size + 1,
                     cache_group_specs=tuple(
                         _cache_arena_attr(

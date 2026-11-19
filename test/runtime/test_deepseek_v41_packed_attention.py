@@ -365,6 +365,7 @@ def test_startup_profile_replays_the_requested_graph_capacity():
     from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+
     runner.dp_local_graph = False
     runner.max_tokens_per_req = 4
     runner.graphs = {}

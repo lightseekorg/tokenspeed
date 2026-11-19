@@ -18,9 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlatQuant INT4 preparation and explicitly selected expert implementations."""
+"""FlatQuant INT4 weight preparation and composed Prefill experts."""
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -192,28 +191,9 @@ def w4a4_grouped_experts(
     )
 
 
-def prepare_flatquant_stage(left, right, clip, *, width: int) -> FlatQuantStage:
-    """Validate and prepare constants once, before graph capture."""
-    if (
-        left.ndim != 2
-        or right.ndim != 2
-        or left.shape[0] != left.shape[1]
-        or right.shape[0] != right.shape[1]
-        or left.shape[0] * right.shape[0] != width
-        or left.dtype != torch.bfloat16
-        or right.dtype != torch.bfloat16
-        or left.device != right.device
-        or clip.device != left.device
-        or clip.numel() != 1
-        or not clip.is_floating_point()
-    ):
-        raise ValueError("Invalid FlatQuant matrices/clip for the activation width")
-    ratio = float(clip.item())
-    if not math.isfinite(ratio) or not 0 < ratio <= 1:
-        raise ValueError("FlatQuant clip must be finite and in (0,1]")
-    if not torch.isfinite(left).all() or not torch.isfinite(right).all():
-        raise ValueError("FlatQuant matrices must be finite")
-    return FlatQuantStage(left.t().contiguous(), right.contiguous(), ratio)
+def prepare_flatquant_stage(left, right, clip) -> FlatQuantStage:
+    """Prepare checkpoint constants once, before graph capture."""
+    return FlatQuantStage(left.t().contiguous(), right.contiguous(), float(clip.item()))
 
 
 def prepare_w4a4_moe_weights(
@@ -313,117 +293,4 @@ def prepare_w4a4_moe_weights(
         first,
         second,
         transposed,
-    )
-
-
-def require_fused_flatquant(op) -> None:
-    """Refuse the old smooth-only ABI rather than silently miscompute W4A4."""
-    required = {
-        "quant_mode": "str",
-        "flatquant13_left": "Optional[Tensor]",
-        "flatquant13_right": "Optional[Tensor]",
-        "flatquant2_left": "Optional[Tensor]",
-        "flatquant2_right": "Optional[Tensor]",
-        "clip13": "float",
-        "clip2": "float",
-        "weight_transposed": "bool",
-    }
-    arguments = {arg.name: str(arg.type) for arg in op._schema.arguments}
-    if any(arguments.get(name) != dtype for name, dtype in required.items()):
-        raise RuntimeError(
-            "fused_mm13_mm2 lacks the FlatQuant W4A4/NZ-transpose ABI; "
-            "rebuild the operator with transform/clip/layout inputs. "
-            "The smooth-only INT4 ABI is not compatible; split fallback is disabled."
-        )
-
-
-def ascend_int4_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
-    """Prepare constants for the explicitly selected fused FlatQuant solution."""
-    import flash_ops  # noqa: F401
-
-    op = torch.ops.custom.fused_mm13_mm2.default
-    require_fused_flatquant(op)
-    if w._int4_plan is not None:
-        return
-    if len(w._int4_loaded) != 6 * w.num_local_experts:
-        raise ValueError("Missing W4A4 expert weights/scales")
-    for module in (w.w1_trans, w.w2_trans, w.act_quantizer_w1, w.act_quantizer_w2):
-        module.validate_loaded()
-    first = prepare_flatquant_stage(
-        w.w1_trans.matrix_left,
-        w.w1_trans.matrix_right,
-        w.act_quantizer_w1.clip_factor_a,
-        width=w.hidden_size,
-    )
-    second = prepare_flatquant_stage(
-        w.w2_trans.matrix_left,
-        w.w2_trans.matrix_right,
-        w.act_quantizer_w2.clip_factor_a,
-        width=w.intermediate_size,
-    )
-    w._int4_plan = prepare_w4a4_moe_weights(
-        w.w13_weight,
-        w.w2_weight,
-        w.w13_weight_scale,
-        w.w2_weight_scale,
-        first,
-        second,
-        transposed=w.w4a4_gmm_is_transposed,
-    )
-    w.w13_weight.data = w._int4_plan.w13
-    w.w2_weight.data = w._int4_plan.w2
-    plan["routed_chain_op"] = op
-    plan.setdefault("expert_start", w.ep_rank * w.num_local_experts)
-    plan["routed_chain_boundary"] = torch.zeros(
-        25, dtype=torch.int32, device=w.w13_weight.device
-    )
-
-
-def ascend_int4_precomputed_moe_apply(
-    *,
-    plan,
-    x,
-    w,
-    router_logits,
-    topk_weights=None,
-    topk_ids=None,
-    num_tokens_global=None,
-    max_num_tokens_per_gpu=None,
-    do_finalize=True,
-    enable_pdl=False,
-):
-    """Invoke only the fused operator; dispatch and EP combine remain external."""
-    if (
-        not do_finalize
-        or enable_pdl
-        or plan.get("activation") not in {"silu", "swiglu"}
-    ):
-        raise ValueError("FlatQuant fused MoE requires finalized SwiGLU without PDL")
-    if topk_ids is None or topk_weights is None or topk_ids.shape != topk_weights.shape:
-        raise ValueError("FlatQuant fused MoE requires matching precomputed TopK")
-    if w._int4_plan is None:
-        raise RuntimeError("FlatQuant fused MoE weights were not prepared")
-    state = w._int4_plan
-    boundary = plan["routed_chain_boundary"]
-    return plan["routed_chain_op"](
-        x.contiguous(),
-        topk_ids.to(torch.int32).contiguous(),
-        state.w13,
-        state.scale13,
-        state.w2,
-        state.scale2,
-        topk_weights.contiguous(),
-        boundary,
-        boundary,
-        boundary,
-        expert_start=plan["expert_start"],
-        quant_bits=4,
-        quant_mode="flatquant",
-        flatquant13_left=state.first.left,
-        flatquant13_right=state.first.right,
-        flatquant2_left=state.second.left,
-        flatquant2_right=state.second.right,
-        clip13=state.first.clip,
-        clip2=state.second.clip,
-        weight_transposed=state.transposed,
     )
