@@ -106,7 +106,9 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
     )
     monkeypatch.setattr(K3AttnComm, "iris_states", {})
     mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
-    config = SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584)
+    config = SimpleNamespace(
+        hidden_size=7168, routed_expert_hidden_size=3584, num_experts=None
+    )
 
     def moe():
         value = kimi_k3.KimiLinearMoE.__new__(kimi_k3.KimiLinearMoE)
@@ -114,6 +116,7 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
         value.iris_state = None
         value.comm = None
         value.shared_experts = SimpleNamespace(shared_parallel=None)
+        value.experts = SimpleNamespace(plan={"weight_dtype": "unquant"})
         # As on CDNA4: the execution plan leaves the decode chain off.
         value.execution_plan = SimpleNamespace(decode_chain=False)
         return value

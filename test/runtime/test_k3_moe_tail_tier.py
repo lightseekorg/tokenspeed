@@ -158,6 +158,7 @@ def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
         ),
         config=SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584),
         _prepare_decode_chain=Mock(return_value=False),
+        _prepare_moe_tail=Mock(return_value=False),
     )
     monkeypatch.setattr(kimi_k3, "prepare_k3_all_reduce_buffers", lambda **kw: False)
     assert kimi_k3.KimiLinearForCausalLM.prepare_communication_runtime(owner, 32768)
