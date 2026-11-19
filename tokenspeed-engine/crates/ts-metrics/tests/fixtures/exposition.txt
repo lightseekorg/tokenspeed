@@ -3,7 +3,7 @@
 # HELP tokenspeed:decode_prefix_cache_hit_ratio Decode-local admission cache hits divided by prompt tokens, weighted by prompt tokens.
 # HELP tokenspeed:decode_prefix_hit_tokens_total Prompt tokens served by the decode-local prefix cache at admission.
 # HELP tokenspeed:decode_prefix_prompt_tokens_total Prompt tokens admitted by the decode-local scheduler.
-# HELP tokenspeed:decode_time_seconds Wall time from the first token to the request's end.
+# HELP tokenspeed:decode_time_seconds Wall time from this role's first output token to the request's end. On a decode role this starts at the first local decode output.
 # HELP tokenspeed:e2e_time_per_output_token_seconds Time from first emitted chunk to request end divided by tokens after the first chunk.
 # HELP tokenspeed:generation_tokens_total Generated tokens committed by decode forwards.
 # HELP tokenspeed:grammar_queue_reqs Admissions waiting for their grammar to compile.
@@ -49,7 +49,7 @@
 # HELP tokenspeed:spec_decode_num_draft_tokens_total Draft tokens proposed across verify steps.
 # HELP tokenspeed:spec_decode_num_drafts_total Number of speculative verify rounds (per request-slot).
 # HELP tokenspeed:time_per_output_token_seconds Time between nonempty emitted chunks divided by tokens in the later chunk.
-# HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to its first output token, on this role.
+# HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to this role's first output token. On a decode role this is the first local decode output; a remote prefill's bootstrap token alone does not end it, except when that token ends the request, so the wait for a decode execution permit is included.
 # TYPE tokenspeed:cache_hit_tokens_total counter
 # TYPE tokenspeed:completion_tokens_total counter
 # TYPE tokenspeed:decode_prefix_cache_hit_ratio histogram

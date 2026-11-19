@@ -20,6 +20,8 @@
 
 """Packed candidate protocol and public adaptive DSpark opt-in contracts."""
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 from torch import nn
@@ -30,6 +32,7 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -180,3 +183,85 @@ def test_executor_without_decodes_has_no_candidates(packed_decode_context, packe
     ctx.output_layout = ForwardOutputLayout(2, 2, 0, 4)
     ctx.decode_query_indptr = torch.tensor([0], dtype=torch.int64) if packed else None
     assert executor._decode_candidates(ctx) is None
+
+
+class _NarrowingDrafter(BaseDrafter):
+    """A drafter whose target forward narrows the context, as packed verify does."""
+
+    def __init__(self, *, spec_num_tokens: int, query_tokens: int):
+        super().__init__(spec_num_tokens=spec_num_tokens)
+        self.query_tokens = query_tokens
+
+    @contextmanager
+    def target_forward_context(self, ctx: ForwardContext):
+        # Packed verification keeps the narrowed extent for the rest of its
+        # own forward: sampling and the NaN audit consume packed rows.
+        ctx.input_num_tokens = self.query_tokens
+        yield
+
+
+def test_every_capture_forward_starts_at_the_native_query_extent():
+    """The grammar fill slices verify candidates by ``ctx.input_num_tokens``.
+
+    The warmups and the capture share one context, and a packed forward
+    leaves it narrowed, so each capture forward has to restore the extent a
+    round starts from; otherwise the captured copy reads an empty slice and
+    replays fill masks from stale draft tokens.
+    """
+    bs, width, query_tokens = 2, 6, 8
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.max_tokens_per_req = width
+    runner.capturable_grammar = None
+    drafter = _NarrowingDrafter(spec_num_tokens=width, query_tokens=query_tokens)
+    extents = []
+
+    def forward_func(*, bs, ctx, sampling_info):
+        extents.append(ctx.input_num_tokens)
+        with drafter.target_forward_context(ctx):
+            pass
+
+    runner._forward_func = forward_func
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=0,
+        input_num_tokens=bs * width,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, bs, width),
+    )
+
+    # The sequence a capture performs: four warmups, then the captured forward.
+    for _ in range(5):
+        runner._capture_forward(bs, ctx, sampling_info=None)
+
+    assert extents == [bs * width] * 5
+
+
+def test_capture_forward_adds_one_grammar_batch_per_run():
+    """Each captured forward pops one grammar batch, so each adds exactly one."""
+    bs, width = 2, 6
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.max_tokens_per_req = width
+    runner._forward_func = lambda **kwargs: None
+    added = []
+
+    class _Grammar:
+        def add_batch(self, *, grammars, bs, has_candidates, output_layout):
+            added.append((len(grammars), bs, has_candidates))
+
+    runner.capturable_grammar = _Grammar()
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=0,
+        input_num_tokens=bs * width,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, bs, width),
+    )
+
+    for _ in range(3):
+        runner._capture_forward(bs, ctx, sampling_info=None)
+
+    assert added == [(bs, bs, False)] * 3

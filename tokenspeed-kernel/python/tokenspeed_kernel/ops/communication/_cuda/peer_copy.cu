@@ -148,10 +148,18 @@ private:
         fail("cuStreamWaitValue64", result);
       const Layer &layer = *job.layer;
       if (!layer.size.empty()) {
+#if CUDART_VERSION < 13000
+        // CUDA 13 removed the per-copy failure index from this API.
+        size_t failed_index = 0;
+#endif
         error = cudaMemcpyBatchAsync(const_cast<void **>(layer.dst.data()),
                                      const_cast<void **>(layer.src.data()),
                                      const_cast<size_t *>(layer.size.data()), layer.size.size(),
-                                     &attr, &attr_index, 1, stream_);
+                                     &attr, &attr_index, 1,
+#if CUDART_VERSION < 13000
+                                     &failed_index,
+#endif
+                                     stream_);
         if (error != cudaSuccess)
           fail("cudaMemcpyBatchAsync", error);
       }

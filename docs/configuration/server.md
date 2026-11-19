@@ -599,7 +599,9 @@ split knobs.
 | `--eplb-rebalance-layers-per-chunk` | MoE layers whose experts move in one scheduling round; required with `--enable-eplb`, `1..num MoE layers`. Fewer layers per chunk bound the per-round stall. |
 
 All of these apply only to models that opt in to expert placement
-(LongCat-Flash); other models refuse them at startup. See
+(LongCat-Flash; Inkling2 for static placements; Kimi-K3 with attention DP
+and EP-only MoE, a `static` dispatch and no load recording); other models
+refuse them at startup. See
 [static expert placement](../serving/parallelism.md#static-expert-placement-with-redundant-experts)
 for the record → place → route flow and the two dispatch flavors, and
 [dynamic expert rebalancing](../serving/parallelism.md#dynamic-expert-rebalancing)
@@ -1032,6 +1034,14 @@ on the model and cache layout, this can reduce the reported token capacity
 for the same arena. Receiving all C requests at their maximum context length
 is not guaranteed.
 
+A ready request that waits for an execution permit is a time-to-first-token
+cost, not a decode cost. The decode role's first-token boundary is its first
+local decode output, so the wait measured by
+`tokenspeed:decode_ready_wait_seconds` and RequestStats `decode_wait_ms`
+falls inside `ttft_ms` and outside the `decode_tps` / TPOT window. Compare
+TPOT across different E values together with those waits and the
+`num_decode_ready_waiting_reqs` gauge.
+
 For a concrete capacity-model example, fix B=32 and 4,096 usable LCM blocks
 on a D rank. Use one full-history group with 64-token pages and one State
 group, both with one child block per LCM block; prefix caching and
@@ -1222,6 +1232,8 @@ The rank-local histogram tokenspeed:decode_ready_wait_seconds measures E-queue
 wait from the decode host observing complete prefill KV arrival to the first
 decode forward dispatch. It records once per request, including requests that
 dispatch immediately, and excludes requests cancelled or finished before decode.
+This wait is inside the decode role's time to first token and outside its
+decode time.
 It excludes prefill computation and KV transfer; dispatch is the host boundary,
 not a GPU kernel start timestamp. The 0.1-second bucket measures how many observed
 waits meet a 100 ms target. Requests still waiting have no histogram observation
@@ -1324,7 +1336,7 @@ add no remote-prefill batch reads. When both are enabled, they share one read.
 | --- | --- | --- |
 | `TTFTBootstrap` | The prefill replica agrees the room is bootstrapped | Engine registration to bootstrap agreement |
 | `TTFTBreakdown` on Prefill | First engine output or terminal release | Bootstrap, admission to first dispatch after bootstrap, prompt execution, transfer observation and output preparation |
-| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output |
+| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output (including a wait for a decode execution permit) |
 
 Prefill holds its first output until the KV transfer completes. Its normal
 breakdown therefore includes `transfer_observe` and `output_pack`; producing
@@ -1348,6 +1360,9 @@ On P, all prefill chunks contribute to `prefill`; only the last chunk records
 `transfer_done`; the summary normally waits for the next local decode commit.
 A request ended by the bootstrap token completes without that decode, and a
 non-streaming request waits until completion to prepare its output.
+`output_prepared` is this sampled summary's boundary. The role metrics'
+`first_token` is the first local decode output, stamped at the first decode
+commit, so it does not wait for a non-streaming flush.
 
 On P, `admission` splits into `ready_to_plan` and `plan_to_dispatch`. On D,
 `transfer_observe` splits into `remote_admission` and `admission_to_landing`.
@@ -1384,7 +1399,7 @@ the stats from host-side timestamps and counters, adding no GPU synchronization;
 formatting and writing the log still have a CPU cost. Example `request_stats` value:
 
 ```
-Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
+Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=2012.6, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
 ```
 
 | Field | Meaning |
@@ -1394,11 +1409,11 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
 | `queue_ms` | Request-supplied `created_time` → first dispatch into a forward batch. Includes time before Rust registration; differs from the submitted → dispatch metrics histogram. |
 | `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
-| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
-| `ttft_ms` | Request-supplied `created_time` → first output token. On a decode node the first token is the prefill node's bootstrap token, so the endpoint is the engine accepting the landed KV and token. |
+| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. This wait is inside `ttft_ms` and outside the decode window. |
+| `ttft_ms` | Request-supplied `created_time` → this role's first output token. On a decode node the endpoint is the first local decode output, or the bootstrap token when that token ends the request; the remote bootstrap token's landing only starts `decode_wait_ms`, so a wait for a decode execution permit is included. |
 | `total_ms` | Request-supplied `created_time` → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
-| `decode_tps` | Decode throughput (generated tokens / decode window). |
+| `decode_tps` | Decode throughput (generated tokens / decode window). On a decode node the window starts at the first local decode output, so queue, prefill and the decode admission wait are excluded. The bootstrap token and the first local token are delivered together, so the metric counts one zero interval: it is the client-observed average, not the local decode step rate. |
 | `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
 | `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for request-supplied creation / first dispatch / finish. `recv_ts` is copied from `created_time`, not stamped by the Rust transport. |
 

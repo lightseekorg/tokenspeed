@@ -178,7 +178,10 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_checkpoint_dir,
+    default_weight_loader,
+)
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
@@ -3267,8 +3270,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             resolve_engram_host_alloc(host_layout),
         )
 
-    def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
-        self._checkpoint_dir = checkpoint_dir
+    bind_checkpoint_dir = bind_checkpoint_dir
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         if self.encoder_only:
