@@ -681,7 +681,17 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         built.map_err(|error| python_error(py, error))
     })?;
     if mode == "encode" {
-        return encode::serve(bootstrap, &stop);
+        let result = encode::serve(bootstrap, &stop);
+        Python::attach(|py| {
+            if let Err(error) = py
+                .import("tokenspeed.runtime.metrics.service")
+                .and_then(|module| module.getattr("metrics_service"))
+                .and_then(|service| service.call_method1("close", (2.0,)))
+            {
+                tracing::warn!(%error, "closing encode metric sinks failed");
+            }
+        });
+        return result;
     }
 
     let (bootstrap, scheduler, config, data_plane, role, peers, peer_sharing, exporter) =

@@ -217,6 +217,7 @@ struct Shared {
     engine_rank: i64,
     bootstrap_timeout: Duration,
     state: Mutex<State>,
+    metrics: Option<Arc<ts_metrics::EncoderTransferMetrics>>,
 }
 
 impl Shared {
@@ -233,7 +234,14 @@ impl Shared {
     }
 
     /// Conclude `room` failed, telling every prefill rank that asked.
-    fn fail(&self, state: &mut State, room: u64, reason: &str) {
+    fn fail(
+        &self,
+        state: &mut State,
+        room: u64,
+        reason: &str,
+        transfer_failure: bool,
+        timeout: bool,
+    ) {
         let entry = state.rooms.remove(&room);
         tracing::error!(room, reason, "EPD embedding send failed");
         if let Some(entry) = &entry {
@@ -244,7 +252,12 @@ impl Shared {
         state
             .tombstones
             .insert(room, Instant::now() + self.bootstrap_timeout);
-        if entry.is_some_and(|entry| entry.begun) {
+        if entry.as_ref().is_some_and(|entry| entry.begun) {
+            if transfer_failure {
+                if let Some(metrics) = &self.metrics {
+                    metrics.failed(timeout);
+                }
+            }
             state.concluded.push(room);
         }
     }
@@ -305,7 +318,7 @@ impl Shared {
                 "the prefill ranks did not all ask within {:?}",
                 self.bootstrap_timeout
             );
-            self.fail(&mut state, room, &reason);
+            self.fail(&mut state, room, &reason, true, true);
         }
         let timeout = self.bootstrap_timeout;
         state.rooms.retain(|&room, entry| {
@@ -384,14 +397,25 @@ impl Shared {
 
     fn run_worker(&self, queue: &mpsc::Receiver<Ready>) {
         while let Ok((chunk, infos)) = queue.recv() {
+            let started = Instant::now();
             let sent = self.transfer(&chunk, &infos);
             let mut state = self.state();
             match sent {
                 Ok(()) => {
+                    if let Some(metrics) = &self.metrics {
+                        let bytes = infos
+                            .iter()
+                            .map(|info| {
+                                let (_, bytes, _, deep) = shard_payload(&chunk, info);
+                                bytes + if info.deepstack_ptr != 0 { deep } else { 0 }
+                            })
+                            .sum();
+                        metrics.completed(started.elapsed().as_secs_f64(), bytes);
+                    }
                     state.rooms.remove(&chunk.room);
                     state.concluded.push(chunk.room);
                 }
-                Err(reason) => self.fail(&mut state, chunk.room, &reason),
+                Err(reason) => self.fail(&mut state, chunk.room, &reason, true, false),
             }
         }
     }
@@ -417,6 +441,13 @@ impl Sender {
     /// control socket, start the threads and register with the bootstrap
     /// server.
     pub fn start(config: SenderConfig) -> Result<Self, StartError> {
+        Self::start_with_metrics(config, None)
+    }
+
+    pub fn start_with_metrics(
+        config: SenderConfig,
+        metrics: Option<Arc<ts_metrics::EncoderTransferMetrics>>,
+    ) -> Result<Self, StartError> {
         let (incoming, messages) = mpsc::channel::<Vec<Bytes>>();
         let transport = Transport::start(&config.peer, incoming)?;
         let port = transport.sockets.port();
@@ -425,6 +456,7 @@ impl Sender {
             engine_rank: config.peer.engine_rank,
             bootstrap_timeout: config.bootstrap_timeout,
             state: Mutex::new(State::default()),
+            metrics,
         });
         let mut queues = Vec::with_capacity(config.transfer_workers.max(1));
         for index in 0..config.transfer_workers.max(1) {
@@ -545,7 +577,7 @@ impl EmbeddingSender for Sender {
             // A worker writes it already and concludes it either way.
             return;
         }
-        self.shared.fail(&mut state, room, reason);
+        self.shared.fail(&mut state, room, reason, false, false);
     }
 
     fn concluded(&mut self) -> Vec<u64> {

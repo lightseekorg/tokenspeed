@@ -46,6 +46,7 @@ use ts_control::{
     event_loop::DataPlaneError,
     transport::EncodeIntake,
 };
+use ts_metrics::{EncoderMetrics, EncoderTransferMetrics, EngineLabels, Exporter, MetricsConfig};
 use ts_pd::{
     bootstrap::{BootstrapServer, Registry},
     epd::sender::{Sender, SenderConfig},
@@ -69,12 +70,16 @@ struct FrontendDial {
 /// What `encode_host.EncodeSettings` carries.
 struct Settings {
     rank: usize,
+    tp_rank: usize,
     tp_ranks: Vec<usize>,
     collective_bind_host: String,
     frontend: Option<FrontendDial>,
     bootstrap_port: Option<u16>,
     sender: SenderConfig,
     config: EncodeConfig,
+    metrics_enabled: bool,
+    outputs: MetricsConfig,
+    labels: EngineLabels,
 }
 
 impl Settings {
@@ -92,7 +97,20 @@ impl Settings {
         let rank: usize = get("rank")?.extract()?;
         let tp_ranks: Vec<usize> = get("tp_ranks")?.extract()?;
         Ok(Self {
+            metrics_enabled: get("metrics_enabled")?.extract()?,
+            outputs: MetricsConfig {
+                prometheus_dir: get("metrics_prometheus_dir")?
+                    .extract::<Option<String>>()?
+                    .map(Into::into),
+                relay_endpoint: get("metrics_relay_endpoint")?.extract()?,
+            },
+            labels: EngineLabels {
+                model_name: get("metrics_model_name")?.extract()?,
+                app_key: get("metrics_app_key")?.extract()?,
+                dp_rank: 0,
+            },
             rank,
+            tp_rank: get("attn_tp_rank")?.extract()?,
             collective_bind_host: get("collective_bind_host")?.extract()?,
             frontend: match get("handshake_address")?.extract::<Option<String>>()? {
                 Some(handshake_address) => Some(FrontendDial {
@@ -152,7 +170,24 @@ pub fn serve(bootstrap: Py<PyAny>, stop: &AtomicBool) -> Result<(), HostError> {
         .bootstrap_port
         .map(|port| BootstrapServer::start(port, Registry::Addresses))
         .transpose()?;
-    let sender = Sender::start(settings.sender)?;
+    let exporter = if settings.metrics_enabled {
+        Some(Exporter::new(&settings.outputs)?)
+    } else {
+        None
+    };
+    let logical_metrics = exporter
+        .as_ref()
+        .filter(|_| settings.rank == settings.tp_ranks[0])
+        .map(|exporter| Arc::new(EncoderMetrics::new(exporter, &settings.labels)));
+    let transfer_metrics = exporter.as_ref().map(|exporter| {
+        Arc::new(EncoderTransferMetrics::new(
+            exporter,
+            &settings.labels.model_name,
+            &settings.labels.app_key,
+            settings.tp_rank,
+        ))
+    });
+    let sender = Sender::start_with_metrics(settings.sender, transfer_metrics)?;
 
     let listener = Listener::bind(&settings.collective_bind_host)?;
     let port = listener.port()?;
@@ -194,7 +229,8 @@ pub fn serve(bootstrap: Py<PyAny>, stop: &AtomicBool) -> Result<(), HostError> {
         slots = settings.config.ring.slots,
         "encoding"
     );
-    let mut encode = EncodeLoop::new(settings.config, data_plane, sender, intake, mesh, group);
+    let mut encode = EncodeLoop::new(settings.config, data_plane, sender, intake, mesh, group)
+        .with_metrics(logical_metrics);
     let served = encode.run(stop);
     // Stops the forward thread and the sender's threads.
     drop(encode);

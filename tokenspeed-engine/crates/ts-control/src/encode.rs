@@ -39,8 +39,11 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -156,6 +159,9 @@ struct Admitted {
     /// Another request held its room when it arrived: it is embedded like
     /// any other (batches are the same on every rank), but not sent.
     duplicate: bool,
+    received_at: Instant,
+    queued_at: Instant,
+    started: Option<Instant>,
 }
 
 /// The round as every rank agrees on it.
@@ -195,6 +201,8 @@ pub struct EncodeLoop<D: EncodeDataPlane, S: EmbeddingSender> {
     encoding: usize,
     /// What the first rank waits for a request before the next round.
     wait: Duration,
+    metrics: Option<Arc<ts_metrics::EncoderMetrics>>,
+    last_snapshot: Option<(Instant, (usize, usize, usize))>,
 }
 
 impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
@@ -224,10 +232,18 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
             sending: HashMap::new(),
             encoding: 0,
             wait: IDLE_WAIT,
+            metrics: None,
+            last_snapshot: None,
         }
     }
 
     /// Serve until `stop` is set on the group's first rank.
+    /// Enable logical metrics on the first attention-TP rank.
+    pub fn with_metrics(mut self, metrics: Option<Arc<ts_metrics::EncoderMetrics>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), EncodeError> {
         loop {
             let received = match self.intake.as_mut() {
@@ -243,6 +259,7 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
             moved |= self.batch(round.free)?;
             moved |= self.hand_over()?;
             moved |= self.reclaim();
+            self.record_snapshot();
             self.wait = if !round.busy && !self.busy() {
                 IDLE_WAIT
             } else if moved {
@@ -254,6 +271,32 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
     }
 
     /// This rank has work in flight.
+    fn record_snapshot(&mut self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let state = (
+            self.hits.len() + self.misses.len(),
+            self.encoding,
+            self.sending.len(),
+        );
+        if self.last_snapshot.is_some_and(|(at, previous)| {
+            previous == state && at.elapsed() < Duration::from_secs(1)
+        }) {
+            return;
+        }
+        self.last_snapshot = Some((Instant::now(), state));
+        let oldest = self
+            .hits
+            .front()
+            .into_iter()
+            .chain(self.misses.front())
+            .filter_map(|id| self.requests.get(id))
+            .map(|request| request.queued_at.elapsed().as_secs_f64())
+            .fold(0.0, f64::max);
+        metrics.snapshot(state.0, state.1, state.2, oldest);
+    }
+
     fn busy(&self) -> bool {
         !self.requests.is_empty() || self.encoding > 0 || !self.leased.is_empty()
     }
@@ -320,13 +363,28 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         let mut admitted = Vec::with_capacity(messages.len());
         let mut taken = Vec::with_capacity(messages.len());
         for frames in messages {
+            if let Some(metrics) = &self.metrics {
+                metrics.arrival();
+            }
             let request: EncodeRequest = match ts_wire::decode_frames(&frames) {
                 Ok(request) => request,
                 Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.invalid();
+                    }
                     tracing::error!(%error, "dropping an encode request that does not decode");
                     continue;
                 }
             };
+            if let Some(metrics) = &self.metrics {
+                metrics.image_count(
+                    request
+                        .items
+                        .iter()
+                        .filter(|item| item.modality == ts_wire::Modality::Image)
+                        .count(),
+                );
+            }
             self.next_admission += 1;
             let admission = self.next_admission;
             let room = request.bootstrap_room;
@@ -340,8 +398,14 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
                         .map(|&(start, end)| end - start + 1)
                         .sum(),
                     duplicate: !self.sender.begin(room),
+                    received_at: Instant::now(),
+                    queued_at: Instant::now(),
+                    started: None,
                 }),
                 items => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.invalid();
+                    }
                     tracing::error!(
                         request_id = request.request_id,
                         items = items.len(),
@@ -354,6 +418,9 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
                 }
             };
             if item.as_ref().is_some_and(|item| item.duplicate) {
+                if let Some(metrics) = &self.metrics {
+                    metrics.duplicate();
+                }
                 tracing::error!(
                     request_id = request.request_id,
                     room,
@@ -381,6 +448,9 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         for ((admission, item), cached) in taken.into_iter().zip(cached) {
             match item {
                 Some(item) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.cache_lookup(cached);
+                    }
                     self.requests.insert(admission, item);
                     if cached {
                         self.hits.push_back(admission);
@@ -428,9 +498,20 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
         if batch.is_empty() {
             return Ok(false);
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.batch(
+                batch.len(),
+                batch.iter().map(|id| self.requests[id].rows).sum(),
+            );
+        }
         let leased: Vec<(u64, usize)> = batch
             .into_iter()
             .map(|admission| {
+                let request = self.requests.get_mut(&admission).expect("queued admission");
+                request.started = Some(Instant::now());
+                if let Some(metrics) = &self.metrics {
+                    metrics.dispatched(request.queued_at.elapsed().as_secs_f64());
+                }
                 let slot = self
                     .free
                     .pop()
@@ -460,6 +541,19 @@ impl<D: EncodeDataPlane, S: EmbeddingSender> EncodeLoop<D, S> {
                 ))
                 .into());
             };
+            if let Some(metrics) = &self.metrics {
+                if !request.duplicate {
+                    metrics.finished(
+                        request
+                            .started
+                            .expect("dispatched admission")
+                            .elapsed()
+                            .as_secs_f64(),
+                        request.queued_at.elapsed().as_secs_f64(),
+                        outcome.is_ok(),
+                    );
+                }
+            }
             if request.duplicate {
                 self.free_slot(admission);
                 continue;
@@ -772,6 +866,7 @@ mod tests {
                         rank.encode.batch(round.free).unwrap();
                         rank.encode.hand_over().unwrap();
                         rank.encode.reclaim();
+                        rank.encode.record_snapshot();
                     }
                 });
             }
@@ -856,5 +951,185 @@ mod tests {
         );
         assert_eq!(ranks[0].encode.free.len(), 4);
         assert!(!ranks[0].encode.busy());
+    }
+    #[test]
+    fn encoder_metrics_count_items_once_and_keep_transfer_failures_separate() {
+        use std::process::Command;
+        use ts_metrics::{EncoderMetrics, EngineLabels, Exporter, MetricsConfig};
+
+        let directory = std::env::temp_dir().join(format!(
+            "ts-epd-metrics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let exporter = Exporter::new(&MetricsConfig {
+            prometheus_dir: Some(directory.clone()),
+            relay_endpoint: None,
+        })
+        .unwrap();
+        let metrics = Arc::new(EncoderMetrics::new(
+            &exporter,
+            &EngineLabels {
+                model_name: "encoder".to_owned(),
+                app_key: "test.encoder".to_owned(),
+                dp_rank: 0,
+            },
+        ));
+        let rounds = vec![vec![
+            // One image with two token spans is still one image item.
+            request("one-image-two-spans", 1, vec![vec![(0, 1), (2, 3)]]),
+            // A malformed multi-item room is rejected before any transfer.
+            request(
+                "invalid-multiple-items",
+                2,
+                vec![vec![(0, 1)], vec![(2, 3)]],
+            ),
+            // Reusing a live room is counted as a duplicate.
+            request("duplicate-room", 1, vec![vec![(0, 3)]]),
+            // This item fails its send slot while ring-copying.
+            request("failed-item", 13, vec![vec![(0, 3)]]),
+            // The fake device's only whole-item cache hit.
+            request("cache-hit", 1000, vec![vec![(0, 3)]]),
+            vec![Bytes::from_static(b"invalid msgpack")],
+        ]];
+        let mut ranks = ranks(8, &[0, 2], rounds);
+        ranks[0].encode.metrics = Some(metrics);
+        run(&mut ranks, 30);
+
+        let output = Command::new(
+            std::env::var("TS_TEST_PYTHON").unwrap_or_else(|_| "python3".to_owned()),
+        )
+        .arg("-c")
+        .arg(
+            "import json,sys; from prometheus_client import CollectorRegistry,multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r,path=sys.argv[1]); print(json.dumps({s.name:s.value for m in r.collect() for s in m.samples}))",
+        )
+        .arg(&directory)
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for (name, expected) in [
+            ("requests_total", 6.0),
+            ("invalid_requests_total", 2.0),
+            ("duplicate_requests_total", 1.0),
+            ("encoded_requests_total", 2.0),
+            ("failed_requests_total", 1.0),
+            ("image_count_count", 5.0),
+            ("image_count_sum", 6.0),
+            ("cache_lookups_total", 4.0),
+            ("cache_hits_total", 1.0),
+            ("execution_time_seconds_count", 3.0),
+            ("request_time_seconds_count", 3.0),
+            ("queue_length", 0.0),
+            ("running_requests", 0.0),
+            ("sending_requests", 0.0),
+        ] {
+            assert_eq!(
+                values[format!("tokenspeed:encoder_{name}")].as_f64(),
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert!(
+            !values
+                .as_object()
+                .unwrap()
+                .contains_key("tokenspeed:encoder_transfer_failures_total"),
+            "an encode/ring-copy failure must not create a transfer failure"
+        );
+    }
+
+    #[test]
+    fn encode_metrics_count_items_and_separate_transfer_failures() {
+        use std::process::Command;
+        use ts_metrics::{EncoderMetrics, EngineLabels, Exporter, MetricsConfig};
+
+        let directory = std::env::temp_dir().join(format!(
+            "ts-epd-metrics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let exporter = Exporter::new(&MetricsConfig {
+            prometheus_dir: Some(directory.clone()),
+            relay_endpoint: None,
+        })
+        .unwrap();
+        let metrics = Arc::new(EncoderMetrics::new(
+            &exporter,
+            &EngineLabels {
+                model_name: "encoder".to_owned(),
+                app_key: "test.encoder".to_owned(),
+                dp_rank: 0,
+            },
+        ));
+        let rounds = vec![vec![
+            request("one-image-two-spans", 1, vec![vec![(0, 1), (2, 3)]]),
+            request(
+                "invalid-multiple-items",
+                2,
+                vec![vec![(0, 1)], vec![(2, 3)]],
+            ),
+            request("duplicate-room", 1, vec![vec![(0, 3)]]),
+            request("failed-copy", 13, vec![vec![(0, 3)]]),
+            request("cache-hit", 1000, vec![vec![(0, 3)]]),
+            vec![Bytes::from_static(b"invalid msgpack")],
+        ]];
+        let mut ranks = ranks(8, &[0, 2], rounds);
+        ranks[0].encode.metrics = Some(metrics);
+        run(&mut ranks, 30);
+        let output = Command::new(
+            std::env::var("TS_TEST_PYTHON").unwrap_or_else(|_| "python3".to_owned()),
+        )
+        .arg("-c")
+        .arg(
+            "import json,sys; from prometheus_client import CollectorRegistry,multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r,path=sys.argv[1]); print(json.dumps({s.name:s.value for m in r.collect() for s in m.samples}))",
+        )
+        .arg(&directory)
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for (name, expected) in [
+            ("requests_total", 6.0),
+            ("invalid_requests_total", 2.0),
+            ("duplicate_requests_total", 1.0),
+            ("encoded_requests_total", 2.0),
+            ("failed_requests_total", 1.0),
+            ("image_count_count", 5.0),
+            ("image_count_sum", 6.0),
+            ("cache_lookups_total", 4.0),
+            ("cache_hits_total", 1.0),
+            ("execution_time_seconds_count", 3.0),
+            ("request_time_seconds_count", 3.0),
+            ("queue_length", 0.0),
+            ("running_requests", 0.0),
+            ("sending_requests", 0.0),
+        ] {
+            assert_eq!(
+                values[format!("tokenspeed:encoder_{name}")].as_f64(),
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert!(!values
+            .as_object()
+            .unwrap()
+            .contains_key("tokenspeed:encoder_transfer_failures_total"));
     }
 }

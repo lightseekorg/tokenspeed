@@ -226,7 +226,10 @@ def _start_ranks(
 
 
 def _start_encode_ranks(
-    server_args: ServerArgs, port_args: PortArgs, parent_death_signal: bool
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    metrics_relay: MetricsRelay | None,
+    parent_death_signal: bool,
 ) -> tuple[list, list]:
     """Start this node's EPD encode ranks, one ``ts-host`` process each in
     encode mode (``epd/encode_host.py``), and return them with their ready
@@ -244,7 +247,7 @@ def _start_encode_ranks(
             rank_server_args,
             port_args,
             contextlib.nullcontext(),
-            None,
+            metrics_relay.endpoint if metrics_relay is not None else None,
             parent_death_signal,
         )
         procs.append(proc)
@@ -398,22 +401,22 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         # Nothing else stops a follower node's ranks, so they must not outlive
         # it, even when it is SIGKILLed; the first node's frontend notices.
         parent_death_signal = server_args.node_rank >= 1
-        if server_args.disaggregation_mode == "encode":
-            # The encode ranks host the node's EPD bootstrap server themselves.
-            procs, readers = _start_encode_ranks(
-                server_args, port_args, parent_death_signal
-            )
-        else:
+        if server_args.disaggregation_mode != "encode":
             # Fail before any rank loads the model.
             refusals = rust_host_refusals(server_args)
             if refusals:
                 raise NotImplementedError(
                     "The engine host does not support " + ", ".join(refusals) + " yet"
                 )
-            # A host's control thread runs no Python: the selected output
-            # plugins run in the node's relay, which the ranks feed.
-            if port_args.metrics_producer_configs:
-                metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
+        # The selected reporter is node-owned for every Rust host mode.
+        if port_args.metrics_producer_configs:
+            metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
+        if server_args.disaggregation_mode == "encode":
+            # The encode ranks host the node's EPD bootstrap server themselves.
+            procs, readers = _start_encode_ranks(
+                server_args, port_args, metrics_relay, parent_death_signal
+            )
+        else:
             procs, readers = _start_ranks(
                 server_args, port_args, metrics_relay, parent_death_signal
             )

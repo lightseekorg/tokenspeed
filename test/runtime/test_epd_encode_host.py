@@ -115,7 +115,15 @@ def _frames(*items: MultimodalDataItem, room: int = 1) -> list[bytes]:
     return [bytes(frame) for frame in MsgpackEncoder().encode(request)]
 
 
-def _plane(tower, *, slots=4, slot_bytes=1024, cache_bytes=1 << 20, deepstack=False):
+def _plane(
+    tower,
+    *,
+    slots=4,
+    slot_bytes=1024,
+    cache_bytes=1 << 20,
+    deepstack=False,
+    metrics_options=None,
+):
     ring = SendRing(
         slots=slots, slot_bytes=slot_bytes, deepstack=deepstack, device="cpu"
     )
@@ -125,6 +133,7 @@ def _plane(tower, *, slots=4, slot_bytes=1024, cache_bytes=1 << 20, deepstack=Fa
         ring=ring,
         device="cpu",
         tp_cpu_group=None,
+        metrics_options=metrics_options,
     )
     return plane, ring
 
@@ -412,3 +421,50 @@ def test_npu_encode_lands_rows_on_selected_device():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_metric_observer_sees_cached_admissions_and_disables_on_failure():
+    calls = []
+
+    def factory(**options):
+        def observe(phase, items):
+            calls.append((phase, len(items)))
+            if phase == "encoded":
+                raise RuntimeError("monitoring unavailable")
+
+        return observe
+
+    class Tower(_Tower):
+        def get_multimodal_encoder_specs(self):
+            return {
+                Modality.IMAGE: EncoderSpec(
+                    self.image_encoder, make_metrics_observer=factory
+                )
+            }
+
+    plane, _ = _plane(Tower(), metrics_options={})
+    plane.enter_forward_thread()
+    for admission in (1, 2):
+        assert plane.admit([(admission, _frames(_item(7, 2)))]) == [admission == 2]
+        plane.encode([(admission, 0)])
+        assert plane.encoded()[0][1] is None
+    assert calls == [("start", 0), ("admit", 1), ("encoded", 0)]
+
+
+def test_metric_observer_is_not_created_when_metrics_disabled():
+    def factory(**options):
+        raise AssertionError("disabled metrics must not construct observers")
+
+    class Tower(_Tower):
+        def get_multimodal_encoder_specs(self):
+            return {
+                Modality.IMAGE: EncoderSpec(
+                    self.image_encoder, make_metrics_observer=factory
+                )
+            }
+
+    plane, _ = _plane(Tower())
+    plane.enter_forward_thread()
+    plane.admit([(1, _frames(_item(7, 2)))])
+    plane.encode([(1, 0)])
+    assert plane.encoded()[0][1] is None

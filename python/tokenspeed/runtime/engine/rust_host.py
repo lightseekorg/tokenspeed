@@ -1830,7 +1830,9 @@ def bootstrap(
             "sharing; rebuild tokenspeed-engine together with this runtime"
         )
     if server_args.disaggregation_mode == "encode":
-        return EncodeBootstrap(server_args, port_args, connection)
+        return EncodeBootstrap(
+            server_args, port_args, connection, metrics_relay_endpoint
+        )
     return HostBootstrap(
         server_args,
         port_args,
