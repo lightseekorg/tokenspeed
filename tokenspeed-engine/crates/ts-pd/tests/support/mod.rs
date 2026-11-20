@@ -210,6 +210,7 @@ pub(crate) fn pair_with(
         bootstrap_timeout,
         step_address,
         0,
+        "early",
     )
 }
 
@@ -220,6 +221,7 @@ pub(crate) fn pair_on_port(
     bootstrap_timeout: Duration,
     step_address: Option<usize>,
     port: u16,
+    decode_allocation_policy: &str,
 ) -> Pair {
     pair_on_port_with_metrics(
         library,
@@ -228,10 +230,12 @@ pub(crate) fn pair_on_port(
         bootstrap_timeout,
         step_address,
         port,
+        decode_allocation_policy,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pair_on_port_with_metrics(
     library: PathBuf,
     source: &[u8],
@@ -239,6 +243,7 @@ pub(crate) fn pair_on_port_with_metrics(
     bootstrap_timeout: Duration,
     step_address: Option<usize>,
     port: u16,
+    decode_allocation_policy: &str,
     metrics: Option<std::sync::Arc<ts_metrics::KvTransferMetrics>>,
 ) -> Pair {
     let server = BootstrapServer::start(port, Registry::CacheLayouts).unwrap();
@@ -270,6 +275,7 @@ pub(crate) fn pair_on_port_with_metrics(
             "engine_rank": 0,
             "cache_layout": layout(None),
             "cache_fields_by_stage": [FIELDS],
+            "decode_allocation_policy": decode_allocation_policy,
         }),
         bootstrap_timeout,
         failed_session_ttl: Duration::from_secs(30),

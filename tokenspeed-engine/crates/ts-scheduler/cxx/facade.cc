@@ -275,6 +275,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
                 case ForwardEventKind::PdBootstrapped:
                     execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
                     break;
+                case ForwardEventKind::PdDestinationReady:
+                    execution_event.With(tokenspeed::pd::DestinationReadyEvent(std::move(request_id)));
+                    break;
                 case ForwardEventKind::PdFailed:
                     execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
                     break;
@@ -631,6 +634,22 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
         const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
         if (batch != nullptr) {
             out.push_back(batch_view(*batch));
+        }
+    }
+    return out;
+}
+
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<rust::String> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
+        if (batch == nullptr) {
+            continue;
+        }
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            if (batch->CompletesPrompt(row)) {
+                out.push_back(rust::String(batch->request_ids[row]));
+            }
         }
     }
     return out;
