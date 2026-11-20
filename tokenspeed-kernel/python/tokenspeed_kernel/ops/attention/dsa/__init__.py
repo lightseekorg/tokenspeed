@@ -1759,9 +1759,9 @@ def dsa_decode_index_candidates(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score and select a KVP decode's local index candidates of every row.
 
-    The rows are scored over this rank's compact owned pages. It serves the decode rows :func:`dsa_index_candidates` serves without
-    mandatory windows (no initial or local tokens), each request's rows
-    consecutive.
+    The rows are scored over this rank's compact owned pages. It serves the
+    decode rows :func:`dsa_index_candidates` serves without mandatory windows
+    (no initial or local tokens), each request's rows consecutive.
 
     Args:
         q: BF16 index queries ``[rows, index_heads, head_dim]``, unit inner
