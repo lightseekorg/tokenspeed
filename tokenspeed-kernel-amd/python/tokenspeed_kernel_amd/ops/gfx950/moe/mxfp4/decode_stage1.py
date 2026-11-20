@@ -202,7 +202,6 @@ def _stage1_mxfp4_direct_mfma_gluon(
             BLOCK_K_PACKED,
             BLOCK_K_SCALE,
             PREFETCH_TILES,
-            False,
         )
 
         out_tile = _direct_swiglu_reduce(
@@ -377,28 +376,6 @@ __all__ = [
 ]
 
 
-@gluon.jit
-def _store_route_map(route_map, group_count, route_expert, groups, rows, TOPK):
-    """Write each local route's index (-1 for another rank's) and the group count."""
-    route = gl.arange(0, route_expert.shape[0], layout=route_expert.type.layout)
-    gl.store(
-        route_map + route,
-        gl.where(route_expert >= 0, route, -1),
-        mask=route < rows * TOPK,
-    )
-    gl.store(group_count, groups)
-
-
-@gluon.jit
-def _store_group(plan_routes, plan_descriptors, group, expert, count, members, BLOCK_M):
-    """Write one group's routes and its (start, count, expert) descriptor."""
-    member = gl.arange(0, BLOCK_M, layout=members.type.layout)
-    gl.store(plan_routes + group * BLOCK_M + member, members)
-    gl.store(plan_descriptors + group * 3, group * BLOCK_M)
-    gl.store(plan_descriptors + group * 3 + 1, count)
-    gl.store(plan_descriptors + group * 3 + 2, expert)
-
-
 def _route_tile_launch_metadata(grid, kernel, args):
     return {"name": f"{kernel.name} (routes={args['out'].shape[0]})"}
 
@@ -409,8 +386,8 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
     xscale,
     w,
     wscale,
-    topk_ids,
-    route_map,
+    sorted_routes,
+    descriptors,
     group_count,
     plan_routes,
     plan_descriptors,
@@ -433,22 +410,21 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     PREFETCH_TILES: gl.constexpr,
+    ROUTES_FROM_IDS: gl.constexpr,
     EXPERT_START: gl.constexpr,
     NUM_EXPERTS: gl.constexpr,
-    MAX_ROWS: gl.constexpr,
-    PREGROUPED: gl.constexpr,
 ):
     """Batch one expert's route tile and store intermediates in token/slot order.
 
-    Each program groups the routes of at most ``MAX_ROWS`` tokens by expert
-    itself from the top-k IDs ``topk_ids`` ``[rows, TOPK]``, ``BLOCK_M``
-    routes a group. Program 0 writes ``route_map`` (each route, or -1 for
-    another rank's) and the group count to ``group_count``; the first job of
-    each group writes the grouping for stage 2: ``plan_routes`` (``BLOCK_M``
-    routes per group) and ``plan_descriptors`` (start, count, expert per
-    group). With ``PREGROUPED``, ``gluon_mxfp4_moe_route_groups_gfx950``
-    already wrote that grouping, route map and group count, and every program
-    reads its jobs' groups as stage 2 does.
+    With ``ROUTES_FROM_IDS`` the program groups the routes of at most
+    ``BLOCK_M`` tokens by expert itself: ``sorted_routes`` is the top-k IDs
+    ``[rows, TOPK]``, program 0 writes the route map (each route, or -1 for
+    another rank's) to ``descriptors``, and the grouping is written out for
+    stage 2 in the route-descriptor kernels' format: ``plan_routes``
+    (``BLOCK_M`` routes per group), ``plan_descriptors`` (start, count,
+    expert per group) and the group count in ``group_count``. Otherwise
+    ``sorted_routes``, ``descriptors`` and ``group_count`` are the
+    route-descriptor kernels' outputs and the plan arguments are unused.
     """
     gl.static_assert(HIDDEN % BLOCK_K == 0, "route tiles require complete K tiles")
     gl.static_assert(
@@ -477,42 +453,45 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
     ask = gl.arange(0, KS, layout=gl.SliceLayout(0, lsa))[None, :]
     bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, lsb))[:, None]
     bsk = gl.arange(0, KS, layout=gl.SliceLayout(0, lsb))[None, :]
-    if PREGROUPED:
-        groups = gl.load(group_count)
-    else:
-        route_expert, counts, first_group, groups = _route_groups_from_ids(
-            topk_ids, rows, EXPERT_START, NUM_EXPERTS, TOPK, MAX_ROWS, BLOCK_M
+    if ROUTES_FROM_IDS:
+        route_expert, counts, group_index, groups = _route_groups_from_ids(
+            sorted_routes, rows, EXPERT_START, NUM_EXPERTS, TOPK, BLOCK_M
         )
         if gl.program_id(0) == 0:
-            _store_route_map(route_map, group_count, route_expert, groups, rows, TOPK)
+            route = gl.arange(0, route_expert.shape[0], layout=route_expert.type.layout)
+            gl.store(
+                descriptors + route,
+                gl.where(route_expert >= 0, route, -1),
+                mask=route < rows * TOPK,
+            )
+            gl.store(group_count, groups)
+    else:
+        groups = gl.load(group_count)
     for job in range(gl.program_id(0), groups * (TWO_I // BLOCK_N), gl.num_programs(0)):
         group = job // (TWO_I // BLOCK_N)
         n = job % (TWO_I // BLOCK_N)
-        if PREGROUPED:
-            count = gl.load(plan_descriptors + group * 3 + 1)
-            expert = gl.load(plan_descriptors + group * 3 + 2)
-            # Padding rows repeat the group's last route.
-            member = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, la))
-            members = gl.load(
-                plan_routes + group * BLOCK_M + gl.minimum(member, count - 1)
-            )
-        else:
+        if ROUTES_FROM_IDS:
             expert, count, members = _group_routes(
-                route_expert, counts, first_group, group, BLOCK_M
+                route_expert, counts, group_index, group, BLOCK_M
             )
             if n == 0:
                 # Stage 2 reads this grouping instead of rebuilding it.
-                _store_group(
-                    plan_routes,
-                    plan_descriptors,
-                    group,
-                    expert,
-                    count,
-                    members,
-                    BLOCK_M,
-                )
-        routes = gl.convert_layout(members, gl.SliceLayout(1, la))[:, None]
-        scale_routes = gl.convert_layout(members, gl.SliceLayout(1, lsa))[:, None]
+                member = gl.arange(0, BLOCK_M, layout=members.type.layout)
+                gl.store(plan_routes + group * BLOCK_M + member, members)
+                gl.store(plan_descriptors + group * 3, group * BLOCK_M)
+                gl.store(plan_descriptors + group * 3 + 1, count)
+                gl.store(plan_descriptors + group * 3 + 2, expert)
+            routes = gl.convert_layout(members, gl.SliceLayout(1, la))[:, None]
+            scale_routes = gl.convert_layout(members, gl.SliceLayout(1, lsa))[:, None]
+        else:
+            start = gl.load(descriptors + group * 3)
+            count = gl.load(descriptors + group * 3 + 1)
+            expert = gl.load(descriptors + group * 3 + 2)
+            first = gl.load(sorted_routes + start)
+            routes = gl.load(sorted_routes + start + am, am < count, other=first)
+            scale_routes = gl.load(
+                sorted_routes + start + asm, asm < count, other=first
+            )
         xoff = (routes // TOPK).to(gl.int64) * X_ROW
         soff = scale_routes // TOPK
         woff = expert.to(gl.int64) * WE
@@ -550,13 +529,17 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
             KP,
             KS,
             PREFETCH_TILES,
-            True,
         )
         tile = _direct_swiglu_reduce(acc, 1.0, 0.0, 0.0, BLOCK_N // 2)
         packed, scale = _mxfp4_quantize_tile(tile)
         pr = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, packed.type.layout))
         pc = gl.arange(0, BLOCK_N // 4, layout=gl.SliceLayout(0, packed.type.layout))
-        destination = gl.convert_layout(members, gl.SliceLayout(1, packed.type.layout))
+        if ROUTES_FROM_IDS:
+            destination = gl.convert_layout(
+                members, gl.SliceLayout(1, packed.type.layout)
+            )
+        else:
+            destination = gl.load(sorted_routes + start + pr, pr < count, other=first)
         gl.store(
             out
             + destination[:, None].to(gl.int64) * INTER_PACKED
@@ -567,9 +550,14 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
         )
         sr = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, scale.type.layout))
         sc = gl.arange(0, BLOCK_N // 64, layout=gl.SliceLayout(0, scale.type.layout))
-        scale_destination = gl.convert_layout(
-            members, gl.SliceLayout(1, scale.type.layout)
-        )
+        if ROUTES_FROM_IDS:
+            scale_destination = gl.convert_layout(
+                members, gl.SliceLayout(1, scale.type.layout)
+            )
+        else:
+            scale_destination = gl.load(
+                sorted_routes + start + sr, sr < count, other=first
+            )
         _mxfp4_store_cdna4_scale(
             out_scale,
             scale,
@@ -580,40 +568,4 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
             sr[:, None] < count,
             M_SWIZZLE=32,
             K_SWIZZLE=8,
-        )
-
-
-@gluon.jit(do_not_specialize=["rows"])
-def gluon_mxfp4_moe_route_groups_gfx950(
-    topk_ids,
-    route_map,
-    group_count,
-    plan_routes,
-    plan_descriptors,
-    rows,
-    EXPERT_START: gl.constexpr,
-    NUM_EXPERTS: gl.constexpr,
-    TOPK: gl.constexpr,
-    MAX_ROWS: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-):
-    """Group the routes of at most ``MAX_ROWS`` tokens by local expert, once.
-
-    Writes what stage 1 (``gluon_mxfp4_moe_stage1_route_tiles_gfx950`` with
-    ``PREGROUPED``) and stage 2 read: ``route_map`` (each route, or -1 for
-    another rank's), ``group_count``, ``plan_routes`` (``BLOCK_M`` routes a
-    group) and ``plan_descriptors`` (start, count, expert a group). Each
-    program writes the groups ``program_id + k * num_programs``.
-    """
-    route_expert, counts, first_group, groups = _route_groups_from_ids(
-        topk_ids, rows, EXPERT_START, NUM_EXPERTS, TOPK, MAX_ROWS, BLOCK_M
-    )
-    if gl.program_id(0) == 0:
-        _store_route_map(route_map, group_count, route_expert, groups, rows, TOPK)
-    for group in range(gl.program_id(0), groups, gl.num_programs(0)):
-        expert, count, members = _group_routes(
-            route_expert, counts, first_group, group, BLOCK_M
-        )
-        _store_group(
-            plan_routes, plan_descriptors, group, expert, count, members, BLOCK_M
         )

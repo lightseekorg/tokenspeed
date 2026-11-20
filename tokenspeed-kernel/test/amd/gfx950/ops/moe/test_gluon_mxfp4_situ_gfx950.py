@@ -1475,7 +1475,6 @@ def test_stage1_quantized_output_scale_panels_gfx950(
             output_k=output_k,
             b_layout=B_LAYOUT_MFMA16.value,
             num_warps=max(1, block_m // 32),
-            wide_tile=False,
         )
     if error:
         kernel.__getitem__.assert_not_called()
@@ -1768,7 +1767,6 @@ def test_stage2_logical_k_ignores_padding_gfx950(
             force_reduce=force_reduce,
             input_sorted=input_sorted,
             a_format=a_format,
-            wide_tile=False,
         )
 
     result = run()
@@ -1882,7 +1880,6 @@ def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
                         force_reduce=True,
                         input_sorted=False,
                         a_format="e2m1",
-                        wide_tile=False,
                     )
                 )
             initialized, uninitialized = outputs

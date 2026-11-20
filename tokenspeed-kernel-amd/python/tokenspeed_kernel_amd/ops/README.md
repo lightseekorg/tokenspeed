@@ -2379,32 +2379,6 @@ N16 layout when a plan asks for it (`moe_plan(expert_layout="n16")`). Their
 results are bit-identical to the default gdot128 layout. The N16 prefill
 takes E2M1 activations only.
 
-### Wide E2M1 prefill tiles
-
-A grouped configuration whose `wide_tiles` is set (in the gfx950 MXFP4
-`fused/tuning.py` table: 4096 x 4096 experts, 64 of 256 local, from 192 rows) runs
-E2M1 package prefill on 64-row sort blocks and both GEMMs on their wide tiles.
-Other shapes keep the general tiles. So does that shape under expert tensor
-parallelism, whose sorted gate/up holds every expert locally (no table row
-yet: the wide tiles are unmeasured there).
-
-The gate/up GEMM's wide tile is 64 rows by 256 interleaved gate/up weight rows
-(128 outputs) on four waves, each wave owning 64 weight rows for all 64 rows,
-so it reads the activation tile from shared memory once per K tile.
-Activations are copied two K tiles ahead through three shared-memory slots,
-and weights and scales load one K tile ahead. The epilogue splits gate from up
-in registers and quantizes the 64 x 128 output in one pass. A 128-row sort
-block is two such tiles with the block's expert. Every output element sees the
-same MFMAs in the same K order as the general tile, so the bits are the same.
-
-The down GEMM's wide tile serves reduce mode: 64 rows by 256 columns on four
-waves through the same K loop as the gate/up tile (256-wide K tiles,
-activations two ahead). Each element accumulates the same 128-wide MFMA steps
-in the same order as the general 128-wide K tile, then rounds once to BF16;
-the 64 x 256 tile is redistributed once and each route's row stored as one
-contiguous span. Both tiles take row, route and token counts at run time, and
-address an expert's weights past 2^31 bytes in 64-bit offsets.
-
 ### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
 
 `gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts

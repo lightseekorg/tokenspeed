@@ -191,7 +191,6 @@ def _stage2_mxfp4_direct_mfma_gluon(
                         I_PACKED,
                         BLOCK_K_PACKED,
                         BLOCK_K_SCALE,
-                        False,
                     ),
                 )
             updated = ()
@@ -264,7 +263,6 @@ def _stage2_mxfp4_direct_mfma_gluon(
                     I_PACKED,
                     BLOCK_K_PACKED,
                     BLOCK_K_SCALE,
-                    False,
                 )
                 for kt in range(0, TOTAL_KT - 1):
                     next_a, next_b, next_a_scale, next_b_scale = (
@@ -297,7 +295,6 @@ def _stage2_mxfp4_direct_mfma_gluon(
                             I_PACKED,
                             BLOCK_K_PACKED,
                             BLOCK_K_SCALE,
-                            False,
                         )
                     )
                     acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
@@ -339,7 +336,6 @@ def _stage2_mxfp4_direct_mfma_gluon(
                         I_PACKED,
                         BLOCK_K_PACKED,
                         BLOCK_K_SCALE,
-                        False,
                     )
                     acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
             # Match the reference combine epilogue ordering.  Its GEMM kernel first
@@ -520,17 +516,13 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     PREFETCH_TILES: gl.constexpr,
-    PERSISTENT_PROGRAMS: gl.constexpr,
-    SINGLE_ROUND_JOBS: gl.constexpr,
 ):
     """Read expert route tiles and return separate token/slot outputs.
 
     ``sorted_routes``, ``descriptors`` and ``group_count`` hold the routes
-    grouped by expert, as stage 1
-    (``gluon_mxfp4_moe_stage1_route_tiles_gfx950``) writes them;
-    ``descriptor_rows`` is the descriptor table's row count. Up to
-    ``SINGLE_ROUND_JOBS`` jobs every program takes at most one; past it the
-    first ``PERSISTENT_PROGRAMS`` programs loop over the jobs and the rest exit.
+    grouped by expert, from the route-descriptor kernels or from stage 1
+    (``gluon_mxfp4_moe_stage1_route_tiles_gfx950`` with ``ROUTES_FROM_IDS``);
+    ``descriptor_rows`` is the descriptor table's row count.
     """
     gl.static_assert(
         INTERMEDIATE % BLOCK_K == 0, "route tiles require complete K tiles"
@@ -568,14 +560,9 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     first_start = _issue_here(first_start)
     first_count = _issue_here(first_count)
     first_expert = _issue_here(first_expert)
-    jobs = groups * (OUTPUT // BLOCK_N)
-    single_round = (jobs <= SINGLE_ROUND_JOBS).to(gl.int32)
-    stride = PERSISTENT_PROGRAMS + single_round * (
-        gl.num_programs(0) - PERSISTENT_PROGRAMS
-    )
-    # Programs past the stride have no job.
-    start = gl.program_id(0) + (gl.program_id(0) >= stride).to(gl.int32) * jobs
-    for job in range(start, jobs, stride):
+    for job in range(
+        gl.program_id(0), groups * (OUTPUT // BLOCK_N), gl.num_programs(0)
+    ):
         group = job // (OUTPUT // BLOCK_N)
         n = job % (OUTPUT // BLOCK_N)
         if job == gl.program_id(0):
@@ -624,7 +611,6 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
             KP,
             KS,
             PREFETCH_TILES,
-            True,
         )
         sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfma))[:, None]
         sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma))[None, :]
