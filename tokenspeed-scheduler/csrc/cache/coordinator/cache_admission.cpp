@@ -225,9 +225,11 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
             _assert(!input, "a State group matches one checkpoint");
             input = std::move(acquired_prefix.state_at_prompt_end[i]);
         }
-        if (const std::optional<CacheKey> key = store_.Groups()[i].Index().KeyOf(store_.DevicePool(), input);
-            key && store_.Boundaries().Tails().Contains(key->content_hash)) {
-            result.resumed_tail_hash = key->content_hash;
+        if (const std::optional<CacheKey> key = store_.Groups()[i].Index().KeyOf(store_.DevicePool(), input)) {
+            store_.Checkpoints().RecordResume(key->content_hash, access_epoch);
+            if (store_.Boundaries().Tails().Contains(key->content_hash)) {
+                result.resumed_tail_hash = key->content_hash;
+            }
         }
         store_.Groups()[i].Allocator().ShapeStateTable(*demands[i].table, std::move(input));
     }
@@ -386,6 +388,10 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
                         store_.Groups()[i].Id(),
                         std::array<std::int32_t, 1>{allocator.BucketOf(host_block->Location())});
                     FatalCheck(destination.size() == 1, "admission plan no longer fits the block pool");
+                    if (const std::optional<CacheKey> key =
+                            store_.Groups()[i].Index().KeyOf(*store_.HostPool(), host_block)) {
+                        store_.Checkpoints().RecordResume(key->content_hash, access_epoch);
+                    }
                     allocator.InstallStateInput(table, std::move(destination.front()));
                     result.load_pairs.push_back(BlockTransfer{.group_id = store_.Groups()[i].Id(),
                                                               .source = std::move(host_block),

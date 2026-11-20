@@ -1377,7 +1377,11 @@ Its responsibilities:
   epoch too. A junction, with checkpoints on two or more branches below it,
   has been resumed from more than once (a shared prompt) and keeps its own
   rank, as does a checkpoint the plan's own victims bring within K of a leaf.
-  Ranks change no checkpoint's
+  An aligned, non-demoted Host-only checkpoint actually resumed by another
+  request keeps its own State recency within N until a descendant is resumed.
+  Publication or a peer's soft lookup alone does not replace that evidence;
+  an accepted peer pin counts as a use. Removing the descendant does not revive
+  the earlier evidence. Ranks change no checkpoint's
   validity and reserve no capacity. `CheckpointResumeGaps` counts the
   admissions between a resumed checkpoint's last use and its resume, from
   which N is chosen.

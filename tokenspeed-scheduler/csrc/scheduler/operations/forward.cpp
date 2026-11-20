@@ -203,7 +203,7 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
 // or was claimed. It reads only the prompt and where the request resumed, so
 // every admission of the prompt decides as its first decode will.
 bool Scheduler::firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const {
-    return config_.role == Role::kFused && !config_.disable_prefix_cache &&
+    return config_.role == Role::kFused && !config_.disable_prefix_cache && !shortPromptEndIsDropped(request) &&
            promptEndCheckpoint(request, resume_tokens) == 0;
 }
 
@@ -383,6 +383,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
                                                     : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
     const auto hashes = request->PromptPrefixHashes().first(static_cast<std::size_t>(candidate_prefix_pages));
     match.candidate_prefix_hashes = hashes;
+    match.max_cacheable_tokens = max_cacheable_tokens;
     auto& prepared_keys = request->GetIf<fsm::Submitted>()->admission.prefix_keys;
     if (!prepared_keys) {
         prepared_keys = coordinator_.Prober().PreparePrefixKeys(hashes);
@@ -402,39 +403,6 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
         match.waits_for_eviction_store = true;
         return match;
     }
-    // Opt-in diagnostics deliberately walk more than matching needs. Emit
-    // only a successful first admission, using the pre-admission snapshot.
-    static const bool inspect_prefix = std::getenv("TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS") != nullptr;
-    if (inspect_prefix) {
-        const auto boundaries = coordinator_.Prober().InspectPrefixAvailability(prompt);
-        std::string rows;
-        for (const auto& boundary : boundaries) {
-            if (!rows.empty()) {
-                rows += ',';
-            }
-            rows += fmt::format("[{},{},{},{}]", boundary.tokens, boundary.device_missing, boundary.host_missing,
-                                boundary.union_missing);
-        }
-        std::string group_names;
-        for (const std::string& id : cache_group_ids_) {
-            if (!group_names.empty()) {
-                group_names += ',';
-            }
-            group_names += id;
-        }
-        std::string prompt_hashes;
-        for (const std::string& hash : hashes) {
-            if (!prompt_hashes.empty()) {
-                prompt_hashes += ',';
-            }
-            prompt_hashes += hash;
-        }
-        match.prefix_diagnostic = fmt::format(
-            "request={} prompt={} bound={} resumed={} kv={} groups={} hashes={} boundaries=[{}]", request->Id(),
-            request->PrefillSize(), prompt.max_tokens,
-            std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens),
-            std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens), group_names, prompt_hashes, rows);
-    }
     // The chain progress counts full pages only; a tail is a boundary, not a
     // hashed page.
     const std::int32_t hit_prefix_pages =
@@ -446,6 +414,44 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
     const auto extension_begin = static_cast<std::size_t>(match.probe.device.full_page_tokens / prefix_granularity);
     match.extension_hashes = hashes.subspan(extension_begin, static_cast<std::size_t>(extension_pages));
     return match;
+}
+
+std::string Scheduler::describePrefixAtAdmission(const Request& request, const AdmissionMatch& match) const {
+    ProfileSpan profile_span{"Scheduler::describePrefixAtAdmission"};
+    const PromptPrefix prompt{
+        .prefix_hashes = match.candidate_prefix_hashes,
+        .tokens = request.TokenSlice(0, request.PrefillSize()),
+        .max_tokens = match.max_cacheable_tokens,
+        .prepared_keys = match.probe.group_keys,
+    };
+    const auto boundaries = coordinator_.Prober().InspectPrefixAvailability(prompt);
+    std::string rows;
+    for (const auto& boundary : boundaries) {
+        if (!rows.empty()) {
+            rows += ',';
+        }
+        rows += fmt::format("[{},{},{},{}]", boundary.tokens, boundary.device_missing, boundary.host_missing,
+                            boundary.union_missing);
+    }
+    std::string group_names;
+    for (const std::string& id : cache_group_ids_) {
+        if (!group_names.empty()) {
+            group_names += ',';
+        }
+        group_names += id;
+    }
+    std::string prompt_hashes;
+    for (const std::string& hash : match.candidate_prefix_hashes) {
+        if (!prompt_hashes.empty()) {
+            prompt_hashes += ',';
+        }
+        prompt_hashes += hash;
+    }
+    return fmt::format("request={} prompt={} bound={} resumed={} kv={} groups={} hashes={} boundaries=[{}]",
+                       request.Id(), request.PrefillSize(), prompt.max_tokens,
+                       std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens),
+                       std::max(match.probe.device.kv_tokens, match.probe.host.kv_tokens), group_names, prompt_hashes,
+                       rows);
 }
 
 void Scheduler::recordAdmittedPages(ExecutionPlan& plan, const AdmissionResult& result) {
@@ -684,6 +690,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         source != fsm::PrefillSource::kRemote ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     // Read before the lone-request hand-over below may take the probe.
     const std::int32_t probed_device_full_page_tokens = match.probe.device.full_page_tokens;
+    // Ranking needs only the match. Inspect the selected admission immediately
+    // before Admit can evict pages, and emit this snapshot only on success.
+    static const bool inspect_prefix = std::getenv("TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS") != nullptr;
+    const std::string prefix_diagnostic =
+        inspect_prefix && !config_.disable_prefix_cache ? describePrefixAtAdmission(*request, match) : std::string{};
     std::optional<AdmissionResult> admission;
     if (writes_checkpoint) {
         admission =
@@ -736,9 +747,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // the Device's prefix (0 when only checkpoints come from Host), and
     // nothing when the Device won.
     const std::int32_t host_hit_tokens = std::max(admission->host_prefix_tokens - admission->device_prefix_tokens, 0);
-    if (!match.prefix_diagnostic.empty()) {
+    if (!prefix_diagnostic.empty()) {
         spdlog::info("[PrefixCacheDiagnostic] {} device_hit_tokens={} host_hit_tokens={} host_gain_tokens={}",
-                     match.prefix_diagnostic, hit_tokens - host_hit_tokens, host_hit_tokens, host_gain_tokens);
+                     prefix_diagnostic, hit_tokens - host_hit_tokens, host_hit_tokens, host_gain_tokens);
     }
     prefix_hit_stats_.prompt_tokens += request->PrefillSize();
     prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;

@@ -460,23 +460,23 @@ def test_a_prefill_server_drops_short_prompt_ends_with_in_forward_checkpoints(
     assert cfg.drop_short_prompt_end_checkpoints is enabled
 
 
-def test_a_fused_server_keeps_short_prompt_ends():
-    # The drop is a prefill-server policy: fused serving keeps its short
-    # prompt ends with in-forward checkpoints on.
+@pytest.mark.parametrize("enabled", [False, True])
+def test_a_fused_server_drops_short_prompt_ends_with_in_forward_checkpoints(enabled):
+    # The same policy reaches the actual scheduler config on both prompt owners.
     args = ServerArgs(
-        model="x", max_num_seqs=8, enable_state_checkpoint_in_forward=True
+        model="x", max_num_seqs=8, enable_state_checkpoint_in_forward=enabled
     )
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
     )
-    assert cfg.state_checkpoint_in_forward
-    assert not cfg.drop_short_prompt_end_checkpoints
+    assert cfg.state_checkpoint_in_forward is enabled
+    assert cfg.drop_short_prompt_end_checkpoints is enabled
 
 
 @pytest.mark.parametrize("role, pool", [("decode", (5, 8)), ("encode", (1, 0))])
 def test_decode_and_encode_servers_drop_no_short_prompt_end(role, pool):
     # A PD launcher may pass the prefill flags to every role; the scheduler
-    # refuses the drop outside the P role, so these servers never set it.
+    # refuses the drop on the D role, and the encode role sets no policy.
     args = ServerArgs(
         model="x",
         max_num_seqs=8,

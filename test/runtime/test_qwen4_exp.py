@@ -2238,6 +2238,8 @@ def test_qwen4_exp_ple_in_forward_checkpoint_matches_a_forward_ending_there() ->
         checkpoints=InForwardStateCheckpoints(
             rows=torch.tensor([0]),
             offsets=torch.tensor([8]),
+            device_rows=torch.tensor([0]),
+            device_offsets=torch.tensor([8]),
             token_index=torch.tensor([8]),
             blocks_by_group={
                 QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor([2], dtype=torch.int32)

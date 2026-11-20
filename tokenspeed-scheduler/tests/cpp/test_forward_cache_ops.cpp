@@ -773,9 +773,9 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     }
 }
 
-TEST(SchedulerConfigValidateTest, DroppingShortPromptEndsTakesThePRoleAndTheInForwardCheckpoint) {
+TEST(SchedulerConfigValidateTest, DroppingShortPromptEndsTakesAPromptOwnerAndTheInForwardCheckpoint) {
     // The drop extends the dead checkpoints the in-forward checkpoint skips,
-    // at the P role's finish; the other roles refuse it instead of ignoring it.
+    // at the P role's finish or fused first decode; the D role refuses it.
     for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
         SCOPED_TRACE(static_cast<int>(role));
         SchedulerConfig config = MakeValidConfig();
@@ -790,7 +790,7 @@ TEST(SchedulerConfigValidateTest, DroppingShortPromptEndsTakesThePRoleAndTheInFo
         EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument)
             << "without the in-forward checkpoint";
         config.state_checkpoint_in_forward = true;
-        if (role == Role::kP) {
+        if (role != Role::kD) {
             EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
         } else {
             EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);

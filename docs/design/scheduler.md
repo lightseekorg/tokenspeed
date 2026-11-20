@@ -547,25 +547,24 @@ either.
 (`PrefillStateCheckpointTokens` is 0: by default a prompt within one chunk
 budget) has no `C` to make its end dead, so the rule above publishes it. With
 `drop_short_prompt_end_checkpoints` (on with
-`--enable-state-checkpoint-in-forward`, P role only) the P role's finish skips
+`--enable-state-checkpoint-in-forward`, P and fused roles) the finish skips
 that end too when it lies inside a page: it publishes the full pages alone,
 like a chunk end (`shortPromptEndIsDropped`). A re-rendered next turn cannot
 resume at that end either; a longer prompt that repeats the whole prompt
 resumes at an earlier checkpoint instead and recomputes the rest of it. A
 page-aligned end keeps its state: it is a chain boundary a longer prompt
 resumes from. The decision reads only the prompt, so it holds whatever the
-cache holds, and nothing before the finish depends on it: the P role
+cache holds. On the P role nothing before the finish depends on it: that role
 reserves no copy-in block for its prompt end and never retracts. Such a
 finish publishes no end state, and it marks no input superseded (below): the
 tail it resumed from, if any (a junction's, whose state a junction cut
 published), may still be the deepest checkpoint a prompt extending it
 resumes at. Under write-back the pages it leaves, with no checkpoint at or
 under them, are dead entries an eviction drops instead of writing back. The
-fused role keeps its short prompt ends, and `Validate` refuses the flag
-there: the drop is a P-role policy, chosen from PD measurements. The same
-case exists at the fused first decode, which publishes a short prompt's end
-and moves off it into its copy-in blocks; applying the drop there, decided
-at admission like `promptEndCheckpoint`, is a possible follow-up.
+fused admission and first decode apply the same decision: no copy-in blocks
+are reserved for the omitted publication, and the request keeps its working
+State. Finishing past that prompt end marks no input superseded either.
+The D role refuses this flag; its prompt arrived by transfer.
 
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to

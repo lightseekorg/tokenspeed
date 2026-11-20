@@ -97,6 +97,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
+from tokenspeed.runtime.utils.tensor import upload_packed
 
 logger = logging.getLogger(__name__)
 
@@ -1137,6 +1138,11 @@ class MambaAttnBackend(AttentionBackend):
         every_n_tokens, cu_starts, rows = scan_checkpoint_plan(
             checkpoints, scan_seq_lens_cpu
         )
+        # Keep scan planning on the host, then stage both consumer indices in
+        # one transfer without waiting for work already on the model stream.
+        device_cu_starts, device_rows = upload_packed(
+            (cu_starts.to(torch.int32), rows), self.device
+        )
         ssm_states = self._state_components(self._state_layer_ids()[0])[1]
         states = torch.empty(
             (int(cu_starts[-1]), *ssm_states.shape[1:]),
@@ -1147,9 +1153,9 @@ class MambaAttnBackend(AttentionBackend):
             GdnStateCheckpoints(
                 every_n_tokens=every_n_tokens,
                 states=states,
-                cu_starts=cu_starts.to(device=self.device, dtype=torch.int32),
+                cu_starts=device_cu_starts,
             ),
-            rows.to(self.device),
+            device_rows,
         )
 
     def _prepare_mixed_verify_metadata(
