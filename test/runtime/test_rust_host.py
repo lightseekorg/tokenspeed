@@ -192,9 +192,11 @@ def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
     return server_args, PortArgs.init_new(server_args)
 
 
-@pytest.mark.parametrize("enable_async_logging", [False, True])
+@pytest.mark.parametrize(
+    "device, enable_async_logging", [("cuda", False), ("npu", True)]
+)
 def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
-    tmp_path, enable_async_logging
+    tmp_path, device, enable_async_logging
 ):
     binary = _fake_host(
         tmp_path,
@@ -202,11 +204,23 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
                          "python": python, "relay": relay,
+                         "npu_device": args.get("--npu-device"),
                          "async_logging": args["--enable-async-logging"]})
         time.sleep(600)
         """,
     )
-    server_args, port_args = _rank_args(3)
+    server_args = ServerArgs(
+        model="x",
+        world_size=4,
+        nnodes=2,
+        nprocs_per_node=2,
+        base_gpu_id=2,
+        gpu_id_step=2,
+        dist_init_addr="127.0.0.1:9199",
+    )
+    server_args.mapping.rank = 3
+    server_args.device = device
+    port_args = PortArgs.init_new(server_args)
     server_args.enable_async_logging = enable_async_logging
     proc, reader = start_rust_host(
         binary, server_args, port_args, nullcontext(), "ipc:///tmp/relay", False
@@ -216,6 +230,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
         assert ready == {
             "status": "ready",
             "rank": 3,
+            "npu_device": "4" if device == "npu" else None,
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
             "async_logging": str(enable_async_logging).lower(),
