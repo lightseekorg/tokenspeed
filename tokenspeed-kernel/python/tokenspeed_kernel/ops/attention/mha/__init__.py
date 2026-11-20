@@ -534,14 +534,14 @@ def mha_decode_with_kvcache(
     v_scale: torch.Tensor | None = None,
     fp8_kv_scales: tuple[float, float] | None = None,
     schedule: torch.Tensor | None = None,
-    output_gate: torch.Tensor | None = None,
-    output_gate_eps: float | None = None,
-    uniform_row_groups: int = 1,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
     *,
     block_draft: bool,
+    output_gate: torch.Tensor | None = None,
+    output_gate_eps: float | None = None,
+    uniform_row_groups: int = 1,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
