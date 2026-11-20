@@ -1917,7 +1917,7 @@ class ProducerAllReduce:
     # Elements per rank slot of the Lamport mailbox region, the stride every
     # kernel on it addresses with. Larger than the one-shot window
     # (LAMPORT_MAX_ELEMENTS, which still selects the all-reduce protocols) so
-    # Muse's fused pre-expert gather fits 320 rows of a TP4 1024-wide shard.
+    # a fused gather fits 320 rows of a 1024-wide shard.
     LAMPORT_CAPACITY_ELEMENTS = 80 * 4096
     # The one-shot sends every peer the whole payload; from this size the
     # two-shot was faster in 8-rank MI355X graph replay. At TP4 the one-shot
@@ -2176,13 +2176,20 @@ class ProducerAllReduce:
         flat = tensor.view(-1)
         numel = flat.numel()
         push_min_bytes = self.ORDINARY_PUSH_MIN_BYTES.get(self.world_size)
-        if self._lamport_two_shot_serves(numel) or self._lamport_one_shot_serves(numel):
-            self.run(flat, flat, numel)
-        elif (
+        in_push_window = (
             push_min_bytes is not None
             and push_min_bytes <= numel * flat.element_size()
             and numel <= self.push_max_numel
-        ):
+        )
+        # At TP4 the Lamport two-shot adds in the push's order, not the
+        # producer pull's (local first), so an ordinary payload takes it only
+        # inside the push window, where the bits are the push's.
+        two_shot = self._lamport_two_shot_serves(numel) and (
+            self.world_size != 4 or in_push_window
+        )
+        if two_shot or self._lamport_one_shot_serves(numel):
+            self.run(flat, flat, numel)
+        elif in_push_window:
             # Outside the Lamport windows run selects the push, whose result
             # is borrowed push storage.
             flat.copy_(self.run(flat, flat, numel)[:numel])
