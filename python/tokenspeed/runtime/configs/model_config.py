@@ -1152,7 +1152,19 @@ class ModelConfig:
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
-        if quant_cfg is None or is_inkling2_manifest_stub(quant_cfg):
+        # A released Inkling2 config.json also carries a generic modelopt
+        # summary; the checkpoint's Inkling2 manifest still governs.
+        inkling2_summary = (
+            isinstance(quant_cfg, dict)
+            and quant_cfg.get("quant_method") == "modelopt"
+            and resolve_architecture(self.hf_config)
+            in (
+                "Inkling2ForConditionalGeneration",
+                "Inkling2LoopForConditionalGeneration",
+            )
+        )
+        fallback = quant_cfg is None or is_inkling2_manifest_stub(quant_cfg)
+        if fallback or inkling2_summary:
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
             # Resolve the local snapshot directory (model_path may be a HF hub ID)
             if os.path.isdir(self.model_path):
@@ -1181,7 +1193,7 @@ class ModelConfig:
                     if hf_quant.get("quant_method") == "inkling2":
                         return hf_quant
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
-                    if quant_algo:
+                    if quant_algo and fallback:
                         quant_cfg = {
                             "quant_method": "modelopt",
                             "quant_algo": quant_algo,
