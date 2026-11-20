@@ -1760,11 +1760,13 @@ TEST_F(AsyncStorageTransactionTest, MalformedObjectFactsCannotCompleteOrReleaseR
 TEST_F(AsyncStorageTransactionTest, RetainingClearRejectsUnindexedNonStorageHostAndDeviceOwners) {
     auto private_host = host.AcquireBlock(0);
     ASSERT_TRUE(private_host);
+    EXPECT_TRUE(coordinator.CacheIsClearableAfterStorageDrain(storage.HeldBlockRefs()));
     EXPECT_FALSE(coordinator.CacheIsClearableRetainingStorage(storage.HeldBlockRefs()));
     EXPECT_EQ(host.NumOccupiedSlots(), 1);
     private_host.reset();
     auto private_device = device.AcquireBlock(0);
     ASSERT_TRUE(private_device);
+    EXPECT_TRUE(coordinator.CacheIsClearableAfterStorageDrain(storage.HeldBlockRefs()));
     EXPECT_FALSE(coordinator.CacheIsClearableRetainingStorage(storage.HeldBlockRefs()));
     private_device.reset();
     EXPECT_TRUE(coordinator.CacheIsClearableRetainingStorage(storage.HeldBlockRefs()));
@@ -1786,9 +1788,11 @@ TEST_F(AsyncStorageTransactionTest, RetainingClearRejectsAPeerExportSharingAnUns
     ASSERT_EQ(peer.blocks.size(), 1u);
     EXPECT_EQ(peer.blocks.front().tier, CacheTier::kHost);
     EXPECT_EQ(peer.blocks.front().block.operator->(), storage.HeldBlockRefs().front()->operator->());
+    EXPECT_FALSE(coordinator.CacheIsClearableAfterStorageDrain(storage.HeldBlockRefs()));
     EXPECT_FALSE(coordinator.CacheIsClearableRetainingStorage(storage.HeldBlockRefs()));
     EXPECT_TRUE(coordinator.Host().ContainsHostCachedBlock(key("h0")));
     peer.blocks.clear();
+    EXPECT_TRUE(coordinator.CacheIsClearableAfterStorageDrain(storage.HeldBlockRefs()));
     EXPECT_TRUE(coordinator.CacheIsClearableRetainingStorage(storage.HeldBlockRefs()));
 }
 

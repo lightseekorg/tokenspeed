@@ -701,6 +701,8 @@ fn retaining_clear_separates_old_tickets_from_current_quarantine() {
     assert!(scheduler.storage_current_pending());
     assert_eq!(scheduler.storage_blocking_quarantined(), 1);
     assert!(scheduler.storage_non_storage_clearable());
+    assert!(scheduler.can_prepare_storage_clear());
+    assert!(scheduler.can_clear_cache_retaining_storage());
     assert_eq!(scheduler.storage_stats().retained_operations, 0);
     scheduler.cancel_storage_for_clear();
     assert!(scheduler.clear_cache_retaining_storage());
@@ -714,6 +716,43 @@ fn retaining_clear_separates_old_tickets_from_current_quarantine() {
     assert_eq!(stats.held_blocks, stats.retained_host_blocks);
     assert_eq!(stats.retained_capacity_warnings, 0);
     assert!(!stats.retained_capacity_exhausted);
+}
+
+#[test]
+fn ordinary_clear_preparation_allows_a_query_to_drain_without_clearing_early() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler
+        .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
+        .unwrap();
+    let query = scheduler.next_execution_plan(true, false).storage_ops()[0].clone();
+    assert!(scheduler.can_prepare_storage_clear());
+    assert!(scheduler.storage_current_pending());
+    assert!(!scheduler.can_clear_cache());
+    let before = scheduler.storage_stats();
+    assert!(scheduler.can_prepare_storage_clear());
+    assert_eq!(scheduler.storage_stats(), before);
+
+    scheduler.cancel_storage_for_clear();
+    scheduler
+        .advance_head(
+            &StorageRound {
+                done: vec![StorageDoneView {
+                    op_id: query.op_id,
+                    success: vec![0; query.keys.len()],
+                    retired: true,
+                    object_failures: vec![0; query.keys.len()],
+                }],
+                ..tick(2)
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(!scheduler.storage_pending());
+    assert!(scheduler.can_clear_cache());
+    assert!(scheduler.clear_cache());
 }
 
 /// A small scheduler of `role` whose one group transfers its suffix.

@@ -701,6 +701,7 @@ mod ffi {
         fn storage_progress_pending(scheduler: &Scheduler) -> bool;
         fn storage_blocking_quarantined(scheduler: &Scheduler) -> usize;
         fn storage_non_storage_clearable(scheduler: &Scheduler) -> bool;
+        fn can_prepare_storage_clear(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
@@ -1057,9 +1058,15 @@ impl Scheduler {
         ffi::storage_blocking_quarantined(self.get())
     }
 
-    /// Pure preflight for owners other than scheduler storage tickets.
+    /// Ordinary indexed-pin preflight after storage references drain.
     pub fn storage_non_storage_clearable(&self) -> bool {
         ffi::storage_non_storage_clearable(self.get())
+    }
+
+    /// Ordinary clear preparation, discounting only real storage pins on
+    /// indexed Host entries. Recovery requires its separate exact preflight.
+    pub fn can_prepare_storage_clear(&self) -> bool {
+        ffi::can_prepare_storage_clear(self.get())
     }
 
     /// The scheduler's storage observations.

@@ -174,11 +174,13 @@ public:
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
     bool CanClearCache() const;
+    // Ordinary clear may first drain actual storage references on indexed
+    // Host entries. Keep main's indexed-pin checks for all other owners.
+    bool CanPrepareStorageClear() const;
     // Explicit recovery. Old I/O blocks remain unavailable; new namespace
     // operations can use the remaining Host space and global I/O credits.
     bool CanClearCacheRetainingStorage() const;
-    // Storage tickets may remain; every other live owner must permit clear.
-    bool StorageNonStorageClearable() const { return CanClearCacheRetainingStorage(); }
+    bool StorageNonStorageClearable() const { return CanPrepareStorageClear(); }
     bool ClearCacheRetainingStorage();
     bool StorageHasRetainedOperations() const {
         return storage_transfers_ && storage_transfers_->HasRetainedOperations();

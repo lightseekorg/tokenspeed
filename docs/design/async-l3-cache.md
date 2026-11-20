@@ -585,8 +585,30 @@ client shutdown and does not by itself disable a healthy new cache generation.
 Recovery index invalidation counts all removed Host entries in the ordinary
 flush eviction statistic, even when an external I/O reference retains the slot.
 
-Health state/epoch and unproven native retirement are separate gauges. Reading
-health never consumes a recovery probe. Snapshots carry no request IDs or object
+`tokenspeed:l3_io_quarantined=1` is a historical lifetime fact: some local native
+access still lacks retirement proof, so shutdown retains the Store registration
+and Host allocation. It does not report current L3 availability.
+`tokenspeed:l3_io_blocked=1` means the active namespace needs isolation before
+new native work: either current-generation unsafe I/O blocked it, or that
+prefix still has older unproven access after a version change. An accepted
+clear can leave quarantine at one and move blocked to zero by selecting a safe
+generation; a new unsafe result in that generation sets blocked again. This
+gauge excludes backend cooldown, queue pressure and exhausted credits.
+This unsafe-isolation gauge is rank-local: use the maximum across the cache
+owners of a replica when assessing its availability, rather than summing flags.
+
+Alert on current blocking or backend/credit pressure when diagnosing availability.
+Use historical quarantine together with `retained_host_blocks`,
+`retained_operations` and exhausted-capacity warnings to track unreclaimable
+resources and plan a restart if capacity becomes insufficient. A historical
+flag by itself does not require disabling a safely isolated active generation,
+and a zero current-blocking flag does not authorize deregistration of old memory.
+
+Health state/epoch, historical unsafety and active-namespace isolation are
+separate gauges. Reading health never consumes a recovery probe. The I/O
+snapshot captures state and active prefix under the same lock order as clear
+and version changes; observations do not combine flags from different I/O
+generations. Snapshots carry no request IDs or object
 keys. Labels identify model, engine role, DP rank and TP rank: I/O is shard-local,
 while scheduler resource/deadline values are mirrored and must not be summed
 across TP owners. Successful adapter byte counters include idempotent PUT hits

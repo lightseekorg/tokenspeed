@@ -2647,6 +2647,81 @@ protected:
     }
 };
 
+TEST_F(SchedulerTestSuite, OrdinaryClearPreservesUnindexedOwnersWithoutRequiringRecoveryPreflight) {
+    ASSERT_FALSE(scheduler_->StoragePending());
+    auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    auto& device = SchedulerTestAccess::Pool(*scheduler_);
+    auto private_device = device.AcquireBlock(0);
+    auto private_host = coordinator.Host().AcquireHostBlock(0, 0);
+    ASSERT_TRUE(private_device && private_host);
+    const auto private_device_location = private_device->Location();
+    const auto private_host_location = private_host->Location();
+    const CacheKey key{.group_id = 0, .content_hash = ContentHash{"ordinary-clear"}};
+    auto indexed_device = device.AcquireBlock(0);
+    coordinator.GroupPrefixIndex(0).Register(device, indexed_device, key, 1, -1, CacheBoundaryKind::kChunk, nullptr,
+                                             {});
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "ordinary indexed Device pins remain protected";
+    EXPECT_FALSE(scheduler_->CanPrepareStorageClear());
+    indexed_device.reset();
+    auto indexed_host = coordinator.Host().AcquireHostBlock(0, 0);
+    coordinator.Host().CacheHostBlock(indexed_host, key, std::nullopt);
+    indexed_host.reset();
+
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(device), 0);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_TRUE(device.IsOccupied(private_device_location));
+    EXPECT_TRUE(private_host->IsOwnedBy(*coordinator.Store().HostPool()));
+    EXPECT_TRUE(coordinator.Store().HostPool()->IsOccupied(private_host_location));
+}
+
+TEST_F(L3BackupClearSuite, AHealthyPutCanDrainBesideAnUnindexedDeviceOwnerBeforeAnOrdinaryClear) {
+    const auto put = StartBackup();
+    auto& device = SchedulerTestAccess::Pool(*scheduler_);
+    auto private_device = device.AcquireBlock(0);
+    ASSERT_TRUE(private_device);
+    const auto location = private_device->Location();
+    const auto operations = scheduler_->GetStorageStats().operations;
+    const auto held_blocks = scheduler_->StorageHeldBlocks();
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_TRUE(scheduler_->StorageNonStorageClearable());
+    EXPECT_FALSE(scheduler_->CanClearCache());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    EXPECT_EQ(scheduler_->GetStorageStats().operations, operations);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), held_blocks);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+
+    Retire(put.op_id, put.keys.size());
+    EXPECT_FALSE(scheduler_->StoragePending());
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_TRUE(device.IsOccupied(location));
+    EXPECT_EQ(device.NumOccupiedSlots(), 1);
+}
+
+TEST_F(L3BackupClearSuite, UnsafeRecoveryStillRejectsAnUnindexedDeviceOwnerWithoutCancellingThePut) {
+    const auto put = StartBackup();
+    auto& device = SchedulerTestAccess::Pool(*scheduler_);
+    auto private_device = device.AcquireBlock(0);
+    ASSERT_TRUE(private_device);
+    ExecutionEvent unknown;
+    unknown.With(cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 0), false,
+                                    std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(unknown));
+
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+    EXPECT_EQ(scheduler_->StorageBlockingQuarantined(), 1u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    EXPECT_EQ(scheduler_->GetStorageStats().retained_operations, 0u);
+    EXPECT_TRUE(private_device->IsOwnedBy(device));
+}
+
 TEST_F(L3BackupClearSuite, FreezingStorageDoesNotCancelADispatchedPut) {
     const auto put = StartBackup();
     const auto held = scheduler_->StorageHeldBlocks();
@@ -2661,12 +2736,13 @@ TEST_F(L3BackupClearSuite, FreezingStorageDoesNotCancelADispatchedPut) {
     for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
 }
 
-TEST_F(L3BackupClearSuite, RejectedClearWithAPrivateHostOwnerDoesNotCancelADispatchedPut) {
+TEST_F(L3BackupClearSuite, RejectedRecoveryWithAPrivateHostOwnerDoesNotCancelADispatchedPut) {
     const auto put = StartBackup();
     auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
     auto private_host = coordinator.Host().AcquireHostBlock(0, 0);
     ASSERT_TRUE(private_host);
-    EXPECT_FALSE(scheduler_->StorageNonStorageClearable());
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
     EXPECT_FALSE(scheduler_->ClearCache());
     EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
     EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());

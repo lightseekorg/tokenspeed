@@ -523,6 +523,9 @@ std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler)
 bool storage_non_storage_clearable(const tokenspeed::Scheduler& scheduler) {
     return scheduler.StorageNonStorageClearable();
 }
+bool can_prepare_storage_clear(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.CanPrepareStorageClear();
+}
 
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
     const tokenspeed::StorageStats stats = scheduler.GetStorageStats();

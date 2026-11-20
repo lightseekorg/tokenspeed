@@ -225,6 +225,15 @@ bool Scheduler::CanClearCache() const {
     return cacheIsClearable(true);
 }
 
+bool Scheduler::CanPrepareStorageClear() const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    const auto storage_refs =
+        storage_transfers_ ? storage_transfers_->HeldBlockRefs() : std::vector<const CacheBlockRef*>{};
+    return coordinator_.CacheIsClearableAfterStorageDrain(storage_refs);
+}
+
 bool Scheduler::CanClearCacheRetainingStorage() const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });

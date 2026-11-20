@@ -2104,6 +2104,8 @@ struct ScriptedRank {
     forwards: usize,
     /// The device operations the rank ran (weight updates, reloads, ...).
     device_ops: Vec<String>,
+    weight_load_versions: Vec<Option<String>>,
+    weight_commits: Vec<bool>,
 }
 
 /// Run `layout`'s ranks, one script per engine (its first rank's frontend
@@ -2131,10 +2133,23 @@ fn run_scripted(
             let device = fake_device(layout, rank, &setup);
             let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
             let device_ops = device.device_ops.clone();
+            let weight_load_versions = device.weight_load_versions.clone();
+            let weight_commits = device.weight_commits.clone();
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
             let outputs = Arc::new(Mutex::new(Vec::new()));
             let released = device.released.clone();
+            let store = matches!(tiers, Tiers::L3).then(|| ScriptedStore {
+                landed: setup.l3_landed_keys.map(|landed| landed(rank)),
+                gate: Gate::opened(),
+                queries: Arc::default(),
+                gets: Arc::default(),
+                probe: setup
+                    .l3_stores
+                    .get(rank)
+                    .cloned()
+                    .or_else(|| setup.l3_store.clone()),
+            });
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
                 script: scripts.next().unwrap().into(),
                 react,
@@ -2154,7 +2169,7 @@ fn run_scripted(
             };
             let (stop, done) = (stop.clone(), done.clone());
             let thread = thread::spawn(move || {
-                let outcome = run_rank(spec, device, None, || frontend, &stop)
+                let outcome = run_rank(spec, device, store, || frontend, &stop)
                     .map_err(|error| error.to_string());
                 done.send(rank).unwrap();
                 outcome
@@ -2168,6 +2183,8 @@ fn run_scripted(
                 plans,
                 idle_forwards,
                 device_ops,
+                weight_load_versions,
+                weight_commits,
             )
         })
         .collect();
@@ -2180,7 +2197,18 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, outputs, released, plans, idle_forwards, device_ops)| {
+            |(
+                thread,
+                replies,
+                finished,
+                outputs,
+                released,
+                plans,
+                idle_forwards,
+                device_ops,
+                weight_load_versions,
+                weight_commits,
+            )| {
                 let outcome = thread.join().unwrap();
                 let plans = plans.lock().unwrap();
                 ScriptedRank {
@@ -2196,6 +2224,8 @@ fn run_scripted(
                     idle_forwards: *idle_forwards.lock().unwrap(),
                     forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
                     device_ops: device_ops.lock().unwrap().clone(),
+                    weight_load_versions: weight_load_versions.lock().unwrap().clone(),
+                    weight_commits: weight_commits.lock().unwrap().clone(),
                 }
             },
         )
@@ -5650,6 +5680,65 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
     // Serving goes on.
     let chunks = run(&engine.client, request("r", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[test]
+fn different_data_parallel_weight_versions_do_not_change_the_collective_sequence() {
+    // Different versions violate the caller's model-consistency contract.
+    // They must still complete the same added namespace collectives, even
+    // when only one engine reports a local version transition.
+    for versions in [["v1", "v2"], ["v2", "v3"]] {
+        let scripts = versions
+            .iter()
+            .enumerate()
+            .map(|(rank, version)| {
+                let mut script: Script = vec![Vec::new(); 30];
+                script[0].push(EngineRequest::Control(Box::new(
+                    ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        model_path: format!("/checkpoint-{version}"),
+                        load_format: None,
+                        weight_version: Some((*version).to_owned()),
+                        flush_cache: true,
+                    }),
+                )));
+                script[8].push(EngineRequest::Add(Box::new(request(
+                    &format!("after-version-load-{rank}"),
+                    1,
+                    budget(2),
+                ))));
+                script
+            })
+            .collect();
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            1,
+            Tiers::L3,
+            Setup {
+                l3_store: Some(Arc::new(StorageProbe::default())),
+                ..Setup::default()
+            },
+            scripts,
+            no_reaction,
+        );
+        for (rank, result) in ranks.iter().enumerate() {
+            assert_eq!(result.outcome, Ok(()), "{versions:?}, DP {rank}");
+            assert_eq!(
+                outcome(result.replies.clone()),
+                [("UpdateWeightFromDiskReqOutput", true)],
+                "{versions:?}, DP {rank}"
+            );
+            assert_eq!(result.device_ops, ["UpdateWeightFromDiskReqInput"]);
+            assert_eq!(
+                result.weight_load_versions,
+                [Some(versions[rank].to_owned())]
+            );
+            assert_eq!(result.weight_commits, [true]);
+            assert_eq!(result.weight_commits, ranks[0].weight_commits);
+            assert_scripted_tokens(result, &format!("after-version-load-{rank}"), 2);
+        }
+    }
 }
 
 /// Wait until every rank recorded `expected` weight commits. The reply

@@ -107,6 +107,7 @@ bool storage_current_pending(const tokenspeed::Scheduler& scheduler);
 bool storage_progress_pending(const tokenspeed::Scheduler& scheduler);
 std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler);
 bool storage_non_storage_clearable(const tokenspeed::Scheduler& scheduler);
+bool can_prepare_storage_clear(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler);
 bool clear_cache(tokenspeed::Scheduler& scheduler);

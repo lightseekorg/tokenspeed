@@ -118,6 +118,27 @@ bool CacheCoordinator::CacheIsClearable(bool include_host) const {
     return host_.IsClearable();
 }
 
+bool CacheCoordinator::CacheIsClearableAfterStorageDrain(std::span<const CacheBlockRef* const> storage_refs) const {
+    if (!deviceCacheIsClearable()) return false;
+    const BlockPool* pool = store_.HostPool();
+    if (pool == nullptr) return storage_refs.empty();
+    std::unordered_map<const CacheBlock*, std::size_t> storage_counts;
+    for (const CacheBlockRef* ref : storage_refs) {
+        if (ref == nullptr || !*ref || !ref->IsOwnedBy(*pool)) return false;
+        ++storage_counts[ref->operator->()];
+    }
+    for (const auto& group : store_.Groups()) {
+        bool clearable = true;
+        group.Index().ForEachBlockRef(*pool, [&](const CacheBlockRef& ref) {
+            const auto it = storage_counts.find(ref.operator->());
+            const auto storage_count = it == storage_counts.end() ? 0 : it->second;
+            if (ref.use_count() != 1 + storage_count) clearable = false;
+        });
+        if (!clearable) return false;
+    }
+    return true;
+}
+
 bool CacheCoordinator::CacheIsClearableRetainingStorage(std::span<const CacheBlockRef* const> storage_refs) const {
     if (evictor_.HasSegments() || !deviceCacheIsClearable() || store_.ActiveParentGauge().Count() != 0) {
         return false;

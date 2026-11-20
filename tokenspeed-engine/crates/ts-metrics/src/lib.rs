@@ -1295,8 +1295,11 @@ pub struct L3ExecutorSnapshot {
     pub health_state: String,
     /// The backend health epoch.
     pub health_epoch: f64,
-    /// Native retirement unproven: new I/O disabled until restart.
+    /// Historical native retirement is unproven; shutdown must retain registration.
     pub unsafe_io: bool,
+    /// The active namespace needs isolation from unsafe I/O before new native work.
+    /// Backend cooldown and operation/Host credit pressure are separate states.
+    pub io_blocked: bool,
 }
 
 /// The scheduler's storage observations (`StorageStats`), mirrored on every
@@ -1360,6 +1363,7 @@ pub struct L3Metrics {
     health: Metric,
     epoch: Metric,
     unsafe_io: Metric,
+    io_blocked: Metric,
     resources: Metric,
     retained_capacity_warnings: Metric,
     expirations: Metric,
@@ -1437,6 +1441,12 @@ impl L3Metrics {
                 exporter,
                 "tokenspeed:l3_io_quarantined",
                 "Historical local native retirement unproven; shutdown retains registration; new cache generations may run.",
+                &L3_LABELS,
+            ),
+            io_blocked: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_io_blocked",
+                "Active namespace needs unsafe I/O isolation; excludes backend cooldown and capacity pressure.",
                 &L3_LABELS,
             ),
             resources: Metric::gauge(
@@ -1549,6 +1559,8 @@ impl L3Metrics {
         self.epoch.set(&self.label_values(&[]), io.health_epoch);
         self.unsafe_io
             .set(&self.label_values(&[]), f64::from(u8::from(io.unsafe_io)));
+        self.io_blocked
+            .set(&self.label_values(&[]), f64::from(u8::from(io.io_blocked)));
         for (resource, value) in [
             ("operations", scheduler.operations),
             ("held_blocks", scheduler.held_blocks),

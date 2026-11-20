@@ -962,13 +962,18 @@ impl Executor {
                 }
             })
             .collect();
-        drop(state);
+        // Keep the epoch, active prefix and historical lifetime fact in one
+        // snapshot. Clear/version changes use the same state -> prefix order.
+        let prefix = self.key_prefix();
+        let unsafe_io = state.unsafe_io;
+        let io_blocked = state.io_blocked || state.namespace_has_unretired_io(&prefix);
         let (health_state, health_epoch) = self.shared.health.snapshot();
         L3ExecutorSnapshot {
             operations,
             health_state: health_state.to_owned(),
             health_epoch: health_epoch as f64,
-            unsafe_io: self.shared.lock().unsafe_io,
+            unsafe_io,
+            io_blocked,
         }
     }
 
@@ -2074,6 +2079,63 @@ mod tests {
         harness.wait(1);
         let drained = row(&executor.snapshot(), "get");
         assert!(drained.operations.iter().all(|(_, count)| *count == 0.0));
+    }
+
+    #[test]
+    fn snapshots_separate_historical_unsafety_from_current_namespace_blocking() {
+        let store = TestStore {
+            put: Some(Box::new(|keys, _, _| {
+                Ok(IoResult {
+                    success: vec![false; keys.len()],
+                    retired: false,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        let initial = executor.snapshot();
+        assert!(!initial.unsafe_io);
+        assert!(!initial.io_blocked);
+        executor.submit(&[put(1, "old-unknown", 1)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        let failed = executor.snapshot();
+        assert!(failed.unsafe_io);
+        assert!(failed.io_blocked);
+
+        executor
+            .begin_cache_generation("00000000000000000000000000000031")
+            .unwrap();
+        let recovered = executor.snapshot();
+        assert!(recovered.unsafe_io);
+        assert!(!recovered.io_blocked);
+        assert!(!executor.current_namespace_needs_isolation());
+        assert_eq!(recovered.health_state, "healthy");
+
+        // Namespace identity matters independently of the current epoch's
+        // block flag: returning to a historically unsafe prefix is blocked.
+        executor.set_weight_version("v2").unwrap();
+        executor.set_weight_version("v1").unwrap();
+        assert!(executor.snapshot().io_blocked);
+        assert!(executor.current_namespace_needs_isolation());
+        executor
+            .begin_cache_generation("00000000000000000000000000000032")
+            .unwrap();
+        assert!(!executor.snapshot().io_blocked);
+        executor.submit(&[put(2, "current-unknown", 2)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        let failed_again = executor.snapshot();
+        assert!(failed_again.unsafe_io);
+        assert!(failed_again.io_blocked);
+
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        std::mem::forget(std::mem::take(&mut harness.pool));
     }
 
     #[test]

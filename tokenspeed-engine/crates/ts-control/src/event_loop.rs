@@ -2014,18 +2014,22 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     fn advance_cache_clear(&mut self) -> Result<Option<bool>, LoopError> {
-        // Reject unrelated owners before cancelling any best-effort work.
-        let can_clear = self.scheduler.storage_non_storage_clearable();
+        let has_storage_owners = self.scheduler.storage_pending();
+        let storage_path = !self.converge(!has_storage_owners)?;
+        // Ordinary clear keeps the original indexed-pin semantics, including
+        // deployments without L3. Storage draining only discounts its own pins;
+        // the stronger all-owner check belongs to actual retained recovery.
+        let can_clear = if storage_path {
+            self.scheduler.can_prepare_storage_clear()
+        } else {
+            self.scheduler.can_clear_cache()
+        };
         if !self.converge(can_clear)? {
             tracing::warn!(
                 can_clear,
                 "cache flush refused: non-storage resources remain held"
             );
             return Ok(Some(false));
-        }
-        if self.cache_clear_started.is_none() {
-            self.scheduler.cancel_storage_for_clear();
-            self.cache_clear_started = Some(Instant::now());
         }
         let unsafe_current = self.scheduler.storage_blocking_quarantined() > 0
             || self
@@ -2036,6 +2040,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // do not force every later clear into another private namespace.
         if !self.converge(!unsafe_current)? {
             return self.clear_cache_retaining_storage().map(Some);
+        }
+        if self.cache_clear_started.is_none() {
+            if storage_path {
+                self.scheduler.cancel_storage_for_clear();
+            }
+            self.cache_clear_started = Some(Instant::now());
         }
         let pending = self.scheduler.storage_current_pending();
         if !self.converge(!pending)? {
@@ -2050,6 +2060,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // Current-namespace work has drained. Old retained tickets may still
         // occupy slots, but cannot prevent purging this safe active prefix.
+        let retaining = self.scheduler.storage_has_retained_operations();
+        let can_finish = if retaining {
+            self.scheduler.can_clear_cache_retaining_storage()
+        } else {
+            self.scheduler.can_clear_cache()
+        };
+        if !self.converge(can_finish)? {
+            tracing::warn!("cache clear refused after storage drain: references remain held");
+            return Ok(Some(false));
+        }
         if let Some(l3) = &self.l3 {
             let deleted = l3.executor.delete_namespace();
             if !self.converge(deleted)? {
@@ -2057,7 +2077,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 return Ok(Some(false));
             }
         }
-        let cleared = if self.scheduler.storage_has_retained_operations() {
+        let cleared = if retaining {
             self.scheduler.clear_cache_retaining_storage()
         } else {
             self.scheduler.clear_cache()
@@ -2150,46 +2170,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     message
                 };
                 if agreed && control::is_weight_load(&op) {
-                    // New pages publish under the new checkpoint only once
-                    // every rank holds its weights.
-                    match self.controls.commit_shared_weight_version(&op) {
-                        Err(refusal) => (false, refusal),
-                        Ok(Some(version)) => {
-                            if let Some(l3) = &self.l3 {
-                                l3.executor.set_weight_version(&version)?;
-                            }
-                            // A -> B -> A must not re-enter a prefix still
-                            // touched by retained old A I/O. Decide this across
-                            // the same owners before planning new cache work.
-                            let needs_isolation = self
-                                .l3
-                                .as_ref()
-                                .is_some_and(|l3| l3.executor.current_namespace_needs_isolation());
-                            let namespace_ready = if self.converge(!needs_isolation)? {
-                                true
-                            } else if let Some(generation) = self.fresh_cache_generation()? {
-                                if let Some(l3) = &self.l3 {
-                                    l3.executor.begin_cache_generation(&generation)?;
-                                }
-                                true
-                            } else {
-                                false
-                            };
-                            if namespace_ready {
-                                if let Some(peer) = &mut self.peer {
-                                    peer.set_weight_version(&version);
-                                }
-                                (true, message)
-                            } else {
-                                (
-                                    false,
-                                    "could not isolate the weight namespace from old I/O"
-                                        .to_owned(),
-                                )
-                            }
-                        }
-                        Ok(None) => (true, message),
-                    }
+                    self.commit_weight_namespace(&op, message)?
                 } else {
                     (agreed, message)
                 }
@@ -2213,6 +2194,68 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.controls.finish_reload();
         }
         Ok(())
+    }
+
+    /// Every member of the agreed load executes the same collective sequence,
+    /// even if its local version stays unchanged or namespace publication fails.
+    fn commit_weight_namespace(
+        &mut self,
+        op: &ControlRequest,
+        message: String,
+    ) -> Result<(bool, String), LoopError> {
+        let version = self.controls.commit_shared_weight_version(op);
+        let local = match &version {
+            Err(refusal) => Err(refusal.clone()),
+            Ok(Some(version)) => match &self.l3 {
+                Some(l3) => l3
+                    .executor
+                    .set_weight_version(version)
+                    .map_err(|error| error.to_string()),
+                None => Ok(()),
+            },
+            Ok(None) => Ok(()),
+        };
+        if !self.converge(local.is_ok())? {
+            return Ok((
+                false,
+                local.err().unwrap_or_else(|| {
+                    "weight namespace publication failed on another rank".to_owned()
+                }),
+            ));
+        }
+        // A -> B -> A must not re-enter a prefix touched by retained old A I/O.
+        // Unchanged-version ranks participate too; local change is not a gate
+        // for collective membership.
+        let changed = matches!(&version, Ok(Some(_)));
+        let needs_isolation = changed
+            && self
+                .l3
+                .as_ref()
+                .is_some_and(|l3| l3.executor.current_namespace_needs_isolation());
+        if !self.converge(!needs_isolation)? {
+            let Some(generation) = self.fresh_cache_generation()? else {
+                return Ok((
+                    false,
+                    "could not isolate the weight namespace from old I/O".to_owned(),
+                ));
+            };
+            let local = match &self.l3 {
+                Some(l3) => l3.executor.begin_cache_generation(&generation),
+                None => Ok(()),
+            };
+            if !self.converge(local.is_ok())? {
+                return Ok((
+                    false,
+                    "could not isolate the weight namespace from old I/O".to_owned(),
+                ));
+            }
+        }
+        if let Ok(Some(version)) = version {
+            if let Some(peer) = &mut self.peer {
+                peer.set_weight_version(&version);
+            }
+        }
+        Ok((true, message))
     }
 
     /// Run a drained, gate-agreed forward reload; its result is agreed across the ranks.

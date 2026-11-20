@@ -200,8 +200,10 @@ Attach the following to the release record before any rollout:
   a `source.dirty` that is not `false`, or an `unavailable` source commit.
 - A byte mismatch, an unretired or unexpected object failure in G2, or a
   skipped native case counted as a pass.
-- A quarantine or an unproven native retirement observed in any
-  environment.
+- Unexpected quarantine or unproven native retirement in a validation gate.
+  Intentional fault-injection coverage must separately prove that old buffers
+  stay protected and new-generation work uses only remaining capacity; it does
+  not waive a clean native-byte gate or prove transport retirement.
 
 **Go** requires: merge — G1 green on the candidate (the PR's tested merge
 commit, clean tree); enabling L3 on any shared environment — additionally G2
@@ -244,18 +246,43 @@ one recovery probe. Serving continues on L1/L2 throughout. Operator
 action: investigate provider/master health and queue sizing; there is no
 data-safety concern and nothing to restart.
 
-**Unsafe-I/O quarantine (restart required).** A native result that cannot
-prove it stopped accessing its Host buffers quarantines every reference of
-that job: the executor rejects all further L3 submissions and `close()`
-reports that a process restart is required. Ordinary computation and valid
-L2 hits continue within the remaining capacity. Operator action: schedule
-a restart of the affected processes using the drain procedure below.
+**Unsafe current namespace.** A result without native retirement proof retains
+every reference of that job and blocks new I/O in that namespace. Explicit
+full-clear first checks non-storage owners. Healthy current work can drain for
+`async.clear_cache_drain_timeout_ms` (default 500 ms, `0` skips that wait); an
+unsafe current scope goes directly to retaining recovery. All ranks agree the
+decision. Recovery invalidates local indexes and starts a fresh generation
+without remote purge, while keeping old native source/destination addresses
+and registration alive. L2, L3 and recomputation may continue with remaining
+Host/operation capacity. A healthy operation that merely exceeds the budget
+also selects this conservative private generation; the timeout is not evidence
+of a broken transport.
 
-Never do any of the following: treat an empty queue or a soft-deadline
-timeout as proof that native I/O retired; use `/flush_cache` or a cache
-clear to free quarantined references (a full cache clear is refused while
-storage operations, Ready holds or quarantine are outstanding); or
-deregister storage while retirement is unknown.
+**Historical unsafe memory.** `tokenspeed:l3_io_quarantined=1` remains set after
+such recovery because a clear supplies no missing retirement proof. It guards
+shutdown: `close()` still refuses deregistration of that old allocation and
+registration. `tokenspeed:l3_io_blocked` instead reports whether the active
+namespace currently needs unsafe-I/O isolation. A safe new generation can have
+quarantined=1 and blocked=0. The latter is separate from backend cooldown and
+Host/operation credit pressure, either of which can independently prevent new
+work. Track retained blocks/operations and exhausted-capacity warnings to plan
+a restart if unreclaimable history consumes the available budget; do not treat
+the historical flag alone as a current L3 outage.
+Both I/O flags are rank-local; aggregate active blocking with MAX across the
+replica's cache owners when alerting on that replica's availability.
+
+**Healthy strict clear.** Once the safe active prefix drains, ordinary clear
+still requires all-rank remote purge success before clearing local indexes.
+Historical references in other prefixes do not prevent that path. Its
+synchronous administrative RPC is outside both preparation and healthy-drain
+timeouts. Recovery generations are agreed only within the engine's
+replica/attention-DP group; independent Prefill services may temporarily stop
+sharing until a new immutable weight version selects their common prefix.
+
+Never treat an empty queue, a soft timeout, successful clear or a zero
+current-blocking gauge as proof that old native I/O retired. A retaining clear
+may succeed while old tickets remain, but never frees them. Do not deregister
+the Host pool, its MR or Store registration while native access is unknown.
 
 ## Drain and deregistration
 

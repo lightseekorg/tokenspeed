@@ -314,6 +314,7 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         health_state: "open".to_owned(),
         health_epoch: 3.0,
         unsafe_io: true,
+        io_blocked: true,
     };
     let scheduler = L3SchedulerStats {
         operations: 1.0,
@@ -372,6 +373,7 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         ("tokenspeed:l3_backend_state", &[], 1.0),
         ("tokenspeed:l3_backend_epoch", &[], 3.0),
         ("tokenspeed:l3_io_quarantined", &[], 1.0),
+        ("tokenspeed:l3_io_blocked", &[], 1.0),
         ("tokenspeed:l3_retained_capacity_warnings_total", &[], 2.0),
         ("tokenspeed:l3_pressure_bypasses_total", &[], 3.0),
         ("tokenspeed:l3_pressure_dropped_backup_keys_total", &[], 7.0),
@@ -439,6 +441,63 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
             .collect();
         let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
         assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn l3_current_namespace_blocking_changes_without_erasing_historical_quarantine() {
+    let directory = scratch_dir("l3-current-namespace");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut metrics = L3Metrics::new(
+        &exporter,
+        &L3Labels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+            tp_rank: 0,
+            engine_role: "null".to_owned(),
+        },
+    );
+    let mut io = L3ExecutorSnapshot {
+        health_state: "healthy".to_owned(),
+        unsafe_io: true,
+        io_blocked: true,
+        ..L3ExecutorSnapshot::default()
+    };
+    let value = |text: &str, name: &str| -> Option<f64> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(|number| number.parse().unwrap())
+    };
+    for (round, blocked) in [true, false, true].into_iter().enumerate() {
+        io.io_blocked = blocked;
+        metrics.record(&io, &L3SchedulerStats::default());
+        let Some(rendered) = render(&directory) else {
+            std::fs::remove_dir_all(&directory).unwrap();
+            return;
+        };
+        assert_eq!(
+            value(&rendered, "tokenspeed:l3_io_quarantined"),
+            Some(1.0),
+            "{round}"
+        );
+        assert_eq!(
+            value(&rendered, "tokenspeed:l3_io_blocked"),
+            Some(f64::from(u8::from(blocked))),
+            "{round}"
+        );
+        // Backend cooldown is independent of unsafe-prefix isolation.
+        assert_eq!(
+            value(&rendered, "tokenspeed:l3_backend_state"),
+            Some(0.0),
+            "{round}"
+        );
     }
     std::fs::remove_dir_all(&directory).unwrap();
 }

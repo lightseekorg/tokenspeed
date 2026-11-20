@@ -400,6 +400,10 @@ public:
     // Same pin checks as ClearDeviceCache / ClearCache, with no mutation.
     // include_host selects both tiers (Host is a no-op without a host pool).
     bool CacheIsClearable(bool include_host) const;
+    // Ordinary clear preparation: indexed pins must be clearable after the
+    // supplied storage references retire. Unindexed owners keep their blocks
+    // and do not participate in an index-only clear, as in CacheIsClearable.
+    bool CacheIsClearableAfterStorageDrain(std::span<const CacheBlockRef* const> storage_refs) const;
     // Recovery preflight: all remaining Host owners must be exactly these
     // borrowed storage refs. No inspection may acquire an extra owning ref.
     bool CacheIsClearableRetainingStorage(std::span<const CacheBlockRef* const> storage_refs) const;
