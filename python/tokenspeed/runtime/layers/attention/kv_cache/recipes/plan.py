@@ -40,7 +40,14 @@ _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
 
 # Atom-addressed history uses a distinct plane id from native byte-page layouts.
+# Pipeline stages append their index to give each stage its own plane.
 FLAT_KV_PLANE = "flatkv_atoms"
+
+
+def is_flat_kv_plane(plane_id: str) -> bool:
+    """Whether the plane's full-history fields use atom page IDs."""
+    return plane_id == FLAT_KV_PLANE or plane_id.startswith(f"{FLAT_KV_PLANE}.")
+
 
 # Byte width per cache dtype name. This module stays torch-free (pure integer
 # geometry, and the plan travels the PD wire as JSON), so dtypes are named by

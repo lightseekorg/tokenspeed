@@ -157,6 +157,7 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             iris_state=None,
             layers=[layer],
             config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
         ),
     )
     assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)

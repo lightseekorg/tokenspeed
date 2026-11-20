@@ -251,6 +251,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         device.build_device_side(
             server_args=args,
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 context_len=4096,
                 is_multimodal_active=False,
                 dsa_padded_prefill_replay=declares_padded_replay,
@@ -897,8 +898,8 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
             submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
                 trace.append(("store", [op.request_pool_index for op in ops]))
             ),
-            submit_load_backs=lambda ops, *, prerequisite_stream: (
-                trace.append("load_backs")
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
             ),
         ),
     )

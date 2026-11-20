@@ -37,9 +37,9 @@ from typing_extensions import override
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    FLAT_KV_PLANE,
     MXFP8_KV_SCALE_TILE_TOKENS,
     MXFP8_SCALE_BLOCK_SIZE,
+    is_flat_kv_plane,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -116,7 +116,7 @@ class MHATokenToKVPool(CachePool):
             field = self.arena.plan.field(field_id)
             if field.group_id != group_id:
                 continue
-            if field.plane_id != FLAT_KV_PLANE:
+            if not is_flat_kv_plane(field.plane_id):
                 continue
             if self._layer_kv_head_counts is not None:
                 raise NotImplementedError(

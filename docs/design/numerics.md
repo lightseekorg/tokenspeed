@@ -457,6 +457,11 @@ which backend disabled which graph.
 
 ### Absorbed MLA
 
+A model backend that supplies both attention kernels can use
+`MLAMetadataBackend` for paged request lengths, page tables and graph buffers.
+It follows the launch's numerical policy when preparing these inputs.
+The backend that executes attention selects the numerical kernels.
+
 Under a bitwise envelope, `MLAAttnBackend` plans the standard
 `mla_extend_with_kvcache` and `mla_decode_with_kvcache` operators with the
 `batch_invariant` requirement. Initial prefill and cached extend both prepare
@@ -476,6 +481,9 @@ A model may bind an existing unquantized Linear or LM-head method to a dense
 GEMM plan without changing its weight owner or storage. The logits processor
 uses that method for a registered bitwise envelope, preserving its normal
 input dtype cast and vocabulary communication.
+
+NPU RL alignment compares model logits for a fixed input history. The worker
+keeps the configured sampler and random stream.
 
 Plugins may call `register_numerics_envelope` from the runtime registration
 surface. A policy supplies its name, bitwise classification, launch resolver

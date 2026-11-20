@@ -198,6 +198,15 @@ ranks have completed admission.
 it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off it once, at construction.
 
+Ordinary communication buffers are prepared for the model's execution groups
+after model-specific communication preparation and before cache memory
+profiling. Large warmup batches can select RCCL while a later small prefix hit
+selects Iris, so warmup traversal alone cannot initialize every serving route.
+Preparation reuses model-owned capacities and follows the mapping's group-role
+order on every rank, so overlapping groups retain symmetric heap offsets.
+Pipeline, weight-sharing and named groups keep their separate communication
+lifecycles.
+
 The transfer itself is the host's (`ts-pd`): the routes between unequal rank
 sets, the block manifests read off each plan's block tables, the layerwise
 chunks and the copies are planned there, over the cache transfer contract the
@@ -687,6 +696,13 @@ Generation throughput counts tokens committed by decode forwards; on a plain
 worker the first token normally comes from prefill. Completion counts are
 role-local: the bootstrap token appears in both P and D totals. Use decode
 completion totals for a disaggregated service's output-token count.
+Speculative acceptance has separate verify-slot and request-level views.
+`tokenspeed:spec_decode_accept_length` remains weighted by the decode slots in
+each verify round. `tokenspeed:request_spec_decode_accept_length` observes one
+unweighted sample per ended request with at least one verify round, using
+`(output_tokens - 1) / verify_rounds`: the bootstrap token is excluded and each
+round's bonus token is included. Requests without a verify round emit no
+sample, and draining the output processor cannot duplicate a request's sample.
 L3 query hits count the token span of each successful storage key. Cache
 groups can cover the same prompt positions, so this measures storage hits
 per group rather than unique prompt tokens.
@@ -737,7 +753,14 @@ the pause), as a pause is under a release. A drain (`abort`, `wait`, a
 release) cancels the admitted requests the scheduler does not hold yet, which
 end toward their clients: those compiling their grammars, and those waiting
 for their images' embeddings, which end once their receives settle — the
-drain waits for those.
+drain waits for those. On a prefill engine under `deferred` decode
+allocation (`scheduler.md` §3.1) the scheduler holds a request the transfer
+peer admitted before its decode destination is allocated, so a `wait` drain
+also waits for those destinations: a computed prompt is still prefilling
+until its transfer starts. A request the peer has not admitted is
+bootstrapping, as under `early`, which a `wait` drain does not wait for.
+The bootstrap timeout bounds the wait, from the moment the prompt held its
+pages.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
 release unmaps. On release the prefill peer deregisters its cache regions
@@ -1034,7 +1057,38 @@ obtain the normal retirement acknowledgments.
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
 to the scheduler, before cache admission. Every round the replica agrees on
 which transfers changed state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together. A peer keeps state only
+transfer aborts its request on every rank together.
+Under `deferred` decode allocation (`scheduler.md` §3.1) the peers keep the
+order "prefill pages first": the prefill node states the policy in its route,
+and a decode rank that reads it sends `["Announce", room, cache]` to the
+room's prefill ranks once connected, again with every heartbeat until each
+answered (at most 256 per endpoint and beat; a beat resumes in room order at
+the first room the previous one left out, whichever endpoint's). The prefill
+peer admits a registered request (`Bootstrapped`) once its decode ranks
+announced it: every attention-TP rank of the decode replica that holds it. The
+pages-held marks and the clocks that start at them are local to a rank and
+time-based; the members of a replica would have to agree on them, and
+`deferred` requires single-member replicas. When the plan carrying a
+request's last chunk goes to the device (`ExecutionPlan::completed_prompts`,
+the scheduler's `ForwardBatch::CompletesPrompt`) the host marks it
+(`PrefillOutbox::mark_pages_held`) and the announcing ranks get the room's
+`Bootstrapped` status, as every later announcement does; a room that failed
+answers `Failed`. Only then does the decode peer report `Bootstrapped` to its
+scheduler: until every expected prefill rank's notice arrived the room is
+reported connecting, and the notice is kept beside the room's state, not in
+it. The manifests then reach the prefill peer, which reports
+`DestinationReady`; a manifest for a room that was not announced, or whose
+request does not hold its pages yet, fails the room, so a decode rank that
+does not follow the order fails at once. The decode scheduler sees every
+noticed request and may allocate them in any order. Timeouts: on the prefill
+side the bootstrap timeout bounds what a request waits for from its decode
+node. Not announced, it runs from registration. Admitted, it runs from the
+pages-held mark to the manifests, with none while the prompt is queued or
+computes: the decode node's waiting timeout bounds that wait. On the decode
+side the waiting timeout runs from registration to the notice, restarted at
+the notice. A request that fails on the prefill side tells its announcing
+ranks as well as those that pre-allocated.
+A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
 for before its request registered here, or one this rank failed first (an

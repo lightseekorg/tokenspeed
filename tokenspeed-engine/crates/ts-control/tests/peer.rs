@@ -138,6 +138,8 @@ struct Replica {
     name: String,
     scheduler: Arc<Mutex<Scheduler>>,
     peer: Peer,
+    decisions: Vec<(String, &'static str)>,
+    landed: Vec<(String, i32, i32)>,
 }
 
 impl Replica {
@@ -173,7 +175,22 @@ impl Replica {
             name,
             scheduler,
             peer,
+            decisions: Vec::new(),
+            landed: Vec::new(),
         }
+    }
+
+    fn enable_logical_metrics(&mut self) {
+        let exporter = ts_metrics::Exporter::new(&Default::default()).unwrap();
+        let metrics = ts_metrics::PeerMetrics::new(
+            &exporter,
+            &ts_metrics::EngineLabels {
+                model_name: "test".into(),
+                app_key: String::new(),
+                dp_rank: 0,
+            },
+        );
+        self.peer.set_metrics(Some(Arc::new(metrics)), None);
     }
 
     /// One round as the control loop runs it: the agreement at the head,
@@ -190,6 +207,8 @@ impl Replica {
     fn round_with_device(&mut self) -> (Vec<(String, i32)>, Vec<PeerFetchView>, bool) {
         let report = self.peer.report();
         let round = self.peer.agree(&[report]).unwrap();
+        self.decisions.extend(round.decisions);
+        self.landed.extend(round.landed);
         let mut scheduler = self.scheduler.lock();
         scheduler.advance_peer(round.now_us, &round.events).unwrap();
         let plan = scheduler.next_execution_plan(true, false);
@@ -324,6 +343,7 @@ fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
     let arena = Arena::new(200_000);
     let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
     let mut reader = Replica::start("v1", READER_BASE, &arena);
+    reader.enable_logical_metrics();
     let tokens: Vec<i32> = (1..=6 * PAGE).collect();
     holder_computes(&mut holder, &tokens, &arena);
 
@@ -364,6 +384,8 @@ fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
         reader.scheduler.lock().peer_stats().landed_tokens,
         landing.end_tokens as u64
     );
+    assert_eq!(reader.landed, vec![("r".into(), 0, prefix)]);
+    assert!(reader.decisions.contains(&("r".into(), "admission")));
 }
 
 /// A prefill replica reads a prefix too, and its landing's plan goes to the
@@ -418,6 +440,7 @@ fn a_holder_that_never_answers_leaves_the_reader_to_compute() {
     let silent = PeerListener::bind("127.0.0.1", 0).unwrap();
     let silent_name = format!("127.0.0.1:{}", silent.port());
     let mut reader = Replica::start("v1", READER_BASE, &arena);
+    reader.enable_logical_metrics();
     let tokens: Vec<i32> = (1..=4 * PAGE).collect();
     reader
         .scheduler
@@ -426,6 +449,7 @@ fn a_holder_that_never_answers_leaves_the_reader_to_compute() {
         .unwrap();
     let (prefix, landings) = rounds_until_prefill(&mut reader, None, "r");
     assert_eq!((prefix, landings.len()), (0, 0));
+    assert!(reader.decisions.contains(&("r".into(), "lookup_timeout")));
 }
 
 #[test]
@@ -498,10 +522,28 @@ fn a_lost_layout_query_does_not_disable_later_landings() {
 }
 
 #[test]
+fn an_empty_holder_returns_a_lookup_miss() {
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start("v1", READER_BASE, &arena);
+    reader.enable_logical_metrics();
+    let tokens = (1..=4 * PAGE).collect();
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", tokens, &holder.name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert_eq!((prefix, landings.len()), (0, 0));
+    assert_eq!(reader.decisions, vec![("r".into(), "lookup_miss")]);
+}
+
+#[test]
 fn a_holder_of_another_namespace_is_never_read() {
     let arena = Arena::new(200_000);
     let mut holder = Replica::start("v2", HOLDER_BASE, &arena);
     let mut reader = Replica::start("v1", READER_BASE, &arena);
+    reader.enable_logical_metrics();
     let tokens: Vec<i32> = (1..=6 * PAGE).collect();
     holder_computes(&mut holder, &tokens, &arena);
     let mut longer = tokens.clone();
@@ -513,6 +555,7 @@ fn a_holder_of_another_namespace_is_never_read() {
         .unwrap();
     let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
     assert_eq!((prefix, landings.len()), (0, 0));
+    assert!(reader.decisions.contains(&("r".into(), "incompatible")));
 }
 
 #[test]

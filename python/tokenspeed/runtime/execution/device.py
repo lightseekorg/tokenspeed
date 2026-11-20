@@ -1583,6 +1583,7 @@ def build_device_side(
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
+    from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_runtime
     from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
@@ -1608,6 +1609,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
+    from tokenspeed.runtime.models.glm5 import GlmDsaSparseAttentionMixin
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
@@ -1642,6 +1644,17 @@ def build_device_side(
             torch.device(server_args.device, gpu_id),
         )
         if server_args.mapping.attn.has_kvp:
+            # A fused decode value tail for the attentions that project as they merge.
+            value_heads = set()
+            for runner in (target, draft):
+                if runner is None:
+                    continue
+                for module in runner.model.modules():
+                    if (
+                        isinstance(module, GlmDsaSparseAttentionMixin)
+                        and module.owned_decode_value_weight() is not None
+                    ):
+                        value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
                 (
@@ -1649,7 +1662,15 @@ def build_device_side(
                     if server_args.distributed_timeout_seconds is not None
                     else DistributedConfig.distributed_timeout_seconds
                 ),
+                value_heads=value_heads.pop() if len(value_heads) == 1 else None,
+                decode_rows=max_batch_size * decode_input_tokens,
             )
+        # Large startup batches can select RCCL while a later prefix hit selects
+        # Iris. Prepare that small-batch route before the serving sync guard.
+        groups = server_args.mapping.all_reduce_groups
+        prepare_all_reduce_runtime(groups, model_config.dtype, backend=None)
+        if draft_model_config is not None:
+            prepare_all_reduce_runtime(groups, draft_model_config.dtype, backend=None)
     if communication_first:
         prepare_multimodal()
 

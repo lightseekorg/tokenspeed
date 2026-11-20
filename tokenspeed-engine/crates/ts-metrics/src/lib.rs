@@ -33,6 +33,8 @@
 //!
 //! Metrics never fail serving: an output that errors is logged and skipped.
 
+mod peer;
+pub use peer::{PeerMetrics, QueuedPeerRead};
 mod prom;
 mod relay;
 
@@ -394,8 +396,11 @@ const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 /// group's first rank.
 #[derive(Debug)]
 pub struct EngineMetrics {
+    /// Logical peer metrics for this DP owner.
+    pub peer: Arc<PeerMetrics>,
     labels: [String; 3],
     spec_decode_accept_length: Metric,
+    request_spec_decode_accept_length: Metric,
     prefix_cache_hit_ratio: Metric,
     prefix_device_hit_ratio: Metric,
     prefix_host_hit_ratio: Metric,
@@ -464,10 +469,18 @@ impl EngineMetrics {
     pub fn new(exporter: &Arc<Exporter>, labels: &EngineLabels) -> Self {
         let names = &ENGINE_LABELS;
         Self {
+            peer: Arc::new(PeerMetrics::new(exporter, labels)),
             spec_decode_accept_length: Metric::histogram(
                 exporter,
                 "tokenspeed:spec_decode_accept_length",
                 "Accepted tokens including bonus per verify request-slot.",
+                names,
+                &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+            ),
+            request_spec_decode_accept_length: Metric::histogram(
+                exporter,
+                "tokenspeed:request_spec_decode_accept_length",
+                "Mean output tokens per verify round, including bonus, per ended speculative request.",
                 names,
                 &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
             ),
@@ -1072,6 +1085,12 @@ impl EngineMetrics {
             .observe(&self.labels(), count as f64);
     }
 
+    /// One speculative request's mean output tokens per verify round, including bonus.
+    pub fn observe_request_spec_decode_accept_length(&self, accept_length: f64) {
+        self.request_spec_decode_accept_length
+            .observe(&self.labels(), accept_length);
+    }
+
     /// Local decode admission hits; never the remote prefill response's usage.
     pub fn record_decode_prefix_hits(&self, prompt: u64, hit: u64) {
         if prompt == 0 {
@@ -1199,8 +1218,11 @@ impl KvTransferMetrics {
             .observe(&[&self.labels[0], &self.labels[1]], seconds);
     }
 
-    /// A transfer that timed out in `stage` (`bootstrapping` on the prefill
-    /// node, `waiting_for_input` on the decode node).
+    /// A transfer that timed out in `stage`: on the prefill node
+    /// `bootstrapping`, or before a node under deferred allocation admitted
+    /// the request `waiting_for_announcement` (of its decode node); on the
+    /// decode node `waiting_for_admission` before its manifest went out, then
+    /// `waiting_for_input`.
     pub fn record_timeout(&self, stage: &str) {
         self.timeouts
             .inc(&[&self.labels[0], &self.labels[1], stage], 1.0);

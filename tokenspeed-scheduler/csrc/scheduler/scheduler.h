@@ -206,6 +206,9 @@ public:
         std::uint64_t failed_landings{0};
     };
     PeerStats GetPeerStats() const;
+    std::vector<PeerExports::PinSample> TakePeerPinSamples() {
+        return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
+    }
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
@@ -219,9 +222,9 @@ public:
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
     // Requests in the running batch: local prefill forwards, prompts whose
-    // prefill is done (about to decode or to transfer), and decodes.
-    // RemotePrefilling (waiting for the peer's KV), waiting and retracted
-    // requests are not running.
+    // prefill is done (about to decode or to transfer, or waiting for their
+    // Decode destination), and decodes. RemotePrefilling (waiting for the
+    // peer's KV), waiting and retracted requests are not running.
     std::size_t RunningSize() const;
     // Physical resources include in-flight cleanup, even after its request
     // leaves the runnable FSM states. D-role decode permits include restore tickets.
@@ -229,6 +232,13 @@ public:
     std::int32_t ActiveDecodeSlots() const { return decode_slots_.Size() - decode_slots_.AvailableSlots(); }
     // D-role prefill is complete but the first local decode has not acquired a permit.
     std::size_t ReadyWaitingSize() const;
+    // P role, deferred decode allocation: computed prompts waiting for their
+    // Decode destination (PrefillAwaitingDestination, a subset of
+    // PrefillSize() and RunningSize()), and the Device parents in their block
+    // tables, counted as ActiveLcmBlocks() counts them; blocks held outside the
+    // tables (e.g. a pending in-forward State checkpoint) are not included.
+    std::size_t AwaitingDestinationSize() const;
+    std::int32_t AwaitingDestinationLcmBlocks() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
@@ -544,6 +554,7 @@ private:
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
+    void handleEvent(const pd::DestinationReadyEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::TransferStoppedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);

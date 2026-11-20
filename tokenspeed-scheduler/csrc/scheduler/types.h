@@ -135,6 +135,18 @@ struct SchedulerConfig {
     // (transfer pins, destination layouts, transfer_policy validation) keys
     // on the role directly.
     Role role{Role::kFused};
+    // What the Decode destination gates on the P role; refused elsewhere
+    // (Validate), and absent there it is kEarly. Under either policy a prompt
+    // is admitted once pd::BootstrappedEvent arrived.
+    //   kEarly     that event also says every Decode rank allocated the
+    //              destination, so a prompt computes with its destination
+    //              allocated.
+    //   kDeferred  the destination has its own event,
+    //              pd::DestinationReadyEvent. A prompt computed before it
+    //              waits in PrefillAwaitingDestination, and its KV is sent
+    //              once it arrived.
+    enum class DecodeAllocationPolicy : std::uint8_t { kEarly, kDeferred };
+    std::optional<DecodeAllocationPolicy> decode_allocation_policy;
 
     bool disable_prefix_cache{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.
