@@ -77,7 +77,7 @@ def _prefer_local_numa(address: int, length: int, nodes: tuple[int, ...]) -> Non
 class PLESharedTable:
     """GPU-mapped host PLE rows shared by workers on one host."""
 
-    def __init__(self, mapping, source: torch.Tensor, layout: str, alloc: str):
+    def __init__(self, mapping, source: torch.Tensor, layout: str):
         ranks = mapping.attn.world_group
         local = [r for r in ranks if r // mapping.nprocs_per_node == mapping.node_rank]
         peer = layout == "peer_sharded"
@@ -101,25 +101,7 @@ class PLESharedTable:
         readers = [mapping.rank] if peer else local
         nodes = [topology[ranks.index(r)] for r in readers]
         nodes = tuple(sorted(set(nodes))) if None not in nodes else ()
-        tables = None
-        if alloc in ("auto", "cumem"):
-            tables, reason = self._cumem_tables(
-                mapping.rank, ranks, owners, len(local) > 1, nbytes, nodes, device
-            )
-            if reason:
-                if alloc == "cumem":
-                    raise RuntimeError(
-                        f"PLE host-NUMA cuMem allocation failed: {reason}"
-                    )
-                if mapping.rank == ranks[0]:
-                    logger.warning(
-                        f"PLE cuMem unavailable, falling back to mmap: {reason}"
-                    )
-        elif alloc != "mmap":
-            raise ValueError(f"Unsupported PLE host table allocator: {alloc}")
-        self.backend = "cumem" if tables is not None else "mmap"
-        if tables is None:
-            tables = self._mmap_tables(ranks, owners, nbytes, nodes)
+        tables = self._mmap_tables(ranks, owners, nbytes, nodes)
         self.tables = [t.view(source.dtype).view(source.shape) for t in tables]
         self.weight = self.tables[owners.index(mapping.rank) if peer else 0]
         self.peer_ptrs = (
@@ -132,59 +114,7 @@ class PLESharedTable:
             else None
         )
         if self.is_writer:
-            logger.info(
-                f"PLE {layout} host table: backend={self.backend}, NUMA nodes={nodes}"
-            )
-
-    def _cumem_tables(self, rank, ranks, owners, exportable, nbytes, nodes, device):
-        owned = exported = error = None
-        mapped = []
-        probe = host_memory.probe_host_memory(device, exportable)
-        errors = [
-            f"rank {r}: {err}"
-            for r, err in zip(ranks, self._exchange(probe, len(ranks)))
-            if err
-        ]
-        if errors:
-            return None, "; ".join(errors)
-        try:
-            if self.is_writer:
-                owned = host_memory.create_host_memory(
-                    nbytes, nodes, device, exportable, 2 << 30, 0.05
-                )
-                if exportable:
-                    exported = owned.export()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        metadata = self._exchange((exported, error), len(ranks))
-        errors = [f"rank {r}: {err}" for r, (_, err) in zip(ranks, metadata) if err]
-        if not errors:
-            try:
-                for owner in owners:
-                    memory = (
-                        owned
-                        if owner == rank
-                        else host_memory.import_host_memory(
-                            metadata[ranks.index(owner)][0], device
-                        )
-                    )
-                    mapped.append(memory)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            errors = [
-                f"rank {r}: {err}"
-                for r, err in zip(ranks, self._exchange(error, len(ranks)))
-                if err
-            ]
-        if errors:
-            for memory in mapped:
-                if memory is not owned:
-                    memory.close()
-            if owned is not None:
-                owned.close()
-            self.publish()
-            return None, "; ".join(errors)
-        return [memory.tensor for memory in mapped], None
+            logger.info(f"PLE {layout} host table: backend=mmap, NUMA nodes={nodes}")
 
     def _mmap_tables(self, ranks, owners, nbytes, nodes):
         path = None

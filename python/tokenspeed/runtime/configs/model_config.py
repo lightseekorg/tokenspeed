@@ -954,11 +954,6 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
-        if not is_draft_worker and server_args.ple_host_table_alloc is not None:
-            if server_args.ple_table_layout not in ("shared", "peer_sharded"):
-                raise ValueError(
-                    "--ple-host-table-alloc requires --ple-table-layout shared or peer_sharded"
-                )
         if not is_draft_worker and server_args.ple_table_layout != "global_sharded":
             if (
                 not is_qwen4_exp(self.hf_config)
@@ -968,9 +963,6 @@ class ModelConfig:
                     "--ple-table-layout requires a Qwen4-Exp target with PLE layers"
                 )
             self.hf_text_config.ple_table_layout = server_args.ple_table_layout
-            self.hf_text_config.ple_host_table_alloc = (
-                server_args.ple_host_table_alloc or "mmap"
-            )
         if server_args.decode_monokernel and not is_draft_worker:
             # The model reads the switch from its text config. ServerArgs
             # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
