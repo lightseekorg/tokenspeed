@@ -3493,16 +3493,19 @@ def invoke_gluon_mxfp4_moe_stage1(
             f"sorted stage1 input has {M_padded} rows but routing requires {EM}"
         )
     del M_padded
-    # Token-order rows are gathered with 32-bit offsets from the activation
-    # base (AMD buffer loads), so their span must fit; sorted rows are
-    # addressed from a per-tile 64-bit base instead. The general kernel reads
-    # scale panels with 32-bit offsets from the scale base.
+    # Activation rows are read with 32-bit offsets from the activation base
+    # (AMD buffer loads), so the span the kernel indexes must fit: the token
+    # rows of a token-order input, the EM sorted rows of a sorted one (sorted
+    # input always takes the general kernel here). The general kernel reads
+    # scale panels with 32-bit offsets from the scale base too.
+    activation_rows = EM if input_sorted else num_tokens
     if (
-        not input_sorted and num_tokens * hidden_states.stride(0) >= 2**31
-    ) or a1_scale.shape[0] * a1_scale.shape[1] >= 2**31:
+        activation_rows * hidden_states.stride(0) >= 2**31
+        or a1_scale.shape[0] * a1_scale.shape[1] >= 2**31
+    ):
         raise ValueError(
             "stage1 activation rows and scales must span less than 2^31 bytes, "
-            f"got {num_tokens} rows of stride {hidden_states.stride(0)} and "
+            f"got {activation_rows} rows of stride {hidden_states.stride(0)} and "
             f"scales {tuple(a1_scale.shape)}"
         )
 
