@@ -344,6 +344,11 @@ def validate_context_parallel_roles(
         )
 
 
+# Muse Spark's --prefill-collective-payload choices (the Iris state's
+# MUSE_PAYLOADS; a test checks they match).
+PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
+
+
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
     """Refuse a launch value outside ``flag``'s closed set of ``choices``.
 
@@ -1140,6 +1145,15 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if (
+            self.prefill_collective_payload != "bf16"
+            and architectures is not None
+            and "MuseSparkForConditionalGeneration" not in architectures
+        ):
+            raise ValueError(
+                "--prefill-collective-payload applies to Muse Spark's owned-row "
+                f"prefill only; this checkpoint is {architectures}"
+            )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
@@ -2338,6 +2352,18 @@ class ServerArgs:
 
         ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice(
+            "--prefill-collective-payload",
+            self.prefill_collective_payload,
+            PREFILL_COLLECTIVE_PAYLOADS,
+        )
+        if self.numerics == "rl-bitwise" and self.prefill_collective_payload != "bf16":
+            # The envelope promises the trainer's bits; the INT8 payload rounds
+            # every prefill collective's inputs.
+            raise ValueError(
+                "--prefill-collective-payload int8-block16 changes prefill "
+                "numerics; --numerics rl-bitwise needs bf16"
+            )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
@@ -5210,7 +5236,7 @@ class ServerArgs:
             "--prefill-collective-payload",
             type=str,
             default=ServerArgs.prefill_collective_payload,
-            choices=["bf16", "int8-block16"],
+            choices=list(PREFILL_COLLECTIVE_PAYLOADS),
             help="Muse Spark: the payload encoding of the owned-row prefill "
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "

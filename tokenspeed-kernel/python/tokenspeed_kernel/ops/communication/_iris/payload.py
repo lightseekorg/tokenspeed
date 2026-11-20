@@ -31,8 +31,12 @@ element reaches the collective's arithmetic as decode(encode(x)):
   decode: code * scale in FP32, rounded once to BF16.
 
 Every step is one correctly rounded FP32 operation, so the bits match the
-reference encoder / decoder exactly. The pulls take 1.25 bytes an element
-instead of 2.
+reference encoder / decoder exactly. The payload is 1.25 bytes an element
+(one code, plus one FP32 scale per 16) instead of 2.
+
+Inputs must be finite: a block holding Inf or NaN has an Inf / NaN scale,
+which the codes and the decoded block do not carry meaningfully. The owned-row
+producers this serves (projections, routed sums) are finite.
 """
 
 from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
@@ -41,7 +45,9 @@ from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
 PAYLOAD_BLOCK = 16
 
 
-@triton.jit
+# The element count follows the batch: unspecialized, so its alignment class
+# does not select a new binary.
+@triton.jit(do_not_specialize=["elements"])
 def encode_int8_block16(x_ptr, codes_ptr, scales_ptr, elements, BLOCK: tl.constexpr):
     """INT8 codes and FP32 block-16 scales of the first ``elements`` BF16
     values of ``x_ptr`` (a multiple of 16), into ``codes_ptr`` and

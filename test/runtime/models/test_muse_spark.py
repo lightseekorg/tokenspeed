@@ -2038,5 +2038,25 @@ def test_prefill_collective_payload_applies_to_extend_forwards_only(
         assert module._collective_payload(mode) == expected, mode
 
 
+def test_prefill_collective_payload_choices_match_the_iris_state() -> None:
+    """ServerArgs validates the flag; the Iris state takes the same names."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MUSE_PAYLOADS
+
+    from tokenspeed.runtime.utils.server_args import PREFILL_COLLECTIVE_PAYLOADS
+
+    assert tuple(PREFILL_COLLECTIVE_PAYLOADS) == tuple(MUSE_PAYLOADS)
+
+
+def test_prefill_collective_payload_is_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--prefill-collective-payload"):
+        ServerArgs(model="x", prefill_collective_payload="fp8")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

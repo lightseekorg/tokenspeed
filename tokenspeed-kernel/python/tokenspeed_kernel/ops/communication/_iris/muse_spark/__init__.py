@@ -113,9 +113,8 @@ _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS = 32
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
-# The int8-block16 pull moves 1.25 bytes an element; at 24 programs it is
-# latency bound. 64 programs were fastest in 4-rank graph replay of 8192 and
-# 16384 rows of 8192 (128 were slightly slower).
+# The int8-block16 pull moves fewer bytes a tile than the BF16 one, so it
+# needs more programs to keep enough loads in flight.
 _MUSE_INT8_SCATTER_PROGRAMS = 64
 # Elements one encode program covers.
 _MUSE_ENCODE_BLOCK = 4096
@@ -752,10 +751,12 @@ class MuseIrisState:
             self._encode_payload(tensor)
         elif tensor.data_ptr() != self.all_reduce.producer.data.data_ptr():
             self.all_reduce.producer.data[: tensor.numel()].copy_(tensor.view(-1))
-        return self._pull_reduce_scatter(rows, width, int8_block16, False)
+        return self._pull_reduce_scatter(
+            rows, width, int8_block16=int8_block16, writes_through=False
+        )
 
     def _pull_reduce_scatter(
-        self, rows: int, width: int, int8_block16: bool, writes_through: bool
+        self, rows: int, width: int, *, int8_block16: bool, writes_through: bool
     ) -> torch.Tensor:
         """Reduce the producer buffer's BF16 rows, or the int8-block16
         payload encoded from them, onto token owners in pull scratch."""
@@ -919,7 +920,10 @@ class MuseIrisState:
         # Otherwise the local producer uses write-through stores; peer reads
         # need no cache writeback.
         return self._pull_reduce_scatter(
-            num_tokens, 4096, int8_block16, not int8_block16
+            num_tokens,
+            4096,
+            int8_block16=int8_block16,
+            writes_through=not int8_block16,
         )
 
     def can_gather_expert_intermediate(self, rows: int) -> bool:
