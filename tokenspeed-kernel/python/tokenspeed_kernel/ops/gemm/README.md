@@ -282,22 +282,6 @@ retain their semantics; small-M BF16 keeps its existing bound.
 streaming the weight once. Its module docstring records the split-K fold, which
 keeps a row's result independent of the batch, and its PDL order.
 
-On gfx950, `rocm_blas.rocm_blas_pinned_mm` runs a fixed rocBLAS or hipBLASLt
-solution for listed (N, K, row range) shapes where the default
-`torch.mm` heuristic picks a slower solution with the same bits. Each pin is
-listed per device and library build, checked bitwise against the default at
-every pinned row count; another device or build keeps the default and logs
-once. The solution runs through PyTorch TunableOp: the first selection that
-consults the pins enables it for the process with tuning off and the pins as
-its only results, so every other GEMM runs the solution `torch.mm` picks
-without TunableOp. A direct `torch.mm` of a pinned shape and row count also
-runs the pin once TunableOp is enabled, which is how prefill projections
-that call `torch.mm` directly take theirs. TunableOp silently skips a GEMM whose
-solution cannot run the problem and leaves the output unwritten, so
-activation runs every pin once into a NaN-filled buffer against the default;
-any mismatch keeps the default for every shape and logs a warning naming the
-pin.
-
 ## Block-FP8 DeepGEMM
 
 `solution="deepgemm"` selects the appropriate block-FP8 kernel for the GPU.
