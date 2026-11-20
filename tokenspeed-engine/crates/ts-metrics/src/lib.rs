@@ -1295,8 +1295,11 @@ pub struct L3ExecutorSnapshot {
     pub health_state: String,
     /// The backend health epoch.
     pub health_epoch: f64,
-    /// Native retirement unproven: new I/O disabled until restart.
+    /// Historical native retirement is unproven; shutdown must retain registration.
     pub unsafe_io: bool,
+    /// The active namespace needs isolation from unsafe I/O before new native work.
+    /// Backend cooldown and operation/Host credit pressure are separate states.
+    pub io_blocked: bool,
 }
 
 /// The scheduler's storage observations (`StorageStats`), mirrored on every
@@ -1307,6 +1310,14 @@ pub struct L3SchedulerStats {
     pub operations: f64,
     /// Host blocks storage operations hold.
     pub held_blocks: f64,
+    /// Old-generation tickets still charged to the global operation limit.
+    pub retained_operations: f64,
+    /// Host references retained by old-generation tickets.
+    pub retained_host_blocks: f64,
+    /// A global operation or Host-reference limit is full with retained work.
+    pub retained_capacity_exhausted: bool,
+    /// Warnings on transitions into retained capacity exhaustion, cumulative.
+    pub retained_capacity_warnings: f64,
     /// Host blocks quarantined after unproven retirement.
     pub quarantined: f64,
     /// Keys known to be absent from the store.
@@ -1352,7 +1363,9 @@ pub struct L3Metrics {
     health: Metric,
     epoch: Metric,
     unsafe_io: Metric,
+    io_blocked: Metric,
     resources: Metric,
+    retained_capacity_warnings: Metric,
     expirations: Metric,
     pressure_bypasses: Metric,
     pressure_drops: Metric,
@@ -1427,7 +1440,13 @@ impl L3Metrics {
             unsafe_io: Metric::gauge(
                 exporter,
                 "tokenspeed:l3_io_quarantined",
-                "Local native retirement unproven; new I/O disabled until restart.",
+                "Historical local native retirement unproven; shutdown retains registration; new cache generations may run.",
+                &L3_LABELS,
+            ),
+            io_blocked: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_io_blocked",
+                "Active namespace needs unsafe I/O isolation; excludes backend cooldown and capacity pressure.",
                 &L3_LABELS,
             ),
             resources: Metric::gauge(
@@ -1435,6 +1454,12 @@ impl L3Metrics {
                 "tokenspeed:l3_scheduler_resources",
                 "Mirrored C++ resource counts; do not sum across TP ranks.",
                 &with(&["resource"]),
+            ),
+            retained_capacity_warnings: Metric::counter(
+                exporter,
+                "tokenspeed:l3_retained_capacity_warnings",
+                "Mirrored transitions into full storage capacity with retained I/O; do not sum TP ranks.",
+                &L3_LABELS,
             ),
             expirations: Metric::counter(
                 exporter,
@@ -1495,6 +1520,7 @@ impl L3Metrics {
                 "pressure_bypasses" => &self.pressure_bypasses,
                 "pressure_drops" => &self.pressure_drops,
                 "backup_drops" => &self.backup_drops,
+                "retained_capacity_warnings" => &self.retained_capacity_warnings,
                 _ => unreachable!("an L3 counter"),
             };
             metric.inc(&self.label_values(extra), delta);
@@ -1533,9 +1559,17 @@ impl L3Metrics {
         self.epoch.set(&self.label_values(&[]), io.health_epoch);
         self.unsafe_io
             .set(&self.label_values(&[]), f64::from(u8::from(io.unsafe_io)));
+        self.io_blocked
+            .set(&self.label_values(&[]), f64::from(u8::from(io.io_blocked)));
         for (resource, value) in [
             ("operations", scheduler.operations),
             ("held_blocks", scheduler.held_blocks),
+            ("retained_operations", scheduler.retained_operations),
+            ("retained_host_blocks", scheduler.retained_host_blocks),
+            (
+                "retained_capacity_exhausted",
+                f64::from(u8::from(scheduler.retained_capacity_exhausted)),
+            ),
             ("quarantined", scheduler.quarantined),
             ("negative_keys", scheduler.negative_keys),
             ("backup_candidates", scheduler.backup_candidates),
@@ -1551,6 +1585,11 @@ impl L3Metrics {
         self.increment("expirations", scheduler.wait_timeouts, &["waiting"]);
         self.increment("expirations", scheduler.ready_expirations, &["ready"]);
         self.increment("pressure_bypasses", scheduler.pressure_bypasses, &[]);
+        self.increment(
+            "retained_capacity_warnings",
+            scheduler.retained_capacity_warnings,
+            &[],
+        );
         self.increment(
             "pressure_drops",
             scheduler.pressure_dropped_backup_keys,

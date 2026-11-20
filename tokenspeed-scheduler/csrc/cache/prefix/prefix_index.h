@@ -655,6 +655,24 @@ public:
         }
     }
 
+    // Maintenance inspection only: borrowing neither pins the block nor
+    // changes ownership. The visitor must not mutate this index or its refs.
+    template <typename Visit>
+    void ForEachBlockRef(const BlockPool& pool, const Visit& visit) const {
+        const CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) return;
+        for (const CacheEntry& entry : entries->entries) visit(entry.block_ref);
+    }
+
+    // Forget reuse metadata, including pinned entries, without revoking their
+    // external owners. A caller must first establish which live refs may remain.
+    // eraseEntry also unlinks observers, peer indexes and boundary-tree holds.
+    void Invalidate(const BlockPool& pool) {
+        CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) return;
+        while (!entries->entries.empty()) eraseEntry(*entries, entries->entries.begin());
+    }
+
     std::int32_t NumEntries(const BlockPool& pool) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index == nullptr ? 0 : static_cast<std::int32_t>(cache_index->entries.size());

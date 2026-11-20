@@ -515,12 +515,27 @@ bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::St
 }
 
 bool storage_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StoragePending(); }
+bool storage_current_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StorageCurrentPending(); }
+bool storage_progress_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StorageProgressPending(); }
+std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageBlockingQuarantined();
+}
+bool storage_non_storage_clearable(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageNonStorageClearable();
+}
+bool can_prepare_storage_clear(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.CanPrepareStorageClear();
+}
 
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
     const tokenspeed::StorageStats stats = scheduler.GetStorageStats();
     return StorageStatsView{
         .operations = stats.operations,
         .held_blocks = stats.held_blocks,
+        .retained_operations = stats.retained_operations,
+        .retained_host_blocks = stats.retained_host_blocks,
+        .retained_capacity_exhausted = stats.retained_capacity_exhausted,
+        .retained_capacity_warnings = stats.retained_capacity_warnings,
         .quarantined = stats.quarantined,
         .negative_keys = stats.negative_keys,
         .backup_candidates = stats.backup_candidates,
@@ -549,6 +564,21 @@ PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
 }
 
 bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache(); }
+
+void cancel_storage_backups(tokenspeed::Scheduler& scheduler) { scheduler.CancelStorageBackups(); }
+void cancel_storage_for_clear(tokenspeed::Scheduler& scheduler) { scheduler.CancelStorageForClear(); }
+
+bool can_clear_cache_retaining_storage(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.CanClearCacheRetainingStorage();
+}
+
+bool clear_cache_retaining_storage(tokenspeed::Scheduler& scheduler) {
+    return scheduler.ClearCacheRetainingStorage();
+}
+
+bool storage_has_retained_operations(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageHasRetainedOperations();
+}
 
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
 

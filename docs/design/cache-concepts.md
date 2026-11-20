@@ -1648,14 +1648,38 @@ Its responsibilities:
   Ready holds, soft deadlines and pressure admission.
 
   A full clear or weight update first agrees flush intent across attention DP,
-  then probes local clearability across cache-owning ranks and DP. Clearability
-  includes outstanding Host copies and storage operations, Ready holds and
-  quarantine. Only after agreement does synchronous remote namespace deletion
-  run; its result is agreed before any rank clears Device/Host indexes. A
-  failed preflight or purge prevents local clearing, and the frontend combines
-  every DP worker's reply. The administrative purge is not bounded by the
-  preparation soft timeout. Independent jobs sharing the namespace are
-  outside this agreement; a fleet-wide flush requires operator coordination.
+  then probes non-storage ownership across cache-owning ranks and DP. Protected
+  Device/PD/tier transfers, suspended images and unrelated pins still refuse
+  clear. Without storage, the ordinary indexed-cache clear rules remain intact.
+  Healthy storage preparation checks indexed owners while allowing its known
+  storage holds to drain; exact physical reference-count and occupied-slot
+  coverage checks apply when retaining recovery or old retained references
+  require local invalidation, rather than to every healthy flush.
+  Healthy outstanding L3 work gets the configured
+  `async.clear_cache_drain_timeout_ms` budget (default 500 ms) to retire through
+  normal control rounds. A healthy drained active namespace takes the strict
+  path: synchronous remote purge succeeds on every rank before local indexes
+  are cleared. A failed preflight or purge prevents local clearing on that path.
+  The administrative purge is not bounded by the preparation or drain budgets.
+
+  An unsafe active namespace or exhausted healthy-drain budget takes retaining
+  clear instead. It detaches old storage tickets, invalidates the local indexes
+  and switches subsequent L3 work to a fresh agreed generation without remote
+  purge. Old Host references and registration remain held until actual native
+  retirement; clear does not free them. Retained tickets consume Host and global
+  operation credits, while remaining capacity supports L2, L3 and recomputation.
+  Even a merely slow healthy operation can cause this conservative private
+  generation when its budget expires; the timeout does not prove native failure.
+
+  The frontend combines every DP worker's reply. Independent Prefill services
+  sharing an original namespace are outside that agreement: recovery generations
+  can split cross-instance sharing until a genuinely different immutable weight
+  version restores its shared prefix. A fleet-wide clear or common recovery
+  generation needs coordination beyond the engine's rank agreement. Historical
+  `l3_io_quarantined` tracks memory still unsafe to deregister; current
+  `l3_io_blocked` tracks the active namespace needing isolation, not that history
+  or backend cooldown. See the asynchronous L3 observability contract for alert
+  interpretation.
 
   With L3 enabled, a weight update requires an explicit `weight_version` and
   successful flush before the GPU load. Automatic per-process version labels

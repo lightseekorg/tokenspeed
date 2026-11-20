@@ -1875,6 +1875,7 @@ separate DRAM provider over RDMA:
     "max_keys_per_operation": 256,
     "wait_timeout_ms": 2000,
     "ready_timeout_ms": 1000,
+    "clear_cache_drain_timeout_ms": 500,
     "max_prefetch_tokens": 8192,
     "query_workers": 2,
     "read_workers": 2,
@@ -1898,8 +1899,11 @@ The group matcher chooses the reusable prefix, which may be shorter than
 requested. A soft deadline permits local computation while native I/O keeps
 its Host references until retirement. A result detached by timeout or
 cancellation cannot publish data. Unknown native retirement quarantines the
-buffers and disables new L3 work until process restart; valid L2 hits and
-ordinary computation can continue. D2H publication and Device-source release
+buffers and blocks new L3 work in that cache generation. An accepted full-clear
+recovery isolates those references and permits L3 in a fresh generation using
+remaining Host and operation capacity; it never frees the unsafe buffers merely
+because the clear succeeded. Valid L2 hits and ordinary computation can continue.
+D2H publication and Device-source release
 wait for replica copy agreement, independently of L3 PUT. The PD prefill role
 can prepare L3 hits; decode receives its missing cache from the prefill peer.
 
@@ -1916,6 +1920,7 @@ the following defaults; unknown options are rejected:
 | `max_prefetch_tokens` | `8192` | Maximum extension beyond the local hit, rather than a prompt-length limit |
 | `wait_timeout_ms` | `2000` | Shared soft wait budget for query and GET |
 | `ready_timeout_ms` | `1000` | Hold time for completed Host results awaiting ordinary admission |
+| `clear_cache_drain_timeout_ms` | `500` | Full-clear budget for healthy outstanding L3 work to retire through normal rounds; `0` skips this wait and isolates pending work immediately |
 | `query_workers` / `read_workers` / `write_workers` | `2` / `2` / `1` | Independent executor worker counts |
 | `failure_threshold` / `recovery_interval_ms` | `1` / `30000` | Backend-health failure threshold and recovery-probe interval |
 | `queue_high_operations` / `queue_low_operations` | `min(8, max_operations)` / high divided by two, rounded down | Queue-count admission watermarks |
@@ -1928,6 +1933,15 @@ Raising `max_prefetch_tokens` alone does not guarantee a longer restore.
 `max_host_blocks` is a logical-reference budget, not bytes or a per-worker
 quota, and cannot exceed the usable Host-parent count. PUTs may use at most
 half of the operation and Host credits, rounded down, to leave room for reads.
+
+`clear_cache_drain_timeout_ms` accepts integers from `0` through
+`(2**63 - 1) // 1000`; booleans, negative values and non-integers are rejected.
+Use the same budget on all cooperating ranks. Clear decisions are agreed across
+the replica and attention-DP ranks: if any rank's budget expires, all select
+isolation together. An active-generation unsafe result skips healthy draining
+and enters recovery directly. Setting `0` changes only the wait policy; it does
+not claim native retirement or release unsafe references. This budget does not
+bound the ordinary synchronous remote namespace purge RPC.
 
 Any high watermark closes new L3 read/write admission; all observations must
 reach their low watermarks before it reopens. The gate bypasses new requests'
@@ -1949,11 +1963,17 @@ counts for page-sharded layouts) and cache-producing runtime
 choices. Different compatibility epochs start cold caches. See
 [cache concepts](../design/cache-concepts.md) for the identity contract.
 
-Host eviction leaves shared objects intact. Full cache clear and weight
-updates require replica-agreed idle state, including storage operations,
-Ready holds and quarantine. Remote namespace purge is still a synchronous
-administrative RPC; preparation soft deadlines do not bound it. Failed
-preflight or purge prevents local clearing. With L3 enabled, weight updates
+Host eviction leaves shared objects intact. A full clear first checks non-storage
+owners, then gives healthy L3 work its configured drain budget. If it retires,
+the normal clear purges the shared namespace. Otherwise recovery detaches old
+storage tickets, clears local indexes and starts a fresh cache generation while
+retaining every old I/O reference; this path performs no remote purge. Remaining
+Host and operation credits support subsequent L2, L3 and recomputation. Repeated
+unknown I/O can exhaust that retained capacity and still require a restart to
+reclaim it safely. Device/PD/tier transfers and unrelated pinned owners can still
+refuse clear. The normal remote purge remains a synchronous administrative RPC;
+neither preparation deadlines nor the healthy-drain budget bounds it, and purge
+failure prevents local clearing on that path. With L3 enabled, weight updates
 require an explicit `weight_version` and a successful flush; the
 metadata-only `/update_weight_version` endpoint is rejected. Independent
 inference jobs sharing a namespace are outside this flush agreement.

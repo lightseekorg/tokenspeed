@@ -48,6 +48,7 @@ class StorageRuntimeConfig:
     write_workers: int
     failure_threshold: int
     recovery_interval_ms: int
+    clear_cache_drain_timeout_ms: int
 
     @classmethod
     def from_extra_config(
@@ -74,6 +75,7 @@ class StorageRuntimeConfig:
             write_workers=1,
             failure_threshold=1,
             recovery_interval_ms=30000,
+            clear_cache_drain_timeout_ms=500,
             queue_high_operations=8,
             queue_low_operations=4,
             queue_high_bytes=256 * 1024 * 1024,
@@ -89,7 +91,12 @@ class StorageRuntimeConfig:
             minimum = (
                 0
                 if name
-                in {"queue_low_operations", "queue_low_bytes", "operation_low_age_ms"}
+                in {
+                    "queue_low_operations",
+                    "queue_low_bytes",
+                    "operation_low_age_ms",
+                    "clear_cache_drain_timeout_ms",
+                }
                 else 1
             )
             if type(value) is not int or value < minimum or value > (2**63 - 1) // 1000:
@@ -149,6 +156,7 @@ class StorageRuntimeConfig:
             write_workers=values["write_workers"],
             failure_threshold=values["failure_threshold"],
             recovery_interval_ms=values["recovery_interval_ms"],
+            clear_cache_drain_timeout_ms=values["clear_cache_drain_timeout_ms"],
         )
 
 
