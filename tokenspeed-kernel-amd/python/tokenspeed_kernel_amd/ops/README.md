@@ -2267,6 +2267,36 @@ This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
 of order-dependent BF16 rounding. Stage 2 clears the destination on each call
 and graph replay. Larger token counts retain the FP32 reduction path.
 
+### Wide E2M1 prefill tiles
+
+A grouped configuration whose `wide_tiles` is set (in the gfx950 MXFP4
+`fused/tuning.py` table: 4096 x 4096 experts, 32 or 64 of 256 local, from 192 rows)
+runs
+E2M1 package prefill on 64-row sort blocks and both GEMMs on their wide tiles.
+Other shapes keep the general tiles. So does that shape under expert tensor
+parallelism, whose sorted gate/up holds every expert locally (no table row
+yet: the wide tiles are unmeasured there).
+
+The gate/up GEMM's wide tile is 64 rows by 256 interleaved gate/up weight rows
+(128 outputs) on four waves, each wave owning 64 weight rows for all 64 rows,
+so it reads the activation tile from shared memory once per K tile.
+Activations are copied two K tiles ahead through three shared-memory slots,
+and weights and scales load one K tile ahead. The epilogue splits gate from up
+in registers and quantizes the 64 x 128 output in one pass. A 128-row sort
+block is two such tiles with the block's expert. Every output element sees the
+same MFMAs in the same K order as the general tile, so the bits are the same.
+
+The down GEMM's wide tile serves reduce mode: 64 rows by 256 columns on four
+waves through the same K loop as the gate/up tile (256-wide K tiles,
+activations two ahead). Each element accumulates the same 128-wide MFMA steps
+in the same order as the general 128-wide K tile, then rounds once to BF16;
+the 64 x 256 tile is redistributed once and each route's row stored as one
+contiguous span. Both tiles take row, route and token counts at run time, and
+address an expert's weights and the sorted intermediate past 2^31 bytes in
+64-bit offsets. Measured on MI355X (one EP4 rank, served EP facade) they are
+faster than the general tiles from 3k to 24k rows; the table row spans 192
+rows up to the stage-1 launcher's 2^31-byte activation bound.
+
 ### gfx950 BF16 expert routes
 
 `gluon_bf16_moe_routes_gfx950` serves `bf16_moe_routes`, the unweighted

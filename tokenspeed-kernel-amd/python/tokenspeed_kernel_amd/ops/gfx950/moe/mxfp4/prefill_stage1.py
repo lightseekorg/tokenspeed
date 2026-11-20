@@ -2519,6 +2519,716 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
 
 
+@gluon.jit
+def _load_a_scale_words(
+    a_scales_ptr,
+    a_scale_base_offsets,
+    GROUP_IDX: gl.constexpr,
+    tile_k,
+    group_stride,
+    A_SCALE_K_STEP: gl.constexpr,
+):
+    # Load the A-scale dwords of one 32-row group and K tile. Callers do so a
+    # K tile ahead of the MFMAs that consume them, so those do not wait for the
+    # load; ``_regroup_scale_words`` turns them into the MFMA operand.
+    return gl.amd.cdna4.buffer_load(
+        ptr=a_scales_ptr,
+        offsets=(
+            a_scale_base_offsets + GROUP_IDX * group_stride + tile_k * A_SCALE_K_STEP
+        ),
+    )
+
+
+@gluon.jit
+def _regroup_scale_words(loaded, scale_layout: gl.constexpr):
+    # ``loaded`` holds one dword per lane: in the swizzle the dword at
+    # (k % 4) * 64 + (row % 16) * 4 has rows m and m + 16 at scales k and
+    # k + 4, the four scales a lane feeds its MFMAs for this group and tile,
+    # with (row, k) at byte 2 * (k // 4) + row // 16. Regroup them into the
+    # MFMA scale layout in registers.
+    k_low = gl.join(loaded.to(gl.uint8), (loaded >> 8).to(gl.uint8))
+    k_high = gl.join((loaded >> 16).to(gl.uint8), (loaded >> 24).to(gl.uint8))
+    # [m % 16, k % 4, m // 16, k // 4] -> [m, k]
+    scales = gl.join(k_low, k_high).permute((2, 0, 3, 1)).reshape((32, 8))
+    return gl.convert_layout(scales, scale_layout)
+
+
+@gluon.jit
+def _b_scale_operand(loaded, word_shift, scale_layout: gl.constexpr):
+    # B-scale MFMA operand from the dwords ``_load_b_scale_vgpr`` loaded: per
+    # lane and 32-row panel, rows n and n + 16 at scales k and k + 4, with
+    # (row, k) at byte 2 * (k // 4) + row % 32 // 16. Keep this wave's row half
+    # and regroup.
+    num_rows: gl.constexpr = loaded.shape[0]
+    halves = gl.join(
+        (loaded >> word_shift).to(gl.uint8),
+        (loaded >> (word_shift + 16)).to(gl.uint8),
+    )
+    # [n, k % 4, k // 4] -> [n, k]
+    scales = halves.permute((0, 2, 1)).reshape((num_rows, 8))
+    return gl.convert_layout(scales, scale_layout)
+
+
+@gluon.jit
+def _wide_load_operands(
+    b_base_ptr,
+    b_scales_words_ptr,
+    offs_b,
+    b_scale_offs,
+    a_scales_words_ptr,
+    a_scale_offs,
+    a_scale_group_stride,
+    tile_k,
+    B_DATA_K_STEP: gl.constexpr,
+):
+    # Both groups' activation-scale dwords, the weight-scale dwords and the
+    # weights of one K tile of the wide stage-1 tile. Loads complete in issue
+    # order, so the scales go first: waiting for them to regroup their bytes
+    # must not wait for the weights too.
+    # A 256-wide K tile's scales of one 32-row panel are 256 bytes, 64 dwords.
+    SCALE_WORDS_PER_K_TILE: gl.constexpr = 64
+    a_words_group0 = _load_a_scale_words(
+        a_scales_words_ptr,
+        a_scale_offs,
+        0,
+        tile_k,
+        a_scale_group_stride,
+        SCALE_WORDS_PER_K_TILE,
+    )
+    a_words_group1 = _load_a_scale_words(
+        a_scales_words_ptr,
+        a_scale_offs,
+        1,
+        tile_k,
+        a_scale_group_stride,
+        SCALE_WORDS_PER_K_TILE,
+    )
+    b_words = _load_b_scale_vgpr(
+        b_scales_words_ptr, b_scale_offs, tile_k, SCALE_WORDS_PER_K_TILE
+    )
+    b = _load_b_data_vgpr(b_base_ptr, offs_b, tile_k * B_DATA_K_STEP)
+    return b, b_words, a_words_group0, a_words_group1
+
+
+@gluon.jit
+def _wide_k_tile(
+    acc_group0,
+    acc_group1,
+    slot_read,
+    slot_write,
+    tile_k,
+    cur_b,
+    cur_b_words,
+    a_words_group0,
+    a_words_group1,
+    a_ptr,
+    offs_a,
+    token_mask,
+    b_base_ptr,
+    b_scales_words_ptr,
+    offs_b,
+    b_scale_offs,
+    b_scale_word_shift,
+    a_scales_words_ptr,
+    a_scale_offs,
+    a_scale_group_stride,
+    B_DATA_K_STEP: gl.constexpr,
+    LOAD_NEXT: gl.constexpr,
+    COPY_AHEAD: gl.constexpr,
+    WAIT_GROUPS: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+):
+    # One K tile of the wide stage-1 tile: issue tile k + 1's register
+    # operands (LOAD_NEXT) and tile k + 2's activation copy into
+    # ``slot_write`` (COPY_AHEAD), wait until tile k's copy has landed (at most
+    # WAIT_GROUPS younger copies in flight), then run tile k's MFMAs from
+    # ``slot_read``. Returns the accumulators and tile k + 1's operands.
+    if LOAD_NEXT:
+        next_b, next_b_words, next_a_words_group0, next_a_words_group1 = (
+            _wide_load_operands(
+                b_base_ptr,
+                b_scales_words_ptr,
+                offs_b,
+                b_scale_offs,
+                a_scales_words_ptr,
+                a_scale_offs,
+                a_scale_group_stride,
+                tile_k + 1,
+                B_DATA_K_STEP,
+            )
+        )
+    else:
+        next_b = cur_b
+        next_b_words = cur_b_words
+        next_a_words_group0 = a_words_group0
+        next_a_words_group1 = a_words_group1
+    if COPY_AHEAD:
+        # The slot tile k - 1 used; the compiler orders the copy after every
+        # wave's reads of that tile.
+        block_k_packed: gl.constexpr = slot_write.shape[1]
+        _prefetch_a_data_lds(
+            slot_write,
+            a_ptr,
+            offs_a,
+            (tile_k + 2) * block_k_packed,
+            mask=token_mask,
+        )
+        cdna4_async_copy.commit_group()
+    cdna4_async_copy.wait_group(WAIT_GROUPS)
+    group_m: gl.constexpr = acc_group0.shape[0]
+    b_scale = _b_scale_operand(cur_b_words, b_scale_word_shift, b_scale_layout)
+    acc_group0 = _compute_mx_group(
+        _read_a_lds_group(slot_read, 0, dot_a_layout, group_m),
+        _regroup_scale_words(a_words_group0, a_scale_layout),
+        cur_b,
+        b_scale,
+        acc_group0,
+        "e2m1",
+    )
+    acc_group1 = _compute_mx_group(
+        _read_a_lds_group(slot_read, 1, dot_a_layout, group_m),
+        _regroup_scale_words(a_words_group1, a_scale_layout),
+        cur_b,
+        b_scale,
+        acc_group1,
+        "e2m1",
+    )
+    # Keep the next tile's scale regrouping out of this tile's MFMAs: loads
+    # complete in issue order, so consuming tile k + 1's scale dwords here
+    # would also wait for tile k + 1's weights.
+    gl.amd.hint.sched_barrier()
+    return (
+        acc_group0,
+        acc_group1,
+        next_b,
+        next_b_words,
+        next_a_words_group0,
+        next_a_words_group1,
+    )
+
+
+@gluon.jit
+def _wide_tile_gemm(
+    a_ptr,
+    stride_am,
+    a_scales_ptr,
+    stride_se_n_pad,
+    b_ptr,
+    stride_be,
+    b_scales_ptr,
+    stride_bse_e,
+    b_scale_panel_words,
+    sorted_token_ids_ptr,
+    EM,
+    num_tokens,
+    off_experts,
+    pid_m,
+    pid_n,
+    N_TOTAL: gl.constexpr,
+    NUM_K_TILES: gl.constexpr,
+    INPUT_SORTED: gl.constexpr,
+):
+    """E2M1 x E2M1 GEMM of one 64-row x 256-column tile over sorted routes.
+
+    Returns the FP32 accumulators of rows 0-31 and 32-63, ``[32, 256]`` each
+    in the 4-wave MFMA layout. Each element accumulates
+    ``v_mfma_scale_f32_16x16x128_f8f6f4`` products over 128-wide K steps in
+    ascending order from zero, as the general stage-1 and stage-2 tiles do.
+
+    Each wave owns 64 of the 256 weight columns for all 64 rows, so it reads
+    the activation tile from LDS once per 256-wide K tile. Activations are
+    copied two K tiles ahead through a three-slot ring; weights,
+    weight-scale and activation-scale dwords load into registers one K tile
+    ahead.
+
+    Activation rows are gathered by token from ``sorted_token_ids``, or are
+    already in sorted order (``INPUT_SORTED``). Weights are the GDOT128
+    (128 x 128-tiled) layout of ``N_TOTAL`` columns; their scales and the
+    activation scales are CDNA4-swizzled, with ``b_scale_panel_words`` and
+    ``stride_se_n_pad * 8`` dwords per 32-row panel.
+    """
+    BLOCK_M: gl.constexpr = 64
+    GROUP_M: gl.constexpr = 32
+    BLOCK_N: gl.constexpr = 256
+    BLOCK_K_PACKED: gl.constexpr = 128
+    gl.static_assert(gl.num_warps() == 4, "the wide tile runs 4 waves")
+    gl.static_assert(NUM_K_TILES >= 2, "the three-slot ring needs two K tiles")
+    gl.static_assert(N_TOTAL % BLOCK_N == 0)
+
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 128],
+        transposed=True,
+        warps_per_cta=[1, 4],
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    a_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [GROUP_M, 8]
+    )
+    b_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_b_layout, [BLOCK_N, 8]
+    )
+
+    # ---- activation rows: gather layout and the three-slot LDS ring -------
+    # Same padded layout as the 64-row E2M1 tile of the general kernel: a
+    # 128-byte pad every 32 rows lets each group's ds_reads share a base.
+    gload_a_layout: gl.constexpr = gl.BlockedLayout([1, 16], [8, 8], [4, 1], [1, 0])
+    shared_a: gl.constexpr = gl.PaddedSharedLayout(
+        [[4096, 128]],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+        ],
+        [],
+        [BLOCK_M, BLOCK_K_PACKED],
+    )
+    smem_a = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [3, BLOCK_M, BLOCK_K_PACKED], shared_a
+    )
+    tile_row = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, gload_a_layout))
+    offs_route = pid_m * BLOCK_M + tile_row
+    packed_route = gl.load(
+        sorted_token_ids_ptr + offs_route, mask=offs_route < EM, other=num_tokens
+    )
+    token_id = packed_route & 0xFFFFFF
+    token_mask = (token_id < num_tokens)[:, None]
+    offs_ak = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(0, gload_a_layout))
+    if INPUT_SORTED:
+        # Rows in sorted order: rebase the scalar pointer per tile so the
+        # 32-bit buffer offsets stay within the tile.
+        a_ptr = a_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_am
+        offs_a = tile_row[:, None] * stride_am + offs_ak[None, :]
+    else:
+        # Buffer-load offsets are 32-bit; the launcher bounds the activation
+        # span.
+        offs_a = (token_id[:, None].to(gl.int64) * stride_am + offs_ak[None, :]).to(
+            gl.int32
+        )
+
+    # ---- activation scales: one dword per lane, 32-row group and K tile ---
+    # See ``_regroup_scale_words`` for the swizzle; group 1 is the next panel.
+    a_scale_word_layout: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]],
+        warp_bases=[[0, 0], [0, 0]],
+        block_bases=[],
+        shape=[16, 4],
+    )
+    a_scale_m = gl.arange(0, 16, layout=gl.SliceLayout(1, a_scale_word_layout))
+    a_scale_k = gl.arange(0, 4, layout=gl.SliceLayout(0, a_scale_word_layout))
+    a_scale_group_stride = stride_se_n_pad * 8
+    # The program's first scale group goes into the base pointer in 64 bits
+    # (it grows with the sorted row count); the buffer offsets keep the
+    # 32-bit in-tile part.
+    a_scales_words_ptr = (
+        a_scales_ptr.to(gl.pointer_type(gl.uint32))
+        + (pid_m * (BLOCK_M // GROUP_M)).to(gl.int64) * a_scale_group_stride
+    )
+    a_scale_offs = a_scale_m[:, None] + a_scale_k[None, :] * 16
+
+    # ---- weights: (16, 16)-tiled GDOT128 closed form, 256 rows ------------
+    offs_bk = gl.arange(0, BLOCK_K_PACKED, layout=gl.SliceLayout(1, dot_b_layout))
+    offs_bn = pid_n * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout)
+    )
+    n_in = offs_bn % 128
+    offs_b = (
+        (offs_bn // 128)[None, :] * (128 * 128)
+        + (n_in // 16)[None, :] * 2048
+        + (offs_bk // 64)[:, None] * 1024
+        + ((offs_bk // 16) % 4)[:, None] * 256
+        + (n_in % 16)[None, :] * 16
+        + (offs_bk % 16)[:, None]
+    )
+    B_DATA_K_STEP: gl.constexpr = (N_TOTAL // 128) * (128 * 128)
+    b_base_ptr = b_ptr + off_experts.to(gl.int64) * stride_be
+
+    # Weight-scale dwords: the MFMA scale layout without its k + 4 register,
+    # which shares the dword (see ``_b_scale_operand``).
+    b_scale_word_layout: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[64, 0], [128, 0]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]],
+        warp_bases=[[16, 0], [32, 0]],
+        block_bases=[],
+        shape=[BLOCK_N, 4],
+    )
+    b_word_rows = (
+        pid_n * BLOCK_N
+        + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_word_layout))
+    ).to(gl.uint32)
+    b_word_k = gl.arange(0, 4, layout=gl.SliceLayout(0, b_scale_word_layout)).to(
+        gl.uint32
+    )
+    b_scale_offs = ((b_word_rows // 32) * b_scale_panel_words + b_word_rows % 16)[
+        :, None
+    ] + b_word_k[None, :] * 16
+    b_scale_word_shift = (((b_word_rows % 32) // 16) * 8)[:, None]
+    b_scales_words_ptr = (b_scales_ptr + off_experts.to(gl.int64) * stride_bse_e).to(
+        gl.pointer_type(gl.uint32)
+    )
+
+    # ---- prologue: A[0], A[1] in flight; B[0] and scales of tile 0 --------
+    slot_cur = smem_a.index(0)
+    slot_next = smem_a.index(1)
+    slot_free = smem_a.index(2)
+    _prefetch_a_data_lds(slot_cur, a_ptr, offs_a, 0, mask=token_mask)
+    cdna4_async_copy.commit_group()
+    _prefetch_a_data_lds(slot_next, a_ptr, offs_a, BLOCK_K_PACKED, mask=token_mask)
+    cdna4_async_copy.commit_group()
+    b_even, b_words_even, a_words0_even, a_words1_even = _wide_load_operands(
+        b_base_ptr,
+        b_scales_words_ptr,
+        offs_b,
+        b_scale_offs,
+        a_scales_words_ptr,
+        a_scale_offs,
+        a_scale_group_stride,
+        0,
+        B_DATA_K_STEP,
+    )
+    acc_group0 = gl.zeros((GROUP_M, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+    acc_group1 = gl.zeros((GROUP_M, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+
+    # ---- steady state: tiles 0 .. NUM_K_TILES - 3 -------------------------
+    # Unrolled twice so tile k + 1's operands load into the registers tile
+    # k - 1 freed: no copies at the loop edge, so no wait for them there.
+    STEADY_TILES: gl.constexpr = NUM_K_TILES - 2
+    for pair in range(STEADY_TILES // 2):
+        tile_k = pair * 2
+        acc_group0, acc_group1, b_odd, b_words_odd, a_words0_odd, a_words1_odd = (
+            _wide_k_tile(
+                acc_group0,
+                acc_group1,
+                slot_cur,
+                slot_free,
+                tile_k,
+                b_even,
+                b_words_even,
+                a_words0_even,
+                a_words1_even,
+                a_ptr,
+                offs_a,
+                token_mask,
+                b_base_ptr,
+                b_scales_words_ptr,
+                offs_b,
+                b_scale_offs,
+                b_scale_word_shift,
+                a_scales_words_ptr,
+                a_scale_offs,
+                a_scale_group_stride,
+                B_DATA_K_STEP,
+                True,
+                True,
+                2,
+                dot_a_layout,
+                a_scale_layout,
+                b_scale_layout,
+            )
+        )
+        slot_cur, slot_next, slot_free = slot_next, slot_free, slot_cur
+        acc_group0, acc_group1, b_even, b_words_even, a_words0_even, a_words1_even = (
+            _wide_k_tile(
+                acc_group0,
+                acc_group1,
+                slot_cur,
+                slot_free,
+                tile_k + 1,
+                b_odd,
+                b_words_odd,
+                a_words0_odd,
+                a_words1_odd,
+                a_ptr,
+                offs_a,
+                token_mask,
+                b_base_ptr,
+                b_scales_words_ptr,
+                offs_b,
+                b_scale_offs,
+                b_scale_word_shift,
+                a_scales_words_ptr,
+                a_scale_offs,
+                a_scale_group_stride,
+                B_DATA_K_STEP,
+                True,
+                True,
+                2,
+                dot_a_layout,
+                a_scale_layout,
+                b_scale_layout,
+            )
+        )
+        slot_cur, slot_next, slot_free = slot_next, slot_free, slot_cur
+    if STEADY_TILES % 2 == 1:
+        acc_group0, acc_group1, b_even, b_words_even, a_words0_even, a_words1_even = (
+            _wide_k_tile(
+                acc_group0,
+                acc_group1,
+                slot_cur,
+                slot_free,
+                STEADY_TILES - 1,
+                b_even,
+                b_words_even,
+                a_words0_even,
+                a_words1_even,
+                a_ptr,
+                offs_a,
+                token_mask,
+                b_base_ptr,
+                b_scales_words_ptr,
+                offs_b,
+                b_scale_offs,
+                b_scale_word_shift,
+                a_scales_words_ptr,
+                a_scale_offs,
+                a_scale_group_stride,
+                B_DATA_K_STEP,
+                True,
+                True,
+                2,
+                dot_a_layout,
+                a_scale_layout,
+                b_scale_layout,
+            )
+        )
+        slot_cur, slot_next, slot_free = slot_next, slot_free, slot_cur
+
+    # ---- the last two tiles: no further activation copies -----------------
+    acc_group0, acc_group1, b_odd, b_words_odd, a_words0_odd, a_words1_odd = (
+        _wide_k_tile(
+            acc_group0,
+            acc_group1,
+            slot_cur,
+            slot_free,
+            NUM_K_TILES - 2,
+            b_even,
+            b_words_even,
+            a_words0_even,
+            a_words1_even,
+            a_ptr,
+            offs_a,
+            token_mask,
+            b_base_ptr,
+            b_scales_words_ptr,
+            offs_b,
+            b_scale_offs,
+            b_scale_word_shift,
+            a_scales_words_ptr,
+            a_scale_offs,
+            a_scale_group_stride,
+            B_DATA_K_STEP,
+            True,
+            False,
+            1,
+            dot_a_layout,
+            a_scale_layout,
+            b_scale_layout,
+        )
+    )
+    acc_group0, acc_group1, _, _, _, _ = _wide_k_tile(
+        acc_group0,
+        acc_group1,
+        slot_next,
+        slot_free,
+        NUM_K_TILES - 1,
+        b_odd,
+        b_words_odd,
+        a_words0_odd,
+        a_words1_odd,
+        a_ptr,
+        offs_a,
+        token_mask,
+        b_base_ptr,
+        b_scales_words_ptr,
+        offs_b,
+        b_scale_offs,
+        b_scale_word_shift,
+        a_scales_words_ptr,
+        a_scale_offs,
+        a_scale_group_stride,
+        B_DATA_K_STEP,
+        False,
+        False,
+        0,
+        dot_a_layout,
+        a_scale_layout,
+        b_scale_layout,
+    )
+
+    return acc_group0, acc_group1
+
+
+@gluon.jit
+def _split_gate_up_activation(
+    acc,
+    DO_SITU: gl.constexpr,
+    ALPHA: gl.constexpr,
+    LIMIT: gl.constexpr,
+    BETA: gl.constexpr,
+    LINEAR_BETA: gl.constexpr,
+):
+    # Interleaved W13 puts gate and up in adjacent columns, which one lane of
+    # the transposed MFMA layout already holds side by side: split them in
+    # registers instead of redistributing the accumulator first.
+    rows: gl.constexpr = acc.shape[0]
+    cols: gl.constexpr = acc.shape[1]
+    gate, up = gl.split(acc.reshape((rows, cols // 2, 2)))
+    return _apply_gate_activation(gate, up, DO_SITU, ALPHA, LIMIT, BETA, LINEAR_BETA)
+
+
+# Token and route counts follow the batch and only bound masks; neither may
+# select a binary.
+def _stage1_wide_launch_metadata(grid, kernel, args):
+    """Report the sorted-route count and padded W13 work of the wide tile."""
+    return {
+        "name": f"{kernel.name} (EM={args['EM']})",
+        "flops8": 2 * args["EM"] * args["K_PACKED_TOTAL"] * 2 * 2 * args["I_r"],
+    }
+
+
+@gluon.jit(
+    launch_metadata=_stage1_wide_launch_metadata,
+    do_not_specialize=["EM", "num_tokens"],
+)
+def gluon_mxfp4_moe_stage1_e2m1_wide_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    c_scale_ptr,
+    a_scales_ptr,
+    b_scales_ptr,
+    sorted_token_ids_ptr,
+    sorted_expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    EM,
+    num_tokens,
+    stride_am,
+    stride_be,
+    stride_cm,
+    stride_bse_e,
+    stride_se_n_pad,
+    K_PACKED_TOTAL: gl.constexpr,
+    SORT_BLOCK_M: gl.constexpr,
+    I_r: gl.constexpr,
+    OUTPUT_K: gl.constexpr,
+    SWIGLU_ALPHA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+    SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+):
+    """E2M1 stage 1 on 64-row x 256-weight-row tiles (128 outputs), 4 waves.
+
+    Same operands, MFMA instruction, 256-wide K tiles and per-element K order
+    as ``gluon_mxfp4_moe_stage1_kernel``'s E2M1 GDOT128 path, so the sorted
+    MXFP4 rows and scales it writes are bit for bit the same. The GEMM is
+    ``_wide_tile_gemm`` (each wave reads the 64-row activation tile from LDS
+    once per K tile, activations two K tiles ahead); the epilogue splits
+    gate/up in registers and quantizes the whole 64 x 128 tile in one pass
+    (one register redistribution through LDS) instead of one pass per 32-row
+    group.
+
+    ``SORT_BLOCK_M`` is the sort's block height (64 or 128), shared with stage
+    2; a 128-row block is two of these tiles with the block's expert.
+    """
+    BLOCK_M: gl.constexpr = 64
+    BLOCK_N: gl.constexpr = 256
+    OUTPUT_BLOCK_N: gl.constexpr = BLOCK_N // 2
+    BLOCK_K_PACKED: gl.constexpr = 128
+    NUM_K_TILES: gl.constexpr = K_PACKED_TOTAL // BLOCK_K_PACKED
+    gl.static_assert(gl.num_warps() == 4, "the wide stage-1 tile runs 4 waves")
+    gl.static_assert(K_PACKED_TOTAL % BLOCK_K_PACKED == 0)
+    gl.static_assert(NUM_K_TILES >= 2, "the three-slot ring needs two K tiles")
+    gl.static_assert(I_r % OUTPUT_BLOCK_N == 0)
+    gl.static_assert(SORT_BLOCK_M % BLOCK_M == 0)
+
+    # Consecutive programs take the column tiles of one row tile; dealt
+    # round-robin over the XCDs, an XCD re-reads the same weight columns of
+    # each of an expert's row tiles from its L2.
+    pid = gl.program_id(axis=0)
+    num_pid_n: gl.constexpr = I_r // OUTPUT_BLOCK_N
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    if pid_m * BLOCK_M >= gl.load(num_tokens_post_padded_ptr):
+        return
+    off_experts = gl.load(sorted_expert_ids_ptr + pid_m // (SORT_BLOCK_M // BLOCK_M))
+
+    acc_group0, acc_group1 = _wide_tile_gemm(
+        a_ptr,
+        stride_am,
+        a_scales_ptr,
+        stride_se_n_pad,
+        b_ptr,
+        stride_be,
+        b_scales_ptr,
+        stride_bse_e,
+        K_PACKED_TOTAL // 2,
+        sorted_token_ids_ptr,
+        EM,
+        num_tokens,
+        off_experts,
+        pid_m,
+        pid_n,
+        2 * I_r,
+        NUM_K_TILES,
+        INPUT_SORTED=False,
+    )
+
+    # ---- epilogue: one pass over the 64 x 128 output tile -----------------
+    act_group0 = _split_gate_up_activation(
+        acc_group0, DO_SITU, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA, SITU_LINEAR_BETA
+    )
+    act_group1 = _split_gate_up_activation(
+        acc_group1, DO_SITU, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA, SITU_LINEAR_BETA
+    )
+    # [32, 128] x 2 -> [64, 128], group 1 below group 0.
+    act = (
+        gl.join(act_group0, act_group1)
+        .permute((2, 0, 1))
+        .reshape((BLOCK_M, OUTPUT_BLOCK_N))
+    )
+    _store_swiglu_tile_group(
+        act,
+        c_ptr,
+        c_scale_ptr,
+        sorted_token_ids_ptr,
+        pid_m,
+        pid_n,
+        EM,
+        num_tokens,
+        1,
+        stride_cm,
+        1,
+        0,
+        BLOCK_M,
+        BLOCK_M,
+        OUTPUT_BLOCK_N,
+        I_r,
+        OUTPUT_K,
+        True,
+        True,
+        False,
+    )
+
+
 def invoke_gluon_mxfp4_moe_stage1(
     hidden_states,
     w1,
@@ -2554,10 +3264,17 @@ def invoke_gluon_mxfp4_moe_stage1(
     *,
     b_layout: int,
     num_warps: int,
+    wide_tile: bool,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 1.
 
     ``num_warps`` explicitly selects the stage's subgroup geometry.
+    ``wide_tile`` selects ``gluon_mxfp4_moe_stage1_e2m1_wide_gfx950`` (64-row x
+    128-output tiles on 4 waves, three-slot activation ring, one-pass
+    epilogue) for E2M1 activations and outputs in sorted MXFP4 with GDOT128
+    weights over 64- or 128-row sort blocks; ``num_warps`` must then be the
+    sort block's own count (``block_m // 32``). Its output is bitwise the same
+    as the general kernel's; other configurations raise ``ValueError``.
     ``b_layout`` names the W13 bank layout (``B_LAYOUT_*``): the MFMA16
     shuffle, which this function applies unless ``b_preshuffled``, or a
     gdot128 or N16 bank, which must be passed preshuffled. N16 banks take
@@ -2776,6 +3493,21 @@ def invoke_gluon_mxfp4_moe_stage1(
             f"sorted stage1 input has {M_padded} rows but routing requires {EM}"
         )
     del M_padded
+    # Activation rows are read with 32-bit offsets from the activation base
+    # (AMD buffer loads), so the span the kernel indexes must fit: the token
+    # rows of a token-order input, the EM sorted rows of a sorted one (sorted
+    # input always takes the general kernel here). The general kernel reads
+    # scale panels with 32-bit offsets from the scale base too.
+    activation_rows = EM if input_sorted else num_tokens
+    if (
+        activation_rows * hidden_states.stride(0) >= 2**31
+        or a1_scale.shape[0] * a1_scale.shape[1] >= 2**31
+    ):
+        raise ValueError(
+            "stage1 activation rows and scales must span less than 2^31 bytes, "
+            f"got {activation_rows} rows of stride {hidden_states.stride(0)} and "
+            f"scales {tuple(a1_scale.shape)}"
+        )
 
     # Step 3: materialise scalar / None args as device tensors so the
     # kernel can just `gl.load` from them.
@@ -2855,6 +3587,66 @@ def invoke_gluon_mxfp4_moe_stage1(
             SWIGLU_LIMIT=float(swiglu_limit),
             SWIGLU_BETA=float(swiglu_beta),
             SITU_LINEAR_BETA=float(situ_linear_beta),
+            num_warps=4,
+        )
+        return out
+
+    if wide_tile:
+        if not (
+            a_format == "e2m1"
+            and output_format == "e2m1"
+            and b_layout == B_LAYOUT_GDOT128.value
+            and output_sorted
+            and output_quantized
+            and not input_sorted
+            and BLOCK_M in (64, 128)
+            and NUM_WARPS == BLOCK_M // 32
+            and K % 256 == 0
+            and K >= 512
+            and I_r % 128 == 0
+            and stride_ak == 1
+            and stride_cn == 1
+        ):
+            raise ValueError(
+                "the wide stage-1 tile serves E2M1 in, sorted MXFP4 out, GDOT128 "
+                "weights, 64- or 128-row sort blocks with block_m // 32 warps, "
+                "K a multiple of 256 (at least 512), I a multiple of 128 and unit "
+                "column strides; got "
+                f"a_format={a_format}, output_format={output_format}, "
+                f"b_layout={b_layout}, output_sorted={output_sorted}, "
+                f"output_quantized={output_quantized}, input_sorted={input_sorted}, "
+                f"block_m={BLOCK_M}, num_warps={NUM_WARPS}, K={K}, I={I_r}, "
+                f"strides ({stride_ak}, {stride_cn})"
+            )
+        # Every 64 rows of a sort block are one tile with the block's expert.
+        gluon_mxfp4_moe_stage1_e2m1_wide_gfx950[(triton.cdiv(EM, 64) * (I_r // 128),)](
+            kernel_hidden_states,
+            w1,
+            out_2d,
+            out_scale_ptr,
+            a1_scale,
+            w1_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids_ptr,
+            EM,
+            num_tokens,
+            stride_am,
+            stride_be,
+            stride_cm,
+            stride_bse_e,
+            stride_se_n_pad,
+            K_PACKED_TOTAL=K_packed_total,
+            SORT_BLOCK_M=BLOCK_M,
+            I_r=I_r,
+            OUTPUT_K=output_k,
+            SWIGLU_ALPHA=float(swiglu_alpha),
+            SWIGLU_LIMIT=float(swiglu_limit),
+            SWIGLU_BETA=float(swiglu_beta),
+            DO_SITU=situ_linear_beta is not None,
+            SITU_LINEAR_BETA=(
+                1.0 if situ_linear_beta is None else float(situ_linear_beta)
+            ),
             num_warps=4,
         )
         return out
