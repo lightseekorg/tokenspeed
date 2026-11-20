@@ -37,13 +37,12 @@ pub struct QueuedPeerRead {
 
 impl QueuedPeerRead {
     /// Record a completed transport call. Dropping the guard also retires its bytes.
-    pub fn finish(self, started: Instant, elapsed: Duration, ok: bool) {
+    pub fn finish(self, started: Instant, elapsed: Duration, host_bytes: u64, ok: bool) {
         self.metrics.shard(
-            &self.holder,
-            self.member,
+            &self,
             started.duration_since(self.queued).as_secs_f64(),
             elapsed.as_secs_f64(),
-            self.bytes,
+            host_bytes,
             ok,
         );
     }
@@ -75,6 +74,7 @@ pub struct PeerMetrics {
     totals: Metric,
     physical: Metric,
     bytes: Metric,
+    source_bytes: Metric,
     outstanding: Metric,
     loads: Mutex<HashMap<(String, usize), u64>>,
 }
@@ -140,6 +140,19 @@ impl PeerMetrics {
                 "tokenspeed:peer_read_bytes",
                 "Payload bytes of successful peer READ calls.",
                 shard,
+            ),
+            source_bytes: Metric::counter(
+                exporter,
+                "tokenspeed:peer_read_source_bytes",
+                "Payload bytes of successful peer READ calls by holder memory tier.",
+                &[
+                    "model_name",
+                    "app_key",
+                    "dp_rank",
+                    "holder",
+                    "member",
+                    "source_tier",
+                ],
             ),
             outstanding: Metric::gauge(
                 exporter,
@@ -248,8 +261,9 @@ impl PeerMetrics {
     }
 
     /// Separate physical queue delay from time spent in the transport.
-    fn shard(&self, holder: &str, member: usize, queued: f64, elapsed: f64, bytes: u64, ok: bool) {
-        let rank = member.to_string();
+    fn shard(&self, read: &QueuedPeerRead, queued: f64, elapsed: f64, host_bytes: u64, ok: bool) {
+        let holder = read.holder.as_str();
+        let rank = read.member.to_string();
         let l = [&*self.model, &*self.app, &*self.dp, holder, &rank];
         self.physical
             .observe(&[l[0], l[1], l[2], holder, &rank, "queue", "ok"], queued);
@@ -266,7 +280,13 @@ impl PeerMetrics {
             elapsed,
         );
         if ok {
-            self.bytes.inc(&l, bytes as f64);
+            self.bytes.inc(&l, read.bytes as f64);
+            for (tier, bytes) in [("host", host_bytes), ("device", read.bytes - host_bytes)] {
+                if bytes > 0 {
+                    self.source_bytes
+                        .inc(&[l[0], l[1], l[2], holder, &rank, tier], bytes as f64);
+                }
+            }
         }
     }
 }
