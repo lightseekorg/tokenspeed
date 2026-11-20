@@ -62,6 +62,7 @@ cute_dsl_fused_fp8_dp_row_linear = error_fn
 cute_dsl_gemm_reduce_scatter = error_fn
 cute_dsl_paged_row_all_gather = error_fn
 cute_dsl_ll_all_gather = error_fn
+cute_dsl_ll_all_gather_floats = error_fn
 cute_dsl_ll_all_to_all = error_fn
 
 # The paged-row all-gather's modes, in the order a mode code numbers them.
