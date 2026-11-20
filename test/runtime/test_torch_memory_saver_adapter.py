@@ -480,8 +480,15 @@ def _check_managed_metadata_on_cuda():
 
     if cutedsl_kda_supported():
         # Exercise lazy compilation and both workspace routes, including growth.
-        for tokens, heads in ((32, 12), (257, 96), (128, 12)):
-            host_bounds = torch.tensor([0, tokens], dtype=torch.int64)
+        for tokens, heads, sequences in (
+            (32, 12, 1),
+            (257, 96, 1),
+            (384, 96, 3),
+            (128, 12, 1),
+        ):
+            host_bounds = torch.arange(sequences + 1, dtype=torch.int64) * (
+                tokens // sequences
+            )
             with saver.named_region("runtime_states"):
                 packed = torch.full(
                     (1, tokens, 3, heads, 128), 0.1, device="cuda", dtype=torch.bfloat16
@@ -494,7 +501,7 @@ def _check_managed_metadata_on_cuda():
                 )
                 decay = torch.zeros(heads, device="cuda")
                 bias = torch.zeros(heads, 128, device="cuda")
-                state = torch.zeros(1, heads, 128, 128, device="cuda")
+                state = torch.zeros(sequences, heads, 128, 128, device="cuda")
                 bounds = host_bounds.to("cuda")
 
             def scan():

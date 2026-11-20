@@ -107,7 +107,7 @@ def cutedsl_kda_chunk_prefill(
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scan BF16 Q/K/V views with FlashInfer's ordinary CuTe kernel.
+    """Scan BF16 Q/K/V views with FlashInfer's CuTe kernels.
 
     Inputs use [B, T, H, 128]; gate is BF16/FP32 and beta contains raw
     logits. State uses FP32 [sequences, H, V, K]. Packed inputs have B=1
