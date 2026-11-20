@@ -153,7 +153,7 @@ void Scheduler::handleEvent(const cache::StorageDetach& event) {
 }
 
 void Scheduler::releaseStorage(Request& request) {
-    if (!storage_transfers_) return;
+    if (!storage_transfers_ && !disk_transfers_) return;
     // The request gives L3 up and keeps its place: the lease on the operation
     // it waits for, or on its Ready data, dies with the wait.
     if (request.Is<fsm::Prefetching>()) {

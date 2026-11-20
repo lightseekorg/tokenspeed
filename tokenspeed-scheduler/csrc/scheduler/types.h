@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/disk.h"
 #include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
@@ -43,6 +44,12 @@ struct SchedulerConfig {
     };
     AllocatorConfig host_allocator;
     AllocatorConfig device_allocator;
+    // The local SSD tier below Host (docs/rfcs/0006-disk-tier.md), packed like
+    // the Host (host_group_packing). total_pages <= 1 means no Disk tier;
+    // anything above it requires disk_config, a Host cache and the
+    // write-back policy.
+    AllocatorConfig disk_allocator;
+    std::optional<DiskConfig> disk_config;
     // The request-private pool a retracted request's image tail lives in
     // (the unaligned tail pages, groups that never publish, and -- with no
     // Host cache -- the whole image). Never prefix-indexed, never evicted.
@@ -67,6 +74,7 @@ struct SchedulerConfig {
     std::vector<std::int32_t> host_group_packing{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
+    bool HasDiskCache() const { return disk_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
 
     // What feeds Host L2 from ordinary Device prefix entries; required with a

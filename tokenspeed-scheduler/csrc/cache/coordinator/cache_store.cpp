@@ -36,13 +36,14 @@ namespace tokenspeed {
 namespace {
 
 BoundaryTree::Config boundaryTreeConfig(const std::vector<CacheGroup>& groups, std::int32_t prefix_granularity,
-                                        bool write_back_evictions, bool has_host_tier) {
+                                        bool write_back_evictions, bool has_host_tier, bool has_disk_tier) {
     BoundaryTree::Config config{
         .prefix_granularity = prefix_granularity,
         .closed_blocks_per_page = 0,
         .num_state_groups = 0,
         .has_prefix_closed_groups = false,
         .has_host_tier = has_host_tier,
+        .has_disk_tier = has_disk_tier,
         .queue_dead_candidates = write_back_evictions,
     };
     for (const CacheGroup& group : groups) {
@@ -103,25 +104,34 @@ CacheStore::GroupMetadata CacheStore::buildGroupMetadata(std::span<const CacheGr
 }
 
 CacheStore::CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                       BlockPool* host_pool, BlockPool* snapshot_pool, bool write_back_evictions,
+                       BlockPool* host_pool, BlockPool* disk_pool, BlockPool* snapshot_pool, bool write_back_evictions,
                        std::int32_t checkpoint_retention_leaf_distance)
     : pool_{pool},
       host_pool_{host_pool},
+      disk_pool_{disk_pool},
       snapshot_pool_{snapshot_pool},
       prefix_granularity_{prefix_granularity},
       checkpoints_{prefix_granularity, checkpoint_retention_leaf_distance},
-      boundary_tree_{boundaryTreeConfig(groups, prefix_granularity, write_back_evictions, host_pool != nullptr),
+      boundary_tree_{boundaryTreeConfig(groups, prefix_granularity, write_back_evictions, host_pool != nullptr,
+                                        disk_pool != nullptr),
                      &checkpoints_},
       groups_{std::move(groups)},
       metadata_{buildGroupMetadata(groups_, prefix_granularity)},
       active_parents_{pool} {
     // These bindings change pool/index state only after all group metadata is valid.
     _assert(!write_back_evictions || groups_.size() <= 64, "writing evictions back supports up to 64 cache groups");
+    // Host writes back to Disk, and Disk feeds only Host.
+    _assert(disk_pool_ == nullptr || (host_pool_ != nullptr && write_back_evictions),
+            "a Disk tier needs a Host tier under the write-back policy");
     for (CacheGroup& group : groups_) {
         const CacheGroupSpec& spec = group.Spec();
         pool_.RegisterGroup(group.Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {
             host_pool_->RegisterGroup(group.Id(), host_pool_->Packing(group.Id()), spec.shard_count);
+        }
+        // The Disk tier packs like the Host, so a block is one I/O between them.
+        if (disk_pool_ != nullptr) {
+            disk_pool_->RegisterGroup(group.Id(), disk_pool_->Packing(group.Id()), spec.shard_count);
         }
         // Packing belongs to the pool; cyclic owner count stays the same across tiers.
         if (snapshot_pool_ != nullptr) {
@@ -130,7 +140,7 @@ CacheStore::CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granu
         if (group.Matcher().IsPrefixClosed() && host_pool_ != nullptr) {
             group.Index().TrackCommonEntries(pool_, *host_pool_);
         }
-        group.Index().TrackBoundaries(boundary_tree_, pool_, host_pool_, spec.attn_kind == AttnKind::kState,
+        group.Index().TrackBoundaries(boundary_tree_, pool_, host_pool_, disk_pool_, spec.attn_kind == AttnKind::kState,
                                       group.Matcher().IsPrefixClosed());
         // Only admissions without State groups read them
         // (AdmissionPlanner::candidatesThroughParentFit), and a replayable

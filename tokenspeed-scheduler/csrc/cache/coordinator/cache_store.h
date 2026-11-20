@@ -24,7 +24,7 @@
 // allocator, prefix index and matcher), their token geometry and match order,
 // the boundary tree and checkpoint tree every group's index entries hold
 // nodes of, the active-parent gauge, and the facts the group specs fix. It
-// references the Device, Host and snapshot pools. The coordinator and its
+// references the Device, Host, Disk and snapshot pools. The coordinator and its
 // components work on it through this interface. Built once; never moves,
 // since index entries point at its trees.
 
@@ -90,7 +90,8 @@ public:
     // write_back_evictions configures the boundary tree to queue dead-node
     // candidates for the write-back policy.
     CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool, BlockPool* host_pool,
-               BlockPool* snapshot_pool, bool write_back_evictions, std::int32_t checkpoint_retention_leaf_distance);
+               BlockPool* disk_pool, BlockPool* snapshot_pool, bool write_back_evictions,
+               std::int32_t checkpoint_retention_leaf_distance);
     CacheStore(const CacheStore&) = delete;
     CacheStore& operator=(const CacheStore&) = delete;
     CacheStore(CacheStore&&) = delete;
@@ -109,6 +110,10 @@ public:
     // Null without a Host tier.
     BlockPool* HostPool() { return host_pool_; }
     const BlockPool* HostPool() const { return host_pool_; }
+    // The local SSD tier below Host (docs/rfcs/0006-disk-tier.md), packed
+    // like the Host. Null without one.
+    BlockPool* DiskPool() { return disk_pool_; }
+    const BlockPool* DiskPool() const { return disk_pool_; }
     // Request-private retraction images: never prefix-indexed, never
     // evicted. Null without one.
     BlockPool* SnapshotPool() { return snapshot_pool_; }
@@ -233,9 +238,13 @@ public:
     const BlockPool& TierPool() const {
         if constexpr (Tier == CacheTier::kDevice) {
             return pool_;
+        } else if constexpr (Tier == CacheTier::kHost) {
+            FatalCheck(host_pool_ != nullptr, "Host cache tier is not configured");
+            return *host_pool_;
+        } else {
+            FatalCheck(disk_pool_ != nullptr, "Disk cache tier is not configured");
+            return *disk_pool_;
         }
-        FatalCheck(host_pool_ != nullptr, "Host cache tier is not configured");
-        return *host_pool_;
     }
     // The keys of a tail ending tail_tokens into the page `hash` names, in
     // group i (TailBlocksFor of them).
@@ -315,6 +324,7 @@ private:
 
     BlockPool& pool_;
     BlockPool* const host_pool_;
+    BlockPool* const disk_pool_;
     BlockPool* const snapshot_pool_;
     const std::int32_t prefix_granularity_;
     // Built before the groups and dropped after them: their index entries

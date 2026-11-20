@@ -199,6 +199,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_rw(
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
+        // The Disk tier (docs/rfcs/0006-disk-tier.md), packed like the Host
+        // (virtual block count including the null page): 1 or less means none.
+        .def_prop_rw(
+            "num_disk_pages", [](const tokenspeed::SchedulerConfig& c) { return c.disk_allocator.total_pages; },
+            [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.disk_allocator.total_pages = v; })
         // The request-private snapshot pool (virtual block count including
         // the null page): 1 means the engine never retracts.
         .def_prop_rw(
@@ -302,6 +307,36 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::DiskConfig>(m, "DiskConfig")
+        .def(nb::init<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int64_t,
+                      std::int64_t>(),
+             nb::arg("max_operations"), nb::arg("max_blocks_per_operation"), nb::arg("max_host_blocks"),
+             nb::arg("max_write_host_blocks"), nb::arg("max_queued_cleanings"), nb::arg("min_prefetch_tokens"),
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"))
+        .def_ro("max_operations", &tokenspeed::DiskConfig::max_operations)
+        .def_ro("max_blocks_per_operation", &tokenspeed::DiskConfig::max_blocks_per_operation)
+        .def_ro("max_host_blocks", &tokenspeed::DiskConfig::max_host_blocks)
+        .def_ro("max_write_host_blocks", &tokenspeed::DiskConfig::max_write_host_blocks)
+        .def_ro("max_queued_cleanings", &tokenspeed::DiskConfig::max_queued_cleanings)
+        .def_ro("min_prefetch_tokens", &tokenspeed::DiskConfig::min_prefetch_tokens)
+        .def_ro("wait_timeout_us", &tokenspeed::DiskConfig::wait_timeout_us)
+        .def_ro("ready_timeout_us", &tokenspeed::DiskConfig::ready_timeout_us);
+    scheduler_config.def_rw("disk_config", &tokenspeed::SchedulerConfig::disk_config);
+    nb::class_<tokenspeed::DiskStats>(m, "DiskStats")
+        .def_ro("operations", &tokenspeed::DiskStats::operations)
+        .def_ro("held_host_blocks", &tokenspeed::DiskStats::held_host_blocks)
+        .def_ro("queued_cleanings", &tokenspeed::DiskStats::queued_cleanings)
+        .def_ro("waiting_requests", &tokenspeed::DiskStats::waiting_requests)
+        .def_ro("ready_requests", &tokenspeed::DiskStats::ready_requests)
+        .def_ro("disk_blocks", &tokenspeed::DiskStats::disk_blocks)
+        .def_ro("free_disk_parents", &tokenspeed::DiskStats::free_disk_parents)
+        .def_ro("written_blocks", &tokenspeed::DiskStats::written_blocks)
+        .def_ro("read_blocks", &tokenspeed::DiskStats::read_blocks)
+        .def_ro("failed_reads", &tokenspeed::DiskStats::failed_reads)
+        .def_ro("failed_writes", &tokenspeed::DiskStats::failed_writes)
+        .def_ro("dropped_cleanings", &tokenspeed::DiskStats::dropped_cleanings)
+        .def_ro("wait_timeouts", &tokenspeed::DiskStats::wait_timeouts)
+        .def_ro("ready_expirations", &tokenspeed::DiskStats::ready_expirations);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
         .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t,
                       std::int32_t>(),
@@ -457,6 +492,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("success", &tokenspeed::cache::StorageDone::success)
         .def_ro("retired", &tokenspeed::cache::StorageDone::retired)
         .def_ro("object_failures", &tokenspeed::cache::StorageDone::object_failures);
+
+    // Every cache owner finished a Disk operation (docs/rfcs/0006-disk-tier.md).
+    nb::class_<tokenspeed::cache::DiskDone>(cache, "DiskDone")
+        .def(nb::init<std::uint64_t, bool>(), nb::arg("op_id"), nb::arg("success"))
+        .def_ro("op_id", &tokenspeed::cache::DiskDone::op_id)
+        .def_ro("success", &tokenspeed::cache::DiskDone::success);
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
@@ -642,6 +683,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("page_offsets", &tokenspeed::SnapshotRestoreBatch::page_offsets)
         .def_ro("source_tiers", &tokenspeed::SnapshotRestoreBatch::source_tiers);
 
+    // Host <-> Disk rows a plan starts on every cache owner's disk executor;
+    // no Device copy, so the data plane leaves them to the control plane.
+    nb::enum_<tokenspeed::DiskOpKind>(cache, "DiskOpKind")
+        .value("Read", tokenspeed::DiskOpKind::kRead)
+        .value("Write", tokenspeed::DiskOpKind::kWrite);
+    nb::class_<tokenspeed::DiskOperation>(cache, "DiskOp")
+        .def_ro("kind", &tokenspeed::DiskOperation::kind)
+        .def_ro("op_id", &tokenspeed::DiskOperation::op_id)
+        .def_ro("group_ids", &tokenspeed::DiskOperation::group_ids)
+        .def_ro("host_blocks", &tokenspeed::DiskOperation::host_blocks)
+        .def_ro("disk_blocks", &tokenspeed::DiskOperation::disk_blocks);
+
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
         for (const auto& op : plan.Operations()) {
@@ -820,6 +873,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "exports none, and reading them changes nothing.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
+        .def("disk_stats", &tokenspeed::Scheduler::GetDiskStats)
         .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)
         .def("storage_quarantined", &tokenspeed::Scheduler::StorageQuarantined)
         .def("storage_negative_keys", &tokenspeed::Scheduler::StorageNegativeKeys)

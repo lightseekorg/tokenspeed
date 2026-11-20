@@ -159,6 +159,28 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (disk_allocator.total_pages < 0) {
+        throw std::invalid_argument("Scheduler: disk_allocator.total_pages must be non-negative");
+    }
+    if (HasDiskCache() != disk_config.has_value()) {
+        throw std::invalid_argument(
+            "Scheduler: a Disk tier (disk_allocator above the null page) requires disk_config, and disk_config "
+            "requires a Disk tier");
+    }
+    if (HasDiskCache()) {
+        disk_config->Validate();
+        // Host writes back to Disk in the background and Disk feeds only Host
+        // (docs/rfcs/0006-disk-tier.md).
+        if (!HasHostCache() || host_write_policy != HostWritePolicy::kWriteBack) {
+            throw std::invalid_argument("Scheduler: a Disk tier requires a Host L2 cache under the write-back policy");
+        }
+        if (disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: a Disk tier needs prefix caching");
+        }
+        if (disk_config->max_host_blocks > host_allocator.NumUsableBlocks()) {
+            throw std::invalid_argument("Scheduler: Disk tier Host credits must not exceed usable Host parents");
+        }
+    }
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
         throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
     }

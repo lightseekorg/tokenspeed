@@ -60,7 +60,9 @@ for settings and defaults.
 ## Request state
 
 A request waiting for QUERY/GET is in the main FSM's `Prefetching` state,
-not in `Submitted` with a second readiness flag. It owns no Device pages or
+not in `Submitted` with a second readiness flag. The Disk tier's prefetch
+(`docs/rfcs/0006-disk-tier.md`) waits in the same state with a lease its own
+transfer manager issues; L3 and the Disk tier never run together. It owns no Device pages or
 request slot and never enters forward candidates, prefill token reservation
 or capacity-retraction demand. A one-shot preparation bit prevents repeated
 storage attempts after a miss, pressure bypass or soft timeout; ordinary

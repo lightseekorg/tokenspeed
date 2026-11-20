@@ -1585,6 +1585,34 @@ Its responsibilities:
   changes eviction eligibility nor needs a second lookup for Device metadata.
   Its pin status is valid only until ownership changes; a later plan inspects
   the entries again.
+* **The Disk tier (local SSD, `docs/rfcs/0006-disk-tier.md`).** A third
+  tier below Host, `CacheTier::kDisk`, with its own `BlockPool` packed like
+  the Host (a Disk block id maps to a file offset as a Host id maps to a Host
+  pool offset). It requires the write-back policy and excludes L3. Its
+  entries hold boundary-tree nodes like the other tiers', so gaps, dead
+  entries and checkpoint dependencies are judged across all three: a page
+  only the Disk holds is no gap, and a checkpoint is dead only when no tier
+  holds the history it needs. Disk feeds only Host -- no admission probe
+  reads it. Two transfers run through `DiskTransferManager`:
+  * *Cleaning* copies dirty Host entries (those the Disk lacks) to Disk ahead
+    of need. A write-back's ACK queues the keys it published on Host; each
+    plan writes the oldest still-dirty ones, each with the dirty Host pages
+    above it nearest the root first, into Disk blocks `DiskCache` places
+    (free capacity, then the Disk's LRU through the shared
+    `TierEvictionPlanner`). The write holds its Host sources and Disk
+    destinations until every owner finished it, then publishes the Disk
+    entries with the Host entries' metadata; a Host placement can then drop
+    the Host copy without loss. Cleaning never removes a Host entry.
+  * *Prefetch* reads a waiting prompt's Disk-only prefix into Host before
+    admission: the Disk's keys of the prompt stand in as Host hits for
+    `ReserveStoragePrefix` (the Host-suffix rule picks the boundary and the
+    keys Host lacks), the request waits in `Prefetching` holding no Device
+    pages, and the read's Host entries are published when every owner
+    finished it and held for the request as its Ready hold, as an L3 GET's
+    are. A failed read drops the Disk entries it read.
+  A Disk entry leaves through `CacheEvictor::EvictDiskCachedBlock` (with its
+  State siblings), dead-entry collection, the tail cap or a clear; eviction
+  does no I/O.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at

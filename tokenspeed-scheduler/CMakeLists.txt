@@ -68,6 +68,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/coordinator/cache_evictor.cpp
     csrc/cache/coordinator/admission_history.cpp
     csrc/cache/coordinator/host_cache.cpp
+    csrc/cache/coordinator/disk_cache.cpp
     csrc/cache/coordinator/prefix_prober.cpp
     csrc/cache/coordinator/storage_queries.cpp
     csrc/cache/coordinator/lone_request_admission.cpp
@@ -77,8 +78,10 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
     csrc/cache/tier/storage_manager.cpp
+    csrc/cache/tier/disk_manager.cpp
     csrc/cache/tier/peer_exports.cpp
     csrc/scheduler/operations/storage.cpp
+    csrc/scheduler/operations/disk.cpp
     csrc/scheduler/operations/peer.cpp
 )
 
@@ -165,6 +168,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_peer_exports.cpp
         tests/cpp/test_peer_scheduler.cpp
         tests/cpp/test_storage_query.cpp
+        tests/cpp/test_disk_tier.cpp
         tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp

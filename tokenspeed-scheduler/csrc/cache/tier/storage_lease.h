@@ -24,15 +24,28 @@
 
 namespace tokenspeed {
 
-class StorageTransferManager;
+class StorageLease;
 
-// A request's claim on one L3 operation it started: a query, or a GET and
-// the Host blocks its ticket holds. The pre-admission state that waits on
-// the operation owns the lease, so whatever ends the wait -- admission, a
-// soft deadline, an abort -- drops it with the state. Dropping it detaches
-// the request from the operation: a finished ticket retires, a command still
-// in the outbox is withdrawn, one already issued is cancelled. Move-only; an
-// empty lease claims nothing. The manager must outlive every lease it issued.
+// What issues storage leases: the L3 transfer manager, or the Disk tier's.
+// Dropping a lease detaches its request from the operation it names.
+class StorageLeaseIssuer {
+protected:
+    friend class StorageLease;
+    StorageLeaseIssuer() = default;
+    StorageLeaseIssuer(const StorageLeaseIssuer&) = default;
+    StorageLeaseIssuer& operator=(const StorageLeaseIssuer&) = default;
+    ~StorageLeaseIssuer() = default;
+    virtual void detach(std::uint64_t operation_id) noexcept = 0;
+};
+
+// A request's claim on one storage operation it started: an L3 query, or an
+// L3 GET or a Disk prefetch and the Host blocks its ticket holds. The
+// pre-admission state that waits on the operation owns the lease, so
+// whatever ends the wait -- admission, a soft deadline, an abort -- drops it
+// with the state. Dropping it detaches the request from the operation: a
+// finished ticket retires, a command still in the outbox is withdrawn, one
+// already issued is cancelled or left to retire on its own. Move-only; an
+// empty lease claims nothing. The issuer must outlive every lease it issued.
 class StorageLease {
 public:
     StorageLease() noexcept = default;
@@ -50,11 +63,12 @@ public:
 
 private:
     friend class StorageTransferManager;
+    friend class DiskTransferManager;
 
-    StorageLease(StorageTransferManager& manager, std::uint64_t operation_id) noexcept
+    StorageLease(StorageLeaseIssuer& manager, std::uint64_t operation_id) noexcept
         : manager_{&manager}, operation_id_{operation_id} {}
 
-    StorageTransferManager* manager_{nullptr};
+    StorageLeaseIssuer* manager_{nullptr};
     std::uint64_t operation_id_{0};
 };
 

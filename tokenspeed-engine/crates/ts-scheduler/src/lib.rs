@@ -353,6 +353,75 @@ mod ffi {
         cleanup_dropped_backup_keys: u64,
     }
 
+    /// The kind of a plan's Disk operation (`DiskOpKind`).
+    #[derive(Debug)]
+    enum DiskOpKind {
+        /// Disk to Host: a prefetch.
+        Read,
+        /// Host to Disk: a cleaning write.
+        Write,
+    }
+
+    /// A Disk operation a plan starts on every cache owner's disk executor
+    /// (`DiskOperation`, `docs/rfcs/0006-disk-tier.md`): row i moves group
+    /// `group_ids[i]`'s block between Host block `host_blocks[i]` and Disk
+    /// block `disk_blocks[i]`.
+    #[derive(Debug, Clone, PartialEq)]
+    struct DiskOpView {
+        /// Which way.
+        kind: DiskOpKind,
+        /// Its id.
+        op_id: u64,
+        /// Each row's cache group, by index.
+        group_ids: Vec<u32>,
+        /// Each row's Host block.
+        host_blocks: Vec<i32>,
+        /// Each row's Disk block.
+        disk_blocks: Vec<i32>,
+    }
+
+    /// A Disk operation every cache owner finished (`cache::DiskDone`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DiskDoneView {
+        /// The operation.
+        op_id: u64,
+        /// Every owner moved every row.
+        success: bool,
+    }
+
+    /// The scheduler's Disk tier observations (`DiskStats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct DiskStatsView {
+        /// Disk operations in flight or holding a request's Host blocks.
+        operations: u64,
+        /// Host blocks Disk operations hold.
+        held_host_blocks: u64,
+        /// Host entries waiting to be cleaned.
+        queued_cleanings: u64,
+        /// Requests waiting for their prefetch.
+        waiting_requests: u64,
+        /// Requests holding a finished prefetch for their admission.
+        ready_requests: u64,
+        /// Disk entries.
+        disk_blocks: u64,
+        /// Empty Disk parents.
+        free_disk_parents: u64,
+        /// Blocks cleaned to Disk, cumulative.
+        written_blocks: u64,
+        /// Blocks prefetched from Disk, cumulative.
+        read_blocks: u64,
+        /// Failed prefetches, cumulative.
+        failed_reads: u64,
+        /// Failed cleaning writes, cumulative.
+        failed_writes: u64,
+        /// Cleaning candidates dropped, cumulative.
+        dropped_cleanings: u64,
+        /// Prefetches that timed out waiting, cumulative.
+        wait_timeouts: u64,
+        /// Ready prefetches that expired, cumulative.
+        ready_expirations: u64,
+    }
+
     /// Prefix-cache hits by tier, cumulative since start (`HostCacheStats`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     struct PrefixHitView {
@@ -638,6 +707,7 @@ mod ffi {
             ticks: &[StorageTickView],
             cancellations: &[StorageCancellationView],
             done: &[StorageDoneView],
+            disk_done: &[DiskDoneView],
             cache_events: &[CacheEvent],
         ) -> Result<()>;
         fn advance_peer(
@@ -703,6 +773,7 @@ mod ffi {
         fn storage_non_storage_clearable(scheduler: &Scheduler) -> bool;
         fn can_prepare_storage_clear(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
+        fn disk_stats(scheduler: &Scheduler) -> DiskStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn cancel_storage_backups(scheduler: Pin<&mut Scheduler>);
@@ -725,6 +796,7 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+        fn plan_disk_ops(plan: &ExecutionPlan) -> Vec<DiskOpView>;
         fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
         /// Install the scheduler's profile span sink, which forwards to
@@ -740,24 +812,27 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
-    PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
-    PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    DiskDoneView, DiskOpKind, DiskOpView, DiskStatsView, ForwardBatchView, ForwardEvent,
+    ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView,
+    PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView, PeerStatsView, PinSampleView,
+    PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
+    StorageStatsView, StorageTickView, TransferBatchView,
 };
 
-/// What advances the scheduler at the head of a round: with L3, the agreed
-/// storage clock, the cancellations and the storage completions; then the
-/// Host copies' acknowledgments.
+/// What advances the scheduler at the head of a round: with L3 or the Disk
+/// tier, the agreed storage clock, the cancellations and the storage and
+/// Disk completions; then the Host copies' acknowledgments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageRound {
-    /// The agreed clock and permissions; `None` without L3.
+    /// The agreed clock and permissions; `None` without L3 or a Disk tier.
     pub tick: Option<StorageTickView>,
     /// Requests cancelled since the last round, in order.
     pub cancellations: Vec<StorageCancellationView>,
     /// Storage operations every owner completed, by op id.
     pub done: Vec<StorageDoneView>,
+    /// Disk operations every owner finished, by op id.
+    pub disk_done: Vec<DiskDoneView>,
 }
 
 extern "C" {
@@ -908,6 +983,7 @@ impl Scheduler {
             ticks,
             &storage.cancellations,
             &storage.done,
+            &storage.disk_done,
             cache_events,
         )
     }
@@ -1072,6 +1148,11 @@ impl Scheduler {
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
+    }
+
+    /// The Disk tier's observations; all zero without one.
+    pub fn disk_stats(&self) -> DiskStatsView {
+        ffi::disk_stats(self.get())
     }
 
     /// Cumulative prefix-cache hits by tier.
@@ -1319,6 +1400,12 @@ impl ExecutionPlan {
     /// runs them on the cache owners' storage executors.
     pub fn storage_ops(&self) -> Vec<StorageOpView> {
         ffi::plan_storage_ops(&self.0)
+    }
+
+    /// The Disk operations the plan starts, in plan order; the control plane
+    /// runs them on the cache owners' disk executors.
+    pub fn disk_ops(&self) -> Vec<DiskOpView> {
+        ffi::plan_disk_ops(&self.0)
     }
 
     /// The peer prefix landings the plan admitted, in plan order.

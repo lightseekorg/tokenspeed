@@ -239,6 +239,7 @@ impl L3 {
             tick: Some(tick),
             cancellations: std::mem::take(&mut self.cancellations),
             done,
+            disk_done: Vec::new(),
         })
     }
 
