@@ -192,7 +192,7 @@ fn registration_reply(frames: &[Bytes]) -> Result<(u64, String, i64), WireError>
         return Err(error("CachePD registration cache identity is invalid"));
     }
     let rank = parse_uint(&frames[3], i64::MAX as u64)
-        .ok_or_else(|| error("CachePD registration acknowledgment rank is invalid"))?;
+        .ok_or_else(|| error("CachePD registration reply rank is invalid"))?;
     Ok((registration_id, cache_id, rank as i64))
 }
 
