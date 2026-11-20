@@ -63,6 +63,7 @@ if current_platform().is_amd:
         "mha_decode_with_kvcache",
         name="gluon_mha_decode_gfx950",
         solution="gluon",
+        features={"rmsnorm_output_gate", "uniform_row_groups"},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
             max_arch_version=ArchVersion(9, 5),
@@ -132,7 +133,7 @@ if current_platform().is_amd:
         "attention",
         "mha_decode_with_kvcache",
         name="gluon_mha_decode_balanced_gfx950",
-        features={"split_schedule"},
+        features={"split_schedule", "rmsnorm_output_gate"},
         priority=Priority.SPECIALIZED,
         **_BALANCED_GFX950,
     )

@@ -97,6 +97,10 @@ using StorageOperation =
 struct StorageStats {
     std::uint64_t operations{0};
     std::uint64_t held_blocks{0};
+    std::uint64_t retained_operations{0};
+    std::uint64_t retained_host_blocks{0};
+    bool retained_capacity_exhausted{false};
+    std::uint64_t retained_capacity_warnings{0};
     std::uint64_t quarantined{0};
     std::uint64_t negative_keys{0};
     std::uint64_t backup_candidates{0};

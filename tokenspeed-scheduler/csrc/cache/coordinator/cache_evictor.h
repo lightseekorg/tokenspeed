@@ -310,6 +310,10 @@ public:
     // ClearCache's eviction of one Host entry, once the whole Host tier was
     // found clearable: no cascade, counted under flush.
     void FlushHostEntry(std::uint32_t group_id, CacheBlockLocation location);
+    // Recovery clear after the Device clear and exact-reference preflight.
+    // Drop every Host index entry, preserving external I/O references, and
+    // count the invalidated entries under flush.
+    void InvalidateHostEntries();
 
     // Cumulative, never reset (accounting only).
     const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }

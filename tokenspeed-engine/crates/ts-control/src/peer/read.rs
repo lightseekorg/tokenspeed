@@ -24,7 +24,7 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, mpsc},
+    sync::{mpsc, Arc},
     thread,
 };
 

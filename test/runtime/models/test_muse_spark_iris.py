@@ -116,6 +116,33 @@ def _communication_worker(rank, world_size, port, check, backend, error_dict):
             dist.destroy_process_group()
 
 
+def _muse_boundary_norms(device):
+    """A Muse layer's post-attention norm (no weight) and pre-feedforward norm,
+    with the model's zero-centered gain, on device in BF16."""
+    from tokenspeed.runtime.models.muse_spark import (
+        ZERO_CENTERED_GAIN_OFFSET,
+        MuseSparkRMSNorm,
+    )
+
+    post_norm = MuseSparkRMSNorm(
+        hidden_size=8192,
+        eps=1e-6,
+        has_weight=False,
+        weight_offset=ZERO_CENTERED_GAIN_OFFSET,
+    )
+    pre_norm = MuseSparkRMSNorm(
+        hidden_size=8192,
+        eps=1e-6,
+        has_weight=True,
+        weight_offset=ZERO_CENTERED_GAIN_OFFSET,
+    ).to(device=device, dtype=torch.bfloat16)
+    # Equal on every rank, without moving the caller's random stream.
+    generator = torch.Generator(device=device).manual_seed(7)
+    with torch.no_grad():
+        pre_norm.weight.copy_(torch.randn(8192, device=device, generator=generator) / 8)
+    return post_norm, pre_norm
+
+
 def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
@@ -135,10 +162,16 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             post_expert_proj=None,
             down_columns=None,
         )
+    # Preparation warms the attention boundary with the first layer's norms.
+    post_norm, pre_norm = _muse_boundary_norms(
+        torch.device("cuda", torch.cuda.current_device())
+    )
     layer = SimpleNamespace(
         iris_state=None,
         self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
         mlp=moe,
+        post_attention_layernorm=post_norm,
+        pre_feedforward_layernorm=pre_norm,
     )
     owner = SimpleNamespace(
         mapping=SimpleNamespace(
@@ -1093,9 +1126,85 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _muse_boundary_warmup_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_lamport_allreduce_muse_attntail,
+    )
+    from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
+        triton_post_norm_residual_pre_norm,
+    )
+
+    # Startup preparation alone must compile the attention boundary's Lamport
+    # push for every row count it serves: rows pick its peer order, staggered
+    # from 5 rows, so batches on both sides of that bound reuse the warmup.
+    _, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
+    post_norm, pre_norm = _muse_boundary_norms(device)
+    torch.manual_seed(11)
+    beta = torch.sigmoid(torch.randn(8192, device=device))
+    alpha = torch.sqrt(1 - beta.square())
+    row_counts = (1, 4, 5, 8, state.boundary_max_rows)
+    bases = [torch.randn(rows, 8192, device=device) for rows in row_counts]
+    streams = [torch.randn_like(base) for base in bases]
+
+    def contribution(base, peer):
+        return (base + (peer + 1) / 8).bfloat16()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    outputs = []
+    with assert_no_triton_compile(iris_fused_lamport_allreduce_muse_attntail):
+        for base, stream in zip(bases, streams):
+            branch = state.all_reduce.acquire_outputs((tuple(base.shape),))[0]
+            branch.copy_(contribution(base, rank))
+            assert state.can_all_reduce_symmetric_boundary(
+                branch, stream, post_norm.weight, alpha, beta, pre_norm.weight
+            )
+            outputs.append(
+                state.all_reduce_symmetric_boundary(
+                    branch,
+                    stream,
+                    post_norm.weight,
+                    alpha,
+                    beta,
+                    pre_norm.weight,
+                    post_norm.eps,
+                    post_norm.weight_offset,
+                    pre_norm.eps,
+                    pre_norm.weight_offset,
+                )
+            )
+    for base, stream, actual in zip(bases, streams, outputs):
+        reduced = sum(contribution(base, peer).float() for peer in range(world_size))
+        expected = triton_post_norm_residual_pre_norm(
+            stream,
+            reduced.bfloat16(),
+            post_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            alpha,
+            beta,
+            pre_norm.weight,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+            False,
+            None,
+            1,
+        )
+        for got, reference in zip(actual, expected):
+            torch.testing.assert_close(
+                got,
+                reference,
+                atol=1e-5 if got.dtype == torch.float32 else 0.015625,
+                rtol=2e-5 if got.dtype == torch.float32 else 0.008,
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 @pytest.mark.parametrize(
     "check,backend",
     [
+        pytest.param(_muse_boundary_warmup_worker, "nccl", id="boundary_warmup"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(

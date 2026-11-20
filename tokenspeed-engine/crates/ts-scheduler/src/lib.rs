@@ -315,6 +315,14 @@ mod ffi {
         operations: u64,
         /// Host blocks storage operations hold.
         held_blocks: u64,
+        /// Old-generation tickets still charged to the operation limit.
+        retained_operations: u64,
+        /// Host references retained by old-generation tickets.
+        retained_host_blocks: u64,
+        /// A global operation or Host-reference limit is full with retained work.
+        retained_capacity_exhausted: bool,
+        /// Capacity warnings emitted on transitions into exhaustion, cumulative.
+        retained_capacity_warnings: u64,
         /// Host blocks quarantined after unproven retirement.
         quarantined: u64,
         /// Keys known to be absent from the store.
@@ -689,9 +697,19 @@ mod ffi {
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
+        fn storage_current_pending(scheduler: &Scheduler) -> bool;
+        fn storage_progress_pending(scheduler: &Scheduler) -> bool;
+        fn storage_blocking_quarantined(scheduler: &Scheduler) -> usize;
+        fn storage_non_storage_clearable(scheduler: &Scheduler) -> bool;
+        fn can_prepare_storage_clear(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn cancel_storage_backups(scheduler: Pin<&mut Scheduler>);
+        fn cancel_storage_for_clear(scheduler: Pin<&mut Scheduler>);
+        fn can_clear_cache_retaining_storage(scheduler: &Scheduler) -> bool;
+        fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
@@ -1024,6 +1042,33 @@ impl Scheduler {
         ffi::storage_pending(self.get())
     }
 
+    /// Current-generation tickets remain, including unknown retirement.
+    pub fn storage_current_pending(&self) -> bool {
+        ffi::storage_current_pending(self.get())
+    }
+
+    /// Current storage work can still advance through completion or deadlines.
+    /// Retained and terminal-unknown tickets keep their resources but do not count.
+    pub fn storage_progress_pending(&self) -> bool {
+        ffi::storage_progress_pending(self.get())
+    }
+
+    /// Current-generation quarantined tickets blocking new storage work.
+    pub fn storage_blocking_quarantined(&self) -> usize {
+        ffi::storage_blocking_quarantined(self.get())
+    }
+
+    /// Ordinary indexed-pin preflight after storage references drain.
+    pub fn storage_non_storage_clearable(&self) -> bool {
+        ffi::storage_non_storage_clearable(self.get())
+    }
+
+    /// Ordinary clear preparation, discounting only real storage pins on
+    /// indexed Host entries. Recovery requires its separate exact preflight.
+    pub fn can_prepare_storage_clear(&self) -> bool {
+        ffi::can_prepare_storage_clear(self.get())
+    }
+
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
@@ -1048,12 +1093,42 @@ impl Scheduler {
         ffi::clear_cache(self.pinned())
     }
 
+    /// Abandon best-effort PUTs before a flush. The next plan carries any
+    /// runtime cancellations; dispatched sources stay pinned until retired.
+    pub fn cancel_storage_backups(&mut self) {
+        ffi::cancel_storage_backups(self.pinned());
+    }
+
+    /// After replica-agreed non-storage preflight, detach request storage
+    /// leases and backups so healthy work can drain without attached holds.
+    pub fn cancel_storage_for_clear(&mut self) {
+        ffi::cancel_storage_for_clear(self.pinned());
+    }
+
+    /// Whether a full clear may retain only the storage tickets' Host blocks.
+    /// Other cache pins, Device transfers and suspended requests still refuse.
+    pub fn can_clear_cache_retaining_storage(&self) -> bool {
+        ffi::can_clear_cache_retaining_storage(self.get())
+    }
+
+    /// Clear cache indexes while preserving detached old storage references.
+    /// The runtime must move subsequent work to a fresh cache generation.
+    pub fn clear_cache_retaining_storage(&mut self) -> bool {
+        ffi::clear_cache_retaining_storage(self.pinned())
+    }
+
+    /// Old storage references survived a clear and still consume capacity.
+    pub fn storage_has_retained_operations(&self) -> bool {
+        ffi::storage_has_retained_operations(self.get())
+    }
+
     /// Drop the Device L1 prefix index only, under the same refusals.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
     }
 
-    /// Whether [`Scheduler::clear_cache`] would succeed now; changes nothing.
+    /// Whether current references permit a full clear, without cancelling
+    /// backups or changing any state.
     pub fn can_clear_cache(&self) -> bool {
         ffi::can_clear_cache(self.get())
     }

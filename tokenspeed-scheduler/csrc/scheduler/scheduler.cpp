@@ -212,8 +212,56 @@ bool Scheduler::ClearCache() {
     return clearCache(true);
 }
 
+void Scheduler::CancelStorageBackups() {
+    if (storage_transfers_) storage_transfers_->CancelBackups();
+}
+
+void Scheduler::CancelStorageForClear() {
+    for (auto& request : requests_) releaseStorage(*request);
+    CancelStorageBackups();
+}
+
 bool Scheduler::CanClearCache() const {
     return cacheIsClearable(true);
+}
+
+bool Scheduler::CanPrepareStorageClear() const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    const auto storage_refs =
+        storage_transfers_ ? storage_transfers_->HeldBlockRefs() : std::vector<const CacheBlockRef*>{};
+    return coordinator_.CacheIsClearableAfterStorageDrain(storage_refs);
+}
+
+bool Scheduler::CanClearCacheRetainingStorage() const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    std::vector<const CacheBlockRef*> retained;
+    if (storage_transfers_) {
+        std::vector<std::uint64_t> leases;
+        for (const auto& request : requests_) {
+            if (const auto* prefetch = request->GetIf<fsm::Prefetching>(); prefetch && prefetch->lease) {
+                leases.push_back(prefetch->lease.OperationId());
+            }
+            if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_hold) {
+                leases.push_back(admission->storage_hold->lease.OperationId());
+            }
+        }
+        if (!storage_transfers_->CanRetainForClear(leases)) return false;
+        retained = storage_transfers_->HeldBlockRefs();
+    }
+    return coordinator_.CacheIsClearableRetainingStorage(retained);
+}
+
+bool Scheduler::ClearCacheRetainingStorage() {
+    if (!CanClearCacheRetainingStorage()) return false;
+    CancelStorageForClear();
+    if (storage_transfers_) storage_transfers_->RetainForClear();
+    coordinator_.ClearCacheRetainingStorage();
+    spdlog::info("[Scheduler] flush completed with old storage references retained; remaining L3 capacity available");
+    return true;
 }
 
 bool Scheduler::cacheIsClearable(bool include_host) const {
@@ -725,6 +773,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
             storage_transfers_->StartBackups();
         else
             storage_transfers_->DropBackups();
+        storage_transfers_->UpdateRetainedCapacityWarning();
         storage_operations = storage_transfers_->TakeCommands();
     }
 
@@ -799,10 +848,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
 }
 
 void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
-    // With nothing out, only a new submission or an abort can change the next
-    // plan.
-    const bool stalled = forward_allowed_ && (!storage_transfers_ || !storage_transfers_->HasPending()) &&
-                         num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+    // Retained and terminal-unknown storage only protect their own addresses;
+    // waiting for them cannot make a blocked request progress.
+    const bool stalled = forward_allowed_ && !StorageProgressPending() && num_live_requests > 0 && plan_is_empty &&
+                         !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
                              return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
                          });

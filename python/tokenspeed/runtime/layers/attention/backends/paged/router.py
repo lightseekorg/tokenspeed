@@ -1018,6 +1018,9 @@ class CacheGroupRouter(AttentionBackend):
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 
+    def gates_decode_output(self, layer):
+        return self._leaf_for(layer).gates_decode_output(layer)
+
     def decode_kv_view(self, layer, token_to_kv_pool):
         return self._leaf_for(layer).decode_kv_view(layer, token_to_kv_pool)
 

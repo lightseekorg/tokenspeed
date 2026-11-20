@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     verify_rows_top_k_top_p_from_pools,
     verify_tree,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import (
@@ -199,6 +201,8 @@ class TritonSamplingBackend(SamplingBackend):
         # membership moves; a steady decode batch pays nothing here.
         self._route_cache: tuple[int, int] | None = None
         self._route_cache_epoch: int | None = None
+        # Set while _warm_sampling_variants re-enters sample / verify.
+        self._warming_sampling_variants = False
 
     def _init_vocab_shard_buffers(self, config: SamplingBackendConfig) -> None:
         """Scratch of the top-k routes' selection from vocabulary shards.
@@ -1162,6 +1166,39 @@ class TritonSamplingBackend(SamplingBackend):
             reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
 
+    def _warm_sampling_variants(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
+    ) -> None:
+        """Compile the eager top-k routes during the startup warm-up.
+
+        The warm decode and graph capture verify at 128 candidates only. An
+        eager step whose finite top_k all fit in 64 selects 64
+        (``_select_top_k_top_p_pad``), and the first token after a prefill is
+        a one-row ``sample``; both compile their own top-k kernels. Sampling
+        and verifying this step's logits at each count, with the same dtype
+        and window as serving, compiles them before serving starts.
+        """
+        logits = logits_output.next_token_logits
+        saved = (self._sample_route, self._top_k_top_p_pad)
+        self._warming_sampling_variants = True
+        try:
+            self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K
+            for pad in (_TOP_K_TOP_P_SMALL_PAD, _TOP_K_TOP_P_PAD):
+                self._top_k_top_p_pad = pad
+                self.sample(
+                    dataclasses.replace(logits_output, next_token_logits=logits[:1]),
+                    sampling_info[:1],
+                )
+                self.verify(logits_output, sampling_info, candidates, tree=tree)
+        finally:
+            self._sample_route, self._top_k_top_p_pad = saved
+            self._warming_sampling_variants = False
+
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
         self,
@@ -1171,6 +1208,14 @@ class TritonSamplingBackend(SamplingBackend):
         *,
         tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            is_warming_up()
+            and not self._warming_sampling_variants
+            and logits_output.next_token_logits is not None
+        ):
+            self._warm_sampling_variants(
+                logits_output, sampling_info, candidates, tree=tree
+            )
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 

@@ -69,18 +69,18 @@ branch is retained only as a kernel-level config.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import _n16_weight_offset
+
+# Both stages' wide tiles run the same 64 x 256 E2M1 GEMM.
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
     B_LAYOUT_GDOT128,
     B_LAYOUT_MFMA16,
     B_LAYOUT_N16,
+    _wide_tile_gemm,
 )
 
-_USES_FP32_ATOMIC: Optional[bool] = None
 _NUM_XCDS = 8
 
 
@@ -156,6 +156,29 @@ def _load_a_to_shared(
         # The compiler's LDS dependence analysis orders this store against
         # the previous tile's cross-wave reads and the reads that follow.
         destination.store(values)
+
+
+@gluon.jit
+def _xcd_m_fast_tile(flat_tile, valid_pid_m, num_pid_m, num_pid_n, NUM_XCDS):
+    """``(pid_m, pid_n)`` of program ``flat_tile`` when consecutive programs go
+    to consecutive XCDs: each XCD walks a contiguous floor/ceil share of the
+    ``valid_pid_m x num_pid_n`` tiles, M fastest. Programs past the valid
+    tiles get ``pid_m = num_pid_m``."""
+    grid_mn = valid_pid_m * num_pid_n
+    pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = grid_mn % NUM_XCDS
+    tall_xcds = gl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
+    xcd = flat_tile % NUM_XCDS
+    local_pid = flat_tile // NUM_XCDS
+    logical = gl.where(
+        xcd < tall_xcds,
+        xcd * pids_per_xcd + local_pid,
+        tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid,
+    )
+    in_valid = flat_tile < grid_mn
+    pid_m = gl.where(in_valid, logical % gl.maximum(valid_pid_m, 1), num_pid_m)
+    pid_n = gl.where(in_valid, logical // gl.maximum(valid_pid_m, 1), 0)
+    return pid_m, pid_n
 
 
 # ---------------------------------------------------------------------------
@@ -445,27 +468,13 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 pid_n = flat_tile % num_pid_n
             elif NUM_XCDS != 1:
                 # Keep an expert's N-tile weights in one XCD's L2; empty tiles exit.
-                valid_pid_m = gl.minimum(
-                    gl.cdiv(num_tokens_post_padded, BLOCK_M), num_pid_m
+                pid_m, pid_n = _xcd_m_fast_tile(
+                    flat_tile,
+                    gl.minimum(gl.cdiv(num_tokens_post_padded, BLOCK_M), num_pid_m),
+                    num_pid_m,
+                    num_pid_n,
+                    NUM_XCDS,
                 )
-                grid_mn = valid_pid_m * num_pid_n
-                pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
-                tall_xcds = grid_mn % NUM_XCDS
-                tall_xcds = gl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
-                xcd = flat_tile % NUM_XCDS
-                local_pid = flat_tile // NUM_XCDS
-                logical = gl.where(
-                    xcd < tall_xcds,
-                    xcd * pids_per_xcd + local_pid,
-                    tall_xcds * pids_per_xcd
-                    + (xcd - tall_xcds) * (pids_per_xcd - 1)
-                    + local_pid,
-                )
-                in_valid = flat_tile < grid_mn
-                pid_m = gl.where(
-                    in_valid, logical % gl.maximum(valid_pid_m, 1), num_pid_m
-                )
-                pid_n = gl.where(in_valid, logical // gl.maximum(valid_pid_m, 1), 0)
             else:
                 pid_m = flat_tile % num_pid_m
                 pid_n = flat_tile // num_pid_m
@@ -1700,6 +1709,158 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         gl.atomic_add(p3, c3_co, mask=m3, sem="relaxed")
 
 
+# Token and route counts follow the batch and only bound masks; neither may
+# select a binary.
+def _stage2_wide_launch_metadata(grid, kernel, args):
+    """Report the sorted-route count and padded W2 work of the wide tile."""
+    return {
+        "name": f"{kernel.name} (EM={args['EM']})",
+        "flops8": 2 * args["EM"] * args["K"] * args["N"],
+    }
+
+
+@gluon.jit(
+    launch_metadata=_stage2_wide_launch_metadata,
+    do_not_specialize=["EM", "token_num"],
+)
+def gluon_mxfp4_moe_stage2_e2m1_wide_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scales_ptr,
+    b_scales_ptr,
+    sorted_token_ids_ptr,
+    sorted_expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    sorted_weights_ptr,
+    EM,
+    token_num,
+    top_k,
+    stride_am,
+    stride_be,
+    stride_cm,
+    stride_bse_e,
+    stride_bse_n,
+    stride_se_n_pad,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    SORT_BLOCK_M: gl.constexpr,
+    APPLY_ROUTED_WEIGHT: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """Reduce-mode E2M1 stage 2 on 64-row x 256-column tiles, 4 waves.
+
+    Writes each route's row of ``inter @ w2_e.T`` (times its routed weight
+    when ``APPLY_ROUTED_WEIGHT``) as BF16 to ``c[token * top_k + slot]``,
+    bit for bit as ``gluon_mxfp4_moe_stage2_1x2_kernel`` does in reduce mode:
+    the same ``v_mfma_scale_f32_16x16x128_f8f6f4`` products accumulate over
+    128-wide K steps in ascending order from zero, then round once to BF16.
+    Its 128-wide K tiles become ``_wide_tile_gemm``'s 256-wide ones (two MFMA
+    steps each), with activations two K tiles ahead and weights one ahead, so
+    a 64-row tile keeps the MFMAs fed where the general tile drains its loads
+    every second K step.
+
+    Rows arrive in sorted order (stage 1's output). ``SORT_BLOCK_M`` is the
+    sort's block height (64 or 128), shared with stage 1; a 128-row block is
+    two of these tiles with the block's expert. The epilogue redistributes
+    the whole 64 x 256 BF16 tile once and stores each row as one contiguous
+    span.
+    """
+    BLOCK_M: gl.constexpr = 64
+    BLOCK_N: gl.constexpr = 256
+    NUM_K_TILES: gl.constexpr = K // 256
+    gl.static_assert(K % 256 == 0, "the wide stage-2 tile takes 256-wide K tiles")
+    gl.static_assert(N % BLOCK_N == 0)
+    gl.static_assert(SORT_BLOCK_M % BLOCK_M == 0)
+
+    flat_tile = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(EM, BLOCK_M)
+    num_pid_n: gl.constexpr = N // BLOCK_N
+    num_tokens_post_padded = gl.load(num_tokens_post_padded_ptr)
+    if NUM_XCDS != 1:
+        # As the general reduce-mode tile: each XCD takes a contiguous run of
+        # M-fast tiles, so consecutive tiles share an expert's weight columns
+        # in its L2; tiles past the valid rows exit.
+        pid_m, pid_n = _xcd_m_fast_tile(
+            flat_tile,
+            gl.minimum(gl.cdiv(num_tokens_post_padded, BLOCK_M), num_pid_m),
+            num_pid_m,
+            num_pid_n,
+            NUM_XCDS,
+        )
+    else:
+        pid_m = flat_tile % num_pid_m
+        pid_n = flat_tile // num_pid_m
+    if pid_m * BLOCK_M >= num_tokens_post_padded:
+        return
+    off_experts = gl.load(sorted_expert_ids_ptr + pid_m // (SORT_BLOCK_M // BLOCK_M))
+    # Blocks of experts outside this rank's range carry -1 and write nothing.
+    if off_experts == -1:
+        return
+
+    acc_group0, acc_group1 = _wide_tile_gemm(
+        a_ptr,
+        stride_am,
+        a_scales_ptr,
+        stride_se_n_pad,
+        b_ptr,
+        stride_be,
+        b_scales_ptr,
+        stride_bse_e,
+        # Dwords per 32-row panel of the weight scales.
+        stride_bse_n * 8,
+        sorted_token_ids_ptr,
+        EM,
+        token_num,
+        off_experts,
+        pid_m,
+        pid_n,
+        N,
+        NUM_K_TILES,
+        INPUT_SORTED=True,
+    )
+
+    # ---- epilogue: one pass over the 64 x 256 BF16 tile ---------------------
+    # Round the accumulator to BF16, then multiply by the BF16 routed weight,
+    # in the general tile's order.
+    c_group0 = acc_group0.to(c_ptr.type.element_ty)
+    c_group1 = acc_group1.to(c_ptr.type.element_ty)
+    if APPLY_ROUTED_WEIGHT:
+        # Rows of valid tiles are below EM, so the weights need no mask.
+        group_m: gl.constexpr = BLOCK_M // 2
+        weight_rows = pid_m * BLOCK_M + gl.arange(
+            0, group_m, layout=gl.SliceLayout(1, acc_group0.type.layout)
+        )
+        weight0 = gl.load(sorted_weights_ptr + weight_rows)
+        weight1 = gl.load(sorted_weights_ptr + weight_rows + group_m)
+        c_group0 = c_group0 * weight0[:, None].to(c_group0.dtype)
+        c_group1 = c_group1 * weight1[:, None].to(c_group1.dtype)
+    # [32, 256] x 2 -> [64, 256], rows 32-63 below rows 0-31.
+    c_tile = gl.join(c_group0, c_group1).permute((2, 0, 1)).reshape((BLOCK_M, BLOCK_N))
+    # A half wave stores one row's 256 columns (512 bytes) per instruction.
+    store_layout: gl.constexpr = gl.BlockedLayout([1, 8], [2, 32], [4, 1], [1, 0])
+    c_tile = gl.convert_layout(c_tile, store_layout)
+    offs_route = pid_m * BLOCK_M + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, store_layout)
+    )
+    packed_route = gl.load(
+        sorted_token_ids_ptr + offs_route, mask=offs_route < EM, other=token_num
+    )
+    token_id = packed_route & 0xFFFFFF
+    dst_row = token_id * top_k + (packed_route >> 24)
+    offs_cn = pid_n * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, store_layout)
+    )
+    # ``.cs`` (streaming): the reduction or the deferred consumer reads each
+    # partial once.
+    gl.store(
+        c_ptr + dst_row[:, None].to(gl.int64) * stride_cm + offs_cn[None, :],
+        c_tile,
+        mask=(token_id < token_num)[:, None],
+        cache_modifier=".cs",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reduce kernel (sums [token, topk, N] -> [token, N], fp32 accumulate)
 # ---------------------------------------------------------------------------
@@ -1790,29 +1951,6 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
 # ---------------------------------------------------------------------------
 
 
-def _record_atomic_lowering() -> None:
-    global _USES_FP32_ATOMIC
-    try:
-        kf = gluon_mxfp4_moe_stage2_1x2_kernel
-        for cache_tuple in getattr(kf, "device_caches", {}).values():
-            kernel_cache = cache_tuple[0]
-            for compiled in kernel_cache.values():
-                asm = getattr(compiled, "asm", None)
-                if asm is None or "amdgcn" not in asm:
-                    continue
-                amdgcn = asm["amdgcn"]
-                if "pk_add_bf16" in amdgcn:
-                    _USES_FP32_ATOMIC = False
-                    return
-                # ``pk_add_bf16`` was ruled out above, so any remaining
-                # ``atomic_add_f32`` is a true fp32 atomic lowering.
-                if "atomic_add_f32" in amdgcn:
-                    _USES_FP32_ATOMIC = True
-                    return
-    except Exception:
-        return
-
-
 def invoke_gluon_mxfp4_moe_stage2_1x2(
     inter_states,
     w1,
@@ -1842,6 +1980,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     deferred_out: torch.Tensor | None = None,
     *,
     b_layout: int,
+    wide_tile: bool,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 2.
 
@@ -1894,6 +2033,12 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         sorted_*     : generated with ``sort_block_m`` when it differs
                        from compute ``block_m``; use 16/32/64/128 to mirror
                        FlyDSL sort_block_m
+
+    ``wide_tile`` selects ``gluon_mxfp4_moe_stage2_e2m1_wide_gfx950`` (64-row
+    x 256-column tiles, 256-wide K tiles, activations two K tiles ahead) for
+    reduce mode over sorted E2M1 rows, GDOT128 weights and 64- or 128-row sort
+    blocks; ``block_m`` must be 64. Each route's row is bitwise the same as
+    the general tile's; other configurations raise ``ValueError``.
 
     Unsupported: ``quant_type`` and ``activation`` are signature
     stubs (kernel does the down-projection with no activation);
@@ -2100,51 +2245,104 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         c_stride_m = out.stride(0)
         c_stride_n = out.stride(1)
 
-    # Step 5: GEMM. Writes either to `partials` (reduce mode) or directly
-    # to `out` (atomic mode), selected by ``USE_REDUCE``.
-    gluon_mxfp4_moe_stage2_1x2_kernel[grid](
-        kernel_inter,
-        w2,
-        c_ptr,
-        a2_scale,
-        w2_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids_ptr,
-        sorted_weights,
-        N,
-        K,
-        EM,
-        token_num,
-        topk,
-        stride_am,
-        stride_ak,
-        stride_be,
-        c_stride_m,
-        c_stride_n,
-        stride_bse_e,
-        stride_bse_n,
-        stride_se_n_pad,
-        K_PACKED_TOTAL=K_packed_total,
-        N_PHYS=N,
-        BLOCK_M=BLOCK_M,
-        SORT_BLOCK_M=SORT_BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        NUM_WARPS=NUM_WARPS,
-        B_LAYOUT=int(b_layout),
-        USE_REDUCE=_use_reduce,
-        MFMA_STORE_LAYOUT=_mfma_store_layout,
-        PERSISTENT=PERSISTENT,
-        COALESCE_SCALES=COALESCE_SCALES,
-        DIRECT_SCALE_LAYOUT=DIRECT_SCALE_LAYOUT,
-        DEFER_EPILOGUE=DEFER_EPILOGUE,
-        APPLY_ROUTED_WEIGHT=do_finalize,
-        INPUT_SORTED=bool(input_sorted),
-        A_FORMAT=a_format,
-        NUM_XCDS=_NUM_XCDS if _use_reduce else 1,
-        num_warps=NUM_WARPS,
-    )
+    if wide_tile:
+        if not (
+            _use_reduce
+            and a_format == "e2m1"
+            and b_layout == B_LAYOUT_GDOT128.value
+            and input_sorted
+            and BLOCK_M == 64
+            and SORT_BLOCK_M in (64, 128)
+            and EM % 64 == 0
+            and K % 256 == 0
+            and K >= 512
+            and N % 256 == 0
+            and stride_ak == 1
+            and c_stride_n == 1
+        ):
+            raise ValueError(
+                "the wide stage-2 tile serves reduce mode over sorted E2M1 rows "
+                "with GDOT128 weights, block_m 64 over 64- or 128-row sort "
+                "blocks (EM a multiple of 64), K and N multiples of 256 with K at "
+                "least 512, and unit column strides; got "
+                f"reduce={_use_reduce}, a_format={a_format}, "
+                f"b_layout={b_layout}, input_sorted={input_sorted}, "
+                f"block_m={BLOCK_M}, sort_block_m={SORT_BLOCK_M}, EM={EM}, "
+                f"K={K}, N={N}, "
+                f"strides ({stride_ak}, {c_stride_n})"
+            )
+        gluon_mxfp4_moe_stage2_e2m1_wide_gfx950[(triton.cdiv(EM, 64) * (N // 256),)](
+            kernel_inter,
+            w2,
+            c_ptr,
+            a2_scale,
+            w2_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids_ptr,
+            sorted_weights,
+            EM,
+            token_num,
+            topk,
+            stride_am,
+            stride_be,
+            c_stride_m,
+            stride_bse_e,
+            stride_bse_n,
+            stride_se_n_pad,
+            K=K,
+            N=N,
+            SORT_BLOCK_M=SORT_BLOCK_M,
+            APPLY_ROUTED_WEIGHT=do_finalize,
+            NUM_XCDS=_NUM_XCDS,
+            num_warps=4,
+        )
+    else:
+        # Step 5: GEMM. Writes either to `partials` (reduce mode) or directly
+        # to `out` (atomic mode), selected by ``USE_REDUCE``.
+        gluon_mxfp4_moe_stage2_1x2_kernel[grid](
+            kernel_inter,
+            w2,
+            c_ptr,
+            a2_scale,
+            w2_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids_ptr,
+            sorted_weights,
+            N,
+            K,
+            EM,
+            token_num,
+            topk,
+            stride_am,
+            stride_ak,
+            stride_be,
+            c_stride_m,
+            c_stride_n,
+            stride_bse_e,
+            stride_bse_n,
+            stride_se_n_pad,
+            K_PACKED_TOTAL=K_packed_total,
+            N_PHYS=N,
+            BLOCK_M=BLOCK_M,
+            SORT_BLOCK_M=SORT_BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            NUM_WARPS=NUM_WARPS,
+            B_LAYOUT=int(b_layout),
+            USE_REDUCE=_use_reduce,
+            MFMA_STORE_LAYOUT=_mfma_store_layout,
+            PERSISTENT=PERSISTENT,
+            COALESCE_SCALES=COALESCE_SCALES,
+            DIRECT_SCALE_LAYOUT=DIRECT_SCALE_LAYOUT,
+            DEFER_EPILOGUE=DEFER_EPILOGUE,
+            APPLY_ROUTED_WEIGHT=do_finalize,
+            INPUT_SORTED=bool(input_sorted),
+            A_FORMAT=a_format,
+            NUM_XCDS=_NUM_XCDS if _use_reduce else 1,
+            num_warps=NUM_WARPS,
+        )
 
     if _use_reduce and do_finalize:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
@@ -2170,8 +2368,6 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             MASK_INVALID_ROUTES=False,
             num_warps=NUM_WARPS_R,
         )
-    if _USES_FP32_ATOMIC is None:
-        _record_atomic_lowering()
     if not do_finalize:
         return partials.view(token_num * topk, N)
     return out

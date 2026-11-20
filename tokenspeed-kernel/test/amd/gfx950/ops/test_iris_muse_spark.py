@@ -2335,7 +2335,7 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
     def two_shot_programs(count):
         """Programs of the generic reduction's two-shot launch, or zero."""
         selected = (
-            reduction.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            reduction.lamport_two_shot_min_numel
             <= count
             <= reduction.lamport_two_shot_max_numel
             and count % two_shot_tile == 0
@@ -2583,16 +2583,12 @@ def _muse_lamport_payload_worker(rank, world_size, device):
     """Distinct per-rank data through each Lamport protocol, grid, and stage."""
     state = _muse_state(rank, device, 128, True)
     reduction = state.reduction
-    two_shot = world_size == 8
-    if two_shot:
-        assert reduction.lamport_two_shot_max_numel == 128 * 8192
-    else:
-        assert reduction.lamport_two_shot_epochs is None
+    assert reduction.lamport_two_shot_max_numel == 128 * 8192
     # (elements, in place, protocol). One-shot: one and eight tiles, one route
     # token, and a two-shot-sized payload of partial two-shot tiles. TP8
     # two-shot: the smallest payload, route tokens 2..32 including the largest
-    # one-shot payload, and the full capacity. TP4 has no two-shot; its larger
-    # payloads use push.
+    # one-shot payload, and the full capacity. TP4 keeps the one-shot over its
+    # whole window, so its two-shot starts above the largest one-shot payload.
     cases = (
         (512, False, "one"),
         (8 * 512, False, "one"),
@@ -2608,9 +2604,9 @@ def _muse_lamport_payload_worker(rank, world_size, device):
         (524288, True, "two"),
         (1048576, False, "two"),
     )
-    if not two_shot:
+    if world_size == 4:
         cases = tuple(
-            (count, in_place, "one" if count <= 43 * 4096 else "push")
+            (count, in_place, "one" if count <= 43 * 4096 else "two")
             for count, in_place, _ in cases
         )
     generator = torch.Generator().manual_seed(4096 + world_size)
@@ -2657,20 +2653,19 @@ def _muse_lamport_payload_worker(rank, world_size, device):
     # Each Lamport call advances the stage of exactly the programs it launched.
     for (count, _, protocol), value, output in zip(cases, inputs, outputs, strict=True):
         one_shot = reduction.lamport_epochs.clone()
-        two = two_shot and reduction.lamport_two_shot_epochs.clone()
+        two = reduction.lamport_two_shot_epochs.clone()
         value.copy_(payloads[0][rank, :1].expand(count))
         reduction.run(value, output, count)
         advanced = (reduction.lamport_epochs != one_shot).sum().item()
         assert advanced == (count // 512 if protocol == "one" else 0)
-        if two_shot:
-            advanced = (reduction.lamport_two_shot_epochs != two).sum().item()
-            assert advanced == (count // 1024 if protocol == "two" else 0)
+        # One two-shot program reduces a 128-element tile of every shard.
+        advanced = (reduction.lamport_two_shot_epochs != two).sum().item()
+        assert advanced == (count // (world_size * 128) if protocol == "two" else 0)
     load(1)
     check(run(), 1)
     # Start the capture from the last stage so replays wrap the rotation.
     reduction.lamport_epochs.fill_(2)
-    if two_shot:
-        reduction.lamport_two_shot_epochs.fill_(2)
+    reduction.lamport_two_shot_epochs.fill_(2)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
@@ -2684,6 +2679,48 @@ def _muse_lamport_payload_worker(rank, world_size, device):
         graph.replay()
         torch.cuda.synchronize()
         check(results, scale)
+    dist.barrier()
+
+
+def _muse_lamport_two_shot_order_worker(rank, world_size, device):
+    """The Lamport two-shot adds in the order of the path it replaced.
+
+    At TP4 it took over the push two-shot's payloads (above the one-shot
+    window), so it must add FP32 (r0 + r1) + (r2 + r3) as the push does; at
+    TP8 it adds in rank order, as the one-shot does. Inexact sums (BF16 values
+    with widely spread exponents) tell the orders apart, which the exact
+    payloads above cannot.
+    """
+    state = _muse_state(rank, device, 128, True)
+    reduction = state.reduction
+    # Served all-reduce rows above the TP4 one-shot window (22 x 8192 elements
+    # and up) to the two-shot capacity.
+    counts = (22 * 8192, 50 * 8192, 64 * 8192, 128 * 8192)
+    generator = torch.Generator().manual_seed(77 + world_size)
+    for count in counts:
+        # Exponents spread over 2**-24..1, so the FP32 sum of the four terms
+        # is often inexact and its order shows after the BF16 rounding.
+        scale = torch.exp2(
+            -torch.randint(0, 25, (world_size, count), generator=generator).float()
+        )
+        values = (
+            torch.randn((world_size, count), generator=generator) * scale
+        ).bfloat16()
+        value = values[rank].to(device)
+        output = torch.empty_like(value)
+        two = reduction.lamport_two_shot_epochs.clone()
+        actual = reduction.run(value, output, count)[:count].clone()
+        assert (reduction.lamport_two_shot_epochs != two).any(), count
+        terms = values.float()
+        if world_size == 4:
+            reduced = (terms[0] + terms[1]) + (terms[2] + terms[3])
+        else:
+            reduced = terms[0]
+            for peer in range(1, world_size):
+                reduced = reduced + terms[peer]
+        torch.testing.assert_close(
+            actual, reduced.bfloat16().to(device), atol=0, rtol=0
+        )
     dist.barrier()
 
 
@@ -3126,7 +3163,14 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
             deterministic_order=True,
         )
         routes = MXFP4SortedRoutes(
-            sorted_ids, sorted_weights, expert_ids, valid, block, rows, 8
+            sorted_ids,
+            sorted_weights,
+            expert_ids,
+            valid,
+            block,
+            rows,
+            8,
+            wide_tiles=False,
         )
         return routes, weights
 
@@ -3388,6 +3432,9 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
             id="sliding_attention_tail_epoch_wrap",
         ),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
+        pytest.param(
+            _muse_lamport_two_shot_order_worker, "nccl", id="lamport_two_shot_order"
+        ),
         pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
         pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
         pytest.param(_muse_tp_column_routes_worker, "nccl", id="tp_column_routes"),
