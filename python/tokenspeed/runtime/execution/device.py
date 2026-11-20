@@ -1300,8 +1300,11 @@ def _capture_serving_graphs(
     if executor.drafter is not None:
         with startup_phase("drafter.profile"):
             executor.drafter.profile_startup(executor)
-    if replays_prefill_graphs and not executor.prefill_graph.disable:
-        # Release capture-stream cache no forward reuses; graph pools are not freed.
+    if (replays_prefill_graphs and not executor.prefill_graph.disable) or (
+        server_args.device == "npu" and server_args.disaggregation_mode == "prefill"
+    ):
+        # Ascend eager Prefill also needs driver memory for lazy operator loading.
+        # Return unused startup blocks before serving. Live and graph storage stay bound.
         device_module = torch.get_device_module(server_args.device)
         before = device_module.memory_reserved() - device_module.memory_allocated()
         device_module.empty_cache()
@@ -1742,10 +1745,14 @@ def build_device_side(
     )
     views = pool_views(attention)
 
-    # On CUDA, what startup keeps resident after the probe build joins the reserve.
+    # The first cache profile precedes executor setup. Charge only what stays
+    # on the device after setup and tuning release their temporary allocations.
+    measure_startup = probing and (
+        server_args.device == "npu" or current_platform().is_nvidia
+    )
     startup_memory = (
         DriverMemoryDeltaObserver(torch.get_device_module(server_args.device), gpu_id)
-        if probing and current_platform().is_nvidia
+        if measure_startup
         else NULL_MEMORY_DELTA_OBSERVER
     )
     with startup_memory.measure("startup"), startup_phase("executor.init"):
@@ -1779,7 +1786,7 @@ def build_device_side(
         current_platform().restore_stack_limit(),
     ):
         executor.autotune(keep_loaded_tactics=False)
-    if probing and current_platform().is_nvidia:
+    if measure_startup:
         # After empty_cache, reserved minus allocated is residue pinned by live buffers.
         device_module = torch.get_device_module(server_args.device)
         pinned = device_module.memory_reserved() - device_module.memory_allocated()

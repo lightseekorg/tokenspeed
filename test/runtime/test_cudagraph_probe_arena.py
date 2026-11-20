@@ -368,7 +368,9 @@ class _ServingCapture(Exception):
     """Ends a fabricated boot where the serving capture would begin."""
 
 
-def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nvidia):
+def _startup_charge(
+    monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nvidia, device_type="cuda"
+):
     """Boot with fakes; returns (startup bytes each rebind got, devices read, stack kept)."""
     from tokenspeed.runtime.execution import factory
 
@@ -479,7 +481,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         enable_memory_saver=False,
         enable_kvstore=False,
         spec_context_pad=0,
-        device="cuda",
+        device=device_type,
     )
     with pytest.raises(_ServingCapture):
         device.build_device_side(
@@ -535,7 +537,19 @@ def test_a_boot_without_a_probe_reads_no_startup_memory(monkeypatch) -> None:
     assert charged == [] and devices == set() and stack == 0
 
 
-def test_a_probe_off_nvidia_leaves_the_startup_residue_to_the_headroom(
+def test_a_probe_on_ascend_charges_the_resident_bytes_to_the_rebind(monkeypatch):
+    charged, devices, _ = _startup_charge(
+        monkeypatch,
+        init_keeps=256 << 20,
+        tune_keeps=0,
+        enforce_eager=False,
+        is_nvidia=False,
+        device_type="npu",
+    )
+    assert charged == [256 << 20] and devices == {3}
+
+
+def test_a_probe_on_rocm_leaves_the_startup_residue_to_the_headroom(
     monkeypatch,
 ) -> None:
     charged, devices, _ = _startup_charge(
@@ -743,24 +757,48 @@ def test_the_roles_that_replay_prefill_graphs_agree_on_and_release_them() -> Non
         "model_config.dsa_padded_prefill_replay)"
     )
     # The serving capture, which a forward reload repeats, gets the boot's verdict.
-    capture = _function("execution/device.py", "_capture_serving_graphs")
-    guards: dict[str, list[str]] = {}
-    for node in (*ast.walk(build), *ast.walk(capture)):
-        if not isinstance(node, ast.If):
-            continue
-        called = {
-            _callee(call)
+    uniform = [
+        ast.unparse(node.test)
+        for node in ast.walk(build)
+        if isinstance(node, ast.If)
+        and any(
+            _callee(call) == "check_rank_uniform_prefill_plan"
             for statement in node.body
             for call in ast.walk(statement)
             if isinstance(call, ast.Call)
-        }
-        for name in ("check_rank_uniform_prefill_plan", "empty_cache"):
-            if name in called:
-                guards.setdefault(name, []).append(ast.unparse(node.test))
-    assert guards["check_rank_uniform_prefill_plan"] == ["replays_prefill_graphs"]
-    assert guards["empty_cache"] == [
-        "replays_prefill_graphs and (not executor.prefill_graph.disable)"
+        )
     ]
+    assert uniform == ["replays_prefill_graphs"]
+
+
+@pytest.mark.parametrize(
+    ("platform", "role", "captures_prefill", "releases"),
+    [
+        ("npu", "prefill", False, True),
+        ("npu", "decode", False, False),
+        ("cuda", "prefill", False, False),
+        ("cuda", "null", True, True),
+    ],
+)
+def test_serving_releases_unused_startup_blocks(
+    monkeypatch, platform, role, captures_prefill, releases
+):
+    from unittest.mock import Mock
+
+    from tokenspeed.runtime import utils
+
+    module = Mock()
+    module.memory_reserved.return_value = module.memory_allocated.return_value = 0
+    monkeypatch.setattr(torch, "get_device_module", lambda unused: module)
+    monkeypatch.setattr(utils, "set_random_seed", lambda seed: None)
+    monkeypatch.setattr(device, "start_expert_load_window", lambda executor: None)
+    executor = Mock(drafter=None)
+    executor.prefill_graph.disable = not captures_prefill
+    args = SimpleNamespace(device=platform, disaggregation_mode=role)
+    device._capture_serving_graphs(
+        executor, args, role == "prefill" or captures_prefill
+    )
+    assert module.empty_cache.call_count == int(releases)
 
 
 if __name__ == "__main__":
