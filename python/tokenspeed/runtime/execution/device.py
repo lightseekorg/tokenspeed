@@ -138,12 +138,14 @@ import contextlib
 import enum
 import json
 import os
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
+from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -400,7 +402,6 @@ class DeviceHandle:
         self,
         executor,
         *,
-        recurrent_state_materialization: bool,
         host_cache_executor=None,
         kv_transfer=None,
         weight_memory: WeightMemoryState | None = None,
@@ -409,7 +410,6 @@ class DeviceHandle:
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
-        self._recurrent_state_materialization = recurrent_state_materialization
         self._weight_memory = weight_memory
         # Development only (--allow-reload-forward); None refuses reload_forward.
         self._forward_reloader = forward_reloader
@@ -424,9 +424,9 @@ class DeviceHandle:
         # with the write-backs and restores with the load-backs; their ACKs
         # ride the cache poll, alongside recurrent-state materialization.
         self._l2 = host_cache_executor
-        self._state_materializations: list[
+        self._state_materializations: deque[
             tuple[Any, tuple[int, ...], torch.Tensor]
-        ] = []
+        ] = deque()
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -531,6 +531,8 @@ class DeviceHandle:
                 raise TypeError(
                     f"unsupported Device cache op: {type(operation).__name__}"
                 )
+        if cache_ops and self._l2 is None:
+            raise RuntimeError("Device cache operations require a Host cache executor")
 
         executor = self._executor
         copies = {
@@ -549,11 +551,7 @@ class DeviceHandle:
         remote_decode = execution_plan.remote_decode
         remote_prefill = execution_plan.remote_prefill
         peer_fetches = self._peer_outbox is not None and execution_plan.has_peer_fetches
-        materializations = (
-            execution_plan.state_materializations
-            if self._recurrent_state_materialization
-            else ()
-        )
+        materializations = execution_plan.state_materializations
         if (
             cache_ops
             or copies
@@ -753,7 +751,7 @@ class DeviceHandle:
             )
 
     def poll_cache_results(self) -> list:
-        """Collect completed Host cache ops (both tiers); never blocks.
+        """Collect completed cache ops and state retirements without blocking.
 
         Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
         ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` and
@@ -761,26 +759,19 @@ class DeviceHandle:
         for the control plane to replica-intersect and advance.
 
         The control thread calls it, deliberately: completion is CUDA event
-        queries plus queue drains (serialized against the forward thread's
-        submissions by the executor's own lock). Queued behind the forward
-        thread's work, the round head would wait for every forward still
-        being launched.
+        queries plus queue drains. The forward thread appends state retirement
+        batches and the control thread removes completed batches. The control
+        thread can poll before the forward thread has submitted a plan.
 
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
         """
-        from tokenspeed_engine.scheduler import Cache
-
-        if self._l2 is None and not self._recurrent_state_materialization:
-            raise RuntimeError(
-                "cache polling requires --enable-kvstore or deferred recurrent state"
-            )
         results = [] if self._l2 is None else list(self._l2.poll_results())
         while self._state_materializations:
             event, op_ids, _staged_slots = self._state_materializations[0]
             if not event.query():
                 break
-            self._state_materializations.pop(0)
+            self._state_materializations.popleft()
             for op_id in op_ids:
                 ack = Cache.StateMaterializedEvent()
                 ack.op_id = op_id
@@ -2070,7 +2061,6 @@ def build_device_side(
         encoder_model_facts=encoder_model_facts,
         handle=DeviceHandle(
             executor,
-            recurrent_state_materialization=server_args.enable_deferred_gdn_state,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
             weight_memory=weight_memory,

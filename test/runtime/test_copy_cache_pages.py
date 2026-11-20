@@ -296,7 +296,6 @@ class TestFinishTailHitCopyCudaTest:
                         attn_kind=ts.AttnKind.Full,
                     )
                 ],
-                defer_recurrent_state=False,
             )
         )
 
@@ -486,11 +485,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         model_executor._cache_runtime_contract = arena.runtime_contract
         model_executor._cache_kvp_rank = 0
         model_executor.drafter = None
-        handle = DeviceHandle(
-            model_executor,
-            host_cache_executor=executor,
-            recurrent_state_materialization=False,
-        )
+        handle = DeviceHandle(model_executor, host_cache_executor=executor)
         # This thread is the forward thread: the handle's work runs here.
         handle.bind_forward_thread()
         try:
@@ -514,7 +509,6 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
                 cache_groups=pool_to_cache_groups(pool),
-                defer_recurrent_state=False,
             )
             scheduler = ts.Scheduler(scheduler_config)
 
@@ -811,11 +805,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         model_executor._cache_runtime_contract = arena.runtime_contract
         model_executor._cache_kvp_rank = 0
         model_executor.drafter = None
-        handle = DeviceHandle(
-            model_executor,
-            host_cache_executor=executor,
-            recurrent_state_materialization=False,
-        )
+        handle = DeviceHandle(model_executor, host_cache_executor=executor)
         handle.bind_forward_thread()
 
         x, y, z = 1, 2, 3
@@ -1030,11 +1020,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         model_executor._cache_runtime_contract = arena.runtime_contract
         model_executor._cache_kvp_rank = 0
         model_executor.drafter = None
-        handle = DeviceHandle(
-            model_executor,
-            host_cache_executor=executor,
-            recurrent_state_materialization=False,
-        )
+        handle = DeviceHandle(model_executor, host_cache_executor=executor)
         handle.bind_forward_thread()
 
         x, y, z = 1, 2, 3

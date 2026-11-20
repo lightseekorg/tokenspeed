@@ -240,10 +240,7 @@ def _config(**overrides):
         storage_config=None,
     )
     fields.update(overrides)
-    return make_config(
-        **fields,
-        defer_recurrent_state=False,
-    )
+    return make_config(**fields)
 
 
 def test_make_config_states_the_snapshot_pool_on_every_role():
@@ -266,17 +263,7 @@ def test_make_config_states_the_snapshot_pool_on_every_role():
         _config(max_retracted_requests=4)
     with pytest.raises(TypeError):
         # The retraction fields are keyword-only and required.
-        make_config(
-            32,
-            64,
-            8,
-            2,
-            0,
-            True,
-            False,
-            "fused",
-            defer_recurrent_state=False,
-        )
+        make_config(32, 64, 8, 2, 0, True, False, "fused")
 
 
 def test_make_config_requires_storage_limits_exactly_with_l3():

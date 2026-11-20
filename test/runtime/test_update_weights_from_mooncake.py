@@ -111,10 +111,7 @@ def test_device_dispatches_the_model_list_by_draft_policy(
     draft_policy, with_draft, expected, snapshot
 ):
     executor = _executor(draft_policy=draft_policy, with_draft=with_draft)
-    handle = DeviceHandle(
-        executor,
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(executor)
     req = _mooncake_req(3)
     req.snapshot = snapshot
 
@@ -132,10 +129,7 @@ def test_device_dispatches_the_model_list_by_draft_policy(
 def test_device_does_not_notify_the_drafter_on_failure():
     executor = _executor(draft_policy="retain", with_draft=True)
     executor.model_runner.update_weights_from_mooncake.return_value = (False, "no")
-    handle = DeviceHandle(
-        executor,
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(executor)
 
     assert handle.update_weights(_mooncake_req(3)) == (False, "no")
     executor.drafter.on_target_weights_updated.assert_not_called()
@@ -144,10 +138,7 @@ def test_device_does_not_notify_the_drafter_on_failure():
 def test_device_still_notifies_after_a_distributed_update():
     executor = _executor(draft_policy="retain", with_draft=True)
     executor.model_runner.update_weights_from_distributed.return_value = (True, "ok")
-    handle = DeviceHandle(
-        executor,
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(executor)
     req = UpdateWeightsFromDistributedReqInput(
         names=[], dtype_names=[], shapes=[], flush_cache=True, weight_version=None
     )
@@ -493,15 +484,7 @@ def _discard_device(monkeypatch):
     runner.model = model
     executor = _executor(draft_policy="retain", with_draft=False)
     executor.model_runner = runner
-    return (
-        DeviceHandle(
-            executor,
-            weight_memory=state,
-            recurrent_state_materialization=False,
-        ),
-        state,
-        model,
-    )
+    return DeviceHandle(executor, weight_memory=state), state, model
 
 
 def _lose_weight_pages(state, model):
@@ -668,10 +651,7 @@ def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
 
 
 def test_device_without_memory_saver_admits_every_weight_load():
-    handle = DeviceHandle(
-        _executor(draft_policy="retain", with_draft=False),
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(_executor(draft_policy="retain", with_draft=False))
     assert handle.check_weight_update(_mooncake_req(3)) == (
         True,
         "ready for weight update",

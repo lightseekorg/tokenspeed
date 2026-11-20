@@ -1309,7 +1309,14 @@ class GdnDeferredWYKernel:
                     cute.arch.mbarrier_arrive(free_bars.iterator + stage)
 
 
-_COMPILED: dict[tuple, object] = {}
+_COMPILED: dict[tuple, dict[tuple, object]] = {}
+_DTYPES = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+    torch.float32: Float32,
+    torch.int32: Int32,
+    torch.int64: Int64,
+}
 
 
 def launch_gdn_deferred_wy(
@@ -1331,122 +1338,130 @@ def launch_gdn_deferred_wy(
     batch, tokens, heads, dim = q.shape
     vheads = v.shape[2]
     if (
-        initial_state.stride()[1:] != (128 * 128, 128, 1)
-        or initial_state.data_ptr() % 16
-        or initial_state.stride(0) * initial_state.element_size() % 16
-        or pending.payload.stride(-1) != 1
-        or pending.payload.shape[-1] * pending.payload.element_size() % 16
-        or not all(
-            x.stride(-1) == 1
-            and x.data_ptr() % 16 == 0
-            and all(s > 0 and s * x.element_size() % 16 == 0 for s in x.stride()[:-1])
-            for x in (q, k, v)
-        )
-        or A_log.dtype != torch.float32
-        or dt_bias.dtype != torch.float32
-    ):
-        from tokenspeed_kernel.ops.attention.gdn._cute_dsl._deferred_wy_fallback import (
-            launch_gdn_deferred_wy as fallback,
-        )
-
-        return fallback(
-            q,
-            k,
-            v,
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            b=b,
-            initial_state=initial_state,
-            initial_state_indices=initial_state_indices,
-            scale=scale,
-            use_qk_l2norm=use_qk_l2norm,
-            pending=pending,
-        )
-    if (
         tokens != 4
         or dim != 128
         or v.shape[-1] != 128
         or initial_state.dtype != torch.bfloat16
     ):
         raise ValueError("pending replay requires T4 and BF16 K128/V128 state")
+    if initial_state.data_ptr() % 16 or initial_state.stride(0) * 2 % 16:
+        raise ValueError("pending replay requires 16-byte aligned state rows")
+
     capacity = pending.steps.shape[1]
-    width = pending.payload.shape[-1]
-    bank_stride = pending.payload.stride(0)
-    layer_offset = (
-        pending.payload.storage_offset() + pending.layer * pending.payload.stride(1)
-    )
-    previous_k = pending.payload.as_strided(
-        (2, capacity, 4, heads, 128),
-        (bank_stride, 4 * width, width, 128, 1),
-        layer_offset,
-    )
-    previous_v = pending.payload.as_strided(
-        (2, capacity, 4, vheads, 128),
-        (bank_stride, 4 * width, width, 128, 1),
-        layer_offset + heads * 128,
-    )
-    previous_a = pending.payload.as_strided(
-        (2, capacity, 4, vheads),
-        (bank_stride, 4 * width, width, 1),
-        layer_offset + heads * 128 + vheads * 128,
-    )
-    previous_b = pending.payload.as_strided(
-        (2, capacity, 4, vheads),
-        (bank_stride, 4 * width, width, 1),
-        layer_offset + heads * 128 + vheads * 128 + vheads,
-    )
     out = q.new_empty((batch, 4, vheads, 128))
-    tensors = (
-        a,
-        b,
-        previous_a,
-        previous_b,
-        A_log,
-        dt_bias,
-        initial_state_indices,
-        pending.rows,
-        pending.steps,
-        pending.pages[:, pending.layer],
-        initial_state,
-        out,
+    state = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(
+        leading_dim=3
     )
-    types = {
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: Float32,
-        torch.int32: Int32,
-        torch.int64: Int64,
-    }
+    if (
+        initial_state.stride()[1:] == (128 * 128, 128, 1)
+        and pending.payload.stride(-1) == 1
+        and pending.payload.shape[-1] * pending.payload.element_size() % 16 == 0
+        and A_log.dtype == dt_bias.dtype == torch.float32
+        and all(
+            x.stride(-1) == 1
+            and x.data_ptr() % 16 == 0
+            and all(s > 0 and s * x.element_size() % 16 == 0 for s in x.stride()[:-1])
+            for x in (q, k, v)
+        )
+    ):
+        kernel = GdnDeferredWYKernel
+        tile_configs = ((1,), (4,))
+        tile_config = (1,) if batch * vheads < 768 else (4,)
+        width = pending.payload.shape[-1]
+        bank_stride = pending.payload.stride(0)
+        layer_offset = (
+            pending.payload.storage_offset() + pending.layer * pending.payload.stride(1)
+        )
+        token_strides = (bank_stride, 4 * width, width, 128, 1)
+        gate_strides = (bank_stride, 4 * width, width, 1)
+        previous_k = pending.payload.as_strided(
+            (2, capacity, 4, heads, 128), token_strides, layer_offset
+        )
+        previous_v = pending.payload.as_strided(
+            (2, capacity, 4, vheads, 128), token_strides, layer_offset + heads * 128
+        )
+        gate_offset = layer_offset + (heads + vheads) * 128
+        previous_a = pending.payload.as_strided(
+            (2, capacity, 4, vheads), gate_strides, gate_offset
+        )
+        previous_b = pending.payload.as_strided(
+            (2, capacity, 4, vheads), gate_strides, gate_offset + vheads
+        )
+        tensors = (
+            a,
+            b,
+            previous_a,
+            previous_b,
+            A_log,
+            dt_bias,
+            initial_state_indices,
+            pending.rows,
+            pending.steps,
+            pending.pages[:, pending.layer],
+            initial_state,
+            out,
+        )
+        strides = tuple(tuple(Int64(s) for s in x.stride()) for x in (a, b)) + (
+            (Int64(4 * width), Int64(width), Int64(1)),
+            (Int64(4 * width), Int64(width), Int64(1)),
+            Int64(initial_state.stride(0)),
+            Int64(bank_stride),
+            Int64(pending.pages.stride(0)),
+        )
+        qkv = tuple(
+            from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=x.ndim - 1)
+            for x in (q, k, previous_k, v, previous_v)
+        )
+        layouts = (qkv, state, state)
+    else:
+        from tokenspeed_kernel.ops.attention.gdn._cute_dsl._deferred_wy_fallback import (
+            GdnDeferredWYStridedKernel,
+        )
+
+        kernel = GdnDeferredWYStridedKernel
+        tile_configs = ((),)
+        tile_config = ()
+        tensors = (
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state_indices,
+            pending.payload,
+            pending.rows,
+            pending.steps,
+            pending.pages,
+            pending.write_bank,
+            out,
+        )
+        strides = tuple(
+            tuple(Int64(s) for s in x.stride()) for x in (q, k, v, a, b)
+        ) + (
+            Int64(pending.payload.stride(0)),
+            Int64(pending.layer * pending.payload.stride(1)),
+            Int64(pending.pages.stride(0)),
+            Int64(pending.layer * pending.pages.stride(1)),
+        )
+        layouts = (state,)
+
     pointers = tuple(
         make_ptr(
-            types[x.dtype],
+            _DTYPES[x.dtype],
             x.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=x.element_size(),
         )
         for x in tensors
     )
-    strides = tuple(tuple(Int64(s) for s in x.stride()) for x in (a, b)) + (
-        (Int64(4 * width), Int64(width), Int64(1)),
-        (Int64(4 * width), Int64(width), Int64(1)),
-        Int64(initial_state.stride(0)),
-        Int64(bank_stride),
-        Int64(pending.pages.stride(0)),
-    )
-    qkv = tuple(
-        from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=x.ndim - 1)
-        for x in (q, k, previous_k, v, previous_v)
-    )
-    state = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(
-        leading_dim=3
-    )
     pdl = pdl_enabled()
+    kernel_config = (heads, vheads, use_qk_l2norm, pdl)
     key = (
+        kernel,
         q.device.index,
-        heads,
-        vheads,
-        use_qk_l2norm,
-        pdl,
+        *kernel_config,
         tuple(x.dtype for x in tensors),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
@@ -1456,21 +1471,18 @@ def launch_gdn_deferred_wy(
         Int32(batch),
         Int32(capacity),
         Float32(128**-0.5 if scale is None else scale),
-        qkv,
-        state,
-        state,
+        *layouts,
         stream,
     )
     with torch.cuda.device(q.device):
-        if (*key, 4) not in _COMPILED:
+        if key not in _COMPILED:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("deferred GDN WY must be warmed before capture")
             # Warm both fixed tile counts together. Small batches need more
             # CTAs to occupy the GPU, without specializing on their row counts.
-            for tiles in (1, 4):
-                _COMPILED[(*key, tiles)] = cute.compile(
-                    GdnDeferredWYKernel(heads, vheads, use_qk_l2norm, pdl, tiles), *args
-                )
-        tiles = 1 if batch * vheads < 768 else 4
-        _COMPILED[(*key, tiles)](*args)
+            _COMPILED[key] = {
+                config: cute.compile(kernel(*kernel_config, *config), *args)
+                for config in tile_configs
+            }
+        _COMPILED[key][tile_config](*args)
     return out

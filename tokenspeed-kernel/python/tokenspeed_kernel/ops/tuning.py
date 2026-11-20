@@ -298,9 +298,9 @@ def set_autotune_max_num_tokens(num_tokens: int) -> None:
     resolve to the wrong bucket.
 
     Args:
-        num_tokens: Largest token extent a forward can execute, including
-            CUDA-graph padding. Raised to flashinfer's own default floor when
-            smaller.
+        num_tokens: Largest token count a single forward can carry (the
+            runtime's ``chunked_prefill_size``). Raised to flashinfer's own
+            default floor when smaller.
     """
     global _autotune_max_num_tokens
     _autotune_max_num_tokens = max(int(num_tokens), _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS)

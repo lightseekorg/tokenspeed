@@ -586,12 +586,7 @@ def executor():
 def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
     executor, history_prefix, history_tokens
 ):
-    plane = _data_plane(
-        DeviceHandle(
-            executor,
-            recurrent_state_materialization=False,
-        )
-    )
+    plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
     plane.admit([("r1", 1, msgspec.msgpack.encode(params), [2, 9], 11, None)])
     scheduler = _scheduler(max_batch_size=4)
@@ -643,7 +638,7 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
             torch.tensor(cumulative_probs) if cumulative_probs is not None else None
         )
     )
-    plane = _data_plane(DeviceHandle(executor, recurrent_state_materialization=False))
+    plane = _data_plane(DeviceHandle(executor))
     plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
@@ -677,7 +672,7 @@ def _plan_with_one_request(rid: str):
 
 
 def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
-    plane = _data_plane(DeviceHandle(executor, recurrent_state_materialization=False))
+    plane = _data_plane(DeviceHandle(executor))
     plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
@@ -701,7 +696,7 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
 
 
 def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
-    plane = _data_plane(DeviceHandle(executor, recurrent_state_materialization=False))
+    plane = _data_plane(DeviceHandle(executor))
     plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     # This rank's plan has a batch, but the control plane decided it idles.
@@ -725,12 +720,7 @@ def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
 
 
 def test_a_plan_without_a_batch_runs_no_forward(executor):
-    plane = _data_plane(
-        DeviceHandle(
-            executor,
-            recurrent_state_materialization=False,
-        )
-    )
+    plane = _data_plane(DeviceHandle(executor))
     assert (
         plane.execute(
             _scheduler(max_batch_size=4).next_execution_plan(),
@@ -763,13 +753,7 @@ def test_the_data_plane_reports_cache_acknowledgments_in_landing_order(executor)
     write_back.op_id = 3
     landed = [snapshot, write_back, Cache.LoadBackDoneEvent(9)]
     host_cache = _HostCache(landed)
-    plane = _data_plane(
-        DeviceHandle(
-            executor,
-            host_cache_executor=host_cache,
-            recurrent_state_materialization=False,
-        )
-    )
+    plane = _data_plane(DeviceHandle(executor, host_cache_executor=host_cache))
     assert plane.poll_cache_events() == [
         ("SnapshotDoneEvent", 7),
         ("WriteBackDoneEvent", 3),
@@ -779,12 +763,7 @@ def test_the_data_plane_reports_cache_acknowledgments_in_landing_order(executor)
 
 
 def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):
-    plane = _data_plane(
-        DeviceHandle(
-            executor,
-            recurrent_state_materialization=False,
-        )
-    )
+    plane = _data_plane(DeviceHandle(executor))
     # The waiting request's probe: a storage operation, and no forward. The
     # host's L3 executor runs it; the data plane, without a Host cache
     # executor here, launches nothing.
@@ -794,12 +773,7 @@ def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):
 
 
 def test_a_released_request_is_forgotten(executor):
-    plane = _data_plane(
-        DeviceHandle(
-            executor,
-            recurrent_state_materialization=False,
-        )
-    )
+    plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1")
     plane.admit([("r1", 1, msgspec.msgpack.encode(params), [], 10, None)])
     plane.release(["r1"])
@@ -810,9 +784,7 @@ def test_a_released_request_is_forgotten(executor):
 def test_a_forward_lands_once_and_counts_toward_a_profile_at_its_note(executor):
     """The commit waits on the copy event exactly once; the profiler counts
     the forward only when the forward thread runs its committed note."""
-    profiled = _data_plane(
-        DeviceHandle(executor, recurrent_state_materialization=False)
-    )
+    profiled = _data_plane(DeviceHandle(executor))
     profiled.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
     launched = profiled.execute(
         _plan_with_one_request("r1"), None, None, None, (None, 0), None
@@ -834,12 +806,7 @@ def test_a_result_without_a_copy_event_cannot_land():
 
 
 def test_the_forward_thread_is_named_for_its_role(executor):
-    data_plane = _data_plane(
-        DeviceHandle(
-            executor,
-            recurrent_state_materialization=False,
-        )
-    )
+    data_plane = _data_plane(DeviceHandle(executor))
     names = []
 
     def forward_thread():
@@ -853,7 +820,7 @@ def test_the_forward_thread_is_named_for_its_role(executor):
 
 
 def test_reused_external_id_binds_the_new_admissions_stops(executor):
-    plane = _data_plane(DeviceHandle(executor, recurrent_state_materialization=False))
+    plane = _data_plane(DeviceHandle(executor))
     scheduler = _scheduler(max_batch_size=1)
     for admission_id, prompt_length, limit, stops in [
         (41, 4, 6, [7]),

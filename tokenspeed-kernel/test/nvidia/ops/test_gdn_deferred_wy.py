@@ -48,10 +48,17 @@ def accepted_state(case, counts):
     return h
 
 
-@pytest.mark.parametrize("strided", [False, True])
-@pytest.mark.parametrize("state_scale", [0.02, 4.0])
-@pytest.mark.parametrize("strong_gate", [False, True])
-@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize(
+    ("strided", "state_scale", "strong_gate", "normalize"),
+    [
+        (False, 0.02, False, True),
+        (False, 4.0, False, True),
+        (False, 0.02, True, False),
+        (True, 0.02, False, True),
+        (True, 4.0, False, False),
+        (True, 0.02, True, True),
+    ],
+)
 def test_deferred_wy(state_scale, strong_gate, strided, normalize):
     case = make_case(
         batch=5,

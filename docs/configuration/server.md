@@ -540,13 +540,6 @@ configured. A smaller batch can reuse that capture if there is room for its
 dummy request slots. These settings do not replace the scheduler's
 `--max-num-seqs` limit.
 
-For a full chunk to reuse a larger recurrent request capacity, reserve a token
-bucket with room for its dummy scan rows. With a 2048-token issue budget and
-request capacities `1 8 32`, `--prefill-graph-max-tokens 2080` supplies that
-room. The capture ladder includes its ceiling even with an explicit bucket
-list. Input buffers cover 2080 rows while the scheduler issues up to 2048 live
-tokens per round.
-
 `--prefill-graph-capture-sizes` remains a compatibility alias for
 `--prefill-graph-capture-token-sizes`. Specify only one spelling per command.
 Both populate the existing `prefill_graph_capture_sizes` Python field.

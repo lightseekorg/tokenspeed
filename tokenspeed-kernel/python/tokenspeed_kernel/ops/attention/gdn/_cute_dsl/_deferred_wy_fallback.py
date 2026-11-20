@@ -26,14 +26,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils
-import torch
 from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from tokenspeed_kernel.ops.attention.gdn._cute_dsl.wy import _mma_tf32
-from tokenspeed_kernel.platform import pdl_enabled
 
 
 @dsl_user_op
@@ -78,7 +75,7 @@ def _product(a, b, lane: Int32):
     return c.load()
 
 
-class GdnDeferredWYKernel:
+class GdnDeferredWYStridedKernel:
     def __init__(self, heads: int, vheads: int, normalize: bool, enable_pdl: bool):
         self.heads = heads
         self.vheads = vheads
@@ -456,106 +453,3 @@ class GdnDeferredWYKernel:
                 cute.copy(store_atom, store_src, store_dst)
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=False)
-
-
-_COMPILED: dict[tuple, object] = {}
-
-
-def launch_gdn_deferred_wy(
-    q,
-    k,
-    v,
-    *,
-    A_log,
-    a,
-    dt_bias,
-    b,
-    initial_state,
-    initial_state_indices,
-    scale,
-    use_qk_l2norm,
-    pending,
-):
-    """V32, two-stage TMA verify; counts, strides and bank selection stay dynamic."""
-    batch, tokens, heads, dim = q.shape
-    vheads = v.shape[2]
-    if (
-        tokens != 4
-        or dim != 128
-        or v.shape[-1] != 128
-        or initial_state.dtype != torch.bfloat16
-    ):
-        raise ValueError("pending replay requires T4 and BF16 K128/V128 state")
-    if initial_state.data_ptr() % 16 or initial_state.stride(0) * 2 % 16:
-        raise ValueError("pending replay requires 16-byte aligned state rows")
-    capacity = pending.steps.shape[1]
-    out = q.new_empty((batch, 4, vheads, 128))
-    tensors = (
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        initial_state_indices,
-        pending.payload,
-        pending.rows,
-        pending.steps,
-        pending.pages,
-        pending.write_bank,
-        out,
-    )
-    types = {
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float16: cutlass.Float16,
-        torch.float32: Float32,
-        torch.int32: Int32,
-        torch.int64: Int64,
-    }
-    pointers = tuple(
-        make_ptr(
-            types[x.dtype],
-            x.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=x.element_size(),
-        )
-        for x in tensors
-    )
-    strides = tuple(tuple(Int64(s) for s in x.stride()) for x in (q, k, v, a, b)) + (
-        Int64(pending.payload.stride(0)),
-        Int64(pending.layer * pending.payload.stride(1)),
-        Int64(pending.pages.stride(0)),
-        Int64(pending.layer * pending.pages.stride(1)),
-    )
-    state = from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic(
-        leading_dim=3
-    )
-    pdl = pdl_enabled()
-    key = (
-        q.device.index,
-        tuple(x.dtype for x in tensors),
-        heads,
-        vheads,
-        use_qk_l2norm,
-        pdl,
-    )
-    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    args = (
-        pointers,
-        strides,
-        Int32(batch),
-        Int32(capacity),
-        Float32(128**-0.5 if scale is None else scale),
-        state,
-        stream,
-    )
-    with torch.cuda.device(q.device):
-        if key not in _COMPILED:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("deferred GDN WY must be warmed before capture")
-            _COMPILED[key] = cute.compile(
-                GdnDeferredWYKernel(heads, vheads, use_qk_l2norm, pdl), *args
-            )
-        _COMPILED[key](*args)
-    return out

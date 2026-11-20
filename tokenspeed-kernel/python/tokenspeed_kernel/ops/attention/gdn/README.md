@@ -324,6 +324,8 @@ The banked WY kernel uses V32 tiles and two state stages. It splits the
 value tiles across CTAs for small batches and streams the tiles within
 a CTA for larger batches. Both variants warm at startup. Batch sizes,
 page strides, accepted lengths and bank indices are runtime values.
+The launcher also accepts strided Q/K/V inputs through a variant with
+scalar input loads and the same replay-before-verify contract.
 
 `benchmarks/nvidia/bench_gdn_deferred.py` measures a continuous sequence
 at the layer count and dimensions read from a checkpoint config. It

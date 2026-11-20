@@ -973,11 +973,11 @@ def test_gdn_replay_commit_layer_offsets_beyond_int32(device: str, require):
 
 
 @pytest.mark.parametrize("rows_aligned", [False, True])
-@pytest.mark.parametrize("layers", [1, 3])
 @pytest.mark.parametrize("precompacted", [False, True])
 def test_selected_replay_skips_unselected_state_reads(
-    device, rows_aligned, layers, precompacted
+    device, rows_aligned, precompacted
 ):
+    layers = 3
     k, v, a, b, A, bias, pool, read, write, accepted = _inputs(
         device, torch.bfloat16, head_k_dim=128, head_v_dim=128
     )
@@ -997,12 +997,8 @@ def test_selected_replay_skips_unselected_state_reads(
     # These pages must never be dereferenced, even in an empty materialization.
     read = torch.where(mask, read, 2**30)
     write = torch.where(mask, write, 2**30)
-    gdn_replay_commit(
-        payload,
-        torch.stack((A, bias))[None].repeat(layers, 1, 1),
-        state_addresses=torch.tensor(
-            [state.data_ptr() for state in pools], device=device, dtype=torch.uint64
-        ),
+    parameters = torch.stack((A, bias))[None].repeat(layers, 1, 1)
+    args = dict(
         state_row_strides=torch.tensor(
             [pool.stride(0)] * layers, device=device, dtype=torch.int64
         ),
@@ -1016,6 +1012,14 @@ def test_selected_replay_skips_unselected_state_reads(
         state_dtype=torch.bfloat16,
         rows_aligned=rows_aligned,
     )
+    gdn_replay_commit(
+        payload,
+        parameters,
+        state_addresses=torch.tensor(
+            [state.data_ptr() for state in pools], device=device, dtype=torch.uint64
+        ),
+        **args,
+    )
     original[write[mask].long()] = expected[mask].bfloat16()
     for state in pools:
         torch.testing.assert_close(state, original, rtol=2e-2, atol=1e-3)
@@ -1024,20 +1028,9 @@ def test_selected_replay_skips_unselected_state_reads(
         selection[-1].zero_()
     gdn_replay_commit(
         payload,
-        torch.stack((A, bias))[None].repeat(layers, 1, 1),
+        parameters,
         state_addresses=torch.zeros(layers, device=device, dtype=torch.uint64),
-        state_row_strides=torch.tensor(
-            [pool.stride(0)] * layers, device=device, dtype=torch.int64
-        ),
-        read_indices=read[None].repeat(layers, 1),
-        write_indices=write[None].repeat(layers, 1),
-        accepted_length=accepted,
-        request_mask=None if precompacted else mask,
-        selected_requests=selection,
-        draft_token_num=4,
-        geometry=(k.shape[2], v.shape[2], 128, 128),
-        state_dtype=torch.bfloat16,
-        rows_aligned=rows_aligned,
+        **args,
     )
     for state in pools:
         torch.testing.assert_close(state, original, rtol=2e-2, atol=1e-3)

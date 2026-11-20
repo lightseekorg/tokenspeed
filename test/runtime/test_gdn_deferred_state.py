@@ -380,7 +380,7 @@ def test_device_retirement_batches_preserve_and_discard_without_kvstore():
 
     executor = Executor(value.backend, torch.cuda.Stream(), torch.cuda.current_stream())
     executor.execution_stream.wait_stream(executor.default_stream)
-    handle = DeviceHandle(executor, recurrent_state_materialization=True)
+    handle = DeviceHandle(executor)
     previous_debug = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:

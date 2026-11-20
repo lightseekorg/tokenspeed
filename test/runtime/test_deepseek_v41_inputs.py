@@ -1188,7 +1188,6 @@ def test_the_forward_reads_a_snapshot_that_does_not_alias_request_state():
         SimpleNamespace(device="cpu", execute_forward_op=execute),
         host_cache_executor=None,
         kv_transfer=None,
-        recurrent_state_materialization=False,
     )
     planned = PlannedForward(
         forward_op=op,

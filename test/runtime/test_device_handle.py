@@ -320,7 +320,6 @@ def _handle(trace, **kwargs):
             mark_remote_cache_ready=lambda slot: trace.append(("ready", slot)),
         ),
         **kwargs,
-        recurrent_state_materialization=False,
     )
 
 
@@ -349,6 +348,7 @@ def _plan(
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
         has_peer_fetches=has_peer_fetches,
+        state_materializations=(),
     )
 
 
@@ -495,10 +495,7 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
             torch.ones(2, device="cpu").add_(1)
         return result
 
-    handle = DeviceHandle(
-        SimpleNamespace(device="cpu", execute_forward_op=cpu_forward),
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(SimpleNamespace(device="cpu", execute_forward_op=cpu_forward))
     planned = replace(_planned(num_extends=batch.num_extends()), forward_op=batch)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU]
@@ -542,10 +539,7 @@ def test_profile_range_closes_and_propagates_original_forward_exception():
     def cpu_forward(*args, **kwargs):
         raise failure
 
-    handle = DeviceHandle(
-        SimpleNamespace(device="cpu", execute_forward_op=cpu_forward),
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(SimpleNamespace(device="cpu", execute_forward_op=cpu_forward))
     planned = replace(_planned(num_extends=1), forward_op=batch)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU]
@@ -968,9 +962,12 @@ def test_shutdown_cache_closes_the_host_cache():
     assert trace == ["l2_shutdown"]
 
 
-def test_cache_polling_without_kvstore_refuses_loudly():
-    with pytest.raises(RuntimeError, match="enable-kvstore"):
-        _handle([]).poll_cache_results()
+def test_device_without_a_host_cache_polls_idle_and_rejects_host_cache_ops(wire_ops):
+    handle = _handle([])
+    assert handle.poll_cache_results() == []
+    plan = _plan(cache=[_WriteBackOp("store")])
+    with pytest.raises(RuntimeError, match="require a Host cache executor"):
+        _execute(handle, plan, None)
 
 
 # ----------------------------------------------------------------------
@@ -1221,10 +1218,7 @@ def test_the_forward_thread_takes_the_device_the_handle_was_built_on():
     previous = torch.cuda.current_device()
     torch.cuda.set_device(1)
     try:
-        handle = DeviceHandle(
-            SimpleNamespace(device="cuda"),
-            recurrent_state_materialization=False,
-        )
+        handle = DeviceHandle(SimpleNamespace(device="cuda"))
     finally:
         torch.cuda.set_device(previous)
     thread = threading.Thread(target=forward_thread, args=(handle,))
@@ -1312,8 +1306,7 @@ def test_expert_load_reset_and_dump_ride_the_execution_stream(tmp_path):
             device_module=_DeviceModule(),
             execution_stream="execution-stream",
             complete_pending_drafting=lambda: None,
-        ),
-        recurrent_state_materialization=False,
+        )
     )
     expert_location.set_global_expert_location_metadata(placement)
     try:
@@ -1408,8 +1401,7 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
             device_module=_DeviceModule(),
             execution_stream="execution-stream",
             complete_pending_drafting=lambda: None,
-        ),
-        recurrent_state_materialization=False,
+        )
     )
     expert_location.set_global_expert_location_metadata(placement)
     try:
@@ -1463,8 +1455,7 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
             execution_stream=stream,
             model_runner=SimpleNamespace(expert_location_updater=_Updater()),
             complete_pending_drafting=lambda: None,
-        ),
-        recurrent_state_materialization=False,
+        )
     )
     handle.apply_expert_placement((0,), rows, moves)
     assert trace == [
@@ -1477,8 +1468,7 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
             device="cpu",
             model_runner=SimpleNamespace(expert_location_updater=None),
             complete_pending_drafting=lambda: None,
-        ),
-        recurrent_state_materialization=False,
+        )
     )
     with pytest.raises(RuntimeError, match="--enable-eplb"):
         handle.apply_expert_placement((0,), rows, moves)
@@ -1501,6 +1491,7 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             self.pages_to_zero = {}
             self.remote_decode = None
             self.remote_prefill = None
+            self.state_materializations = ()
             self.reads = 0
 
         def pages_to_copy_arrays(self):
@@ -1614,9 +1605,7 @@ class _RegisteringDecodePeer:
 def test_kv_release_quiesces_copies_and_deregisters_the_peer():
     trace = []
     handle = DeviceHandle(
-        _SleepExecutor(trace),
-        kv_transfer=_RegisteringDecodePeer(trace),
-        recurrent_state_materialization=False,
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
     )
 
     handle.prepare_kv_release()
@@ -1636,10 +1625,7 @@ def test_kv_release_quiesces_copies_and_deregisters_the_peer():
 
 def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     trace = []
-    handle = DeviceHandle(
-        _SleepExecutor(trace),
-        recurrent_state_materialization=False,
-    )
+    handle = DeviceHandle(_SleepExecutor(trace))
 
     handle.prepare_kv_release()
     handle.finish_kv_resume()
@@ -1675,7 +1661,7 @@ def test_nccl_suspend_and_resume_reach_the_communicators(
     monkeypatch.setattr(
         device_module, "resume_nccl_communicators", lambda: trace.append("resume")
     )
-    handle = DeviceHandle(_SleepExecutor(trace), recurrent_state_materialization=False)
+    handle = DeviceHandle(_SleepExecutor(trace))
     handle._forward_device = torch.device(device_type)
     handle._executor.config.enforce_eager = enforce_eager
     monkeypatch.setattr(torch.version, "hip", hip)

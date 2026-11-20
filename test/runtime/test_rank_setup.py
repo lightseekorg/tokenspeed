@@ -182,23 +182,12 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
-        make_config(
-            **fields,
-            defer_recurrent_state=False,
-        )
+        make_config(**fields)
     policy = ts.SchedulerConfig.HostWritePolicy
-    cfg = make_config(
-        **fields,
-        host_write_policy="write_through",
-        defer_recurrent_state=False,
-    )
+    cfg = make_config(**fields, host_write_policy="write_through")
     assert cfg.host_write_policy == policy.WriteThrough
     # Mapped as given: the scheduler, not make_config, decides what it runs.
-    cfg = make_config(
-        **fields,
-        host_write_policy="write_back",
-        defer_recurrent_state=False,
-    )
+    cfg = make_config(**fields, host_write_policy="write_back")
     assert cfg.host_write_policy == policy.WriteBack
 
 
@@ -1059,27 +1048,13 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
     )
+    assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
-        make_config(
-            **fields,
-            defer_recurrent_state=False,
-        ).prefill_chunk_yield_tokens
-        == 0
-    )
-    assert (
-        make_config(
-            **fields,
-            prefill_chunk_yield_tokens=16,
-            defer_recurrent_state=False,
-        ).prefill_chunk_yield_tokens
+        make_config(**fields, prefill_chunk_yield_tokens=16).prefill_chunk_yield_tokens
         == 16
     )
     with pytest.raises(ValueError, match="non-negative"):
-        make_config(
-            **fields,
-            prefill_chunk_yield_tokens=-1,
-            defer_recurrent_state=False,
-        )
+        make_config(**fields, prefill_chunk_yield_tokens=-1)
 
 
 @pytest.mark.parametrize(
