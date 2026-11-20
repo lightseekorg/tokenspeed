@@ -1687,6 +1687,7 @@ def dsa_select_owned_candidates(
 
 def _decode_candidate_traits(
     *,
+    requests: int,
     index_heads: int,
     head_dim: int,
     page_size: int,
@@ -1696,6 +1697,7 @@ def _decode_candidate_traits(
 ) -> dict:
     """:func:`dsa_decode_index_candidates`' selection traits."""
     return {
+        "requests": int(requests),
         "index_heads": int(index_heads),
         "head_dim": int(head_dim),
         "page_size": int(page_size),
@@ -1708,6 +1710,7 @@ def _decode_candidate_traits(
 
 def dsa_decode_index_candidates_supported(
     *,
+    requests: int,
     index_heads: int,
     head_dim: int,
     page_size: int,
@@ -1718,14 +1721,16 @@ def dsa_decode_index_candidates_supported(
 ) -> bool:
     """Return whether the KVP decode candidates op serves these sizes.
 
-    That is :func:`dsa_decode_index_candidates` over BF16 index queries,
-    ``query_group_size`` rows per request. Host values only, so every rank of a KVP group decides alike; sizes no
-    leaf takes keep :func:`dsa_index_candidates`.
+    That is :func:`dsa_decode_index_candidates` over BF16 index queries of
+    ``requests`` requests, ``query_group_size`` rows each. Host values only,
+    so every rank of a KVP group decides alike; sizes no leaf takes keep
+    :func:`dsa_index_candidates`.
     """
     return _selects(
         "dsa_decode_index_candidates",
         format_signature(q=dense_tensor_format(torch.bfloat16)),
         _decode_candidate_traits(
+            requests=requests,
             index_heads=index_heads,
             head_dim=head_dim,
             page_size=page_size,
@@ -1798,6 +1803,7 @@ def dsa_decode_index_candidates(
         "dsa_decode_index_candidates",
         _attention_format_signature(q=q),
         traits=_decode_candidate_traits(
+            requests=rows // query_group_size,
             index_heads=q.shape[1],
             head_dim=q.shape[2],
             page_size=page_size,

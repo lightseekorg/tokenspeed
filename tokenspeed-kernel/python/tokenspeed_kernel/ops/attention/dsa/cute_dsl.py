@@ -929,6 +929,8 @@ if _fused_indexer is not None:
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
         traits={
+            # The scorer's tile prefix sum holds this many requests.
+            "requests_max": frozenset({FUSED_DECODE_TOPK_MAX_REQUESTS}),
             "index_heads": frozenset({_FUSED_HEADS}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({_FUSED_PAGE}),
@@ -995,6 +997,11 @@ if _fused_indexer is not None:
             raise ValueError(
                 f"{rows} decode rows need {group}-row request groups and their "
                 "[rows, 1] local lengths"
+            )
+        if rows // group > FUSED_DECODE_TOPK_MAX_REQUESTS:
+            raise ValueError(
+                f"KVP decode candidates schedule at most "
+                f"{FUSED_DECODE_TOPK_MAX_REQUESTS} requests, got {rows // group}"
             )
         if scores_out is not None and (
             scores_out.shape != (rows, topk)

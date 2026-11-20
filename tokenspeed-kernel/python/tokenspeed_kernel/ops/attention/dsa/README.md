@@ -373,9 +373,9 @@ candidates: each row's exact local top-k over this rank's compact owned pages
 `-inf` for invalid candidates, the scores written straight into a send
 buffer's rows (`scores_out`). It serves decode rows without mandatory windows,
 each request's `query_group_size` rows consecutive;
-`dsa_decode_index_candidates_supported` decides from host sizes, and the owned
-decode top-k (`select_owned_dsa_topk`) falls back to `dsa_index_candidates`
-where it refuses.
+`dsa_decode_index_candidates_supported` decides from host sizes, the request
+count among them, and the owned decode top-k (`select_owned_dsa_topk`) falls
+back to `dsa_index_candidates` where it refuses.
 
 On SM100-SM103 the `cute_dsl` leaf runs the fused decode top-k's kernels in a
 KVP mode after the shared query quantization (`compile_candidates`):

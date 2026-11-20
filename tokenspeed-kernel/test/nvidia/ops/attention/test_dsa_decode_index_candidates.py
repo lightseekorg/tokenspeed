@@ -52,6 +52,10 @@ from tokenspeed_kernel.ops.attention.dsa import (  # noqa: E402
     dsa_index_candidates,
     plan_dsa_index_candidates,
 )
+from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (  # noqa: E402
+    FUSED_DECODE_TOPK_MAX_REQUESTS,
+    cute_dsl_dsa_decode_index_candidates,
+)
 
 PAGE, HEADS, DIM, TOPK = 64, 32, 128, 2048
 SOFTMAX_SCALE = DIM**-0.5 * HEADS**-0.5
@@ -140,6 +144,7 @@ def test_kvp_decode_candidates_match_the_deep_gemm_candidates(group, degree, ran
     )  # fmt: skip
     assert pages is not None
     assert dsa_decode_index_candidates_supported(
+        requests=len(lengths),
         index_heads=HEADS,
         head_dim=DIM,
         page_size=PAGE,
@@ -206,6 +211,7 @@ def test_kvp_decode_candidates_compile_once_across_batches():
 
 def test_kvp_decode_candidates_refuse_other_sizes():
     sizes = dict(
+        requests=FUSED_DECODE_TOPK_MAX_REQUESTS,
         index_heads=HEADS,
         head_dim=DIM,
         page_size=PAGE,
@@ -216,9 +222,36 @@ def test_kvp_decode_candidates_refuse_other_sizes():
     )
     assert dsa_decode_index_candidates_supported(**sizes)
     for name, value in (
+        ("requests", FUSED_DECODE_TOPK_MAX_REQUESTS + 1),
         ("query_group_size", 9),
         ("topk", 512),
         ("index_heads", 64),
         ("index_k_format", "mxfp4"),
+        ("index_k_format", "bf16"),
     ):
         assert not dsa_decode_index_candidates_supported(**{**sizes, name: value})
+
+
+def test_kvp_decode_candidates_refuse_more_requests_than_the_scorer_holds():
+    # The scorer's tile prefix sum in shared memory holds this many requests.
+    requests = FUSED_DECODE_TOPK_MAX_REQUESTS + 1
+    plane, table, request_ids, causal, q, weights = _inputs(
+        requests, 1, [PAGE] * requests, 1, 0, seed=3
+    )
+    pages = plan_dsa_index_candidates(
+        q, weights, plane, table, request_ids, causal, page_size=PAGE,
+        solution="deep_gemm",
+    )  # fmt: skip
+    with pytest.raises(ValueError, match="at most"):
+        cute_dsl_dsa_decode_index_candidates(
+            q,
+            weights,
+            plane,
+            pages,
+            row_lengths=causal,
+            query_group_size=1,
+            page_size=PAGE,
+            topk=TOPK,
+            softmax_scale=SOFTMAX_SCALE,
+            scores_out=None,
+        )

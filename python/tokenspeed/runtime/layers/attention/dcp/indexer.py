@@ -640,7 +640,10 @@ def _score_owned_rows(
     """
     rows = q.shape[0]
     pages = _tile_pages(q, weights, index_k_cache, metadata, 0, rows, page_size)
-    index_k_format = metadata.index_k_format or "fp8_scaled"
+    # Without a stated format a plane holds what its dtype says; mxfp4 is always stated.
+    index_k_format = metadata.index_k_format or (
+        "bf16" if index_k_cache.dtype == torch.bfloat16 else "fp8_scaled"
+    )
     if (
         pages is not None
         and q_scales is None
@@ -648,6 +651,7 @@ def _score_owned_rows(
         and initial_tokens == 0
         and local_tokens == 0
         and dsa_decode_index_candidates_supported(
+            requests=rows // query_group_size,
             index_heads=q.shape[1],
             head_dim=q.shape[2],
             page_size=page_size,
