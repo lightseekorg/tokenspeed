@@ -22,7 +22,6 @@
 
 import importlib.util
 from datetime import timedelta
-from itertools import product
 from pathlib import Path
 
 import pytest
@@ -51,7 +50,6 @@ def _lookup(mapping, *, use_attn_tp=False):
         storage_dtype=None,
         output_dtype=torch.float32,
         offload=False,
-        host_table_alloc="mmap",
         table_layout="attn_tp_sharded" if use_attn_tp else "global_sharded",
         prefix="",
     )
@@ -239,7 +237,7 @@ def _mapped_lookup_worker(rank, rendezvous):
     )
     process_group_manager.init_process_group(mapping.attn.world_group)
     try:
-        for mode, alloc in product(("shared", "peer_sharded"), ("mmap", "auto")):
+        for mode in ("shared", "peer_sharded"):
             lookup = ple_lookup.PLELookup(
                 mapping,
                 vocab_size=250,
@@ -249,7 +247,6 @@ def _mapped_lookup_worker(rank, rendezvous):
                 output_dtype=torch.bfloat16,
                 offload=True,
                 table_layout=mode,
-                host_table_alloc=alloc,
                 prefix="",
             )
             src = (torch.arange(250 * 16).reshape(250, 16) % 101).to(
@@ -262,20 +259,6 @@ def _mapped_lookup_worker(rank, rendezvous):
             result = lookup.finish(lookup.start(ids, lookup.make_layout(None, 2)))
             expected = (src.float()[ids.cpu()] * 0.125).bfloat16().view(2, 32)
             torch.testing.assert_close(result.cpu(), expected, atol=0, rtol=0)
-        from tokenspeed_kernel import host_memory
-
-        from tokenspeed.runtime.layers.ple_shared_table import PLESharedTable
-
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(
-                host_memory,
-                "probe_host_memory",
-                lambda *args: "injected probe error" if rank == 1 else None,
-            )
-            source = torch.empty((16, 8), device="meta")
-            with pytest.raises(RuntimeError, match="rank 1: injected probe error"):
-                PLESharedTable(mapping, source, "shared", "cumem")
-            assert PLESharedTable(mapping, source, "shared", "auto").backend == "mmap"
     finally:
         dist.destroy_process_group()
 

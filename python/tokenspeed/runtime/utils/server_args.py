@@ -880,7 +880,6 @@ class ServerArgs:
     # back to the generic all-to-all instead of growing it at runtime.
     head_tp_exchange_max_rows: int = 256
     ple_table_layout: str = "global_sharded"
-    ple_host_table_alloc: str | None = None
     lm_head_tp_size: int | None = None
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
@@ -4999,12 +4998,6 @@ class ServerArgs:
             "o_proj rows). The symmetric-memory scratch is allocated before "
             "graph capture; larger forwards fall back to the generic all-to-all. "
             "Only used with --attn-head-tp-size > 1.",
-        )
-        parser.add_argument(
-            "--ple-host-table-alloc",
-            choices=["auto", "cumem", "mmap"],
-            help="Host allocation for shared and peer_sharded PLE tables. Default: mmap. "
-            "cumem requires host-NUMA CUDA VMM; auto tries cumem before mmap.",
         )
         parser.add_argument(
             "--ple-table-layout",
