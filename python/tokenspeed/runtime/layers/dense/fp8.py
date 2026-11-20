@@ -329,6 +329,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
             )
             return out if out is not None else output.view(*output_shape)
+        # Prequantized scales must match the layout mm_activation_scale_layout reports.
         if block_scale is None:
             scale_encoding = (
                 "packed_ue8m0"

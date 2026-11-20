@@ -72,7 +72,8 @@ def _torch_copies(fn) -> list[str]:
     return [
         event.name
         for event in prof.events()
-        if event.device_type.name == "CUDA" and "copy" in event.name
+        if event.device_type.name == "CUDA"
+        and ("copy" in event.name.lower() or "memcpy" in event.name.lower())
     ]
 
 
