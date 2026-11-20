@@ -25,8 +25,8 @@ BF16 partial is known bit for bit and the switch's FP32 sum of the partials
 rounds once: within one BF16 unit of the reference, since the switch may break
 rounding ties either way. Covers blocks that fill and that pad the 128-row
 tile, row counts that change between calls without recompiling, graph replays
-with fresh inputs, and an owner whose rows lie past 2^31 elements of the
-symmetric storage.
+with fresh inputs, and owner rows past 2^31 elements of the symmetric
+storage.
 """
 
 from datetime import timedelta
@@ -123,7 +123,7 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
 def _offsets_past_int32(rank, size, rendezvous):
     device = _init(rank, size, rendezvous)
     n, k = 16384, 64
-    # The last owner's rows start past 2^31 elements of the symmetric storage.
+    # The last owner's final 128 rows, checked below, lie past 2^31 elements.
     block = 2**31 // n // size + 128
     state = create_gemm_reduce_scatter_state(
         dist.group.WORLD, device, size * block, n, k
