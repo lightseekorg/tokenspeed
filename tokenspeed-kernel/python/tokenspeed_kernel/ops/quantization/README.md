@@ -77,14 +77,14 @@ MN-major storage alone does not guarantee TMA alignment.
 
 This entry eliminates the contiguous-scale copy in the quantization wrapper.
 A downstream GEMM can also skip its scale repack only when it accepts the
-native strides and encoding. In particular, it does not guarantee that
-Blackwell consumers can skip scale alignment or encoding conversion.
+native strides and encoding. The TRT-LLM CuTe-DSL block-FP8 GEMM does; other
+Blackwell consumers may still need scale alignment or encoding conversion.
 
 Ordinary quantization requests token-major storage and excludes this entry
 from ranked selection. Explicit `override` selects the native entry; its
 implementation validates the supported quantization parameters. Callers
-opting in must support the returned strides. This entry does not change
-model projections or GEMM dispatch.
+opting in must support the returned strides. Block-FP8 linear layers select it
+when `mm_activation_scale_layout` reports that their GEMM reads MN-major scales.
 
 ## DeepGEMM packed UE8M0
 

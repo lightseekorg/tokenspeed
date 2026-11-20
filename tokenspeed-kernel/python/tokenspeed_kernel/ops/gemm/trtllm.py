@@ -130,7 +130,9 @@ _BLOCK_FP8_TRAITS = {
     "n_align": frozenset({128}),
     "k_align": frozenset({128}),
     "a_contiguous": frozenset({True}),
+    "a_scales_layout": frozenset({"mn_major"}),
     "b_contiguous": frozenset({True}),
+    "b_scales_contiguous": frozenset({True}),
     "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
     "has_alpha": frozenset({False}),
     "operands_aligned_16": frozenset({True}),
@@ -171,8 +173,9 @@ def trtllm_cutedsl_mm_fp8_blockscale(
     Args:
         A: Contiguous E4M3 activation matrix [M,K].
         B: Contiguous E4M3 weight matrix [N,K].
-        A_scales: Logical FP32 [M,K/128] activation scales.
-        B_scales: FP32 [N/128,K/128] checkpoint scales.
+        A_scales: Logical FP32 [M,K/128] activation scales stored MN-major:
+            stride(0) is 1 and stride(1), at least M, is read in place.
+        B_scales: Contiguous FP32 [N/128,K/128] checkpoint scales.
         out_dtype: BF16 output type.
         alpha: Must be None; additional scaling is unsupported.
         block_size: Must be [128,128].
