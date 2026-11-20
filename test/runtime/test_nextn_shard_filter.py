@@ -227,13 +227,7 @@ class TestLoaderSkipsFilteredShards:
         # pipeline stage's draft) bound the distributed loader's collectives.
         groups = []
 
-        def capture(
-            source,
-            weight_name_filter,
-            checkpoint_load_group,
-            mapping,
-            shared_weight_name_filter,
-        ):
+        def capture(source, weight_name_filter, checkpoint_load_group, mapping):
             groups.append(checkpoint_load_group)
             return iter(())
 

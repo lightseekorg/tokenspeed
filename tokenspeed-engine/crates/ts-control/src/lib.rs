@@ -39,6 +39,7 @@ pub mod json_framing;
 pub mod kv_events;
 pub mod l3;
 pub mod output;
+pub mod peer;
 pub mod relay;
 pub mod request;
 pub mod request_stats;

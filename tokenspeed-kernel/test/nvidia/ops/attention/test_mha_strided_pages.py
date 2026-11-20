@@ -139,6 +139,7 @@ def test_decode_reads_strided_pages_and_sink_window_union(
         window_sink=sink_tokens,
         return_lse=return_lse,
         solution="triton",
+        block_draft=False,
     )
 
     def change_decode_rows():
@@ -224,6 +225,7 @@ def test_paged_kv_offsets_past_int32(writer):
         window_sink=0,
         return_lse=False,
         solution="triton",
+        block_draft=False,
     )
     scores = torch.einsum("hd,thd->ht", q[-1].float(), k.float()) / 8
     expected = torch.einsum("ht,thd->hd", scores.softmax(-1), v.float())

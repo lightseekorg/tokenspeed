@@ -480,6 +480,7 @@ def _decode_selection(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     fp8_kv_scales: tuple[float, float] | None,
+    block_draft: bool,
 ):
     """Signature, scale kwargs and traits that select a decode kernel; shared
     by mha_decode_with_kvcache and mha_decode_schedule so both pick the same
@@ -488,6 +489,7 @@ def _decode_selection(
         q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
     )
     traits = {
+        "block_draft": block_draft,
         "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
@@ -528,6 +530,8 @@ def mha_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    block_draft: bool,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
@@ -563,6 +567,8 @@ def mha_decode_with_kvcache(
             only kernels that read one.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        block_draft: Select noncausal draft-block attention via its trait.
+            Pass False for ordinary decode and True for a noncausal draft block.
     """
     signature, scale_kwargs, traits = _decode_selection(
         q,
@@ -578,6 +584,7 @@ def mha_decode_with_kvcache(
         k_scale,
         v_scale,
         fp8_kv_scales,
+        block_draft,
     )
     schedule_kwargs = {}
     if schedule is not None:
@@ -653,6 +660,7 @@ def mha_decode_schedule(
     # attention options
     *,
     window_left: int = -1,
+    block_draft: bool,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -676,7 +684,7 @@ def mha_decode_schedule(
     Args:
         q, k_cache, v_cache, cache_seqlens, max_seqlen_q, window_left,
         logit_cap, sinks, return_lse, q_scale, k_scale, v_scale,
-        fp8_kv_scales: As for :func:`mha_decode_with_kvcache`; they select the
+        fp8_kv_scales, block_draft: As for :func:`mha_decode_with_kvcache`; they select the
             same kernel.
         out: int32 [>= batch + 1, 2] tensor to write the schedule into in
             place (a persistent buffer keeps the address a captured graph
@@ -701,6 +709,7 @@ def mha_decode_schedule(
         k_scale,
         v_scale,
         fp8_kv_scales,
+        block_draft,
         solution,
     )
     if kernel is None:
@@ -738,6 +747,7 @@ def mha_decode_takes_schedule(
     v_cache: torch.Tensor,
     max_seqlen_q: int,
     window_left: int = -1,
+    block_draft: bool,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -757,7 +767,7 @@ def mha_decode_takes_schedule(
             ``q`` shaped [rows, heads, dim]; only their metadata is read
             (meta tensors work).
         max_seqlen_q, window_left, logit_cap, sinks, return_lse, q_scale,
-        k_scale, v_scale, fp8_kv_scales, solution: As for
+        k_scale, v_scale, fp8_kv_scales, block_draft, solution: As for
             :func:`mha_decode_with_kvcache`.
     """
     return (
@@ -775,6 +785,7 @@ def mha_decode_takes_schedule(
             k_scale,
             v_scale,
             fp8_kv_scales,
+            block_draft,
             solution,
         )
         is not None
@@ -795,6 +806,7 @@ def _schedule_kernel(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     fp8_kv_scales: tuple[float, float] | None,
+    block_draft: bool,
     solution: str | None,
 ):
     """The schedule-reading decode kernel for these arguments
@@ -822,6 +834,7 @@ def _schedule_kernel(
         k_scale is not None,
         v_scale is not None,
         fp8_kv_scales is not None,
+        block_draft,
         solution,
     )
     if key not in _SCHEDULE_KERNELS:
@@ -839,6 +852,7 @@ def _schedule_kernel(
             k_scale,
             v_scale,
             fp8_kv_scales,
+            block_draft,
             solution,
         )
     return _SCHEDULE_KERNELS[key]
@@ -861,6 +875,7 @@ def _select_schedule_kernel(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     fp8_kv_scales: tuple[float, float] | None,
+    block_draft: bool,
     solution: str | None,
 ):
     signature, _, traits = _decode_selection(
@@ -879,6 +894,7 @@ def _select_schedule_kernel(
         k_scale,
         v_scale,
         fp8_kv_scales,
+        block_draft,
     )
     try:
         decode = select_kernel(

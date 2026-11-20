@@ -48,7 +48,8 @@ namespace {
 
 static_assert(
     std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Submitted&&>())),
-                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling>>);
+                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling,
+                                fsm::PeerLanding>>);
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(std::declval<fsm::Prefilling&&>())),
                              std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling>>);
 
@@ -2017,6 +2018,7 @@ protected:
 
     // The boundaries the feed currently reports as stored, keyed by their
     // tokens; a drain's events are applied in order (removals first).
+    // The Device stream only: these scenarios follow the Device view.
     using Published = std::map<std::vector<std::int32_t>, std::uint64_t>;
     static void Apply(Published& published, const std::vector<KvCacheEvent>& events) {
         std::map<std::uint64_t, std::vector<std::int32_t>> by_hash;
@@ -2025,12 +2027,14 @@ protected:
         }
         for (const KvCacheEvent& event : events) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                if (removed->medium != KvEventMedium::kDevice) continue;
                 for (const std::uint64_t hash : removed->block_hashes) {
                     ASSERT_TRUE(by_hash.contains(hash)) << "a removal names a boundary never stored";
                     published.erase(by_hash.at(hash));
                 }
             } else {
                 const auto& stored = std::get<KvBlockStoredEvent>(event);
+                if (stored.medium != KvEventMedium::kDevice) continue;
                 ASSERT_EQ(stored.block_hashes.size(), 1u);
                 ASSERT_TRUE(published.emplace(stored.token_ids, stored.block_hashes.front()).second)
                     << "a boundary is stored once until it is removed";
@@ -2579,6 +2583,38 @@ TEST_F(L3LeaseLifetimeSuite, AnAbortReleasesTheReadyDataItHolds) {
     EXPECT_FALSE(scheduler_->StoragePending());
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the read's Host entries stay cached, unpinned";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), static_cast<std::int32_t>(get.keys.size()));
+}
+
+// With KV events on, an L3 read registers Host entries for a prefix this
+// engine never published: the boundary tree reports their Host residency,
+// and the scheduler, holding no descriptor for them, publishes nothing until
+// a publication here describes them.
+class L3KvEventsSuite : public L3LeaseLifetimeSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = L3LeaseLifetimeSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+};
+
+TEST_F(L3KvEventsSuite, AnL3ReadOfAPrefixNeverPublishedHereIsNotAnEvent) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(query.op_id, query.keys.size());
+    const auto get = std::get<StorageGetOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(get.op_id, get.keys.size());
+    ASSERT_GT(scheduler_->HostPoolCachedBlocks(), 0) << "the read landed Host entries";
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        const auto medium = std::visit([](const auto& e) { return e.medium; }, event);
+        EXPECT_NE(medium, KvEventMedium::kHost) << "no Host event without a descriptor";
+    }
+    // The request aborts: its read's Host entries stay cached, still
+    // undescribed, and nothing is reported.
+    SendAbortEvent("r");
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
 // The session a request names is registered at its first admission for as
@@ -3781,10 +3817,11 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
                                                       /*awaits_result=*/true});
     ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
 
-    request.Apply(fsm::ExtendResultEvent{{}});  // an older intermediate chunk's empty result
+    // An older intermediate chunk's empty result.
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});
     EXPECT_TRUE(request.Is<fsm::PrefillAwaitingResult>()) << "an empty result must not end the wait";
 
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});  // the final chunk's token
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.LastToken(), 42);
 }
@@ -3827,12 +3864,13 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
     ASSERT_EQ(request.ResultsInFlight(), 2);
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token, ahead of chunk 1's result
+    // The final chunk's token, ahead of chunk 1's result.
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 1) << "chunk 1's forward is still out against these pages";
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // chunk 1's empty result, late
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});  // chunk 1's empty result, late
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 0);
 }
@@ -3868,7 +3906,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     request.TrackScheduledForward();
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // the first chunk landed
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});  // the first chunk landed
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     const auto* retracted = request.GetIf<fsm::Retracted>();
@@ -3953,9 +3991,9 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7), /*await_destination=*/false});
     ASSERT_EQ(request.GeneratedTokens(), 1000);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -3976,8 +4014,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     ASSERT_TRUE(coordinator.Restore(request.GetIf<fsm::Retracted>()->image, demands,
-                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1,
-                                    /*drop_claims_if_unfit=*/false));
+                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/7});
     ASSERT_TRUE(request.Is<fsm::Restoring>());
@@ -4018,9 +4055,9 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7), /*await_destination=*/false});
     ASSERT_EQ(request.GeneratedTokens(), 4097);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -4234,6 +4271,24 @@ protected:
         return rows;
     }
 };
+
+TEST_F(PrefillChunkYieldCapacitySuite, InflightCountsOnlyFinalResultsAwaitingTransferCompletion) {
+    SubmitBootstrapped("prompt", MakeTokens(14, 1000));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 0, 8}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "intermediate prefill is still computation";
+    EXPECT_EQ(scheduler_->PdTransferSize(), 1u) << "page pinning already starts during prefill";
+    SendForwardDone("prompt");
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 8, 14}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "the final forward result has not landed";
+    SendForwardDone("prompt", {900});
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "ready before remote dispatch";
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "transfer dispatched, still awaiting ACK";
+    SendPdSucceeded("prompt");
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+}
 
 TEST_F(PrefillChunkYieldCapacitySuite, AFailedCarriedPromptEndsTheFillAndTheChunkThatGaveWayIsAdmittedFirst) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 32);
@@ -4801,8 +4856,7 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    const std::optional<AdmissionResult> admission = AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
@@ -4994,6 +5048,368 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     FAIL() << "third was never scheduled";
 }
 
+// With a sliding-window group whose window at the junction was never cached, the cut there writes and publishes it.
+class JunctionCutSlidingSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      /*sliding_window_tokens=*/2),
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState),
+        };
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(JunctionCutSlidingSuite, CutsAtTheFullHistoryCoverageWhenTheWindowThereIsGone) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    PlanOnce();  // tokens 0..8: the window behind 6 slides out inside the chunk
+    SendForwardDone("seed");
+    PlanOnce();  // prompt end at token 12
+    SendForwardDone("seed", {42});
+    PlanOnce();  // first decode: the prompt-end checkpoint is published
+    SendForwardDone("seed", {43});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 0u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    Submit(first);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the full-history coverage";
+    SendForwardDone("first");
+    plan = PlanOnce();  // publishes state@6 and first's window behind it
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    SendForwardDone("first", {7});
+
+    RequestSpec third = seed;
+    third.request_id = "third";
+    for (std::size_t i = 6; i < third.tokens.size(); ++i) {
+        third.tokens[i] += 3000;
+    }
+    Submit(third);
+    for (int round = 0; round < 4; ++round) {
+        plan = PlanOnce();
+        batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        const auto it = std::ranges::find(batch->request_ids, "third");
+        if (it == batch->request_ids.end()) {
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction's checkpoint and window are a hit";
+        return;
+    }
+    FAIL() << "third was never scheduled";
+}
+
+class JunctionCutSlidingHostSuite : public JunctionCutSlidingSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = JunctionCutSlidingSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        return cfg;
+    }
+};
+
+// The seed on the Host alone: its full-history run reaches 6 without a window, so `first` still cuts at 6.
+TEST_F(JunctionCutSlidingHostSuite, HostOnlyFullHistoryCutsTheFirstChunkWhenTheWindowThereIsGone) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    AckWriteBacks(PlanOnce());  // tokens 0..8
+    SendForwardDone("seed");
+    AckWriteBacks(PlanOnce());  // prompt end at token 12
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    Submit(first);
+    ExecutionPlan plan = PlanOnce();
+    AckWriteBacks(plan);
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the Host's full-history run";
+    SendForwardDone("first");
+    plan = PlanOnce();  // publishes state@6 and first's window behind it
+    AckWriteBacks(plan);
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    SendForwardDone("first", {7});
+
+    RequestSpec third = seed;
+    third.request_id = "third";
+    for (std::size_t i = 6; i < third.tokens.size(); ++i) {
+        third.tokens[i] += 3000;
+    }
+    Submit(third);
+    for (int round = 0; round < 4; ++round) {
+        plan = PlanOnce();
+        AckWriteBacks(plan);
+        batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        const auto it = std::ranges::find(batch->request_ids, "third");
+        if (it == batch->request_ids.end()) {
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "a later prompt resumes at the Host-reached junction";
+        return;
+    }
+    FAIL() << "third was never scheduled";
+}
+
+// A seed prefilled in chunks of 8 (windows cached only at 8 and its end), then `first` and `third` diverging from it.
+class JunctionReachSuite : public SchedulerTestSuite {
+protected:
+    virtual bool WithState() const { return true; }
+    virtual std::int32_t Window() const { return 2; }
+    virtual std::int32_t Grain() const { return 1; }
+    virtual Role ServingRole() const { return Role::kFused; }
+    // The seed on the Host alone: L2 write-through on, and Run clears the Device cache after the seed.
+    virtual bool HostOnlySeed() const { return false; }
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.role = ServingRole();
+        cfg.prefix_granularity = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = !HostOnlySeed();
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      Window()),
+        };
+        if (WithState()) {
+            cfg.cache_groups.push_back(
+                MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState));
+            if (Grain() > 1) {
+                cfg.cache_groups.back().checkpoint_granularity = Grain();
+                cfg.state_checkpoint_in_forward = true;
+            }
+        }
+        if (cfg.role != Role::kFused) {
+            for (CacheGroupConfig& group : cfg.cache_groups) {
+                group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
+                                                                            : CacheTransferPolicy::FullSuffix;
+            }
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    static RequestSpec Diverging(const RequestSpec& seed, const std::string& id, std::size_t diverge,
+                                 std::int32_t offset) {
+        RequestSpec spec = seed;
+        spec.request_id = id;
+        for (std::size_t i = diverge; i < spec.tokens.size(); ++i) {
+            spec.tokens[i] += offset;
+        }
+        return spec;
+    }
+
+    // Prefills `id` to its prompt end, returning its chunks as {resumed, input} pairs.
+    std::vector<std::pair<std::int32_t, std::int32_t>> PrefillAll(const std::string& id) {
+        std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+        for (int round = 0; round < 8; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr || batch->NumExtends() == 0) {
+                continue;
+            }
+            chunks.emplace_back(batch->extend_prefix_lens.at(0), batch->input_lengths.at(0));
+            const bool left = batch->extend_prefix_lens[0] + batch->input_lengths[0] < batch->prefill_lengths[0];
+            SendForwardDone(id, left ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{42});
+            if (!left) {
+                break;
+            }
+        }
+        return chunks;
+    }
+
+    // The seed, finished; then `first` prefilled; then the prefix `third` resumes at.
+    struct Outcome {
+        std::vector<std::pair<std::int32_t, std::int32_t>> first_chunks;
+        std::int32_t third_resumed{-1};
+        std::uint64_t unresumable_kv{0};
+    };
+    Outcome Run(std::int32_t seed_pages, std::size_t diverge) {
+        const RequestSpec seed = MakeRequestSpec("seed", seed_pages);
+        Submit(seed);
+        PrefillAll("seed");
+        AckWriteBacks(PlanOnce());
+        SendForwardDone("seed", {43});
+        SendFinish("seed");
+        AckWriteBacks(PlanOnce());
+        if (HostOnlySeed()) {
+            EXPECT_TRUE(scheduler_->ClearL1Cache());
+        }
+        Outcome out;
+        Submit(Diverging(seed, "first", diverge, 1000));
+        out.first_chunks = PrefillAll("first");
+        Submit(Diverging(seed, "third", diverge, 3000));
+        for (int round = 0; round < 6 && out.third_resumed < 0; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr) {
+                continue;
+            }
+            const auto it = std::ranges::find(batch->request_ids, "third");
+            if (it != batch->request_ids.end() && batch->NumExtends() > 0) {
+                out.third_resumed =
+                    batch->extend_prefix_lens.at(static_cast<std::size_t>(it - batch->request_ids.begin()));
+            }
+        }
+        out.unresumable_kv = scheduler_->GetHostCacheStats().prefix_hits.unresumable_kv_tokens;
+        return out;
+    }
+    using Chunks = std::vector<std::pair<std::int32_t, std::int32_t>>;
+};
+
+// A sliding-only model has no checkpoint to publish, so no junction reaches past the missing window.
+class JunctionReachSlidingOnlySuite : public JunctionReachSuite {
+protected:
+    bool WithState() const override { return false; }
+};
+
+TEST_F(JunctionReachSlidingOnlySuite, AMissingWindowCutsNothingWithoutAStateGroup) {
+    const Outcome out = Run(/*seed_pages=*/6, /*diverge=*/6);
+    EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 4}}));
+    EXPECT_EQ(out.third_resumed, 0);
+    EXPECT_EQ(out.unresumable_kv, 0u);
+}
+
+// A window wider than a page: first resumes at the seed's chunk end 8 and needs no extra cut at 10.
+class JunctionReachSlidingOnlyWideSuite : public JunctionReachSlidingOnlySuite {
+protected:
+    std::int32_t Window() const override { return 4; }
+};
+
+TEST_F(JunctionReachSlidingOnlyWideSuite, AWideWindowAddsNoPrefillRoundWithoutAStateGroup) {
+    const Outcome out = Run(/*seed_pages=*/8, /*diverge=*/10);
+    EXPECT_EQ(out.first_chunks, (Chunks{{8, 8}}));
+    EXPECT_EQ(out.third_resumed, 8);
+    EXPECT_EQ(out.unresumable_kv, 0u);
+}
+
+// A restricted State group (G = 4): the coverage 10 is off the grid, so the junction stays at 8.
+class JunctionReachRestrictedSuite : public JunctionReachSuite {
+protected:
+    std::int32_t Grain() const override { return 4; }
+};
+
+TEST_F(JunctionReachRestrictedSuite, TheJunctionStaysOnTheCheckpointGrid) {
+    const Outcome out = Run(/*seed_pages=*/8, /*diverge=*/10);
+    EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 8}}));
+    EXPECT_EQ(out.third_resumed, 8);
+    EXPECT_EQ(out.unresumable_kv, 8u);
+}
+
+// The same with the seed on the Host alone: the Host's reach stays on the grid at 8 too.
+class JunctionReachRestrictedHostSuite : public JunctionReachRestrictedSuite {
+protected:
+    bool HostOnlySeed() const override { return true; }
+};
+
+TEST_F(JunctionReachRestrictedHostSuite, TheHostReachStaysOnTheCheckpointGrid) {
+    const Outcome out = Run(/*seed_pages=*/8, /*diverge=*/10);
+    EXPECT_EQ(out.third_resumed, 8);
+    EXPECT_EQ(out.unresumable_kv, 8u);
+}
+
+// A sliding-only model with the seed on the Host alone makes no junction past a missing window either.
+class JunctionReachSlidingOnlyHostSuite : public JunctionReachSlidingOnlySuite {
+protected:
+    bool HostOnlySeed() const override { return true; }
+};
+
+TEST_F(JunctionReachSlidingOnlyHostSuite, AHostMissingWindowCutsNothingWithoutAStateGroup) {
+    const Outcome out = Run(/*seed_pages=*/6, /*diverge=*/6);
+    EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 4}}));
+    EXPECT_EQ(out.third_resumed, 0);
+    EXPECT_EQ(out.unresumable_kv, 0u);
+}
+
+// The D role's probe leaves the State groups out, so a missing window makes no junction there either.
+class JunctionReachDecodeRoleSuite : public JunctionReachSuite {
+protected:
+    Role ServingRole() const override { return Role::kD; }
+    void SubmitBootstrapped(const RequestSpec& spec) {
+        Submit(spec);
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{spec.request_id});
+        scheduler_->Advance(std::move(event));
+    }
+    void Land(const std::string& id) {
+        ExecutionEvent event;
+        event.With(pd::RemotePrefillDoneEvent{id, 30000});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(JunctionReachDecodeRoleSuite, AMissingWindowMakesNoJunctionOnTheDecodeRole) {
+    const RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    SubmitBootstrapped(seed);
+    ExecutionPlan plan = PlanOnce();
+    ASSERT_NE(FindRemoteAdmission(plan), nullptr);
+    Land("seed");
+    PlanOnce();
+    SendForwardDone("seed", {43});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+
+    SubmitBootstrapped(Diverging(seed, "first", 6, 1000));
+    plan = PlanOnce();
+    const ForwardBatch* admission = FindRemoteAdmission(plan);
+    ASSERT_NE(admission, nullptr);
+    ASSERT_EQ(admission->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.unresumable_kv_tokens, 0u);
+}
+
 class JunctionCutHostSuite : public JunctionCutSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -5019,7 +5435,7 @@ TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "six KV pages and state@12";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
     // The clear evicts the six pages and state@12; Host holds all seven.
-    const CacheCoordinator::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
+    const CacheEvictor::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
     EXPECT_EQ(flushed.blocks, 7u);
     EXPECT_EQ(flushed.host_resident, 7u);
 
@@ -5095,7 +5511,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
+    const std::optional<AdmissionResult> admission =
         AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
@@ -5169,8 +5585,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     const auto restore =
-        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch,
-                            /*drop_claims_if_unfit=*/false);
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch);
     ASSERT_TRUE(restore);
     ASSERT_EQ(restore->snapshot_pairs.size(), 2u) << "the 4 computed prompt tokens; the decode input has no KV yet";
     request.Apply(
@@ -5217,8 +5632,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    const std::optional<AdmissionResult> admission = AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
@@ -5234,7 +5648,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
 
     // The last chunk's ExtendResult lands while still PrefillDone.
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     EXPECT_TRUE(request.Is<fsm::Retracted>());
@@ -5254,8 +5668,8 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
         GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1},
         GroupDemand{.table = &restored[1], .extent = DenseGrowth{0}, .reserve_tokens = 1},
     };
-    ASSERT_TRUE(coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch,
-                                    /*drop_claims_if_unfit=*/false));
+    ASSERT_TRUE(
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/1});
     request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate(), DecodeSlotIndex{}});
@@ -5663,7 +6077,7 @@ TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
     EXPECT_NE(log.find("flush L1 cache completed"), std::string::npos);
     // r1 published 9 computed tokens: four pages and a one-token tail in each
     // of the two groups. No Host pool holds anything.
-    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
     EXPECT_EQ(evictions.flush.blocks, 10u);
     EXPECT_EQ(evictions.flush.host_resident, 0u);
     EXPECT_EQ(evictions.admission.blocks + evictions.restore.blocks + evictions.tail_cap.blocks, 0u);

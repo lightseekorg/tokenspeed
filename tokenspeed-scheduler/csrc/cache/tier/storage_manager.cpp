@@ -141,7 +141,7 @@ StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std:
 
 bool StorageTransferManager::Completed(std::uint64_t id) const {
     const auto it = operations_.find(id);
-    return it == operations_.end() || it->second.completed;
+    return it == operations_.end() || it->second.Completed();
 }
 
 bool StorageTransferManager::IsQuery(std::uint64_t id) const {
@@ -149,7 +149,7 @@ bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
-std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
+std::vector<CacheKey> StorageTransferManager::RecordQueryHits(std::uint64_t id) {
     Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
@@ -160,10 +160,9 @@ std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
     return keys;
 }
 
-StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPrefix& prompt,
-                                               std::span<const CacheKey> hits) {
+StorageLease StorageTransferManager::StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits) {
     if (!CanStart() || hits.empty()) return {};
-    auto reservation = coordinator_.ReserveStoragePrefix(prompt, hits, availableHostCredits());
+    auto reservation = coordinator_.Storage().ReserveStoragePrefix(prompt, hits, availableHostCredits());
     if (reservation.keys.empty()) return {};
     StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
@@ -202,7 +201,7 @@ void StorageTransferManager::rememberPublished(const CacheKey& key) {
 
 void StorageTransferManager::Complete(const cache::StorageDone& event) {
     const auto it = operations_.find(event.op_id);
-    if (it == operations_.end() || it->second.completed) return;
+    if (it == operations_.end() || it->second.Completed()) return;
     Ticket& ticket = it->second;
     if (event.success.size() != ticket.keys.size() || event.object_failures.size() != event.success.size()) {
         throw std::invalid_argument("L3 completion size differs from its immutable operation");
@@ -214,7 +213,6 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
         }
     }
     ticket.success = event.success;
-    ticket.completed = true;
     ticket.quarantined = !event.retired;
     const auto kind = ticket.kind;
     if (kind == StorageKind::kGet) {
@@ -225,14 +223,15 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
                 std::erase(published_order_, ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
-                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i], /*inherited_metadata=*/std::nullopt);
+                coordinator_.Host().CacheHostBlock(ticket.blocks[i], ticket.keys[i],
+                                                   /*inherited_metadata=*/std::nullopt);
                 // A successful accepted GET proves the immutable object also
                 // existed remotely. A later producer need not PUT it again.
                 rememberPublished(ticket.keys[i]);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {
-            coordinator_.CacheHostTail(ticket.tail_prior, *ticket.tail);
+            coordinator_.Host().CacheHostTail(ticket.tail_prior, *ticket.tail);
         }
     }
     if (!event.retired) return;  // Quarantine is charged until a process/transport teardown proves safety.
@@ -251,7 +250,7 @@ void StorageTransferManager::detach(std::uint64_t id) noexcept {
     Ticket& ticket = it->second;
     ticket.detached = true;
     if (ticket.quarantined) return;
-    if (ticket.completed) {
+    if (ticket.Completed()) {
         operations_.erase(it);
         return;
     }
@@ -315,7 +314,7 @@ void StorageTransferManager::StartBackups() {
         CacheKey key = std::move(backup_candidates_.front());
         backup_candidates_.pop_front();
         if (!pending.insert(key).second) continue;
-        CacheBlockRef ref = coordinator_.AcquireHostCachedBlock(key);
+        CacheBlockRef ref = coordinator_.Store().AcquireHostCachedBlock(key);
         if (!ref) {
             ++unavailable_dropped_backup_keys_;
             continue;

@@ -602,6 +602,26 @@ def _dsa_persistent_topk():
 # shapes and dtypes; only their types, strides and alignment matter.
 
 
+def _kimi_k3_moe_tail():
+    # One layer's tail at 8 rows that also writes the next layer's input.
+    from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail import kernel
+
+    key = kernel.KimiK3MoeTailBuild(
+        tokens=8, nblocks=3, reset=False, eps=1e-5, out_eps=1e-5, ln_eps=1e-5,
+        next_mix=True, mix_eps=1e-5,
+    )  # fmt: skip
+    types, constexprs = kernel.compile_signature(key)
+    options = dict(num_stages=1, enable_fp_fusion=False, **kernel.compile_options())
+    return _compile_gfx950(
+        kernel.gluon_kimi_k3_moe_tail_gfx950,
+        types,
+        constexprs,
+        8,
+        ("rank", "slot", "blk_sm", "blk_sr"),
+        options,
+    )
+
+
 def _offline_warmup(fn, compiled):
     """A ``fn.warmup`` that compiles for gfx950 without a device and appends
     the kernel to ``compiled``."""
@@ -805,6 +825,7 @@ VARIANTS = {
     "mha_extend_warp_pipelined": _mha_extend_warp_pipelined,
     "mla_prefill_8wave": _mla_prefill_8wave,
     "dsa_persistent_topk": _dsa_persistent_topk,
+    "kimi_k3_moe_tail-rows8": _kimi_k3_moe_tail,
     # The target layer: decode (1 row), one verify (8) and two (16).
     "muse_layer-rows1-sliding": lambda: _layer(1, 1, False),
     "muse_layer-rows1-full": lambda: _layer(1, 1, True),
@@ -885,6 +906,19 @@ INLINE_ASM = {
         _MONO + "muse_spark.moe_experts:_ballot_slots2",
         "the picks' slots by lane reads and ballots (128 picks)",
         "compiler lowering matching the measured asm code size",
+    ),
+    # The Kimi-K3 MoE tail's two empty type bridges (no instruction).
+    "wave_pending": (
+        _AMD + "kimi_k3.moe_tail._stages.common:wave_pending",
+        "types a wave vote, already one scalar per wave, as a scalar that a"
+        " loop or branch condition takes",
+        "a Gluon ballot (wave vote) op with a scalar result",
+    ),
+    "shared_address": (
+        _AMD + "kimi_k3.moe_tail._stages.lds:shared_address",
+        "a shared-memory allocation's LDS address, for the extern library's"
+        " masked accesses that add no workgroup barrier",
+        "a Gluon op that exposes a shared-memory allocation's address",
     ),
 }
 # Inline asm that existed before this gate, which the kernels above compile in.

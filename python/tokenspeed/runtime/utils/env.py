@@ -35,6 +35,7 @@ global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "enable_dsv41_adaptive_dspark": ServerArgs.enable_dsv41_adaptive_dspark,
+    "enable_dp_local_cuda_graph": ServerArgs.enable_dp_local_cuda_graph,
     "dsv41_dspark_min_batch_size": ServerArgs.dsv41_dspark_min_batch_size,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
@@ -47,6 +48,7 @@ global_server_args_dict: dict = {
     "engram_host_table_numa": ServerArgs.engram_host_table_numa,
     "decode_monokernel": ServerArgs.decode_monokernel,
     "monokernel_stuck_record_dir": ServerArgs.monokernel_stuck_record_dir,
+    "disable_overlap_schedule": ServerArgs.disable_overlap_schedule,
     "speculative_algorithm": ServerArgs.speculative_algorithm,
     "drafter_attention_backend": ServerArgs.drafter_attention_backend,
     "kv_cache_dtype": ServerArgs.kv_cache_dtype,
@@ -117,6 +119,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "enable_dsv41_adaptive_dspark": server_args.enable_dsv41_adaptive_dspark,
+            "enable_dp_local_cuda_graph": server_args.enable_dp_local_cuda_graph,
             "dsv41_dspark_min_batch_size": server_args.dsv41_dspark_min_batch_size,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
@@ -152,6 +155,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
+            "disable_overlap_schedule": server_args.disable_overlap_schedule,
             "speculative_algorithm": server_args.speculative_algorithm,
             "drafter_attention_backend": server_args.drafter_attention_backend,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
@@ -302,6 +306,9 @@ class EnvFloat(EnvField):
 
 class Envs:
     # fmt: off
+
+    # PLE embedding lookup
+    TOKENSPEED_PLE_HOST_CACHE_SLOTS = EnvInt(524288)
 
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/peer.h"
 #include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include <vector>
@@ -79,9 +80,10 @@ struct SchedulerConfig {
     enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
     HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
 
-    // The D role streams no ordinary Device cache entry to Host; its Host
-    // cache holds only the published pages of retracted requests (the image's
-    // L2 leg) until they are restored.
+    // Under write-through the D role streams no ordinary Device cache entry
+    // to Host: it would copy every landed prompt. Under write-back it writes
+    // back what its admissions evict, as every role does, and its remote
+    // admission loads a Host hit below the landing (ProbeDecodePrefix).
     bool StreamsDeviceCacheToHost() const {
         return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
     }
@@ -115,6 +117,9 @@ struct SchedulerConfig {
     // entries are written to the pool as a write-through Host store would be.
     // P and fused roles, replicated groups, never with L3 or a snapshot pool.
     std::optional<SharedL2Config> shared_l2_config;
+    // Sharing cached prefixes with other replicas
+    // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
+    std::optional<PeerConfig> peer_config;
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
@@ -136,6 +141,18 @@ struct SchedulerConfig {
     // (transfer pins, destination layouts, transfer_policy validation) keys
     // on the role directly.
     Role role{Role::kFused};
+    // What the Decode destination gates on the P role; refused elsewhere
+    // (Validate), and absent there it is kEarly. Under either policy a prompt
+    // is admitted once pd::BootstrappedEvent arrived.
+    //   kEarly     that event also says every Decode rank allocated the
+    //              destination, so a prompt computes with its destination
+    //              allocated.
+    //   kDeferred  the destination has its own event,
+    //              pd::DestinationReadyEvent. A prompt computed before it
+    //              waits in PrefillAwaitingDestination, and its KV is sent
+    //              once it arrived.
+    enum class DecodeAllocationPolicy : std::uint8_t { kEarly, kDeferred };
+    std::optional<DecodeAllocationPolicy> decode_allocation_policy;
 
     bool disable_prefix_cache{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.
@@ -201,9 +218,11 @@ struct SchedulerConfig {
     // that fit whole, so they run complete in the same forward: the chunk
     // ends on an earlier page and gives up fewer than this plus one page
     // (docs/design/scheduler.md §1.1). A chunk yields only while such prompts
-    // wait, and only what they take. 0 (the default) is off; at most half of
-    // max_scheduled_tokens, so a long prompt keeps about half of every round
-    // or more.
+    // wait, and only what they take. 0 (the default) is off: no chunk gives
+    // way; at most half of max_scheduled_tokens, so a long prompt keeps about
+    // half of every round or more. The budget a P-role chunk leaves on its
+    // own goes to bootstrapped prompts that fit whole in it whatever this
+    // value (§1.1).
     std::int32_t prefill_chunk_yield_tokens{0};
 
     // The single validation entry point for a scheduler configuration: every

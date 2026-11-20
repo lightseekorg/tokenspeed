@@ -59,6 +59,7 @@ HostCacheStats = _ext.HostCacheStats
 StorageConfig = _ext.StorageConfig
 StoragePressure = _ext.StoragePressure
 StorageKind = _ext.StorageKind
+PeerConfig = _ext.PeerConfig
 
 PD = _ext.PD
 Cache = _ext.Cache
@@ -95,6 +96,7 @@ __all__ = [
     "StorageStats",
     "HostCacheStats",
     "StorageKind",
+    "PeerConfig",
     "RequestSpec",
     "AttnKind",
     "CacheGroupConfig",

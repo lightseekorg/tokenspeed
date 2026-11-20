@@ -141,3 +141,216 @@ def test_adaptive_dspark_cli_reaches_runtime_and_resets():
     finally:
         global_server_args_dict.clear()
         global_server_args_dict.update(original)
+
+
+def test_sampled_adaptive_dspark_requires_recorded_proposals():
+    argv = [
+        "--model",
+        "x",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--sampling-backend",
+        "flashinfer",
+        "--grammar-backend",
+        "none",
+        "--disable-prefill-graph",
+        "--enable-dsv41-adaptive-dspark",
+    ]
+    with pytest.raises(ValueError, match="enable-speculative-sampling"):
+        prepare_server_args(argv)
+    with pytest.raises(ValueError, match="sampling-stream per-request"):
+        prepare_server_args(argv + ["--enable-speculative-sampling"])
+    args = prepare_server_args(
+        argv + ["--enable-speculative-sampling", "--sampling-stream", "per-request"]
+    )
+    assert args.enable_speculative_sampling
+    assert args.speculative_rejection_sample_method == "standard"
+
+
+def test_sampled_adaptive_dspark_rejects_attention_tp():
+    with pytest.raises(ValueError, match="attention TP1"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--sampling-backend",
+                "flashinfer",
+                "--grammar-backend",
+                "none",
+                "--disable-prefill-graph",
+                "--enable-dsv41-adaptive-dspark",
+                "--enable-speculative-sampling",
+                "--sampling-stream",
+                "per-request",
+                "--tensor-parallel-size",
+                "2",
+            ]
+        )
+
+
+def _dp_local_graph_args():
+    return [
+        "--model",
+        "x",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--sampling-backend",
+        "greedy",
+        "--moe-backend",
+        "mega_moe",
+        "--enable-dp-local-cuda-graph",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["mega_moe", "deep_gemm_mega_moe"])
+@pytest.mark.parametrize("draft_backend", [None, "mega_moe", "deep_gemm_mega_moe"])
+@pytest.mark.parametrize("role", ["null", "decode"])
+def test_dp_local_cuda_graph_accepts_fixed_greedy(backend, draft_backend, role):
+    argv = _dp_local_graph_args() + [
+        "--moe-backend",
+        backend,
+        "--disaggregation-mode",
+        role,
+        "--data-parallel-size",
+        "2",
+        "--enable-expert-parallel",
+    ]
+    if draft_backend is not None:
+        argv += ["--draft-moe-backend", draft_backend]
+    args = prepare_server_args(argv)
+    assert args.enable_dp_local_cuda_graph
+    assert not args.enable_dsv41_adaptive_dspark
+    assert args.mapping.attn.dp_size == 2
+
+
+def test_dp_local_cuda_graph_accepts_sampled_adaptive():
+    args = prepare_server_args(
+        _dp_local_graph_args()
+        + [
+            "--sampling-backend",
+            "flashinfer",
+            "--enable-dsv41-adaptive-dspark",
+            "--enable-speculative-sampling",
+            "--sampling-stream",
+            "per-request",
+            "--disable-prefill-graph",
+            "--grammar-backend",
+            "none",
+        ]
+    )
+    assert args.enable_dp_local_cuda_graph
+    assert args.enable_dsv41_adaptive_dspark
+    assert args.enable_speculative_sampling
+
+
+def test_dp_local_cuda_graph_sampled_path_keeps_adaptive_validation():
+    with pytest.raises(ValueError, match="enable-speculative-sampling"):
+        prepare_server_args(
+            _dp_local_graph_args()
+            + [
+                "--sampling-backend",
+                "flashinfer",
+                "--enable-dsv41-adaptive-dspark",
+                "--disable-prefill-graph",
+                "--grammar-backend",
+                "none",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        (["--speculative-algorithm", "MTP"], "require DSPARK"),
+        (["--moe-backend", "auto"], "MegaMoE for both target and draft"),
+        (["--draft-moe-backend", "deep_gemm"], "MegaMoE for both target and draft"),
+        (["--enforce-eager"], "require CUDA graphs"),
+        (["--disaggregation-mode", "prefill"], "decode-capable worker"),
+        (["--disaggregation-mode", "encode"], "decode-capable worker"),
+        (["--sampling-backend", "flashinfer"], "greedy sampling or adaptive"),
+        (["--tensor-parallel-size", "2"], "attention/dense/MoE/LM-head TP1"),
+        (
+            ["--world-size", "2", "--data-parallel-size", "2"],
+            "attention/dense/MoE/LM-head TP1",
+        ),
+        (
+            [
+                "--world-size",
+                "2",
+                "--data-parallel-size",
+                "2",
+                "--enable-expert-parallel",
+                "--dense-tp-size",
+                "2",
+            ],
+            "attention/dense/MoE/LM-head TP1",
+        ),
+        (
+            [
+                "--world-size",
+                "2",
+                "--data-parallel-size",
+                "2",
+                "--enable-expert-parallel",
+                "--lm-head-tp-size",
+                "2",
+            ],
+            "attention/dense/MoE/LM-head TP1",
+        ),
+        (
+            [
+                "--world-size",
+                "2",
+                "--data-parallel-size",
+                "2",
+                "--enable-expert-parallel",
+                "--attn-head-tp-size",
+                "2",
+                "--disaggregation-mode",
+                "decode",
+                "--disable-prefill-graph",
+            ],
+            "attention/dense/MoE/LM-head TP1",
+        ),
+        (["--dp-sampling"], "no DP sampling"),
+    ],
+)
+def test_dp_local_cuda_graph_rejects_unsupported_configuration(options, message):
+    with pytest.raises(ValueError, match=message):
+        prepare_server_args(_dp_local_graph_args() + options)
+
+
+@pytest.mark.parametrize(
+    "parallel_sizes",
+    [
+        (2, 1, 1, 1),
+        (1, 2, 1, 1),
+        (1, 1, 2, 1),
+        (1, 1, 1, 2),
+    ],
+)
+def test_dp_local_cuda_graph_rejects_parallel_groups(parallel_sizes):
+    args = prepare_server_args(_dp_local_graph_args())
+    # Exercise this admission rule independently of earlier topology checks.
+    (
+        args.pipeline_parallel_size,
+        args.kv_parallel_size,
+        args.decode_context_parallel_size,
+        args.query_context_parallel_size,
+    ) = parallel_sizes
+    with pytest.raises(ValueError, match="PP1/KVP1/DCP1/QCP1"):
+        args.validate_dp_local_cuda_graph()
+
+
+def test_dp_local_cuda_graph_cli_reaches_runtime_and_resets():
+    original = global_server_args_dict.copy()
+    try:
+        global_server_args_dict_update(prepare_server_args(_dp_local_graph_args()))
+        assert global_server_args_dict["enable_dp_local_cuda_graph"] is True
+        global_server_args_dict_update(prepare_server_args(["--model", "x"]))
+        assert global_server_args_dict["enable_dp_local_cuda_graph"] is False
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(original)

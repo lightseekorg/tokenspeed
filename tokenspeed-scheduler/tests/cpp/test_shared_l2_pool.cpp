@@ -84,7 +84,7 @@ struct Prompt {
     CheckpointTree::Lineage Publication(std::uint64_t publisher) const {
         return {.tokens = tokens, .prefix_hashes = hashes, .tail = tail, .access_epoch = publisher};
     }
-    CacheCoordinator::PromptPrefix Prefix() const {
+    PromptPrefix Prefix() const {
         return {.prefix_hashes = hashes, .tokens = tokens, .max_tokens = static_cast<std::int32_t>(tokens.size())};
     }
 };
@@ -584,7 +584,7 @@ TEST(SharedL2Pool, MisusedCallsAreRefusedBeforeAnythingChanges) {
     EXPECT_THROW(SharedL2Pool(HybridSpecs(), kPage, {1 << 16, 1}, 1 << 15, 0, kRetention, 0), std::runtime_error);
 
     // A lookup whose tokens do not reach its bound, or whose bound is negative.
-    CacheCoordinator::PromptPrefix lookup = prompt.Prefix();
+    PromptPrefix lookup = prompt.Prefix();
     lookup.max_tokens += 1;
     EXPECT_THROW(pool.Probe(2, lookup), std::invalid_argument);
     lookup.max_tokens = -kPage;
@@ -645,11 +645,11 @@ struct LocalHostTier {
 
     void Publish(const Prompt& point) {
         const std::vector<CacheKey> keys = StateKeys(point);
-        CacheCoordinator::HostAllocationBatch batch;
+        HostCache::HostAllocationBatch batch;
         if (!HoldsAll(point)) {
             const std::vector<std::uint32_t> groups{0, 1};
             const std::vector<std::int32_t> buckets{0, 0};
-            batch = cache.AcquireHostBlocks(groups, buckets);
+            batch = cache.Host().AcquireHostBlocks(groups, buckets);
             ASSERT_EQ(batch.stats.allocated, keys.size());
         }
         std::vector<BlockTable> tables(2);
@@ -666,20 +666,21 @@ struct LocalHostTier {
             admission->access_epoch);
         cache.Free(tables);
         for (std::size_t i = 0; i < batch.blocks.size(); ++i) {
-            cache.CacheHostBlock(batch.blocks[i], keys[i], std::nullopt);
+            cache.Host().CacheHostBlock(batch.blocks[i], keys[i], std::nullopt);
         }
         if (point.tail) {
-            cache.CacheHostTail(point.hashes.empty() ? ContentHash{} : ContentHash{point.hashes.back()}, *point.tail);
+            cache.Host().CacheHostTail(point.hashes.empty() ? ContentHash{} : ContentHash{point.hashes.back()},
+                                       *point.tail);
         }
         admission.reset();
         ASSERT_TRUE(cache.ClearDeviceCache());
     }
     // A new request resumes at the probe's Host hit and leaves.
-    void Resume(const CacheCoordinator::PromptPrefix& prefix) {
+    void Resume(const PromptPrefix& prefix) {
         {
             std::vector<BlockTable> tables(2);
-            auto admission =
-                AdmitForTest(cache, tables, cache.ProbePromptPrefix(prefix), GroupDemand{.extent = DenseGrowth{0}});
+            auto admission = AdmitForTest(cache, tables, cache.Prober().ProbePromptPrefix(prefix),
+                                          GroupDemand{.extent = DenseGrowth{0}});
             ASSERT_TRUE(admission);
             admission.reset();
             cache.Free(tables);
@@ -688,11 +689,11 @@ struct LocalHostTier {
     }
     bool HoldsAll(const Prompt& point) const {
         return std::ranges::all_of(StateKeys(point),
-                                   [&](const CacheKey& key) { return cache.ContainsHostCachedBlock(key); });
+                                   [&](const CacheKey& key) { return cache.Host().ContainsHostCachedBlock(key); });
     }
     bool HoldsNone(const Prompt& point) const {
         return std::ranges::none_of(StateKeys(point),
-                                    [&](const CacheKey& key) { return cache.ContainsHostCachedBlock(key); });
+                                    [&](const CacheKey& key) { return cache.Host().ContainsHostCachedBlock(key); });
     }
 };
 
@@ -750,18 +751,19 @@ TEST(SharedL2Pool, EvictsAsARanksOwnHostTierGivenTheSameSequence) {
                         std::vector<std::int32_t> longer = point.tokens;
                         longer.push_back(7);
                         const Prompt prompt{std::move(longer)};
-                        CacheCoordinator::PromptPrefix prefix = prompt.Prefix();
+                        PromptPrefix prefix = prompt.Prefix();
                         prefix.max_tokens = static_cast<std::int32_t>(point.tokens.size());
                         const SharedL2Pool::Hit hit = pool.Probe(2, prefix);
                         pool.Release(2, hit.ticket);
-                        ASSERT_EQ(hit.num_tokens, local.cache.ProbePromptPrefix(prefix).host.num_common_tokens);
+                        ASSERT_EQ(hit.num_tokens,
+                                  local.cache.Prober().ProbePromptPrefix(prefix).host.num_common_tokens);
                         if (hit.num_tokens > 0) {
                             local.Resume(prefix);
                         }
                     } else if (action == 9) {
                         const std::vector<CacheKey> keys = StateKeys(published[turns[random() % turns.size()]]);
                         pool.Touch(keys);
-                        local.cache.TouchHostBlocks(keys);
+                        local.cache.Host().TouchHostBlocks(keys);
                     } else {
                         // A request computes a published turn again and offers its
                         // checkpoint again: held, it is refreshed; evicted
@@ -784,7 +786,7 @@ TEST(SharedL2Pool, EvictsAsARanksOwnHostTierGivenTheSameSequence) {
                     ASSERT_TRUE(AllGranted(Reserve(pool, 3, StateKeys(Prompt{Sequence(4, 900000 + 10 * round)}))));
                     const std::vector<std::uint32_t> groups{0, 1};
                     const std::vector<std::int32_t> buckets{0, 0};
-                    CacheCoordinator::HostAllocationBatch batch = local.cache.AcquireHostBlocks(groups, buckets);
+                    HostCache::HostAllocationBatch batch = local.cache.Host().AcquireHostBlocks(groups, buckets);
                     ASSERT_EQ(batch.stats.allocated, 2u);
                     for (CacheBlockRef& block : batch.blocks) {
                         local_reserved.push_back(std::move(block));
@@ -793,7 +795,7 @@ TEST(SharedL2Pool, EvictsAsARanksOwnHostTierGivenTheSameSequence) {
                 }
                 EXPECT_EQ(pool.GetStats().cached_blocks, 0);
                 evictions_compared += pool.GetStats().evicted_blocks;
-                EXPECT_EQ(pool.GetStats().evicted_blocks, local.cache.HostEvictions().lru.blocks);
+                EXPECT_EQ(pool.GetStats().evicted_blocks, local.cache.Evictor().HostEvictions().lru.blocks);
                 pool.Disconnect(3);
             }
         }
@@ -832,14 +834,14 @@ struct TierPair {
         on_device.Free(tables);
         for (const CacheKey& key :
              prompt.Keys(state ? std::vector<std::uint32_t>{kState} : std::vector<std::uint32_t>{})) {
-            if (on_host.ContainsHostCachedBlock(key)) continue;
-            CacheBlockRef block = on_host.AcquireHostBlock(key.group_id, 0);
+            if (on_host.Host().ContainsHostCachedBlock(key)) continue;
+            CacheBlockRef block = on_host.Host().AcquireHostBlock(key.group_id, 0);
             ASSERT_TRUE(block);
-            on_host.CacheHostBlock(block, key, std::nullopt);
+            on_host.Host().CacheHostBlock(block, key, std::nullopt);
         }
         if (prompt.tail) {
-            on_host.CacheHostTail(prompt.hashes.empty() ? ContentHash{} : ContentHash{prompt.hashes.back()},
-                                  *prompt.tail);
+            on_host.Host().CacheHostTail(prompt.hashes.empty() ? ContentHash{} : ContentHash{prompt.hashes.back()},
+                                         *prompt.tail);
         }
     }
 };
@@ -871,11 +873,11 @@ TEST(SharedL2Pool, AProbeOfAnEmptyDeviceMatchesTheHostTierAlone) {
             SCOPED_TRACE(testing::Message()
                          << tokens.size() << " tokens from " << tokens.front() << ", bound " << bound);
             const Prompt prompt{tokens};
-            CacheCoordinator::PromptPrefix prefix = prompt.Prefix();
+            PromptPrefix prefix = prompt.Prefix();
             prefix.max_tokens = bound;
-            const CacheCoordinator::PrefixProbe::Tier device = tiers.on_device.ProbePromptPrefix(prefix).device;
-            const CacheCoordinator::PrefixProbe host_probe = tiers.on_host.ProbePromptPrefix(prefix);
-            const CacheCoordinator::PrefixProbe::Tier& host = host_probe.host;
+            const PrefixProbe::Tier device = tiers.on_device.Prober().ProbePromptPrefix(prefix).device;
+            const PrefixProbe host_probe = tiers.on_host.Prober().ProbePromptPrefix(prefix);
+            const PrefixProbe::Tier& host = host_probe.host;
             EXPECT_EQ(host_probe.device.num_common_tokens, 0);
             EXPECT_EQ(host.num_common_tokens, device.num_common_tokens);
             EXPECT_EQ(host.kv_tokens, device.kv_tokens);
@@ -924,27 +926,27 @@ TEST(SharedL2Pool, BoundedTakesOfARanksStoreCandidatesKeepTheirOrder) {
         admission->access_epoch);
     cache.Free(tables);
     admission.reset();
-    ASSERT_FALSE(cache.HasPendingStores());
+    ASSERT_FALSE(cache.Host().HasPendingStores());
 
     std::vector<std::string> taken;
     const auto take = [&](std::size_t max_candidates) {
-        for (const CacheCoordinator::StoreCandidate& candidate : cache.TakePendingStores(max_candidates)) {
+        for (const HostCache::StoreCandidate& candidate : cache.Host().TakePendingStores(max_candidates)) {
             taken.push_back(candidate.key.content_hash.ToString());
         }
     };
-    cache.QueueCachedBlocksForStore(prompt.hashes);
+    cache.Host().QueueCachedBlocksForStore(prompt.hashes);
     take(3);
-    cache.QueueCachedBlocksForStore(std::span{prompt.hashes}.first(2));
+    cache.Host().QueueCachedBlocksForStore(std::span{prompt.hashes}.first(2));
     take(3);
     take(2);
     EXPECT_EQ(taken, std::vector<std::string>(prompt.hashes.begin(), prompt.hashes.begin() + 8));
-    EXPECT_TRUE(cache.HasPendingStores());
+    EXPECT_TRUE(cache.Host().HasPendingStores());
 
     // Pages 8 and 9 and the two queued again are left.
     ASSERT_TRUE(cache.ClearDeviceCache());
-    EXPECT_EQ(cache.StoreCandidatesDroppedByFlush(), 4u);
-    EXPECT_FALSE(cache.HasPendingStores());
-    EXPECT_TRUE(cache.TakePendingStores(1).empty());
+    EXPECT_EQ(cache.Host().StoreCandidatesDroppedByFlush(), 4u);
+    EXPECT_FALSE(cache.Host().HasPendingStores());
+    EXPECT_TRUE(cache.Host().TakePendingStores(1).empty());
 }
 
 // A rank's Host tier standing for the pool, each waiting prompt's answer
@@ -967,35 +969,36 @@ TEST(SharedL2Pool, ATailPastThePerPageCapCostsTheOldestWaitingPromptItsHit) {
         const Prompt& prompt = prompts.emplace_back(std::move(tokens));
         std::vector<CacheBlockRef>& blocks = held.emplace_back();
         for (const CacheKey& key : prompt.Keys({kState})) {
-            CacheBlockRef block = rank.AcquireHostCachedBlock(key);
+            CacheBlockRef block = rank.Store().AcquireHostCachedBlock(key);
             if (!block) {
-                block = rank.AcquireHostBlock(key.group_id, 0);
+                block = rank.Host().AcquireHostBlock(key.group_id, 0);
                 ASSERT_TRUE(block);
-                rank.CacheHostBlock(block, key, std::nullopt);
+                rank.Host().CacheHostBlock(block, key, std::nullopt);
             }
             blocks.push_back(std::move(block));
         }
-        rank.CacheHostTail(ContentHash{prompt.hashes.back()}, *prompt.tail);
+        rank.Host().CacheHostTail(ContentHash{prompt.hashes.back()}, *prompt.tail);
     }
 
     for (std::size_t i = 1; i < prompts.size(); ++i) {
-        EXPECT_EQ(rank.ProbePromptPrefix(prompts[i].Prefix()).host.num_common_tokens, kPage + 1) << i;
+        EXPECT_EQ(rank.Prober().ProbePromptPrefix(prompts[i].Prefix()).host.num_common_tokens, kPage + 1) << i;
     }
     const Prompt& oldest = prompts.front();
-    const CacheCoordinator::PrefixProbe probe = rank.ProbePromptPrefix(oldest.Prefix());
+    const PrefixProbe probe = rank.Prober().ProbePromptPrefix(oldest.Prefix());
     EXPECT_EQ(probe.host.num_common_tokens, 0);
     EXPECT_EQ(probe.host.kv_tokens, kPage);
     const std::vector<CacheKey> keys = oldest.Keys({kState});
-    EXPECT_TRUE(std::ranges::all_of(keys, [&](const CacheKey& key) { return rank.ContainsHostCachedBlock(key); }));
+    EXPECT_TRUE(
+        std::ranges::all_of(keys, [&](const CacheKey& key) { return rank.Host().ContainsHostCachedBlock(key); }));
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(rank).empty());
 
     held.front().clear();
     // The page is the other prompts' too; the tail's block and the checkpoint go.
-    EXPECT_FALSE(rank.DropHostEntry(keys[0]));
-    EXPECT_TRUE(rank.DropHostEntry(keys[1]));
-    EXPECT_TRUE(rank.DropHostEntry(keys[2]));
-    EXPECT_FALSE(rank.ContainsHostCachedBlock(keys[1]));
-    EXPECT_FALSE(rank.ContainsHostCachedBlock(keys[2]));
+    EXPECT_FALSE(rank.Host().DropHostEntry(keys[0]));
+    EXPECT_TRUE(rank.Host().DropHostEntry(keys[1]));
+    EXPECT_TRUE(rank.Host().DropHostEntry(keys[2]));
+    EXPECT_FALSE(rank.Host().ContainsHostCachedBlock(keys[1]));
+    EXPECT_FALSE(rank.Host().ContainsHostCachedBlock(keys[2]));
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(rank).empty());
     held.clear();
 }

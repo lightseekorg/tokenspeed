@@ -61,15 +61,17 @@ class LamportResidualRMSNorm:
     def supported(world_size: int, width: int) -> bool:
         """Whether the kernel's layouts cover a row of ``width`` BF16 columns.
 
-        A row is split into one 32-bit word per lane per chunk at most, and
-        the normalizing workgroup holds whole BF16 pairs in every lane.
+        A row is split into whole BF16 pairs per chunk, one 32-bit word per
+        lane at most; the normalizing workgroup pads the row to a power of
+        two that holds whole pairs in every lane.
         """
         threads = 64 * LamportResidualRMSNorm.NUM_WARPS
+        chunks = LamportResidualRMSNorm.CHUNKS
         return (
             current_platform().is_cdna4
             and world_size in (4, 8)
-            and width & (width - 1) == 0
-            and 2 * threads <= width <= 2 * threads * LamportResidualRMSNorm.CHUNKS
+            and width % (2 * chunks) == 0
+            and 2 * threads <= width <= 2 * threads * chunks
         )
 
     def __init__(self, peers: IrisGroup, max_rows: int, width: int):
@@ -136,7 +138,9 @@ class LamportResidualRMSNorm:
             MAX_LOCAL_ROWS=self.max_local_rows,
             EPS=eps,
             CHUNKS=self.CHUNKS,
-            ELEMENTS_PER_THREAD=width // (64 * self.NUM_WARPS),
+            ELEMENTS_PER_THREAD=triton.next_power_of_2(
+                triton.cdiv(width, 64 * self.NUM_WARPS)
+            ),
             NUM_WARPS=self.NUM_WARPS,
             PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
             WAIT_STORES=policy.wait_stores,
@@ -182,7 +186,7 @@ def _iris_residual_rmsnorm_chunk(
     THREADS: gl.constexpr = 64 * NUM_WARPS
     PEER_STRIDE: gl.constexpr = MAX_LOCAL_ROWS * PAIRS
     # One word per lane; chunks smaller than the workgroup leave lanes idle.
-    gl.static_assert(CHUNK <= THREADS)
+    gl.static_assert(CHUNK <= THREADS and CHUNK * CHUNKS == PAIRS)
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     index = gl.arange(0, THREADS, layout=layout)
     valid = index < CHUNK
@@ -283,11 +287,17 @@ def _iris_residual_rmsnorm_finish(
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Wait for a reduced row, then add the residual and normalize it."""
+    """Wait for a reduced row, then add the residual and normalize it.
+
+    The row is laid out over ``BLOCK`` columns, the power of two the lanes
+    cover; columns past ``WIDTH`` load as zeros and are neither awaited nor
+    stored.
+    """
     PAIRS: gl.constexpr = WIDTH // 2
     THREADS: gl.constexpr = 64 * NUM_WARPS
+    BLOCK: gl.constexpr = THREADS * ELEMENTS_PER_THREAD
     WORDS: gl.constexpr = ELEMENTS_PER_THREAD // 2
-    gl.static_assert(THREADS * ELEMENTS_PER_THREAD == WIDTH)
+    gl.static_assert(WIDTH <= BLOCK)
     layout: gl.constexpr = gl.BlockedLayout(
         [ELEMENTS_PER_THREAD], [64], [NUM_WARPS], [0]
     )
@@ -295,29 +305,48 @@ def _iris_residual_rmsnorm_finish(
         [1, WORDS], [64, 1], [NUM_WARPS, 1], [1, 0]
     )
     # Overlap the residual and weight reads with the wait.
-    columns = gl.arange(0, WIDTH, layout=layout)
+    columns = gl.arange(0, BLOCK, layout=layout)
+    in_row = columns < WIDTH
     offsets = row * WIDTH + columns
-    residual = gl.amd.cdna4.buffer_load(residual_ptr, offsets).to(gl.float32)
-    weight = gl.amd.cdna4.buffer_load(weight_ptr, columns).to(gl.float32)
+    residual = gl.amd.cdna4.buffer_load(
+        residual_ptr, offsets, mask=in_row, other=0.0
+    ).to(gl.float32)
+    weight = gl.amd.cdna4.buffer_load(weight_ptr, columns, mask=in_row, other=0.0).to(
+        gl.float32
+    )
     lane = gl.arange(0, THREADS, layout=gl.SliceLayout(1, word_layout))
     word = gl.arange(0, WORDS, layout=gl.SliceLayout(0, word_layout))
-    word_offsets = row * PAIRS + lane[:, None] * WORDS + word[None, :]
+    pair = lane[:, None] * WORDS + word[None, :]
+    pair_in_row = pair < PAIRS
+    word_offsets = row * PAIRS + pair
     mailbox = gather_ptr.to(gl.pointer_type(gl.uint32), bitcast=True)
-    words = gl.amd.cdna4.buffer_load(mailbox, word_offsets, cache=".cv")
+    words = gl.amd.cdna4.buffer_load(
+        mailbox, word_offsets, mask=pair_in_row, other=0, cache=".cv"
+    )
     missing = gl.max(((words >> 16) == 0x8000).to(gl.int32), 1)
     while _iris_subgroup_any(missing):
-        words = gl.amd.cdna4.buffer_load(mailbox, word_offsets, cache=".cv")
+        words = gl.amd.cdna4.buffer_load(
+            mailbox, word_offsets, mask=pair_in_row, other=0, cache=".cv"
+        )
         missing = gl.max(((words >> 16) == 0x8000).to(gl.int32), 1)
     gl.amd.cdna4.buffer_store(
-        gl.full_like(words, 0x80000000), mailbox, word_offsets, cache=".wt"
+        gl.full_like(words, 0x80000000),
+        mailbox,
+        word_offsets,
+        mask=pair_in_row,
+        cache=".wt",
     )
     even = (words << 16).to(gl.float32, bitcast=True)
     odd = (words & 0xFFFF0000).to(gl.float32, bitcast=True)
-    reduced = gl.convert_layout(gl.reshape(gl.join(even, odd), [WIDTH]), layout)
+    reduced = gl.convert_layout(gl.reshape(gl.join(even, odd), [BLOCK]), layout)
     total = reduced + residual
-    gl.amd.cdna4.buffer_store(total.to(gl.bfloat16), residual_out_ptr, offsets)
+    gl.amd.cdna4.buffer_store(
+        total.to(gl.bfloat16), residual_out_ptr, offsets, mask=in_row
+    )
     total *= gl.rsqrt(gl.sum(total * total, 0) / WIDTH + EPS)
-    gl.amd.cdna4.buffer_store((total * weight).to(gl.bfloat16), norm_out_ptr, offsets)
+    gl.amd.cdna4.buffer_store(
+        (total * weight).to(gl.bfloat16), norm_out_ptr, offsets, mask=in_row
+    )
 
 
 @gluon.jit(do_not_specialize=["rows"])

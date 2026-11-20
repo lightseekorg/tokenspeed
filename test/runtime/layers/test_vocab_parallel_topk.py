@@ -22,8 +22,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -404,6 +406,33 @@ def test_radix_shard_topk_picks_the_same_candidates_as_torch() -> None:
         got = torch.gather(logits.float(), 1, ids.long())
         assert sorted(got.flatten().tolist()) == sorted(want.flatten().tolist())
         torch.testing.assert_close(values.float(), got, atol=1e-2, rtol=0)
+
+
+def _kernel_test_utils():
+    helper = Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_no_row_count_compiles_the_radix_topk_after_the_probe() -> None:
+    """The row count picks the radix kernel's chunking, so the probe compiles
+    every chunking a call up to ``max_rows`` rows can take."""
+    head = SimpleNamespace(weight=torch.zeros(1, device="cuda", dtype=torch.bfloat16))
+    # Muse Spark's vocabulary shard at TP4; 96 rows reach every chunking.
+    cols, max_rows = 202048 // 4, 96
+    selector = _selector(head, 4, 16, max_rows, cols * 4)
+    selector._radix_topk = selector._probe_radix_topk(cols)
+    if selector._radix_topk is None:
+        pytest.skip("vendored radix top-k is not built here")
+
+    logits = torch.randn(max_rows, cols, device="cuda", dtype=torch.bfloat16)
+    with _kernel_test_utils().assert_no_cute_compile():
+        for rows in range(1, max_rows + 1):
+            selector._shard_topk(logits[:rows])
+        torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

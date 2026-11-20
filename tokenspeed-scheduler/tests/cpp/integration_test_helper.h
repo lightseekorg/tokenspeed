@@ -54,8 +54,7 @@ struct SchedulerTestAccess {
                                      std::int32_t first_page) {
         scheduler.registerKvEventPrefixPages(request, hashes, first_page, static_cast<std::int32_t>(hashes.size()));
     }
-    static void RecordAdmittedPages(Scheduler& scheduler, ExecutionPlan& plan,
-                                    const CacheCoordinator::AdmissionResult& result) {
+    static void RecordAdmittedPages(Scheduler& scheduler, ExecutionPlan& plan, const AdmissionResult& result) {
         scheduler.recordAdmittedPages(plan, result);
     }
     static std::uint64_t DecodeAdmissions(const Scheduler& scheduler) { return scheduler.decode_admissions_; }

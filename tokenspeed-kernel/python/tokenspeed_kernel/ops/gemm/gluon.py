@@ -104,7 +104,13 @@ if platform.is_amd:
         launch_gluon_gemv_a16w16_gfx950 as _gemv_a16w16_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_rmsnorm_gemv_a16w16_gfx950 as _rmsnorm_gemv_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        prefers_gluon_rmsnorm_gemv_a16w16_gfx950 as _prefers_rmsnorm_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gated_norm_gemv_a16w16_gfx950 as _supports_gated_norm_gemv,
@@ -114,6 +120,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gemv_a16w16_gfx950 as _supports_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_rmsnorm_gemv_a16w16_gfx950 as _supports_rmsnorm_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
@@ -721,6 +730,41 @@ if platform.is_amd:
     ) -> torch.Tensor:
         """Dispatch gated decode rows to the gfx950 MFMA GEMV."""
         return _gated_norm_gemv_a16w16_impl(x, gate, norm_weight, weight, out, eps)
+
+    def _rmsnorm_gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        return _prefers_rmsnorm_gemv(m, n, k) and _supports_rmsnorm_gemv(m, n, k)
+
+    @register_kernel(
+        "gemm",
+        "mv_rmsnorm",
+        name="gluon_rmsnorm_gemv_a16w16_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={"mnk_problem_filter": frozenset({_rmsnorm_gemv_a16w16_filter})},
+    )
+    def gluon_rmsnorm_gemv_a16w16_gfx950(
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        x_norm: torch.Tensor,
+        eps: float,
+        kv: torch.Tensor | None = None,
+        kv_norm_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch normalized decode rows to the gfx950 MFMA GEMV."""
+        return _rmsnorm_gemv_a16w16_impl(
+            x, norm_weight, weight, out, x_norm, eps, kv, kv_norm_weight
+        )
 
     @register_kernel(
         "gemm",
@@ -1697,6 +1741,8 @@ if platform.is_amd:
     # 5-16 tokens reuse the decode GEMV tiles, matching the GEMV and the
     # standalone partials bit for bit. The MLA projection's unfused path runs
     # hipBLASLt instead, which the fusion beats by dropping the partials launch.
+    # 3808 is K3.1's DSA decode projection, the MLA one with the indexer's key
+    # and head-weight rows stacked below it.
     @register_kernel(
         "gemm",
         "linear_attnres_partials",
@@ -1719,7 +1765,7 @@ if platform.is_amd:
         traits={
             "tokens": frozenset(range(5, 17)),
             "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
-            "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
+            "output_size": frozenset({3648, 3808, KIMI3_QKVFAB_SIZE}),
             "num_blocks": frozenset(range(1, 12)),
             "inputs_contiguous": frozenset({True}),
         },

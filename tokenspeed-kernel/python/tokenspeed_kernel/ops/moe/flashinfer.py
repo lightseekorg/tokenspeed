@@ -2217,7 +2217,32 @@ if platform.is_nvidia:
         w.hidden_size_padded = hidden_padded
         w.hidden_size_original = getattr(w, "hidden_size", hidden_padded)
         w._flashinfer_trtllm_autotuned = False
-        return None
+
+        from tokenspeed_kernel.ops.communication.peer_weights import (
+            ExpertWeightShard,
+            PreparedExpertWeights,
+        )
+
+        streamed = (
+            "w13_weight",
+            "w13_weight_scale",
+            "w2_weight",
+            "w2_weight_scale",
+            "w13_weight_bias",
+            "w2_weight_bias",
+        )
+        replicated = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+        # Read attributes rather than nn.Module parameters: kernel tests pass
+        # plain weight stand-ins. Absent optional tensors (biases, clamp
+        # limit) stay out of the manifest.
+        return PreparedExpertWeights(
+            layout=f"flashinfer-trtllm-mxfp4-{'situ' if situ else 'swiglu'}-v1",
+            shards=tuple(
+                ExpertWeightShard(name, tensor, name in replicated)
+                for name in (*streamed, *replicated)
+                if (tensor := getattr(w, name, None)) is not None
+            ),
+        )
 
     def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         return _flashinfer_trtllm_mxfp4_moe_weights(plan, w, situ=False)

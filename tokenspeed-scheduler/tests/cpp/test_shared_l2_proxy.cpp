@@ -165,11 +165,11 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
         EXPECT_EQ(created[i].bucket, 0);
         EXPECT_GE(created[i].block, 1);
     }
-    EXPECT_EQ(rank.cache.NumPinnedHostCachedBlocks(), 4);
+    EXPECT_EQ(rank.cache.Host().NumPinnedHostCachedBlocks(), 4);
     // A prompt that extends it resumes at the proxied checkpoint.
     const Prompt longer{Sequence(14)};
-    const CacheCoordinator::PrefixProbe probe =
-        rank.cache.ProbePromptPrefix({.prefix_hashes = longer.hashes, .tokens = longer.tokens, .max_tokens = 13});
+    const PrefixProbe probe = rank.cache.Prober().ProbePromptPrefix(
+        {.prefix_hashes = longer.hashes, .tokens = longer.tokens, .max_tokens = 13});
     EXPECT_EQ(probe.host.num_common_tokens, 10);
 
     // Held: nothing is dropped, nothing released.
@@ -178,13 +178,13 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     // The hold goes (an admission consumed the state): the entries leave at
     // the next pass, then the pool's ticket.
     hold.reset();
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 4);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 4);
     rank.proxy.ReleaseUnheld();
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
     const std::vector<SharedL2Operation> commands = rank.proxy.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
     EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(commands).front().ticket, 7u);
-    EXPECT_EQ(rank.cache.HostEvictions().released.blocks, 4u);
+    EXPECT_EQ(rank.cache.Evictor().HostEvictions().released.blocks, 4u);
     // No ticket is left to release.
     rank.proxy.ReleaseUnheld();
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
@@ -234,7 +234,7 @@ TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
     ASSERT_EQ(created.size(), 2u);
     for (std::size_t j = 0; j < created.size(); ++j) {
         const CacheKey& key = extended.keys[2 + j];
-        const CacheBlockRef block = rank.cache.AcquireHostCachedBlock(key);
+        const CacheBlockRef block = rank.cache.Store().AcquireHostCachedBlock(key);
         ASSERT_TRUE(static_cast<bool>(block));
         EXPECT_EQ(created[j].group_id, key.group_id);
         EXPECT_EQ(created[j].block,
@@ -251,13 +251,13 @@ TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
     // The shorter prompt's checkpoint is held by nothing now and leaves; its
     // pages are the longer hit's too.
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 4);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 4);
     third.reset();
     rank.proxy.ReleaseUnheld();
     const std::vector<SharedL2ReleaseOperation> released =
         CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands());
     ASSERT_EQ(released.size(), 2u);
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
 }
 
 TEST(SharedL2Proxy, AnEntryALoadBackReadsStaysUntilTheLoadLands) {
@@ -267,12 +267,12 @@ TEST(SharedL2Proxy, AnEntryALoadBackReadsStaysUntilTheLoadLands) {
     rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, 5), rank.TailPrior(prompt), hold);
     // The load-back's ticket holds its sources as block references.
     std::vector<CacheBlockRef> load;
-    for (const CacheKey& key : prompt.Keys()) load.push_back(rank.cache.AcquireHostCachedBlock(key));
+    for (const CacheKey& key : prompt.Keys()) load.push_back(rank.cache.Store().AcquireHostCachedBlock(key));
     hold.reset();
     for (std::int32_t plan = 0; plan < 3; ++plan) {
         rank.proxy.ReleaseUnheld();
         EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-        EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 4);
+        EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 4);
     }
     // A load of the tail and the checkpoint alone: the pages leave first,
     // the ticket with the last entry.
@@ -282,7 +282,7 @@ TEST(SharedL2Proxy, AnEntryALoadBackReadsStaysUntilTheLoadLands) {
     load.clear();
     rank.proxy.ReleaseUnheld();
     EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).front().ticket, 5u);
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
 }
 
 TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsAMiss) {
@@ -290,7 +290,7 @@ TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsAMiss) {
     const Prompt prompt{Sequence(10)};
     SharedL2LookupHold hold = rank.proxy.StartLookup("r");
     EXPECT_TRUE(rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, 5), rank.TailPrior(prompt), hold).empty());
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
     EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).front().ticket, 5u);
     // The ticket went back with the answer: no later pass releases it again.
     hold.reset();
@@ -326,21 +326,21 @@ TEST(SharedL2Proxy, AMalformedAnswerIsRefusedBeforeAnythingOfItIsKept) {
     }
     EXPECT_NE(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(rank.cache.Host().NumHostCachedBlocks(), 0);
 }
 
 TEST(SharedL2Proxy, DroppingAHostEntryLeavesAHeldOneAndCountsAMissingOneDone) {
     Rank rank(16, 16);
     const CacheKey page{.group_id = kFull, .content_hash = Prompt{Sequence(4)}.End()};
-    EXPECT_TRUE(rank.cache.DropHostEntry(page));
-    CacheBlockRef block = rank.cache.AcquireHostBlock(kFull, 0);
-    rank.cache.CacheHostBlock(block, page, std::nullopt);
-    EXPECT_FALSE(rank.cache.DropHostEntry(page));
-    EXPECT_TRUE(rank.cache.ContainsHostCachedBlock(page));
+    EXPECT_TRUE(rank.cache.Host().DropHostEntry(page));
+    CacheBlockRef block = rank.cache.Host().AcquireHostBlock(kFull, 0);
+    rank.cache.Host().CacheHostBlock(block, page, std::nullopt);
+    EXPECT_FALSE(rank.cache.Host().DropHostEntry(page));
+    EXPECT_TRUE(rank.cache.Host().ContainsHostCachedBlock(page));
     block = {};
-    EXPECT_TRUE(rank.cache.DropHostEntry(page));
-    EXPECT_FALSE(rank.cache.ContainsHostCachedBlock(page));
-    EXPECT_EQ(rank.cache.HostEvictions().released.blocks, 1u);
+    EXPECT_TRUE(rank.cache.Host().DropHostEntry(page));
+    EXPECT_FALSE(rank.cache.Host().ContainsHostCachedBlock(page));
+    EXPECT_EQ(rank.cache.Evictor().HostEvictions().released.blocks, 1u);
     EXPECT_EQ(rank.host.NumEmptyLcmBlocks(), 16);
 }
 
@@ -349,8 +349,7 @@ TEST(SharedL2Proxy, DeviceHitsAreCollectedOnceEnabled) {
     const Prompt prompt{Sequence(10)};
     rank.Publish(prompt);
     const Prompt longer{Sequence(14)};
-    const CacheCoordinator::PromptPrefix prefix{
-        .prefix_hashes = longer.hashes, .tokens = longer.tokens, .max_tokens = 13};
+    const PromptPrefix prefix{.prefix_hashes = longer.hashes, .tokens = longer.tokens, .max_tokens = 13};
     CacheCoordinatorTestAccess::MatchPromptPrefix(rank.cache, prefix);
     EXPECT_TRUE(rank.cache.TakeDeviceHits().empty());
     rank.cache.CollectDeviceHits();
@@ -393,7 +392,7 @@ TEST(SharedL2Proxy, PoolWritesAreBoundedAndOnlyThoseInFlightPinTheirSources) {
     // Saturated: the rest stays queued and pins nothing, so the Device may
     // evict it -- all but the six blocks the two writes read.
     EXPECT_TRUE(rank.transfers.StartPoolWrites(limits).empty());
-    EXPECT_TRUE(rank.cache.HasPendingStores());
+    EXPECT_TRUE(rank.cache.Host().HasPendingStores());
     EXPECT_FALSE(rank.cache.ClearDeviceCache());
     // A request that needs every block but those six.
     std::vector<BlockTable> pressure(2);
@@ -417,7 +416,7 @@ TEST(SharedL2Proxy, PoolWritesAreBoundedAndOnlyThoseInFlightPinTheirSources) {
     EXPECT_EQ(stats.evicted_before_drain, 2u);
     EXPECT_EQ(std::accumulate(stats.blocks.begin(), stats.blocks.end(), std::uint64_t{0}), 6u);
     EXPECT_TRUE(late.empty());
-    EXPECT_FALSE(rank.cache.HasPendingStores());
+    EXPECT_FALSE(rank.cache.Host().HasPendingStores());
     EXPECT_TRUE(rank.cache.ClearDeviceCache());
 }
 
@@ -442,7 +441,7 @@ TEST(SharedL2Proxy, PoolWritesSkipWhatTheProxyHoldsAndWhatAWriteCarries) {
     const TierTransferManager::WriteBackStats& stats = rank.transfers.WriteBackStatsFor(HostStoreCause::kPublication);
     EXPECT_EQ(stats.host_cached, 1u);
     // Queued again while the write is out (a finish queues every entry).
-    rank.cache.QueueCachedBlocksForStore(prompt.hashes);
+    rank.cache.Host().QueueCachedBlocksForStore(prompt.hashes);
     EXPECT_TRUE(rank.transfers.StartPoolWrites(limits).empty());
     EXPECT_EQ(stats.in_flight, 1u);
     EXPECT_EQ(stats.host_cached, 2u);

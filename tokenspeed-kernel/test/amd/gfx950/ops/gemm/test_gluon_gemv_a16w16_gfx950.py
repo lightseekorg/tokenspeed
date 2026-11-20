@@ -37,11 +37,16 @@ from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
 from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     _select_mv,
     mm,
+    mv_rmsnorm,
     mv_rmsnorm_gated_sigmoid,
     mv_rmsnorm_gated_sigmoid_supported,
+    mv_rmsnorm_supported,
 )
 from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     gluon_gemv_a16w16_gfx950 as registered_gemv,
+)
+from tokenspeed_kernel.ops.layernorm.triton import (  # noqa: E402
+    rmsnorm_fused_parallel,
 )
 from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
@@ -49,8 +54,10 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
     _PREFERRED_BUCKETS,
     gluon_gated_norm_gemv_a16w16_gfx950,
     gluon_gemv_a16w16_gfx950,
+    gluon_rmsnorm_gemv_a16w16_gfx950,
     launch_gluon_gated_norm_gemv_a16w16_gfx950,
     launch_gluon_gemv_a16w16_gfx950,
+    launch_gluon_rmsnorm_gemv_a16w16_gfx950,
     prefers_gluon_gemv_a16w16_gfx950,
 )
 
@@ -307,3 +314,96 @@ def test_gated_norm_gemv_leaves_other_rows_and_heads_to_two_launches():
     # Heads narrower than the MFMA tile's K step are not ones it can serve.
     gate = torch.empty((8, k), dtype=torch.bfloat16, device="cuda")
     assert not mv_rmsnorm_gated_sigmoid_supported(gate, norm_weight[:64], weight)
+
+
+@pytest.mark.parametrize("m", [2, 3, 5, 8])
+@pytest.mark.parametrize("with_kv", [True, False])
+def test_rmsnorm_gemv_matches_the_fused_norm_then_mm(m, with_kv):
+    """One launch reproduces ``rmsnorm_fused_parallel`` and ``mm`` bit for bit.
+
+    This is Kimi K3.1's TP8 DSA query path at decode widths: the q and KV
+    latents are strided views of the wider a-projection, and the weight is the
+    stacked [q_b; wq_b] projection.
+    """
+    n, k, kv_width, width = 6400, 1536, 512, 3648
+    generator = torch.Generator(device="cuda").manual_seed(20261115 + m)
+    scale = 10 ** (torch.rand((m, 1), device="cuda", generator=generator) * 4 - 2)
+    rows = torch.randn((m, width), device="cuda", generator=generator) * scale
+    rows = rows.to(torch.bfloat16)
+    norm_weight = torch.rand(k, device="cuda", generator=generator) + 0.5
+    norm_weight = norm_weight.to(torch.bfloat16)
+    kv_norm_weight = torch.rand(kv_width, device="cuda", generator=generator) + 0.5
+    kv_norm_weight = kv_norm_weight.to(torch.bfloat16)
+    weight = (
+        torch.randn((n, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+        / 32
+    )
+    expected_rows = rows.clone()
+    expected_norm = rows.new_empty((m, k))
+    rmsnorm_fused_parallel(
+        input1=expected_rows[:, :k],
+        weight1=norm_weight,
+        output1=expected_norm,
+        input2=expected_rows[:, k : k + kv_width],
+        weight2=kv_norm_weight,
+        output2=expected_rows[:, k : k + kv_width],
+        eps=1e-6,
+    )
+    if not with_kv:
+        expected_rows = rows.clone()
+    expected = mm(expected_norm, weight)
+    x = rows[:, :k]
+    kv = (rows[:, k : k + kv_width], kv_norm_weight) if with_kv else (None, None)
+    assert mv_rmsnorm_supported(x, norm_weight, weight, *kv)
+    x_norm = torch.full_like(expected_norm, float("nan"))
+    actual = torch.full_like(expected, float("nan"))
+    mv_rmsnorm(x, norm_weight, weight, 1e-6, actual, x_norm, *kv)
+    assert torch.equal(actual, expected)
+    assert torch.equal(x_norm, expected_norm)
+    assert torch.equal(rows, expected_rows)
+
+
+def test_rmsnorm_gemv_compiles_once_per_norm_bucket():
+    n, k, kv_width = 6400, 1536, 512
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.ones(k, device="cuda", dtype=torch.bfloat16)
+    kv_norm_weight = torch.ones(kv_width, device="cuda", dtype=torch.bfloat16)
+
+    def run(m):
+        rows = torch.randn(m, k + kv_width, device="cuda", dtype=torch.bfloat16)
+        x = rows[:, :k]
+        launch_gluon_rmsnorm_gemv_a16w16_gfx950(
+            x,
+            norm_weight,
+            weight,
+            x.new_empty(m, n),
+            x.new_empty(m, k),
+            1e-6,
+            rows[:, k:],
+            kv_norm_weight,
+        )
+
+    # Warm the 2..4 and 5..8 row buckets.
+    run(2)
+    run(5)
+    with assert_no_triton_compile(gluon_rmsnorm_gemv_a16w16_gfx950):
+        for m in range(2, 9):
+            run(m)
+
+
+def test_rmsnorm_gemv_leaves_other_rows_to_two_launches():
+    n, k = 6400, 1536
+    weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    norm_weight = torch.empty(k, dtype=torch.bfloat16, device="cuda")
+    # One row takes the single-row GEMV, and past 8 rows the fused launch
+    # measured slower than the two launches.
+    for m in (1, 9, 16):
+        x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+        assert not mv_rmsnorm_supported(x, norm_weight, weight)
+    # Rows the Triton norm would not load in 16-byte vectors.
+    rows = torch.empty((8, k + 8), dtype=torch.bfloat16, device="cuda")
+    assert mv_rmsnorm_supported(rows[:, :k], norm_weight, weight)
+    assert not mv_rmsnorm_supported(rows[:, 1 : k + 1], norm_weight, weight)
+    # A shape where mm keeps its own GEMM.
+    other = torch.empty((5000, k), dtype=torch.bfloat16, device="cuda")
+    assert not mv_rmsnorm_supported(rows[:, :k], norm_weight, other)

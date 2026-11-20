@@ -50,10 +50,14 @@
 
 use std::{
     collections::{HashSet, VecDeque},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
+use parking_lot::{lock_api::ArcMutexGuard, Mutex, RawMutex};
 use ts_collective::{Group, Mesh, Reduce};
 use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
@@ -80,6 +84,7 @@ use crate::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
         LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
     },
+    peer::{Peer, PeerError},
     relay::{self, RelayError},
     request::RequestGrammar,
     shared_l2::{Pool, PoolClient, PoolError},
@@ -365,6 +370,10 @@ pub struct Load {
     pub kv_total_pages: i64,
     /// Resident cache blocks, including reclaimable prefix-cache entries.
     pub kv_used_pages: i64,
+    /// Prompt plus committed output tokens of every request held by the rank.
+    pub num_resident_tokens: i64,
+    /// Waiting prompts less observed cache hits, plus unscheduled prefill tokens.
+    pub num_waiting_uncached_tokens: i64,
 }
 
 /// The frontend: requests in, outputs out.
@@ -438,6 +447,9 @@ pub enum LoopError {
     /// The shared L2 pool's client or its owner failed.
     #[error(transparent)]
     Pool(#[from] PoolError),
+    /// The replica could not agree on its peer sharing reports.
+    #[error(transparent)]
+    Peer(#[from] PeerError),
     /// The ranks disagree on a control operation.
     #[error("control: {0}")]
     Control(String),
@@ -547,11 +559,19 @@ pub struct Subsystems {
     /// With a shared L2 pool as the Host tier, this rank's client of the
     /// pool's owner. `None` without one.
     pub pool: Option<Box<dyn PoolClient + Send>>,
+    /// With peer prefix sharing, this rank's part of it: started over the
+    /// loop's scheduler, which its endpoint serves between rounds. `None`
+    /// without.
+    pub peer: Option<Peer>,
 }
 
 /// One rank's scheduling loop.
 pub struct EventLoop<D: DataPlane, F: Frontend> {
-    scheduler: Scheduler,
+    /// Held for the whole round. A peer holder's endpoint answers from the
+    /// scheduler between rounds, so the loop lets go of it only where it
+    /// waits on something else: a forward's result, an idle frontend, a
+    /// paused round's sleep.
+    scheduler: ArcMutexGuard<RawMutex, Scheduler>,
     data_plane: D,
     frontend: F,
     outputs: OutputProcessor,
@@ -568,6 +588,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     l3_metrics: Option<L3Metrics>,
     /// The shared L2 pool: this rank's client and the writes in flight there.
     pool: Option<Pool>,
+    peer: Option<Peer>,
+    /// The peer clock the replica agreed on this round.
+    peer_now_us: i64,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
     /// The last cumulative prefix-hit counters reported, for deltas.
@@ -616,15 +639,19 @@ struct Relayed {
     /// With L3, every member's storage report, in member order; empty
     /// without.
     l3_reports: Vec<Vec<u8>>,
+    /// With peer sharing, every member's peer report, in member order;
+    /// empty without.
+    peer_reports: Vec<Vec<u8>>,
 }
 
 impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// A loop over `scheduler`, with `outputs` configured for the engine's
     /// speculation and streaming. `frontend` is used only on the replica's
     /// first member; with a PD transfer peer in `subsystems`, `outputs`
-    /// follows its role.
+    /// follows its role. A peer in `subsystems` was started over
+    /// `scheduler`.
     pub fn new(
-        scheduler: Scheduler,
+        scheduler: Arc<Mutex<Scheduler>>,
         data_plane: D,
         frontend: F,
         outputs: OutputProcessor,
@@ -644,7 +671,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
             pool: subsystems.pool.map(Pool::new),
-            scheduler,
+            peer: subsystems.peer,
+            peer_now_us: 0,
+            scheduler: scheduler.lock_arc(),
             data_plane,
             frontend,
             outputs,
@@ -768,6 +797,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
+        // A peer servicer answers from the scheduler between rounds, and the
+        // loop releases it only while it waits on the device or on an idle
+        // frontend. A loop waiting on a transfer -- a prefill engine on its
+        // PD sends, a landing on its reads -- does neither and spins
+        // through empty rounds, so it hands the scheduler to a waiting
+        // servicer once per round; with none waiting this costs one atomic
+        // read.
+        ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
         let held_spans = profile::hold();
@@ -779,7 +816,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let wait = (submitted.is_empty() && self.idle() && self.dp_idle).then_some(IDLE_WAIT);
             let _span = profile::span("Frontend::receive");
             let mut received = submitted;
-            received.extend(self.frontend.receive(wait));
+            let frontend = &mut self.frontend;
+            received.extend(match wait {
+                Some(_) => ArcMutexGuard::unlocked(&mut self.scheduler, || frontend.receive(wait)),
+                None => frontend.receive(wait),
+            });
             received
         } else {
             Vec::new()
@@ -787,13 +828,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Nothing reaches a rank whose frontend is gone: it stops as on a
         // stop request, so every rank stops after this round.
         let stop_requested = stop_requested || self.frontend.closed();
-        let report = self.l3.as_ref().map(Tier::report);
+        let l3_report = self.l3.as_ref().map(Tier::report);
+        let peer_report = self.peer.as_mut().map(Peer::report);
         let Relayed {
             mut stop,
             messages,
             l3_reports,
-        } = self.relay(stop_requested, received, report)?;
+            peer_reports,
+        } = self.relay(stop_requested, received, l3_report, peer_report)?;
         let mut busy = !messages.is_empty();
+        // First at the head: the holder's changes since the last round, as
+        // its replica agreed on them, then the landings' progress.
+        busy |= self.peer_round(&peer_reports)?;
         self.admit(messages, &mut outputs, &mut released)?;
         self.apply_pause_transitions(&mut outputs, &mut released)?;
         self.drain_grammar_queue(&mut outputs, &mut released)?;
@@ -856,7 +902,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if let Some(pool) = self.pool.as_mut() {
                 busy |= pool.dispatch(&plan, self.in_flight.len())?;
             }
-            self.cache_ops.dispatched(&plan.cache_ops());
+            let cache_ops = plan.cache_ops();
+            self.cache_ops.dispatched(&cache_ops);
+            self.dispatch_peer(&plan);
+            // The storage tick disabled forward planning: scheduler aborts arise
+            // only in that build, and frozen rounds reset the no-progress streak.
+            self.record_scheduler_metrics(None, &cache_ops, 0);
             busy |= plan.needs_device();
             if plan.needs_device() {
                 self.data_plane.execute(plan, &Dispatch::default())?;
@@ -870,7 +921,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             busy |= forwarded;
             self.note_forward(forwarded);
-            std::thread::sleep(PAUSED_IDLE_SLEEP);
+            ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                std::thread::sleep(PAUSED_IDLE_SLEEP);
+            });
         } else {
             // With a shared L2 pool, the waiting prompts not looked up yet
             // ask the pool in one request, and the round waits for its
@@ -944,6 +997,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 kv_active_pages: i64::from(self.active_pages()),
                 kv_total_pages: self.config.kv_total_pages,
                 kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
+                num_resident_tokens: self.outputs.num_resident_tokens(),
+                num_waiting_uncached_tokens: sizes.pending_prefill_tokens,
             };
             // Silent aborts must refresh load immediately; periodic heartbeats
             // also keep an idle engine's load snapshot fresh at its frontend.
@@ -1021,6 +1076,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
         self.cache_ops.dispatched(&cache_ops);
+        self.dispatch_peer(&plan);
         let aborted = self.outputs.finish_scheduler_aborts(&plan.aborts());
         outputs.extend(aborted.outputs);
         released.extend(aborted.released);
@@ -1034,100 +1090,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
         }
-        // The scheduler's counts as this round planned, for the metrics and
-        // the batch line: nothing between the two mutates the scheduler, so
-        // they are taken once, and only for a reader.
-        let mut planned_sizes: Option<SchedulerSizes> = None;
-        if let Some(metrics) = &self.metrics {
-            let _span = profile::span("EventLoop::record_metrics");
-            // A retraction victim's image store is the retraction signal.
-            let retracted = cache_ops
-                .iter()
-                .filter(|op| op.kind == CacheOpKind::SnapshotStore)
-                .count();
-            metrics.record_preemptions(retracted as i64);
-            for _ in 0..aborted.stats.capacity_aborts {
-                metrics.record_capacity_abort();
-            }
-            // A pre-dispatch snapshot: the running count still holds what
-            // this round's commits end. `sizes.running` is the batch;
-            // `outputs.num_running()` is every request this rank holds,
-            // including the PD transfer and waiting states the batch excludes.
-            let sizes = planned_sizes.insert(self.scheduler.sizes());
-            let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
-                batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
-            });
-            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
-            let active_pages = self
-                .active_pages
-                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
-            metrics.record_scheduler_iteration(
-                sizes.running as i64,
-                self.outputs.num_running() as i64,
-                sizes.waiting as i64,
-                i64::from(active_pages),
-                self.config.kv_total_pages,
-                iteration_tokens,
-            );
-            metrics.record_decode_slot_usage(
-                sizes.allocated_request_slots as i64,
-                sizes.active_decode_slots as i64,
-                sizes.ready_waiting as i64,
-            );
-            let total_pages = self.config.kv_total_pages;
-            metrics.record_cache_occupancy(
-                total_pages - i64::from(sizes.empty_lcm_blocks),
-                i64::from(active_pages),
-                total_pages,
-                self.config.kv_token_capacity,
-            );
-            match self.outputs.role() {
-                crate::output::Role::Prefill => metrics.record_prefill_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
-                    sizes.retracted as i64,
-                ),
-                crate::output::Role::Decode => metrics.record_decode_queues(
-                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
-                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
-                    sizes.pd_transfer as i64,       // transfer pins pages
-                    sizes.retracted as i64,
-                ),
-                crate::output::Role::Plain => {}
-            }
-            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
-            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
-            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
-            let request = self.outputs.take_request_metrics();
-            for seconds in request.ttft_seconds {
-                metrics.observe_time_to_first_token(seconds);
-            }
-            for seconds in request.request_seconds {
-                metrics.observe_request_time(seconds);
-            }
-            for seconds in request.decode_seconds {
-                metrics.observe_decode_time(seconds);
-            }
-            for seconds in request.tpot_seconds {
-                metrics.observe_time_per_output_token(seconds);
-            }
-            metrics.record_completion_tokens(request.completion_tokens);
-            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
-            let hits = self.scheduler.prefix_hit_stats();
-            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
-            metrics.record_prefix_hits(
-                delta.prompt_tokens,
-                delta.device_hit_tokens,
-                delta.host_hit_tokens,
-                delta.l3_hit_tokens,
-            );
-        }
-
         let dp = self.dp_round(forward.as_ref(), stop)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
-            // The idle forward replaces this rank's batch; what is dispatched
-            // commits first, as nothing would follow it.
+            // Padding for a peer is not a local request batch.
             forward = None;
+        }
+        let planned_sizes = self.record_scheduler_metrics(
+            forward.as_ref(),
+            &cache_ops,
+            aborted.stats.capacity_aborts,
+        );
+
+        if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
+            // What was dispatched commits first, as no local batch follows.
             self.commit_down_to(0, events, outputs, released)?;
         }
         // Gathered before this round's commits: a commit may end requests
@@ -1203,6 +1178,136 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         self.commit_down_to(depth, events, outputs, released)?;
         Ok(device_work || storage_work || pool_work)
+    }
+
+    /// Export a round's snapshot on both serving and paused paths. The
+    /// returned scheduler sizes can also be reused by the batch log.
+    fn record_scheduler_metrics(
+        &mut self,
+        forward: Option<&ForwardBatchView>,
+        cache_ops: &[ts_scheduler::CacheOpView],
+        capacity_aborts: i64,
+    ) -> Option<SchedulerSizes> {
+        let mut planned_sizes: Option<SchedulerSizes> = None;
+        if let Some(metrics) = &self.metrics {
+            let _span = profile::span("EventLoop::record_metrics");
+            // A retraction victim's image store is the retraction signal.
+            let retracted = cache_ops
+                .iter()
+                .filter(|op| op.kind == CacheOpKind::SnapshotStore)
+                .count();
+            metrics.record_preemptions(retracted as i64);
+            for _ in 0..capacity_aborts {
+                metrics.record_capacity_abort();
+            }
+            // State occupancy is not forward batch size: PrefillDone can
+            // wait for PD retirement or a decode permit, and an overlapped
+            // round can still hold rows from earlier forwards.
+            let sizes = planned_sizes.insert(self.scheduler.sizes());
+            let iteration_tokens: i64 = forward.map_or(0, |batch| {
+                batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
+            });
+            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
+            let active_pages = self
+                .active_pages
+                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
+            metrics.record_scheduler_iteration(
+                forward.map_or(0, |batch| batch.request_ids.len() as i64),
+                self.outputs.num_running() as i64,
+                sizes.waiting as i64 + sizes.ready_waiting as i64 + self.withheld.len() as i64,
+                i64::from(active_pages),
+                self.config.kv_total_pages,
+                iteration_tokens,
+            );
+            metrics.record_decode_slot_usage(
+                sizes.allocated_request_slots as i64,
+                sizes.active_decode_slots as i64,
+                sizes.ready_waiting as i64,
+            );
+            let total_pages = self.config.kv_total_pages;
+            metrics.record_cache_occupancy(
+                total_pages - i64::from(sizes.empty_lcm_blocks),
+                i64::from(active_pages),
+                total_pages,
+                self.config.kv_token_capacity,
+            );
+            match self.outputs.role() {
+                crate::output::Role::Prefill => metrics.record_prefill_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.prefill_inflight as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Decode => metrics.record_decode_queues(
+                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
+                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
+                    sizes.remote_prefilling as i64, // transfer queue: alias of kv_wait
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Plain => {}
+            }
+            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
+            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
+            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
+            let request = self.outputs.take_request_metrics();
+            for (rid, lookup, admission, aborted) in request.peer_stops {
+                let outcome = if aborted { "cancelled" } else { "no_gain" };
+                if let Some(start) = admission {
+                    metrics
+                        .peer
+                        .stage("admission", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(start) = lookup {
+                    metrics
+                        .peer
+                        .stage("lookup_to_ready", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(peer) = &mut self.peer {
+                    peer.end_lookup(&rid, outcome);
+                }
+            }
+            for (expected, actual, outcome) in request.peer_usage {
+                metrics.peer.usage(expected, actual, outcome);
+            }
+            for seconds in request.ttft_seconds {
+                metrics.observe_time_to_first_token(seconds);
+            }
+            for seconds in request.request_seconds {
+                metrics.observe_request_time(seconds);
+            }
+            for seconds in request.decode_seconds {
+                metrics.observe_decode_time(seconds);
+            }
+            for seconds in request.tpot_seconds {
+                metrics.observe_time_per_output_token(seconds);
+            }
+            for seconds in request.e2e_tpot_seconds {
+                metrics.observe_e2e_time_per_output_token(seconds);
+            }
+            metrics.record_completion_tokens(request.completion_tokens);
+            for count in request.completion_token_samples {
+                metrics.observe_request_completion_tokens(count);
+            }
+            for accept_length in request.spec_decode_accept_length_samples {
+                metrics.observe_request_spec_decode_accept_length(accept_length);
+            }
+            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            let hits = self.scheduler.prefix_hit_stats();
+            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
+            if self.outputs.role() == crate::output::Role::Decode {
+                metrics.record_decode_prefix_hits(
+                    delta.prompt_tokens,
+                    delta.device_hit_tokens + delta.host_hit_tokens,
+                );
+            }
+            metrics.record_prefix_hits(
+                delta.prompt_tokens,
+                delta.device_hit_tokens,
+                delta.host_hit_tokens,
+                delta.l3_hit_tokens,
+            );
+        }
+
+        planned_sizes
     }
 
     /// Count this round's forward, real or idle, for the expert rebalance;
@@ -1957,11 +2062,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if agreed && control::is_weight_load(&op) {
                     // New pages publish under the new checkpoint only once
                     // every rank holds its weights.
-                    match self.controls.commit_l3_weight_version(&op) {
+                    match self.controls.commit_shared_weight_version(&op) {
                         Err(refusal) => (false, refusal),
                         Ok(Some(version)) => {
                             if let Some(l3) = &self.l3 {
                                 l3.executor.set_weight_version(&version)?;
+                            }
+                            if let Some(peer) = &mut self.peer {
+                                peer.set_weight_version(&version);
                             }
                             (true, message)
                         }
@@ -2397,6 +2505,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         received: Vec<EngineRequest>,
         l3_report: Option<Vec<u8>>,
+        peer_report: Option<Vec<u8>>,
     ) -> Result<Relayed, LoopError> {
         let replica = &self.ranks.replica;
         if replica.size() == 1 {
@@ -2404,6 +2513,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 stop: stop_requested,
                 messages: received,
                 l3_reports: l3_report.into_iter().collect(),
+                peer_reports: peer_report.into_iter().collect(),
             });
         }
         let _span = profile::span("EventLoop::relay");
@@ -2413,26 +2523,36 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             Vec::new()
         };
-        let (relayed, l3_reports) = match l3_report {
-            None => (self.ranks.mesh.broadcast(replica, 0, payload)?, Vec::new()),
-            Some(report) => {
-                // Every member's storage report rides the relay: one
-                // exchange a round for both.
-                let gathered = self
-                    .ranks
-                    .mesh
-                    .all_gather(replica, &relay::join(&payload, &report))?;
-                let mut relayed = Vec::new();
-                let mut reports = Vec::with_capacity(gathered.len());
-                for (member, part) in gathered.iter().enumerate() {
-                    let (relay, report) = relay::split(part)?;
-                    if member == 0 {
-                        relayed = relay.to_vec();
-                    }
-                    reports.push(report.to_vec());
+        // Every member's reports ride the relay: one exchange a round for
+        // all of them, in the same order on every member.
+        let (has_l3, has_peer) = (l3_report.is_some(), peer_report.is_some());
+        let reports: Vec<Vec<u8>> = l3_report.into_iter().chain(peer_report).collect();
+        let (mut l3_reports, mut peer_reports) = (Vec::new(), Vec::new());
+        let relayed = if reports.is_empty() {
+            self.ranks.mesh.broadcast(replica, 0, payload)?
+        } else {
+            let gathered = self
+                .ranks
+                .mesh
+                .all_gather(replica, &relay::join(&payload, &reports))?;
+            let mut relayed = Vec::new();
+            for (member, part) in gathered.iter().enumerate() {
+                let (relay, parts) = relay::split(part)?;
+                if parts.len() != reports.len() {
+                    return Err(RelayError::Truncated.into());
                 }
-                (relayed, reports)
+                if member == 0 {
+                    relayed = relay.to_vec();
+                }
+                let mut parts = parts.into_iter();
+                if has_l3 {
+                    l3_reports.extend(parts.next().map(<[u8]>::to_vec));
+                }
+                if has_peer {
+                    peer_reports.extend(parts.next().map(<[u8]>::to_vec));
+                }
             }
+            relayed
         };
         let (stop, messages) = if owner {
             (stop_requested, received)
@@ -2443,7 +2563,83 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             stop,
             messages,
             l3_reports,
+            peer_reports,
         })
+    }
+
+    /// The round's peer agreement, fed to the scheduler: the holder's
+    /// changes and the reader's answers and landings, then the clock its
+    /// deadlines run on. Returns whether anything happened.
+    fn peer_round(&mut self, reports: &[Vec<u8>]) -> Result<bool, LoopError> {
+        let Some(peer) = self.peer.as_mut() else {
+            return Ok(false);
+        };
+        let round = peer.agree(reports)?;
+        self.peer_now_us = round.now_us;
+        if let Some(metrics) = &self.metrics {
+            for (rid, result) in round.decisions {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.disposition = result;
+                    if result == "admission" {
+                        usage.admission_at = Some(Instant::now());
+                    } else if let Some(start) = usage.lookup_at.take() {
+                        metrics.peer.stage(
+                            "lookup_to_ready",
+                            "fallback",
+                            start.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+            }
+            for (rid, begin, end) in round.landed {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.window = Some((begin, end));
+                    usage.disposition = "unused_after_landing";
+                    if let Some(start) = usage.lookup_at.take() {
+                        metrics
+                            .peer
+                            .stage("lookup_to_ready", "ok", start.elapsed().as_secs_f64());
+                    }
+                }
+            }
+        }
+        peer.sample_scheduler(&mut self.scheduler, round.now_us);
+        self.scheduler
+            .advance_peer(round.now_us, &round.events)
+            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+        Ok(!round.events.is_empty())
+    }
+
+    /// A plan's peer work goes out: its landings start (each read waits for
+    /// this plan's device work on its member), and the lookups it queued are
+    /// sent.
+    fn dispatch_peer(&mut self, plan: &ExecutionPlan) {
+        if let Some(peer) = self.peer.as_mut() {
+            let fetches = plan.peer_fetches();
+            let lookups = self.scheduler.take_peer_lookups();
+            if let Some(metrics) = &self.metrics {
+                let now = Instant::now();
+                for lookup in &lookups {
+                    if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
+                        usage.lookup_at = Some(now);
+                        usage.disposition = "lookup";
+                    }
+                }
+                for fetch in &fetches {
+                    if let Some(usage) = self.outputs.peer_usage(&fetch.request_id) {
+                        if let Some(start) = usage.admission_at.take() {
+                            metrics.peer.stage(
+                                "admission",
+                                "ok",
+                                now.duration_since(start).as_secs_f64(),
+                            );
+                        }
+                        usage.disposition = "landing";
+                    }
+                }
+            }
+            peer.dispatch(fetches, lookups, self.peer_now_us);
+        }
     }
 
     /// With attention DP, every rank's batch this round, and whether any
@@ -2634,6 +2830,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
                 }
+                PdEvent::DestinationReady(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdDestinationReady, &rid, -1));
+                }
                 PdEvent::Succeeded(rid) => {
                     events.push(pd_event(ForwardEventKind::PdSucceeded, &rid, -1));
                     absorb(self.outputs.finish_prefill(&rid), events, outputs, released);
@@ -2703,7 +2902,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         while self.in_flight.len() > depth {
             let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
-            let result = self.data_plane.complete(pending)?;
+            let data_plane = &mut self.data_plane;
+            let result =
+                ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
             if let Some(pool) = self.pool.as_mut() {
                 pool.forward_committed()?;
             }

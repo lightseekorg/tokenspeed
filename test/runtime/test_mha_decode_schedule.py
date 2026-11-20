@@ -174,6 +174,7 @@ class _Step:
             v_cache=value.view(-1, PAGE_SIZE, KV_HEADS, HEAD_DIM),
             cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
             max_seqlen_q=self.width,
+            block_draft=False,
         )
 
     def check(self, output: torch.Tensor, layer_id: int, lengths: list[int]) -> None:

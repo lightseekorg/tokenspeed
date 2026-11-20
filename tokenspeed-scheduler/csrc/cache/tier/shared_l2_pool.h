@@ -104,7 +104,7 @@ public:
     SharedL2Pool& operator=(const SharedL2Pool&) = delete;
 
     // The prompt carries its tokens up to max_tokens.
-    Hit Probe(ClientId client, const CacheCoordinator::PromptPrefix& prompt);
+    Hit Probe(ClientId client, const PromptPrefix& prompt);
     void Release(ClientId client, Ticket ticket);
     // A key the pool holds, one another write reserved or a repeated one gets
     // no page (kHeld). The keys the pool holds are refreshed, as a rank's
@@ -129,7 +129,7 @@ public:
     // or reservations.
     bool Clear();
 
-    bool Contains(const CacheKey& key) const { return cache_.ContainsHostCachedBlock(key); }
+    bool Contains(const CacheKey& key) const { return cache_.Host().ContainsHostCachedBlock(key); }
     Stats GetStats() const;
 
 private:

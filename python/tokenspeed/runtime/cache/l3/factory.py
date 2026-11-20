@@ -123,7 +123,7 @@ def mooncake_store_library() -> str:
     return path
 
 
-def resolve_deployment_id(
+def cache_deployment_id(
     server_args: ServerArgs,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
@@ -135,8 +135,10 @@ def resolve_deployment_id(
     draft_attention_backend_name: str,
     world_cpu_group: ProcessGroup | None,
 ) -> str:
-    """This rank's deployment identity (``storage_deployment_id``): what L3
-    names its objects under and what a shared L2 pool admits its ranks by.
+    """The cache namespace's deployment id: everything that shapes a cached
+    page's bytes (``storage_deployment_id``). Pages are shared only under one
+    id -- through the L3 tier, between peer replicas (``cache/peer.py``), or
+    in a shared L2 pool, which admits its ranks by it (``cache/shared_l2``).
 
     Args:
         server_args: Resolved launch settings; numerical choices are snapshotted.
@@ -150,7 +152,10 @@ def resolve_deployment_id(
         attention_backend_name: The resolved target attention backend.
         draft_attention_backend_name: The resolved draft attention backend.
         world_cpu_group: The existing Gloo world group for checkpoint agreement;
-            None in a single-process deployment.
+            None in a single-process deployment. Every rank calls this.
+
+    Returns:
+        The id; the weight version is not part of it.
     """
     from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
 
@@ -328,7 +333,7 @@ def l3_settings(
         host_blocks=host_storage.num_host_lcm_blocks,
         prefix_granularity=host_cache.memory_plan.prefix_granularity,
     )
-    deployment_id = resolve_deployment_id(
+    deployment_id = cache_deployment_id(
         server_args,
         model_config,
         draft_model_config,
@@ -344,10 +349,8 @@ def l3_settings(
     return L3Settings(
         runtime=config,
         deployment_id=deployment_id,
-        # As the deployment id reads the draft: an empty path is no draft.
-        has_draft=(
-            draft_model_config is not None and bool(str(draft_model_config.model_path))
-        ),
+        has_draft=draft_model_config is not None
+        and bool(str(draft_model_config.model_path)),
         weight_version=str(server_args.weight_version),
         host_buffer=int(host_storage.host_buffer.data_ptr()),
         host_buffer_bytes=int(host_storage.host_buffer_bytes),

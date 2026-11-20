@@ -55,7 +55,7 @@ void SharedL2LookupHold::reset() noexcept {
 }
 
 SharedL2Proxy::SharedL2Proxy(CacheCoordinator& coordinator) : coordinator_{coordinator} {
-    _assert(coordinator_.HasHostPool(), "shared L2 needs its proxy Host tier");
+    _assert(coordinator_.Host().HasPool(), "shared L2 needs its proxy Host tier");
 }
 
 SharedL2LookupHold SharedL2Proxy::StartLookup(const std::string& request_id) {
@@ -110,7 +110,7 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
     std::vector<std::uint32_t> groups;
     std::vector<std::int32_t> buckets;
     for (std::size_t i = 0; i < result.keys.size(); ++i) {
-        if (CacheBlockRef block = coordinator_.AcquireHostCachedBlock(result.keys[i])) {
+        if (CacheBlockRef block = coordinator_.Store().AcquireHostCachedBlock(result.keys[i])) {
             shared.push_back(std::move(block));
             continue;
         }
@@ -118,7 +118,7 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
         groups.push_back(result.keys[i].group_id);
         buckets.push_back(result.buckets[i]);
     }
-    CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostBlocks(groups, buckets);
+    HostCache::HostAllocationBatch batch = coordinator_.Host().AcquireHostBlocks(groups, buckets);
     if (batch.stats.unallocated != 0) {
         // The proxy tier is sized past the pool, so only a mis-sized rank
         // gets here: the prompt computes its prefix instead.
@@ -132,7 +132,7 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
     for (std::size_t j = 0; j < fresh.size(); ++j) {
         const CacheKey& key = result.keys[fresh[j]];
         CacheBlockRef& block = batch.blocks[j];
-        coordinator_.CacheHostBlock(block, key, /*inherited_metadata=*/std::nullopt);
+        coordinator_.Host().CacheHostBlock(block, key, /*inherited_metadata=*/std::nullopt);
         created.push_back(SharedL2ProxyPage{
             .group_id = key.group_id,
             .block = coordinator_.Allocator(static_cast<std::int32_t>(key.group_id)).ResolveCacheBlockId(*block),
@@ -142,7 +142,7 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
         ticket.keys.push_back(key);
     }
     if (result.tail) {
-        coordinator_.CacheHostTail(tail_prior, *result.tail);
+        coordinator_.Host().CacheHostTail(tail_prior, *result.tail);
     }
     hold.blocks_ = std::move(batch.blocks);
     hold.blocks_.insert(hold.blocks_.end(), std::make_move_iterator(shared.begin()),
@@ -167,7 +167,7 @@ void SharedL2Proxy::ReleaseUnheld() {
         // From the answer's last entry back. One still held -- by a waiting
         // prompt's lookup, or by the load-back reading it -- ends the pass
         // for its ticket, so a ticket in use costs one check per plan.
-        while (!ticket.keys.empty() && coordinator_.DropHostEntry(ticket.keys.back())) {
+        while (!ticket.keys.empty() && coordinator_.Host().DropHostEntry(ticket.keys.back())) {
             ticket.keys.pop_back();
         }
         if (ticket.keys.empty()) {

@@ -722,7 +722,7 @@ def _check_visibility_within_retention(
             f"sink tokens but cache group {spec.group_id!r} retains {spec.sink_tokens}."
         )
     # The scheduler keeps the last `retained - 1` computed tokens ahead of
-    # the next position (GroupGeometry::ExpiredBlocksAt), exactly the HF
+    # the next position (GroupGeometry::ExpiredBlockEndAt), exactly the HF
     # window minus the current token.
     if retained is None or window_left + 1 > retained:
         raise ValueError(

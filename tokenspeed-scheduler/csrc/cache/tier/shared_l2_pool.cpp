@@ -74,14 +74,14 @@ SharedL2Pool::SharedL2Pool(std::span<const CacheGroupSpec> specs, std::int32_t p
     }
 }
 
-SharedL2Pool::Hit SharedL2Pool::Probe(ClientId client, const CacheCoordinator::PromptPrefix& prompt) {
+SharedL2Pool::Hit SharedL2Pool::Probe(ClientId client, const PromptPrefix& prompt) {
     if (prompt.max_tokens < 0 || prompt.tokens.size() < static_cast<std::size_t>(prompt.max_tokens)) {
         throw std::invalid_argument("a shared L2 lookup's tokens must reach its bound");
     }
     Hit hit;
     // The Device tier is empty, so the Host suffix of the probe starts at the
     // prompt's first token: the Host tier alone.
-    CacheCoordinator::PrefixProbe probe = cache_.ProbePromptPrefix(prompt);
+    PrefixProbe probe = cache_.Prober().ProbePromptPrefix(prompt);
     hit.kv_tokens = probe.host.kv_tokens;
     hit.num_tokens = probe.host.num_common_tokens;
     if (probe.host.tail) {
@@ -146,13 +146,13 @@ SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::span<const
     // are refreshed, as that publication refreshes a rank's own Host copies,
     // before pages are acquired for the others, which evicts the entries
     // least recently used.
-    cache_.TouchHostBlocks(keys);
+    cache_.Host().TouchHostBlocks(keys);
     std::vector<std::size_t> wanted;
     std::vector<std::uint32_t> wanted_groups;
     std::vector<std::int32_t> wanted_buckets;
     std::unordered_set<CacheKey, CacheKeyHash> requested;
     for (std::size_t i = 0; i < keys.size(); ++i) {
-        if (cache_.ContainsHostCachedBlock(keys[i]) || writing_.contains(keys[i]) ||
+        if (cache_.Host().ContainsHostCachedBlock(keys[i]) || writing_.contains(keys[i]) ||
             !requested.insert(keys[i]).second) {
             continue;
         }
@@ -163,7 +163,7 @@ SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::span<const
     if (wanted.empty()) {
         return result;
     }
-    CacheCoordinator::HostAllocationBatch batch = cache_.AcquireHostBlocks(wanted_groups, wanted_buckets);
+    HostCache::HostAllocationBatch batch = cache_.Host().AcquireHostBlocks(wanted_groups, wanted_buckets);
     Write write{writing_};
     for (std::size_t j = 0; j < wanted.size(); ++j) {
         CacheBlockRef& block = batch.blocks[j];
@@ -196,7 +196,7 @@ void SharedL2Pool::keepHeadroom() {
     const auto blocks = static_cast<std::size_t>(headroom_lcm_blocks_) * static_cast<std::size_t>(headroom_packing_);
     const std::vector<std::uint32_t> groups(blocks, headroom_group_);
     const std::vector<std::int32_t> buckets(blocks, 0);
-    cache_.AcquireHostBlocks(groups, buckets);
+    cache_.Host().AcquireHostBlocks(groups, buckets);
 }
 
 bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints) {
@@ -241,10 +241,10 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Checkp
     std::vector<BoundaryTree::Hold> linked;
     linked.reserve(completed.size());
     for (const CompletedPages& checkpoint : completed) {
-        linked.push_back(cache_.LinkCheckpoint(checkpoint));
+        linked.push_back(cache_.Store().Boundaries().LinkPublication(checkpoint));
     }
     for (std::size_t i = 0; i < write.Keys().size(); ++i) {
-        cache_.CacheHostBlock(write.Blocks()[i], write.Keys()[i], /*inherited_metadata=*/std::nullopt);
+        cache_.Host().CacheHostBlock(write.Blocks()[i], write.Keys()[i], /*inherited_metadata=*/std::nullopt);
     }
     // A boundary nothing registered under leaves again.
     linked.clear();
@@ -253,7 +253,7 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Checkp
         // Two ranks issue the same access epochs: the client tells them apart.
         cache_.RecordCheckpoint(checkpoint, checkpoints[i].access_epoch ^ (client * 0x9E3779B97F4A7C15ULL));
         if (checkpoint.tail) {
-            cache_.CacheHostTail(
+            cache_.Host().CacheHostTail(
                 checkpoint.prefix_hashes.empty() ? ContentHash{} : ContentHash{checkpoint.prefix_hashes.back()},
                 *checkpoint.tail);
         }
@@ -263,7 +263,7 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Checkp
 
 void SharedL2Pool::Touch(std::span<const CacheKey> keys) {
     validateKeys(keys);
-    cache_.TouchHostBlocks(keys);
+    cache_.Host().TouchHostBlocks(keys);
 }
 
 void SharedL2Pool::Disconnect(ClientId client) {
@@ -283,10 +283,10 @@ SharedL2Pool::Stats SharedL2Pool::GetStats() const {
     Stats stats{
         .total_lcm_blocks = pool_.NumLcmBlocks(),
         .free_lcm_blocks = pool_.NumEmptyLcmBlocks(),
-        .cached_blocks = cache_.NumHostCachedBlocks(),
-        .pinned_blocks = cache_.NumPinnedHostCachedBlocks(),
+        .cached_blocks = cache_.Host().NumHostCachedBlocks(),
+        .pinned_blocks = cache_.Host().NumPinnedHostCachedBlocks(),
         .reserved_blocks = writing_.size(),
-        .evicted_blocks = cache_.HostEvictions().lru.blocks,
+        .evicted_blocks = cache_.Evictor().HostEvictions().lru.blocks,
         .checkpoints = cache_.Checkpoints().Size(),
     };
     for (const auto& [client, state] : clients_) {

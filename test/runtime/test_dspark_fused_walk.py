@@ -1,10 +1,11 @@
-"""DSpark's greedy walk as one launch and one all-gather per round.
+"""DSpark's greedy walk as one launch and one exchange per round.
 
 The fused round must reproduce the generic walk token for token: the bias is
 the BF16 Markov GEMM, the logit is the BF16 sum, and the winner is the first
 maximum over the global vocabulary, which across shards means the lowest
 token id among equal logits. Ranks are simulated on one device by running
-each shard's round and concatenating the words as the all-gather would.
+each shard's round and concatenating the words as the all-gather would, or
+taking their maximum as an all-reduce MAX would.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.drafter import dspark as dspark_module
 from tokenspeed.runtime.execution.drafter._dspark_walk import (
     dspark_walk_finish,
     dspark_walk_round,
@@ -48,11 +50,15 @@ def _reference_walk(base, latent_table, bias_weight, anchor, shards):
     return tokens
 
 
-def _fused_walk(base, latent_table, bias_weight, anchor, shards):
-    """Every simulated rank runs its shard; all must agree on the block."""
+def _fused_walk(base, latent_table, bias_weight, anchor, shards, reduce_max=False):
+    """Every simulated rank runs its shard; all must agree on the block.
+
+    The words are exchanged gathered, or reduced with MAX to one per row.
+    """
     positions, rows, vocab = base.shape
     width = vocab // shards
     device = base.device
+    decoded = 1 if reduce_max else shards
     tokens = [
         torch.zeros((rows, positions + 1), dtype=torch.int32, device=device)
         for _ in range(shards)
@@ -73,12 +79,12 @@ def _fused_walk(base, latent_table, bias_weight, anchor, shards):
                 gathered,
                 column=k,
                 vocab_start=t * width,
-                tp=shards,
+                tp=decoded,
             )
             words.append(word)
-        gathered = torch.cat(words)
+        gathered = torch.stack(words).amax(0) if reduce_max else torch.cat(words)
     for t in range(shards):
-        dspark_walk_finish(tokens[t], gathered, column=positions, tp=shards)
+        dspark_walk_finish(tokens[t], gathered, column=positions, tp=decoded)
     for t in range(1, shards):
         torch.testing.assert_close(tokens[t], tokens[0], rtol=0, atol=0)
     return tokens[0]
@@ -96,9 +102,10 @@ def _weights(vocab, seed, scale=0.05):
     return latent_table, bias_weight, gen
 
 
+@pytest.mark.parametrize("reduce_max", [False, True])
 @pytest.mark.parametrize("rows", [3, 33])
 @pytest.mark.parametrize("shards", [1, 4])
-def test_the_fused_walk_matches_the_generic_walk(rows, shards) -> None:
+def test_the_fused_walk_matches_the_generic_walk(rows, shards, reduce_max) -> None:
     vocab, positions = 4096, 7
     latent_table, bias_weight, gen = _weights(vocab, seed=rows * 10 + shards)
     base = (
@@ -112,7 +119,7 @@ def test_the_fused_walk_matches_the_generic_walk(rows, shards) -> None:
     )
 
     expected = _reference_walk(base, latent_table, bias_weight, anchor, shards)
-    produced = _fused_walk(base, latent_table, bias_weight, anchor, shards)
+    produced = _fused_walk(base, latent_table, bias_weight, anchor, shards, reduce_max)
     assert produced.tolist() == expected.tolist()
 
 
@@ -144,8 +151,9 @@ def test_ties_go_to_the_lowest_token_id_across_shards() -> None:
     base[:, 1, 520] = 1.5
     anchor = torch.zeros(rows, device="cuda", dtype=torch.int32)
 
-    produced = _fused_walk(base, latent_table, bias_weight, anchor, 4)
-    assert produced[:, 1:].tolist() == [[300, 300], [520, 520]]
+    for reduce_max in (False, True):
+        produced = _fused_walk(base, latent_table, bias_weight, anchor, 4, reduce_max)
+        assert produced[:, 1:].tolist() == [[300, 300], [520, 520]]
 
 
 def test_negative_logits_order_by_value_not_by_bits() -> None:
@@ -232,7 +240,7 @@ def test_the_drafter_proposes_the_same_block_either_way(rows) -> None:
     block = torch.randint(
         0, 2048, (rows, drafter.spec_num_tokens - 1), generator=gen, device="cuda"
     ).to(torch.int32)
-    block_logits = drafter._block_base_logits(hidden)
+    block_logits = drafter._block_base_logits(hidden, full_vocab=False)
     assert drafter._fused_walk_fits(block_logits)
 
     blocks = {}
@@ -244,6 +252,37 @@ def test_the_drafter_proposes_the_same_block_either_way(rows) -> None:
             blocks[fused] = drafter._sample_block(hidden, block, tokens).tolist()
     assert blocks[True] == blocks[False]
     assert [row[0] for row in blocks[True]] == block[:, 0].tolist()
+
+
+@pytest.mark.parametrize("reduced", [True, False])
+def test_each_round_reduces_its_words_or_gathers_them(reduced) -> None:
+    """A group with a prepared word MAX reduces each round's words in place
+    and the next launch decodes one word per row; otherwise the rounds
+    all-gather and decode every rank's word."""
+    drafter = _drafter()
+    group = (0, 1, 2, 3)
+    drafter.logits_processor = Mock(tp_size=4, tp_group=group)
+    rows, rounds = 3, drafter.spec_num_tokens - 1
+    block_logits = torch.zeros(
+        (rounds, rows, 2048 // 4), device="cuda", dtype=torch.bfloat16
+    )
+    tokens = torch.zeros(
+        (rows, drafter.spec_num_tokens), dtype=torch.int32, device="cuda"
+    )
+    backend = Mock()
+    backend.try_word_max.return_value = reduced
+
+    with (
+        patch.object(dspark_module, "get_global_backend", return_value=backend),
+        patch.object(dspark_module, "dspark_walk_round"),
+        patch.object(dspark_module, "dspark_walk_finish") as walk_finish,
+        patch.object(dspark_module, "all_gather_single") as gather,
+    ):
+        drafter._fused_greedy_walk(block_logits, tokens)
+
+    decoded = 1 if reduced else 4
+    assert walk_finish.call_args.kwargs["tp"] == decoded
+    assert gather.call_count == (0 if reduced else rounds)
 
 
 def test_the_fused_walk_stands_down_where_it_does_not_fit() -> None:

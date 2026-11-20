@@ -142,6 +142,29 @@ class Metric:
             self._prometheus_metric.observe(value)
         self._emit(value, weight=1)
 
+    def observe_weighted(self, value: float, *, total: float, weight: int) -> None:
+        """Emit an atomic weighted sample and update Prometheus without a loop.
+
+        The sample is an aggregate mean, not a distribution of individual values.
+        Supply the original total to keep the Prometheus sum exact. Raw events
+        carry only value and weight; sinks reconstructing their product may round.
+        """
+        self._check_operation("observe")
+        if weight <= 0:
+            return
+        if self._prometheus_metric is not None:
+            histogram = self._prometheus_metric
+            # Mirror Histogram.observe using prometheus_client internals; the
+            # reporter tests cover sum, count, and buckets across dependency upgrades.
+            histogram._sum.inc(total)
+            for bound, bucket in zip(
+                histogram._upper_bounds, histogram._buckets, strict=True
+            ):
+                if value <= bound:
+                    bucket.inc(weight)
+                    break
+        self._emit(value, weight=weight)
+
 
 class MetricFactory:
     """Create metric bindings without importing unused reporters."""

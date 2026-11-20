@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "scheduler/outside_events/cache.h"
+#include "cache/tier/peer.h"
 #include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include "scheduler/outside_events/forward.h"
@@ -33,10 +34,12 @@
 namespace tokenspeed {
 
 // Keep concrete events grouped by CacheEvent, ForwardEvent, and PDEvent.
-using Event = std::variant<cache::StorageTick, cache::StorageDetach, cache::StorageDone, cache::SharedL2WriteDone,
-                           cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone,
-                           forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens,
-                           pd::BootstrappedEvent, pd::FailedEvent, pd::TransferStoppedEvent, pd::SucceededEvent,
-                           pd::RemotePrefillDoneEvent>;
+using Event =
+    std::variant<cache::StorageTick, cache::StorageDetach, cache::StorageDone, cache::SharedL2WriteDone,
+                 cache::PeerTick, cache::PeerLookup, cache::PeerPin, cache::PeerRelease, cache::PeerLookupAnswered,
+                 cache::PeerFetchDone, cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone,
+                 cache::RestoreDone, forward::ExtendResult, forward::Finish, forward::Abort,
+                 forward::UpdateReserveNumTokens, pd::BootstrappedEvent, pd::DestinationReadyEvent, pd::FailedEvent,
+                 pd::TransferStoppedEvent, pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
 
 }  // namespace tokenspeed

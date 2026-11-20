@@ -177,7 +177,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.4 and compile isolated modules, operators, and tuning caches. They require
+0.7.5 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -252,7 +252,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.4) initializes unused rows inside active
+The pinned FlashInfer version (0.7.5) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -453,6 +453,29 @@ expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
 
+## FlashInfer CuTe DSL NVFP4 SiTU (`flashinfer_cutedsl.py`)
+
+`flashinfer_cutedsl_nvfp4_situ_routed_moe_apply` runs Kimi-K3 NVFP4 SiTU
+experts on FlashInfer's CuTe DSL fused MoE (`--moe-backend
+flashinfer_cutedsl`); `auto` keeps the TRT-LLM-Gen kernel. The preprocessor
+converts the checkpoint layout: W13 rows `[gate | up]` become `[up | gate]`
+interleaved in 64-row groups, and the linear E4M3 block scales are swizzled
+per expert. The scale storage stays expert-major and the kernels read it
+through an MMA-layout view, so DWDP streams these experts like the TRT-LLM
+layout. FC1 alpha is `a13 * w13_scale_2` and FC2 alpha `a2 * w2_scale_2`. The
+kernel quantizes the GEMM2 input with one global scale (`1 / a2`), so the
+preprocessor rejects checkpoints whose per-expert `a2` differ (Kimi-K3-NVFP4
+ships 1.0 everywhere).
+
+Expert parallelism uses global routing IDs and computes only the local
+expert shard; the caller owns dispatch and combines the ranks' partial outputs.
+EP1 execution also supports DWDP's full-expert views over sharded weight storage.
+
+The apply uses one fixed tactic (256-row routing tiles, 2-CTA clusters) and
+the fused, atomic finalize; it always finalizes. On GB300 at K3 prefill shapes
+(896 experts, top-16, uniform routing) the routed MoE layer is 5-6% faster than
+TRT-LLM-Gen at 16K rows and 11% faster at 24K rows beside a peer weight copy.
+
 ## FP8 per-channel experts
 
 Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output
@@ -596,16 +619,20 @@ also sorts the routes by expert for the A8W4 SiTU decode, in one launch for
 up to 256 rows. Each row program routes one row with the packed top-k's own
 code, so ids and FP32 weights match `kimi3_sigmoid_bias_topk` bit for bit,
 writes them through to memory, sets its row's bit in each selected expert's
-arrival mask, and increments an arrival counter. One sorting program per 512
-routes follows the row programs in the grid (so every row program has
-dispatched before they wait) and polls the counter. Each sorting program
-derives the expert offsets from the masks and places its share of the routes
-at their expert's first slot plus the number of earlier rows in that expert's
-mask, in `gluon_moe_sorting`'s block-16 format. Routes within an expert
-therefore follow the flat top-k order, as `deterministic_order=True` does. The
-last sorting program leaves the caller-owned scratch zeroed, so sequential and
-graph-replayed launches can share it. The Kimi-K3 TP decode on gfx950 uses it,
-and the MoE then skips its own sort.
+arrival mask, and increments an arrival counter. From 33 rows, one sorting
+program per 512 routes follows the row programs in the grid (so every row
+program has dispatched before they wait) and polls the counter. Each sorting
+program derives the expert offsets from the masks and places its share of the
+routes at their expert's first slot plus the number of earlier rows in that
+expert's mask, in `gluon_moe_sorting`'s block-16 format. Through 32 rows, the
+masks fit one word per expert and there are no sorting programs: once every
+row has arrived, each row program derives the same offsets and places its own
+routes. Routes within an expert therefore follow the flat top-k order, as
+`deterministic_order=True` does. Every launch leaves the caller-owned scratch
+ready for the next, so sequential and graph-replayed launches can share it:
+the last sorting program zeroes it, and self-sorting launches alternate
+between two mask buffers, each zeroing the one its predecessor read. The
+Kimi-K3 TP decode on gfx950 uses it, and the MoE then skips its own sort.
 
 ## Kimi-K3 front projections
 
@@ -897,3 +924,18 @@ also exercise uneven/empty owners over multiple GPUs:
 python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
 ```
+
+
+## Router projection with NVFP4 input
+
+`try_router_gemm_nvfp4` produces BF16 router logits and the packed E2M1 / linear
+E4M3 input accepted by NVFP4 MoE. Its scalar is the consumer's quantization-domain
+global scale. Routing, top-k and expert evaluation remain with the caller.
+Automatic SM107 selection covers the measured M1/M4, H2560/E512, aligned BF16/PDL
+case; other inputs retain separate projection and quantization. The Qwen caller
+also retains serial preparation for prefill, other topologies and padded expert
+widths. The CUDA producer keeps four FP32 K partials, reduces them in order, and
+rounds logits once to BF16. Compile/cache keys contain model dimensions only;
+row count stays runtime, with M1 and capacity-8 kernels built together before
+capture. The native tile is a temporary CUDA implementation preserving the
+validated arithmetic; no AOT files or task-specific loader are needed.

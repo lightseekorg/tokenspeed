@@ -84,6 +84,9 @@ struct Table {
     dp_size: Option<Value>,
     tp_size_per_dp_rank: Option<i64>,
     pp_size: Option<i64>,
+    /// The Prefill node's decode allocation policy, as its ranks registered
+    /// it; a node that registers none allocates early.
+    decode_allocation_policy: Option<Value>,
     /// DP group -> TP rank within it -> address.
     ranks: HashMap<i64, HashMap<i64, RankAddress>>,
     /// The first registered layout's wire form, and the layout.
@@ -193,6 +196,10 @@ impl Table {
         if let Some(pp_size) = data.get("pp_size") {
             self.pp_size = Some(integer(Some(pp_size), "pp_size")?);
         }
+        // What the Decode ranks must do before they allocate; absent, early.
+        if let Some(policy) = data.get("decode_allocation_policy") {
+            self.decode_allocation_policy = Some(policy.clone());
+        }
         // With PP the per-DP world spans the stages; the table keys by the
         // dense stage-major rank.
         let world = integer(Some(&world_size), "world_size")?;
@@ -246,6 +253,9 @@ impl Table {
                 "prefill_dp_size": self.dp_size.clone().unwrap_or(Value::Null),
                 "prefill_pp_size": self.pp_size.unwrap_or(1),
             });
+            if let Some(policy) = &self.decode_allocation_policy {
+                info["prefill_decode_allocation_policy"] = policy.clone();
+            }
             if registry == Registry::CacheLayouts {
                 info["cache_layout"] = self
                     .cache_layout

@@ -30,6 +30,8 @@ use super::*;
 
 #[path = "data_plane/cpu_benchmark.rs"]
 mod cpu_benchmark;
+#[path = "data_plane/pd_notice.rs"]
+mod pd_notice;
 #[path = "data_plane/result_buffers.rs"]
 mod result_buffers;
 
@@ -258,6 +260,7 @@ fn admission_identity_and_stop_criteria_reach_python_together() {
             session_id: String::new(),
             cache_group_id: String::new(),
             shared_prefix_tokens: Vec::new(),
+            peer_holder: String::new(),
             tokens: vec![1, 2, 3],
             max_new_tokens: 8,
             max_cached_prefix_tokens: i32::MAX,

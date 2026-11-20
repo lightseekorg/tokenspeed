@@ -47,11 +47,11 @@ std::vector<SharedL2Lookup> Scheduler::SharedL2Lookups() {
         const std::span<const std::string> prompt_hashes = request->PromptPrefixHashes();
         const std::span<const std::string> hashes = prompt_hashes.first(
             std::min(prompt_hashes.size(), static_cast<std::size_t>(max_tokens / config_.prefix_granularity)));
-        const CacheCoordinator::PromptPrefix prompt{
+        const PromptPrefix prompt{
             .prefix_hashes = hashes, .tokens = request->TokenSlice(0, max_tokens), .max_tokens = max_tokens};
         // The Device alone: a proxy entry another prompt's lookup holds may
         // be gone by this prompt's admission.
-        if (max_tokens == 0 || coordinator_.ProbePromptPrefix(prompt).device_only_hit_tokens >= max_tokens) {
+        if (max_tokens == 0 || coordinator_.Prober().ProbePromptPrefix(prompt).device_only_hit_tokens >= max_tokens) {
             // Nothing the pool could add.
             admission->pool_settled = true;
             continue;
