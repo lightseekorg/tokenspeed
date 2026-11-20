@@ -142,6 +142,8 @@ class Kimi3MoEExecutionPlan:
     # Decode forwards may take the mailbox decode chain, bound once communication
     # is prepared where its kernels serve the model.
     decode_chain: bool
+    # FlashInfer's CuTe DSL NVFP4 SiTU experts on precomputed top-k.
+    use_cutedsl: bool
     use_marlin: bool = False
 
     @classmethod
@@ -178,12 +180,19 @@ class Kimi3MoEExecutionPlan:
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
         )
+        use_cutedsl = (
+            not owns_ep_communication
+            and not use_native
+            and not use_marlin
+            and moe_backend.is_flashinfer_cutedsl()
+        )
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
             use_mega_moe=use_mega_moe,
             owns_ep_communication=owns_ep_communication,
             use_marlin=use_marlin,
+            use_cutedsl=use_cutedsl,
             overlap_shared_experts=(
                 use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),

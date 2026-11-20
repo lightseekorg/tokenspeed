@@ -71,6 +71,50 @@ def gather_sampled_rows(
     return gathered.index_select(0, plan.sampled_to_request)
 
 
+def _dp_group_rows(attn, rank, padded_global_num_tokens, live_global_num_tokens):
+    """``(padded, live, tp_rank)`` of ``rank``'s attention-DP group."""
+    dp_rank, tp_rank = divmod(attn.scatter_index(rank), attn.tp_size)
+    # The count table is indexed by global rank with the DP stride.
+    first = dp_rank * attn.tp_size
+    padded = int(padded_global_num_tokens[first])
+    live = int(live_global_num_tokens[first])
+    if not 0 <= live <= padded:
+        raise ValueError(
+            f"rank {rank}: {live} live rows do not fit {padded} padded rows"
+        )
+    return padded, live, tp_rank
+
+
+def scattered_moe_source_rows(
+    mapping, padded_global_num_tokens, live_global_num_tokens, ranks
+):
+    """Return the padded and live rows of each requested attention scatter shard."""
+    attn = mapping.attn
+    world_size = mapping.world_size
+    if len(padded_global_num_tokens) != world_size:
+        raise ValueError(
+            f"padded_global_num_tokens has {len(padded_global_num_tokens)} "
+            f"entries, world_size={world_size}"
+        )
+    if len(live_global_num_tokens) != world_size:
+        raise ValueError(
+            f"live_global_num_tokens has {len(live_global_num_tokens)} "
+            f"entries, world_size={world_size}"
+        )
+
+    segments = []
+    for rank in ranks:
+        padded, live, tp_rank = _dp_group_rows(
+            attn, rank, padded_global_num_tokens, live_global_num_tokens
+        )
+        lengths = scatter_count(padded, attn.tp_size)
+        offset = sum(lengths[:tp_rank])
+        segments.append(
+            (lengths[tp_rank], min(max(live - offset, 0), lengths[tp_rank]))
+        )
+    return segments
+
+
 def moe_input_row_segments(
     mapping: Mapping,
     *,
@@ -100,44 +144,22 @@ def moe_input_row_segments(
         to the MoE input's row count.
     """
     attn = mapping.attn
-    world_size = mapping.world_size
-    if len(padded_global_num_tokens) != world_size:
-        raise ValueError(
-            f"padded_global_num_tokens has {len(padded_global_num_tokens)} "
-            f"entries, world_size={world_size}"
-        )
-    if len(live_global_num_tokens) != world_size:
-        raise ValueError(
-            f"live_global_num_tokens has {len(live_global_num_tokens)} "
-            f"entries, world_size={world_size}"
-        )
-
-    def dp_group_rows(rank: int) -> tuple[int, int, int]:
-        """``(padded, live, tp_rank)`` of ``rank``'s attention-DP group."""
-        dp_rank, tp_rank = divmod(attn.scatter_index(rank), attn.tp_size)
-        # The count table is indexed by global rank with the DP stride.
-        first = dp_rank * attn.tp_size
-        padded = int(padded_global_num_tokens[first])
-        live = int(live_global_num_tokens[first])
-        if not 0 <= live <= padded:
-            raise ValueError(
-                f"rank {rank}: {live} live rows do not fit {padded} padded rows"
-            )
-        return padded, live, tp_rank
-
-    def shard(rank: int) -> tuple[int, int]:
-        """``rank``'s reduce-scatter shard: a contiguous run of its group's rows."""
-        padded, live, tp_rank = dp_group_rows(rank)
-        lengths = scatter_count(padded, attn.tp_size)
-        offset = sum(lengths[:tp_rank])
-        return lengths[tp_rank], min(max(live - offset, 0), lengths[tp_rank])
-
     moe_all_reduce = attn.tp_size == mapping.moe.tp_ep_size
-    if mapping.moe.has_tp_ep and not moe_all_reduce:
-        return [shard(rank) for rank in mapping.moe.tp_ep_group]
-    if mapping.has_attn_tp and not moe_all_reduce:
-        return [shard(mapping.rank)]
-    padded, live, _ = dp_group_rows(mapping.rank)
+    if not moe_all_reduce and (mapping.moe.has_tp_ep or mapping.has_attn_tp):
+        ranks = mapping.moe.tp_ep_group if mapping.moe.has_tp_ep else (mapping.rank,)
+        return scattered_moe_source_rows(
+            mapping, padded_global_num_tokens, live_global_num_tokens, ranks
+        )
+    if (
+        len(padded_global_num_tokens) != mapping.world_size
+        or len(live_global_num_tokens) != mapping.world_size
+    ):
+        raise ValueError(
+            f"MoE row tables must have world_size={mapping.world_size} entries"
+        )
+    padded, live, _ = _dp_group_rows(
+        attn, mapping.rank, padded_global_num_tokens, live_global_num_tokens
+    )
     return [(padded, live)]
 
 

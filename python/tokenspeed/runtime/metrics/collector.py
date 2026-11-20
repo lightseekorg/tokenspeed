@@ -786,7 +786,10 @@ class KVTransferMetrics:
             ],
         )
         # `stage` is the bounded TransferPoll state the request was stuck in:
-        # "bootstrapping" (prefill never received the cache manifest) or
+        # "bootstrapping" (prefill never received the cache manifest),
+        # "waiting_for_announcement" (a prefill under deferred allocation
+        # never admitted the request: decode never announced it),
+        # "waiting_for_admission" (decode never published its manifest) or
         # "waiting_for_input" (decode never received the transfer-done signal).
         self.kv_transfer_timeouts = factory.counter(
             name="tokenspeed:kv_transfer_timeouts",

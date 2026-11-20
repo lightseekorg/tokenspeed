@@ -1301,6 +1301,18 @@ class HostBootstrap:
             model_config = load_model_config(
                 server_args, server_args.model, draft_of=None
             )
+            # Refused here, where the model is known, like the layouts
+            # ServerArgs refuses: deferred allocation is not validated
+            # with multimodal inputs.
+            if (
+                model_config.is_multimodal_active
+                and server_args.disaggregation_decode_allocation_policy == "deferred"
+            ):
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy deferred does "
+                    "not support a multimodal model; serve it with "
+                    "--language-model-only"
+                )
             if server_args.speculative_draft_model_path is not None:
                 draft_model_config = load_model_config(
                     server_args,
@@ -1432,11 +1444,7 @@ class HostBootstrap:
                 context_len=model_config.context_len,
                 max_single_request_tokens=self._max_single_request_tokens,
                 decode_input_tokens=decode_input_tokens,
-                max_kv_page_num=(
-                    0
-                    if server_args.chunk_prefill_kv_size is None
-                    else scheduler_config.max_kv_page_num
-                ),
+                max_kv_page_num=scheduler_config.max_kv_page_num,
                 prefix_granularity=geometry.prefix_granularity,
             )
             self._max_total_num_tokens = geometry.token_capacity
