@@ -1059,3 +1059,41 @@ def test_wide_tiles_serve_only_gdot128_banks_from_token_order(
         tuning._stage2_wide_tile(True, 64, 4096, 4096, "e2m1", b_layout, reduces=True)
         == gdot128
     )
+
+
+def test_token_counts_reuse_one_compilation_without_warmup() -> None:
+    """Token counts reuse one compiled kernel per tile configuration.
+
+    Token counts are runtime values of both sorted GEMMs and of the scale
+    gather: after one call per tile configuration (64-row blocks at 192-256
+    and 513-1280 rows here, 128-row blocks at 257-512), with warm counts that
+    are not multiples of 16, counts in every integer-specialization class
+    (multiples of 16 and not) reuse the compiled kernels.
+    """
+    g = torch.Generator(device="cuda").manual_seed(13)
+    w = _experts(
+        _codes(g, EXPERTS, 2 * INTER, HIDDEN // 2),
+        _scales(g, EXPERTS, 2 * INTER, HIDDEN // 32),
+    )
+    weight = prepare_moe_sorted_down_weight(
+        _codes(g, EXPERTS, HIDDEN // SLICES, INTER // 2),
+        _scales(g, EXPERTS, HIDDEN // SLICES, INTER // 32),
+    )
+
+    def run(rows: int) -> None:
+        routes, data, scales = _gate_up(w, rows, seed=rows)
+        out = torch.empty(
+            (rows * TOP_K, HIDDEN // SLICES), device="cuda", dtype=torch.bfloat16
+        )
+        moe_sorted_down(data, scales, routes, weight, out)
+
+    run(300)
+    run(645)
+    with assert_no_triton_compile(
+        prefill_stage1.gluon_mxfp4_moe_stage1_kernel,
+        prefill_stage2.gluon_mxfp4_moe_stage2_1x2_kernel,
+        scale._gather_package_cdna4_scale_kernel,
+    ):
+        for rows in (192, 199, 208, 257, 511, 512, 1023, 1025, 1100):
+            run(rows)
+    torch.cuda.synchronize()

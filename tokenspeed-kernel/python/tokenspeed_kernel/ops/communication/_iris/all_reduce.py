@@ -1914,6 +1914,11 @@ class ProducerAllReduce:
     """
 
     LAMPORT_MAX_ELEMENTS = 43 * 4096
+    # Elements per rank slot of the Lamport mailbox region, the stride every
+    # kernel on it addresses with. Larger than the one-shot window
+    # (LAMPORT_MAX_ELEMENTS, which still selects the all-reduce protocols) so
+    # a fused gather fits 320 rows of a 1024-wide shard.
+    LAMPORT_CAPACITY_ELEMENTS = 80 * 4096
     # The one-shot sends every peer the whole payload; from this size the
     # two-shot was faster in 8-rank MI355X graph replay. At TP4 the one-shot
     # stays faster up to its whole window (LAMPORT_MAX_ELEMENTS), so the
@@ -1962,7 +1967,7 @@ class ProducerAllReduce:
     @staticmethod
     def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
         lamport = (
-            min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_MAX_ELEMENTS)
+            min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_CAPACITY_ELEMENTS)
             if enable_lamport
             else 0
         )
@@ -2002,11 +2007,14 @@ class ProducerAllReduce:
         self.pull = pull
         self.world_size = peers.world_size
         max_numel = producer.data.numel()
-        self.lamport_max_numel = (
-            min(max_numel // 512 * 512, self.LAMPORT_MAX_ELEMENTS)
+        # The mailbox region's slot size, and the one-shot window inside it
+        # that the protocol choices read.
+        self.lamport_capacity = (
+            min(max_numel // 512 * 512, self.LAMPORT_CAPACITY_ELEMENTS)
             if enable_lamport
             else 0
         )
+        self.lamport_max_numel = min(self.lamport_capacity, self.LAMPORT_MAX_ELEMENTS)
         alignment = self.world_size * 8
         self.push_max_numel = min(
             max_numel // alignment * alignment, self.PUSH_MAX_ELEMENTS
@@ -2024,16 +2032,16 @@ class ProducerAllReduce:
         self.push_output = peers.ctx.empty((self.push_max_numel,), dtype=torch.bfloat16)
         self.lamport_region = (
             peers.ctx.empty(
-                (3, self.world_size, self.lamport_max_numel), dtype=torch.bfloat16
+                (3, self.world_size, self.lamport_capacity), dtype=torch.bfloat16
             )
-            if self.lamport_max_numel
+            if self.lamport_capacity
             else None
         )
         self.lamport_epochs = (
             torch.zeros(
-                self.lamport_max_numel // 512, dtype=torch.int32, device=peers.device
+                self.lamport_capacity // 512, dtype=torch.int32, device=peers.device
             )
-            if self.lamport_max_numel
+            if self.lamport_capacity
             else None
         )
         self.lamport_peer_addresses = None
@@ -2227,7 +2235,7 @@ class ProducerAllReduce:
                 RANK=self.pull.producer.peers.rank,
                 WORLD_SIZE=self.world_size,
                 total_elements=numel,
-                MAX_ELEMENTS=self.lamport_max_numel,
+                MAX_ELEMENTS=self.lamport_capacity,
                 NUM_STAGES=3,
                 PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 num_warps=1,
