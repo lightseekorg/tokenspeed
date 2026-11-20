@@ -19,8 +19,9 @@
 // SOFTWARE.
 
 //! A Decode rank's peer: it finds a request's Prefill ranks through the
-//! bootstrap server, registers with them once per route, sends each
-//! admitted request's page manifest, and collects their completions.
+//! bootstrap server, registers with them once per route (and waits until
+//! each acknowledged the registration), sends each admitted request's page
+//! manifest, and collects their completions.
 //!
 //! Threads: one per bootstrap address connects its requests to their routes
 //! (HTTP lookups), one handles the status socket, one watches the Prefill
@@ -32,8 +33,8 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant},
@@ -68,6 +69,13 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// beat must not fill the endpoint's queue, which registrations and
 /// manifests share.
 const ANNOUNCE_BURST: usize = 256;
+/// How long a route's registration waits for every target's acknowledgment.
+/// A control connection that fails discards its queue after five seconds
+/// (`net`); this leaves room for a resend on a fresh connection.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a registration not yet acknowledged by every target is resent.
+const REGISTRATION_RESEND: Duration = Duration::from_secs(1);
 
 /// A Decode rank's settings.
 #[derive(Debug, Clone)]
@@ -91,6 +99,14 @@ pub struct DecodeConfig {
     pub heartbeat_interval: Duration,
     /// Failed checks in a row after which a Prefill node counts as lost.
     pub heartbeat_max_failures: u32,
+}
+
+/// A route registration waiting for its targets' replies.
+#[derive(Default)]
+struct Registering {
+    acknowledged: BTreeSet<i64>,
+    /// Why a target rejected the registration, if one did.
+    rejection: Option<String>,
 }
 
 /// A Prefill rank a route reaches.
@@ -144,6 +160,7 @@ struct State {
     addr_rooms: HashMap<String, HashSet<u64>>,
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
     routes: HashMap<String, (Option<String>, Arc<PrefillRoute>)>,
+    /// The routes every target acknowledged this cache's registration on.
     connections: HashMap<ConnectionKey, Arc<Vec<Target>>>,
     /// The connected rooms whose Prefill node defers the decode allocation: the
     /// node was told of each, and its notice admits the room here.
@@ -151,6 +168,8 @@ struct State {
     /// The Prefill ranks whose notice arrived: the room's request holds
     /// every page of its prompt there.
     notices: HashMap<u64, BTreeSet<i64>>,
+    /// Route registrations in progress, by id.
+    registering: HashMap<u64, Registering>,
 }
 
 impl State {
@@ -389,11 +408,120 @@ struct Shared {
     tp_size: i64,
     tp_rank: i64,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
+    /// Signaled when a Prefill rank replies to a registration.
+    registration_replied: Condvar,
+    /// The id of the next route registration.
+    next_registration_id: AtomicU64,
 }
 
 impl Shared {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("the PD state lock is poisoned")
+    }
+
+    /// Prefill rank `rank` installed registration `id` of cache `cache_id`,
+    /// or rejected it for `rejection`.
+    fn reply_to_registration(&self, id: u64, cache_id: &str, rank: i64, rejection: Option<String>) {
+        let mut state = self.state();
+        if cache_id != state.cache_id {
+            return;
+        }
+        let Some(registering) = state.registering.get_mut(&id) else {
+            return;
+        };
+        match rejection {
+            None => {
+                registering.acknowledged.insert(rank);
+            }
+            Some(reason) => {
+                registering.rejection.get_or_insert(format!(
+                    "Prefill rank {rank} rejected the Decode cache registration: {reason}"
+                ));
+            }
+        }
+        self.registration_replied.notify_all();
+    }
+
+    /// Register the current cache with a route's `targets`, resending until
+    /// every target acknowledged it: a registration queued on a control
+    /// socket is lost with that socket's backlog when its connection fails
+    /// (`net::Sockets`). Returns the state lock once every target
+    /// acknowledged, `None` if the room stopped waiting for its connection
+    /// or the cache was replaced meanwhile, and an error when a target
+    /// rejected the registration or the targets did not all acknowledge it
+    /// within [`REGISTRATION_TIMEOUT`].
+    fn register<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, State>,
+        room: u64,
+        targets: &[Target],
+    ) -> Result<Option<MutexGuard<'a, State>>, String> {
+        let id = self.next_registration_id.fetch_add(1, Ordering::Relaxed);
+        let cache_id = state.cache_id.clone();
+        // Built under the incarnation lock: the frames name the current
+        // cache and session, both replaced together on a wake.
+        let frames = wire::registration_frames(
+            &self.local_ip,
+            self.transport.sockets.port(),
+            &self.transport.session_id(),
+            &cache_id,
+            self.arena_base,
+            &self.layout_wire,
+            self.tp_size,
+            self.tp_rank,
+            id,
+        );
+        state.registering.insert(id, Registering::default());
+        let deadline = Instant::now() + REGISTRATION_TIMEOUT;
+        let mut resend_at = Instant::now();
+        let outcome = loop {
+            if !state.awaiting_connection(room) || state.cache_id != cache_id {
+                break Ok(false);
+            }
+            let registering = &state.registering[&id];
+            if let Some(rejection) = &registering.rejection {
+                break Err(rejection.clone());
+            }
+            let acknowledged = &registering.acknowledged;
+            let unacknowledged: Vec<&Target> = targets
+                .iter()
+                .filter(|target| !acknowledged.contains(&target.rank))
+                .collect();
+            if unacknowledged.is_empty() {
+                break Ok(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let ranks: Vec<i64> = unacknowledged.iter().map(|target| target.rank).collect();
+                break Err(format!(
+                    "Prefill ranks {ranks:?} did not acknowledge the Decode cache registration \
+                     within {REGISTRATION_TIMEOUT:?}"
+                ));
+            }
+            if now >= resend_at {
+                // A room's pre-allocation follows on these same sockets.
+                let sent = unacknowledged.iter().try_for_each(|target| {
+                    self.transport
+                        .sockets
+                        .send(&target.host, target.port, frames.clone())
+                });
+                if let Err(error) = sent {
+                    break Err(error.to_string());
+                }
+                resend_at = now + REGISTRATION_RESEND;
+            }
+            state = self
+                .registration_replied
+                .wait_timeout(state, resend_at.min(deadline) - now)
+                .expect("the PD state lock is poisoned")
+                .0;
+        };
+        state.registering.remove(&id);
+        match outcome {
+            Ok(true) => Ok(Some(state)),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Queue cancellation on the same sockets as registration and manifests.
@@ -478,7 +606,8 @@ impl Shared {
 
     /// Connect a room to its Prefill ranks:
     /// look up the route, register with its ranks the first time the route
-    /// is used, and mark the room bootstrapped.
+    /// is used (recording the route once every rank acknowledged), and mark
+    /// the room bootstrapped.
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
         let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let cache_id = {
@@ -551,28 +680,10 @@ impl Shared {
             return Ok(());
         }
         if !state.connections.contains_key(&key) {
-            // Enqueue registration while holding the incarnation lock. A
-            // room's pre-allocation follows on this same socket.
-            let session_id = self.transport.session_id();
-            for target in targets.iter() {
-                self.transport
-                    .sockets
-                    .send(
-                        &target.host,
-                        target.port,
-                        wire::registration_frames(
-                            &self.local_ip,
-                            self.transport.sockets.port(),
-                            &session_id,
-                            &state.cache_id,
-                            self.arena_base,
-                            &self.layout_wire,
-                            self.tp_size,
-                            self.tp_rank,
-                        ),
-                    )
-                    .map_err(|error| error.to_string())?;
-            }
+            state = match self.register(state, room, &targets)? {
+                Some(state) => state,
+                None => return Ok(()),
+            };
             state.connections.insert(key, targets.clone());
         }
         if state.attach(room, addr, &route, targets.clone()) {
@@ -893,6 +1004,8 @@ impl DecodePeer {
             tp_size: config.tp_size,
             tp_rank: config.tp_rank,
             metrics: config.peer.metrics.clone(),
+            registration_replied: Condvar::new(),
+            next_registration_id: AtomicU64::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -902,6 +1015,18 @@ impl DecodePeer {
                 .name("ts-pd-status".to_owned())
                 .spawn(move || loop {
                     match messages.recv_timeout(SOCKET_POLL) {
+                        Ok(frames) if wire::is_registration_ack(&frames) => {
+                            match wire::registration_ack(&frames) {
+                                Ok((id, cache_id, rank)) => shared.reply_to_registration(id, &cache_id, rank, None),
+                                Err(error) => tracing::error!(%error, "rejecting a malformed registration acknowledgment"),
+                            }
+                        }
+                        Ok(frames) if wire::is_registration_reject(&frames) => {
+                            match wire::registration_reject(&frames) {
+                                Ok((id, cache_id, rank, reason)) => shared.reply_to_registration(id, &cache_id, rank, Some(reason)),
+                                Err(error) => tracing::error!(%error, "rejecting a malformed registration rejection"),
+                            }
+                        }
                         Ok(frames) if wire::is_cancellation_ack(&frames) => {
                             match wire::cancellation_ack(&frames) {
                                 Ok((room, cache_id, rank)) => shared.state().acknowledge_cancellation(room, &cache_id, rank),
