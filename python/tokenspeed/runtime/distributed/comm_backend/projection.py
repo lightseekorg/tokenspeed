@@ -41,13 +41,19 @@ if TYPE_CHECKING:
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
 _FUSED_COL_TP_SIZES = (2, 4)
-_FUSED_COL_MIN_ROWS = 64
-# Smaller output projections retain the ordinary path.
+_FUSED_BF16_COL_MIN_ROWS = 32
+_FUSED_FP8_COL_MIN_ROWS = 64
 _FUSED_ROW_TP_SIZES = (2, 4)
-_FUSED_ROW_MIN_ROWS = 64
-_FUSED_BF16_MIN_ROWS = 32
+_FUSED_BF16_ROW_MIN_ROWS = 64
+_FUSED_FP8_ROW_MIN_ROWS = 64
 
 logger = logging.getLogger(__name__)
+
+
+def _fused_min_rows(kind: Literal["column", "row"], bf16: bool) -> int:
+    if kind == "row":
+        return _FUSED_BF16_ROW_MIN_ROWS if bf16 else _FUSED_FP8_ROW_MIN_ROWS
+    return _FUSED_BF16_COL_MIN_ROWS if bf16 else _FUSED_FP8_COL_MIN_ROWS
 
 
 @dataclass(frozen=True)
@@ -439,12 +445,8 @@ class ProjectionBackend:
             fused_tp_sizes = (
                 _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_COL_TP_SIZES
             )
-            min_fused_rows = (
-                _FUSED_BF16_MIN_ROWS
-                if spec.weight_dtype == torch.bfloat16
-                else (
-                    _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
-                )
+            min_fused_rows = _fused_min_rows(
+                spec.kind, spec.weight_dtype == torch.bfloat16
             )
             if batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
@@ -555,7 +557,7 @@ class ProjectionBackend:
         bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_column is None
-            or rows < (_FUSED_BF16_MIN_ROWS if bf16 else _FUSED_COL_MIN_ROWS)
+            or rows < _fused_min_rows("column", bf16)
             or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
         ):
@@ -608,7 +610,7 @@ class ProjectionBackend:
         bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_row is None
-            or rows < (_FUSED_BF16_MIN_ROWS if bf16 else _FUSED_ROW_MIN_ROWS)
+            or rows < _fused_min_rows("row", bf16)
             or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
         ):

@@ -354,8 +354,9 @@ width of the checkpoint and returned logical outputs.
 
 Block-FP8 and BF16 fusion support SM100 and SM103. A subgroup can span nodes
 within one NVLink domain when every rank can allocate fabric memory.
-The subgroup maximum must be at least 64 physical rows for block-FP8 and 32
-for BF16. SM100 uses the same aligned shapes for both formats.
+The subgroup maximum must be at least 32 physical rows for BF16 column fusion
+and 64 for BF16 row or block-FP8 fusion. SM100 uses the same aligned shapes for
+both formats.
 BF16 fusion uses BF16 operands directly.
 Row GEMM partials round to BF16, then sum in FP32 rank order before final BF16
 rounding. Unsupported configurations use the ordinary projection collectives.

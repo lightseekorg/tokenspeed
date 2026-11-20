@@ -27,6 +27,7 @@ torchrun and select pytest node IDs matching the torchrun world size.
 import gc
 import importlib.util
 import os
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -172,7 +173,7 @@ def _worker(
         if quantized:
             counts_list = [(32,) * world_size, (64,) * world_size, (64, 0)]
         else:
-            counts_list = [(rows,) * world_size for rows in (30, 32, 64, 65, 128)]
+            counts_list = [(rows,) * world_size for rows in (30, 32, 63, 64, 65, 128)]
             counts_list += [
                 (rows,) * world_size
                 for rows in (256, 384, 512, 1024, 2048)
@@ -215,19 +216,17 @@ def _worker(
                 (0, 32, 1, 30)[:world_size],
             ]
         backend = AutoBackend()
-        workspace = prepare_projection_collectives(
-            ProjectionSpec(
-                group=tuple(range(world_size)),
-                kind=kind,
-                input_size=input_size,
-                output_size=output_size,
-                max_tokens=capacity,
-                dtype=torch.bfloat16,
-                weight_dtype=weight_dtype,
-                device=device,
-            ),
-            backend,
+        spec = ProjectionSpec(
+            group=tuple(range(world_size)),
+            kind=kind,
+            input_size=input_size,
+            output_size=output_size,
+            max_tokens=capacity,
+            dtype=torch.bfloat16,
+            weight_dtype=weight_dtype,
+            device=device,
         )
+        workspace = prepare_projection_collectives(spec, backend)
         state = workspace.fused_column if kind == "column" else workspace.fused_row
         assert state is not None, (
             kind,
@@ -237,7 +236,7 @@ def _worker(
             output_size,
         )
         assert state.quantized == quantized
-        dispatch_rows = 64 if quantized else 32
+        dispatch_rows = 64 if quantized or kind == "row" else 32
 
         def project(x, counts, out):
             if kind == "column":
@@ -327,6 +326,14 @@ def _worker(
                 torch.testing.assert_close(actual, ref, rtol=0, atol=0)
         graph.reset()
         workspace.close()
+
+        if kind == "row" and not quantized:
+            small_workspace = prepare_projection_collectives(
+                replace(spec, max_tokens=dispatch_rows - 1), backend
+            )
+            prepared_fusion = small_workspace.fused_row is not None
+            small_workspace.close()
+            assert not prepared_fusion
 
         # Reprepare a smaller capacity after calls that changed row buckets.
         state = create(
