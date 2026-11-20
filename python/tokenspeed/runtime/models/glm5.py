@@ -768,8 +768,7 @@ class GlmDsaSparseAttentionMixin:
                 causal_lens = (
                     seq_lens[requests.long()]
                     - (q_len_per_req - 1)
-                    + torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
-                    % q_len_per_req
+                    + torch.arange(q.shape[0], device=q.device) % q_len_per_req
                 )
                 dcp_index = build_dcp_index_metadata(
                     q,
