@@ -503,17 +503,23 @@ def projection_mm_reduce_scatter(
     return backend.projection_reduce_scatter(partial, rows, workspace)
 
 
-def _check_transpose(weight: torch.Tensor, workspace: ProjectionWorkspace) -> None:
+def _check_transpose(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+) -> None:
     spec = workspace.spec
     # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
     if (
         spec.kind != "transpose"
+        or inputs.shape[0] > len(spec.group) * rows
         or weight.shape != (spec.output_size // len(spec.group), spec.input_size)
         or weight.shape[0] == weight.shape[1]
     ):
         raise ValueError(
-            "A transpose GEMM takes its transpose workspace's non-square "
-            "[N / TP, K] shard"
+            "A transpose GEMM takes at most TP * rows rows and its transpose "
+            "workspace's non-square [N / TP, K] shard"
         )
 
 
@@ -527,7 +533,7 @@ def projection_mm_to_owners(
     """Project all rows through this rank's shard; return owner rows through backend."""
     from tokenspeed_kernel.ops.gemm import mm
 
-    _check_transpose(weight, workspace)
+    _check_transpose(inputs, rows, weight, workspace)
     # The exchange's output must not share storage with its input.
     projected = inputs.new_empty((len(workspace.spec.group) * rows, weight.shape[0]))
     mm(inputs, weight, out=projected[: inputs.shape[0]])
@@ -1067,7 +1073,7 @@ class ProjectionBackend:
                 inputs, rows, weight, workspace, self._fallback
             )
         _check_workspace(rows, workspace, self._fallback)
-        _check_transpose(weight, workspace)
+        _check_transpose(inputs, rows, weight, workspace)
         return workspace.owner_rows.mm_to_owners(inputs, rows, weight)
 
     def all_to_all(

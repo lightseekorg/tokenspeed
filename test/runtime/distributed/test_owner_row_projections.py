@@ -193,6 +193,16 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
             inputs, weight, expected = transposed(rows, seed)
             owned = projection_mm_to_owners(inputs, rows, weight, transpose, backend)
             torch.testing.assert_close(owned, expected, atol=0, rtol=0)
+        # Rows beyond the owners' extent fail here too.
+        for rows in (100, 700):
+            with pytest.raises(ValueError):
+                projection_mm_to_owners(
+                    inputs.new_zeros(world_size * rows + 1, 128),
+                    rows,
+                    weight,
+                    transpose,
+                    backend,
+                )
 
         # Two captured transposes replay on new rows; the second one's rows stay.
         rows = 700
