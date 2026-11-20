@@ -79,6 +79,9 @@ Start here:
 - [Compatible Parameters](https://lightseek.org/tokenspeed/configuration/compatible-parameters)
 - [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
 
+For Ascend memory release and graph recovery, see the
+[ACL Graph Memory Saver guide](docs/serving/ascend-memory-saver.md).
+
 ## Citation
 
 ```bibtex

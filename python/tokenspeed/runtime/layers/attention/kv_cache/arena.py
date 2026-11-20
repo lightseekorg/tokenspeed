@@ -150,7 +150,7 @@ class CacheArena:
         # A group may have no fields on this rank: pipeline parallelism keeps
         # every group but drops the fields of layers another stage owns.
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+            enable=enable_memory_saver, device=device
         )
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
         with self.memory_saver_adapter.named_region("attention_state"):

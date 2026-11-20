@@ -51,8 +51,8 @@
 //!   `update_weights_from_disk([{model_path, load_format, flush_cache = true,
 //!   weight_version}])`, `update_weights_from_mooncake([{version,
 //!   flush_cache = true, weight_version}])`;
-//! * `release_memory_occupation([{tags}])`,
-//!   `resume_memory_occupation([{tags}])`;
+//! * `release_memory_occupation([{tags, transition_id}])`,
+//!   `resume_memory_occupation([{tags, transition_id}])`;
 //! * `rebalance_experts()`;
 //! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints;
 //! * `reload_forward([{mode = "wait", modules, id, timeout_s}])`: development only
@@ -71,7 +71,7 @@ use ts_wire::{
         PROFILE_STOP,
     },
     msgpack::Integer,
-    ControlRequest, Value,
+    ControlRequest, StrOrList, Value,
 };
 
 use crate::request::MAX_CACHE_SESSION_ID_BYTES;
@@ -312,14 +312,14 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
         }
         "release_memory_occupation" => {
             ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                rid: None,
+                rid: body.str_opt("transition_id")?.map(StrOrList::One),
                 http_worker_ipc: None,
                 tags: body.strs_opt("tags")?,
             })
         }
         "resume_memory_occupation" => {
             ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                rid: None,
+                rid: body.str_opt("transition_id")?.map(StrOrList::One),
                 http_worker_ipc: None,
                 tags: body.strs_opt("tags")?,
             })
@@ -604,6 +604,8 @@ fn string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("../tests/unit/test_calls_memory_transition.rs");
 
     fn call(method: &str, args: Vec<Value>) -> ControlCall {
         ControlCall {

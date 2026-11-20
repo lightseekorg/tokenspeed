@@ -232,6 +232,45 @@ class Qwen3ForCausalLM(BaseCausalLM):
             (".gate_up_proj.", ".up_proj.", 1),
         ]
 
+    @property
+    def supports_weight_discard(self) -> bool:
+        # Enable the new recovery contract on NPU without changing GPU support.
+        return all(parameter.device.type == "npu" for parameter in self.parameters())
+
+    def required_weight_update_names(self) -> set[str]:
+        stacked = self.get_stacked_params_mapping()
+        names = set()
+        for name, _ in self.named_parameters():
+            sources = {
+                name.replace(fused, source)
+                for fused, source, _ in stacked
+                if fused in name
+            }
+            names.update(sources or {name})
+        if "Embedding" in self.config.name_or_path:
+            # Match the original checkpoint namespace before load_weights adds
+            # the backbone prefix; prefixed input would otherwise be skipped.
+            unmapped = {name for name in names if not name.startswith("model.")}
+            if unmapped:
+                raise ValueError(
+                    "The embedding loader has no checkpoint source for "
+                    f"parameters outside the backbone: {sorted(unmapped)}"
+                )
+            return {name.removeprefix("model.") for name in names}
+        return names
+
+    def weight_discard_redundant_checkpoint_names(self) -> frozenset[str]:
+        # Some tied checkpoints also export the head. The canonical embedding
+        # key must still arrive and is the only writer of the shared storage.
+        return (
+            frozenset({"lm_head.weight"})
+            if self.lm_head is self.model.embed_tokens
+            else frozenset()
+        )
+
+    def weight_discard_preserved_tensors(self) -> tuple[torch.Tensor, ...]:
+        return tuple(self.buffers())
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
     ) -> set[str]:
