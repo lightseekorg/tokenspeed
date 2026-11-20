@@ -2127,11 +2127,35 @@ def test_owned_row_flags_are_validated_in_server_args() -> None:
     for tokens in (8191, 2**17):
         with pytest.raises(ValueError, match="--owned-rows-max-tokens"):
             ServerArgs(model="x", owned_rows_max_tokens=tokens)
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", owned_attention_output="all-to-all", numerics="rl-bitwise"
+        )
     assert ServerArgs(model="x").owned_rows_max_tokens == 8192
     assert (
         ServerArgs(model="x", owned_rows_max_tokens=24576).owned_rows_max_tokens
         == 24576
     )
+
+
+def test_prefill_collective_payload_choices_match_the_iris_state() -> None:
+    """ServerArgs validates the flag; the Iris state takes the same names."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MUSE_PAYLOADS
+
+    from tokenspeed.runtime.utils.server_args import PREFILL_COLLECTIVE_PAYLOADS
+
+    assert tuple(PREFILL_COLLECTIVE_PAYLOADS) == tuple(MUSE_PAYLOADS)
+
+
+def test_prefill_collective_payload_is_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--prefill-collective-payload"):
+        ServerArgs(model="x", prefill_collective_payload="fp8")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
+        )
 
 
 if __name__ == "__main__":

@@ -1154,9 +1154,13 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.post_expert_norm.weight = torch.nn.Parameter(norm)
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    # Prepare int8-block16 payloads too; each call names its payload.
+    # Prepare int8-block16 payloads too; each call names its payload. Restored
+    # once the state is prepared (it reads the flag only there).
     global_server_args_dict["prefill_collective_payload"] = "int8-block16"
-    group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    try:
+        group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    finally:
+        global_server_args_dict["prefill_collective_payload"] = "bf16"
 
     def inputs(rows):
         torch.manual_seed(rows + rank * 17)

@@ -3489,6 +3489,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 f"{unprepared or f'max forward tokens {max_num_tokens} below {MUSE_OWNED_ROWS_MIN_TOKENS}'}); "
                 "serve with --owned-attention-output reduce-scatter"
             )
+        if global_server_args_dict["prefill_collective_payload"] != "bf16" and (
+            unprepared is not None or max_num_tokens < MUSE_OWNED_ROWS_MIN_TOKENS
+        ):
+            # The payload encodes only Iris owned-row collectives; refuse a
+            # flag that would never apply.
+            raise RuntimeError(
+                "--prefill-collective-payload int8-block16 needs Muse Spark's Iris "
+                f"owned-row prefill, which this server does not run ("
+                f"{unprepared or f'max forward tokens {max_num_tokens} below {MUSE_OWNED_ROWS_MIN_TOKENS}'}); "
+                "serve with --prefill-collective-payload bf16"
+            )
         if unprepared is not None:
             if self.model.config.decode_monokernel:
                 # The launches' mailbox scratch lives on the Iris heap that

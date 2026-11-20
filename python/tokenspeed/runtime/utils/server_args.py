@@ -348,6 +348,9 @@ def validate_context_parallel_roles(
 OWNED_ATTENTION_OUTPUTS = ("reduce-scatter", "all-to-all")
 # Main's owned-row cap; --owned-rows-max-tokens defaults to it.
 OWNED_ROWS_MAX_TOKENS_DEFAULT = 8192
+# Muse Spark's --prefill-collective-payload choices (the Iris state's
+# MUSE_PAYLOADS; a test checks they match).
+PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
 
 
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
@@ -1160,6 +1163,20 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if (
+            (
+                self.owned_attention_output != "reduce-scatter"
+                or self.owned_rows_max_tokens != OWNED_ROWS_MAX_TOKENS_DEFAULT
+                or self.prefill_collective_payload != "bf16"
+            )
+            and architectures is not None
+            and "MuseSparkForConditionalGeneration" not in architectures
+        ):
+            raise ValueError(
+                "--prefill-collective-payload, --owned-attention-output and "
+                "--owned-rows-max-tokens apply to Muse Spark's owned-row prefill "
+                f"only; this checkpoint is {architectures}"
+            )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
@@ -2373,6 +2390,29 @@ class ServerArgs:
             raise ValueError(
                 f"--owned-rows-max-tokens must be in [{OWNED_ROWS_MAX_TOKENS_DEFAULT}, "
                 f"{(2**31 - 1) // (8192 * 2)}], got {self.owned_rows_max_tokens}"
+            )
+        if self.numerics == "rl-bitwise" and (
+            self.owned_attention_output != "reduce-scatter"
+            or self.owned_rows_max_tokens != OWNED_ROWS_MAX_TOKENS_DEFAULT
+        ):
+            # Both move owned-row prefill sums to another order; the envelope
+            # promises the trainer's bits.
+            raise ValueError(
+                "--owned-attention-output all-to-all and a raised "
+                "--owned-rows-max-tokens change prefill numerics; --numerics "
+                "rl-bitwise needs the defaults"
+            )
+        _require_choice(
+            "--prefill-collective-payload",
+            self.prefill_collective_payload,
+            PREFILL_COLLECTIVE_PAYLOADS,
+        )
+        if self.numerics == "rl-bitwise" and self.prefill_collective_payload != "bf16":
+            # The envelope promises the trainer's bits; the INT8 payload rounds
+            # every prefill collective's inputs.
+            raise ValueError(
+                "--prefill-collective-payload int8-block16 changes prefill "
+                "numerics; --numerics rl-bitwise needs bf16"
             )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
@@ -5267,7 +5307,7 @@ class ServerArgs:
             "--prefill-collective-payload",
             type=str,
             default=ServerArgs.prefill_collective_payload,
-            choices=["bf16", "int8-block16"],
+            choices=list(PREFILL_COLLECTIVE_PAYLOADS),
             help="Muse Spark: the payload encoding of the owned-row prefill "
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "

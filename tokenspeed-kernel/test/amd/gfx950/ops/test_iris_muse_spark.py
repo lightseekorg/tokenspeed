@@ -3558,13 +3558,13 @@ def test_muse_collective_replay(check, backend, world_size):
 
 
 def _int8_block16_payloads(seed):
-    """The int8-block16 reference's payload families [4096, 2048] (BF16): Gaussian,
-    Student t (3 dof, from the global generator seeded 0), Gaussian with
-    sparse 100x outliers, and exact ties / zeros."""
-    torch.manual_seed(0)
+    """Payload families [4096, 2048] (BF16), all from one generator: Gaussian,
+    Student t with 3 degrees of freedom (a Gaussian over the root of a scaled
+    chi-square), Gaussian with sparse 100x outliers, and exact ties / zeros."""
     g = torch.Generator().manual_seed(seed)
     gauss = torch.randn(4096, 2048, generator=g)
-    t3 = torch.distributions.StudentT(3.0).sample((4096, 2048))
+    chi2 = (torch.randn(3, 4096, 2048, generator=g) ** 2).sum(0)
+    t3 = torch.randn(4096, 2048, generator=g) / torch.sqrt(chi2 / 3)
     outliers = gauss.clone()
     outliers[torch.rand(4096, 2048, generator=g) < 1e-3] *= 100.0
     ties = torch.zeros(64, 2048)
@@ -3582,59 +3582,75 @@ def _int8_block16_payloads(seed):
     }
 
 
+def _int8_block16_reference(x):
+    """The definition: per 16 elements scale = max|x| / 127 (1e-30 / 127 for an
+    all-zero block), codes = rint(x / scale) clamped to [-127, 127], decode =
+    codes x scale rounded once to BF16. Returns (codes, scales, decoded)."""
+    blocks = x.reshape(-1, 16).float()
+    scales = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
+    codes = torch.round(blocks / scales).clamp(-127.0, 127.0)
+    decoded = (codes * scales).bfloat16()
+    return codes.to(torch.int8).reshape(-1), scales.reshape(-1), decoded.reshape(-1)
+
+
 def test_int8_block16_encode_matches_the_reference_bit_for_bit():
     """Codes, scales and the decoded payload equal the reference encoder and
-    decoder on its four payload families (digests are SHA-256 of the decoded
-    BF16, first 16 hex)."""
-    import hashlib
-
+    decoder bit for bit on four payload families."""
     from tokenspeed_kernel.ops.communication._iris.payload import (
         encode_int8_block16,
     )
 
-    digests = {
-        "gaussian": "b3044bcaf7d9e1ce",
-        "student-t3": "cb1177c40455975a",
-        "gauss+outliers": "8ce4cec3b927cfde",
-        "ties/zeros": "acfb594248bcef70",
-    }
     for name, x in _int8_block16_payloads(2026).items():
-        blocks = x.reshape(-1, 16).float()
-        scales = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
-        codes = torch.round(blocks / scales).clamp(-127.0, 127.0).to(torch.int8)
+        codes, scales, decoded = _int8_block16_reference(x)
         device_codes = torch.empty(x.numel(), dtype=torch.int8, device="cuda")
         device_scales = torch.empty(x.numel() // 16, dtype=torch.float32, device="cuda")
         encode_int8_block16[(-(-x.numel() // 4096),)](
             x.cuda(), device_codes, device_scales, x.numel(), BLOCK=4096
         )
-        assert torch.equal(device_codes.cpu(), codes.reshape(-1)), name
+        assert torch.equal(device_codes.cpu(), codes), name
         assert torch.equal(
-            device_scales.cpu().view(torch.int32), scales.reshape(-1).view(torch.int32)
+            device_scales.cpu().view(torch.int32), scales.view(torch.int32)
         ), name
-        decoded = (
+        device_decoded = (
             (device_codes.float().view(-1, 16) * device_scales.view(-1, 1))
             .bfloat16()
+            .reshape(-1)
             .cpu()
         )
-        digest = hashlib.sha256(decoded.view(torch.int16).numpy().tobytes())
-        assert digest.hexdigest()[:16] == digests[name], name
+        assert torch.equal(device_decoded.view(torch.int16), decoded.view(torch.int16))
 
 
 def test_int8_block16_encode_indexes_past_2_31_elements():
     """The encode's program bases are 64-bit: the far end of a payload past
-    2^31 elements encodes as its start does."""
+    2^31 elements encodes to the reference's codes and scales."""
     from tokenspeed_kernel.ops.communication._iris.payload import (
         encode_int8_block16,
     )
 
     elements = 2**31 + 4096
     x = torch.zeros(elements, dtype=torch.bfloat16, device="cuda")
-    tail = torch.randn(4096, device="cuda").bfloat16()
-    x[:4096] = tail
-    x[-4096:] = tail
+    tail = torch.randn(4096, generator=torch.Generator().manual_seed(31)).bfloat16()
+    x[-4096:] = tail.cuda()
     codes = torch.empty(elements, dtype=torch.int8, device="cuda")
     scales = torch.empty(elements // 16, dtype=torch.float32, device="cuda")
     encode_int8_block16[(-(-elements // 4096),)](x, codes, scales, elements, BLOCK=4096)
-    assert torch.equal(codes[-4096:], codes[:4096])
-    assert torch.equal(scales[-256:], scales[:256])
-    assert bool((codes[:4096] != 0).any())
+    want_codes, want_scales, _ = _int8_block16_reference(tail)
+    assert torch.equal(codes[-4096:].cpu(), want_codes)
+    assert torch.equal(
+        scales[-256:].cpu().view(torch.int32), want_scales.view(torch.int32)
+    )
+    assert bool((want_codes != 0).any())
+
+
+def test_int8_block16_payload_choice_is_checked():
+    """An owned-row collective names its payload: an unknown name raises, and
+    int8-block16 raises when its buffers were not prepared."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
+
+    state = MuseIrisState.__new__(MuseIrisState)
+    state.payload_codes = None
+    assert state._int8_block16("bf16") is False
+    with pytest.raises(ValueError, match="unknown collective payload"):
+        state._int8_block16("fp8")
+    with pytest.raises(RuntimeError, match="not prepared"):
+        state._int8_block16("int8-block16")
