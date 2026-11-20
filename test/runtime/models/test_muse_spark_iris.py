@@ -170,7 +170,9 @@ def _prepare_muse_backend(
     )
     layer = SimpleNamespace(
         iris_state=None,
-        self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
+        self_attn=SimpleNamespace(
+            iris_state=None, qkv_proj=projection, owned_heads_to_owners=False
+        ),
         mlp=moe,
         post_attention_layernorm=post_norm,
         pre_feedforward_layernorm=pre_norm,

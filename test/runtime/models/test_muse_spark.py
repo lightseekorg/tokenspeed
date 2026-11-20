@@ -1499,7 +1499,12 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
         model=SimpleNamespace(
-            layers=[SimpleNamespace(mlp=mlp)],
+            layers=[
+                SimpleNamespace(
+                    mlp=mlp,
+                    self_attn=SimpleNamespace(owned_heads_to_owners=False),
+                )
+            ],
             config=SimpleNamespace(decode_monokernel=False),
             owned_projections=None,
         ),
