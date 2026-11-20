@@ -40,7 +40,7 @@ sys.path.insert(0, str(_TEST_DIR))  # ``ci_system``
 sys.path.insert(0, str(_TEST_DIR.parent))  # ``test.runtime.*``
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="runtime-2gpu")
+register_cuda_ci(est_time=240, suite="runtime-2gpu")
 
 _HEADS = 12
 
@@ -120,11 +120,44 @@ def _dense_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
     _assert_close_to_reference(replayed, reference[prompt + spec_width :], fraction)
 
 
+def _prepare_value_tail():
+    """Prepare the KVP group's decode exchange with the fused value tail.
+
+    As the device setup does; returns a patch that counts the tail's calls.
+    """
+    from unittest import mock
+
+    from tokenspeed_kernel.ops.attention.mla.cute_dsl import DcpValueTail
+    from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.layers.attention.dcp import comm
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    group = tuple(global_server_args_dict["mapping"].attn.kvp_group)
+    gather_fabric_map()
+    process_group_manager.register_process_group(
+        "gloo", group, dist.new_group(backend="gloo")
+    )
+    comm.prepare_decode_exchange(group, 120, value_heads=_HEADS, decode_rows=64)
+    return mock.patch.object(
+        DcpValueTail, "__call__", autospec=True, side_effect=DcpValueTail.__call__
+    )
+
+
 def _selection_case(
-    rank: int, kv_cache_dtype, spec_width: int, fraction: float, fused_query: bool
+    rank: int,
+    kv_cache_dtype,
+    spec_width: int,
+    fraction: float,
+    fused_query: bool,
+    value_tail: bool,
 ):
     """History past index_topk: the group selects what one rank holding the
-    whole history selects, and attends it to the same output."""
+    whole history selects, and attends it to the same output; with
+    ``value_tail`` its owned decode merges and projects in the fused tail."""
     from test.runtime.test_kimi_k31 import (
         _assert_close_to_reference,
         _k31_attention_stack,
@@ -167,7 +200,15 @@ def _selection_case(
     )
     blocks = [9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
     run = dict(prompt=prompt, spec_width=spec_width, blocks=blocks)
-    *outputs, (slots, counts) = _prefill_then_decode_twice(*sharded, hidden, **run)
+    if value_tail:
+        assert sharded[0].owned_decode_value_weight() is not None
+        with _prepare_value_tail() as tail_calls:
+            *outputs, (slots, counts) = _prefill_then_decode_twice(
+                *sharded, hidden, **run
+            )
+        assert tail_calls.call_count
+    else:
+        *outputs, (slots, counts) = _prefill_then_decode_twice(*sharded, hidden, **run)
     *expected, (expected_slots, expected_counts) = _prefill_then_decode_twice(
         *whole, hidden, **run
     )
@@ -301,7 +342,27 @@ def test_kvp2_attention_matches_dense_mla_and_replays_in_a_decode_graph(
 def test_kvp2_selects_and_attends_like_one_rank_holding_the_history(
     tmp_path, kv_cache_dtype, spec_width, fraction, fused_query
 ):
-    _spawn(tmp_path, _selection_case, kv_cache_dtype, spec_width, fraction, fused_query)
+    _spawn(
+        tmp_path,
+        _selection_case,
+        kv_cache_dtype,
+        spec_width,
+        fraction,
+        fused_query,
+        False,
+    )
+
+
+@pytest.mark.parametrize("kv_cache_dtype, spec_width, fraction", _DTYPES)
+def test_kvp2_value_tail_merges_and_projects_like_one_rank(
+    tmp_path, kv_cache_dtype, spec_width, fraction
+):
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("the fused decode value tail runs on SM100 and SM103")
+    _spawn(tmp_path, _selection_case, kv_cache_dtype, spec_width, fraction, False, True)
 
 
 @pytest.mark.parametrize(
