@@ -113,6 +113,7 @@ def test_shared_paths_require_every_group(path):
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
         f"{KERNEL}/ops/moe/gluon.py",
         f"{KERNEL}/ops/communication/iris.py",
+        f"{KERNEL}/ops/gemm/rocm_blas.py",
     ],
 )
 def test_amd_owned_paths_require_only_amd(path):

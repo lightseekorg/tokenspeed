@@ -119,7 +119,7 @@ RUNNER_GROUP_PATHS = {
 # that are not listed, such as ``triton``, are shared.
 KERNEL_PACKAGE = "tokenspeed-kernel/python/tokenspeed_kernel"
 VENDOR_KERNEL_SOLUTIONS = {
-    "amd": frozenset({"gluon", "iris"}),
+    "amd": frozenset({"gluon", "iris", "rocm_blas"}),
     "npu": frozenset({"ascend"}),
     "nvidia": frozenset(
         {

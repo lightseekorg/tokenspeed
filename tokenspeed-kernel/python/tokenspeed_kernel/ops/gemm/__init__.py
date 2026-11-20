@@ -4356,6 +4356,7 @@ import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.native  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.rocm_blas  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton_fp8_channel  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: E402,F401
