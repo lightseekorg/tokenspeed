@@ -1031,20 +1031,22 @@ retire cache identities, room tombstones or possible remote writes.
 
 A decode cache's registration with a route is therefore acknowledged. Each
 registration carries an id; a prefill rank acknowledges it once the
-registration is installed, so the manifests that follow find the cache. The
-decode connection worker resends the registration every second to the targets
-that have not acknowledged it and records the route as registered only when
-every target has. A prefill rank that rejects the registration replies with
-its reason, which fails the room at once. A room whose route is not
-acknowledged within ten seconds fails before publishing a manifest, so it
-retires locally, and the next room registers again; since one worker serves a
-bootstrap address, an unreachable target delays that address's later rooms by
-up to as long. Recording a route when its registration is merely queued would
-leave a lost registration's route recorded but unknown to prefill: every later
-room on it would fail and keep its pages pinned. Prefill ranks still install
-the id-less registration of an older decode rank, without acknowledging it; a
-decode rank needs prefill ranks that acknowledge, so prefill ranks are
-upgraded first.
+registration is installed, so the manifests that follow find the cache. An
+identical registration, such as a resend or the same cache registering again
+after a route change, replaces nothing and is installed without waiting for
+writes. The decode connection worker resends the registration every second to
+the targets that have not acknowledged it, also when their queue refused it,
+and records the route as registered only when every target has. A target that
+rejects the registration replies with its reason, which fails the room at
+once. A room whose route is not acknowledged within 10 seconds fails before
+publishing a manifest, so it retires locally, and the next room registers
+again; since one worker serves a bootstrap address, an unreachable target
+delays that address's later rooms by up to as long. Recording a route when its
+registration is merely queued would leave a lost registration's route recorded
+but unknown to prefill: every later room on it would fail and keep its pages
+pinned. Prefill ranks still install the id-less registration of an older
+decode rank, without acknowledging it; a decode rank needs prefill ranks that
+acknowledge, so prefill ranks are upgraded first.
 
 Decode bootstrap lookups are serialized per bootstrap address, with independent
 workers for other addresses. Polling (including idle polls) and registration

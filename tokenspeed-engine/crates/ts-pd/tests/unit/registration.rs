@@ -763,3 +763,64 @@ fn a_rejected_registration_tells_its_decode_rank_why() {
         .unwrap_err()
         .contains("unregistered"));
 }
+
+#[test]
+fn an_identical_registration_is_acknowledged_while_its_cache_is_written() {
+    let native = NativeLibrary::new();
+    let peer = Arc::new(shared(&native));
+    let source = Arc::new(vec![73u8; 32]);
+    let destination = Arc::new(vec![0u8; 32]);
+    let receiver =
+        ts_mooncake::Engine::start(peer.transport.library.clone(), "127.0.0.1", "rdma", "")
+            .unwrap();
+    peer.transport
+        .engine()
+        .register(source.as_ptr() as usize, source.len())
+        .unwrap();
+    receiver
+        .register(destination.as_ptr() as usize, destination.len())
+        .unwrap();
+    let session = receiver.session_id();
+    let (decode, replies) = decode_socket();
+    let frames = registration("cache-a", session, decode.port());
+    peer.handle_registration(&frames);
+    let ack = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        wire::registration_ack(&ack),
+        Ok((7, "cache-a".to_owned(), 0))
+    );
+    preallocate(&peer, "cache-a", 1).unwrap();
+    let installed = peer.plan_registration(&frames).unwrap();
+    native.block_writes();
+    let writer = {
+        let peer = peer.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        thread::spawn(move || {
+            peer.write_copies(
+                1,
+                &installed,
+                &[Copy::Spans {
+                    sources: vec![source.as_ptr() as u64],
+                    destinations: vec![destination.as_ptr() as u64],
+                    lengths: vec![32],
+                }],
+            )
+        })
+    };
+    assert!(native.wait_write_entered(Duration::from_secs(2)));
+    // The same cache registers again, as after a route change, while one of
+    // its writes is inside native I/O: nothing is replaced, so nothing waits.
+    let mut again = frames.clone();
+    again[9] = Bytes::from_static(b"8");
+    peer.handle_registration(&again);
+    let ack = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        wire::registration_ack(&ack),
+        Ok((8, "cache-a".to_owned(), 0))
+    );
+    preallocate(&peer, "cache-a", 2).unwrap();
+    native.release_writes();
+    writer.join().unwrap().unwrap();
+    assert_eq!(*destination, *source);
+}

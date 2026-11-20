@@ -450,7 +450,7 @@ fn a_heartbeat_repeats_a_bounded_number_of_announcements_and_covers_every_room_i
 }
 
 #[test]
-fn replies_for_another_cache_id_or_rank_do_not_complete_a_registration() {
+fn replies_for_another_cache_id_or_rank_do_not_settle_a_registration() {
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) =
         setup(&native, Duration::from_secs(60), Duration::from_secs(60));
@@ -459,9 +459,12 @@ fn replies_for_another_cache_id_or_rank_do_not_complete_a_registration() {
             wire::registration_ack_frames(id, "another-cache", 0),
             wire::registration_ack_frames(id + 1, cache_id, 0),
             wire::registration_ack_frames(id, cache_id, 1),
+            wire::registration_reject_frames(id, "another-cache", 0, "stale"),
+            wire::registration_reject_frames(id, cache_id, 1, "not a target"),
         ]
     });
     let server = bootstrap_to(prefill.port(), None);
+    let started = Instant::now();
     peer.register("stray", &bootstrap(server.port(), 1))
         .unwrap();
     let events = until_stopped(
@@ -471,6 +474,8 @@ fn replies_for_another_cache_id_or_rank_do_not_complete_a_registration() {
         "stray",
         REGISTRATION_TIMEOUT + Duration::from_secs(5),
     );
+    // Only the deadline ended it: no stray reply settled it either way.
+    assert!(started.elapsed() >= REGISTRATION_TIMEOUT);
     assert!(!events.contains(&PdEvent::Bootstrapped("stray".to_owned())));
     assert!(peer.shared.state().connections.is_empty());
 }
@@ -500,4 +505,60 @@ fn a_rejected_registration_fails_its_room_at_once() {
     );
     assert!(!events.contains(&PdEvent::Bootstrapped("rejected".to_owned())));
     assert!(peer.shared.state().connections.is_empty());
+}
+
+#[test]
+fn a_full_control_queue_delays_a_registration_instead_of_failing_its_room() {
+    let native = NativeLibrary::new();
+    let (mut peer, _outbox, mut mesh, group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    let (prefill, _received) = answering_prefill(acknowledge);
+    // A relay in front of the Prefill socket leaves its first connection
+    // silent, so the queue behind it fills until the connect deadline drops
+    // that connection with its backlog; later connections are relayed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay = listener.local_addr().unwrap().port();
+    let target = prefill.port();
+    thread::spawn(move || {
+        let mut silent = Vec::new();
+        for (index, client) in listener.incoming().enumerate() {
+            let Ok(client) = client else { return };
+            if index == 0 {
+                silent.push(client);
+                continue;
+            }
+            let server = std::net::TcpStream::connect(("127.0.0.1", target)).unwrap();
+            for (mut from, mut to) in [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ] {
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut from, &mut to);
+                    let _ = to.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        }
+    });
+    let mut queued = 0;
+    while peer
+        .shared
+        .transport
+        .sockets
+        .send("127.0.0.1", relay, vec![crate::net::ascii(queued)])
+        .is_ok()
+    {
+        queued += 1;
+        assert!(queued <= 4096, "the control queue never filled");
+    }
+    let server = bootstrap_to(relay, None);
+    peer.register("queued", &bootstrap(server.port(), 1))
+        .unwrap();
+    let deadline = Instant::now() + REGISTRATION_TIMEOUT;
+    let mut events = Vec::new();
+    while !events.contains(&PdEvent::Bootstrapped("queued".to_owned())) {
+        assert!(Instant::now() < deadline, "not connected: {events:?}");
+        events.extend(peer.poll(&mut mesh, &group).unwrap());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(events, [PdEvent::Bootstrapped("queued".to_owned())]);
 }

@@ -759,11 +759,15 @@ impl Shared {
                 .registrations
                 .values()
                 .filter(|previous| {
-                    previous.cache_id == pending.cache_id
-                        || pending.registration.as_ref().is_some_and(|next| {
-                            (previous.endpoint == next.endpoint && previous.port == next.port)
-                                || previous.session_id == next.session_id
-                        })
+                    // An identical registration (a resend, or the same cache
+                    // registering again after a route change) replaces
+                    // nothing, so it waits for no writer.
+                    pending.registration.as_ref() != Some(*previous)
+                        && (previous.cache_id == pending.cache_id
+                            || pending.registration.as_ref().is_some_and(|next| {
+                                (previous.endpoint == next.endpoint && previous.port == next.port)
+                                    || previous.session_id == next.session_id
+                            }))
                 })
                 .map(|previous| state.registration_gates[&previous.cache_id].clone())
                 .collect()

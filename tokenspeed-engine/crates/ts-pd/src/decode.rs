@@ -31,7 +31,7 @@
 //! rank's cache transfer contract ([`crate::layout`]).
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex, MutexGuard,
@@ -105,8 +105,9 @@ pub struct DecodeConfig {
 #[derive(Default)]
 struct Registering {
     acknowledged: BTreeSet<i64>,
-    /// Why a target rejected the registration, if one did.
-    rejection: Option<String>,
+    /// Why each rank that rejected the registration did; only the route's
+    /// targets count.
+    rejections: BTreeMap<i64, String>,
 }
 
 /// A Prefill rank a route reaches.
@@ -434,9 +435,7 @@ impl Shared {
                 registering.acknowledged.insert(rank);
             }
             Some(reason) => {
-                registering.rejection.get_or_insert(format!(
-                    "Prefill rank {rank} rejected the Decode cache registration: {reason}"
-                ));
+                registering.rejections.entry(rank).or_insert(reason);
             }
         }
         self.registration_replied.notify_all();
@@ -474,13 +473,19 @@ impl Shared {
         state.registering.insert(id, Registering::default());
         let deadline = Instant::now() + REGISTRATION_TIMEOUT;
         let mut resend_at = Instant::now();
+        let mut refused = None;
         let outcome = loop {
             if !state.awaiting_connection(room) || state.cache_id != cache_id {
                 break Ok(false);
             }
             let registering = &state.registering[&id];
-            if let Some(rejection) = &registering.rejection {
-                break Err(rejection.clone());
+            if let Some((rank, reason)) = targets
+                .iter()
+                .find_map(|target| registering.rejections.get_key_value(&target.rank))
+            {
+                break Err(format!(
+                    "Prefill rank {rank} rejected the Decode cache registration: {reason}"
+                ));
             }
             let acknowledged = &registering.acknowledged;
             let unacknowledged: Vec<&Target> = targets
@@ -493,20 +498,27 @@ impl Shared {
             let now = Instant::now();
             if now >= deadline {
                 let ranks: Vec<i64> = unacknowledged.iter().map(|target| target.rank).collect();
+                let refused = refused
+                    .map(|error| format!("; the last resend was refused: {error}"))
+                    .unwrap_or_default();
                 break Err(format!(
                     "Prefill ranks {ranks:?} did not acknowledge the Decode cache registration \
-                     within {REGISTRATION_TIMEOUT:?}"
+                     within {REGISTRATION_TIMEOUT:?} (Prefill must run a version that \
+                     acknowledges registrations){refused}"
                 ));
             }
             if now >= resend_at {
-                // A room's pre-allocation follows on these same sockets.
-                let sent = unacknowledged.iter().try_for_each(|target| {
-                    self.transport
-                        .sockets
-                        .send(&target.host, target.port, frames.clone())
-                });
-                if let Err(error) = sent {
-                    break Err(error.to_string());
+                // A room's pre-allocation follows on these same sockets. A
+                // refused enqueue (a full or retiring queue) is retried on the
+                // next resend, within the deadline.
+                for target in &unacknowledged {
+                    if let Err(error) =
+                        self.transport
+                            .sockets
+                            .send(&target.host, target.port, frames.clone())
+                    {
+                        refused = Some(error.to_string());
+                    }
                 }
                 resend_at = now + REGISTRATION_RESEND;
             }
