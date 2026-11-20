@@ -273,6 +273,7 @@ class PagedAttention(nn.Module):
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         ctx: ForwardContext,
+        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Core attention over prepared inputs, the eager break: the prologue's
@@ -290,7 +291,6 @@ class PagedAttention(nn.Module):
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-        rmsnorm_output_gate = kwargs.pop("rmsnorm_output_gate", None)
         in_kernel = (
             rmsnorm_output_gate is not None
             and ctx.forward_mode.is_decode()

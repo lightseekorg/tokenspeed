@@ -631,11 +631,20 @@ def mha_decode_with_kvcache(
     # serves the call (the gate then runs separately below, and the rows run
     # as their own one-row requests).
     optional = []
-    if output_gate is not None and uniform_row_groups > 1:
+    # A kernel gates in its store only where it reduces a head in the separate
+    # op's order: 64-wide heads, BF16 output (FP8 queries give BF16) and a
+    # BF16 gate. Other calls run the separate op below.
+    gate_in_kernel = (
+        output_gate is not None
+        and q.shape[-1] == 64
+        and q.dtype != torch.float16
+        and output_gate.dtype == torch.bfloat16
+    )
+    if gate_in_kernel and uniform_row_groups > 1:
         optional.append(_RMSNORM_OUTPUT_GATE | _UNIFORM_ROW_GROUPS)
     if uniform_row_groups > 1:
         optional.append(_UNIFORM_ROW_GROUPS)
-    if output_gate is not None:
+    if gate_in_kernel:
         optional.append(_RMSNORM_OUTPUT_GATE)
     for extra in optional:
         try:
@@ -721,7 +730,7 @@ def mha_decode_with_kvcache(
         return output
     tokens, heads, head_dim = output.shape
     return weightless_rmsnorm_gated_sigmoid(
-        output.view(tokens, heads * head_dim),
+        output.reshape(tokens, heads * head_dim),
         output_gate,
         heads,
         head_dim,

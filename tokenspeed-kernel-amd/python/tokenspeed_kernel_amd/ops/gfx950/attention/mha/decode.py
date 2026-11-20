@@ -1693,14 +1693,16 @@ def _output_gate_args(
         or return_lse
         or out_dtype != torch.bfloat16
         or output_gate.dtype != torch.bfloat16
+        # output_gate_layout reduces a 64-wide head in the separate op's order.
+        or q.shape[2] != 64
         or output_gate.shape != (q.shape[0], width)
         or output_gate.stride(1) != 1
         or output_gate.device != q.device
     ):
         raise ValueError(
-            f"{kernel}: the output gate needs output_gate_eps, BF16 output and a "
-            f"BF16 [{q.shape[0]}, {width}] gate with unit column stride, and no "
-            "return_lse"
+            f"{kernel}: the output gate needs output_gate_eps, BF16 output, head "
+            f"dim 64 and a BF16 [{q.shape[0]}, {width}] gate with unit column "
+            "stride, and no return_lse"
         )
     return output_gate, output_gate.stride(0), float(output_gate_eps), True
 

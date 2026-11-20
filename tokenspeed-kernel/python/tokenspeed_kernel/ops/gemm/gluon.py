@@ -152,9 +152,6 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
-        MAX_ROWS as _FP32_ROUTER_GEMV_MAX_ROWS,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950 as _router_gemv_mm_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
@@ -287,39 +284,12 @@ if platform.is_amd:
         # The caller's counters are sized for the portable kernel's column
         # blocks; the split-K GEMM counts arrivals per row-and-column tile.
         del counters
-        if is_warming_up():
-            _warm_fp32_router_gemv_rows(x, weight, multiplier, enable_pdl)
         tile_counters = zeroed_state(
             _fp32_router_gemv_counters(x.shape[0], weight.shape[0], x.shape[1]),
             dtype=torch.int32,
             device=x.device,
         )
         return _fp32_router_gemv_impl(x, weight, multiplier, tile_counters, enable_pdl)
-
-    def _warm_fp32_router_gemv_rows(
-        x: torch.Tensor, weight: torch.Tensor, multiplier: float, enable_pdl: bool
-    ) -> None:
-        """Compile the router's row-count variants up to the GEMV's limit.
-
-        The GEMV's BLOCK_M follows the row count's power of two, and a split-K
-        tile serves the rows above it. Startup warm forwards and graph capture
-        reach only some of those counts, so a short eager extend would compile
-        the rest while serving. One launch per power of two covers them all.
-        """
-        rows = 1
-        while rows <= _FP32_ROUTER_GEMV_MAX_ROWS:
-            _fp32_router_gemv_impl(
-                x.new_zeros((rows, x.shape[1])),
-                weight,
-                multiplier,
-                zeroed_state(
-                    _fp32_router_gemv_counters(rows, weight.shape[0], x.shape[1]),
-                    dtype=torch.int32,
-                    device=x.device,
-                ),
-                enable_pdl,
-            )
-            rows *= 2
 
     def _supports_router_gemv_mm_problem(m: int, n: int, k: int) -> bool:
         # Any router shape the traits admit tiles the router half; the decode

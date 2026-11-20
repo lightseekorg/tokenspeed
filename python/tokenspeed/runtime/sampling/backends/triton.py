@@ -1192,15 +1192,7 @@ class TritonSamplingBackend(SamplingBackend):
                 self._top_k_top_p_pad = pad
                 self.sample(
                     dataclasses.replace(logits_output, next_token_logits=logits[:1]),
-                    dataclasses.replace(
-                        sampling_info,
-                        req_pool_indices=sampling_info.req_pool_indices[:1],
-                        vocab_mask=(
-                            None
-                            if sampling_info.vocab_mask is None
-                            else sampling_info.vocab_mask[:1]
-                        ),
-                    ),
+                    sampling_info[:1],
                 )
                 self.verify(logits_output, sampling_info, candidates, tree=tree)
         finally:

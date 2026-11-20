@@ -165,8 +165,9 @@ _REDUCE_MAILBOX_ROWS = 64
 # Lamport mailbox capacity (ProducerAllReduce.LAMPORT_CAPACITY_ELEMENTS, 320
 # rows of a 1024-wide shard); TP8 uses the same limit. In TP4 graph replay the
 # fused path beat the column gather plus a separate quantize at every row
-# count tested, 64 to 320, with the same bits. Pre-expert workspace rows past 64 serve only as the fused path's
-# placeholder for the gathered BF16 rows, which it returns but does not fill.
+# count tested, 64 to 320, with the same bits. Pre-expert workspace rows past
+# 64 serve only as the fused path's placeholder for the gathered BF16 rows,
+# which it returns but does not fill.
 _GATHER_MXFP4_MAX_ROWS = 320
 # Row limit of the fused gather + RMSNorm (BF16 output) path, the one-shot
 # Lamport window (172 rows of a 1024-wide shard). It matches the separate norm
@@ -1094,12 +1095,16 @@ class MuseSparkAttention(nn.Module):
             # Attention gates its own output (in the decode kernel's store
             # where it can); a single row keeps it for the output GEMV below.
             gated = q.shape[0] > 1
-            gate_kwargs = (
-                {"rmsnorm_output_gate": (output_gate, self.rms_norm_eps)}
-                if gated
-                else {}
+            output = self.attn(
+                q,
+                k,
+                v,
+                positions,
+                ctx,
+                rmsnorm_output_gate=(
+                    (output_gate, self.rms_norm_eps) if gated else None
+                ),
             )
-            output = self.attn(q, k, v, positions, ctx, **gate_kwargs)
         if not gated:
             output = output.contiguous()
             # One row normalizes and gates inside the output projection's GEMV.

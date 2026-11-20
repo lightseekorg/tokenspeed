@@ -1365,7 +1365,11 @@ class ModelExecutor:
                             ),
                             graph_phase=False,
                         )
-                if hipblaslt_autotune_enabled() and not self.config.prefill_only:
+                if (
+                    tune
+                    and hipblaslt_autotune_enabled()
+                    and not self.config.prefill_only
+                ):
                     # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
                     # captured batch size tunes the dense GEMMs the tuned file
                     # does not list, so capture records the picks. Tuning ends
