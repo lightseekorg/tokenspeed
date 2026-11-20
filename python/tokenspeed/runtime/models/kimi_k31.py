@@ -910,8 +910,10 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
     def _index_slot_owner(
         self, ctx: ForwardContext
     ) -> tuple[int, int, int, int] | None:
-        """The front's ``slot_owner``: this rank's KVP placement of the
-        round's virtual slots, or None where the cache is not placed."""
+        """Return the front's ``slot_owner``, or None for an unplaced cache.
+
+        That is this rank's KVP placement of the round's virtual slots.
+        """
         backend = ctx.attn_backend
         if isinstance(backend, HybridLinearAttnBackend):
             backend = backend.full_attn_backend

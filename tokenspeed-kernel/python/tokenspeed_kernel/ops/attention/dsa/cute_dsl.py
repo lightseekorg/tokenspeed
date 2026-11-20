@@ -673,8 +673,8 @@ if _decode_front is not None:
             key_norm_eps: The index-key LayerNorm epsilon.
             index_k_cache: Contiguous packed uint8 ``fp8_scaled`` plane
                 ``[slots, 132]`` of whole pages, 16-byte aligned.
-            slots: Contiguous int64 or int32 ``[rows]`` non-negative plane slots,
-                or virtual slots under ``slot_owner``.
+            slots: Contiguous int64 or int32 ``[rows]`` non-negative plane
+                slots, or virtual slots under ``slot_owner``.
             slot_owner: None, or ``virtual_slots_to_local``'s ``(rows_per_page,
                 virtual_block_count, degree, rank)`` of a KVP placement: only
                 this rank's rows are written, at their local plane slots.

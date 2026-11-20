@@ -3047,8 +3047,11 @@ def _bf16_step(x: torch.Tensor) -> torch.Tensor:
 
 
 def test_the_front_writes_index_keys_through_the_kvp_placement() -> None:
-    """The front's ``slot_owner`` is the full-attention leaf's KVP placement
-    of the round's virtual slots, and None for an unplaced cache."""
+    """The front's ``slot_owner`` is the leaf's KVP placement, or None.
+
+    The placement is the full-attention leaf's, of the round's virtual slots,
+    and an unplaced cache gives None.
+    """
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.models import kimi_k31
 

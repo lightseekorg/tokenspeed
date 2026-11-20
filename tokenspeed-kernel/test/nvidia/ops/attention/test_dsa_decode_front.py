@@ -240,9 +240,12 @@ def test_the_front_takes_either_slot_and_key_norm_dtype(slot_dtype, norm_dtype) 
 @pytest.mark.parametrize("rank", [0, 3])
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
 def test_a_kvp_placement_writes_only_its_rows_at_local_slots(slot_dtype, rank) -> None:
-    """Under a KVP placement the slots are virtual: a rank writes the rows of
-    its blocks at their local slots, as virtual_slots_to_local resolves them,
-    and none of the others (null block 0 and blocks past the count included)."""
+    """A rank writes only its own rows, at local slots, under a placement.
+
+    The slots are virtual: a rank writes the rows of its blocks at their local
+    slots, as virtual_slots_to_local resolves them, and none of the others
+    (null block 0 and blocks past the count included).
+    """
     rows_per_page, degree = 2 * PAGE, 4
     # The plane's 12 local blocks hold every owner's share of 44 virtual ones.
     blocks = degree * (PAGES * PAGE // rows_per_page - 1) + 1
