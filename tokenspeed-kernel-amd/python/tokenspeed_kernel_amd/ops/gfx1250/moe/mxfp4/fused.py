@@ -62,6 +62,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (
     _matmul_decode,
+    decode_gate_up_tile_config,
     decode_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
@@ -3320,7 +3321,19 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             f"'swiglu', or 'situ', got {activation!r}"
         )
     if decode:
-        gate_up_tiles = decode_tile_config(int(hidden_states.shape[-1]))
+        gate_up_k = int(hidden_states.shape[-1])
+        gate_up_tiles = decode_tile_config(gate_up_k)
+        rows = int(topk_ids.numel())
+        if block_m is None and _resolve_block_m(True, rows, num_experts) == 16:
+            # The wide step's ring is sized around decode's 16-row tile.
+            gate_up_tiles = decode_gate_up_tile_config(
+                gate_up_k,
+                RaggedTensorMetadata.n_blocks(num_experts, rows, 16)
+                * triton.cdiv(int(w13_raw.shape[-1]), gate_up_tiles["block_n"]),
+                torch.cuda.get_device_properties(
+                    hidden_states.device
+                ).multi_processor_count,
+            )
         # The down projection reduces over the activation's half of W13's N.
         down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
         if activation_dtype == "fp8":

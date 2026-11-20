@@ -64,6 +64,27 @@ def decode_tile_config(k: int) -> dict[str, int]:
     }
 
 
+# K step of a long-K gate/up launch whose programs each have a CU to
+# themselves.
+_DECODE_LONE_PROGRAM_BLOCK_K = 1024
+
+
+def decode_gate_up_tile_config(k: int, programs: int, cus: int) -> dict[str, int]:
+    """Return the decode gate/up tile for a launch of ``programs`` on ``cus`` CUs.
+
+    The ring of :func:`decode_tile_config` is sized so that two programs fit
+    in a CU's LDS. A launch with at most one program per CU has that LDS to
+    itself, so a long K is read in 1024-wide steps: the same weight bytes in
+    half the TDM operations and waits, with twice as many requested before the
+    first step. One such ring fills a CU, so a launch with more programs than
+    CUs keeps the 512-wide step; it measured slower with the wide one.
+    """
+    tiles = decode_tile_config(k)
+    if k >= _DECODE_LONG_K and programs <= cus:
+        tiles["block_k"] = _DECODE_LONE_PROGRAM_BLOCK_K
+    return tiles
+
+
 def _decode_launch_metadata(grid, kernel, args):
     """Report routed-row work and modeled traffic to Proton.
 

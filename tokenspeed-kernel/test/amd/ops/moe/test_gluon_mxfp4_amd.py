@@ -70,6 +70,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
     fused as gfx1250_fused,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (  # noqa: E402
+    decode_gate_up_tile_config,
     decode_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
@@ -1620,6 +1621,16 @@ def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
     short_k = decode_tile_config(384)
     assert long_k["block_k"] == 512 and short_k["block_k"] == 128
     assert long_k["block_n"] == short_k["block_n"] == 128
+
+
+def test_gfx1250_decode_gate_up_reads_wide_k_steps_with_a_cu_per_program() -> None:
+    static = decode_tile_config(3584)
+    # At most one program per CU: the long K is read in 1024-wide steps.
+    assert decode_gate_up_tile_config(3584, 96, 256) == {**static, "block_k": 1024}
+    assert decode_gate_up_tile_config(3584, 256, 256)["block_k"] == 1024
+    # Programs sharing CUs, and a short K, keep the static tile.
+    assert decode_gate_up_tile_config(3584, 257, 256) == static
+    assert decode_gate_up_tile_config(384, 96, 256) == decode_tile_config(384)
 
 
 def _sparse_decode_moe_case(num_tokens: int):
