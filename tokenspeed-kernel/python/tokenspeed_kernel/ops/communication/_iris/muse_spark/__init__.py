@@ -1826,7 +1826,7 @@ class MuseIrisState:
                 RANK=rank,
                 WORLD_SIZE=self.world_size,
                 LOCAL_WIDTH=local_width,
-                MAX_ELEMENTS=reduction.lamport_max_numel,
+                MAX_ELEMENTS=reduction.lamport_capacity,
                 BLOCK_M=1 << (rows - 1).bit_length(),
                 OUTPUTS=outputs,
                 POST_EPS=post_eps,
@@ -1860,7 +1860,7 @@ class MuseIrisState:
             WORLD_SIZE=self.world_size,
             K=_MUSE_ROUTE_WIDTH,
             LOCAL_WIDTH=local_width,
-            MAX_ELEMENTS=reduction.lamport_max_numel,
+            MAX_ELEMENTS=reduction.lamport_capacity,
             BLOCK_M=1 << (rows - 1).bit_length(),
             BLOCK_K=block_k,
             WAVES_PER_OUTPUT=waves,
@@ -1978,7 +1978,7 @@ class MuseIrisState:
                 WIDTH=4096,
                 row_stride=routes.stride(0),
                 EPS=eps,
-                MAX_ELEMENTS=self.reduction.lamport_max_numel,
+                MAX_ELEMENTS=self.reduction.lamport_capacity,
                 PORTABLE_MATH=num_tokens > 16,
                 PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 num_warps=1,
@@ -2196,7 +2196,7 @@ class MuseIrisState:
             WIDTH=_MUSE_ROUTE_WIDTH,
             EPS=eps,
             WEIGHT_OFFSET=weight_offset,
-            MAX_ELEMENTS=self.reduction.lamport_max_numel,
+            MAX_ELEMENTS=self.reduction.lamport_capacity,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             WAIT_STORES=self._arch.wait_stores,
             num_warps=8,
@@ -2253,7 +2253,7 @@ class MuseIrisState:
             and local_width % 512 == 0
             and triton.next_power_of_2(total_width) == total_width
             and total_width % 1024 == 0
-            and rows * local_width <= self.reduction.lamport_max_numel
+            and rows * local_width <= self.reduction.lamport_capacity
         )
 
     def can_all_gather_rmsnorm(self, local: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -2320,7 +2320,7 @@ class MuseIrisState:
             total_width=total_width,
             eps=eps,
             weight_offset=weight_offset,
-            max_elements=self.reduction.lamport_max_numel,
+            max_elements=self.reduction.lamport_capacity,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             WAIT_STORES=self._arch.wait_stores,
             num_warps=4,
@@ -2418,7 +2418,7 @@ class MuseIrisState:
             total_width=total_width,
             eps=eps,
             weight_offset=weight_offset,
-            max_elements=self.reduction.lamport_max_numel,
+            max_elements=self.reduction.lamport_capacity,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             WAIT_STORES=self._arch.wait_stores,
             EXPERTS=logits.shape[1],
@@ -2473,7 +2473,7 @@ class MuseIrisState:
                 weight_offset=weight_offset,
                 scale_stride_linear=scales.stride(0),
                 scale_stride_mblock=scales.stride(1),
-                max_elements=self.reduction.lamport_max_numel,
+                max_elements=self.reduction.lamport_capacity,
                 PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 WAIT_STORES=self._arch.wait_stores,
                 num_warps=1,
