@@ -113,7 +113,9 @@ def _payload_layout(groups):
 
 def test_block_offsets_follow_group_packing_without_overlap():
     layout = _layout()
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout, group_specs=_SPECS, num_host_lcm_blocks=2, host_register_threads=None
+    )
 
     # The 80-byte State rounds the parent up to three whole KV pages.
     assert storage.host_lcm_block_bytes == 96
@@ -127,7 +129,9 @@ def test_block_offsets_follow_group_packing_without_overlap():
 @pytest.mark.parametrize("group_index,block_id", [(0, 0), (0, 7), (1, 3)])
 def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
     layout = _layout()
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout, group_specs=_SPECS, num_host_lcm_blocks=2, host_register_threads=None
+    )
 
     with pytest.raises(IndexError):
         storage.host_block_offset(group_index, block_id)
@@ -159,7 +163,9 @@ def test_host_fields_are_packed_without_padding():
         consumers=(("full.k", "full.v"), ("state.ssm", "state.conv")),
     )
 
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=1)
+    storage = HostCacheStorage(
+        layout, group_specs=_SPECS, num_host_lcm_blocks=1, host_register_threads=None
+    )
 
     assert storage.host_cache_block_bytes == (80, 1200)
     assert storage.host_field_offsets == ((0, 40), (0, 1000))
@@ -178,7 +184,9 @@ def test_host_storage_does_not_retain_device_buffers():
     buffer = DeviceBuffer()
     reference = weakref.ref(buffer)
     layout = dataclasses.replace(_layout(), buffers=(buffer,))
-    storage = HostCacheStorage(layout, group_specs=_SPECS, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout, group_specs=_SPECS, num_host_lcm_blocks=2, host_register_threads=None
+    )
     del layout, buffer
     gc.collect()
     assert reference() is None
@@ -198,7 +206,10 @@ def test_shared_host_storage_packs_payloads_independently_of_device_strides():
         consumers=(("kv",), ("ssm",), ("aux",)),
     )
     storage = HostCacheStorage(
-        layout, group_specs=(*_SPECS, _kv("aux")), num_host_lcm_blocks=2
+        layout,
+        group_specs=(*_SPECS, _kv("aux")),
+        num_host_lcm_blocks=2,
+        host_register_threads=None,
     )
 
     # Three 32-byte KV pages make the 96-byte parent: 19 aux payloads fit it.
@@ -232,7 +243,9 @@ _QWEN38_GROUPS = (
 
 def test_parent_packs_whole_kv_pages_beside_a_larger_state_checkpoint():
     layout, specs = _payload_layout(_QWEN38_GROUPS)
-    storage = HostCacheStorage(layout, group_specs=specs, num_host_lcm_blocks=2)
+    storage = HostCacheStorage(
+        layout, group_specs=specs, num_host_lcm_blocks=2, host_register_threads=None
+    )
 
     # The State checkpoint is 8.63 full-attention pages: 8 pages leave a 7.3%
     # gap in every full-attention parent. The parent rounds up to 9 pages,

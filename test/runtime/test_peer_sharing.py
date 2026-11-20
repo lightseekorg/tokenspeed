@@ -96,6 +96,7 @@ def _setup():
         layout,
         group_specs=(_spec("full", "full_history"), _spec("swa", "full_history")),
         num_host_lcm_blocks=NUM_LCM_BLOCKS,
+        host_register_threads=None,
     )
     field_addresses = {
         field.field_id: device.data_ptr() + field.device_block_zero_offset_bytes

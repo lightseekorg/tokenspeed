@@ -113,8 +113,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.check_host_memory = Mock()
     lanes.host_memory_share = Mock(return_value=(10**12, "host (psutil)"))
     lanes.largest_pinned_fit = Mock(
-        side_effect=lambda room_bytes, *, block_bytes: (
-            max(room_bytes, 0) // block_bytes * block_bytes
+        side_effect=lambda room_bytes, *, block_bytes, padding_bytes=0: (
+            max(room_bytes - padding_bytes, 0) // block_bytes * block_bytes
         )
     )
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)

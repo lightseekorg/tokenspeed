@@ -129,6 +129,7 @@ def construction(tmp_path):
             ),
         ),
         num_host_lcm_blocks=16,
+        host_register_threads=None,
     )
     host_cache = HostCacheResources(
         storage=storage,
