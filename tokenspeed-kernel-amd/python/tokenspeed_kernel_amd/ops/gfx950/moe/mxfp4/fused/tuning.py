@@ -34,15 +34,73 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _SWIZZLE_K_S_INNER,
     _TCP_INFLIGHT_CAP_BYTES,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import B_LAYOUT_GDOT128
 
 
 class _GroupedMoEConfig(NamedTuple):
-    """Sorting and stage-1 settings; both GEMMs share ``block_m``."""
+    """Sorting and stage-1 settings; both GEMMs share ``block_m``.
+
+    ``wide_tiles`` runs E2M1 package prefill on the wide tiles: stage 1's
+    64- or 128-row x 128-output tile and, in reduce mode on 64-row sort
+    blocks, stage 2's 64 x 256 x 256 tile. Both keep every output element's
+    K order, so they write the bits the general kernels write; only shapes
+    whose table rows set it take them (``_stage1_wide_tile``,
+    ``_stage2_wide_tile``).
+    """
 
     block_m: int
     stage1_num_warps: int
     use_minimum_route_chunks: bool
     runtime_rows: bool
+    wide_tiles: bool
+
+
+def _stage1_wide_tile(
+    wide_tiles: bool,
+    block_m: int,
+    hidden_dim: int,
+    inter_dim: int,
+    activation_format: str,
+    b_layout: int,
+    input_sorted: bool,
+) -> bool:
+    """Whether stage 1 takes its wide tile: the configuration asks for it and
+    the call fits the tile (E2M1 rows from token order, GDOT128 weights, the
+    sort block and shape). Other calls keep the general kernel."""
+    return (
+        wide_tiles
+        and activation_format == "e2m1"
+        and b_layout == B_LAYOUT_GDOT128.value
+        and not input_sorted
+        and block_m in (64, 128)
+        and hidden_dim % 256 == 0
+        and hidden_dim >= 512
+        and inter_dim % 128 == 0
+    )
+
+
+def _stage2_wide_tile(
+    wide_tiles: bool,
+    block_m: int,
+    out_dim: int,
+    k: int,
+    activation_format: str,
+    b_layout: int,
+    reduces: bool,
+) -> bool:
+    """Whether stage 2 (``out_dim`` columns, ``k``-wide rows) takes its wide
+    tile: the configuration asks for it, in reduce mode on 64-row sort
+    blocks over GDOT128 weights. Other calls keep the general kernel."""
+    return (
+        wide_tiles
+        and reduces
+        and block_m == 64
+        and activation_format == "e2m1"
+        and b_layout == B_LAYOUT_GDOT128.value
+        and out_dim % 256 == 0
+        and k % 256 == 0
+        and k >= 512
+    )
 
 
 # Key: hidden width, intermediate width, padded W2 K, local/global experts, top-k.
@@ -52,18 +110,40 @@ _GROUPED_MOE_CONFIGS = {
         (
             49,
             128,
-            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=True, runtime_rows=False),
+            _GroupedMoEConfig(
+                32,
+                4,
+                use_minimum_route_chunks=True,
+                runtime_rows=False,
+                wide_tiles=False,
+            ),
         ),
         (
             129,
             191,
-            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=False, runtime_rows=True),
+            _GroupedMoEConfig(
+                32,
+                4,
+                use_minimum_route_chunks=False,
+                runtime_rows=True,
+                wide_tiles=False,
+            ),
         ),
+        # 64-row blocks on the wide tiles. Measured faster than the general
+        # tiles from 3k to 24k rows (one EP rank, served facade) and checked
+        # at 192-2k and 32k-64k rows (see the MoE README). Deferred calls of
+        # at most 256 rows take the route tiles before this table. The upper
+        # bound is the stage-1 launcher's: token-order E2M1 rows of 2,048
+        # bytes must span less than 2^31 bytes.
         (
             192,
-            8192,
+            (1 << 31) // (4096 // 2) - 1,
             _GroupedMoEConfig(
-                64, 2, use_minimum_route_chunks=False, runtime_rows=False
+                64,
+                2,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+                wide_tiles=True,
             ),
         ),
     )
@@ -81,14 +161,22 @@ _GROUPED_SITU_MOE_CONFIGS = {
             449,
             1792,
             _GroupedMoEConfig(
-                32, 4, use_minimum_route_chunks=False, runtime_rows=False
+                32,
+                4,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+                wide_tiles=False,
             ),
         ),
         (
             1793,
             16384,
             _GroupedMoEConfig(
-                64, 4, use_minimum_route_chunks=False, runtime_rows=False
+                64,
+                4,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+                wide_tiles=False,
             ),
         ),
     ),
@@ -342,6 +430,7 @@ def _select_grouped_moe_config(
             8,
             use_minimum_route_chunks=False,
             runtime_rows=False,
+            wide_tiles=False,
         )
     block_m = _select_grouped_moe_block_m(num_tokens, top_k, num_experts)
     return _GroupedMoEConfig(
@@ -349,6 +438,7 @@ def _select_grouped_moe_config(
         max(1, block_m // 32),
         use_minimum_route_chunks=False,
         runtime_rows=False,
+        wide_tiles=False,
     )
 
 

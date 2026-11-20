@@ -3114,7 +3114,14 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
             deterministic_order=True,
         )
         routes = MXFP4SortedRoutes(
-            sorted_ids, sorted_weights, expert_ids, valid, block, rows, 8
+            sorted_ids,
+            sorted_weights,
+            expert_ids,
+            valid,
+            block,
+            rows,
+            8,
+            wide_tiles=False,
         )
         return routes, weights
 

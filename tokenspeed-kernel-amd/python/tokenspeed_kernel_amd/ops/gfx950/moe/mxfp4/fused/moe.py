@@ -86,6 +86,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _select_direct_stage2_deferred_block_n,
     _select_grouped_moe_config,
     _select_route_tile_config,
+    _stage1_wide_tile,
+    _stage2_wide_tile,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     W_LAYOUT_GDOT128,
@@ -2254,7 +2256,8 @@ class MXFP4SortedRoutes(NamedTuple):
     ``sorted_ids`` packs ``(slot << 24) | token`` per sorted row, with padding
     rows at token ``rows``; ``num_valid_ids[0]`` is the padded row extent on
     the device. ``block_m`` is the sort's per-expert padding, which both GEMMs
-    tile by.
+    tile by. ``wide_tiles`` is the grouped configuration's choice of the wide
+    prefill tiles, which the down GEMM follows too.
     """
 
     sorted_ids: torch.Tensor
@@ -2264,6 +2267,7 @@ class MXFP4SortedRoutes(NamedTuple):
     block_m: int
     rows: int
     top_k: int
+    wide_tiles: bool
 
 
 def sorted_route_capacity(rows: int, num_experts: int, top_k: int) -> int:
@@ -2404,6 +2408,15 @@ def _package_prefill_gate_up(
         a1_scale=stage1_scale,
         block_m=sort_block_m,
         num_warps=config.stage1_num_warps,
+        wide_tile=_stage1_wide_tile(
+            config.wide_tiles,
+            sort_block_m,
+            hidden_dim,
+            int(package_w13.shape[1]) // 2,
+            activation_format,
+            b_layout,
+            input_sorted,
+        ),
         b_preshuffled=True,
         b_layout=b_layout,
         swiglu_alpha=float(swiglu_alpha),
@@ -2427,6 +2440,7 @@ def _package_prefill_gate_up(
         sort_block_m,
         n_tokens,
         top_k,
+        config.wide_tiles,
     )
     return routes, intermediate, intermediate_scale, out
 
@@ -2483,6 +2497,15 @@ def _package_prefill_down(
         force_reduce=force_reduce,
         input_sorted=True,
         a_format=activation_format,
+        wide_tile=_stage2_wide_tile(
+            routes.wide_tiles,
+            routes.block_m,
+            int(package_w2.shape[1]),
+            stage2_logical_k,
+            activation_format,
+            b_layout,
+            reduces=not do_finalize or force_reduce,
+        ),
     )
 
 
