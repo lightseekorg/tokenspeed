@@ -352,10 +352,11 @@ can fuse with 96-channel shard alignment on SM103. This layout pads 14400
 logical outputs to 14592 stored channels and preserves the original order and
 width of the checkpoint and returned logical outputs.
 
-Block-FP8 fusion supports SM100 and SM103 at a subgroup maximum of at least 64
-physical rows. BF16 fusion supports node-local SM100 and SM103 groups at a
-subgroup maximum of at least 32 physical rows. SM100 uses the same aligned
-shapes for both formats. BF16 fusion uses BF16 operands directly.
+Block-FP8 and BF16 fusion support SM100 and SM103. A subgroup can span nodes
+within one NVLink domain when every rank can allocate fabric memory.
+The subgroup maximum must be at least 64 physical rows for block-FP8 and 32
+for BF16. SM100 uses the same aligned shapes for both formats.
+BF16 fusion uses BF16 operands directly.
 Row GEMM partials round to BF16, then sum in FP32 rank order before final BF16
 rounding. Unsupported configurations use the ordinary projection collectives.
 

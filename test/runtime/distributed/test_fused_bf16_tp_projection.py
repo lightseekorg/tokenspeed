@@ -18,10 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""BF16 TP projection checks and a bounded native block-FP8 regression smoke."""
+"""BF16 TP projection checks and a bounded native block-FP8 regression smoke.
+
+To exercise BF16 over a multi-node NVLink fabric, run the BF16 cases with
+torchrun and select pytest node IDs matching the torchrun world size.
+"""
 
 import gc
 import importlib.util
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -57,9 +62,11 @@ def _worker(
     )
     helper = importlib.util.module_from_spec(helper_spec)
     helper_spec.loader.exec_module(helper)
-    torch.cuda.set_device(rank)
+    launched_with_torchrun = rendezvous == "env://"
+    local_rank = int(os.environ["LOCAL_RANK"]) if launched_with_torchrun else rank
+    torch.cuda.set_device(local_rank)
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    device = torch.device("cuda", rank)
+    device = torch.device("cuda", local_rank)
     dist.init_process_group(
         "nccl",
         init_method=rendezvous,
@@ -69,6 +76,18 @@ def _worker(
         device_id=device,
     )
     try:
+        if launched_with_torchrun:
+            from tokenspeed_kernel.ops.communication.fabric import (
+                gather_fabric_map,
+                group_has_fabric,
+                group_host_span,
+            )
+
+            gather_fabric_map()
+            ranks = tuple(range(world_size))
+            assert group_host_span(ranks) > 1, "requires ranks on multiple hosts"
+            assert group_has_fabric(ranks), "requires NVLink fabric on every rank"
+
         if kind == "column":
             create = create_fused_tp_column_projection_state
             run = (
@@ -333,30 +352,36 @@ def _worker(
         dist.destroy_process_group()
 
 
+def _launch_bf16_projection(
+    tmp_path, kind, world_size, input_size, output_size, capacity, supported_arches
+):
+    args = (kind, False, input_size, output_size, capacity)
+    if "TORCHELASTIC_RUN_ID" in os.environ:
+        assert (
+            int(os.environ["WORLD_SIZE"]) == world_size
+        ), "select BF16 cases matching the torchrun world size"
+        _worker(int(os.environ["RANK"]), world_size, "env://", *args)
+        return
+    if (
+        torch.cuda.device_count() < world_size
+        or torch.cuda.get_device_capability() not in supported_arches
+    ):
+        pytest.skip(f"requires {world_size} node-local GPUs in {supported_arches}")
+    mp.spawn(
+        _worker,
+        args=(world_size, f"file://{tmp_path / 'rendezvous'}", *args),
+        nprocs=world_size,
+        join=True,
+    )
+
+
 @pytest.mark.parametrize(
     ("kind", "world_size"),
     (("column", 2), ("column", 4), ("row", 2)),
 )
 def test_native_bf16_tp_projection(tmp_path, kind, world_size):
-    supported_arches = ((10, 0), (10, 3))
-    if (
-        torch.cuda.device_count() < world_size
-        or torch.cuda.get_device_capability() not in supported_arches
-    ):
-        pytest.skip(f"requires {world_size} node-local SM100 or SM103 GPUs")
-    mp.spawn(
-        _worker,
-        args=(
-            world_size,
-            f"file://{tmp_path / 'rendezvous'}",
-            kind,
-            False,
-            1024,
-            1024,
-            128,
-        ),
-        nprocs=world_size,
-        join=True,
+    _launch_bf16_projection(
+        tmp_path, kind, world_size, 1024, 1024, 128, ((10, 0), (10, 3))
     )
 
 
@@ -373,19 +398,4 @@ def test_native_fp8_tp_projection_smoke(tmp_path, kind):
 
 
 def test_native_bf16_dsa_column_projection(tmp_path):
-    if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("requires 4 node-local SM103 GPUs")
-    mp.spawn(
-        _worker,
-        args=(
-            4,
-            f"file://{tmp_path / 'rendezvous'}",
-            "column",
-            False,
-            7168,
-            14592,
-            2048,
-        ),
-        nprocs=4,
-        join=True,
-    )
+    _launch_bf16_projection(tmp_path, "column", 4, 7168, 14592, 2048, ((10, 3),))

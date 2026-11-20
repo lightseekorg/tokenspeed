@@ -488,11 +488,7 @@ class ProjectionBackend:
             node_local = len({value[0] for value in hosts}) == 1
             if node_local or group_has_fabric(spec.group):
                 self._prepare_lamport(workspace, use_lamport_reduction)
-                if spec.weight_dtype == torch.bfloat16 and not node_local:
-                    fused_disabled_reason = (
-                        "BF16 projection fusion requires a node-local group"
-                    )
-                elif all(value[2] for value in hosts):
+                if all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
                         create_fused_tp_column_projection_state,
                     )
