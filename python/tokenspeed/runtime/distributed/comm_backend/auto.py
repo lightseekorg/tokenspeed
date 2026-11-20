@@ -962,6 +962,16 @@ class AutoBackend(CommBackend):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self._projection.all_gather(tensor, rows, quantize, workspace)
 
+    def projection_gather_mm(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        return self._projection.gather_mm(tensor, rows, weight, out, workspace)
+
     def projection_all_to_all(
         self,
         tensor: torch.Tensor,

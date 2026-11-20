@@ -618,14 +618,19 @@ class MoELayer(torch.nn.Module):
             if not (
                 self.plan["supports_peer_weights"]
                 or (
-                    self._quant_kind in ("nvfp4", "mxfp4")
-                    and self.activation == "situ"
-                    and self.plan["solution"] == "flashinfer_trtllm"
+                    self.activation == "situ"
+                    and (self.plan["solution"], self._quant_kind)
+                    in {
+                        ("flashinfer_trtllm", "nvfp4"),
+                        ("flashinfer_trtllm", "mxfp4"),
+                        ("flashinfer_cutedsl", "nvfp4"),
+                    }
                 )
             ):
                 raise ValueError(
                     "Peer weights require a MoE kernel that declares "
-                    "supports_peer_weights, or FlashInfer TRTLLM NVFP4 or MXFP4 SiTU"
+                    "supports_peer_weights, or FlashInfer TRTLLM NVFP4/MXFP4 "
+                    "or CuTe DSL NVFP4 SiTU"
                 )
             self._storage_spec = replace(
                 self._spec,

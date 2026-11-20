@@ -159,6 +159,21 @@ class CommBackend(ABC):
 
         return projection_all_gather(tensor, rows, quantize, workspace, self)
 
+    def projection_gather_mm(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> torch.Tensor:
+        """Gather owner rows and project them through a weight shard into out."""
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_gather_mm,
+        )
+
+        return projection_gather_mm(tensor, rows, weight, out, workspace, self)
+
     def projection_all_to_all(
         self,
         tensor: torch.Tensor,
