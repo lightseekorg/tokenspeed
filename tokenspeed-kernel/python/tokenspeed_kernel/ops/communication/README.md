@@ -213,6 +213,23 @@ on 8 GB300s over two nodes a [8192, 7168] sum takes 260 us there and 291 us at
 8 CTAs, where NCCL takes 364 us. The result lives in the buffer until the next
 stage or view of that width.
 
+## Fused GEMM + reduce-scatter
+
+`cute_dsl_gemm_reduce_scatter` (SM100 and SM103) computes this rank's row
+block of `reduce_scatter(x @ weight.T)` for BF16 operands in one persistent
+kernel, NVIDIA CUTLASS's CuTe DSL example vendored under
+`thirdparty/cute_dsl/gemm_reduce_scatter`. Each rank stores its BF16 partial
+tiles in symmetric memory and signals the tile's owner; the owner sums all
+ranks' tiles with `multimem.ld_reduce` (FP32 accumulation in the switch, one
+rounding, ties possibly broken either way) while the remaining tiles compute.
+`create_gemm_reduce_scatter_state` is collective and compiles once with dynamic
+rows before graph capture; it needs NVLink multicast. Row blocks pad to the
+128-row tile. A barrier before each call keeps a peer's exit-flag reset from
+racing a call with another row count. The runtime's scatter projections use it
+above the Lamport reduce-scatter's rows. Projecting 8192 rows of 2048 channels
+per rank into 8192 outputs over four GB200s takes 229 us against 406 us for
+the GEMM and NCCL's reduce-scatter.
+
 ## One-hop LL exchange
 
 `cute_dsl_ll_all_gather` and `cute_dsl_ll_all_to_all` (SM100 and SM103) move

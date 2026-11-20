@@ -85,6 +85,7 @@ __all__ = [
     # GEMM
     "bmm",
     "mm",
+    "mm_activation_scale_layout",
     "plan_dense_gemm",
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
@@ -365,6 +366,24 @@ def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
     return spec is not None and spec.solution == "torch"
 
 
+def _scales_major(scales: torch.Tensor | None) -> str | frozenset[str]:
+    """Which axis of 2-D scales is contiguous; empty when both orders fit."""
+    if scales is None or scales.dim() != 2:
+        return frozenset()
+    k_major = scales.shape[1] == 1 or scales.stride(1) == 1
+    mn_major = scales.shape[0] == 1 or scales.stride(0) == 1
+    if k_major and mn_major:
+        return frozenset()
+    return "k_major" if k_major else "mn_major" if mn_major else "strided"
+
+
+def _reads_mn_major_scales(kernel_name: str) -> bool:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    return spec is not None and spec.traits.get("a_scales_layout") == frozenset(
+        {"mn_major"}
+    )
+
+
 def _validate_gemm_out(
     out: torch.Tensor,
     *,
@@ -543,6 +562,139 @@ def plan_dense_gemm(
         declared_traits=frozenset(),
         ignore_layout=False,
     )
+
+
+def _mm_traits(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    *,
+    M: int,
+    N: int,
+    K: int,
+    b_layout: str,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    alpha: torch.Tensor | None,
+    quant: str | None,
+    block_size: list[int] | None,
+    enable_pdl: bool,
+) -> dict[str, object]:
+    """The traits mm selects its kernel with."""
+    block_scale_layout = (
+        "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
+    )
+    # Online FP32/UE8M0 quantizers write contiguous FP8; describe what GEMM sees.
+    online_contiguous_a = (
+        quant == "mxfp8"
+        and A_scales is None
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and B_scales is not None
+        and block_size is not None
+        and (
+            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
+            or (
+                B_scales.dtype == torch.uint8
+                and block_size[1] == 32
+                and A.stride(-1) == 1
+            )
+        )
+    )
+    traits: dict[str, object] = {
+        "m": M,
+        "n": N,
+        "k": K,
+        "b_layout": b_layout,
+        "a_contiguous": online_contiguous_a or A.is_contiguous(),
+        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
+        "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "a_scales_layout": _scales_major(A_scales),
+        "b_contiguous": B.is_contiguous(),
+        "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
+        "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
+        "block_scale_layout": block_scale_layout,
+        "has_alpha": alpha is not None,
+        "out_contiguous": out is None or out.is_contiguous(),
+        "out_dtype": out_dtype,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
+        "pdl_enabled": enable_pdl,
+    }
+    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+        # Offset views can break alignment; online quantization allocates aligned ones.
+        traits["operands_aligned_16"] = (
+            online_contiguous_a or A.data_ptr() % 16 == 0
+        ) and B.data_ptr() % 16 == 0
+        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
+        traits["scales_aligned_16"] = (
+            A_scales is None or A_scales.data_ptr() % 16 == 0
+        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
+
+    if A.dtype == B.dtype == torch.bfloat16:
+        traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0
+        traits["out_aligned_32"] = out is None or out.data_ptr() % 32 == 0
+    return traits
+
+
+def mm_activation_scale_layout(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    B_scales: torch.Tensor,
+    block_size: list[int],
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+) -> str:
+    """The activation-scale layout mm's block-FP8 kernel reads for 16-bit A.
+
+    Quantize ``A`` into this layout before ``mm(quant="mxfp8")`` so neither
+    the quantizer nor the kernel copies the scales into another layout.
+
+    Args:
+        A: BF16 or FP16 activations ``[M, K]`` that will be quantized.
+        B: E4M3 weights.
+        B_scales: Weight block scales, as passed to ``mm``.
+        block_size: Block size, as passed to ``mm``.
+        out: Output buffer, as passed to ``mm``.
+        out_dtype: Output dtype, as passed to ``mm``; defaults to ``A``'s.
+        solution: Implementation family, as passed to ``mm``.
+        override: Kernel name, as passed to ``mm``.
+
+    Returns:
+        ``"mn_major"`` when the kernel ``mm`` selects reads MN-major
+        activation scales, otherwise ``"k_major"``.
+    """
+    override = resolve_kernel_override("gemm", "mm", override)
+    out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    K = A.shape[-1]
+    b_layout = "KN" if B.shape[0] == K else "NK"
+    N = B.shape[-1] if b_layout == "KN" else B.shape[0]
+    traits = _mm_traits(
+        A,
+        B,
+        None,
+        B_scales,
+        M=A.shape[0],
+        N=N,
+        K=K,
+        b_layout=b_layout,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=None,
+        quant="mxfp8",
+        block_size=block_size,
+        enable_pdl=pdl_enabled(),
+    )
+    signature = _gemm_format_signature(
+        A, B, None, B_scales, out_dtype, "mxfp8", block_size
+    )
+    kernel = select_kernel(
+        "gemm", "mm", signature, traits=traits, solution=solution, override=override
+    )
+    return "mn_major" if _reads_mn_major_scales(kernel.name) else "k_major"
 
 
 def mm(
@@ -763,59 +915,22 @@ def mm(
         if bias is None and not small_n and _use_mv(A, B):
             return mv(A, B, out)
 
-    block_scale_layout = (
-        "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
+    traits = _mm_traits(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        M=M,
+        N=N,
+        K=K,
+        b_layout=b_layout,
+        out=out,
+        out_dtype=out_dtype,
+        alpha=alpha,
+        quant=quant,
+        block_size=block_size,
+        enable_pdl=enable_pdl,
     )
-    # Supported online FP32/UE8M0 quantizers materialize contiguous FP8 operands.
-    # Describe the layout seen by GEMM, not the original dense activation view.
-    online_contiguous_a = (
-        quant == "mxfp8"
-        and A_scales is None
-        and A.dtype in (torch.bfloat16, torch.float16)
-        and B_scales is not None
-        and block_size is not None
-        and (
-            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
-            or (
-                B_scales.dtype == torch.uint8
-                and block_size[1] == 32
-                and A.stride(-1) == 1
-            )
-        )
-    )
-    traits: dict[str, object] = {
-        "m": M,
-        "n": N,
-        "k": K,
-        "b_layout": b_layout,
-        "a_contiguous": online_contiguous_a or A.is_contiguous(),
-        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
-        "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
-        "b_contiguous": B.is_contiguous(),
-        "b_inner_stride_one": B.stride(-1) == 1,
-        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
-        "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
-        "block_scale_layout": block_scale_layout,
-        "has_alpha": alpha is not None,
-        "out_contiguous": out is None or out.is_contiguous(),
-        "out_dtype": out_dtype,
-        "out_inner_stride_one": out is None or out.stride(-1) == 1,
-        "pdl_enabled": enable_pdl,
-    }
-    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
-        # Contiguous offset views can still violate a backend's pointer alignment.
-        # Online quantization allocates aligned activation values and scales.
-        traits["operands_aligned_16"] = (
-            online_contiguous_a or A.data_ptr() % 16 == 0
-        ) and B.data_ptr() % 16 == 0
-        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
-        traits["scales_aligned_16"] = (
-            A_scales is None or A_scales.data_ptr() % 16 == 0
-        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
-
-    if A.dtype == B.dtype == torch.bfloat16:
-        traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0
-        traits["out_aligned_32"] = out is None or out.data_ptr() % 32 == 0
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
@@ -862,6 +977,9 @@ def mm(
             enable_pdl=enable_pdl,
             kernel_name=kernel.name,
         )
+        if _reads_mn_major_scales(kernel.name) and _scales_major(A_scales) == "k_major":
+            # This kernel reads MN-major scales; the online quantizer writes K-major.
+            A_scales = A_scales.t().contiguous().t()
 
     # Online per-token FP8 quantization of 16-bit activations.
     if (
