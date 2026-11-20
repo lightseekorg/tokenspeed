@@ -24,8 +24,9 @@ Small integer operands make every product and FP32 sum exact, so each rank's
 BF16 partial is known bit for bit and the switch's FP32 sum of the partials
 rounds once: within one BF16 unit of the reference, since the switch may break
 rounding ties either way. Covers blocks that fill and that pad the 128-row
-tile, row counts that change between calls without recompiling, and graph
-replays with fresh inputs.
+tile, row counts that change between calls without recompiling, graph replays
+with fresh inputs, and an owner whose rows lie past 2^31 elements of the
+symmetric storage.
 """
 
 from datetime import timedelta
@@ -58,16 +59,16 @@ def _init(rank, size, rendezvous):
     return device
 
 
-def _operands(size, block, seed, device):
-    """Every rank's ``[size * block, K]`` input and ``[N, K]`` weight."""
+def _operands(size, block, n, k, seed, device):
+    """Every rank's ``[size * block, k]`` input and ``[n, k]`` weight."""
     generator = torch.Generator().manual_seed(seed)
-    xs = torch.randint(-2, 3, (size, size * block, K), generator=generator)
-    ws = torch.randint(-2, 3, (size, N, K), generator=generator)
+    shape = (size, size * block, k)
+    xs = torch.randint(-2, 3, shape, generator=generator, dtype=torch.int8)
+    ws = torch.randint(-2, 3, (size, n, k), generator=generator, dtype=torch.int8)
     return xs.to(device, torch.bfloat16), ws.to(device, torch.bfloat16)
 
 
-def _assert_matches(got, xs, ws, rank, block):
-    rows = slice(rank * block, (rank + 1) * block)
+def _assert_matches(got, xs, ws, rows, block):
     partials = [(x[rows].float() @ w.float().T).bfloat16() for x, w in zip(xs, ws)]
     expected = torch.stack(partials).float().sum(0).bfloat16()
     # One BF16 unit: a tie the switch rounds the other way.
@@ -82,9 +83,10 @@ def _matches_reference(rank, size, rendezvous):
     # The state compiled the kernel: no row count compiles another.
     with assert_no_cute_compile():
         for seed, block in enumerate(BLOCKS):
-            xs, ws = _operands(size, block, seed, device)
+            xs, ws = _operands(size, block, N, K, seed, device)
             got = cute_dsl_gemm_reduce_scatter(state, xs[rank], ws[rank])
-            _assert_matches(got, xs, ws, rank, block)
+            rows = slice(rank * block, (rank + 1) * block)
+            _assert_matches(got, xs, ws, rows, block)
     dist.destroy_process_group()
 
 
@@ -94,7 +96,9 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
         dist.group.WORLD, device, size * max(BLOCKS), N, K
     )
     blocks = (256, 100)
-    inputs = [_operands(size, block, 10 + i, device) for i, block in enumerate(blocks)]
+    inputs = [
+        _operands(size, block, N, K, 10 + i, device) for i, block in enumerate(blocks)
+    ]
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -104,14 +108,30 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
         ]
     for replay in range(3):
         for i, (block, (xs, ws)) in enumerate(zip(blocks, inputs)):
-            fresh, _ = _operands(size, block, 20 + 2 * replay + i, device)
+            fresh, _ = _operands(size, block, N, K, 20 + 2 * replay + i, device)
             xs.copy_(fresh)
         torch.cuda.synchronize()
         dist.barrier()
         graph.replay()
         torch.cuda.synchronize()
         for block, (xs, ws), out in zip(blocks, inputs, outputs):
-            _assert_matches(out, xs, ws, rank, block)
+            rows = slice(rank * block, (rank + 1) * block)
+            _assert_matches(out, xs, ws, rows, block)
+    dist.destroy_process_group()
+
+
+def _offsets_past_int32(rank, size, rendezvous):
+    device = _init(rank, size, rendezvous)
+    n, k = 16384, 64
+    # The last owner's rows start past 2^31 elements of the symmetric storage.
+    block = 2**31 // n // size + 128
+    state = create_gemm_reduce_scatter_state(
+        dist.group.WORLD, device, size * block, n, k
+    )
+    xs, ws = _operands(size, block, n, k, 30, device)
+    got = cute_dsl_gemm_reduce_scatter(state, xs[rank], ws[rank])
+    end = (rank + 1) * block
+    _assert_matches(got[-128:], xs, ws, slice(end - 128, end), block)
     dist.destroy_process_group()
 
 
@@ -136,3 +156,7 @@ def test_matches_reference(tmp_path):
 
 def test_graph_replays_fresh_inputs(tmp_path):
     _spawn(_graph_replays_fresh_inputs, tmp_path)
+
+
+def test_offsets_past_int32(tmp_path):
+    _spawn(_offsets_past_int32, tmp_path)

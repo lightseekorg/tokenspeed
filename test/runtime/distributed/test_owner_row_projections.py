@@ -140,6 +140,16 @@ def _worker(rank: int, port: int, world_size: int, backend_name: str) -> None:
             torch.testing.assert_close(
                 reduced, expected[rank * rows : (rank + 1) * rows], atol=0, rtol=0
             )
+        # Rows beyond the owners' extent fail on every path instead of being dropped.
+        for rows in (100, 700):
+            with pytest.raises(ValueError):
+                projection_mm_reduce_scatter(
+                    inputs.new_zeros(world_size * rows + 1, 64),
+                    rows,
+                    weight,
+                    scatter,
+                    backend,
+                )
 
         # Three captured gathers replay on new rows: no state carries between calls.
         rows = 700

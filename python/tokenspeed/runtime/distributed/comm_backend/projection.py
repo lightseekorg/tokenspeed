@@ -398,16 +398,23 @@ def projection_gather_mm(
     return mm(gathered, weight, out=out)
 
 
-def _check_scatter(weight: torch.Tensor, workspace: ProjectionWorkspace) -> None:
+def _check_scatter(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+) -> None:
     spec = workspace.spec
     # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
     if (
         spec.kind != "scatter"
+        or inputs.shape[0] > len(spec.group) * rows
         or weight.shape != (spec.output_size, spec.input_size // len(spec.group))
         or weight.shape[0] == weight.shape[1]
     ):
         raise ValueError(
-            "A scatter GEMM takes its scatter workspace's non-square [N, K / TP] shard"
+            "A scatter GEMM takes at most TP * rows rows and its scatter "
+            "workspace's non-square [N, K / TP] shard"
         )
 
 
@@ -421,7 +428,7 @@ def projection_mm_reduce_scatter(
     """Project all rows into borrowed partials, then reduce them through backend."""
     from tokenspeed_kernel.ops.gemm import mm
 
-    _check_scatter(weight, workspace)
+    _check_scatter(inputs, rows, weight, workspace)
     partial = backend.acquire_projection_output(rows, workspace)
     mm(inputs, weight, out=partial[: inputs.shape[0]])
     partial[inputs.shape[0] :].zero_()
@@ -927,7 +934,7 @@ class ProjectionBackend:
         )
 
         _check_workspace(rows, workspace, self._fallback)
-        _check_scatter(weight, workspace)
+        _check_scatter(inputs, rows, weight, workspace)
         padding = len(workspace.spec.group) * rows - inputs.shape[0]
         if padding:
             inputs = torch.nn.functional.pad(inputs, (0, 0, 0, padding))
