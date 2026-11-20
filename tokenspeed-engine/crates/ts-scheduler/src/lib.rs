@@ -79,6 +79,10 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
+        /// PD, P role under deferred decode allocation: every decode rank
+        /// allocated the request's destination
+        /// (`pd::DestinationReadyEvent`).
+        PdDestinationReady,
         /// PD: the request's transfer failed; it may still be stopping
         /// (`pd::FailedEvent`).
         PdFailed,
@@ -418,6 +422,8 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
+        /// P-role prompts with final output ready, awaiting PD completion.
+        prefill_inflight: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
     }
@@ -468,6 +474,10 @@ mod ffi {
     /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerLookupView {
+        /// Request owning this lookup.
+        request_id: String,
+        /// Deadline on the agreed scheduler clock.
+        deadline_us: i64,
         /// The lease the lookup opens.
         lease: PeerLeaseView,
         /// The holder's name.
@@ -563,7 +573,18 @@ mod ffi {
         request_id: String,
     }
 
-    /// The scheduler's peer sharing observations (`Scheduler::PeerStats`).
+    /// Duration and deadline headroom of a completed hard pin.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct PinSampleView {
+        /// Time between applying and releasing the hard pin, in microseconds.
+        held_us: i64,
+        /// Signed microseconds left until the deadline at release.
+        remaining_us: i64,
+        /// Whether the holder reclaimed the pin on expiry.
+        expired: bool,
+    }
+
+    /// The scheduler's peer sharing observations.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct PeerStatsView {
         /// Holder: leases held.
@@ -626,6 +647,7 @@ mod ffi {
         ) -> bool;
         fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn plan_calls(scheduler: &Scheduler) -> i64;
+        fn take_peer_pin_samples(scheduler: Pin<&mut Scheduler>) -> Vec<PinSampleView>;
         fn peer_stats(scheduler: &Scheduler) -> PeerStatsView;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
@@ -675,6 +697,7 @@ mod ffi {
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
+        fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -701,7 +724,7 @@ pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
-    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
     SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
     StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
@@ -915,7 +938,12 @@ impl Scheduler {
         ffi::plan_calls(self.get())
     }
 
-    /// The scheduler's peer sharing observations.
+    /// Drain hard pins released or expired since the last sample.
+    pub fn take_peer_pin_samples(&mut self) -> Vec<PinSampleView> {
+        ffi::take_peer_pin_samples(self.pinned())
+    }
+
+    /// Current holder and reader state.
     pub fn peer_stats(&self) -> PeerStatsView {
         ffi::peer_stats(self.get())
     }
@@ -1155,6 +1183,12 @@ impl ExecutionPlan {
     pub fn forward_batches(&self) -> Vec<ForwardBatchView> {
         let _span = profile::span("ExecutionPlan::forward_batches");
         ffi::plan_forward_batches(&self.0)
+    }
+
+    /// The requests whose prompt's last chunk the plan's batches carry
+    /// (`ForwardBatch::CompletesPrompt`).
+    pub fn completed_prompts(&self) -> Vec<String> {
+        ffi::plan_completed_prompts(&self.0)
     }
 
     /// Whether the data plane has anything to do for this plan: a batch,

@@ -894,6 +894,8 @@ class ServerArgs:
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     enable_external_encoder: bool = False
     disaggregation_mode: str = "null"
+    # Prefill role only; None resolves to "early" there (resolve_disaggregation).
+    disaggregation_decode_allocation_policy: str | None = None
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
@@ -1366,15 +1368,7 @@ class ServerArgs:
         ):
             _require_choice(flag, value, choices)
         if self.sampling_backend is None:
-            # ``flashinfer`` is the only built-in backend that respects per-request
-            # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
-            # (see ``GreedySamplingBackend.sample``: *"sampling_info is ignored
-            # for single-step (always argmax)"*) — fast for hand-tuned greedy
-            # decoding but silently wrong for any serving deployment where
-            # requests carry sampling params, since the model collapses into
-            # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA and Ascend; users can
-            # still opt into greedy explicitly via ``--sampling-backend greedy``.
+            # Choose the platform sampler that respects request-level parameters.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
@@ -1533,10 +1527,6 @@ class ServerArgs:
             if self.disaggregation_mode != "prefill":
                 raise ValueError(
                     "Peer expert weights currently require a prefill instance"
-                )
-            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
-                raise ValueError(
-                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
                 )
             if self.mapping.requires_forward_coordination:
                 raise ValueError(
@@ -2390,16 +2380,17 @@ class ServerArgs:
         self.moe_cutlass_fused_finalize = False
         # MoE keeps auto or the user's provider restriction. The expert
         # plan checks the batch_invariant feature against actual layer geometry.
-        # Sampling: greedy rows must break exact logit ties canonically, and
-        # sampled rows must draw from a stream the co-batch cannot move.
-        if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
-            raise ValueError(
-                f"--numerics {self.numerics} needs a sampling backend with "
-                "canonical greedy tie-breaking "
-                f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
-                f"{self.sampling_backend} resolves exact ties in reduction order"
-            )
-        self.sampling_stream = "per-request"
+        # The NPU alignment contract compares model logits for the same history.
+        # Serving keeps its configured sampler and random stream.
+        if self.device != "npu":
+            if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
+                raise ValueError(
+                    f"--numerics {self.numerics} needs a sampling backend with "
+                    "canonical greedy tie-breaking "
+                    f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
+                    f"{self.sampling_backend} resolves exact ties in reduction order"
+                )
+            self.sampling_stream = "per-request"
         # Keep the trainer's selection order. The envelope still requires
         # batch-invariant top-k and attention leaves.
         self.dsa_slot_order = "selection"
@@ -2524,6 +2515,47 @@ class ServerArgs:
             raise ValueError(
                 "--enable-external-encoder requires aggregated or prefill serving"
             )
+        # Only the prefill role has a decode allocation policy. Omitted, it is
+        # early: a prompt waits for its Decode destination before it is
+        # admitted, as every prefill server did before the flag existed.
+        if self.disaggregation_mode == "prefill":
+            if self.disaggregation_decode_allocation_policy is None:
+                self.disaggregation_decode_allocation_policy = "early"
+            _require_choice(
+                "--disaggregation-decode-allocation-policy",
+                self.disaggregation_decode_allocation_policy,
+                ("early", "deferred"),
+            )
+        elif self.disaggregation_decode_allocation_policy is not None:
+            raise ValueError(
+                "--disaggregation-decode-allocation-policy requires "
+                "--disaggregation-mode prefill"
+            )
+        if self.disaggregation_decode_allocation_policy == "deferred":
+            # Experimental: one attention rank per prompt, no external
+            # encoder, and the KV sent from the computed prompt rather than
+            # streamed during its forward. Refused, never rewritten; a
+            # multimodal model is refused by the rank, which reads the model
+            # (HostBootstrap).
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("attention TP > 1", self.mapping.attn.tp_size > 1),
+                    ("--kv-parallel-size > 1", self.mapping.attn.kvp_size > 1),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                    ("--enable-external-encoder", self.enable_external_encoder),
+                    (
+                        "--disaggregation-layerwise-interval other than 0",
+                        self.disaggregation_layerwise_interval != 0,
+                    ),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy deferred does "
+                    f"not support {', '.join(unsupported)}"
+                )
         # PD disaggregation. The prefill role keeps the ordinary graph flags:
         # it never runs a decode step, so the decode graph has nothing to
         # capture (ModelExecutorConfig.prefill_only), while its extend
@@ -2568,8 +2600,7 @@ class ServerArgs:
         # startup prefixes would delete an L3 store's shared namespace.
         if self.disaggregation_mode != "null":
             raise ValueError(
-                "--enable-startup-requests is not supported with "
-                "--disaggregation-mode"
+                "--enable-startup-requests is not supported with --disaggregation-mode"
             )
         if self.kvstore_storage_backend is not None:
             raise ValueError(
@@ -2585,10 +2616,6 @@ class ServerArgs:
         unsupported = [
             setting
             for setting, refused in (
-                (
-                    "--disaggregation-mode decode",
-                    self.disaggregation_mode == "decode",
-                ),
                 ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
                 ("--disable-prefix-caching", not self.enable_prefix_caching),
                 (
@@ -2655,8 +2682,7 @@ class ServerArgs:
             ("write_through", "write_back"),
         )
         if self.kvstore_write_policy == "write_back":
-            # Decode's Host holds retraction images only, and L3 staging would
-            # split what is written back; pipeline stages and query context
+            # L3 staging would split what is written back; pipeline stages and query context
             # parallelism have not run write-back. Attention TP and
             # --kv-parallel-size need no refusal: a written-back segment
             # publishes once every rank of the replica has acknowledged it
@@ -2667,10 +2693,6 @@ class ServerArgs:
                 setting
                 for setting, refused in (
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
-                    (
-                        "--disaggregation-mode decode",
-                        self.disaggregation_mode == "decode",
-                    ),
                     (
                         "--kvstore-storage-backend",
                         self.kvstore_storage_backend is not None,
@@ -3569,8 +3591,10 @@ class ServerArgs:
             "prefill role caches. "
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
-            "the copy), so the two tiers hold mostly different pages. "
-            "write_back is refused with --disaggregation-mode decode, "
+            "the copy), so the two tiers hold mostly different pages; on "
+            "--disaggregation-mode decode a remote admission then loads its "
+            "Host hit and the prefill node sends only the rest. "
+            "write_back is refused with "
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with more than 64 cache groups; see "
@@ -3604,8 +3628,10 @@ class ServerArgs:
             "this replica serves its own cache the same way. Its endpoint binds "
             "this port (attention-DP rank r binds this port + r). Needs the Host "
             "tier (--enable-kvstore) and prefix caching; refused with "
-            "--disaggregation-mode decode, --kvstore-storage-backend, "
+            "--kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
+            "A --disaggregation-mode decode replica serves the history it "
+            "decoded but never reads: its prefill node sends what it lacks. "
             "Replicas share only with replicas of "
             "the same model, cache layout, weights and parallel layout. RDMA "
             "devices come from --disaggregation-ib-device. See "
@@ -5353,6 +5379,25 @@ class ServerArgs:
             default="null",
             choices=["null", "prefill", "decode", "encode"],
             help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
+        )
+        parser.add_argument(
+            "--disaggregation-decode-allocation-policy",
+            type=str,
+            choices=["early", "deferred"],
+            default=ServerArgs.disaggregation_decode_allocation_policy,
+            help="Prefill servers only: what a request's Decode allocation "
+            "gates. 'early' (the default) starts the prefill once every Decode "
+            "rank has allocated the destination; it is deprecated and will be "
+            "removed once 'deferred' supports the layouts that still need it. "
+            "'deferred' (experimental) starts the prefill without waiting for "
+            "the allocation, which the Decode server makes once the prefill "
+            "server holds every page of the prompt, and holds only its KV "
+            "transfer until then. deferred requires attention TP 1, "
+            "--kv-parallel-size 1, --pipeline-parallel-size 1, no "
+            "--enable-external-encoder, --disaggregation-layerwise-interval 0 "
+            "and a model without multimodal input (or --language-model-only). "
+            "Refused with any other --disaggregation-mode; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",

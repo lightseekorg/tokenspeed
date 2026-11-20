@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+from tokenspeed.runtime.model_loader.weight_utils import bind_checkpoint_dir
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpModel,
@@ -222,6 +223,7 @@ class Qwen4ExpDraftModel(Qwen4ExpModel):
 class Qwen4ExpForCausalLMNextN(nn.Module):
     """One-layer Qwen4-Exp MTP head used by TokenSpeed's MTP drafter."""
 
+    bind_checkpoint_dir = bind_checkpoint_dir
     compute_dsa_topk_first_step = True
     # Later steps use draft-owned inputs, QSA indices and cache metadata.
     supports_draft_overlap = True
@@ -234,6 +236,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self._checkpoint_dir: str | None = None
         config = copy.deepcopy(getattr(config, "text_config", config))
         quant_config = _resolve_mtp_quant_config(quant_config)
         config.num_hidden_layers = 1
@@ -460,31 +463,29 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         return "mtp" in name or "shared_head" in name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def remap():
-            for name, weight in weights:
-                if "mtp" not in name and "shared_head" not in name:
-                    continue
-                if name.startswith(
-                    (
-                        "mtp.fc_embedding.",
-                        "mtp.fc_hidden.",
-                        "mtp.pre_fc_norm_embedding.",
-                        "mtp.pre_fc_norm_hidden.",
-                    )
-                ):
-                    name = name.replace("mtp.", "", 1)
-                elif "shared_head" in name:
-                    name = "lm_head.weight"
-                else:
-                    name = name.replace("mtp.", "model.", 1)
-                yield name, weight
+        def remap(name):
+            if not self.checkpoint_weight_name_filter(name):
+                return None
+            if name.startswith(
+                (
+                    "mtp.fc_embedding.",
+                    "mtp.fc_hidden.",
+                    "mtp.pre_fc_norm_embedding.",
+                    "mtp.pre_fc_norm_hidden.",
+                )
+            ):
+                return name.replace("mtp.", "", 1)
+            if "shared_head" in name:
+                return "lm_head.weight"
+            return name.replace("mtp.", "model.", 1)
 
         return load_qwen4_exp_weights(
             self,
             self.config,
             self.mapping,
-            remap(),
+            weights,
             include_visual=False,
+            remap_name=remap,
         )
 
 

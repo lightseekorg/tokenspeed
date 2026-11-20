@@ -276,6 +276,8 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
         .to(dtype=torch.int32)
         .cuda()
     )
+    topk_ids[0] = -1
+    topk_ids[1, 0] = -1
     topk_weights = (
         torch.rand(num_tokens, TOP_K, generator=generator)
         .softmax(dim=-1)

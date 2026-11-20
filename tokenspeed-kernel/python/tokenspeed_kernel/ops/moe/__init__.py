@@ -238,7 +238,7 @@ def prepare_sm90_fp8_moe(
         returning its output list. Private modes additionally accept a positive
         uint32 ``expected_m`` or None. Callers compute that hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.4, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.5, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
@@ -2265,6 +2265,10 @@ def moe_plan(
     supports_fp8_per_tensor_input = True in apply_spec.traits.get(
         "supports_fp8_per_tensor_input", frozenset({False})
     )
+    # The weight preprocessor returns PreparedExpertWeights for DWDP storage.
+    supports_peer_weights = True in apply_spec.traits.get(
+        "supports_peer_weights", frozenset({False})
+    )
     sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
     sorted_route_block_sizes = apply_spec.traits.get(
         "sorted_route_block_size", frozenset()
@@ -2305,6 +2309,7 @@ def moe_plan(
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
         "supports_fp8_per_tensor_input": supports_fp8_per_tensor_input,
+        "supports_peer_weights": supports_peer_weights,
         "sorted_route_rows": sorted_route_rows,
         "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
@@ -2525,6 +2530,7 @@ import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.moe.flashinfer_cutedsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401

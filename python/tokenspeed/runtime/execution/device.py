@@ -574,7 +574,8 @@ class DeviceHandle:
         # stream, behind the execution stream, is the whole argument.
         if copies:
             executor.copy_cache_pages(copies)
-        zero_event = executor.zero_cache_pages(pages) if pages else None
+        if pages:
+            executor.zero_cache_pages(pages)
         if l2 is not None:
             if cache_ops:
                 # A load's or restore's destination may be a block that a
@@ -593,18 +594,30 @@ class DeviceHandle:
             # and a draft round still pending from the previous forward began
             # in that forward, behind the waits for that plan's load.
             l2.submit_load_backs(cache_ops, prerequisite_stream=executor.default_stream)
-        peer_fence = None
-        if peer_fetches:
-            # A peer landing's READs write this plan's blocks from outside
-            # the streams, so they start once everything before them that
-            # touches those blocks ran: the forwards in flight (an abort frees
-            # its blocks at once, and this plan may grant one to a landing),
-            # and the stores reading the victims this plan regranted, its
-            # copies and its zeroing, all on the default stream by now. The
-            # landing's own blocks are never zeroed or copied into.
+        # A landing -- a peer landing's READs or the D role's PD receive --
+        # writes this plan's blocks from outside the streams, and its end is
+        # what lets its request's first forward read them. So it starts once
+        # everything before it that touches the request's blocks ran: the
+        # forwards in flight (an abort frees its blocks at once, and this plan
+        # may grant one to a landing), the stores reading the victims this
+        # plan regranted, its copies and its zeroing, all on the default
+        # stream by now, and this plan's Host loads of the request's local hit
+        # below the landing: the request's first forward runs in a later plan,
+        # whose layerwise load waits name only that plan's loads. The
+        # landing's own blocks are never zeroed, copied or loaded into.
+        landing_fences = []
+        if peer_fetches or remote_prefill is not None:
             executor.default_stream.wait_stream(executor.execution_stream)
-            peer_fence = executor.device_module.Event()
-            peer_fence.record(executor.default_stream)
+            fence_streams = [executor.default_stream]
+            if l2 is not None and cache_ops:
+                fence_streams.append(l2.load_stream)
+            # Keep the Host-load fence separate: putting its wait on the
+            # default stream would stall this plan's forward behind the
+            # entire load instead of its ordinary layerwise waits.
+            for stream in fence_streams:
+                fence = executor.device_module.Event()
+                fence.record(stream)
+                landing_fences.append(fence)
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
         # handed over asynchronously exactly like the model's ForwardBatch,
@@ -637,13 +650,14 @@ class DeviceHandle:
             # landed, so masking continues from the right state.
             result = self._launch_forward(planned)
 
+        # Both transfer triggers are CPU-issued and write outside CUDA
+        # streams. Wait after launching this plan's forward, so that forward
+        # can overlap the loads while the landing waits for every prerequisite.
+        for fence in landing_fences:
+            fence.synchronize()
         if remote_prefill is not None:
-            self._pull_remote_prefill(remote_prefill, zero_event)
-        if peer_fence is not None:
-            # Behind the forward's launch, as the remote prefill's pull is:
-            # the wait holds the forward thread until the step in flight
-            # ends, and never delays this plan's launch.
-            peer_fence.synchronize()
+            peer.execute(remote_prefill)
+        if peer_fetches:
             self._peer_outbox.reads_ready()
         return result
 
@@ -781,34 +795,6 @@ class DeviceHandle:
             list(remote_prefill.request_pool_indices[:num_extends])
         )
         executor.reset_remote_prefill_cache_lengths(remote_prefill)
-
-    def _pull_remote_prefill(self, remote_prefill, zero_event) -> None:
-        """Pull a remote-prefill stream's rows' KV from the peer, behind the
-        round's forward.
-
-        The RDMA trigger is CPU-issued but writes the device pages the slot
-        preparation touched, so it must follow them and the zeroing fence
-        (Mooncake and GPUDirect writes are not ordered by the zeroing
-        stream, so the destination pages must be published from sanitized
-        memory). The same fence covers a retraction's stream-ordered
-        write-back reading pages this admission was granted: the zero event
-        is recorded on the forward thread's stream AFTER that stream waited
-        on the write-back's completion, so waiting on it waits on the copy
-        too. The zeroing is ordered behind the step in flight, so this wait
-        holds the forward thread until that step ends; placed after the
-        round's forward is launched, it never delays that launch. Completion
-        arrives through the transfer events.
-
-        Args:
-            remote_prefill: The plan's remote-prefill stream; supplies the
-                admitted rows.
-            zero_event: This plan's page-zeroing completion, or None when the
-                plan zeroes nothing (an admission always zeroes its fresh
-                pages, so a granted request's receive never sees None).
-        """
-        if zero_event is not None:
-            zero_event.synchronize()
-        self._kv_transfer.execute(remote_prefill)
 
     # ------------------------------------------------------------------
     # Memory-saver release/wake (see engine/memory_occupation.py)
@@ -1597,6 +1583,7 @@ def build_device_side(
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
+    from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_runtime
     from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
@@ -1622,6 +1609,7 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
+    from tokenspeed.runtime.models.glm5 import GlmDsaSparseAttentionMixin
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
@@ -1656,6 +1644,17 @@ def build_device_side(
             torch.device(server_args.device, gpu_id),
         )
         if server_args.mapping.attn.has_kvp:
+            # A fused decode value tail for the attentions that project as they merge.
+            value_heads = set()
+            for runner in (target, draft):
+                if runner is None:
+                    continue
+                for module in runner.model.modules():
+                    if (
+                        isinstance(module, GlmDsaSparseAttentionMixin)
+                        and module.owned_decode_value_weight() is not None
+                    ):
+                        value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
                 (
@@ -1663,7 +1662,15 @@ def build_device_side(
                     if server_args.distributed_timeout_seconds is not None
                     else DistributedConfig.distributed_timeout_seconds
                 ),
+                value_heads=value_heads.pop() if len(value_heads) == 1 else None,
+                decode_rows=max_batch_size * decode_input_tokens,
             )
+        # Large startup batches can select RCCL while a later prefix hit selects
+        # Iris. Prepare that small-batch route before the serving sync guard.
+        groups = server_args.mapping.all_reduce_groups
+        prepare_all_reduce_runtime(groups, model_config.dtype, backend=None)
+        if draft_model_config is not None:
+            prepare_all_reduce_runtime(groups, draft_model_config.dtype, backend=None)
     if communication_first:
         prepare_multimodal()
 

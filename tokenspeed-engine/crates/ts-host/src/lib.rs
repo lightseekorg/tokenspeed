@@ -873,7 +873,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         .transpose()?;
     // Its endpoint serves the scheduler between the loop's rounds.
     let scheduler = Arc::new(parking_lot::Mutex::new(scheduler));
-    let peer = peer_sharing
+    let mut peer = peer_sharing
         .map(|settings| {
             peer::start(
                 settings,
@@ -885,6 +885,21 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         })
         .transpose()
         .map_err(HostError::Peer)?;
+    if let Some(peer) = &mut peer {
+        let logical = metrics.as_ref().map(|m| Arc::clone(&m.peer));
+        let physical = exporter
+            .as_ref()
+            .filter(|_| config.metrics.transfer)
+            .map(|exporter| {
+                logical.clone().unwrap_or_else(|| {
+                    Arc::new(ts_metrics::PeerMetrics::new(
+                        exporter,
+                        &config.metrics.labels,
+                    ))
+                })
+            });
+        peer.set_metrics(logical, physical);
+    }
     let mut event_loop = EventLoop::new(
         scheduler,
         data_plane,

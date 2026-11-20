@@ -27,9 +27,6 @@ from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_npu:
     from tokenspeed_kernel_npu.ops.moe import (
-        ascend_bf16_distributed_precomputed_moe_apply as _distributed_moe_apply,
-    )
-    from tokenspeed_kernel_npu.ops.moe import (
         ascend_bf16_precomputed_moe_apply as _moe_apply,
     )
     from tokenspeed_kernel_npu.ops.moe import (
@@ -43,12 +40,6 @@ if current_platform().is_npu:
     )
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_softmax_bias_topk as _softmax_bias_topk,
-    )
-    from tokenspeed_kernel_npu.ops.w4a4 import (
-        ascend_int4_precomputed_moe_apply as _int4_moe_apply,
-    )
-    from tokenspeed_kernel_npu.ops.w4a4 import (
-        ascend_int4_process_moe_weights as _int4_process_weights,
     )
 
     _CAPABILITY = CapabilityRequirement(vendors=frozenset({"ascend"}))
@@ -117,56 +108,6 @@ if current_platform().is_npu:
     )
     def int8_moe_apply(**kwargs):
         return _int8_moe_apply(**kwargs)
-
-    @register_kernel(
-        "moe",
-        "apply",
-        name="ascend_int4_precomputed_moe_apply",
-        solution="flash_npu_chain",
-        capability=_CAPABILITY,
-        signatures=format_signatures("x", "dense", {torch.bfloat16}),
-        traits={
-            "weight_dtype": frozenset({"int4"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({64}),
-            "internal_activation_dtype": frozenset({"int4"}),
-            "supports_bias": frozenset({False}),
-        },
-        priority=Priority.SPECIALIZED,
-        features={"ascend", "npu_graph", "w4a4", "flatquant", "nz"},
-        weight_preprocessor=_int4_process_weights,
-    )
-    def int4_moe_apply(**kwargs):
-        return _int4_moe_apply(**kwargs)
-
-    @register_kernel(
-        "moe",
-        "apply",
-        name="ascend_bf16_distributed_precomputed_moe_apply",
-        solution="torch_npu",
-        capability=_CAPABILITY,
-        signatures=format_signatures("x", "dense", {torch.bfloat16}),
-        traits={
-            "weight_dtype": frozenset({"unquant"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({True}),
-            "ispp_alignment": frozenset({32}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
-        },
-        priority=Priority.SPECIALIZED,
-        features={"ascend", "npu_graph", "all_to_all"},
-        weight_preprocessor=_process_weights,
-    )
-    def distributed_moe_apply(**kwargs):
-        return _distributed_moe_apply(**kwargs)
 
 
 __all__ = ["moe_apply", "softmax_bias_topk"]

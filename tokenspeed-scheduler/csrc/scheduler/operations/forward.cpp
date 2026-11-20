@@ -353,7 +353,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, st
     _assert(request->Is<fsm::Submitted>(), "the admission probe is for a Submitted request");
     const auto probe = [this, request](const PromptPrefix& prompt) {
         if (config_.role == Role::kD) {
-            return coordinator_.Prober().ProbeDecodeDevicePrefix(prompt, request->PrefillSize());
+            return coordinator_.Prober().ProbeDecodePrefix(prompt, request->PrefillSize());
         }
         return coordinator_.Prober().ProbePromptPrefix(prompt);
     };
@@ -1000,6 +1000,21 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // The first decode spends the prompt end's copy-in blocks; a decode
     // reserves none.
     if (!admitStep(plan, feedback, *request, staged, demands, progress, /*copy_in_point=*/std::nullopt)) {
+        // Deferred decode allocation rests on a prompt's remote decode
+        // taking no block: the Decode node allocated because the prompt
+        // holds every page it needs. The prompt stays as it is and is tried
+        // again; its Decode node's waiting timeout ends it.
+        if (auto* done = request->GetIf<fsm::PrefillDone>();
+            done != nullptr && config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
+            !std::exchange(done->remote_decode_failure_logged, true)) {
+            spdlog::error(
+                "[Scheduler] deferred decode allocation: the remote decode of request {} ({} prompt tokens) was "
+                "not admitted: it asked for {} more tokens{}{} with {} of {} Device LCM blocks empty; the prompt "
+                "keeps its pages until its decode node gives up",
+                request->Id(), request->PrefillSize(), reserve_tokens,
+                completed_page ? ", a completed page's publication" : "",
+                completed_checkpoint ? ", a State checkpoint" : "", EmptyLcmBlocks(), TotalLcmBlocks());
+        }
         return std::nullopt;
     }
     staged.Commit();

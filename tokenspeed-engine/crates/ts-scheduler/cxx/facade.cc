@@ -209,11 +209,21 @@ std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler) {
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
     rust::Vec<PeerLookupView> out;
     for (const tokenspeed::PeerLookupRequest& lookup : scheduler.TakePeerLookups()) {
-        out.push_back(PeerLookupView{.lease = ToView(lookup.lease),
+        out.push_back(PeerLookupView{.request_id = rust::String(lookup.request_id),
+                                     .deadline_us = lookup.deadline_us,
+                                     .lease = ToView(lookup.lease),
                                      .holder = rust::String(lookup.holder),
                                      .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                      .tokens = ToRustVec(lookup.tokens),
                                      .max_tokens = lookup.max_tokens});
+    }
+    return out;
+}
+
+rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler) {
+    rust::Vec<PinSampleView> out;
+    for (const auto& sample : scheduler.TakePeerPinSamples()) {
+        out.push_back(PinSampleView{.held_us = sample.held_us, .remaining_us = sample.remaining_us, .expired = sample.expired});
     }
     return out;
 }
@@ -264,6 +274,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
                     break;
                 case ForwardEventKind::PdBootstrapped:
                     execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdDestinationReady:
+                    execution_event.With(tokenspeed::pd::DestinationReadyEvent(std::move(request_id)));
                     break;
                 case ForwardEventKind::PdFailed:
                     execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
@@ -404,6 +417,7 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .prefill_inflight = scheduler.PrefillInflightSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }
@@ -620,6 +634,22 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
         const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
         if (batch != nullptr) {
             out.push_back(batch_view(*batch));
+        }
+    }
+    return out;
+}
+
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<rust::String> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
+        if (batch == nullptr) {
+            continue;
+        }
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            if (batch->CompletesPrompt(row)) {
+                out.push_back(rust::String(batch->request_ids[row]));
+            }
         }
     }
     return out;

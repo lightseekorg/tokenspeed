@@ -499,14 +499,33 @@ std::size_t Scheduler::ReadyWaitingSize() const {
 
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult,
+                                fsm::PrefillAwaitingDestination, fsm::PrefillDone>();
     }));
 }
 
 std::size_t Scheduler::RunningSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillAwaitingDestination,
+                                fsm::PrefillDone, fsm::Decoding>();
     }));
+}
+
+std::size_t Scheduler::AwaitingDestinationSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->Is<fsm::PrefillAwaitingDestination>();
+    }));
+}
+
+std::int32_t Scheduler::AwaitingDestinationLcmBlocks() const {
+    std::vector<std::span<const BlockTable>> request_tables;
+    for (const auto& request : requests_) {
+        if (!request->Is<fsm::PrefillAwaitingDestination>()) {
+            continue;
+        }
+        request_tables.emplace_back(request->BlockTablesRef());
+    }
+    return coordinator_.CountActiveLcmBlocks(request_tables);
 }
 
 std::size_t Scheduler::RemotePrefillSize() const {
@@ -517,6 +536,15 @@ std::size_t Scheduler::RemotePrefillSize() const {
 std::size_t Scheduler::PdTransferSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); }));
+}
+
+std::size_t Scheduler::PrefillInflightSize() const {
+    if (config_.role != Role::kP) {
+        return 0;
+    }
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
+    }));
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {

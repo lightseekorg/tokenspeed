@@ -883,8 +883,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if let Some(l3) = &self.l3 {
                 busy |= l3.submit(&plan)?;
             }
-            self.cache_ops.dispatched(&plan.cache_ops());
+            let cache_ops = plan.cache_ops();
+            self.cache_ops.dispatched(&cache_ops);
             self.dispatch_peer(&plan);
+            // The storage tick disabled forward planning: scheduler aborts arise
+            // only in that build, and frozen rounds reset the no-progress streak.
+            self.record_scheduler_metrics(None, &cache_ops, 0);
             busy |= plan.needs_device();
             if plan.needs_device() {
                 self.data_plane.execute(plan, &Dispatch::default())?;
@@ -1039,100 +1043,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_planned(&batch.request_ids, false);
             }
         }
-        // The scheduler's counts as this round planned, for the metrics and
-        // the batch line: nothing between the two mutates the scheduler, so
-        // they are taken once, and only for a reader.
-        let mut planned_sizes: Option<SchedulerSizes> = None;
-        if let Some(metrics) = &self.metrics {
-            let _span = profile::span("EventLoop::record_metrics");
-            // A retraction victim's image store is the retraction signal.
-            let retracted = cache_ops
-                .iter()
-                .filter(|op| op.kind == CacheOpKind::SnapshotStore)
-                .count();
-            metrics.record_preemptions(retracted as i64);
-            for _ in 0..aborted.stats.capacity_aborts {
-                metrics.record_capacity_abort();
-            }
-            // A pre-dispatch snapshot: the running count still holds what
-            // this round's commits end. `sizes.running` is the batch;
-            // `outputs.num_running()` is every request this rank holds,
-            // including the PD transfer and waiting states the batch excludes.
-            let sizes = planned_sizes.insert(self.scheduler.sizes());
-            let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
-                batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
-            });
-            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
-            let active_pages = self
-                .active_pages
-                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
-            metrics.record_scheduler_iteration(
-                sizes.running as i64,
-                self.outputs.num_running() as i64,
-                sizes.waiting as i64,
-                i64::from(active_pages),
-                self.config.kv_total_pages,
-                iteration_tokens,
-            );
-            metrics.record_decode_slot_usage(
-                sizes.allocated_request_slots as i64,
-                sizes.active_decode_slots as i64,
-                sizes.ready_waiting as i64,
-            );
-            let total_pages = self.config.kv_total_pages;
-            metrics.record_cache_occupancy(
-                total_pages - i64::from(sizes.empty_lcm_blocks),
-                i64::from(active_pages),
-                total_pages,
-                self.config.kv_token_capacity,
-            );
-            match self.outputs.role() {
-                crate::output::Role::Prefill => metrics.record_prefill_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
-                    sizes.retracted as i64,
-                ),
-                crate::output::Role::Decode => metrics.record_decode_queues(
-                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
-                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
-                    sizes.pd_transfer as i64,       // transfer pins pages
-                    sizes.retracted as i64,
-                ),
-                crate::output::Role::Plain => {}
-            }
-            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
-            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
-            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
-            let request = self.outputs.take_request_metrics();
-            for seconds in request.ttft_seconds {
-                metrics.observe_time_to_first_token(seconds);
-            }
-            for seconds in request.request_seconds {
-                metrics.observe_request_time(seconds);
-            }
-            for seconds in request.decode_seconds {
-                metrics.observe_decode_time(seconds);
-            }
-            for seconds in request.tpot_seconds {
-                metrics.observe_time_per_output_token(seconds);
-            }
-            metrics.record_completion_tokens(request.completion_tokens);
-            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
-            let hits = self.scheduler.prefix_hit_stats();
-            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
-            metrics.record_prefix_hits(
-                delta.prompt_tokens,
-                delta.device_hit_tokens,
-                delta.host_hit_tokens,
-                delta.l3_hit_tokens,
-            );
-        }
-
         let dp = self.dp_round(forward.as_ref(), stop)?;
         if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
-            // The idle forward replaces this rank's batch; what is dispatched
-            // commits first, as nothing would follow it.
+            // Padding for a peer is not a local request batch.
             forward = None;
+        }
+        let planned_sizes = self.record_scheduler_metrics(
+            forward.as_ref(),
+            &cache_ops,
+            aborted.stats.capacity_aborts,
+        );
+
+        if dp.as_ref().is_some_and(|dp| dp.idle_forward) {
+            // What was dispatched commits first, as no local batch follows.
             self.commit_down_to(0, events, outputs, released)?;
         }
         // Gathered before this round's commits: a commit may end requests
@@ -1208,6 +1131,136 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         self.commit_down_to(depth, events, outputs, released)?;
         Ok(device_work || storage_work)
+    }
+
+    /// Export a round's snapshot on both serving and paused paths. The
+    /// returned scheduler sizes can also be reused by the batch log.
+    fn record_scheduler_metrics(
+        &mut self,
+        forward: Option<&ForwardBatchView>,
+        cache_ops: &[ts_scheduler::CacheOpView],
+        capacity_aborts: i64,
+    ) -> Option<SchedulerSizes> {
+        let mut planned_sizes: Option<SchedulerSizes> = None;
+        if let Some(metrics) = &self.metrics {
+            let _span = profile::span("EventLoop::record_metrics");
+            // A retraction victim's image store is the retraction signal.
+            let retracted = cache_ops
+                .iter()
+                .filter(|op| op.kind == CacheOpKind::SnapshotStore)
+                .count();
+            metrics.record_preemptions(retracted as i64);
+            for _ in 0..capacity_aborts {
+                metrics.record_capacity_abort();
+            }
+            // State occupancy is not forward batch size: PrefillDone can
+            // wait for PD retirement or a decode permit, and an overlapped
+            // round can still hold rows from earlier forwards.
+            let sizes = planned_sizes.insert(self.scheduler.sizes());
+            let iteration_tokens: i64 = forward.map_or(0, |batch| {
+                batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
+            });
+            let (scheduler, idle) = (&self.scheduler, self.outputs.num_running() == 0);
+            let active_pages = self
+                .active_pages
+                .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
+            metrics.record_scheduler_iteration(
+                forward.map_or(0, |batch| batch.request_ids.len() as i64),
+                self.outputs.num_running() as i64,
+                sizes.waiting as i64 + sizes.ready_waiting as i64 + self.withheld.len() as i64,
+                i64::from(active_pages),
+                self.config.kv_total_pages,
+                iteration_tokens,
+            );
+            metrics.record_decode_slot_usage(
+                sizes.allocated_request_slots as i64,
+                sizes.active_decode_slots as i64,
+                sizes.ready_waiting as i64,
+            );
+            let total_pages = self.config.kv_total_pages;
+            metrics.record_cache_occupancy(
+                total_pages - i64::from(sizes.empty_lcm_blocks),
+                i64::from(active_pages),
+                total_pages,
+                self.config.kv_token_capacity,
+            );
+            match self.outputs.role() {
+                crate::output::Role::Prefill => metrics.record_prefill_queues(
+                    sizes.bootstrapping as i64,
+                    sizes.prefill_inflight as i64,
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Decode => metrics.record_decode_queues(
+                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
+                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
+                    sizes.remote_prefilling as i64, // transfer queue: alias of kv_wait
+                    sizes.retracted as i64,
+                ),
+                crate::output::Role::Plain => {}
+            }
+            metrics.record_generation_tokens(self.outputs.take_generated_tokens());
+            let (prompt_tokens, cache_hit_tokens) = self.outputs.take_request_tokens();
+            metrics.record_request_tokens(prompt_tokens, cache_hit_tokens);
+            let request = self.outputs.take_request_metrics();
+            for (rid, lookup, admission, aborted) in request.peer_stops {
+                let outcome = if aborted { "cancelled" } else { "no_gain" };
+                if let Some(start) = admission {
+                    metrics
+                        .peer
+                        .stage("admission", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(start) = lookup {
+                    metrics
+                        .peer
+                        .stage("lookup_to_ready", outcome, start.elapsed().as_secs_f64());
+                }
+                if let Some(peer) = &mut self.peer {
+                    peer.end_lookup(&rid, outcome);
+                }
+            }
+            for (expected, actual, outcome) in request.peer_usage {
+                metrics.peer.usage(expected, actual, outcome);
+            }
+            for seconds in request.ttft_seconds {
+                metrics.observe_time_to_first_token(seconds);
+            }
+            for seconds in request.request_seconds {
+                metrics.observe_request_time(seconds);
+            }
+            for seconds in request.decode_seconds {
+                metrics.observe_decode_time(seconds);
+            }
+            for seconds in request.tpot_seconds {
+                metrics.observe_time_per_output_token(seconds);
+            }
+            for seconds in request.e2e_tpot_seconds {
+                metrics.observe_e2e_time_per_output_token(seconds);
+            }
+            metrics.record_completion_tokens(request.completion_tokens);
+            for count in request.completion_token_samples {
+                metrics.observe_request_completion_tokens(count);
+            }
+            for accept_length in request.spec_decode_accept_length_samples {
+                metrics.observe_request_spec_decode_accept_length(accept_length);
+            }
+            metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            let hits = self.scheduler.prefix_hit_stats();
+            let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
+            if self.outputs.role() == crate::output::Role::Decode {
+                metrics.record_decode_prefix_hits(
+                    delta.prompt_tokens,
+                    delta.device_hit_tokens + delta.host_hit_tokens,
+                );
+            }
+            metrics.record_prefix_hits(
+                delta.prompt_tokens,
+                delta.device_hit_tokens,
+                delta.host_hit_tokens,
+                delta.l3_hit_tokens,
+            );
+        }
+
+        planned_sizes
     }
 
     /// Count this round's forward, real or idle, for the expert rebalance;
@@ -2461,6 +2514,34 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         let round = peer.agree(reports)?;
         self.peer_now_us = round.now_us;
+        if let Some(metrics) = &self.metrics {
+            for (rid, result) in round.decisions {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.disposition = result;
+                    if result == "admission" {
+                        usage.admission_at = Some(Instant::now());
+                    } else if let Some(start) = usage.lookup_at.take() {
+                        metrics.peer.stage(
+                            "lookup_to_ready",
+                            "fallback",
+                            start.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+            }
+            for (rid, begin, end) in round.landed {
+                if let Some(usage) = self.outputs.peer_usage(&rid) {
+                    usage.window = Some((begin, end));
+                    usage.disposition = "unused_after_landing";
+                    if let Some(start) = usage.lookup_at.take() {
+                        metrics
+                            .peer
+                            .stage("lookup_to_ready", "ok", start.elapsed().as_secs_f64());
+                    }
+                }
+            }
+        }
+        peer.sample_scheduler(&mut self.scheduler, round.now_us);
         self.scheduler
             .advance_peer(round.now_us, &round.events)
             .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
@@ -2472,11 +2553,30 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// sent.
     fn dispatch_peer(&mut self, plan: &ExecutionPlan) {
         if let Some(peer) = self.peer.as_mut() {
-            peer.dispatch(
-                plan.peer_fetches(),
-                self.scheduler.take_peer_lookups(),
-                self.peer_now_us,
-            );
+            let fetches = plan.peer_fetches();
+            let lookups = self.scheduler.take_peer_lookups();
+            if let Some(metrics) = &self.metrics {
+                let now = Instant::now();
+                for lookup in &lookups {
+                    if let Some(usage) = self.outputs.peer_usage(&lookup.request_id) {
+                        usage.lookup_at = Some(now);
+                        usage.disposition = "lookup";
+                    }
+                }
+                for fetch in &fetches {
+                    if let Some(usage) = self.outputs.peer_usage(&fetch.request_id) {
+                        if let Some(start) = usage.admission_at.take() {
+                            metrics.peer.stage(
+                                "admission",
+                                "ok",
+                                now.duration_since(start).as_secs_f64(),
+                            );
+                        }
+                        usage.disposition = "landing";
+                    }
+                }
+            }
+            peer.dispatch(fetches, lookups, self.peer_now_us);
         }
     }
 
@@ -2667,6 +2767,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 PdEvent::Bootstrapped(rid) => {
                     self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
+                }
+                PdEvent::DestinationReady(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdDestinationReady, &rid, -1));
                 }
                 PdEvent::Succeeded(rid) => {
                     events.push(pd_event(ForwardEventKind::PdSucceeded, &rid, -1));
