@@ -820,6 +820,13 @@ class ServerArgs:
     # element instead of 2, and a numerics change. Decode and verify forwards
     # stay BF16.
     prefill_collective_payload: str = "bf16"
+    # Muse Spark: how owned-row prefill rounds return attention outputs to the
+    # token owners. "reduce-scatter": every rank projects its heads of all rows
+    # and the partial sums are reduce-scattered. "all-to-all": each owner
+    # receives its rows of every rank's heads and projects them through the
+    # whole output projection, gathered on every rank after loading (+1 full
+    # output weight a layer); fewer bytes, a different summation order.
+    owned_attention_output: str = "reduce-scatter"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -5205,6 +5212,16 @@ class ServerArgs:
             "with a row's offset in the buffer, so neither is "
             "batch-invariant. Gathers keep the multicast kernels. Turns off "
             "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--owned-attention-output",
+            type=str,
+            default=ServerArgs.owned_attention_output,
+            choices=["reduce-scatter", "all-to-all"],
+            help="Muse Spark: how owned-row prefill rounds return attention "
+            "outputs to the token owners. all-to-all sends each owner its rows "
+            "of every rank's heads and projects them through the whole output "
+            "projection (+1 output weight a layer; a numerics change).",
         )
         parser.add_argument(
             "--prefill-collective-payload",
