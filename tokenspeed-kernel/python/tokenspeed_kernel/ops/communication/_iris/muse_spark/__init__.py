@@ -113,8 +113,9 @@ _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS = 32
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
-# The int8-block16 pull moves fewer bytes a tile than the BF16 one, so it
-# needs more programs to keep enough loads in flight.
+# The int8-block16 pull moves 1.25 bytes an element instead of 2, so its
+# 4096-element tiles cover twice the elements of the BF16 tiles and the payload
+# is half as many tiles; it runs more programs to keep enough loads in flight.
 _MUSE_INT8_SCATTER_PROGRAMS = 64
 # Elements one encode program covers.
 _MUSE_ENCODE_BLOCK = 4096
