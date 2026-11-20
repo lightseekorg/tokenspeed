@@ -73,9 +73,9 @@ def memory_regions(
     The memory-saver ``adapter`` unmaps and re-maps the allocator regions;
     the device handle does the data-plane work that must surround them.
     Which pools and peers that work touches is the handle's business; this
-    side only says when. ``graph_tag`` selects the engine's graph pool.
-    ``nccl_suspendable`` says whether the process can suspend its NCCL
-    communicators; without it there is no ``nccl`` region.
+    side only says when. ``nccl_suspendable`` says whether the process's
+    NCCL can suspend communicators; without it there is no ``nccl`` region.
+    ``graph_tag`` selects the engine's graph pool.
     ``synchronize_kv_before_registration`` fences the KV clear before the
     transfer engine registers the re-mapped arena on devices that need it.
     """

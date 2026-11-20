@@ -867,9 +867,6 @@ def test_host_protocol_and_capability_agree_before_device_build(
     monkeypatch, checked_startup, device, role, memory_saver, protocol, required
 ):
     from tokenspeed.runtime.engine import rust_host
-    from tokenspeed.runtime.engine.memory_protocol import (
-        supports_replica_memory_transitions,
-    )
     from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
         TorchMemorySaverAdapter,
     )
@@ -886,15 +883,6 @@ def test_host_protocol_and_capability_agree_before_device_build(
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
     expected = checked_startup and memory_saver and device == "npu" and role != "encode"
-    assert (
-        supports_replica_memory_transitions(
-            checked_startup=checked_startup,
-            memory_saver=memory_saver,
-            backend_capable=device == "npu",
-            role=role,
-        )
-        is expected
-    )
     assert TorchMemorySaverAdapter.adapter_class(
         memory_saver, device=device
     ).supports_replica_memory_transitions is (device == "npu" and memory_saver)

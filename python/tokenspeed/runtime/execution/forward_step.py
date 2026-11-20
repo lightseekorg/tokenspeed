@@ -1029,14 +1029,12 @@ class ForwardStepRunner:
         _is_capture_mode = True
         global global_graph_memory_pool
         if self.device == "npu" and self.config.enable_memory_saver:
-            # Keep persistent state outside this pool; replay must write its
-            # temporaries before reading them. The executable stays resident.
             graph_capture = self.memory_saver_adapter.npu_graph(
                 graph,
                 pool=global_graph_memory_pool,
                 stream=self.stream,
                 tag="acl_graph",
-                policy="discard",
+                policy=self.config.acl_graph_memory_policy,
                 pool_scope="decode",
                 auto_dispatch_capture=True,
             )

@@ -396,6 +396,8 @@ class DeviceHandle:
     anything the caller could then use to bypass the rest.
     """
 
+    _additional_discard_reload_types: tuple[type, ...] = ()
+
     def __init__(
         self,
         executor,
@@ -1063,25 +1065,19 @@ class DeviceHandle:
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
         state = self._weight_memory
-        if state is not None:
-            if state.policy == "discard" and not self._supports_discard_reload(req):
-                return (
-                    False,
-                    "Discard policy requires a complete Model Updater SDK update",
-                )
-            try:
-                state.check_update()
-            except RuntimeError as exc:
-                return False, str(exc)
+        if state is None:
+            return True, "ready for weight update"
+        if (
+            state.policy == "discard"
+            and type(req) is not UpdateWeightsFromMooncakeReqInput
+            and type(req) not in self._additional_discard_reload_types
+        ):
+            return False, "Discard policy requires a complete Model Updater SDK update"
+        try:
+            state.check_update()
+        except RuntimeError as exc:
+            return False, str(exc)
         return True, "ready for weight update"
-
-    def _supports_discard_reload(self, req) -> bool:
-        """Admit a discard restore transport; the session validates its data."""
-        from tokenspeed.runtime.engine.io_struct import (
-            UpdateWeightsFromMooncakeReqInput,
-        )
-
-        return type(req) is UpdateWeightsFromMooncakeReqInput
 
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.

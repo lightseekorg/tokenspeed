@@ -65,6 +65,46 @@ def test_cli_selects_cpu_backup_without_requiring_an_updater():
     assert args.model_update_config is None
 
 
+@pytest.mark.parametrize(
+    "graph_args,expected",
+    [([], "discard"), (["--acl-graph-memory-policy", "cpu_backup"], "cpu_backup")],
+)
+def test_acl_graph_policy_is_independent_of_weight_policy(
+    tmp_path, graph_args, expected
+):
+    args = prepare_server_args(
+        [
+            str(tmp_path),
+            "--device",
+            "npu",
+            "--disable-prefill-graph",
+            "--disable-pdl",
+            "--enable-memory-saver",
+            "--weight-memory-policy",
+            "discard",
+            *graph_args,
+        ]
+    )
+    assert args.acl_graph_memory_policy == expected
+    assert args.weight_memory_policy == "discard"
+
+
+@pytest.mark.parametrize("device,saver", [("cuda", True), ("npu", False)])
+def test_acl_graph_backup_requires_an_enabled_ascend_saver(tmp_path, device, saver):
+    with pytest.raises(
+        ValueError, match="--acl-graph-memory-policy cpu_backup requires"
+    ):
+        ServerArgs(
+            model=str(tmp_path),
+            device=device,
+            enable_memory_saver=saver,
+            weight_memory_policy="cpu_backup",
+            acl_graph_memory_policy="cpu_backup",
+            disable_prefill_graph=True,
+            disable_pdl=True,
+        )
+
+
 @pytest.mark.parametrize("draft_policy", ["retain", "refresh"])
 def test_discard_uses_explicit_draft_update_semantics(draft_policy):
     args = ServerArgs(**discard_args(model_update_draft_weights=draft_policy))

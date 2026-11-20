@@ -29,7 +29,8 @@ import pytest
     os.environ.get("RUN_NPU_MEMORY_SAVER_TESTS") != "1",
     reason="requires RUN_NPU_MEMORY_SAVER_TESTS=1 and an exclusively assigned NPU",
 )
-def test_runtime_owners_survive_memory_release():
+@pytest.mark.parametrize("graph_policy", ["discard", "cpu_backup"])
+def test_runtime_owners_survive_memory_release(graph_policy):
     import torch
 
     pytest.importorskip("torch_npu")
@@ -74,7 +75,7 @@ def test_runtime_owners_survive_memory_release():
             pool=None,
             stream=torch.npu.Stream(),
             tag="acl_graph",
-            policy="discard",
+            policy=graph_policy,
             pool_scope="decode",
             auto_dispatch_capture=True,
         ):
@@ -94,13 +95,26 @@ def test_runtime_owners_survive_memory_release():
         torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
         tensors = (constant, workspace, output)
         addresses = [tensor.data_ptr() for tensor in tensors]
+        output_ptr = output.data_ptr()
         for _ in range(3):
             saver.pause("acl_graph")
+            # The saver can retain pools from earlier captures in this process.
+            (output_block,) = [
+                block
+                for block in saver.stats()["blocks"]
+                if 0 <= output_ptr - int(block["ptr"], 16) < block["aligned_bytes"]
+            ]
+            assert output_block["tag"] == "acl_graph"
+            assert not output_block["mapped"] and not output_block["physical_live"]
+            assert output_block["backup_valid"] == (graph_policy == "cpu_backup")
             saver.pause("kv_cache")
             saver.pause("weights")
             torch.testing.assert_close(comm_buffer.cpu(), torch.full((128,), 11.0))
             saver.resume("weights")
             saver.resume("acl_graph")
+            if graph_policy == "cpu_backup":
+                # Check restored bytes before replay can regenerate the output.
+                torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
             torch.testing.assert_close(constant.cpu(), torch.full((128,), 7.0))
             torch.testing.assert_close(workspace.cpu(), torch.full((128,), 3.0))
             saver.resume("kv_cache")

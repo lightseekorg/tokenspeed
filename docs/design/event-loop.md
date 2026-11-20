@@ -777,7 +777,9 @@ address used by EPD. A release is refused while transfers are in
 flight, and refused for a paused PD engine with buffered requests, whose
 transfers cannot drain until those requests are admitted; their transfer
 registration is deferred until resume admits them, and aborted buffered
-requests never register one. An empty memory-resume request is a successful
+requests never register one. An explicit empty release list is refused before
+the scheduler drains. Omitting the list releases all configured regions.
+An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
 

@@ -1068,12 +1068,9 @@ fn finish_serving(
 
 /// Run one rank on the calling (main) thread and exit without Python finalization.
 #[pyfunction]
-fn run_host(
-    py: Python<'_>,
-    control_fd: i32,
-    enable_async_logging: bool,
-    restore_gil_for_exit: bool,
-) -> PyResult<()> {
+fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
+    // Triton-Ascend exit handlers may release Python objects even without memory saving.
+    let restore_gil_for_exit = std::env::var("TS_HOST_DEVICE").as_deref() == Ok("npu");
     let code = py.detach(|| {
         let args = Args {
             control_fd,

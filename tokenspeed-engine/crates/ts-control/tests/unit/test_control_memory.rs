@@ -226,3 +226,19 @@ fn graph_wake_preserves_the_backend_kv_sleeping_state() {
         }
     }
 }
+
+#[test]
+fn refusing_a_second_release_preserves_the_pending_release() {
+    let mut controls = controls(true);
+    controls.handle(release(Some(vec!["kv_cache"])), None);
+    controls.handle(release(Some(vec!["weights"])), None);
+    assert_eq!(
+        successes(&controls.take_replies()),
+        [("ReleaseMemoryOccupationReqOutput", false)]
+    );
+    assert!(controls.releasing_or_released());
+    let Some(Drain::Release(tags)) = controls.take_drain() else {
+        panic!("the first release must still drain");
+    };
+    assert_eq!(tags, ["kv_cache"]);
+}

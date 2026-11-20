@@ -272,6 +272,22 @@ fn cancelling_memory_release_preserves_prefixes_when_one_rank_cannot_clear_l1() 
 }
 
 #[test]
+fn an_empty_release_keeps_generation_available() {
+    for coordinated in [false, true] {
+        let mut script = vec![Vec::new(); 12];
+        script[0].push(memory_transition(true, Some(&[])));
+        script[2].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
+        let ranks = run_memory_scripted(Layout::Tp(2), coordinated, Setup::default(), vec![script]);
+        assert_eq!(
+            outcome(ranks[0].replies.clone()),
+            [("ReleaseMemoryOccupationReqOutput", false)]
+        );
+        assert_scripted_tokens(&ranks[0], "awake", 2);
+        assert!(ranks.iter().all(|rank| rank.device_ops.is_empty()));
+    }
+}
+
+#[test]
 fn a_rank_refusing_memory_preflight_leaves_the_replica_usable() {
     for (layout, failed_rank) in [(Layout::Tp(2), 1), (Layout::TpDp { tp: 2, dp: 2 }, 3)] {
         let mut script = vec![Vec::new(); 24];

@@ -200,11 +200,13 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
     binary = _fake_host(
         tmp_path,
         """
+        import os
+        assert set(args) == {"--python", "--control-fd", "--enable-async-logging"}
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
                          "python": python, "relay": relay,
                          "async_logging": args["--enable-async-logging"],
-                         "restore_gil": args.get("--restore-gil-for-exit")})
+                         "device": os.environ["TS_HOST_DEVICE"]})
         time.sleep(600)
         """,
     )
@@ -229,7 +231,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
             "async_logging": str(enable_async_logging).lower(),
-            "restore_gil": "true" if device == "npu" else None,
+            "device": device,
         }
         assert proc.is_alive() and proc.exitcode is None
     finally:
