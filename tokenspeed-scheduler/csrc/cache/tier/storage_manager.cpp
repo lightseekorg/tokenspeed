@@ -25,6 +25,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include <spdlog/spdlog.h>
+
 #include "utils.h"
 
 namespace tokenspeed {
@@ -68,6 +70,38 @@ bool StorageTransferManager::CanStart() const {
 
 bool StorageTransferManager::HasRetainedOperations() const {
     return std::ranges::any_of(operations_, [](const auto& entry) { return entry.second.retained_after_clear; });
+}
+
+bool StorageTransferManager::HasCurrentPending() const {
+    return std::ranges::any_of(operations_, [](const auto& entry) { return !entry.second.retained_after_clear; });
+}
+
+std::size_t StorageTransferManager::NumRetainedOperations() const {
+    return std::ranges::count_if(operations_, [](const auto& entry) { return entry.second.retained_after_clear; });
+}
+
+std::size_t StorageTransferManager::NumRetainedHostBlocks() const {
+    std::size_t count = 0;
+    for (const auto& [id, ticket] : operations_) {
+        if (ticket.retained_after_clear) count += ticket.blocks.size();
+    }
+    return count;
+}
+
+void StorageTransferManager::UpdateRetainedCapacityWarning() {
+    const bool exhausted =
+        HasRetainedOperations() &&
+        (operations_.size() >= static_cast<std::size_t>(config_.max_operations) || availableHostCredits() == 0);
+    if (exhausted && !retained_capacity_exhausted_) {
+        ++retained_capacity_warnings_;
+        spdlog::warn(
+            "[L3] storage capacity exhausted with retained I/O: retained_operations={} "
+            "retained_host_blocks={} operations={}/{} held_host_blocks={}/{}; "
+            "retained buffers remain protected until native retirement",
+            NumRetainedOperations(), NumRetainedHostBlocks(), NumOperations(), config_.max_operations, NumHeldBlocks(),
+            config_.max_host_blocks);
+    }
+    retained_capacity_exhausted_ = exhausted;
 }
 
 std::vector<const CacheBlockRef*> StorageTransferManager::HeldBlockRefs() const {

@@ -43,6 +43,13 @@ public:
     const StorageConfig& Config() const { return config_; }
     bool CanStart() const;
     bool HasRetainedOperations() const;
+    bool HasCurrentPending() const;
+    std::size_t NumRetainedOperations() const;
+    std::size_t NumRetainedHostBlocks() const;
+    // Called by the planning round, not by read-only stats/preflight queries.
+    void UpdateRetainedCapacityWarning();
+    bool RetainedCapacityExhausted() const { return retained_capacity_exhausted_; }
+    std::uint64_t NumRetainedCapacityWarnings() const { return retained_capacity_warnings_; }
     // Borrowed until the next manager mutation; does not change ref counts.
     std::vector<const CacheBlockRef*> HeldBlockRefs() const;
     // Every attached request operation needs a real lease the scheduler can
@@ -66,8 +73,9 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
-    // Historical successful, replica-agreed, retired PUT/accepted GET receipts. They
-    // do not pin Host memory or guarantee residence after external eviction.
+    // Historical replica-agreed, retired SDK PUT acknowledgements / accepted
+    // GET receipts. A legacy PUT ACK can precede remote readability. These
+    // hints neither pin Host memory nor guarantee remote residence.
     bool WasPublished(const CacheKey& key) const { return published_.contains(key); }
     std::size_t NumPublishedKeys() const { return published_.size(); }
     std::uint64_t PublicationEpoch() const { return publication_epoch_; }
@@ -130,6 +138,8 @@ private:
     std::vector<StorageOperation> commands_;
     std::uint64_t next_id_{1};
     bool pressure_gate_closed_{false};
+    bool retained_capacity_exhausted_{false};
+    std::uint64_t retained_capacity_warnings_{0};
     std::uint64_t pressure_dropped_backup_keys_{0};
     std::uint64_t overflow_dropped_backup_keys_{0};
     std::uint64_t unavailable_dropped_backup_keys_{0};

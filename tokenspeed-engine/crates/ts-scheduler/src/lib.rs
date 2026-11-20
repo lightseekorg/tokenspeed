@@ -315,6 +315,14 @@ mod ffi {
         operations: u64,
         /// Host blocks storage operations hold.
         held_blocks: u64,
+        /// Old-generation tickets still charged to the operation limit.
+        retained_operations: u64,
+        /// Host references retained by old-generation tickets.
+        retained_host_blocks: u64,
+        /// A global operation or Host-reference limit is full with retained work.
+        retained_capacity_exhausted: bool,
+        /// Capacity warnings emitted on transitions into exhaustion, cumulative.
+        retained_capacity_warnings: u64,
         /// Host blocks quarantined after unproven retirement.
         quarantined: u64,
         /// Keys known to be absent from the store.
@@ -689,10 +697,14 @@ mod ffi {
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
+        fn storage_current_pending(scheduler: &Scheduler) -> bool;
+        fn storage_blocking_quarantined(scheduler: &Scheduler) -> usize;
+        fn storage_non_storage_clearable(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn cancel_storage_backups(scheduler: Pin<&mut Scheduler>);
+        fn cancel_storage_for_clear(scheduler: Pin<&mut Scheduler>);
         fn can_clear_cache_retaining_storage(scheduler: &Scheduler) -> bool;
         fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
         fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
@@ -1028,6 +1040,21 @@ impl Scheduler {
         ffi::storage_pending(self.get())
     }
 
+    /// Current-generation tickets remain, including unknown retirement.
+    pub fn storage_current_pending(&self) -> bool {
+        ffi::storage_current_pending(self.get())
+    }
+
+    /// Current-generation quarantined tickets blocking new storage work.
+    pub fn storage_blocking_quarantined(&self) -> usize {
+        ffi::storage_blocking_quarantined(self.get())
+    }
+
+    /// Pure preflight for owners other than scheduler storage tickets.
+    pub fn storage_non_storage_clearable(&self) -> bool {
+        ffi::storage_non_storage_clearable(self.get())
+    }
+
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
@@ -1056,6 +1083,12 @@ impl Scheduler {
     /// runtime cancellations; dispatched sources stay pinned until retired.
     pub fn cancel_storage_backups(&mut self) {
         ffi::cancel_storage_backups(self.pinned());
+    }
+
+    /// After replica-agreed non-storage preflight, detach request storage
+    /// leases and backups so healthy work can drain without attached holds.
+    pub fn cancel_storage_for_clear(&mut self) {
+        ffi::cancel_storage_for_clear(self.pinned());
     }
 
     /// Whether a full clear may retain only the storage tickets' Host blocks.

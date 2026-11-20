@@ -76,7 +76,8 @@ use ts_wire::{
         GetSharedPrefixPublicationReqInput, GetSharedPrefixPublicationReqOutput,
         IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput, ProfileReq,
         ReleaseMemoryOccupationReqInput, ReloadForwardReqInput, ResumeMemoryOccupationReqInput,
-        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput, PROFILE_START,
+        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromDistributedReqInput, PROFILE_START,
     },
     multimodal::{Modality, MultimodalDataItem, MultimodalInputs},
     ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineRequest, SamplingParams,
@@ -338,6 +339,8 @@ struct FakeDevice {
     landed: Arc<Mutex<Vec<Landing>>>,
     /// Control operations the device ran, in order.
     device_ops: Arc<Mutex<Vec<String>>>,
+    /// Version identities seen by the fake weight loader, in execution order.
+    weight_load_versions: Arc<Mutex<Vec<Option<String>>>>,
     /// Results published after the control plane's all-rank agreement.
     weight_commits: Arc<Mutex<Vec<bool>>>,
     /// Inject a local loading failure while other ranks succeed.
@@ -896,6 +899,12 @@ impl DataPlane for FakeDevice {
 
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         self.device_ops.lock().unwrap().push(op.tag().to_owned());
+        let version = match op {
+            ControlRequest::UpdateWeightFromDisk(request) => request.weight_version.clone(),
+            ControlRequest::UpdateWeightsFromDistributed(request) => request.weight_version.clone(),
+            _ => None,
+        };
+        self.weight_load_versions.lock().unwrap().push(version);
         Ok((!self.fail_weight_update, "applied".to_owned()))
     }
 
@@ -1351,6 +1360,7 @@ struct Rank {
     storage_gate: Arc<Gate>,
     landed: Arc<Mutex<Vec<Landing>>>,
     device_ops: Arc<Mutex<Vec<String>>>,
+    weight_load_versions: Arc<Mutex<Vec<Option<String>>>>,
     weight_commits: Arc<Mutex<Vec<bool>>>,
     weight_load_refused: Arc<AtomicBool>,
     /// Every rank's own control results, including non-frontend mirrors.
@@ -1939,6 +1949,7 @@ async fn start_ranks_with(
                 storage_gate,
                 landed: device.landed.clone(),
                 device_ops: device.device_ops.clone(),
+                weight_load_versions: device.weight_load_versions.clone(),
                 weight_commits: device.weight_commits.clone(),
                 weight_load_refused: device.weight_load_refused.clone(),
                 control_replies: Arc::default(),
@@ -5162,6 +5173,7 @@ fn outcome(replies: Vec<ControlOutput>) -> Vec<(&'static str, bool)> {
                 ControlOutput::IsSchedulerPaused(r) => r.is_paused,
                 ControlOutput::FlushCache(r) => r.success,
                 ControlOutput::UpdateWeightFromDisk(r) => r.success,
+                ControlOutput::UpdateWeightsFromDistributed(r) => r.success,
                 ControlOutput::ReleaseMemoryOccupation(r) => r.success,
                 ControlOutput::ResumeMemoryOccupation(r) => r.success,
                 ControlOutput::IsSleeping(r) => r.is_sleeping,
@@ -5866,6 +5878,476 @@ async fn evict_and_restore_from_l3(
     }
 }
 
+struct ReleaseStoreGate(Arc<Gate>);
+
+impl Drop for ReleaseStoreGate {
+    fn drop(&mut self) {
+        *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.0.opened.notify_all();
+    }
+}
+
+async fn wait_for_store_put(store: &StorageProbe) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.puts.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the PUT did not reach the Store");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_healthy_pending_put_drains_without_blocking_controls_or_rotating_the_namespace() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let ids: Vec<i32> = (1..=65).collect();
+    assert_eq!(
+        tokens(&run(&engine.client, routed_prompt("healthy-writer", &ids, None)).await),
+        [1000, 1001, 1002, 1003]
+    );
+    wait_for_store_put(&store).await;
+    admission_on_every_rank(&engine).await;
+    admission_on_every_rank(&engine).await;
+    let namespace = ts_l3::keys::key_prefix("serving", "v1", "");
+    let flush_finished = AtomicBool::new(false);
+    let flush = async {
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            control(
+                &engine,
+                ControlRequest::FlushCache(FlushCacheReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                }),
+            ),
+        )
+        .await
+        .expect("healthy flush did not finish after the native call retired");
+        flush_finished.store(true, Ordering::SeqCst);
+        output
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_millis(100), admission_on_every_rank(&engine))
+            .await
+            .expect("waiting for storage blocked the control event loop");
+        assert!(store.put_results.lock().unwrap().is_empty());
+        assert!(!flush_finished.load(Ordering::SeqCst));
+        gate.open();
+    };
+    let (flushed, ()) = tokio::join!(flush, release);
+    assert_eq!(flushed, [("FlushCacheReqOutput", true)]);
+    assert!(!store.put_results.lock().unwrap().is_empty());
+    assert_eq!(*store.removed.lock().unwrap(), [format!("{namespace}_")]);
+    assert!(store.memory.keys().is_empty());
+    for output in publication_on_every_rank(&engine, "healthy-after-flush", &ids).await {
+        assert_eq!(output.storage_namespace, namespace);
+        assert_ne!(output.status, "published");
+    }
+    for capacity in admission_on_every_rank(&engine).await {
+        assert_eq!(capacity.host_free_blocks, capacity.host_total_blocks);
+    }
+    drop(engine);
+    assert!(store.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn weight_operations_keep_their_order_and_load_once_after_async_storage_drain() {
+    let gate = Gate::closed();
+    let remote = Arc::new(MemoryStore::new());
+    let stores: Vec<_> = (0..2)
+        .map(|_| {
+            Arc::new(StorageProbe {
+                memory: remote.clone(),
+                put_gate: Some(gate.clone()),
+                ..StorageProbe::default()
+            })
+        })
+        .collect();
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            l3_stores: stores.clone(),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let ids: Vec<i32> = (1..=65).collect();
+    run(
+        &engine.client,
+        routed_prompt("before-weight-drain", &ids, None),
+    )
+    .await;
+    for store in &stores {
+        wait_for_store_put(store).await;
+    }
+    admission_on_every_rank(&engine).await;
+    admission_on_every_rank(&engine).await;
+    let first_finished = AtomicBool::new(false);
+    let second_finished = AtomicBool::new(false);
+    let first = async {
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            control(
+                &engine,
+                ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    model_path: "/checkpoint-v2".to_owned(),
+                    load_format: None,
+                    weight_version: Some("v2".to_owned()),
+                    flush_cache: true,
+                }),
+            ),
+        )
+        .await
+        .expect("the first queued weight update did not finish");
+        first_finished.store(true, Ordering::SeqCst);
+        output
+    };
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // A different wire kind can enter while the first request waits;
+        // EngineClient serializes requests of the same kind itself.
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            control(
+                &engine,
+                ControlRequest::UpdateWeightsFromDistributed(
+                    UpdateWeightsFromDistributedReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        names: vec!["weight".to_owned()],
+                        dtype_names: vec!["float32".to_owned()],
+                        shapes: vec![vec![1]],
+                        group_name: "weight_update_group".to_owned(),
+                        weight_version: Some("v3".to_owned()),
+                        flush_cache: true,
+                    },
+                ),
+            ),
+        )
+        .await
+        .expect("the subsequent queued weight update did not finish");
+        second_finished.store(true, Ordering::SeqCst);
+        output
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_millis(100), admission_on_every_rank(&engine))
+            .await
+            .expect("weight-update storage drain blocked the event loop");
+        assert!(!first_finished.load(Ordering::SeqCst));
+        assert!(!second_finished.load(Ordering::SeqCst));
+        for rank in &engine.ranks {
+            assert!(rank.device_ops.lock().unwrap().is_empty());
+            assert!(rank.weight_commits.lock().unwrap().is_empty());
+        }
+        gate.open();
+    };
+    let (first, second, ()) = tokio::join!(first, second, release);
+    assert_eq!(first, [("UpdateWeightFromDiskReqOutput", true)]);
+    assert_eq!(second, [("UpdateWeightsFromDistributedReqOutput", true)]);
+    assert_weight_commits(&engine, &[true, true]).await;
+    for rank in &engine.ranks {
+        assert_eq!(
+            *rank.device_ops.lock().unwrap(),
+            [
+                "UpdateWeightFromDiskReqInput",
+                "UpdateWeightsFromDistributedReqInput"
+            ]
+        );
+        assert_eq!(
+            *rank.weight_load_versions.lock().unwrap(),
+            [Some("v2".to_owned()), Some("v3".to_owned())]
+        );
+    }
+    let namespace = ts_l3::keys::key_prefix("serving", "v3", "");
+    for output in publication_on_every_rank(&engine, "after-ordered-weight-drain", &ids).await {
+        assert_eq!(output.storage_namespace, namespace);
+    }
+    drop(engine);
+    assert!(stores
+        .iter()
+        .all(|store| store.closed.load(Ordering::SeqCst)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waiting_forever() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let ids: Vec<i32> = (1..=65).collect();
+    run(
+        &engine.client,
+        routed_prompt("slow-healthy-writer", &ids, None),
+    )
+    .await;
+    wait_for_store_put(&store).await;
+    admission_on_every_rank(&engine).await;
+    admission_on_every_rank(&engine).await;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            control(
+                &engine,
+                ControlRequest::FlushCache(FlushCacheReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                }),
+            ),
+        )
+        .await
+        .expect("clear waited indefinitely for a healthy but stalled native call"),
+        [("FlushCacheReqOutput", true)]
+    );
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(store.put_results.lock().unwrap().is_empty());
+    assert!(store.removed.lock().unwrap().is_empty());
+    let before = publication_on_every_rank(&engine, "slow-put-isolated", &ids).await;
+    let namespace = agreed_namespace(&before, "v1");
+    let original = ts_l3::keys::key_prefix("serving", "v1", "");
+    assert_ne!(namespace, original);
+    for capacity in admission_on_every_rank(&engine).await {
+        assert!(capacity.host_free_blocks < capacity.host_total_blocks);
+    }
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.put_results.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the released old PUT did not return");
+    assert!(store
+        .memory
+        .keys()
+        .iter()
+        .all(|key| key.starts_with(&original)));
+    for output in publication_on_every_rank(&engine, "slow-put-late-result", &ids).await {
+        assert_eq!(output.storage_namespace, namespace);
+        assert_ne!(output.status, "published");
+    }
+    drop(engine);
+    assert!(store.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn returning_to_a_weight_version_with_old_unsafe_io_isolates_its_old_remote_objects() {
+    let store = Arc::new(StorageProbe::default());
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let original_ids: Vec<i32> = (1..=65).collect();
+    let original = ts_l3::keys::key_prefix("serving", "v1", "");
+    run(
+        &engine.client,
+        routed_prompt("published-before-recovery", &original_ids, None),
+    )
+    .await;
+    wait_for_publication(&engine, &original_ids, &[0], &original).await;
+    let old_keys = store.memory.keys();
+    assert!(!old_keys.is_empty());
+    let finished = store.put_results.lock().unwrap().len();
+    *store.failed_put_retirement.lock().unwrap() = Some(false);
+    let unsafe_ids: Vec<i32> = (1001..=1065).collect();
+    run(
+        &engine.client,
+        routed_prompt("unretired-before-weight-change", &unsafe_ids, None),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !store.put_results.lock().unwrap()[finished..].contains(&false) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the old weight namespace did not receive its unsafe result");
+    flush_until_idle(&engine).await;
+    *store.failed_put_retirement.lock().unwrap() = None;
+    let load = |version: &str| {
+        ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            model_path: format!("/checkpoint-{version}"),
+            load_format: None,
+            weight_version: Some(version.to_owned()),
+            flush_cache: true,
+        })
+    };
+    assert_eq!(
+        control(&engine, load("v2")).await,
+        [("UpdateWeightFromDiskReqOutput", true)]
+    );
+    assert_eq!(
+        control(&engine, load("v1")).await,
+        [("UpdateWeightFromDiskReqOutput", true)]
+    );
+    assert_weight_commits(&engine, &[true, true]).await;
+    assert!(store
+        .memory
+        .batch_exists(&old_keys)
+        .unwrap()
+        .iter()
+        .all(|exists| *exists));
+    let outputs =
+        publication_on_every_rank(&engine, "returned-weight-version", &original_ids).await;
+    let returned = agreed_namespace(&outputs, "v1");
+    assert_ne!(returned, original);
+    assert!(outputs.iter().all(|output| output.status != "published"));
+    let queries_before = store.queries.lock().unwrap().len();
+    let gets_before = store.get_keys.lock().unwrap().len();
+    let restored = run(
+        &engine.client,
+        routed_prompt("recompute-after-return", &original_ids, None),
+    )
+    .await;
+    assert_eq!(tokens(&restored), [1000, 1001, 1002, 1003]);
+    assert_eq!(restored.last().unwrap().cached_tokens, 0);
+    assert_eq!(store.get_keys.lock().unwrap().len(), gets_before);
+    {
+        let queries = store.queries.lock().unwrap();
+        assert!(queries.len() > queries_before);
+        assert!(queries[queries_before..]
+            .iter()
+            .flat_map(|(keys, _)| keys)
+            .all(|key| key.starts_with(&returned)));
+    }
+    wait_for_publication(&engine, &original_ids, &[0], &returned).await;
+    drop(engine);
+    assert!(!store.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_pause_allows_an_already_running_put_to_publish() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let ids: Vec<i32> = (1..=65).collect();
+    run(&engine.client, routed_prompt("paused-writer", &ids, None)).await;
+    wait_for_store_put(&store).await;
+    assert_eq!(
+        control(&engine, pause("keep")).await,
+        [("PauseSchedulerReqOutput", true)]
+    );
+    gate.open();
+    let namespace = ts_l3::keys::key_prefix("serving", "v1", "");
+    wait_for_publication(&engine, &ids, &[0], &namespace).await;
+    assert_eq!(
+        control(&engine, resume()).await,
+        [("ResumeSchedulerReqOutput", true)]
+    );
+    drop(engine);
+    assert!(store.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_storage_flush_refusal_keeps_an_existing_backup_attached() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let ids: Vec<i32> = (1..=65).collect();
+    run(&engine.client, routed_prompt("existing-backup", &ids, None)).await;
+    wait_for_store_put(&store).await;
+    let previous_stores = engine.cache_ops(CacheOpKind::WriteBack);
+    *engine.ranks[0].ack_gate.open.lock().unwrap() = false;
+    let pending_ids: Vec<i32> = (1001..=1065).collect();
+    run(
+        &engine.client,
+        routed_prompt("unretired-device-copy", &pending_ids, None),
+    )
+    .await;
+    assert!(engine.cache_ops(CacheOpKind::WriteBack) > previous_stores);
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            control(
+                &engine,
+                ControlRequest::FlushCache(FlushCacheReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                }),
+            ),
+        )
+        .await
+        .expect("non-storage flush refusal did not return"),
+        [("FlushCacheReqOutput", false)]
+    );
+    gate.open();
+    let namespace = ts_l3::keys::key_prefix("serving", "v1", "");
+    wait_for_publication(&engine, &ids, &[0], &namespace).await;
+    assert!(store.removed.lock().unwrap().is_empty());
+    engine.ranks[0].ack_gate.open();
+    flush_until_idle(&engine).await;
+    drop(engine);
+    assert!(store.closed.load(Ordering::SeqCst));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_generation() {
     for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
@@ -5926,7 +6408,11 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         assert!(stores[1].put_results.lock().unwrap().is_empty());
         let old_namespace = ts_l3::keys::key_prefix("serving", "v1", "");
 
-        flush_until_idle(&engine).await;
+        admission_on_every_rank(&engine).await;
+        admission_on_every_rank(&engine).await;
+        tokio::time::timeout(Duration::from_millis(200), flush_until_idle(&engine))
+            .await
+            .expect("current unsafe I/O should recover without waiting for the drain deadline");
         // The first following round consumes the recovery's queued-cancel
         // reports. Measure permanent holds after those safe tickets retire.
         admission_on_every_rank(&engine).await;
@@ -5941,18 +6427,21 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         let first = publication_on_every_rank(&engine, "first-generation", &old_ids).await;
         let first_namespace = agreed_namespace(&first, "v1");
         assert_ne!(first_namespace, old_namespace);
-        // A second clear must isolate even an earlier recovery's jobs with a
-        // fresh namespace, while preserving exactly the same unsafe capacity.
+        assert!(stores
+            .iter()
+            .all(|store| store.removed.lock().unwrap().is_empty()));
+        // Historical holds do not poison the new generation. With no current
+        // work left, the next clear purges it without rotating again.
         flush_until_idle(&engine).await;
         let second = publication_on_every_rank(&engine, "second-generation", &old_ids).await;
-        assert_ne!(agreed_namespace(&second, "v1"), first_namespace);
+        assert_eq!(agreed_namespace(&second, "v1"), first_namespace);
         let second_capacity = admission_on_every_rank(&engine).await;
         for (before, after) in retained.iter().zip(second_capacity) {
             assert_eq!(before.host_free_blocks, after.host_free_blocks);
         }
-        assert!(stores
-            .iter()
-            .all(|store| store.removed.lock().unwrap().is_empty()));
+        assert!(stores.iter().all(|store| {
+            store.removed.lock().unwrap().last() == Some(&format!("{first_namespace}_"))
+        }));
         // Only the old call is uncertain. The backend can service new jobs.
         *stores[0].failed_put_retirement.lock().unwrap() = None;
         let load = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
@@ -6017,10 +6506,18 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
             &target_keys,
         )
         .await;
-        // The cold GET above used the same namespace. A later administrative
-        // clear may rotate again; only the original unsafe capacity remains.
+        // The current generation is healthy even though old sources remain
+        // unsafe. Normal clear must purge this namespace and keep its name.
         flush_until_idle(&engine).await;
         wait_for_retained_capacity(&engine, &retained).await;
+        for output in
+            publication_on_every_rank(&engine, "healthy-generation-cleared", &target_ids).await
+        {
+            assert_eq!(output.storage_namespace, namespace);
+        }
+        assert!(stores.iter().all(|store| {
+            store.removed.lock().unwrap().last() == Some(&format!("{namespace}_"))
+        }));
         engine.settle().await;
         assert_eq!(engine.released_on(0), engine.released_on(1));
         drop(engine);
@@ -6081,16 +6578,49 @@ async fn unequal_data_parallel_host_capacity_keeps_new_l3_generations_and_forwar
         .all(|retired| !retired));
     assert!(stores[1].puts.lock().unwrap().is_empty());
     assert!(engine.released_on(1).is_empty());
-    flush_until_idle(&engine).await;
+    admission_on_every_rank(&engine).await;
+    admission_on_every_rank(&engine).await;
+    tokio::time::timeout(Duration::from_millis(200), flush_until_idle(&engine))
+        .await
+        .expect("current unsafe I/O should recover without the drain deadline");
     admission_on_every_rank(&engine).await;
     let retained = admission_on_every_rank(&engine).await;
     assert_eq!(retained[0].host_total_blocks, retained[1].host_total_blocks);
     assert!(retained[0].host_free_blocks > 0);
     assert!(retained[0].host_free_blocks < retained[1].host_free_blocks);
     assert_eq!(retained[1].host_free_blocks, retained[1].host_total_blocks);
-    assert!(stores
+    let original = ts_l3::keys::key_prefix("serving", "v1", "");
+    let recovered = publication_on_every_rank(&engine, "unequal-dp-recovered", &old_ids).await;
+    let recovered_namespace = agreed_namespace(&recovered, "v1");
+    assert_ne!(recovered_namespace, original);
+    // DP engines can receive the broadcast flush in different rounds. A
+    // peer's later copy may already purge the new safe prefix, but the old
+    // unsafe namespace must never be deleted by either engine.
+    assert!(stores.iter().all(|store| {
+        store
+            .removed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|prefix| prefix == &format!("{recovered_namespace}_"))
+    }));
+    let removed_before: Vec<usize> = stores
         .iter()
-        .all(|store| store.removed.lock().unwrap().is_empty()));
+        .map(|store| store.removed.lock().unwrap().len())
+        .collect();
+    flush_until_idle(&engine).await;
+    let cleared = publication_on_every_rank(&engine, "unequal-dp-safe-clear", &old_ids).await;
+    assert_eq!(agreed_namespace(&cleared, "v1"), recovered_namespace);
+    for (store, offset) in stores.iter().zip(removed_before) {
+        let removed = store.removed.lock().unwrap();
+        assert!(removed.len() > offset);
+        assert!(removed[offset..]
+            .iter()
+            .all(|prefix| prefix == &format!("{recovered_namespace}_")));
+    }
+    for (before, after) in retained.iter().zip(admission_on_every_rank(&engine).await) {
+        assert_eq!(before.host_free_blocks, after.host_free_blocks);
+    }
     *stores[0].failed_put_retirement.lock().unwrap() = None;
     let load = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
         rid: None,
@@ -6154,6 +6684,14 @@ async fn unequal_data_parallel_host_capacity_keeps_new_l3_generations_and_forwar
     }
     flush_until_idle(&engine).await;
     wait_for_retained_capacity(&engine, &retained).await;
+    for output in
+        publication_on_every_rank(&engine, "healthy-dp-generation-cleared", &old_ids).await
+    {
+        assert_eq!(output.storage_namespace, namespace);
+    }
+    assert!(stores
+        .iter()
+        .all(|store| { store.removed.lock().unwrap().last() == Some(&format!("{namespace}_")) }));
     drop(engine);
     assert!(stores[1].closed.load(Ordering::SeqCst));
     assert!(!stores[0].closed.load(Ordering::SeqCst));

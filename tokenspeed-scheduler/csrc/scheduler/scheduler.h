@@ -160,13 +160,16 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
-    // Cancel best-effort PUTs before flush preflight. Runtime cancellation is
+    // Explicit cancellation of best-effort PUTs. Runtime cancellation is
     // carried by the next plan; source pins still require retired completion.
     void CancelStorageBackups();
+    // After the non-storage preflight succeeds, detach request preparations
+    // and backups so healthy storage work can drain without attached leases.
+    void CancelStorageForClear();
     // Inspect current in-flight, pin and suspended-request checks with no
-    // mutation or cancellation. Weight updates cancel backups separately and
-    // MIN-reduce this across the replica before any
-    // rank clears. Every flush refuses while RetractedSize() > 0: a
+    // mutation or cancellation. Weight updates MIN-reduce preflight across
+    // the replica before detaching storage or clearing any rank's cache.
+    // Every flush refuses while RetractedSize() > 0: a
     // suspended request's image would otherwise resume old KV under a flushed
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
@@ -174,11 +177,17 @@ public:
     // Explicit recovery. Old I/O blocks remain unavailable; new namespace
     // operations can use the remaining Host space and global I/O credits.
     bool CanClearCacheRetainingStorage() const;
+    // Storage tickets may remain; every other live owner must permit clear.
+    bool StorageNonStorageClearable() const { return CanClearCacheRetainingStorage(); }
     bool ClearCacheRetainingStorage();
     bool StorageHasRetainedOperations() const {
         return storage_transfers_ && storage_transfers_->HasRetainedOperations();
     }
     bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
+    bool StorageCurrentPending() const { return storage_transfers_ && storage_transfers_->HasCurrentPending(); }
+    std::size_t StorageBlockingQuarantined() const {
+        return storage_transfers_ ? storage_transfers_->NumBlockingQuarantined() : 0;
+    }
     std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
     std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }
     std::size_t StorageNegativeKeys() const { return storage_transfers_ ? storage_transfers_->NumNegativeKeys() : 0; }

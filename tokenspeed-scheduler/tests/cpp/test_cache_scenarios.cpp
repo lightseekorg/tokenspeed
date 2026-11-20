@@ -2585,6 +2585,111 @@ TEST_F(L3LeaseLifetimeSuite, AnAbortReleasesTheReadyDataItHolds) {
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), static_cast<std::int32_t>(get.keys.size()));
 }
 
+TEST_F(L3LeaseLifetimeSuite, ClearPreparationDetachesAReadyLeaseSoHealthyStorageCanDrain) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(query.op_id, query.keys.size());
+    const auto get = std::get<StorageGetOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(get.op_id, get.keys.size());
+    Tick(2, /*allow_forward=*/false);
+    PlanOnce();
+    ASSERT_EQ(scheduler_->GetStorageStats().ready_requests, 1u);
+    ASSERT_TRUE(scheduler_->StorageCurrentPending());
+    ASSERT_TRUE(scheduler_->StorageNonStorageClearable());
+
+    scheduler_->CancelStorageForClear();
+    EXPECT_FALSE(scheduler_->StorageCurrentPending());
+    EXPECT_FALSE(scheduler_->StoragePending());
+    EXPECT_EQ(scheduler_->GetStorageStats().ready_requests, 0u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), 0u);
+    EXPECT_TRUE(scheduler_->CanClearCache());
+}
+
+TEST_F(L3LeaseLifetimeSuite, ClearPreparationDetachesAnAttachedQueryUntilItsRealRetirement) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    ASSERT_TRUE(scheduler_->StorageNonStorageClearable());
+    scheduler_->CancelStorageForClear();
+    EXPECT_TRUE(scheduler_->StorageCurrentPending());
+    EXPECT_EQ(scheduler_->GetStorageStats().waiting_requests, 0u);
+    Tick(2, /*allow_forward=*/false);
+    EXPECT_EQ(std::get<StorageCancelOperation>(OnlyStorageOp(PlanOnce())).op_id, query.op_id);
+    Retire(query.op_id, query.keys.size());
+    EXPECT_FALSE(scheduler_->StorageCurrentPending());
+    EXPECT_FALSE(scheduler_->StoragePending());
+}
+
+class L3BackupClearSuite : public L3LeaseLifetimeSuite {
+protected:
+    StoragePutOperation StartBackup() {
+        auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+        auto& storage = SchedulerTestAccess::Storage(*scheduler_);
+        // The final token is replayed, leaving one complete two-token prefix.
+        const auto hashes = scheduler_->PrefixHashesForTokens({1, 2, 3});
+        const auto keys = coordinator.Store().ExpandPrefixKeys(hashes);
+        for (const auto& key : keys) {
+            auto source = coordinator.Host().AcquireHostBlock(static_cast<std::int32_t>(key.group_id), 0);
+            coordinator.Host().CacheHostBlock(source, key, std::nullopt);
+        }
+        storage.QueueBackups(keys);
+        Tick(1, /*allow_forward=*/false);
+        return std::get<StoragePutOperation>(OnlyStorageOp(PlanOnce()));
+    }
+
+    void FreezeStorage(std::int64_t now_us) {
+        ExecutionEvent tick;
+        tick.With(cache::StorageTick{now_us, false, false, StoragePressure{0, 0, 0}});
+        scheduler_->Advance(std::move(tick));
+    }
+};
+
+TEST_F(L3BackupClearSuite, FreezingStorageDoesNotCancelADispatchedPut) {
+    const auto put = StartBackup();
+    const auto held = scheduler_->StorageHeldBlocks();
+    ASSERT_GT(held, 0u);
+    FreezeStorage(2);
+    for (int round = 0; round < 3; ++round) {
+        EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+        EXPECT_EQ(scheduler_->StorageHeldBlocks(), held);
+    }
+    Retire(put.op_id, put.keys.size());
+    EXPECT_FALSE(scheduler_->StoragePending());
+    for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
+TEST_F(L3BackupClearSuite, RejectedClearWithAPrivateHostOwnerDoesNotCancelADispatchedPut) {
+    const auto put = StartBackup();
+    auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    auto private_host = coordinator.Host().AcquireHostBlock(0, 0);
+    ASSERT_TRUE(private_host);
+    EXPECT_FALSE(scheduler_->StorageNonStorageClearable());
+    EXPECT_FALSE(scheduler_->ClearCache());
+    EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    private_host.reset();
+    Retire(put.op_id, put.keys.size());
+    for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
+TEST_F(L3BackupClearSuite, RejectedClearWithAPeerExportDoesNotCancelADispatchedPut) {
+    const auto put = StartBackup();
+    auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    const auto hashes = scheduler_->PrefixHashesForTokens({1, 2, 3});
+    auto peer = coordinator.ExportPrefix(coordinator.Prober().ProbePrefix(hashes));
+    ASSERT_FALSE(peer.blocks.empty());
+    EXPECT_FALSE(scheduler_->StorageNonStorageClearable());
+    EXPECT_FALSE(scheduler_->ClearCache());
+    EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    peer.blocks.clear();
+    Retire(put.op_id, put.keys.size());
+    for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
 // With KV events on, an L3 read registers Host entries for a prefix this
 // engine never published: the boundary tree reports their Host residency,
 // and the scheduler, holding no descriptor for them, publishes nothing until

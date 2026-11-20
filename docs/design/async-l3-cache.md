@@ -204,26 +204,25 @@ not the cached bytes. Independently mounted data segments can outlive inference
 workers: setting `global_segment_size=0` explicitly makes an inference worker
 a client without mounting storage of its own.
 
-For the default Host C ABI, a legacy `ILLEGAL_CLIENT` PUT result is an ownership
+For the audited default Host C ABI, an `ILLEGAL_CLIENT` PUT result is an ownership
 rejection, either before I/O or at End after every allocated memory transfer
 succeeded. Failed transfers keep their own error even if Revoke also fails.
 A complete batch containing only success, duplicate/allocation rejection and
 `ILLEGAL_CLIENT` therefore retires its sources; the rejected write still fails
 and cannot add a publication receipt. Any transfer/RPC/unknown error in the
-same batch keeps whole-batch retirement unknown. An SDK's explicit
-`source_retired=false` always overrides this legacy inference. This contract
-does not cover flexible memory/NoF policies or other transfer backends.
+same batch keeps whole-batch retirement unknown. This contract applies to the
+default memory-only Host path documented below; it does not establish retirement
+for flexible memory/NoF policies, custom backends or arbitrary SDK revisions.
 
-A full-clear attempt or frozen storage round cancels best-effort backups.
-Candidates and PUTs still in the scheduler outbox are discarded immediately;
-dispatched PUTs are detached and receive one cancellation command through the
-ordinary plan. Their late success cannot add a publication receipt. Source
-references remain held until every owner reports retirement. Cancelling a
-running executor job currently does not abort its native call, so this does
-not make an active or quarantined PUT safe to free, nor guarantee that the
-remote object was never published. A refused flush can therefore cancel
-backups while leaving all cache indexes intact. Storage recovery, described
-below, can clear those indexes while keeping the outstanding references.
+An explicit full-clear first checks that no unrelated resources prevent it.
+Only an accepted clear detaches request storage leases and cancels backups.
+Candidates and commands still in the scheduler outbox are discarded; commands
+already dispatched receive cancellation through the ordinary plan. Running
+native calls keep their references until every owner reports retirement, and
+their detached results cannot add a publication receipt. A later backend purge
+failure can refuse the accepted clear, but an initial non-storage pin refusal
+does not cancel any backup. Ordinary keep pauses and frozen storage rounds only
+drop backup candidates; they do not cancel dispatched PUTs.
 
 ## Controller queues, monitor and bounds
 
@@ -370,42 +369,60 @@ miss before destination transfer submission. PUT `OBJECT_ALREADY_EXISTS`
 `NO_AVAILABLE_HANDLE` (`-200`) is the master's allocation
 rejection before any source transfer: a retired per-page failure that leaves
 the page unacknowledged for the scheduler to re-offer, never a quarantine.
-Other negative transfer errors, exceptions after native submission,
-and malformed transfer results do not prove retirement.
+Default Host PUT `ILLEGAL_CLIENT` (`-601`) rejects publication after that object's
+allocated memory transfers succeeded; it also retires sources, without claiming
+the write succeeded. Any transfer, RPC or unknown error in the same status
+vector keeps retirement unproven for the complete batch. Top-level SDK errors,
+exceptions after native submission and malformed results do not prove retirement.
 
-For PUT, a duplicate-create rejection is not itself a publication ACK: an SDK
-may also return it for another writer still in progress. Legacy SDKs can also
-collapse this rejection into zero. The adapter confirms readability before
-acknowledging either legacy result; an unconfirmed duplicate retires without
-publishing and remains eligible for a later write attempt.
+This PUT interpretation is tied to the audited
+[Mooncake b04 C ABI declaration](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/include/store_c.h#L77-L82).
+The existing Rust wrapper passes a null replication config. In that source,
+[null selects the default config](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/src/store_c.cpp#L42-L45),
+whose [policy requests memory only](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/include/replica.h#L104-L107).
+The [Host buffer path calls BatchPut](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/src/real_client.cpp#L4141-L4192),
+which [waits for the transfers before finalization](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/src/client_service.cpp#L3258-L3273).
+Its [finalizer preserves a transfer failure ahead of a Revoke error](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/src/client_service.cpp#L2911-L2922).
+These data-flow conditions justify the default Host result set; an ownership
+error alone is not a general retirement guarantee for other backend policies.
+
+PUT keeps the existing SDK semantics: zero and duplicate-create statuses are
+accepted/existing acknowledgments. The SDK can return them while another writer
+is still in progress, and
+[CollectResults collapses the rejection into zero](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/src/client_service.cpp#L3074-L3081).
+The adapter retains the initial existence check but does not add a post-PUT
+confirmation RPC. Its PUT receipt, including a shared-prefix `published` status
+derived from that receipt, is a best-effort historical hint rather than a strong
+promise of current readability or pinned remote storage. A group can therefore
+be released before another writer's object is readable; the next Prefill may
+miss and recompute. This accepts an occasional optimistic hint to keep the
+normal RPC path unchanged.
+
+A PUT ACK never supplies restored bytes. L3 restores still require full-length
+successful GET results and the existing success/retirement agreement across all
+owners before installing Host data; the ordinary H2D completion then governs
+Device readiness. Missing or short reads are not installed and use the normal
+recomputation path. Unknown I/O still retains its references under the existing
+retirement rules. Neither a PUT ACK nor a metadata observation makes another
+key's unknown transfer safe to release.
 
 Workers sharing one Mooncake client admit at most one in-flight PUT per complete
 object key. Partly overlapping batches still write their other keys; duplicate
-positions retire without a write or publication ACK. A claim is released only
-before native submission or after proven source retirement. Unknown native
-retirement retains both the claim and the executor's existing quarantine. This
-is local write coalescing, not cross-client ownership or a replacement for the
-master's write-generation checks.
+positions retire without a write or new SDK ACK. A claim is released only
+before native submission or when the complete default Host status vector proves
+retirement. Transfer/RPC/unknown errors retain every claim of that batch together
+with the executor's quarantine and C++ Host references. This is local write
+coalescing, not cross-client ownership or a replacement for the master's
+write-generation checks.
 
-A lost or timed-out End RPC retains the key claim even if native source access
-has retired: an old RPC could otherwise affect a new write by that same client.
-This key-local hold does not quarantine safely retired Host bytes or prevent a
-switch to a new weight namespace. An existence query cannot settle the old
-RPC's lifetime.
-
-The optional Mooncake `batch_put_from_with_retirement_v1` C ABI extension reports
-source retirement separately from per-key publication results. A native proof of
-retirement lets a metadata rejection finish as a failed cache write, without
-quarantining Host memory or claiming publication. Without the extension, the
-adapter retains its conservative legacy error classification; `ILLEGAL_CLIENT`
-alone never proves retirement. A metadata existence query cannot replace this
-native lifetime evidence. The v1 extension preserves duplicate rejections and
-reserves zero for this write's successful End, so only its duplicate statuses
-need an extra metadata query.
-
-The upstream SDK's original setup ABI can connect only the explicit `default`
-tenant. A named tenant requires the tenant-aware entry point; its absence is a
-connection error, never a change to the requested tenant.
+A lost or timed-out End RPC has no safe-retirement status in this interface, so
+both the key claim and C++ Host/operation credits remain held. An old RPC could
+still affect a new write by that same client. A timer or an existence query
+cannot settle that control lifetime, so claims cannot expire on a timeout.
+Within the executor's bounded admission, retained claimed keys are bounded by
+the same charged operations and their per-operation key limits; clearing into a
+new namespace does not reset these resource budgets. This change uses only the
+existing SDK functions and does not require a Mooncake ABI extension.
 
 `Store::failures_retire` declares the store's guarantee when a call fails or
 returns a malformed result: whether it has stopped accessing the supplied Host
@@ -433,9 +450,15 @@ the remaining capacity. A deployment SDK must honor
 the adapter's return-code contract; real transport fault tests remain part of
 hardware validation.
 
-A full clear with outstanding storage work takes a separate recovery entry.
-The replica and attention-DP engines agree to use it if any engine needs to
-retain storage work. Preflight still refuses Device/PD/tier transfers,
+A full clear with healthy outstanding storage work first yields to normal
+control rounds for up to 500 ms. Pending standalone flush replies and the
+original weight-operation queue head remain pending; no weight load or new
+forward/storage plan begins meanwhile. The rounds still poll, agree and apply
+completions and answer control queries. If the jobs retire, clear purges the
+current namespace and keeps its shared prefix, without a recovery generation.
+An active-generation quarantine/unproven namespace goes directly to recovery;
+otherwise only exhaustion of the drain budget selects recovery. Every decision
+is agreed across the replica and attention-DP ranks. Preflight still refuses Device/PD/tier transfers,
 suspended retraction images and owners outside the storage tickets. The cache
 owner checks the exact block identities and reference counts, including
 unindexed GET destinations, before changing any index. Requests drop their
@@ -458,15 +481,26 @@ late-retirement notification is currently available. These old tickets do not
 block new L3 merely because they are quarantined, nor suppress a new generation's
 backup of the same logical key. They still consume real Host credits and the
 global operation limit. New computation, L2 and L3 use the remaining capacity.
+Repeated unknown I/O can consume those budgets permanently; the implementation
+does not evict unsafe references to make room. Retained counts and exhausted
+capacity are exported, and a transition into exhausted capacity emits a warning.
 Old queue age is excluded from current pressure; clearing also resets backend
 health with a new health epoch, so old failures cannot close the new generation.
 A new unproven result in the current generation again blocks new I/O until clear.
 The aggregate unsafe-I/O metric and shutdown proof remain conservative.
+Historical unsafe prefixes are tracked separately from the active prefix.
+Later healthy clears can delete the safe active namespace and clear its indexes
+while keeping old references, without rotating into yet another private scope.
 
 Weight metadata advances only after every rank successfully loads the weights.
 An actual change to another immutable weight version restores its standard
 shared weight namespace across independent engines. Reapplying the same version
-keeps the clear-generation suffix. A same-version recovery clear is local to
+keeps the clear-generation suffix. Returning A -> B -> A while old A access is
+unproven selects a fresh agreed generation before new A work can begin; it does
+not reactivate the unsafe shared A prefix. An old namespace whose I/O is fully
+retired can still contain valid immutable-weight objects; changing back to that
+version may reuse them. Flush invalidates/purges the active namespace, not every
+historical weight namespace. A same-version recovery clear is local to
 the engines sharing that control agreement. Independent Prefill services remain
 in separate recovery namespaces until a new weight version; sharing a recovery
 generation would require an additional common-generation control protocol.
@@ -488,10 +522,12 @@ deletion is deferred to store administration or
 recovery after retirement; a successful recovery clear promises local logical
 invalidation and safe retained ownership, not immediate remote deletion.
 It does not repair Mooncake's ownership protocol or cancel its transport.
-With no retained storage work, the ordinary clear still uses replica-agreed
+After current-prefix work drains, ordinary clear uses replica-agreed
 preflight and synchronous remote namespace deletion before clearing local
 indexes. A deletion failure there still prevents local clearing. That normal
 administrative call can delay control processing until its backend returns.
+Old retained references in other prefixes can remain throughout that normal
+purge; the historical shutdown quarantine flag alone does not prevent it.
 L1-only clear may proceed while Host-only storage I/O remains active.
 Shutdown closes the L3 executor when the host's event loop ends, before the
 data plane's device-copy cleanup. L3 joins its workers with a deadline and then
@@ -512,6 +548,16 @@ Ready expiration are different counters; client detachment increments neither.
 Pressure bypasses and dropped backup candidate keys have separate counters;
 the admission gate is a mirrored scheduler gauge. These do not count unique
 remote objects or saved prefill tokens.
+
+`tokenspeed:l3_scheduler_resources` adds `retained_operations`,
+`retained_host_blocks`, and `retained_capacity_exhausted` resource labels.
+`tokenspeed:l3_retained_capacity_warnings` counts transitions into full global
+operation or Host credits while retained I/O exists. These are mirrored counts;
+do not sum them across TP ranks. After capacity recovers, another exhaustion
+can emit a new warning. The historical `l3_io_quarantined` flag still protects
+client shutdown and does not by itself disable a healthy new cache generation.
+Recovery index invalidation counts all removed Host entries in the ordinary
+flush eviction statistic, even when an external I/O reference retains the slot.
 
 Health state/epoch and unproven native retirement are separate gauges. Reading
 health never consumes a recovery probe. Snapshots carry no request IDs or object

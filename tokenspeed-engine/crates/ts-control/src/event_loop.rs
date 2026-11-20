@@ -195,6 +195,9 @@ const RELOAD_GATE_CODE: i64 = 7;
 
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
+// Cache administration yields to ordinary rounds while healthy I/O drains.
+// Beyond this budget it can isolate old storage references without waiting.
+const CACHE_CLEAR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A failure of a data-plane operation; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
@@ -594,6 +597,10 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
     cache_ops: CacheOps,
     controls: Controls,
+    /// Accepted cache clear waiting for native completions between rounds.
+    cache_clear_started: Option<Instant>,
+    /// Standalone flush callers whose replies wait for that clear.
+    deferred_flushes: usize,
     /// Admissions withheld from the scheduler while paused, in arrival order.
     withheld: Vec<Submission>,
     /// EPD: admissions waiting for their images' embeddings, in staging
@@ -680,6 +687,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
+            cache_clear_started: None,
+            deferred_flushes: 0,
             withheld: Vec::new(),
             staged: Vec::new(),
             dp_idle: true,
@@ -731,7 +740,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     break;
                 }
             }
-            while !self.clear_cache()? {
+            loop {
+                if self.clear_cache()? == Some(true) {
+                    break;
+                }
                 if self.round(stop.load(Ordering::Relaxed))? {
                     return Ok(true);
                 }
@@ -761,6 +773,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The scheduler's counts are a pass over its requests per state: ask
         // for them only once the loop's own state says nothing runs.
         if !self.in_flight.is_empty()
+            || self.cache_clear_started.is_some()
             || self.cache_ops.open() != 0
             || self.outputs.num_running() != 0
         {
@@ -844,7 +857,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
         let (memory_resident, release_pending, nccl_release_pending) = self.gate()?;
-        let forward_allowed = memory_resident && !self.controls.forward_blocked();
+        let forward_allowed = memory_resident
+            && !self.controls.forward_blocked()
+            && self.cache_clear_started.is_none();
 
         // The storage tick and the cache-op acknowledgments advance at the
         // head of the round, so this round's plan sees them.
@@ -1801,7 +1816,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// and whether any rank has a pending memory release or NCCL release.
     fn gate(&mut self) -> Result<(bool, bool, bool), LoopError> {
         let _span = profile::span("EventLoop::gate");
-        let flushes = self.controls.take_flushes();
+        let flushes = self
+            .deferred_flushes
+            .checked_add(self.controls.take_flushes())
+            .ok_or_else(|| LoopError::Control("cache flush request count overflow".to_owned()))?;
+        self.deferred_flushes = 0;
         let head = self.controls.weight_head().and_then(control::gate_code);
         let internal = self.controls.internal_head().map(InternalOp::gate_code);
         // A reload heads the queue from its arrival; it runs once drained, with the same id, everywhere.
@@ -1894,20 +1913,34 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             },
             ready => ready,
         };
-        // One blocking device operation per round: a frontend one first.
-        let ready_internal = if all_have_internal && ready.is_none() {
-            self.controls.pop_internal()
-        } else {
-            None
-        };
         if let Some(op) = &ready {
             want_flush |= control::wants_flush(op);
         }
         let flushed = if want_flush {
-            self.clear_cache()?
+            match self.clear_cache()? {
+                Some(flushed) => flushed,
+                None => {
+                    // No frontend admission runs inside this gate. Restore the
+                    // original head before yielding so weights_busy() and the
+                    // next round still see this operation, without cloning its
+                    // potentially large serialized weight payload each round.
+                    if let Some(op) = ready {
+                        self.controls.defer_weight_op(op);
+                    }
+                    self.deferred_flushes = flushes;
+                    return Ok((memory_resident, release_pending, nccl_release_pending));
+                }
+            }
         } else {
             true
         };
+        // One blocking device operation per round: a frontend one first.
+        let ready_internal =
+            if all_have_internal && ready.is_none() && self.cache_clear_started.is_none() {
+                self.controls.pop_internal()
+            } else {
+                None
+            };
         for _ in 0..flushes {
             self.controls
                 .reply(ControlOutput::FlushCache(FlushCacheReqOutput {
@@ -1952,50 +1985,64 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(agreed != 0)
     }
 
-    /// Drop the prefix caches on every rank or on none. Storage recovery
-    /// retains the same tickets across each replica and moves new L3 work to
-    /// a fresh generation; native
-    /// retirement remains required for reclaiming those physical blocks.
-    fn clear_cache(&mut self) -> Result<bool, LoopError> {
-        self.scheduler.cancel_storage_backups();
-        let storage_needs_retention = self.scheduler.storage_pending()
-            || self.scheduler.storage_has_retained_operations()
-            || self
-                .l3
-                .as_ref()
-                .is_some_and(|l3| l3.executor.snapshot().unsafe_io);
-        // Select one path across both the replica and attention-DP engines;
-        // a local native flag never decides which mirrored blocks to retain.
-        if !self.converge(!storage_needs_retention)? {
-            return self.clear_cache_retaining_storage();
+    /// One clear attempt: None yields to the normal round so native I/O can
+    /// retire. Explicit unsafe access or the drain deadline selects recovery.
+    fn clear_cache(&mut self) -> Result<Option<bool>, LoopError> {
+        let result = self.advance_cache_clear()?;
+        if result.is_some() {
+            self.cache_clear_started = None;
         }
-        let can_clear = self.scheduler.can_clear_cache();
+        Ok(result)
+    }
+
+    fn advance_cache_clear(&mut self) -> Result<Option<bool>, LoopError> {
+        // Reject unrelated owners before cancelling any best-effort work.
+        let can_clear = self.scheduler.storage_non_storage_clearable();
         if !self.converge(can_clear)? {
             tracing::warn!(
                 can_clear,
-                l3_idle = self.l3.as_ref().map(|l3| l3.executor.is_idle()),
-                l3_unsafe_io = self.l3.as_ref().map(|l3| l3.executor.snapshot().unsafe_io),
-                "cache flush refused at scheduler preflight"
+                "cache flush refused: non-storage resources remain held"
             );
-            return Ok(false);
+            return Ok(Some(false));
         }
-        // The L3 objects go first, in a phase of its own: a store that
-        // fails to delete must leave every rank's indexes untouched.
+        if self.cache_clear_started.is_none() {
+            self.scheduler.cancel_storage_for_clear();
+            self.cache_clear_started = Some(Instant::now());
+        }
+        let unsafe_current = self.scheduler.storage_blocking_quarantined() > 0
+            || self
+                .l3
+                .as_ref()
+                .is_some_and(|l3| l3.executor.current_namespace_needs_isolation());
+        // Historical unsafe flags/tickets protect their own addresses. They
+        // do not force every later clear into another private namespace.
+        if !self.converge(!unsafe_current)? {
+            return self.clear_cache_retaining_storage().map(Some);
+        }
+        let pending = self.scheduler.storage_current_pending();
+        if !self.converge(!pending)? {
+            let expired = self.cache_clear_started.expect("clear started").elapsed()
+                >= CACHE_CLEAR_DRAIN_TIMEOUT;
+            if !self.converge(!expired)? {
+                return self.clear_cache_retaining_storage().map(Some);
+            }
+            return Ok(None);
+        }
+        // Current-namespace work has drained. Old retained tickets may still
+        // occupy slots, but cannot prevent purging this safe active prefix.
         if let Some(l3) = &self.l3 {
             let deleted = l3.executor.delete_namespace();
-            let l3_idle = l3.executor.is_idle();
-            let l3_unsafe_io = l3.executor.snapshot().unsafe_io;
             if !self.converge(deleted)? {
-                tracing::warn!(
-                    deleted,
-                    l3_idle,
-                    l3_unsafe_io,
-                    "cache flush refused at L3 namespace deletion"
-                );
-                return Ok(false);
+                tracing::warn!(deleted, "cache flush refused at L3 namespace deletion");
+                return Ok(Some(false));
             }
         }
-        Ok(self.scheduler.clear_cache())
+        let cleared = if self.scheduler.storage_has_retained_operations() {
+            self.scheduler.clear_cache_retaining_storage()
+        } else {
+            self.scheduler.clear_cache()
+        };
+        self.converge(cleared).map(Some)
     }
 
     /// Isolate old native I/O, then allow L3 in a fresh namespace using only
@@ -2009,17 +2056,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             );
             return Ok(false);
         }
-        let mut nonce = [0u8; 16];
-        let generated = std::fs::File::open("/dev/urandom")
-            .and_then(|mut random| random.read_exact(&mut nonce))
-            .is_ok();
-        if !self.converge(generated)? {
-            tracing::warn!("cache recovery could not allocate a fresh namespace generation");
+        let Some(generation) = self.fresh_cache_generation()? else {
             return Ok(false);
-        }
-        let group = self.ranks.dp.as_ref().unwrap_or(&self.ranks.replica);
-        let nonce = self.ranks.mesh.broadcast(group, 0, nonce.to_vec())?;
-        let generation: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        };
         if let Some(l3) = &self.l3 {
             l3.executor.begin_cache_generation(&generation)?;
         }
@@ -2030,6 +2069,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             "cache indexes cleared with storage references retained; L3 uses a fresh generation; remote purge deferred"
         );
         Ok(cleared)
+    }
+
+    fn fresh_cache_generation(&mut self) -> Result<Option<String>, LoopError> {
+        let mut nonce = [0u8; 16];
+        let generated = std::fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .is_ok();
+        if !self.converge(generated)? {
+            tracing::warn!("cache recovery could not allocate a fresh namespace generation");
+            return Ok(None);
+        }
+        let group = self.ranks.dp.as_ref().unwrap_or(&self.ranks.replica);
+        let nonce = self.ranks.mesh.broadcast(group, 0, nonce.to_vec())?;
+        let generation: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(Some(generation))
     }
 
     /// Finish a gated weight operation: its result is agreed across the
@@ -2084,10 +2138,35 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             if let Some(l3) = &self.l3 {
                                 l3.executor.set_weight_version(&version)?;
                             }
-                            if let Some(peer) = &mut self.peer {
-                                peer.set_weight_version(&version);
+                            // A -> B -> A must not re-enter a prefix still
+                            // touched by retained old A I/O. Decide this across
+                            // the same owners before planning new cache work.
+                            let needs_isolation = self
+                                .l3
+                                .as_ref()
+                                .is_some_and(|l3| l3.executor.current_namespace_needs_isolation());
+                            let namespace_ready = if self.converge(!needs_isolation)? {
+                                true
+                            } else if let Some(generation) = self.fresh_cache_generation()? {
+                                if let Some(l3) = &self.l3 {
+                                    l3.executor.begin_cache_generation(&generation)?;
+                                }
+                                true
+                            } else {
+                                false
+                            };
+                            if namespace_ready {
+                                if let Some(peer) = &mut self.peer {
+                                    peer.set_weight_version(&version);
+                                }
+                                (true, message)
+                            } else {
+                                (
+                                    false,
+                                    "could not isolate the weight namespace from old I/O"
+                                        .to_owned(),
+                                )
                             }
-                            (true, message)
                         }
                         Ok(None) => (true, message),
                     }

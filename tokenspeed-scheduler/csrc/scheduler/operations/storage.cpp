@@ -36,6 +36,10 @@ StorageStats Scheduler::GetStorageStats() const {
     if (!storage_transfers_) return stats;
     stats.operations = storage_transfers_->NumOperations();
     stats.held_blocks = storage_transfers_->NumHeldBlocks();
+    stats.retained_operations = storage_transfers_->NumRetainedOperations();
+    stats.retained_host_blocks = storage_transfers_->NumRetainedHostBlocks();
+    stats.retained_capacity_exhausted = storage_transfers_->RetainedCapacityExhausted();
+    stats.retained_capacity_warnings = storage_transfers_->NumRetainedCapacityWarnings();
     stats.quarantined = storage_transfers_->NumQuarantined();
     stats.negative_keys = storage_transfers_->NumNegativeKeys();
     stats.backup_candidates = storage_transfers_->NumBackupCandidates();

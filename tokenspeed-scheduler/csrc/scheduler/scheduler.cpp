@@ -209,12 +209,16 @@ bool Scheduler::ClearL1Cache() {
 }
 
 bool Scheduler::ClearCache() {
-    CancelStorageBackups();
     return clearCache(true);
 }
 
 void Scheduler::CancelStorageBackups() {
     if (storage_transfers_) storage_transfers_->CancelBackups();
+}
+
+void Scheduler::CancelStorageForClear() {
+    for (auto& request : requests_) releaseStorage(*request);
+    CancelStorageBackups();
 }
 
 bool Scheduler::CanClearCache() const {
@@ -244,8 +248,7 @@ bool Scheduler::CanClearCacheRetainingStorage() const {
 
 bool Scheduler::ClearCacheRetainingStorage() {
     if (!CanClearCacheRetainingStorage()) return false;
-    for (auto& request : requests_) releaseStorage(*request);
-    CancelStorageBackups();
+    CancelStorageForClear();
     if (storage_transfers_) storage_transfers_->RetainForClear();
     coordinator_.ClearCacheRetainingStorage();
     spdlog::info("[Scheduler] flush completed with old storage references retained; remaining L3 capacity available");
@@ -760,7 +763,8 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         if (storage_allowed_)
             storage_transfers_->StartBackups();
         else
-            storage_transfers_->CancelBackups();
+            storage_transfers_->DropBackups();
+        storage_transfers_->UpdateRetainedCapacityWarning();
         storage_operations = storage_transfers_->TakeCommands();
     }
 

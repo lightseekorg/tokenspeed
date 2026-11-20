@@ -452,6 +452,12 @@ impl Controls {
         self.weight_ops.pop_front()
     }
 
+    /// Return the gated head when cache clearing yields to I/O completions.
+    /// The next round must see the same operation before any later arrivals.
+    pub fn defer_weight_op(&mut self, op: ControlRequest) {
+        self.weight_ops.push_front(op);
+    }
+
     /// Gated operations still queued, frontend or internal: either may
     /// still touch model memory.
     pub fn weights_busy(&self) -> bool {

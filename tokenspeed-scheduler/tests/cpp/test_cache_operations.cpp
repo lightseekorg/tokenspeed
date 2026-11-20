@@ -1905,11 +1905,90 @@ TEST_F(AsyncStorageTransactionTest, RetainedTicketsStillConsumeTheGlobalOperatio
     bounded.TakeCommands();
     bounded.RetainForClear();
     EXPECT_TRUE(bounded.HasRetainedOperations());
+    EXPECT_FALSE(bounded.HasCurrentPending());
+    EXPECT_EQ(bounded.NumRetainedOperations(), 2u);
+    EXPECT_EQ(bounded.NumRetainedHostBlocks(), 0u);
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_TRUE(bounded.RetainedCapacityExhausted());
+    EXPECT_EQ(bounded.NumRetainedCapacityWarnings(), 1u);
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_EQ(bounded.NumRetainedCapacityWarnings(), 1u);
     EXPECT_FALSE(bounded.CanStart());
     EXPECT_FALSE(bounded.StartQuery({key("third")}, {2}));
     bounded.Complete(cache::StorageDone{first_id, {0}, true, {0}});
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_FALSE(bounded.RetainedCapacityExhausted());
     EXPECT_TRUE(bounded.CanStart());
-    EXPECT_TRUE(bounded.StartQuery({key("third")}, {2}));
+    auto third = bounded.StartQuery({key("third")}, {2});
+    EXPECT_TRUE(third);
+    EXPECT_TRUE(bounded.HasCurrentPending());
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_TRUE(bounded.RetainedCapacityExhausted());
+    EXPECT_EQ(bounded.NumRetainedCapacityWarnings(), 2u);
+}
+
+TEST_F(AsyncStorageTransactionTest, RetainedHostCreditsWarnOnlyWhenCapacityBecomesExhausted) {
+    auto limits = storage.Config();
+    limits.max_host_blocks = 2;
+    StorageTransferManager bounded{coordinator, limits};
+    const auto prompt = StoragePrompt(std::span{hashes}.first(1), 2);
+    auto first = bounded.StartRead(prompt, std::array{key("h0")});
+    auto second = bounded.StartRead(prompt, std::array{key("h0")});
+    ASSERT_TRUE(first && second);
+    const auto first_id = first.OperationId();
+    bounded.TakeCommands();
+    first.reset();
+    second.reset();
+    bounded.TakeCommands();
+    bounded.RetainForClear();
+    EXPECT_EQ(bounded.NumRetainedOperations(), 2u);
+    EXPECT_EQ(bounded.NumRetainedHostBlocks(), 2u);
+    EXPECT_EQ(bounded.NumHeldBlocks(), 2u);
+    EXPECT_FALSE(bounded.HasCurrentPending());
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_TRUE(bounded.RetainedCapacityExhausted());
+    for (int round = 0; round < 3; ++round) bounded.UpdateRetainedCapacityWarning();
+    EXPECT_EQ(bounded.NumRetainedCapacityWarnings(), 1u);
+
+    bounded.Complete(cache::StorageDone{first_id, {0}, true, {0}});
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_FALSE(bounded.RetainedCapacityExhausted());
+    EXPECT_EQ(bounded.NumRetainedHostBlocks(), 1u);
+    auto current = bounded.StartRead(prompt, std::array{key("h0")});
+    ASSERT_TRUE(current);
+    const auto current_id = current.OperationId();
+    bounded.TakeCommands();
+    bounded.UpdateRetainedCapacityWarning();
+    EXPECT_TRUE(bounded.RetainedCapacityExhausted());
+    EXPECT_EQ(bounded.NumRetainedCapacityWarnings(), 2u);
+    EXPECT_EQ(bounded.NumRetainedHostBlocks(), 1u);
+    EXPECT_EQ(bounded.NumHeldBlocks(), 2u);
+    bounded.Complete(cache::StorageDone{current_id, {0}, false, {0}});
+    EXPECT_TRUE(bounded.HasCurrentPending()) << "current unknown retirement must still block clear draining";
+    EXPECT_EQ(bounded.NumBlockingQuarantined(), 1u);
+}
+
+TEST_F(AsyncStorageTransactionTest, RetainingClearCountsInvalidatedHostEntriesAsFlushAndKeepsUnsafeSources) {
+    for (const auto& hash : hashes) {
+        auto ref = host.AcquireBlock(0);
+        coordinator.Host().CacheHostBlock(ref, key(hash), std::nullopt);
+    }
+    storage.QueueBackups(std::array{key("h0")});
+    storage.StartBackups();
+    const auto put = std::get<StoragePutOperation>(storage.TakeCommands().front());
+    storage.CancelBackups();
+    storage.RetainForClear();
+    ASSERT_TRUE(coordinator.CacheIsClearableRetainingStorage(storage.HeldBlockRefs()));
+    coordinator.ClearCacheRetainingStorage();
+    EXPECT_EQ(coordinator.Evictor().HostEvictions().flush.blocks, 3u);
+    EXPECT_EQ(coordinator.Evictor().HostEvictions().flush.device_resident, 0u);
+    EXPECT_EQ(host.NumOccupiedSlots(), 1);
+    EXPECT_EQ(storage.NumRetainedHostBlocks(), 1u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(host), 0);
+    coordinator.ClearCacheRetainingStorage();
+    EXPECT_EQ(coordinator.Evictor().HostEvictions().flush.blocks, 3u);
+    storage.Complete(cache::StorageDone{put.op_id, {0}, true, {0}});
+    EXPECT_EQ(host.NumOccupiedSlots(), 0);
 }
 
 TEST(CacheOperationTest, RetainingClearKeepsMixedPackingIoLocationsIdenticalAcrossMirrors) {

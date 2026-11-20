@@ -26,11 +26,11 @@
 //! is given, in a bounded window, and reports per-key facts. It never calls
 //! the scheduler, a collective or the GPU. A job that cannot run (a full
 //! queue, a backend held open after failures, shutdown) completes at once as
-//! a retired failure; a backend that cannot prove retirement disables new
-//! I/O on this rank until restart.
+//! a retired failure; unproven access blocks its generation until explicit
+//! clear recovery while the scheduler keeps its original addresses alive.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -202,6 +202,7 @@ impl Kind {
 struct Job {
     op_id: u64,
     epoch: u64,
+    prefix: String,
     kind: Kind,
     keys: Vec<String>,
     ranges: Vec<Option<Range>>,
@@ -262,10 +263,23 @@ struct State {
     cache_generation: Option<String>,
     /// Unproven I/O in the current generation blocks new jobs until clear.
     io_blocked: bool,
+    /// Prefixes whose completed calls never proved retirement. Their owning
+    /// scheduler tickets retain the matching Host and operation credits.
+    unretired_prefixes: HashSet<String>,
     unsafe_io: bool,
     last_submitted: u64,
     /// Workers still running.
     running_workers: usize,
+}
+
+impl State {
+    fn namespace_has_unretired_io(&self, prefix: &str) -> bool {
+        self.unretired_prefixes.contains(prefix)
+            || self
+                .jobs
+                .values()
+                .any(|job| job.job.epoch != self.epoch && job.job.prefix == prefix)
+    }
 }
 
 /// A permission to call the backend, from one health epoch.
@@ -432,6 +446,7 @@ impl Shared {
         if !result.retired {
             counters.unretired += 1;
             state.unsafe_io = true;
+            state.unretired_prefixes.insert(job.prefix.clone());
             if job.epoch == state.epoch {
                 state.io_blocked = true;
             }
@@ -468,6 +483,7 @@ impl Shared {
             return Err(ExecutorError::Credits);
         }
         let (op_id, kind, num_keys, job_epoch) = (job.op_id, job.kind, job.keys.len(), job.epoch);
+        let scope_blocked = state.namespace_has_unretired_io(&job.prefix);
         let num_bytes = job.num_bytes();
         state.counters[kind.index()].accepted += 1;
         state.jobs.insert(
@@ -484,6 +500,7 @@ impl Shared {
         let queue = &state.queues[kind.index()];
         if state.stopping
             || state.io_blocked
+            || scope_blocked
             || job_epoch != state.epoch
             || queue.len() >= self.config.max_operations
         {
@@ -595,7 +612,11 @@ impl Shared {
         // has an old token or never enters the backend after the generation cut.
         let permission = {
             let state = self.lock();
-            if state.stopping || state.io_blocked || job.epoch != state.epoch {
+            if state.stopping
+                || state.io_blocked
+                || job.epoch != state.epoch
+                || state.namespace_has_unretired_io(&job.prefix)
+            {
                 None
             } else {
                 self.health.begin()
@@ -765,7 +786,10 @@ impl Executor {
         self.shared.prefix.lock().expect("L3 prefix lock").clone()
     }
 
-    fn object_keys(&self, keys: &[StorageKey]) -> Result<(u64, Vec<String>), ExecutorError> {
+    fn object_keys(
+        &self,
+        keys: &[StorageKey],
+    ) -> Result<(u64, String, Vec<String>), ExecutorError> {
         let state = self.shared.lock();
         let prefix = self.key_prefix();
         let names = keys
@@ -780,7 +804,7 @@ impl Executor {
                 ))
             })
             .collect::<Result<Vec<_>, ExecutorError>>()?;
-        Ok((state.epoch, names))
+        Ok((state.epoch, prefix, names))
     }
 
     /// Freeze `keys`' object names and this rank's Host ranges, in the
@@ -801,10 +825,11 @@ impl Executor {
             .zip(host_blocks)
             .map(|(key, &block)| self.shared.layout.owned_range(key.group, block))
             .collect::<Result<Vec<_>, _>>()?;
-        let (epoch, keys) = self.object_keys(keys)?;
+        let (epoch, prefix, keys) = self.object_keys(keys)?;
         Ok(Job {
             op_id,
             epoch,
+            prefix,
             kind,
             keys,
             ranges,
@@ -820,10 +845,11 @@ impl Executor {
                     continue;
                 }
                 Operation::Query { op_id, keys } => {
-                    let (epoch, keys) = self.object_keys(keys)?;
+                    let (epoch, prefix, keys) = self.object_keys(keys)?;
                     Job {
                         op_id: *op_id,
                         epoch,
+                        prefix,
                         kind: Kind::Query,
                         keys,
                         ranges: Vec::new(),
@@ -1005,13 +1031,29 @@ impl Executor {
         Ok(())
     }
 
-    /// Delete the namespace's objects once idle: true when they are gone.
+    /// The active namespace still has unproven access, including an old I/O
+    /// generation returning to this prefix after a weight-version change.
+    pub fn current_namespace_needs_isolation(&self) -> bool {
+        let state = self.shared.lock();
+        let prefix = self.key_prefix();
+        state.io_blocked || state.namespace_has_unretired_io(&prefix)
+    }
+
+    /// Delete only the active namespace after all its jobs retire. Historical
+    /// unknown I/O in other prefixes still protects shutdown, but cannot touch
+    /// this prefix. The control thread must withhold new submissions throughout.
     pub fn delete_namespace(&self) -> bool {
-        if !self.is_idle() {
-            return false;
-        }
-        let prefix = format!("{}_", self.key_prefix());
-        self.shared.store.remove_by_prefix(&prefix)
+        let prefix = {
+            let state = self.shared.lock();
+            let prefix = self.key_prefix();
+            if state.unretired_prefixes.contains(&prefix)
+                || state.jobs.values().any(|job| job.job.prefix == prefix)
+            {
+                return false;
+            }
+            prefix
+        };
+        self.shared.store.remove_by_prefix(&format!("{prefix}_"))
     }
 
     /// Stop the workers within `timeout` and release the store; a later
@@ -1649,7 +1691,9 @@ mod tests {
         assert_eq!(executor.snapshot().health_state, "healthy");
         assert!(executor.snapshot().unsafe_io);
         assert!(!executor.is_idle());
-        assert!(!executor.delete_namespace());
+        // Purging the safe active prefix does not prove that older native
+        // access retired, and does not authorize deregistering the Host pool.
+        assert!(executor.delete_namespace());
         assert!(matches!(
             harness.close(Duration::from_secs(2)),
             Err(ExecutorError::Unretired)
@@ -1807,6 +1851,62 @@ mod tests {
         executor.submit(&[put(2, "fresh", 2)]).unwrap();
         assert_eq!(harness.wait(1)[0].success, [true]);
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn purging_a_safe_generation_preserves_an_older_unretired_namespace() {
+        let memory = Arc::new(MemoryStore::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (stored, puts) = (Arc::clone(&memory), Arc::clone(&calls));
+        let store = TestStore {
+            memory: Arc::clone(&memory),
+            put: Some(Box::new(move |keys, host, ranges| {
+                let mut result = stored.batch_put_from(keys, host, ranges)?;
+                if puts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    result.retired = false;
+                }
+                Ok(result)
+            })),
+            ..TestStore::new()
+        };
+        let mut harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        let original = executor.key_prefix();
+        executor.submit(&[put(1, "old", 1)]).unwrap();
+        assert!(!harness.wait(1)[0].retired);
+        assert!(executor.current_namespace_needs_isolation());
+        assert!(!executor.delete_namespace());
+        executor
+            .begin_cache_generation("00000000000000000000000000000004")
+            .unwrap();
+        let fresh = executor.key_prefix();
+        assert!(!executor.current_namespace_needs_isolation());
+        executor.submit(&[put(2, "new", 2)]).unwrap();
+        assert!(harness.wait(1)[0].retired);
+        assert!(executor.delete_namespace());
+        assert_eq!(memory.keys(), [keys::object_key(&original, "old", 0, 0, 0)]);
+        assert!(!memory.keys().iter().any(|key| key.starts_with(&fresh)));
+        assert!(executor.snapshot().unsafe_io);
+        assert!(!executor.is_idle());
+
+        executor.set_weight_version("v2").unwrap();
+        executor.set_weight_version("v1").unwrap();
+        assert_eq!(executor.key_prefix(), original);
+        assert!(executor.current_namespace_needs_isolation());
+        executor.submit(&[put(3, "must-not-reenter", 2)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [false]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!executor.delete_namespace());
+        executor
+            .begin_cache_generation("00000000000000000000000000000005")
+            .unwrap();
+        executor.submit(&[put(4, "after-return", 3)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        std::mem::forget(std::mem::take(&mut harness.pool));
     }
 
     #[test]
@@ -2565,7 +2665,7 @@ mod tests {
                 page_offset: 0,
             },
         ];
-        let (_, names) = executor.object_keys(&keys).unwrap();
+        let (_, _, names) = executor.object_keys(&keys).unwrap();
         let mut payload = vec![7_u8; 16];
         memory
             .batch_put_from(

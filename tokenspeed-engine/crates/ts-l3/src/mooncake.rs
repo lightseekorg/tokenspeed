@@ -41,10 +41,8 @@ const OBJECT_ALREADY_EXISTS: i32 = -705;
 /// `NO_AVAILABLE_HANDLE`: the master's allocation rejection, before any
 /// source transfer.
 const NO_AVAILABLE_HANDLE: i32 = -200;
-/// Ownership rejection before transfer, or at End after source reads finish.
+/// Ownership rejection at End after the audited default Host transfers finish.
 const ILLEGAL_CLIENT: i32 = -601;
-const RPC_FAIL: i32 = -900;
-const RPC_TIMEOUT: i32 = -901;
 
 /// A store client with the Host pool registered.
 pub struct MooncakeStore {
@@ -90,20 +88,20 @@ impl PutClaim<'_> {
         self.release_on_drop = false;
     }
 
-    fn native_finished(&mut self, source_retired: bool, results: &[i32]) {
-        // A timeout/lost response may leave an old End RPC running. Source
-        // retirement releases Host bytes, but does not authorize another write
-        // with the same client identity while that control result is unknown.
-        self.release_on_drop =
-            source_retired && !results.iter().any(|r| [RPC_FAIL, RPC_TIMEOUT].contains(r));
+    fn native_finished(&mut self, retired: bool) {
+        // The default Host result contract below is the only retirement
+        // evidence. A lost/timed-out End may still act on this client's key;
+        // waiting longer cannot make it safe to release that key's claim.
+        self.release_on_drop = retired;
     }
 }
 
 impl Drop for PutClaim<'_> {
     fn drop(&mut self) {
         if !self.release_on_drop {
-            // The executor quarantines the source too. Do not let another
-            // worker begin a new write while the old native access is unknown.
+            // The executor retains this batch's Host references and operation
+            // credits too, so these keys remain bounded by the same admission
+            // budgets. Do not permit another write while old I/O is unknown.
             return;
         }
         // A guard can drop during unwinding; another panic would abort.
@@ -176,48 +174,32 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
     }
 }
 
-/// A duplicate PUT is published only if a metadata query confirms it readable.
-/// Native lifetime evidence is independent of publication. The legacy Host
-/// C ABI uses the default reliable memory policy: End follows all successful
-/// transfers, and a failed transfer is not hidden by a later Revoke rejection.
-/// Thus ILLEGAL_CLIENT retires sources without proving publication. Unknown
-/// results in the same batch, or explicit negative lifetime evidence, do not.
-fn put_outcome(
-    published: Vec<bool>,
-    missing: &[usize],
-    results: &[i32],
-    source_retired: Option<bool>,
-) -> IoResult {
-    let mut success = published;
+/// Keep the SDK's accepted/existing PUT acknowledgment as a historical hint,
+/// not a promise that another writer's object is readable yet. Actual restore
+/// still needs full-length GET success independently of that acknowledgment.
+/// The audited default Host C ABI uses the reliable memory policy: End follows
+/// successful allocated transfers, and a failed transfer is not hidden by a
+/// later Revoke rejection. ILLEGAL_CLIENT therefore retires sources without
+/// proving publication. This does not generalize to flexible memory/NoF or
+/// custom backend policies; see docs/design/async-l3-cache.md for source links.
+fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
+    let mut success = exists;
     for (&index, &result) in missing.iter().zip(results) {
-        success[index] = if publication_needs_query(result, source_retired) {
-            success[index]
-        } else {
-            result == 0
-        };
+        success[index] = result == 0 || result == OBJECT_ALREADY_EXISTS;
     }
     IoResult {
         object_failures: vec![false; success.len()],
         success,
-        retired: source_retired.unwrap_or_else(|| {
-            results.iter().all(|&result| {
-                [
-                    0,
-                    OBJECT_ALREADY_EXISTS,
-                    NO_AVAILABLE_HANDLE,
-                    ILLEGAL_CLIENT,
-                ]
-                .contains(&result)
-            })
+        retired: results.iter().all(|&result| {
+            [
+                0,
+                OBJECT_ALREADY_EXISTS,
+                NO_AVAILABLE_HANDLE,
+                ILLEGAL_CLIENT,
+            ]
+            .contains(&result)
         }),
     }
-}
-
-fn publication_needs_query(result: i32, source_retired: Option<bool>) -> bool {
-    // The legacy SDK also turns a duplicate's ALREADY_EXISTS into zero, even
-    // when the other writer has not published. The v1 extension preserves that
-    // rejection and reserves zero for this write's successful End.
-    result == OBJECT_ALREADY_EXISTS || (result == 0 && source_retired.is_none())
 }
 
 /// The objects of the namespace `prefix`, as the store's regular expression.
@@ -227,8 +209,8 @@ fn namespace_pattern(prefix: &str) -> String {
 
 impl Store for MooncakeStore {
     fn failures_retire(&self) -> bool {
-        // A failed SDK call does not prove that RDMA stopped using the Host
-        // bytes.
+        // A top-level SDK error supplies no per-key status vector and does not
+        // prove that native access to the Host bytes stopped.
         false
     }
 
@@ -280,7 +262,7 @@ impl Store for MooncakeStore {
         }
         // A metadata failure precedes any access to the source bytes: no
         // write starts, and nothing is left reading them.
-        let mut exists = match self.batch_exists(keys) {
+        let exists = match self.batch_exists(keys) {
             Ok(exists) => exists,
             Err(error) => {
                 tracing::error!(%error, "Mooncake existence query before PUT failed");
@@ -295,40 +277,18 @@ impl Store for MooncakeStore {
         let mut claim = self.in_flight_puts.claim(keys, &candidates);
         let missing: Vec<usize> = claim.entries.iter().map(|(index, _)| *index).collect();
         if missing.is_empty() {
-            return Ok(put_outcome(exists, &missing, &[], Some(true)));
+            return Ok(put_outcome(exists, &missing, &[]));
         }
         let put_keys: Vec<String> = missing.iter().map(|&i| keys[i].clone()).collect();
         let put_ranges: Vec<Range> = missing.iter().map(|&i| ranges[i]).collect();
         let (addrs, sizes) = Self::addresses(host, &put_ranges);
         claim.native_started();
-        let outcome = self
+        let results = self
             .client
-            .batch_put_from_with_retirement(&put_keys, &addrs, &sizes)
+            .batch_put_from(&put_keys, &addrs, &sizes)
             .map_err(failed)?;
-        // A duplicate may still be in progress. Legacy SDKs can also collapse
-        // that rejection into zero, so both legacy statuses need confirmation.
-        let unconfirmed: Vec<usize> = outcome
-            .results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &result)| {
-                publication_needs_query(result, outcome.source_retired).then_some(i)
-            })
-            .collect();
-        if !unconfirmed.is_empty() {
-            let unconfirmed_keys: Vec<String> =
-                unconfirmed.iter().map(|&i| put_keys[i].clone()).collect();
-            match self.batch_exists(&unconfirmed_keys) {
-                Ok(published) => {
-                    for (&i, readable) in unconfirmed.iter().zip(published) {
-                        exists[missing[i]] = readable;
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "PUT publication is unconfirmed"),
-            }
-        }
-        let result = put_outcome(exists, &missing, &outcome.results, outcome.source_retired);
-        claim.native_finished(result.retired, &outcome.results);
+        let result = put_outcome(exists, &missing, &results);
+        claim.native_finished(result.retired);
         Ok(result)
     }
 
@@ -364,6 +324,9 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
 
+    const RPC_FAIL: i32 = -900;
+    const RPC_TIMEOUT: i32 = -901;
+
     #[test]
     fn put_claims_filter_only_overlapping_objects_and_release_before_submission() {
         let registry = InFlightPuts::default();
@@ -386,13 +349,22 @@ mod tests {
     }
 
     #[test]
-    fn native_put_claims_are_released_only_with_retirement_evidence() {
-        for retired in [true, false] {
+    fn default_host_put_results_release_only_safely_retired_claims() {
+        for (result, retired) in [
+            (0, true),
+            (OBJECT_ALREADY_EXISTS, true),
+            (NO_AVAILABLE_HANDLE, true),
+            (ILLEGAL_CLIENT, true),
+            (-800, false),
+            (-1, false),
+        ] {
             let registry = InFlightPuts::default();
             let keys = vec!["a".to_owned()];
             let mut claim = registry.claim(&keys, &[0]);
             claim.native_started();
-            claim.native_finished(retired, &[0]);
+            let outcome = put_outcome(vec![false], &[0], &[result]);
+            assert_eq!(outcome.retired, retired);
+            claim.native_finished(outcome.retired);
             drop(claim);
             let next = registry.claim(&keys, &[0]);
             assert_eq!(next.entries.is_empty(), !retired);
@@ -400,21 +372,33 @@ mod tests {
     }
 
     #[test]
-    fn source_retirement_does_not_release_a_claim_with_an_unknown_end_rpc() {
+    fn an_unknown_end_rpc_retains_both_the_put_claim_and_source_ownership() {
         for result in [RPC_FAIL, RPC_TIMEOUT] {
             let registry = InFlightPuts::default();
             let keys = vec!["a".to_owned()];
             let mut claim = registry.claim(&keys, &[0]);
             claim.native_started();
-            let outcome = put_outcome(vec![false], &[0], &[result], Some(true));
+            let outcome = put_outcome(vec![false], &[0], &[result]);
             assert_eq!(outcome.success, [false]);
-            assert!(outcome.retired); // The buffer can be released independently.
-            claim.native_finished(outcome.retired, &[result]);
+            assert!(!outcome.retired);
+            claim.native_finished(outcome.retired);
             drop(claim);
             assert!(registry.claim(&keys, &[0]).entries.is_empty());
             let next_namespace = vec!["v2/a".to_owned()];
             assert_eq!(registry.claim(&next_namespace, &[0]).entries.len(), 1);
         }
+    }
+
+    #[test]
+    fn a_native_call_without_a_result_does_not_release_its_claim() {
+        let registry = InFlightPuts::default();
+        let keys = vec!["a".to_owned()];
+        {
+            let mut claim = registry.claim(&keys, &[0]);
+            claim.native_started();
+            // A failed SDK call returns through `?` without a status vector.
+        }
+        assert!(registry.claim(&keys, &[0]).entries.is_empty());
     }
 
     #[test]
@@ -448,17 +432,12 @@ mod tests {
     fn existing_objects_are_not_rewritten_and_rejections_retire() {
         // `existing` is stored; `saved` writes; `pressure` meets a full
         // store, a failure the scheduler offers again.
-        let outcome = put_outcome(
-            vec![true, true, false],
-            &[1, 2],
-            &[0, NO_AVAILABLE_HANDLE],
-            None,
-        );
+        let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
         assert_eq!(outcome.success, [true, true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false, false, false]);
-        // Another writer's create succeeds only after publication is verified.
-        let outcome = put_outcome(vec![true], &[0], &[OBJECT_ALREADY_EXISTS], None);
+        // Another writer's accepted create keeps the SDK's best-effort ACK.
+        let outcome = put_outcome(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]);
         assert_eq!(outcome.success, [true]);
         assert!(outcome.retired);
     }
@@ -466,64 +445,76 @@ mod tests {
     #[test]
     fn a_failed_put_does_not_retire() {
         for error in [-1, -800] {
-            let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, error], None);
+            let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, error]);
             assert_eq!(outcome.success, [true, true, false]);
             assert!(!outcome.retired);
         }
     }
 
     #[test]
-    fn an_in_progress_duplicate_is_retired_without_publication() {
+    fn zero_and_duplicate_results_keep_the_existing_sdk_ack_semantics() {
         for result in [0, OBJECT_ALREADY_EXISTS] {
-            let outcome = put_outcome(vec![false], &[0], &[result], None);
-            assert_eq!(outcome.success, [false]);
+            let outcome = put_outcome(vec![false], &[0], &[result]);
+            assert_eq!(outcome.success, [true]);
             assert!(outcome.retired);
             assert_eq!(outcome.object_failures, [false]);
         }
-        // V1 has an authoritative successful End, independent of a later query.
-        let outcome = put_outcome(vec![false], &[0], &[0], Some(true));
-        assert_eq!(outcome.success, [true]);
     }
 
     #[test]
-    fn publication_confirmation_never_proves_source_retirement() {
-        for result in [0, OBJECT_ALREADY_EXISTS] {
-            let outcome = put_outcome(vec![true], &[0], &[result], Some(false));
-            assert_eq!(outcome.success, [true]);
-            assert!(!outcome.retired);
-        }
-    }
-
-    #[test]
-    fn metadata_rejection_retires_the_default_host_put_unless_native_proof_denies_it() {
-        for (native, retired) in [(None, true), (Some(false), false), (Some(true), true)] {
-            let outcome = put_outcome(vec![true, false], &[0, 1], &[0, ILLEGAL_CLIENT], native);
-            assert_eq!(outcome.success, [true, false]);
-            assert_eq!(outcome.retired, retired);
-            assert_eq!(outcome.object_failures, [false, false]);
-        }
-        // A backend's explicit lack of proof overrides a successful return code.
-        let outcome = put_outcome(vec![false], &[0], &[0], Some(false));
-        assert!(!outcome.retired);
-    }
-
-    #[test]
-    fn a_legacy_owner_rejection_does_not_hide_another_keys_unknown_transfer() {
+    fn a_put_ack_does_not_retire_another_keys_unknown_io() {
         for unknown in [-800, RPC_FAIL, RPC_TIMEOUT, -1] {
-            let outcome = put_outcome(
-                vec![false, false],
-                &[0, 1],
-                &[ILLEGAL_CLIENT, unknown],
-                None,
-            );
-            assert_eq!(outcome.success, [false, false]);
+            let outcome = put_outcome(vec![false, false], &[0, 1], &[0, unknown]);
+            assert_eq!(outcome.success, [true, false]);
             assert!(!outcome.retired);
             assert_eq!(outcome.object_failures, [false, false]);
         }
     }
 
     #[test]
-    fn retired_legacy_owner_rejections_are_failed_writes_without_poisoning_objects() {
+    fn a_put_ack_does_not_override_a_later_get_miss_or_short_read() {
+        for status in [0, OBJECT_ALREADY_EXISTS] {
+            let ack = put_outcome(vec![false], &[0], &[status]);
+            assert_eq!(ack.success, [true]);
+            assert!(ack.retired);
+            for result in [OBJECT_NOT_FOUND, 4] {
+                let read = get_outcome(&[result], &[8]);
+                assert_eq!(read.success, [false]);
+                assert!(read.retired);
+                assert_eq!(read.object_failures, [true]);
+            }
+        }
+    }
+
+    #[test]
+    fn an_owner_rejection_retires_default_host_sources_without_publication() {
+        let outcome = put_outcome(vec![true, true], &[0, 1], &[0, ILLEGAL_CLIENT]);
+        assert_eq!(outcome.success, [true, false]);
+        assert!(outcome.retired);
+        assert_eq!(outcome.object_failures, [false, false]);
+    }
+
+    #[test]
+    fn an_owner_rejection_does_not_hide_another_keys_unknown_transfer() {
+        for unknown in [-800, RPC_FAIL, RPC_TIMEOUT, -1] {
+            for results in [[ILLEGAL_CLIENT, unknown], [unknown, ILLEGAL_CLIENT]] {
+                let registry = InFlightPuts::default();
+                let keys = vec!["a".to_owned(), "b".to_owned()];
+                let mut claim = registry.claim(&keys, &[0, 1]);
+                claim.native_started();
+                let outcome = put_outcome(vec![false, false], &[0, 1], &results);
+                assert_eq!(outcome.success, [false, false]);
+                assert!(!outcome.retired);
+                assert_eq!(outcome.object_failures, [false, false]);
+                claim.native_finished(outcome.retired);
+                drop(claim);
+                assert!(registry.claim(&keys, &[0, 1]).entries.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn default_host_statuses_keep_sdk_acks_separate_from_source_retirement() {
         let outcome = put_outcome(
             vec![false; 4],
             &[0, 1, 2, 3],
@@ -533,9 +524,8 @@ mod tests {
                 OBJECT_ALREADY_EXISTS,
                 NO_AVAILABLE_HANDLE,
             ],
-            None,
         );
-        assert_eq!(outcome.success, [false; 4]);
+        assert_eq!(outcome.success, [false, true, true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false; 4]);
     }

@@ -396,6 +396,10 @@ pub fn scheduler_stats(stats: StorageStatsView) -> L3SchedulerStats {
     L3SchedulerStats {
         operations: stats.operations as f64,
         held_blocks: stats.held_blocks as f64,
+        retained_operations: stats.retained_operations as f64,
+        retained_host_blocks: stats.retained_host_blocks as f64,
+        retained_capacity_exhausted: stats.retained_capacity_exhausted,
+        retained_capacity_warnings: stats.retained_capacity_warnings as f64,
         quarantined: stats.quarantined as f64,
         negative_keys: stats.negative_keys as f64,
         backup_candidates: stats.backup_candidates as f64,

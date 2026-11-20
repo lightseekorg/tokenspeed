@@ -418,6 +418,15 @@ void CacheEvictor::FlushHostEntry(std::uint32_t group_id, CacheBlockLocation loc
     ++host_evictions_.flush.blocks;
 }
 
+void CacheEvictor::InvalidateHostEntries() {
+    const BlockPool* pool = store_.HostPool();
+    if (pool == nullptr) return;
+    for (auto& group : store_.Groups()) {
+        host_evictions_.flush.blocks += group.Index().NumEntries(*pool);
+        group.Index().Invalidate(*pool);
+    }
+}
+
 void CacheEvictor::RecordTail(const ContentHash& prior, const TailPublication& tail) {
     const std::optional<TailTable::Tail> dropped = store_.Boundaries().RecordTail(prior, tail.tail_tokens, tail.hash);
     if (!dropped) {

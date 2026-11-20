@@ -657,6 +657,65 @@ fn a_detached_request_cancels_its_storage_operation() {
     assert!(ops[1].op_id > query.op_id);
 }
 
+#[test]
+fn retaining_clear_separates_old_tickets_from_current_quarantine() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler
+        .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
+        .unwrap();
+    let query = scheduler.next_execution_plan(true, false).storage_ops()[0].clone();
+    scheduler
+        .advance_head(
+            &StorageRound {
+                done: vec![StorageDoneView {
+                    op_id: query.op_id,
+                    success: vec![1; query.keys.len()],
+                    retired: true,
+                    object_failures: vec![0; query.keys.len()],
+                }],
+                ..tick(2)
+            },
+            &[],
+        )
+        .unwrap();
+    let get = scheduler.next_execution_plan(true, false).storage_ops()[0].clone();
+    assert_eq!(get.kind, StorageOpKind::Get);
+    assert!(!get.host_blocks.is_empty());
+    scheduler
+        .advance_head(
+            &StorageRound {
+                done: vec![StorageDoneView {
+                    op_id: get.op_id,
+                    success: vec![0; get.keys.len()],
+                    retired: false,
+                    object_failures: vec![0; get.keys.len()],
+                }],
+                ..tick(3)
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(scheduler.storage_current_pending());
+    assert_eq!(scheduler.storage_blocking_quarantined(), 1);
+    assert!(scheduler.storage_non_storage_clearable());
+    assert_eq!(scheduler.storage_stats().retained_operations, 0);
+    scheduler.cancel_storage_for_clear();
+    assert!(scheduler.clear_cache_retaining_storage());
+    assert!(scheduler.storage_pending());
+    assert!(!scheduler.storage_current_pending());
+    assert_eq!(scheduler.storage_blocking_quarantined(), 0);
+    let stats = scheduler.storage_stats();
+    assert_eq!(stats.operations, 1);
+    assert_eq!(stats.retained_operations, 1);
+    assert_eq!(stats.retained_host_blocks, get.host_blocks.len() as u64);
+    assert_eq!(stats.held_blocks, stats.retained_host_blocks);
+    assert_eq!(stats.retained_capacity_warnings, 0);
+    assert!(!stats.retained_capacity_exhausted);
+}
+
 /// A small scheduler of `role` whose one group transfers its suffix.
 fn pd_scheduler(role: &str) -> String {
     NEW_SCHEDULER.replace(

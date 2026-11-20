@@ -162,9 +162,7 @@ bool CacheCoordinator::CacheIsClearableRetainingStorage(std::span<const CacheBlo
 
 void CacheCoordinator::ClearCacheRetainingStorage() {
     FatalCheck(ClearDeviceCache(), "retaining-storage clear keeps its Device preflight valid");
-    if (BlockPool* pool = store_.HostPool()) {
-        for (auto& group : store_.Groups()) group.Index().Invalidate(*pool);
-    }
+    evictor_.InvalidateHostEntries();
     store_.Boundaries().ClearAfterCacheClear();
     store_.Checkpoints().Clear();
 }

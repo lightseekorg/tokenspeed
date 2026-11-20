@@ -318,6 +318,10 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
     let scheduler = L3SchedulerStats {
         operations: 1.0,
         held_blocks: 2.0,
+        retained_operations: 1.0,
+        retained_host_blocks: 2.0,
+        retained_capacity_exhausted: true,
+        retained_capacity_warnings: 2.0,
         quarantined: 1.0,
         negative_keys: 1.0,
         wait_timeouts: 1.0,
@@ -368,6 +372,7 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         ("tokenspeed:l3_backend_state", &[], 1.0),
         ("tokenspeed:l3_backend_epoch", &[], 3.0),
         ("tokenspeed:l3_io_quarantined", &[], 1.0),
+        ("tokenspeed:l3_retained_capacity_warnings_total", &[], 2.0),
         ("tokenspeed:l3_pressure_bypasses_total", &[], 3.0),
         ("tokenspeed:l3_pressure_dropped_backup_keys_total", &[], 7.0),
         (
@@ -404,6 +409,21 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
             "tokenspeed:l3_scheduler_resources",
             &[("resource", "held_blocks")],
             2.0,
+        ),
+        (
+            "tokenspeed:l3_scheduler_resources",
+            &[("resource", "retained_operations")],
+            1.0,
+        ),
+        (
+            "tokenspeed:l3_scheduler_resources",
+            &[("resource", "retained_host_blocks")],
+            2.0,
+        ),
+        (
+            "tokenspeed:l3_scheduler_resources",
+            &[("resource", "retained_capacity_exhausted")],
+            1.0,
         ),
         (
             "tokenspeed:l3_scheduler_resources",
