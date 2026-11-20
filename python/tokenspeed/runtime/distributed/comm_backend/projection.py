@@ -585,7 +585,7 @@ class ProjectionBackend:
         _check_workspace(rows, workspace, self._fallback)
         fused(
             workspace.fused_column,
-            inputs.contiguous(),
+            inputs,
             weight,
             weight_scales,
             owner_rows,
@@ -629,22 +629,14 @@ class ProjectionBackend:
             )
 
             _check_workspace(rows, workspace, self._fallback)
-            output = out[: inputs.shape[0]]
-            # Alignment is rank-local. Stage the output without changing the
-            # collective chosen by this rank or its peers.
-            aligned_output = (
-                torch.empty_like(output) if output.data_ptr() % 16 else output
-            )
             cute_dsl_fused_bf16_dp_row_linear(
                 workspace.fused_row,
-                inputs.contiguous(),
+                inputs,
                 weight,
                 None,
                 owner_rows,
-                aligned_output,
+                out[: inputs.shape[0]],
             )
-            if aligned_output is not output:
-                output.copy_(aligned_output)
             return True
         if (
             weight.dtype != torch.float8_e4m3fn
@@ -660,14 +652,12 @@ class ProjectionBackend:
         _check_workspace(rows, workspace, self._fallback)
         cute_dsl_fused_fp8_dp_row_linear(
             workspace.fused_row,
-            inputs.contiguous(),
+            inputs,
             weight,
             weight_scales,
             owner_rows,
             out[: inputs.shape[0]],
-            input_scales=(
-                input_scales.contiguous() if input_scales is not None else None
-            ),
+            input_scales=input_scales,
         )
         return True
 

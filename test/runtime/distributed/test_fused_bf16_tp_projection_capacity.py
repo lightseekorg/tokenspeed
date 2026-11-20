@@ -112,16 +112,6 @@ def _worker(rank, rendezvous):
                 total.add_(partial.float())
             return total.to(torch.bfloat16)
 
-        def caller_output(rows):
-            # Only one rank needs an aligned staging buffer. All four must
-            # still enter the same fused collective.
-            offset = int(rank == 0)
-            elements = rows * output_size
-            storage = torch.empty(
-                elements + offset, dtype=torch.bfloat16, device=device
-            )
-            return storage[offset:].view(rows, output_size)
-
         # Cross the cooperative row ACK protocol in both directions while
         # sharing one large-capacity state, including changing empty owners.
         equal_512 = (512,) * world_size
@@ -154,6 +144,15 @@ def _worker(rank, rendezvous):
             )
             for counts in counts_list
         ]
+        caller_output_shape = (inputs[0].shape[0], output_size)
+        # Reject the same invalid layout on every rank before any launch.
+        invalid_storage = inputs[0].new_empty(
+            (caller_output_shape[0] * output_size + 1,)
+        )
+        invalid_output = invalid_storage[1:].view(caller_output_shape)
+        with pytest.raises(ValueError, match="out must be 16-byte aligned"):
+            linear(inputs[0], ctx=contexts[0], out=invalid_output)
+
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         retained = []
@@ -161,7 +160,7 @@ def _worker(rank, rendezvous):
             for case_index, (x, ctx) in enumerate(zip(inputs, contexts)):
                 expected = reference(x)
                 epoch = int(state.input_flags[0])
-                out = caller_output(x.shape[0]) if case_index == 0 else None
+                out = x.new_empty(caller_output_shape) if case_index == 0 else None
                 actual, bias = linear(x, ctx=ctx, out=out)
                 assert bias is None
                 if out is not None:
@@ -203,7 +202,7 @@ def _worker(rank, rendezvous):
         else:
             alias_output = alias_input.new_empty((512, output_size))
         caller_outputs = {
-            0: caller_output(inputs[0].shape[0]),
+            0: inputs[0].new_empty(caller_output_shape),
             alias_case: alias_output,
         }
         gc.collect()

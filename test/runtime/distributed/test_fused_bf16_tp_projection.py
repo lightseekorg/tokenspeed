@@ -234,6 +234,26 @@ def _worker(
                 # Keep native coverage for batches below the runtime cutoff.
                 run(state, x, weight, weight_scales, counts, out)
 
+        # Give every rank invalid operands so the test can catch the error
+        # without leaving a peer inside a collective.
+        counts = (dispatch_rows,) * world_size
+        invalid_input = torch.zeros(
+            (input_size, dispatch_rows), dtype=torch.bfloat16, device=device
+        ).T
+        out = invalid_input.new_empty((dispatch_rows, output_size))
+        with pytest.raises(ValueError, match="inputs must be contiguous"):
+            project(invalid_input, counts, out)
+
+        if quantized and kind == "row":
+            fp8_input = invalid_input.contiguous().to(torch.float8_e4m3fn)
+            scales = torch.ones(
+                (dispatch_rows, input_size // 64), dtype=torch.float32, device=device
+            )[:, ::2]
+            with pytest.raises(ValueError, match="input_scales must be contiguous"):
+                backend.try_fused_dp_row_linear(
+                    fp8_input, scales, weight, weight_scales, counts, out, workspace
+                )
+
         inputs = [values((counts[rank], input_size)) for counts in counts_list]
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())

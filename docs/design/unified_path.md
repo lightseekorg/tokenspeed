@@ -477,6 +477,10 @@ channels through the `scale` argument to `DPRowParallelLinear.forward`. All rank
 use the same input format. Empty ranks on the E4M3 path supply empty inputs and
 scales.
 
+Fused projections require contiguous tensors with 16-byte aligned data
+pointers. An invalid layout raises before the local kernel launch. Callers
+must treat this as failure of the TP group.
+
 Prepared FP8 row buckets can transpose activation scales inside 128-row blocks
 so each K group's scales occupy consecutive shared-memory banks. The exchange
 and GEMM use the same layout. This is limited to aligned owner boundaries,

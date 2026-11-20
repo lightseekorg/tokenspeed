@@ -560,20 +560,23 @@ class FusedTPProjectionState:
             raise ValueError("Block-FP8 projection requires weight scales")
         tensors = [
             (
+                "inputs",
                 inputs,
                 (rows, self.input_size),
                 torch.float8_e4m3fn if input_scales is not None else torch.bfloat16,
             ),
             (
+                "weight",
                 weight,
                 (self.shard_size, self.gemm_input_size),
                 torch.float8_e4m3fn if self.quantized else torch.bfloat16,
             ),
-            (out, (rows, self.output_size), torch.bfloat16),
+            ("out", out, (rows, self.output_size), torch.bfloat16),
         ]
         if weight_scales is not None:
             tensors.append(
                 (
+                    "weight_scales",
                     weight_scales,
                     (self.shard_size // 128, self.gemm_input_size // 128),
                     torch.float32,
@@ -581,17 +584,27 @@ class FusedTPProjectionState:
             )
         if input_scales is not None:
             tensors.append(
-                (input_scales, (rows, self.input_size // 128), torch.float32)
+                (
+                    "input_scales",
+                    input_scales,
+                    (rows, self.input_size // 128),
+                    torch.float32,
+                )
             )
-        for tensor, shape, dtype in tensors:
+        for name, tensor, shape, dtype in tensors:
             if (
                 tensor.shape != shape
                 or tensor.dtype != dtype
                 or tensor.device != self.device
-                or not tensor.is_contiguous()
-                or tensor.data_ptr() % 16
             ):
-                raise ValueError("Incompatible fused TP projection tensor")
+                raise ValueError(
+                    f"Fused TP projection {name} must have shape {shape} "
+                    f"and dtype {dtype} on {self.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"Fused TP projection {name} must be contiguous")
+            if tensor.data_ptr() % 16:
+                raise ValueError(f"Fused TP projection {name} must be 16-byte aligned")
         if live_rows == 0:
             return out
         self.compiled[bucket, inputs.dtype](
