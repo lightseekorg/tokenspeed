@@ -1523,6 +1523,27 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
         MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
+def test_int8_payload_without_iris_fails_startup_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prefill-collective-payload int8-block16 encodes only Iris owned-row
+    collectives: a server whose Iris cannot be prepared refuses it at startup
+    instead of serving with the flag inert."""
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", "int8-block16"
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
 @requires_gpu
 def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
     bf16_default_dtype,
