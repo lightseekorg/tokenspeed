@@ -2137,6 +2137,43 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
     assert kwargs == expected
 
 
+def test_prefill_tuning_ceiling_includes_graph_padding():
+    def warm(*, input_ids, **kwargs):
+        assert input_ids.numel() == 16
+
+    events = []
+    capacity = 16384
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(
+            chunked_prefill_size=16,
+            context_len=4096,
+            prefill_only=True,
+            disable_autotune=True,
+        ),
+        forward=warm,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(capacity, dtype=torch.int32),
+            positions_buf=torch.zeros(capacity, dtype=torch.int64),
+            max_bs=8,
+            max_num_tokens=capacity,
+            on_fill_dummy=lambda **kwargs: None,
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            lambda tokens, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(),
+        drafter=None,
+        model_input_kwargs=lambda tokens, bs, rows: {},
+        events=events,
+    )
+    previous = tuning_module.get_autotune_max_num_tokens()
+    try:
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+        assert tuning_module.get_autotune_max_num_tokens() == capacity
+    finally:
+        tuning_module.set_autotune_max_num_tokens(previous)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 

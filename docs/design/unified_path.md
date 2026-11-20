@@ -2234,6 +2234,13 @@ with one variant per token bucket and request count. `ModelExecutorConfig`
 requires this field explicitly: factories forward the configured list or `None`
 for the default, so missing configuration wiring fails at
 construction. Token buckets still follow the shared prefill token ladder.
+The default token ceiling is bounded by the scheduler's chunk budget. An
+explicit larger `prefill_graph_max_tokens` is a physical graph capacity and
+must be preserved through capture and input-buffer sizing. It leaves room
+for unused scan slots when a full live chunk rounds up to a request capacity.
+The scheduler continues to count live tokens against its issue budget. Replay
+can select the next captured token bucket with that room, or retain the
+ordinary attention breaks when none fits.
 Capture requests have positive lengths and fit the model context and request
 buffers. At replay, unused execution slots have zero convolution length,
 negative state-block indices and one padding row each in the scan, past the
