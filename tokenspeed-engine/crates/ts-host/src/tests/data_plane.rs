@@ -30,6 +30,8 @@ use super::*;
 
 #[path = "data_plane/cpu_benchmark.rs"]
 mod cpu_benchmark;
+#[path = "data_plane/pd_notice.rs"]
+mod pd_notice;
 #[path = "data_plane/result_buffers.rs"]
 mod result_buffers;
 
