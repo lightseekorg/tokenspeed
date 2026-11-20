@@ -443,6 +443,8 @@ class ModelExecutorConfig:
     decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
+    # Explicit None inherits the token ladder for the narrowing decoder.
+    prefill_graph_decoder_capture_sizes: list[int] | None
     # Prompt-logprob gather: how many prompt rows go through the LM head at
     # once (``--input-logprob-chunk-tokens``). Bounds the transient
     # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
@@ -576,6 +578,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+            prefill_graph_decoder_capture_sizes=server_args.prefill_graph_decoder_capture_sizes,
             state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
@@ -1622,7 +1625,8 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
-                request_token_history=model_kwargs.get("request_token_history"),
+                positions=positions,
+                model_kwargs=model_kwargs,
             )
         if (
             mode is not None

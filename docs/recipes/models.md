@@ -1439,8 +1439,24 @@ token bucket and decoder graphs per decoder-row bucket, the latter shared by
 every token bucket and capped at 128 rows per request
 (`--max-num-seqs` × 128, see
 [`docs/design/unified_path.md`](../design/unified_path.md#prefill-graphs-around-a-row-narrowing)).
-`--prefill-graph-capture-sizes` sets both ladders. `--disable-prefill-graph`
-turns both off. Decode CUDA graphs are unaffected.
+`--prefill-graph-capture-sizes` sets the encoder token ladder; the decoder
+inherits it unless `--prefill-graph-decoder-capture-sizes` overrides its row
+capacities. Both obey `--prefill-graph-max-tokens` and the chunk limit, and
+the decoder is also bounded by its per-request window and rank-local request
+capacity. For small prefills, a starting configuration is:
+
+```bash
+--prefill-graph-max-tokens 384 \
+--prefill-graph-capture-sizes 128 256 384 \
+--prefill-graph-decoder-capture-sizes 128 256 384
+```
+
+Keep the scheduling budget separate: a 4096-token prefill can run its encoder
+eagerly and replay a fitting decoder graph. These flags do not capture a
+4096-token graph. V4.1 vision encoding and embedding merge stay eager; image
+masks are refreshed through the token graph, and text-only prefills in a
+multimodal deployment use an all-False mask. `--disable-prefill-graph` turns
+both stages off. Decode CUDA graphs are unaffected.
 
 ```bash
 tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \

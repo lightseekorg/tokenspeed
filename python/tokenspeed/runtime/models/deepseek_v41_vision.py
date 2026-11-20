@@ -41,6 +41,22 @@ from tokenspeed.runtime.utils.env import envs
 
 
 @lru_cache(maxsize=16)
+def _get_vision_cos_sin_cpu(
+    n_h: int,
+    n_w: int,
+    dim: int,
+    theta: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim)
+    )
+    hpos = torch.arange(n_h, device="cpu").unsqueeze(1).expand(n_h, n_w)
+    wpos = torch.arange(n_w, device="cpu").unsqueeze(0).expand(n_h, n_w)
+    freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
+    freqs = freqs.flatten(1)
+    return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
+
+
 def get_vision_cos_sin(
     n_h: int,
     n_w: int,
@@ -48,12 +64,13 @@ def get_vision_cos_sin(
     theta: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    hpos = torch.arange(n_h).unsqueeze(1).expand(n_h, n_w)
-    wpos = torch.arange(n_w).unsqueeze(0).expand(n_h, n_w)
-    freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
-    freqs = freqs.flatten(1)
-    return freqs.cos().unsqueeze(1).to(device), freqs.sin().unsqueeze(1).to(device)
+    """Return per-grid RoPE tables on ``device``, retaining only CPU storage.
+
+    Vision runs eagerly, so its GPU copies can die with the forward instead
+    of pinning ordinary allocator segments across weights release/resume.
+    """
+    cos, sin = _get_vision_cos_sin_cpu(n_h, n_w, dim, theta)
+    return cos.to(device), sin.to(device)
 
 
 def apply_vision_rotary(

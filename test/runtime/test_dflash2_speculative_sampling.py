@@ -355,6 +355,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
+        prefill_graph_decoder_capture_sizes=None,
         input_logprob_chunk_tokens=N,
         enable_speculative_sampling=True,
         enable_dp_local_cuda_graph=False,

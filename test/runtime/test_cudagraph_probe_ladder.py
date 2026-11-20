@@ -53,6 +53,9 @@ from tokenspeed.runtime.execution.prefill_graph import (  # noqa: E402
     PrefillGraph,
 )
 from tokenspeed.runtime.layers.attention import registry  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
+    TorchMemorySaverAdapter,
+)
 
 WIDTH = cudagraph_memory.PROBE_ENTRIES_PER_LADDER
 
@@ -110,7 +113,13 @@ def _prefill_graph(buckets, *, decoder_buckets=None, context_len=4096, sizes=Non
         narrowing_forward=lambda _encoded, _ctx: SimpleNamespace(
             land_into=lambda _statics: None
         ),
+        encoder_forward=lambda _ids, _positions, ctx, **_kwargs: ("encoded", ctx.rows),
     )
+    graph.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    graph._compute_input_embeddings = lambda ids, ctx, *, request_token_history: (
+        torch.zeros(ids.numel(), 1)
+    )
+    graph._model_inputs = lambda rows, ctx, embeds: (None, None, {})
     graph.config = SimpleNamespace(
         global_rank=1,
         device="cpu",
@@ -362,7 +371,9 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     monkeypatch.setattr(
         prefill_graph,
         "BreakableCapture",
-        lambda pool, stream, handoff_storage: _Recorder("capture", pool, stream),
+        lambda pool, stream, handoff_storage, *, run_segments_while_capturing: _Recorder(
+            "capture", pool, stream
+        ),
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
     monkeypatch.setattr(torch.cuda, "stream", on_stream)
@@ -482,7 +493,9 @@ def test_narrowing_decoders_share_outputs_and_encoders_keep_their_handoffs(
     given = []
 
     class _Capture:
-        def __init__(self, pool, stream, handoff_storage):
+        def __init__(
+            self, pool, stream, handoff_storage, *, run_segments_while_capturing
+        ):
             given.append(handoff_storage)
             self.pool = pool or "pool"
             self.stream = SimpleNamespace(wait_stream=lambda _stream: None)

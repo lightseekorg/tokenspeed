@@ -40,6 +40,7 @@ from torch import nn
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution import input_buffer, model_executor, weight_loader
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -865,6 +866,9 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     num_tokens = 0 if mode == ForwardMode.IDLE else 2
 
     class Model:
+        def __init__(self):
+            self.is_multimodal_active = False
+
         def forward(self, ctx, input_ids, positions, **kwargs):
             return DeepseekV41ForCausalLM.prepare_model_kwargs(
                 self, ctx, input_ids, kwargs
@@ -963,7 +967,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         events.append("forward")
 
     runner = ModelRunner.__new__(ModelRunner)
-    runner.model = SimpleNamespace(forward=forward)
+    runner.model = SimpleNamespace(forward=forward, is_multimodal_active=False)
     runner.is_generation = True
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
@@ -993,13 +997,13 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.model_runner = runner
     executor.drafter = None
     executor._samples_from_vocab_shard = False
+    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     pg = PrefillGraph.__new__(PrefillGraph)
-    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    pg.memory_saver_adapter = executor.memory_saver_adapter
     pg.config = executor.config
     pg.input_buffers = ib
     pg.attn_backend = SimpleNamespace(init_forward_metadata=init_metadata)
     pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
-    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     pg.dp_size = 1
     pg.drafter = None
     executor.prefill_graph = pg
@@ -1354,6 +1358,7 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
     adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(adapter)
     adapter.config = SimpleNamespace(image_token_id=5)
+    adapter.is_multimodal_active = True
     adapter.model = nn.Module()
     adapter.model.embed_tokens = nn.Embedding.from_pretrained(
         torch.zeros(VOCAB_SIZE, 4, device=ib.device)
@@ -1378,6 +1383,51 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
         ctx, ids, {"multimodal_context": context, "image_mask": explicit}
     )
     assert result["image_mask"] is explicit
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
+def test_text_prefill_mask_preserves_decode_and_explicit_inputs(active, mode):
+    # Supply tiny weights instead of constructing a checkpoint-sized model.
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.is_multimodal_active = active
+    adapter.model = nn.Module()
+    adapter.model.embed_tokens = nn.Embedding(VOCAB_SIZE, 4)
+    ids = torch.tensor([1, 2, 3])
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=int(mode.is_extend()),
+        input_num_tokens=ids.numel(),
+        forward_mode=mode,
+        output_layout=ForwardOutputLayout(
+            int(mode.is_extend()), int(mode.is_extend()), int(mode.is_decode()), 1
+        ),
+    )
+    prepared = adapter.prepare_model_kwargs(ctx, ids, {})
+    if active and mode.is_extend():
+        assert prepared["image_mask"].dtype == torch.bool
+        assert prepared["image_mask"].tolist() == [False] * 3
+    else:
+        assert prepared["image_mask"] is None
+    embeds = torch.randn(3, 4)
+    explicit = torch.tensor([False, True, False])
+    prepared = adapter.prepare_prefill_graph_inputs(
+        ids,
+        ctx,
+        model_kwargs={"input_embeds": embeds, "image_mask": explicit},
+        multimodal_context=None,
+    )
+    assert prepared["image_mask"] is explicit
+    assert prepared["input_embeds"] is embeds
+    buffers = adapter.allocate_prefill_graph_inputs(7)
+    if active:
+        assert buffers["image_mask"].shape == (7,)
+        assert not buffers["image_mask"].any()
+    else:
+        assert buffers == {}
 
 
 def test_engram_token_map_must_cover_the_vocabulary():

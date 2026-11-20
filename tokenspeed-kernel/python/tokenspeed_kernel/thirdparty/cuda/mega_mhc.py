@@ -123,9 +123,9 @@ def shifted_post_pre_norm(
 ):
     """Return new residual, normalized input and next pre/post/comb coefficients.
 
-    Inputs follow ``try_mhc_shifted_post_pre_norm``. Do not capture or replay
-    this call in a CUDA graph: DeepGEMM split barriers can read the previous
-    replay's partials.
+    Inputs follow ``try_mhc_shifted_post_pre_norm``. Warm up the eventual
+    capture stream first: DeepGEMM initializes its per-stream split barriers
+    outside capture and advances their epoch after each launch.
     No input is mutated, and no output is retained outside this invocation.
     """
     return _launch(
