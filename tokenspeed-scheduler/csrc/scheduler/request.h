@@ -84,10 +84,20 @@ public:
     }
 
     // Decode rounds in which the prefill/decode interval held this prompt
-    // back (Submitted or Prefilling). Never reset, so the interval's bound
-    // on it spans every chunk.
+    // back (Submitted or Prefilling). Never reset by default, so the
+    // interval's bound on it spans every chunk; with
+    // max_consecutive_prefill_rounds the scheduler restarts it whenever one
+    // of the prompt's chunks runs, so the bound applies per chunk.
     std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
     void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+    void ResetPrefillDeferred() { prefill_deferred_rounds_ = 0; }
+
+    // Rounds in which this prompt's chunk gave way to carried prompts
+    // (prefill_chunk_yield_tokens): it was cut shorter or a carried prompt
+    // ran beside it. Never reset, so prefill_chunk_yield_max_rounds bounds
+    // the prompt across all its chunks.
+    std::int32_t PrefillRoundsGivenWay() const { return prefill_rounds_given_way_; }
+    void NotePrefillGaveWay() { ++prefill_rounds_given_way_; }
 
     // P role, deferred decode allocation: a pd::DestinationReadyEvent
     // arrived, so every Decode rank allocated the destination. Until then a
@@ -397,6 +407,7 @@ private:
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
     std::int32_t prefill_deferred_rounds_{0};
+    std::int32_t prefill_rounds_given_way_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;

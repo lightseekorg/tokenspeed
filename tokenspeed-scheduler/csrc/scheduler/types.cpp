@@ -125,6 +125,11 @@ void SchedulerConfig::Validate() const {
             "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be at most half of "
             "max_scheduled_tokens (--chunked-prefill-size)");
     }
+    // The default leaves the yield unbounded, as before the bound existed.
+    if (prefill_chunk_yield_tokens > 0 && prefill_chunk_yield_max_rounds <= 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_max_rounds must be positive when prefill_chunk_yield_tokens is");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }
@@ -233,6 +238,16 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
             "a P node runs no decodes and a D node no local prefill");
+    }
+    if (max_consecutive_prefill_rounds < 0) {
+        throw std::invalid_argument("Scheduler: max_consecutive_prefill_rounds must be >= 0");
+    }
+    // The cap bounds how long an overdue prompt may suspend the interval:
+    // without an interval there is nothing to suspend.
+    if (max_consecutive_prefill_rounds != 0 && prefill_decode_interval == 0) {
+        throw std::invalid_argument(
+            "Scheduler: max_consecutive_prefill_rounds requires prefill_decode_interval "
+            "(--prefill-decode-interval) > 0");
     }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {

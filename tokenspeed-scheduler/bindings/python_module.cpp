@@ -215,6 +215,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("prefill_decode_min_interval", &tokenspeed::SchedulerConfig::prefill_decode_min_interval)
+        .def_rw("max_consecutive_prefill_rounds", &tokenspeed::SchedulerConfig::max_consecutive_prefill_rounds)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
@@ -224,9 +225,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
         .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
         // P role: the most tokens a prefill chunk that cannot finish gives up
-        // for whole prompts behind it; 0 is off, at most half of
-        // max_scheduled_tokens.
-        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens);
+        // for whole prompts behind it (0 is off, at most half of
+        // max_scheduled_tokens), and the most rounds one prompt gives way
+        // (unbounded by default; positive while the yield is on).
+        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens)
+        .def_rw("prefill_chunk_yield_max_rounds", &tokenspeed::SchedulerConfig::prefill_chunk_yield_max_rounds);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
