@@ -2024,11 +2024,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             self.scheduler.can_clear_cache()
         };
+        // Refusals log at debug, and only on the refusing rank: warm-up retries
+        // its clear every round, and the flush reply already reports failure.
         if !self.converge(can_clear)? {
-            tracing::warn!(
-                can_clear,
-                "cache flush refused: non-storage resources remain held"
-            );
+            if !can_clear {
+                tracing::debug!("cache flush refused: non-storage resources remain held");
+            }
             return Ok(Some(false));
         }
         let unsafe_current = self.scheduler.storage_blocking_quarantined() > 0
@@ -2067,13 +2068,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.scheduler.can_clear_cache()
         };
         if !self.converge(can_finish)? {
-            tracing::warn!("cache clear refused after storage drain: references remain held");
+            if !can_finish {
+                tracing::debug!("cache clear refused after storage drain: references remain held");
+            }
             return Ok(Some(false));
         }
         if let Some(l3) = &self.l3 {
+            // A failed backend purge logs its own error.
             let deleted = l3.executor.delete_namespace();
             if !self.converge(deleted)? {
-                tracing::warn!(deleted, "cache flush refused at L3 namespace deletion");
+                if !deleted {
+                    tracing::debug!("cache flush refused at L3 namespace deletion");
+                }
                 return Ok(Some(false));
             }
         }
@@ -2090,16 +2096,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     fn clear_cache_retaining_storage(&mut self) -> Result<bool, LoopError> {
         let can_clear = self.scheduler.can_clear_cache_retaining_storage();
         if !self.converge(can_clear)? {
-            tracing::warn!(
-                can_clear,
-                "cache recovery refused: non-storage resources remain held"
-            );
+            if !can_clear {
+                tracing::debug!("cache recovery refused: non-storage resources remain held");
+            }
             return Ok(false);
         }
         let Some(generation) = self.fresh_cache_generation()? else {
             return Ok(false);
         };
         if let Some(l3) = &self.l3 {
+            // Fails only on a malformed or reused agreed nonce or an exhausted
+            // epoch counter: invariant violations, not refusals to converge.
+            // The scheduler clear below repeats the pure preflight agreed above
+            // with no scheduler mutation in between, so it cannot refuse either.
             l3.executor.begin_cache_generation(&generation)?;
         }
         let cleared = self.scheduler.clear_cache_retaining_storage();
@@ -2117,7 +2126,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .and_then(|mut random| random.read_exact(&mut nonce))
             .is_ok();
         if !self.converge(generated)? {
-            tracing::warn!("cache recovery could not allocate a fresh namespace generation");
+            if !generated {
+                tracing::warn!("cache recovery could not allocate a fresh namespace generation");
+            }
             return Ok(None);
         }
         let group = self.ranks.dp.as_ref().unwrap_or(&self.ranks.replica);

@@ -219,9 +219,12 @@ Only an accepted clear detaches request storage leases and cancels backups.
 Candidates and commands still in the scheduler outbox are discarded; commands
 already dispatched receive cancellation through the ordinary plan. Running
 native calls keep their references until every owner reports retirement, and
-their detached results cannot add a publication receipt. A later backend purge
-failure can refuse the accepted clear, but an initial non-storage pin refusal
-does not cancel any backup. Ordinary keep pauses and frozen storage rounds only
+their detached results cannot add a publication receipt. An initial
+non-storage pin refusal does not cancel any backup, but acceptance is not
+rolled back: a clear refused later (a backend purge failure, references still
+held on some rank after the drain) or abandoned by its caller keeps those
+cancellations, so the backups are lost, detached prefetches recompute, and a
+retried flush cancels again. Ordinary keep pauses and frozen storage rounds only
 drop backup candidates; they do not cancel dispatched PUTs.
 
 ## Controller queues, monitor and bounds
