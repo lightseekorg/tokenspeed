@@ -25,11 +25,7 @@ import time
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.ple import (
-    ple_ngram_ids,
-    ple_page_gather,
-    ple_page_gather_pair,
-)
+from tokenspeed_kernel.ops.ple import ple_ngram_ids
 from tokenspeed_kernel.ops.ple.triton import _ngram_ids_kernel
 from tokenspeed_kernel.platform import pdl_enabled
 
@@ -136,29 +132,6 @@ def test_ple_uniform_index_perf(batch_size: int, length: int, mode: str) -> None
     for actual, expected in zip(optimized(), baseline(), strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     _compare(f"uniform_index_bs{batch_size}_len{length}", baseline, optimized, mode)
-
-
-@pytest.mark.parametrize("mode", ["eager", "graph"])
-@pytest.mark.parametrize("batch_size", [1, 4])
-def test_ple_page_gather_pair_perf(batch_size: int, mode: str) -> None:
-    context = torch.arange(64, device="cuda", dtype=torch.long).reshape(32, 2)
-    conv = torch.randn(32, 4, 2560, device="cuda", dtype=torch.bfloat16)
-    pages = torch.arange(1, batch_size + 1, device="cuda", dtype=torch.int32)
-
-    def baseline():
-        return (
-            ple_page_gather(context, pages, context.stride(0), 99),
-            ple_page_gather(conv, pages, conv.stride(0)),
-        )
-
-    def optimized():
-        return ple_page_gather_pair(
-            context, conv, pages, context.stride(0), conv.stride(0), 99
-        )
-
-    for actual, expected in zip(optimized(), baseline(), strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    _compare(f"page_gather_pair_bs{batch_size}", baseline, optimized, mode)
 
 
 @pytest.mark.parametrize("mode", ["eager", "graph"])

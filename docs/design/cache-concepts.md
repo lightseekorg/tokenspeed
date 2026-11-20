@@ -2219,6 +2219,12 @@ grouping trades snapshot capacity and throughput for tighter checkpoint
 packing and the measured tail-latency benefit; revisiting it must account for
 the snapshot budget and workload, as well as payload padding.
 
+During CUDA PLE verify, the convolution writes the carried state and one
+normalized input per candidate to scratch. `copy_state_rows_compact`
+reconstructs the accepted window in its cache page using the destination
+stride for either layout. Regular GPU convolution and monokernels write the
+same verify layout, including during graph replay.
+
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's
 rows on that layer's K and V planes, so a parent is exactly its KV pages. A
