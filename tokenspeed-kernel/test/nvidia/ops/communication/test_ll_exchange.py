@@ -78,7 +78,7 @@ def _exchange_matches_nccl(rank, size, rendezvous):
     )
     assert state is not None
     generator = torch.Generator(device=device).manual_seed(1000 + rank)
-    # The state compiled both calls: no payload size compiles another.
+    # The state compiled every call: no payload size compiles another.
     with assert_no_cute_compile():
         for payload in SIZES:
             for _ in range(3):
@@ -96,23 +96,27 @@ def _exchange_matches_nccl(rank, size, rendezvous):
                 )
                 assert torch.equal(got_gather, expected_gather), payload
                 assert torch.equal(got_a2a, expected_a2a), payload
-    # Float words travel as themselves; only the sentinel word changes, to
-    # another NaN.
-    for payload in SIZES:
-        words = torch.randint(
-            -(2**31),
-            2**31 - 1,
-            (payload // 4,),
-            dtype=torch.int32,
-            device=device,
-            generator=generator,
-        )
-        words[::97] = -1
-        expected = torch.empty(size * words.numel(), dtype=torch.int32, device=device)
-        dist.all_gather_into_tensor(expected, words)
-        expected[expected == -1] = 0x7FFFFFFF
-        got = cute_dsl_ll_all_gather_floats(state, words, torch.empty_like(expected))
-        assert torch.equal(got, expected), payload
+        # Float words travel as themselves; only the sentinel word changes, to
+        # another NaN.
+        for payload in SIZES:
+            words = torch.randint(
+                -(2**31),
+                2**31 - 1,
+                (payload // 4,),
+                dtype=torch.int32,
+                device=device,
+                generator=generator,
+            )
+            words[::97] = -1
+            expected = torch.empty(
+                size * words.numel(), dtype=torch.int32, device=device
+            )
+            dist.all_gather_into_tensor(expected, words)
+            expected[expected == -1] = 0x7FFFFFFF
+            got = cute_dsl_ll_all_gather_floats(
+                state, words, torch.empty_like(expected)
+            )
+            assert torch.equal(got, expected), payload
     # Other dtypes travel as their bytes.
     words = torch.randn(size * 1024, device=device).view(torch.int32)
     got = cute_dsl_ll_all_to_all(state, words, torch.empty_like(words))
@@ -239,6 +243,30 @@ def _refusals(rank, size, rendezvous):
             cute_dsl_ll_all_gather(state, bad_in, bad_out)
     with pytest.raises(ValueError, match="does not serve"):
         cute_dsl_ll_all_to_all(state, torch.zeros(size * 4096 + 16, dtype=torch.uint8, device=device), out)  # fmt: skip
+    # A zero float cap allocates no float workspace and serves no float words.
+    bytes_only = create_ll_exchange_state(
+        group,
+        device,
+        cap_bytes=CAP_BYTES,
+        float_cap_bytes=0,
+        timeout_ns=TIMEOUT_NS,
+        eligible=True,
+    )
+    assert bytes_only.float_workspace is None and bytes_only.float_ctrl is None
+    assert bytes_only.serves(16, floats=False)
+    assert not bytes_only.serves(16, floats=True)
+    with pytest.raises(ValueError, match="does not serve"):
+        cute_dsl_ll_all_gather_floats(bytes_only, torch.zeros(4, dtype=torch.int32, device=device), torch.empty(4 * size, dtype=torch.int32, device=device))  # fmt: skip
+    # Caps differing across ranks name the one that differs.
+    with pytest.raises(ValueError, match="float_cap_bytes differs"):
+        create_ll_exchange_state(
+            group,
+            device,
+            cap_bytes=CAP_BYTES,
+            float_cap_bytes=CAP_BYTES * (1 + rank % 2),
+            timeout_ns=TIMEOUT_NS,
+            eligible=True,
+        )
     dist.destroy_process_group()
 
 

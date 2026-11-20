@@ -96,8 +96,8 @@ class CommBackend(ABC):
 
         It serves ``all_gather_single``, ``all_gather`` and equal-split
         ``all_to_all_single`` calls of up to ``cap_bytes`` per rank, and
-        ``all_gather_float_words_single`` calls of up to ``float_cap_bytes``;
-        False keeps the generic collectives.
+        ``all_gather_float_words_single`` calls of up to ``float_cap_bytes``
+        (0 for none); False keeps the generic collectives.
         """
         return False
 

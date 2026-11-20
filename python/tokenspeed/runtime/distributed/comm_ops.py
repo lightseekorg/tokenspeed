@@ -522,7 +522,7 @@ def prepare_small_exchange(
         group: Global ranks of the exchange.
         cap_bytes: Largest per-rank payload the exchange serves, a multiple of 16.
         float_cap_bytes: Largest per-rank float-word gather it serves, a
-            multiple of 16.
+            multiple of 16, or 0 for none.
         timeout_ns: Bound of every in-kernel wait for a peer.
         backend: Backend to prepare, or ``None`` for the global backend.
 

@@ -83,6 +83,7 @@ def prepare_decode_exchange(
     *,
     value_heads: int | None,
     decode_rows: int,
+    float_words: bool,
 ) -> bool:
     """Collectively prepare the KVP group's one-hop exchange of small payloads.
 
@@ -91,7 +92,8 @@ def prepare_decode_exchange(
     and partial exchanges then take it whenever their payload fits; nothing
     else changes, and every byte arrives as the generic collective delivers it.
     With ``value_heads`` it also prepares the fused decode value tail
-    (:func:`combine_project_attention_partials`).
+    (:func:`combine_project_attention_partials`), and with ``float_words`` the
+    float-word gather of an owned decode top-k (:func:`select_owned_dsa_topk`).
 
     Args:
         group: Global ranks of the KVP group.
@@ -99,6 +101,8 @@ def prepare_decode_exchange(
         value_heads: Local query heads of an MLA model whose decode projects
             512-wide latents to 128-wide values, or None.
         decode_rows: Most rows of one decode forward.
+        float_words: Whether a decode gathers float words; without, no float
+            workspace is allocated.
 
     Returns:
         Whether the group exchanges through it.
@@ -115,8 +119,9 @@ def prepare_decode_exchange(
         )
         if tail is not None:
             _VALUE_TAILS[group] = tail
+    float_cap = DECODE_FLOAT_EXCHANGE_CAP_BYTES if float_words else 0
     prepared = prepare_small_exchange(
-        group, DECODE_EXCHANGE_CAP_BYTES, DECODE_FLOAT_EXCHANGE_CAP_BYTES, timeout_ns
+        group, DECODE_EXCHANGE_CAP_BYTES, float_cap, timeout_ns
     )
     if torch.distributed.get_rank() == group[0]:
         logger.info(

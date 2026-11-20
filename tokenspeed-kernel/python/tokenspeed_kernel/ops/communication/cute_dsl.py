@@ -446,8 +446,8 @@ def create_ll_exchange_state(
         cap_bytes: Largest per-rank payload, a positive multiple of 16; equal
             on every rank. The workspace holds ``4 * ranks * cap_bytes``.
         float_cap_bytes: Largest per-rank payload of a float-word gather
-            (``cute_dsl_ll_all_gather_floats``), a positive multiple of 16;
-            equal on every rank. Its workspace holds ``2 * ranks *
+            (``cute_dsl_ll_all_gather_floats``), a multiple of 16, or 0 for
+            none; equal on every rank. Its workspace holds ``2 * ranks *
             float_cap_bytes``.
         timeout_ns: Bound of every in-kernel wait; a peer that does not reach
             the same call within it fails the kernel with a trap.
@@ -469,7 +469,7 @@ def create_ll_exchange_state(
         and cap_bytes > 0
         and cap_bytes % 16 == 0
         and 4 * degree * cap_bytes < 2**31
-        and float_cap_bytes > 0
+        and float_cap_bytes >= 0
         and float_cap_bytes % 16 == 0
         and 2 * degree * float_cap_bytes < 2**31
         and timeout_ns > 0
@@ -497,11 +497,15 @@ def create_ll_exchange_state(
     )
     dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
     ok, all_multicast, low, high, float_low, float_high = votes.tolist()
-    if ok and (low != -high or float_low != -float_high):
-        raise ValueError(
-            f"ll_exchange: cap_bytes differs across ranks "
-            f"{dist.get_process_group_ranks(group)}"
-        )
+    for name, least, most in (
+        ("cap_bytes", low, -high),
+        ("float_cap_bytes", float_low, -float_high),
+    ):
+        if ok and least != most:
+            raise ValueError(
+                f"ll_exchange: {name} differs across ranks "
+                f"{dist.get_process_group_ranks(group)}: {least} to {most}"
+            )
     if not ok:
         return None
     return build_ll_exchange_state(
