@@ -686,6 +686,38 @@ router and do not depend on the FlashInfer package shipping its experimental
 kernel sources (release wheels omit them). Prepare/warm up before graph capture;
 no persistent activation tensors are cached per layer by this adapter.
 
+## Kimi-K3 MXFP4 MegaMoE (`flashinfer_cutedsl.py`)
+
+`flashinfer_mxfp4_situ_mega_moe_apply` (`solution="mega_moe"`) runs FlashInfer's
+Kimi K3 MegaMoE: one kernel dispatches each rank's routed rows to the ranks that
+own their experts, runs both MXFP4 expert GEMMs with SiTU on MXFP8 activations,
+and combines the results on the source rank. FlashInfer specializes the kernel
+to Kimi K3's routed geometry (896 experts, top-16, hidden 3584, intermediate
+3072, EP 1/8/16), which the registration declares as traits.
+
+The preprocessor rewrites the checkpoint's packed experts in place into the
+kernel's layout (gate/up rows interleaved in 16-row groups, block scales
+swizzled), so the layer keeps one copy of its weights. Weights are launch
+arguments: every MoE layer of an EP group shares one set of workspaces
+(`thirdparty/flashinfer/kimi_mega_moe.py`).
+
+A workspace's token capacity is a compile-time parameter of the kernel; the
+live row count is not. The plan's `persistent_max_num_tokens_per_gpu` is the
+most rows a rank runs in one step. The first launch creates one workspace per
+power-of-two capacity from 128 up to that bound and warms each with a masked
+row, so serving neither compiles nor allocates. That launch is collective: it
+must be eager and reached by every EP rank together. A step uses the workspace
+of its largest per-rank row count, the same on every rank.
+
+The kernel is sized for every SM of the device. Above 128 rows per rank its
+router spans several CTAs and deadlocks across ranks when another kernel holds
+SMs during the launch, so the caller must not overlap it with work on another
+stream. Kimi-K3 runs its shared expert beside the routing and joins it before
+the launch.
+
+The kernel takes BF16 rows, int32 expert ids and FP32 route weights, and
+returns a view of the workspace that is valid until its next launch.
+
 ## NVFP4 MegaMoE for Qwen3.5
 
 The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and

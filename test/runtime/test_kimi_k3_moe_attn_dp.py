@@ -89,6 +89,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
             self.plan = {"a2a_backend": expected_a2a}
+            self.topk_weights_dtype = torch.float32
             self.sorted_route_rows = frozenset()
 
     monkeypatch.setattr(
@@ -192,6 +193,10 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     assert layer.shared_experts.down_proj.tp_size == 1
     assert layer.shared_experts.down_proj.tp_group is None
     assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
+    # MegaMoE takes the routing-weight dtype its kernel declares.
+    assert layer.topk.topk_config.topk_weights_dtype == (
+        torch.float32 if moe_backend == "mega_moe" else torch.bfloat16
+    )
     assert layer.comm is None
     assert layer.native_latent_moe is None
 
@@ -408,6 +413,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             moe=SimpleNamespace(ep_group=group),
         ),
         execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=False),
+        kimi_mega_moe=False,
         moe_alltoall=(
             SimpleNamespace(dispatch=dispatch, combine=combine)
             if use_alltoall
@@ -624,7 +630,12 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     up = Kimi3LatentProjection(4, 8, params_dtype=torch.bfloat16, solution="torch")
     up.weight.data.normal_(std=0.1)
     layer = SimpleNamespace(
-        execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
+        # MXFP4 experts run FlashInfer's Kimi MegaMoE, which takes these tensors
+        # as they are and must not overlap the shared expert.
+        execution_plan=SimpleNamespace(
+            use_mega_moe=weight_dtype == "mxfp4", owns_ep_communication=True
+        ),
+        kimi_mega_moe=weight_dtype == "mxfp4",
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
@@ -667,6 +678,9 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
             "experts",
             "reduce",
         ]
+    elif weight_dtype == "mxfp4":
+        # The shared expert is joined before the fused kernel is launched.
+        assert events == ["join", "experts"]
     else:
         assert events == ["experts"]
     routed.assert_called_once()

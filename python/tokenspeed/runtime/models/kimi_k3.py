@@ -1146,6 +1146,18 @@ def _decode_verify_width() -> int:
     return 1
 
 
+def _max_rows_per_rank(mapping: Mapping) -> int:
+    """The most token rows one attention-DP rank runs in a forward."""
+    args = global_server_args_dict
+    decode_rows = (
+        max(1, int(args["max_num_seqs"]) // mapping.attn.dp_size)
+        * _decode_verify_width()
+    )
+    if args["disaggregation_mode"] == "decode":
+        return decode_rows
+    return max(int(args["max_prefill_tokens"]), decode_rows)
+
+
 def _decode_graph_rows() -> set[int]:
     """Token rows of each decode graph the executor captures (its resolved batch
     ladder); speculative verify runs the verify width per request."""
@@ -2663,6 +2675,15 @@ class KimiLinearMoE(nn.Module):
                 )
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
+        # FlashInfer's Kimi MegaMoE (MXFP4 experts) takes its rows and routes
+        # as tensors, sizes its workspaces at startup, and needs every SM of
+        # the device while it runs. The other MegaMoE kernels do none of these.
+        self.kimi_mega_moe = (
+            self.execution_plan.use_mega_moe
+            and quant_config is not None
+            and quant_config.moe_weight_dtype(prefix) == "mxfp4"
+        )
+
         # Leave routing unconstrained: the registry prefers a kernel-routing
         # implementation when one exists and otherwise selects a precomputed-
         # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
@@ -2699,7 +2720,8 @@ class KimiLinearMoE(nn.Module):
             # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
             # runs w4a4 with the kernel wrapper quantizing the bf16 input
             # itself, which the registry models as "input". CuTe DSL NVFP4
-            # SiTU quantizes its bf16 input the same way.
+            # SiTU quantizes its bf16 input the same way. MegaMoE follows the
+            # same split by weight dtype.
             internal_activation_dtype_override=(
                 "input"
                 if self.execution_plan.use_native
@@ -2708,10 +2730,14 @@ class KimiLinearMoE(nn.Module):
                 else (
                     _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
                     if self.execution_plan.use_trtllm
+                    or self.execution_plan.use_mega_moe
                     else None
                 )
             ),
             expert_layout=expert_layout,
+            persistent_max_num_tokens_per_gpu=(
+                _max_rows_per_rank(mapping) if self.kimi_mega_moe else None
+            ),
         )
 
         if mapping.attn.dp_size > 1:
@@ -2749,11 +2775,16 @@ class KimiLinearMoE(nn.Module):
                 else self.experts.topk_output_format
             ),
             # bf16 weights out: makes precomputed TRT-LLM SiTU consume them
-            # without a cast. This setting is unused by kernel-routing plans.
+            # without a cast. MegaMoE takes the dtype its kernel declares.
+            # This setting is unused by kernel-routing plans.
             topk_weights_dtype=(
-                torch.bfloat16
-                if plan.use_trtllm or plan.owns_ep_communication
-                else torch.float32
+                self.experts.topk_weights_dtype
+                if plan.use_mega_moe
+                else (
+                    torch.bfloat16
+                    if plan.use_trtllm or plan.owns_ep_communication
+                    else torch.float32
+                )
             ),
         )
         self.expert_dispatch_info: ExpertLocationDispatchInfo | None = None
@@ -3666,7 +3697,7 @@ class KimiLinearMoE(nn.Module):
 
         quant_out = None
         routing_out = None
-        if self.execution_plan.use_mega_moe:
+        if self.execution_plan.use_mega_moe and not self.kimi_mega_moe:
             from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 
             moe_runner = runner.get_runner(
@@ -3821,6 +3852,23 @@ class KimiLinearMoE(nn.Module):
                             shared_output, num_tokens
                         )
 
+            def run_shared_experts() -> torch.Tensor | None:
+                if num_tokens == 0:
+                    return None
+                if shared_activated is None:
+                    return self.shared_experts(hidden_states, down_out=None)
+                return kimi3_shared_down_projection(
+                    shared_activated, self.shared_experts.down_proj.weight
+                )
+
+            shared_before_routed = shared_communication is None and self.kimi_mega_moe
+            if shared_before_routed:
+                # The shared expert overlaps the routing above and is done
+                # before the fused kernel takes every SM.
+                with fork.branch():
+                    shared_output = run_shared_experts()
+                fork.join()
+
             routing = StandardTopKOutput(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
@@ -3868,17 +3916,9 @@ class KimiLinearMoE(nn.Module):
             ):
                 projected, _ = self.routed_expert_up_proj(routed_output)
 
-            if shared_communication is None:
+            if shared_communication is None and not shared_before_routed:
                 with fork.branch():
-                    if num_tokens > 0:
-                        if shared_activated is None:
-                            shared_output = self.shared_experts(
-                                hidden_states, down_out=None
-                            )
-                        else:
-                            shared_output = kimi3_shared_down_projection(
-                                shared_activated, self.shared_experts.down_proj.weight
-                            )
+                    shared_output = run_shared_experts()
 
         if num_tokens == 0:
             return prefix_sum
