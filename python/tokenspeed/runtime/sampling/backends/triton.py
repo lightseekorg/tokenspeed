@@ -642,11 +642,19 @@ class TritonSamplingBackend(SamplingBackend):
         self._publish_verify_reads_draft_q()
 
     def _publish_verify_reads_draft_q(self) -> None:
-        """Tell the drafter whether this batch's verify reads its recorded q.
+        """Tell the drafter whether the next verify will read its recorded q.
 
         A DFlash2 walk samples its proposals only when the verify that follows
         applies rejection sampling to them; otherwise it takes the best lane,
         which an exact-match verify accepts more often than a draw.
+
+        The q the walk records in step t is read by step t + 1's verify, so
+        this batch's route stands in for the next one: exact while the batch
+        keeps its composition. When the route changes between the two steps,
+        that one round is off: best-lane proposals meet a q-reading verify,
+        which verifies their slot -1 rows by exact match, or sampled ones meet
+        an exact-match verify, which accepts them less often; the next walk
+        follows the new route.
         """
         value = int(
             self.config.enable_speculative_sampling

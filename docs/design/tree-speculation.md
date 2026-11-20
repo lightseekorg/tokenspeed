@@ -244,6 +244,11 @@ stream's position keys, while the walk's draft noise and the accept coins
 use their own salted offsets. Greedy rows, rows without a q (slot `-1`) and
 routes without an exact filtered distribution (top-p only, mixed batches)
 keep the plain-decoding draw.
+The DFlash2 walk follows that route: it samples and records a q only while the
+batch's route reads one (`SpeculativeSamplingPools.verify_reads_draft_q`, set
+by the backend's `prepare_step`). Otherwise every row takes its best lane and
+records slot `-1`, so an exact-match verify gets the draft it most often
+accepts.
 The `sonic` backend draws every node row the way its `sample` draws
 (`sonic.tree_targets`): Philox noise keyed by the request's offset and the
 node's depth, and penalties counting the tokens of the node's path on top of

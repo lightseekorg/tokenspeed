@@ -430,10 +430,6 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     assert not drafter.logits_processor.do_argmax
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
-
-
 @pytest.mark.parametrize(
     ("batch", "reads_q"),
     [
@@ -540,3 +536,7 @@ def test_a_mixed_batch_walks_the_best_lane_and_records_no_proposal():
     assert out.tolist() == best
     for slot in pool_slots:
         assert states.future_draft_q.slot[slot].tolist() == [-1] * N
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

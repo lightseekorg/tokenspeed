@@ -270,16 +270,17 @@ class DFlash2(DFlash):
         """Walk the lattice into ``out`` (clamped to the vocabulary) and,
         when sampling, record its q for the next round's verify.
 
-        One kernel for every row: greedy rows (and every row while the flag
-        is off, or while the batch's verify does not read the recorded q,
-        ``SpeculativeSamplingPools.verify_reads_draft_q``) take the best
-        edge; sampling rows draw from q, with noise
-        keyed by the request's seed, this round's position and the drawn
-        token id, so every TP rank draws the same token from the same
-        replicated scores. With the flag on, the kernel writes each request's
-        chain straight into ``RuntimeStates.future_draft_q`` (a request that
-        proposes nothing gets slot -1 on every node); with it off, into a
-        private scratch table nothing reads. Tensor-only, so it records into
+        One kernel for every row. Greedy rows take the best edge. So does
+        every row while speculative sampling is off, and while the batch's
+        verify does not read the recorded q
+        (``SpeculativeSamplingPools.verify_reads_draft_q``). Sampling rows
+        draw from q, with noise keyed by the request's seed, this round's
+        position and the drawn token id, so every TP rank draws the same token
+        from the same replicated scores. With speculative sampling on, the
+        kernel writes each request's chain straight into
+        ``RuntimeStates.future_draft_q`` (a request that proposes nothing gets
+        slot -1 on every node); with it off, into a private scratch table
+        nothing reads. Tensor-only, so it records into
         the draft graph.
         """
         bs = candidate_ids.shape[0]
