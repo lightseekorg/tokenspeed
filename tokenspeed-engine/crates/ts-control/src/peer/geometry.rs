@@ -117,6 +117,8 @@ pub struct Spans {
     pub destinations: Vec<u64>,
     /// Bytes per span.
     pub lengths: Vec<u64>,
+    /// Portion of the payload backed by pinned holder Host memory.
+    pub host_bytes: u64,
 }
 
 impl Spans {
@@ -218,6 +220,9 @@ pub fn read_spans(
                 i64::from(destination.block_id),
                 landing.page_stride,
             )?);
+            if source.host {
+                spans.host_bytes += field.bytes;
+            }
             spans.lengths.push(field.bytes);
         }
     }
@@ -285,6 +290,7 @@ mod tests {
         assert_eq!(spans.sources, vec![1_000_700, 1_010_700]);
         assert_eq!(spans.destinations, vec![2_000_300, 2_010_300]);
         assert_eq!(spans.lengths, vec![40, 60]);
+        assert_eq!(spans.host_bytes, 0);
     }
 
     #[test]
@@ -301,6 +307,17 @@ mod tests {
         assert_eq!(spans.sources, vec![5_000_400, 5_000_440]);
         assert_eq!(spans.destinations, vec![2_000_400, 2_010_400]);
         assert_eq!(spans.total_bytes(), 100);
+        assert_eq!(spans.host_bytes, 100);
+        let mixed = read_spans(
+            &holder,
+            &reader,
+            &[
+                (page(0, 1, true, 5), page(0, 1, false, 4)),
+                (page(0, 0, false, 7), page(0, 0, false, 3)),
+            ],
+        )
+        .unwrap();
+        assert_eq!((mixed.total_bytes(), mixed.host_bytes), (200, 100));
     }
 
     #[test]

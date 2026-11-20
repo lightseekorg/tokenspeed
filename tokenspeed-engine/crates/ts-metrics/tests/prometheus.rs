@@ -547,15 +547,40 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
     completed.finish(
         std::time::Instant::now(),
         std::time::Duration::from_millis(200),
+        16,
         true,
     );
     drop(cancelled);
+    let failed = engine.peer.queue_read("a".into(), 0, 256);
+    failed.finish(
+        std::time::Instant::now(),
+        std::time::Duration::ZERO,
+        192,
+        false,
+    );
     engine.peer.usage(Some(10), 14, "used");
     engine.peer.usage(None, 5, "used");
     engine.peer.usage(Some(8), 0, "lookup_miss");
     let Some(text) = render(&directory) else {
         return;
     };
+    for (tier, expected) in [("host", 16.0), ("device", 48.0)] {
+        let line = text
+            .lines()
+            .find(|line| {
+                line.starts_with("tokenspeed:peer_read_source_bytes_total{")
+                    && line.contains(&format!("source_tier=\"{tier}\""))
+            })
+            .unwrap();
+        assert_eq!(
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            expected
+        );
+    }
     for (name, outcome, expected) in [
         ("peer_estimation_error_tokens_sum", "used", -4.0),
         ("peer_estimation_error_tokens_count", "used", 1.0),

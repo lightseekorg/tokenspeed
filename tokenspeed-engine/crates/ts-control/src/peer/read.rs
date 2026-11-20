@@ -105,7 +105,12 @@ impl Reads {
                         reader.read(&job.session, &job.spans)
                     };
                     if let Some(observation) = observation {
-                        observation.finish(started, started.elapsed(), outcome.is_ok());
+                        observation.finish(
+                            started,
+                            started.elapsed(),
+                            job.spans.host_bytes,
+                            outcome.is_ok(),
+                        );
                     }
                     tracing::debug!(
                         request = job.request_id,
@@ -250,6 +255,7 @@ mod tests {
                 sources: vec![4],
                 destinations: vec![32],
                 lengths: vec![8],
+                host_bytes: 0,
             },
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
@@ -271,6 +277,7 @@ mod tests {
                     sources: vec![1],
                     destinations: vec![2],
                     lengths: vec![8],
+                    host_bytes: 0,
                 },
             });
             assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
@@ -316,6 +323,7 @@ mod tests {
                 sources: vec![0],
                 destinations: vec![destination],
                 lengths: vec![8],
+                host_bytes: 0,
             },
         }
     }
