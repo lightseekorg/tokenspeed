@@ -1559,9 +1559,7 @@ def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
     args.resolve_model_defaults()
 
 
-def test_heads_all_to_all_without_iris_fails_startup_with_the_cause(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_heads_all_to_all_without_iris_fails_startup_with_the_cause() -> None:
     """--owned-attention-output all-to-all runs only on Iris owned rows: a
     server whose Iris cannot be prepared refuses it at startup instead of
     gathering output weights it would never use."""
