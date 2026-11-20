@@ -129,8 +129,12 @@ class AscendMLAAttention(KimiLinearMLAAttention):
 
     def _forward_prefill(self, positions, hidden, ctx, comm_manager):
         backend = ascend_mla_prefill_backend(ctx.attn_backend)
-        plan = backend._prefill_plan
-        if plan is None or hidden.shape[0] != plan.row_counts[backend._dcp.rank]:
+        plan = backend._prefill
+        if (
+            plan is None
+            or not plan.row_counts
+            or hidden.shape[0] != plan.row_counts[backend._dcp.rank]
+        ):
             raise ValueError("MLA Prefill hidden rows must follow the TP partition")
         if (
             self.use_output_gate
@@ -153,22 +157,19 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         else:
             qnorm = hidden.new_empty((0, self.q_lora_rank))
             latent = hidden.new_empty((0, self.kv_lora_rank + self.qk_rope_head_dim))
-        # Retain Q-latent gathering and local-head projections. KV uses the
-        # same execution stream with early history gathering when available.
-        backend.prefetch_prefill_layer(self.layer_id)
-        backend.start_prefill_kv(self.layer_id, latent)
+        kv = backend.prepare_prefill_kv(
+            self.layer_id,
+            latent,
+            ctx.attn_backend.padded_write_locations(
+                self.attn_mqa, ctx.forward_mode, sum(plan.row_counts)
+            ),
+        )
         qnorm = comm_manager.pre_attn_comm(qnorm, ctx)
         query = self.q_b_proj(qnorm)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         if self.q_lora_scale is not None:
             query = query * self.q_lora_scale
         if query.shape[0] != plan.row_end:
             raise ValueError("MLA Prefill Q gather must cover the full token span")
-        backend.consume_prefill_kv(
-            self.layer_id,
-            ctx.attn_backend.padded_write_locations(
-                self.attn_mqa, ctx.forward_mode, query.shape[0]
-            ),
-        )
         attended = query.new_empty(
             (query.shape[0], self.num_local_heads, self.v_head_dim)
         )
@@ -177,13 +178,12 @@ class AscendMLAAttention(KimiLinearMLAAttention):
                 self._prefill_sequence(
                     query[begin:end].contiguous(),
                     lambda first, last: backend.read_prefill_rows(
-                        sequence, first, last
+                        kv, sequence, first, last
                     ),
                     prefix=prefix,
                     kv_block_tokens=65536,
                 )
             )
-        backend.finish_prefill_layer(self.layer_id)
         return self.o_proj(attended.flatten(1))[0]
 
     def forward(self, positions, hidden_states, ctx, comm_manager, *, projection_out):

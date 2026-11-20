@@ -279,6 +279,10 @@ class CommBackend(ABC):
 
         return False
 
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        """Prepare ordinary reductions that may first be selected by a small batch."""
+        return False
+
     def can_acquire_all_reduce_outputs(
         self,
         shapes: tuple[tuple[int, ...], ...],

@@ -13,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA fabric allocations and zero-copy views for immutable expert storage."""
+"""CUDA VMM allocations and zero-copy views for immutable expert storage.
+
+Owned storage is exported through an explicit shareable handle type. Fabric
+handles carry an opaque payload and need an IMEX channel; POSIX file
+descriptors are process-local, so the caller passes them between processes on
+one node (for example with ``SCM_RIGHTS``).
+"""
 
 from __future__ import annotations
 
@@ -33,34 +39,51 @@ def checked(result):
     return values[0] if len(values) == 1 else values
 
 
-def allocation_prop(device: int, *, fabric: bool):
+HANDLE_TYPES = {
+    "fabric": cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+    "posix_fd": cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+}
+
+
+def _handle_type(name: str):
+    if name not in HANDLE_TYPES:
+        raise ValueError(f"Unsupported shareable handle type: {name}")
+    return HANDLE_TYPES[name]
+
+
+def device_location(device: int):
     location = cu.CUmemLocation()
     location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
     location.id = device
+    return location
+
+
+def allocation_prop(device: int, *, handle_type: str | None):
+    """Pinned device memory; ``handle_type=None`` allocates unexported memory."""
     prop = cu.CUmemAllocationProp()
     prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-    prop.location = location
+    prop.location = device_location(device)
     prop.requestedHandleTypes = (
-        cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        if fabric
+        _handle_type(handle_type)
+        if handle_type is not None
         else cu.CUmemAllocationHandleType(0)
     )
     return prop
 
 
-def granularity(device: int) -> int:
+def granularity(device: int, *, handle_type: str) -> int:
     return int(
         checked(
             cu.cuMemGetAllocationGranularity(
-                allocation_prop(device, fabric=True),
+                allocation_prop(device, handle_type=handle_type),
                 cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
             )
         )
     )
 
 
-def allocate(size: int, device: int, *, fabric: bool) -> int:
-    prop = allocation_prop(device, fabric=fabric)
+def allocate(size: int, device: int, *, handle_type: str | None) -> int:
+    prop = allocation_prop(device, handle_type=handle_type)
     result = cu.cuMemCreate(size, prop, 0)
     if result[0] == cu.CUresult.CUDA_ERROR_OUT_OF_MEMORY:
         # Driver allocations cannot reclaim PyTorch's freed preprocessing buffers.
@@ -75,25 +98,21 @@ def allocate(size: int, device: int, *, fabric: bool) -> int:
     return int(checked(result))
 
 
-def export(handle: int) -> bytes:
+def export(handle: int, *, handle_type: str) -> bytes | int:
+    """Fabric returns the opaque payload; POSIX returns a new local descriptor."""
     value = checked(
-        cu.cuMemExportToShareableHandle(
-            handle,
-            cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-            0,
-        )
+        cu.cuMemExportToShareableHandle(handle, _handle_type(handle_type), 0)
     )
-    return bytes(value.data)
+    return bytes(value.data) if handle_type == "fabric" else int(value)
 
 
-def import_handle(payload: bytes) -> int:
+def import_handle(payload: bytes | int, *, handle_type: str) -> int:
+    """Import a fabric payload or a descriptor already received by this process.
+
+    The caller still owns, and closes, a received descriptor.
+    """
     return int(
-        checked(
-            cu.cuMemImportFromShareableHandle(
-                payload,
-                cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-            )
-        )
+        checked(cu.cuMemImportFromShareableHandle(payload, _handle_type(handle_type)))
     )
 
 
@@ -107,7 +126,7 @@ def map_handle(address: int, size: int, handle: int) -> None:
 
 def set_access(address: int, size: int, device: int) -> None:
     access = cu.CUmemAccessDesc()
-    access.location = allocation_prop(device, fabric=True).location
+    access.location = device_location(device)
     access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
     checked(cu.cuMemSetAccess(address, size, [access], 1))
 

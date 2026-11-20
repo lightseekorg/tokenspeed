@@ -4270,6 +4270,24 @@ protected:
     }
 };
 
+TEST_F(PrefillChunkYieldCapacitySuite, InflightCountsOnlyFinalResultsAwaitingTransferCompletion) {
+    SubmitBootstrapped("prompt", MakeTokens(14, 1000));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 0, 8}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "intermediate prefill is still computation";
+    EXPECT_EQ(scheduler_->PdTransferSize(), 1u) << "page pinning already starts during prefill";
+    SendForwardDone("prompt");
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 8, 14}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "the final forward result has not landed";
+    SendForwardDone("prompt", {900});
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "ready before remote dispatch";
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "transfer dispatched, still awaiting ACK";
+    SendPdSucceeded("prompt");
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+}
+
 TEST_F(PrefillChunkYieldCapacitySuite, AFailedCarriedPromptEndsTheFillAndTheChunkThatGaveWayIsAdmittedFirst) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 32);
     // Each 7-token prompt holds 4 pages (with the decode slot) until its

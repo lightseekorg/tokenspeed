@@ -156,7 +156,7 @@ def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk
     [(2, 64, 4, 512, "uniform"), (4, 64, 4, 2048, "uniform")]
     + [(8, 64, 4, topk, "uniform") for topk in (512, 2048)]
     + [(8, 7, 1, 2048, "uniform")]
-    + [(8, 64, 4, 2048, band) for band in ("tied", "narrow", "single")],
+    + [(8, 64, 4, 2048, band) for band in ("tied", "narrow", "single", "short")],
 )
 def test_owned_selection_is_each_ranks_share_of_the_merge(
     degree, rows, q_len, topk, band
@@ -179,6 +179,10 @@ def test_owned_selection_is_each_ranks_share_of_the_merge(
         )
     elif band == "single":
         scores = torch.where(positions < 0, scores, 2.5)
+    elif band == "short":
+        # Every row's history fits the top-k: each rank keeps all it holds.
+        positions[:, :, topk // (2 * degree) :] = -1
+        scores[positions < 0] = -torch.inf
     expected = _merged_then_compacted(
         table, virtual_blocks, positions, scores, q_len, topk
     )
