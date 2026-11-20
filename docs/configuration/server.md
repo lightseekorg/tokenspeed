@@ -84,6 +84,7 @@ its request partition is invalidated before another PD owner uses it.
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 | `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
+| `--prefill-collective-payload {bf16,int8-block16}` | Muse Spark: the payload encoding of the owned-row prefill collectives (the QKVG all-to-all and the attention and expert reduce-scatters) in extend forwards. `bf16` (the default) transfers the rows as produced; `int8-block16` transfers INT8 codes with an FP32 scale per 16 elements and decodes them to BF16 before the collective's arithmetic, at 1.25 bytes an element. A numerics change; decode and verify forwards stay BF16. |
 
 ### Qwen FP8 attention projections
 

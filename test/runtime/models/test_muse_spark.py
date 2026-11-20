@@ -579,7 +579,13 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
     output, sentinel = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
+        hidden,
+        router_input,
+        hidden.shape[0],
+        hidden.shape[0],
+        None,
+        project=True,
+        payload="bf16",
     )
     assert sentinel is None
 
@@ -1186,7 +1192,7 @@ def test_owned_attention_stores_prepared_rows_once(
     attention.owned_projections = None
 
     attention.iris_state = SimpleNamespace(
-        all_to_all_transpose_qkvg_norm_rope=lambda *args: (
+        all_to_all_transpose_qkvg_norm_rope=lambda *args, payload: (
             prepared_q,
             prepared_k,
             prepared_v,
@@ -1461,6 +1467,7 @@ def test_experts_combined_prepares_routing_once_per_token_count(
             tokens,
             prepared,
             False,
+            payload="bf16",
         )
 
     combine(2, None)
@@ -1773,6 +1780,7 @@ def _gathered_mxfp4_workspace_worker(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
+            int8_payloads=False,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -2012,6 +2020,22 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
+
+
+@pytest.mark.parametrize("flag", ["bf16", "int8-block16"])
+def test_prefill_collective_payload_applies_to_extend_forwards_only(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """--prefill-collective-payload selects the owned-row collectives'
+    encoding of extend forwards; every other forward mode stays BF16."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", flag
+    )
+    for mode in ForwardMode:
+        expected = flag if mode == ForwardMode.EXTEND else "bf16"
+        assert module._collective_payload(mode) == expected, mode
 
 
 if __name__ == "__main__":

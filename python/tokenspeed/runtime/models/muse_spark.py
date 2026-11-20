@@ -98,6 +98,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
@@ -1066,6 +1067,7 @@ class MuseSparkAttention(nn.Module):
                 cos_sin_cache,
                 self.rms_norm_eps,
                 self.q_scale,
+                payload=_collective_payload(ctx.forward_mode),
             )
             prepared = self.attn.store_prepared(q, k, v, ctx)
             output = self.attn.attend(prepared.q, prepared.k, prepared.v, ctx)
@@ -1077,7 +1079,11 @@ class MuseSparkAttention(nn.Module):
                     normalized, owned_global_rows, self.qkv_proj.weight, owned.qkv
                 )
             elif owned_global_rows is not None:
-                qkv_gate = iris.all_to_all_transpose_qkvg(projected, owned_global_rows)
+                qkv_gate = iris.all_to_all_transpose_qkvg(
+                    projected,
+                    owned_global_rows,
+                    payload=_collective_payload(ctx.forward_mode),
+                )
             elif normalized.shape[0] == 0:
                 return normalized.new_empty((0, self.hidden_size)), None, 1
             else:
@@ -1217,6 +1223,15 @@ MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
 # NVIDIA owns rows over NCCL from here; below it the split collectives cost more than they save.
 MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
+
+
+def _collective_payload(forward_mode: ForwardMode) -> str:
+    """The payload encoding of an owned-row collective: the
+    --prefill-collective-payload choice for extend forwards; decode (and
+    verify), mixed and idle forwards keep BF16."""
+    if forward_mode.is_extend():
+        return global_server_args_dict["prefill_collective_payload"]
+    return "bf16"
 
 
 class PreparedFP32RouterGEMV(nn.Module):
@@ -1511,8 +1526,12 @@ class MuseSparkMoE(nn.Module):
         route_weights: torch.Tensor,
         *,
         owned_rows: bool,
+        payload: str,
     ) -> torch.Tensor:
-        """Complete TP routes before normalization, or sum normalized EP routes."""
+        """Complete TP routes before normalization, or sum normalized EP routes.
+
+        ``payload`` is the owned-row reduce-scatters' encoding
+        (``_collective_payload``)."""
         norm = self.post_expert_norm
         iris = self.iris_state
         if self.tp_size > 1:
@@ -1608,6 +1627,7 @@ class MuseSparkMoE(nn.Module):
                     norm.weight,
                     norm.eps,
                     norm.weight_offset,
+                    payload=payload,
                 )
                 if reduced is not None:
                     return reduced
@@ -1689,7 +1709,7 @@ class MuseSparkMoE(nn.Module):
                 # The kernel already summed over the EP ranks.
                 return combined
             if owned_rows:
-                return iris.reduce_scatter_owned_rows(combined)
+                return iris.reduce_scatter_owned_rows(combined, payload=payload)
         if not owned_rows and self.ep_size <= 1:
             return combined
         if not current_platform().is_cdna4:
@@ -1702,7 +1722,7 @@ class MuseSparkMoE(nn.Module):
                 output.copy_(combined)
             combined = output
         if owned_rows:
-            return iris.reduce_scatter_owned_rows(combined)
+            return iris.reduce_scatter_owned_rows(combined, payload=payload)
         return _muse_all_reduce(self.iris_state, (combined,), self.ep_group)[0]
 
     def _experts_combined(
@@ -1716,8 +1736,13 @@ class MuseSparkMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         prepared: PreparedNvfp4Routing | None,
         owned_rows: bool,
+        *,
+        payload: str,
     ) -> torch.Tensor:
-        """Run the experts and complete sharded routes before normalization."""
+        """Run the experts and complete sharded routes before normalization.
+
+        ``payload`` is the owned-row reduce-scatters' encoding
+        (``_collective_payload``)."""
         norm_weight = self.post_expert_norm.weight
         iris = self.iris_state
         if (
@@ -1778,6 +1803,7 @@ class MuseSparkMoE(nn.Module):
             num_tokens=topk_ids.shape[0],
             route_weights=topk_weights,
             owned_rows=owned_rows,
+            payload=payload,
         )
 
     def _forward_owned_projections(
@@ -1830,6 +1856,8 @@ class MuseSparkMoE(nn.Module):
             max_num_tokens_per_gpu,
             None,
             False,
+            # Rank-local rows: no owned-row collective reads the payload.
+            payload="bf16",
         )
         return (
             owned.matmul_to_owners(combined, rows, self.post_expert_proj.weight),
@@ -2026,12 +2054,15 @@ class MuseSparkMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         owned_global_rows: int | None,
         project: bool,
+        *,
+        payload: str,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
         The returned projection may defer its gather to the residual boundary.
         Without ``project`` the combined expert rows are returned unprojected
-        for a boundary that applies ``post_expert_proj`` itself.
+        for a boundary that applies ``post_expert_proj`` itself. ``payload``
+        is the owned-row reduce-scatters' encoding (``_collective_payload``).
         """
         if owned_global_rows is not None and self.iris_state is None:
             assert project
@@ -2164,6 +2195,7 @@ class MuseSparkMoE(nn.Module):
             max_num_tokens_per_gpu,
             prepared,
             owned_global_rows is not None,
+            payload=payload,
         )
         if not project:
             assert owned_global_rows is None
@@ -2545,7 +2577,10 @@ class MuseSparkDecoderLayer(nn.Module):
                 owned_global_rows if owned_qkvg else None,
             )
             if owned_global_rows is not None and iris is not None:
-                attention_output = iris.reduce_scatter_owned_rows(attention_output)
+                attention_output = iris.reduce_scatter_owned_rows(
+                    attention_output,
+                    payload=_collective_payload(ctx.forward_mode),
+                )
             elif (
                 self.self_attn.o_proj.tp_size > 1
                 and not self.self_attn.o_proj.reduce_results
@@ -2669,6 +2704,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 max_num_tokens_per_gpu,
                 owned_global_rows,
                 project=not project_in_boundary,
+                payload=_collective_payload(ctx.forward_mode),
             )
         if project_in_boundary:
             return self.iris_state.gemv_all_gather_boundary(
@@ -3374,6 +3410,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 enable_lamport=True,
                 owned_route_max_rows=owned_route_max_rows,
                 intermediate_gather_max_rows=intermediate_gather_max_rows,
+                int8_payloads=global_server_args_dict["prefill_collective_payload"]
+                == "int8-block16",
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )

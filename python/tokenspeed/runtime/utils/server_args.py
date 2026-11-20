@@ -812,6 +812,14 @@ class ServerArgs:
     # switches below (resolve_numerics). Each folded switch can still be set
     # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Muse Spark: the payload encoding of the owned-row prefill collectives
+    # (the QKVG all-to-all and the attention and expert reduce-scatters) in
+    # extend forwards. "bf16" transfers the rows as produced. "int8-block16"
+    # transfers INT8 codes with an FP32 scale per 16 elements, decoded to BF16
+    # by the receiver before the collective's arithmetic: 1.25 bytes an
+    # element instead of 2, and a numerics change. Decode and verify forwards
+    # stay BF16.
+    prefill_collective_payload: str = "bf16"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -5197,6 +5205,16 @@ class ServerArgs:
             "with a row's offset in the buffer, so neither is "
             "batch-invariant. Gathers keep the multicast kernels. Turns off "
             "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--prefill-collective-payload",
+            type=str,
+            default=ServerArgs.prefill_collective_payload,
+            choices=["bf16", "int8-block16"],
+            help="Muse Spark: the payload encoding of the owned-row prefill "
+            "collectives in extend forwards. int8-block16 sends INT8 codes with "
+            "an FP32 scale per 16 elements (a numerics change); decode stays "
+            "BF16.",
         )
         parser.add_argument(
             "--numerics",
