@@ -31,7 +31,7 @@ use std::{
     ffi::CString,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Once, PoisonError,
     },
     thread,
@@ -348,6 +348,8 @@ struct FakeDevice {
     /// The rank's load prerequisites refuse (weights released, KV still
     /// resident); a test clears it before retrying.
     weight_load_refused: Arc<AtomicBool>,
+    /// Count prerequisite checks while a queued load yields to cache I/O.
+    weight_load_checks: Arc<AtomicUsize>,
     /// EPLB: this rank's EP rank, which skews the load it counts.
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
@@ -893,6 +895,7 @@ impl DataPlane for FakeDevice {
         &mut self,
         _op: &ControlRequest,
     ) -> Result<(bool, String), DataPlaneError> {
+        self.weight_load_checks.fetch_add(1, Ordering::SeqCst);
         let refused = self.weight_load_refused.load(Ordering::SeqCst);
         Ok((!refused, "local load prerequisite".to_owned()))
     }
@@ -1363,6 +1366,7 @@ struct Rank {
     weight_load_versions: Arc<Mutex<Vec<Option<String>>>>,
     weight_commits: Arc<Mutex<Vec<bool>>>,
     weight_load_refused: Arc<AtomicBool>,
+    weight_load_checks: Arc<AtomicUsize>,
     /// Every rank's own control results, including non-frontend mirrors.
     control_replies: Arc<Mutex<Vec<ControlOutput>>>,
     applied: Applied,
@@ -1952,6 +1956,7 @@ async fn start_ranks_with(
                 weight_load_versions: device.weight_load_versions.clone(),
                 weight_commits: device.weight_commits.clone(),
                 weight_load_refused: device.weight_load_refused.clone(),
+                weight_load_checks: device.weight_load_checks.clone(),
                 control_replies: Arc::default(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
@@ -5895,6 +5900,295 @@ async fn wait_for_store_put(store: &StorageProbe) {
     })
     .await
     .expect("the PUT did not reach the Store");
+}
+
+fn waiting_reload(id: &str, timeout_s: Option<f64>) -> ControlRequest {
+    ControlRequest::ReloadForward(ReloadForwardReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        mode: "wait".to_owned(),
+        modules: None,
+        id: Some(id.to_owned()),
+        timeout_s,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_reload_during_storage_drain_restores_forward_progress() {
+    for cancel in [false, true] {
+        let gate = Gate::closed();
+        let remote = Arc::new(MemoryStore::new());
+        let stores: Vec<_> = (0..2)
+            .map(|_| {
+                Arc::new(StorageProbe {
+                    memory: remote.clone(),
+                    put_gate: Some(gate.clone()),
+                    ..StorageProbe::default()
+                })
+            })
+            .collect();
+        let engine = start_ranks_with(
+            Layout::Tp(2),
+            1,
+            Tiers::L3,
+            Setup {
+                l3_stores: stores.clone(),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let _release = ReleaseStoreGate(gate.clone());
+        let old_ids: Vec<i32> = (1..=65).collect();
+        run(
+            &engine.client,
+            routed_prompt("before-ended-reload", &old_ids, None),
+        )
+        .await;
+        for store in &stores {
+            wait_for_store_put(store).await;
+        }
+        admission_on_every_rank(&engine).await;
+        admission_on_every_rank(&engine).await;
+        let reloaded = {
+            let reload = control(
+                &engine,
+                waiting_reload("ends-while-draining", (!cancel).then_some(0.05)),
+            );
+            tokio::pin!(reload);
+            let observe_wait = async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                // The drain has no model or device-copy work left. These two
+                // complete rounds let reload readiness reach the clear gate,
+                // where the still-running native PUT prevents normal purging.
+                admission_on_every_rank(&engine).await;
+                admission_on_every_rank(&engine).await;
+                for rank in &engine.ranks {
+                    assert!(rank.device_ops.lock().unwrap().is_empty());
+                }
+                assert!(stores
+                    .iter()
+                    .all(|store| store.put_results.lock().unwrap().is_empty()));
+            };
+            tokio::select! {
+                output = &mut reload => panic!("reload ended before its storage-drain wait: {output:?}"),
+                () = observe_wait => {}
+            }
+            if cancel {
+                assert_eq!(
+                    control(&engine, resume()).await,
+                    [("ResumeSchedulerReqOutput", true)]
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(1), &mut reload)
+                .await
+                .expect("the expired or cancelled reload did not reply")
+        };
+        assert_eq!(reloaded, [("ReloadForwardReqOutput", false)]);
+        let next_ids: Vec<i32> = (1001..=1065).collect();
+        let chunks = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &engine.client,
+                routed_prompt("after-ended-reload", &next_ids, None),
+            ),
+        )
+        .await
+        .expect("an ended reload left cache clearing frozen");
+        assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+        for rank in &engine.ranks {
+            assert!(rank.device_ops.lock().unwrap().is_empty());
+            assert!(rank.weight_commits.lock().unwrap().is_empty());
+        }
+        assert!(stores
+            .iter()
+            .all(|store| store.put_results.lock().unwrap().is_empty()));
+        gate.open();
+        drop(engine);
+        assert!(stores
+            .iter()
+            .all(|store| store.closed.load(Ordering::SeqCst)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_weight_load_refused_after_storage_drain_started_restores_forward_progress() {
+    let gate = Gate::closed();
+    let remote = Arc::new(MemoryStore::new());
+    let stores: Vec<_> = (0..2)
+        .map(|_| {
+            Arc::new(StorageProbe {
+                memory: remote.clone(),
+                put_gate: Some(gate.clone()),
+                ..StorageProbe::default()
+            })
+        })
+        .collect();
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            l3_stores: stores.clone(),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let old_ids: Vec<i32> = (1..=65).collect();
+    run(
+        &engine.client,
+        routed_prompt("before-late-weight-refusal", &old_ids, None),
+    )
+    .await;
+    for store in &stores {
+        wait_for_store_put(store).await;
+    }
+    admission_on_every_rank(&engine).await;
+    admission_on_every_rank(&engine).await;
+    let loaded = {
+        let load = control(
+            &engine,
+            ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                model_path: "/checkpoint-v2".to_owned(),
+                load_format: None,
+                weight_version: Some("v2".to_owned()),
+                flush_cache: true,
+            }),
+        );
+        tokio::pin!(load);
+        let refuse_after_ready = async {
+            tokio::time::timeout(Duration::from_millis(200), async {
+                while !engine
+                    .ranks
+                    .iter()
+                    .all(|rank| rank.weight_load_checks.load(Ordering::SeqCst) > 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the weight load never passed its initial prerequisite check");
+            // A complete later control round proves the first successful
+            // prerequisite check has already yielded from the clear gate.
+            admission_on_every_rank(&engine).await;
+            admission_on_every_rank(&engine).await;
+            // Only one owner changes its prerequisites. Every mirror must
+            // remove the deferred load and release the clear-wait freeze.
+            engine.ranks[1]
+                .weight_load_refused
+                .store(true, Ordering::SeqCst);
+        };
+        let (loaded, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(&mut load, refuse_after_ready)
+        })
+        .await
+        .expect("the deferred weight load did not reply after its refusal");
+        loaded
+    };
+    assert_eq!(loaded, [("UpdateWeightFromDiskReqOutput", false)]);
+    for rank in &engine.ranks {
+        assert!(rank.weight_load_checks.load(Ordering::SeqCst) >= 2);
+        assert!(rank.device_ops.lock().unwrap().is_empty());
+        assert!(rank.weight_commits.lock().unwrap().is_empty());
+    }
+    let next_ids: Vec<i32> = (1001..=1065).collect();
+    let chunks = tokio::time::timeout(
+        Duration::from_secs(2),
+        run(
+            &engine.client,
+            routed_prompt("after-late-weight-refusal", &next_ids, None),
+        ),
+    )
+    .await
+    .expect("a refused deferred weight load left cache clearing frozen");
+    assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+    assert!(stores
+        .iter()
+        .all(|store| store.put_results.lock().unwrap().is_empty()));
+    gate.open();
+    drop(engine);
+    assert!(stores
+        .iter()
+        .all(|store| store.closed.load(Ordering::SeqCst)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_unsafe_storage_does_not_prevent_a_forward_reload_from_becoming_ready() {
+    let remote = Arc::new(MemoryStore::new());
+    let stores = vec![
+        Arc::new(StorageProbe {
+            memory: remote.clone(),
+            failed_put_retirement: Mutex::new(Some(false)),
+            ..StorageProbe::default()
+        }),
+        Arc::new(StorageProbe {
+            memory: remote,
+            ..StorageProbe::default()
+        }),
+    ];
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            l3_stores: stores.clone(),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let old_ids: Vec<i32> = (1..=65).collect();
+    run(
+        &engine.client,
+        routed_prompt("before-retained-reload", &old_ids, None),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stores
+            .iter()
+            .any(|store| store.put_results.lock().unwrap().is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the original owners did not finish their native calls");
+    assert!(stores[0].put_results.lock().unwrap().contains(&false));
+    flush_until_idle(&engine).await;
+    *stores[0].failed_put_retirement.lock().unwrap() = None;
+    admission_on_every_rank(&engine).await;
+    let retained = admission_on_every_rank(&engine).await;
+    assert!(retained.iter().all(|capacity| {
+        capacity.host_free_blocks > 0 && capacity.host_free_blocks < capacity.host_total_blocks
+    }));
+    assert_eq!(retained[0].host_free_blocks, retained[1].host_free_blocks);
+    let reloaded = tokio::time::timeout(
+        Duration::from_secs(1),
+        control(&engine, waiting_reload("retained-storage", Some(0.2))),
+    )
+    .await
+    .expect("historical unsafe storage prevented reload readiness");
+    assert_eq!(reloaded, [("ReloadForwardReqOutput", true)]);
+    for rank in &engine.ranks {
+        assert_eq!(*rank.device_ops.lock().unwrap(), ["ReloadForwardReqInput"]);
+        assert!(rank.weight_commits.lock().unwrap().is_empty());
+    }
+    wait_for_retained_capacity(&engine, &retained).await;
+    let next_ids: Vec<i32> = (1001..=1065).collect();
+    let chunks = tokio::time::timeout(
+        Duration::from_secs(2),
+        run(
+            &engine.client,
+            routed_prompt("after-retained-reload", &next_ids, None),
+        ),
+    )
+    .await
+    .expect("serving did not resume after a reload with retained storage");
+    assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+    drop(engine);
+    assert!(!stores[0].closed.load(Ordering::SeqCst));
+    assert!(stores[1].closed.load(Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "multi_thread")]

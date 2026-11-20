@@ -599,6 +599,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     controls: Controls,
     /// Accepted cache clear waiting for native completions between rounds.
     cache_clear_started: Option<Instant>,
+    /// Warm-up drives its clear directly between serving rounds, without a
+    /// queued frontend control request. Keep that demand alive while it waits.
+    startup_cache_clear: bool,
     /// Standalone flush callers whose replies wait for that clear.
     deferred_flushes: usize,
     /// Admissions withheld from the scheduler while paused, in arrival order.
@@ -688,6 +691,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
             cache_clear_started: None,
+            startup_cache_clear: false,
             deferred_flushes: 0,
             withheld: Vec::new(),
             staged: Vec::new(),
@@ -740,14 +744,17 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     break;
                 }
             }
+            self.startup_cache_clear = true;
             loop {
                 if self.clear_cache()? == Some(true) {
                     break;
                 }
                 if self.round(stop.load(Ordering::Relaxed))? {
+                    self.startup_cache_clear = false;
                     return Ok(true);
                 }
             }
+            self.startup_cache_clear = false;
         }
         Ok(false)
     }
@@ -1916,6 +1923,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if let Some(op) = &ready {
             want_flush |= control::wants_flush(op);
         }
+        if !want_flush && !self.startup_cache_clear {
+            // A deferred reload can expire or be cancelled, and a load can
+            // lose admission while storage drains. With no remaining flush
+            // caller, stop withholding forwards for that abandoned clear.
+            self.cache_clear_started = None;
+        }
         let flushed = if want_flush {
             match self.clear_cache()? {
                 Some(flushed) => flushed,
@@ -2411,7 +2424,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         }
         if matches!(drain, Drain::Reload)
-            && (!self.transfers_idle() || !self.scheduler.can_clear_cache())
+            && (!self.transfers_idle() || !self.scheduler.storage_non_storage_clearable())
         {
             // Capture writes KV pages a transfer or a Host write-back could still touch.
             return Ok(());

@@ -456,6 +456,13 @@ original weight-operation queue head remain pending; no weight load or new
 forward/storage plan begins meanwhile. The rounds still poll, agree and apply
 completions and answer control queries. If the jobs retire, clear purges the
 current namespace and keeps its shared prefix, without a recovery generation.
+If a deferred reload expires or is cancelled, or a weight load loses admission,
+the gate drops the abandoned clear wait once no other flush caller remains.
+Forward planning then follows the ordinary pause/memory permissions again.
+Startup warm-up drives a clear without a frontend request and explicitly keeps
+that separate demand alive until its clear finishes. Reload readiness checks
+non-storage owners rather than requiring old retained tickets to disappear;
+the eventual clear still drains or isolates current storage work normally.
 An active-generation quarantine/unproven namespace goes directly to recovery;
 otherwise only exhaustion of the drain budget selects recovery. Every decision
 is agreed across the replica and attention-DP ranks. Preflight still refuses Device/PD/tier transfers,
