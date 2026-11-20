@@ -63,6 +63,11 @@ void SchedulerConfig::Validate() const {
     if (max_kv_page_num < 0) {
         throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");
     }
+    // Absent on the P role it is kEarly: what a caller built before the policy existed sends.
+    if (role != Role::kP && decode_allocation_policy) {
+        throw std::invalid_argument(
+            "Scheduler: decode_allocation_policy (--disaggregation-decode-allocation-policy) is for the P role only");
+    }
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }

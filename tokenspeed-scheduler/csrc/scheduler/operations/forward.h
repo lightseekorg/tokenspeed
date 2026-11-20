@@ -312,6 +312,10 @@ struct ForwardBatch {
 
     bool empty() const { return request_ids.empty(); }
     std::size_t NumExtends() const { return extend_prefix_lens.size(); }
+    // Extend row `row` carries its prompt's last chunk.
+    bool CompletesPrompt(std::size_t row) const {
+        return extend_prefix_lens[row] + input_lengths[row] == prefill_lengths[row];
+    }
 
     bool operator==(const ForwardBatch&) const = default;
 };
