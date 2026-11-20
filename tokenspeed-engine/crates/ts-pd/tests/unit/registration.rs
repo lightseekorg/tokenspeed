@@ -81,6 +81,7 @@ fn registration(cache: &str, session: &str, port: u16) -> Vec<Bytes> {
         layout(Some(0x2000)).as_bytes(),
         1,
         0,
+        7,
     )
 }
 
@@ -282,6 +283,8 @@ fn replacement_waits_for_its_writer_without_blocking_other_registrations() {
     // Cancellation of a deferred cache is processed before activation. Its
     // queued manifest must not revive the cancelled room after replacement.
     peer.handle_cancellation(&wire::cancellation_frames(2, "new-cache"));
+    // The replacement is not acknowledged before it is installed: the first
+    // reply is the cancellation's.
     let ack = received.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(
         wire::cancellation_ack(&ack).unwrap(),
@@ -292,7 +295,13 @@ fn replacement_waits_for_its_writer_without_blocking_other_registrations() {
     native.release_writes();
     writer.join().unwrap().unwrap();
     assert_eq!(*destination, *source);
+    assert!(received.recv_timeout(Duration::from_millis(200)).is_err());
     peer.flush_registrations();
+    let ack = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        wire::registration_ack(&ack),
+        Ok((7, "new-cache".to_owned(), 0))
+    );
     assert!(peer
         .write_copies(1, &old, &[])
         .unwrap_err()
@@ -355,11 +364,23 @@ fn decode_socket() -> (crate::net::Sockets, mpsc::Receiver<Vec<Bytes>>) {
     )
 }
 
+/// The next message other than a registration acknowledgment that a Decode
+/// rank's socket receives within `timeout`.
+fn next_status(received: &mpsc::Receiver<Vec<Bytes>>, timeout: Duration) -> Option<Vec<Bytes>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let frames = received
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()?;
+        if !wire::is_registration_ack(&frames) {
+            return Some(frames);
+        }
+    }
+}
+
 /// The next status a Decode rank's socket receives.
 fn status(received: &mpsc::Receiver<Vec<Bytes>>) -> (u64, TransferPoll) {
-    let frames = received
-        .recv_timeout(Duration::from_secs(3))
-        .expect("a status message");
+    let frames = next_status(received, Duration::from_secs(3)).expect("a status message");
     let message = StatusMessage::from_frames(&frames).unwrap();
     (message.room, message.status)
 }
@@ -376,7 +397,7 @@ fn announce_until_answered(
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         peer.shared.handle(&wire::announce_frames(room, cache));
-        if let Ok(frames) = received.recv_timeout(Duration::from_millis(50)) {
+        if let Some(frames) = next_status(received, Duration::from_millis(50)) {
             let message = StatusMessage::from_frames(&frames).unwrap();
             return (message.room, message.status);
         }
@@ -440,7 +461,7 @@ fn a_request_under_deferred_allocation_is_admitted_by_its_announcement_and_grant
     );
     // The announcement is answered only once the prompt holds its pages,
     // and a manifest before that is refused: the room fails on both sides.
-    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(next_status(&received, Duration::from_millis(100)).is_none());
     assert!(preallocate(&peer.shared, "cache-a", 7)
         .unwrap_err()
         .contains("does not hold its pages"));
@@ -451,7 +472,7 @@ fn a_request_under_deferred_allocation_is_admitted_by_its_announcement_and_grant
     assert_eq!(status(&received), (7, TransferPoll::Bootstrapped));
     // Told once: the mark again sends nothing.
     outbox.mark_pages_held(&["r".to_owned()]);
-    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(next_status(&received, Duration::from_millis(100)).is_none());
     // Every announcement is answered: a repeated one, again.
     assert_eq!(
         announce_until_answered(&peer, &received, 7, "cache-a"),
@@ -691,4 +712,115 @@ fn a_request_waiting_for_its_announcement_is_reported_after_the_stall_interval()
         "{log}"
     );
     assert!(!log.contains("computing(room=1"), "{log}");
+}
+
+#[test]
+fn an_installed_registration_is_acknowledged_to_its_decode_rank() {
+    let native = NativeLibrary::new();
+    let peer = shared(&native);
+    let (decode, acknowledgments) = decode_socket();
+    peer.handle_registration(&registration("cache-a", "127.0.0.1:41001", decode.port()));
+    let ack = acknowledgments
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        wire::registration_ack(&ack),
+        Ok((7, "cache-a".to_owned(), 0))
+    );
+    assert_eq!(preallocate(&peer, "cache-a", 1), Ok(()));
+    // An older Decode rank's nine frames install without an acknowledgment.
+    let (old_decode, unacknowledged) = decode_socket();
+    let legacy = registration("cache-b", "127.0.0.1:41002", old_decode.port());
+    peer.handle_registration(&legacy[..9]);
+    assert_eq!(preallocate(&peer, "cache-b", 2), Ok(()));
+    assert!(unacknowledged
+        .recv_timeout(Duration::from_millis(300))
+        .is_err());
+}
+
+#[test]
+fn a_rejected_registration_tells_its_decode_rank_why() {
+    let native = NativeLibrary::new();
+    let peer = shared(&native);
+    let (decode, replies) = decode_socket();
+    let frames = wire::registration_frames(
+        "127.0.0.1",
+        decode.port(),
+        "127.0.0.1:41001",
+        "cache-a",
+        0x2000,
+        b"not a layout",
+        1,
+        0,
+        7,
+    );
+    peer.handle_registration(&frames);
+    let reply = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (id, cache_id, rank, reason) = wire::registration_reject(&reply).unwrap();
+    assert_eq!((id, cache_id.as_str(), rank), (7, "cache-a", 0));
+    assert!(!reason.is_empty());
+    assert!(preallocate(&peer, "cache-a", 1)
+        .unwrap_err()
+        .contains("unregistered"));
+}
+
+#[test]
+fn an_identical_registration_is_acknowledged_while_its_cache_is_written() {
+    let native = NativeLibrary::new();
+    let peer = Arc::new(shared(&native));
+    let source = Arc::new(vec![73u8; 32]);
+    let destination = Arc::new(vec![0u8; 32]);
+    let receiver =
+        ts_mooncake::Engine::start(peer.transport.library.clone(), "127.0.0.1", "rdma", "")
+            .unwrap();
+    peer.transport
+        .engine()
+        .register(source.as_ptr() as usize, source.len())
+        .unwrap();
+    receiver
+        .register(destination.as_ptr() as usize, destination.len())
+        .unwrap();
+    let session = receiver.session_id();
+    let (decode, replies) = decode_socket();
+    let frames = registration("cache-a", session, decode.port());
+    peer.handle_registration(&frames);
+    let ack = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        wire::registration_ack(&ack),
+        Ok((7, "cache-a".to_owned(), 0))
+    );
+    preallocate(&peer, "cache-a", 1).unwrap();
+    let installed = peer.plan_registration(&frames).unwrap();
+    native.block_writes();
+    let writer = {
+        let peer = peer.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        thread::spawn(move || {
+            peer.write_copies(
+                1,
+                &installed,
+                &[Copy::Spans {
+                    sources: vec![source.as_ptr() as u64],
+                    destinations: vec![destination.as_ptr() as u64],
+                    lengths: vec![32],
+                }],
+            )
+        })
+    };
+    assert!(native.wait_write_entered(Duration::from_secs(2)));
+    // The same cache registers again, as after a route change, while one of
+    // its writes is inside native I/O: nothing is replaced, so nothing waits.
+    let mut again = frames.clone();
+    again[9] = Bytes::from_static(b"8");
+    peer.handle_registration(&again);
+    let ack = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        wire::registration_ack(&ack),
+        Ok((8, "cache-a".to_owned(), 0))
+    );
+    preallocate(&peer, "cache-a", 2).unwrap();
+    native.release_writes();
+    writer.join().unwrap().unwrap();
+    assert_eq!(*destination, *source);
 }

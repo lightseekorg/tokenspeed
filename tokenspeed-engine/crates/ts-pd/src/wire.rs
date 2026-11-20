@@ -20,7 +20,11 @@
 
 //! The P/D control messages. Cache registrations carry an incarnation
 //! separate from the transport address: every P/D peer must support this
-//! nine-frame protocol before serving together.
+//! nine-frame protocol before serving together. A tenth frame asks the
+//! Prefill rank to acknowledge the registration once installed
+//! ([`registration_ack_frames`]), or to say why it rejected it
+//! ([`registration_reject_frames`]); a Decode rank waits for that reply, so
+//! it needs Prefill ranks that send it.
 
 use bytes::Bytes;
 
@@ -49,7 +53,8 @@ fn text(frame: &[u8], name: &str) -> Result<String, WireError> {
 }
 
 /// A Decode rank's registration with a Prefill rank: where to reach it,
-/// its transfer session, and the identity of its current cache.
+/// its transfer session, the identity of its current cache, and the id the
+/// Prefill rank acknowledges it by.
 #[allow(clippy::too_many_arguments)]
 pub fn registration_frames(
     host: &str,
@@ -60,6 +65,7 @@ pub fn registration_frames(
     layout: &[u8],
     tp_size: i64,
     tp_rank: i64,
+    registration_id: u64,
 ) -> Vec<Bytes> {
     vec![
         Bytes::from_static(b"None"),
@@ -72,6 +78,7 @@ pub fn registration_frames(
         ascii(tp_size),
         ascii(tp_rank),
         ascii(cache_id),
+        ascii(registration_id),
     ]
 }
 
@@ -85,8 +92,8 @@ pub fn is_registration(frames: &[Bytes]) -> bool {
 /// A registration's reply route, readable even when its layout is rejected
 /// (`KVArgsRegisterInfo.route_header_from_zmq`): endpoint, port, cache identity.
 pub fn registration_route(frames: &[Bytes]) -> Result<(String, u16, String), WireError> {
-    if frames.len() != 9 || !is_registration(frames) {
-        return Err(error("CachePD slab registration requires exactly 9 frames"));
+    if !matches!(frames.len(), 9 | 10) || !is_registration(frames) {
+        return Err(error("CachePD slab registration requires 9 or 10 frames"));
     }
     let endpoint = text(&frames[1], "CachePD registration endpoint")?;
     let cache_id = text(&frames[8], "CachePD registration cache identity")?;
@@ -100,6 +107,93 @@ pub fn registration_route(frames: &[Bytes]) -> Result<(String, u16, String), Wir
         .filter(|&port| port >= 1)
         .ok_or_else(|| error("CachePD registration port is invalid"))?;
     Ok((endpoint, port as u16, cache_id))
+}
+
+/// The id a registration is acknowledged by; `None` for the nine frames of
+/// a Decode rank that predates acknowledgments, which is not acknowledged.
+pub fn registration_id(frames: &[Bytes]) -> Result<Option<u64>, WireError> {
+    frames
+        .get(9)
+        .map(|frame| {
+            parse_uint(frame, u64::MAX)
+                .ok_or_else(|| error("CachePD registration id must be canonical unsigned ASCII"))
+        })
+        .transpose()
+}
+
+/// A Prefill rank installed registration `registration_id` of the Decode
+/// cache `cache_id`: pre-allocations that follow it find the cache.
+pub fn registration_ack_frames(registration_id: u64, cache_id: &str, rank: i64) -> Vec<Bytes> {
+    vec![
+        Bytes::from_static(b"RegisterAck"),
+        ascii(registration_id),
+        ascii(cache_id),
+        ascii(rank),
+    ]
+}
+
+pub fn is_registration_ack(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"RegisterAck")
+}
+
+/// A registration acknowledgment's id, cache identity and Prefill rank.
+pub fn registration_ack(frames: &[Bytes]) -> Result<(u64, String, i64), WireError> {
+    if frames.len() != 4 || !is_registration_ack(frames) {
+        return Err(error(
+            "CachePD registration acknowledgment requires exactly 4 frames",
+        ));
+    }
+    registration_reply(frames)
+}
+
+/// A Prefill rank rejected registration `registration_id` of the Decode
+/// cache `cache_id`, for `reason`.
+pub fn registration_reject_frames(
+    registration_id: u64,
+    cache_id: &str,
+    rank: i64,
+    reason: &str,
+) -> Vec<Bytes> {
+    vec![
+        Bytes::from_static(b"RegisterReject"),
+        ascii(registration_id),
+        ascii(cache_id),
+        ascii(rank),
+        Bytes::copy_from_slice(reason.as_bytes()),
+    ]
+}
+
+pub fn is_registration_reject(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"RegisterReject")
+}
+
+/// A registration rejection's id, cache identity, Prefill rank and reason.
+pub fn registration_reject(frames: &[Bytes]) -> Result<(u64, String, i64, String), WireError> {
+    if frames.len() != 5 || !is_registration_reject(frames) {
+        return Err(error(
+            "CachePD registration rejection requires exactly 5 frames",
+        ));
+    }
+    let (registration_id, cache_id, rank) = registration_reply(frames)?;
+    let reason = String::from_utf8_lossy(&frames[4]).into_owned();
+    Ok((registration_id, cache_id, rank, reason))
+}
+
+/// The id, cache identity and Prefill rank after a registration reply's header.
+fn registration_reply(frames: &[Bytes]) -> Result<(u64, String, i64), WireError> {
+    let registration_id = parse_uint(&frames[1], u64::MAX)
+        .ok_or_else(|| error("CachePD registration id must be canonical unsigned ASCII"))?;
+    let cache_id = text(&frames[2], "CachePD registration cache identity")?;
+    if cache_id.is_empty() || cache_id.len() > 512 {
+        return Err(error("CachePD registration cache identity is invalid"));
+    }
+    let rank = parse_uint(&frames[3], i64::MAX as u64)
+        .ok_or_else(|| error("CachePD registration reply rank is invalid"))?;
+    Ok((registration_id, cache_id, rank as i64))
 }
 
 /// A Decode rank's pre-allocation of one request: its destination block
@@ -395,6 +489,7 @@ mod tests {
             b"L",
             4,
             2,
+            7,
         );
         assert_eq!(
             registration_route(&frames),
@@ -422,6 +517,7 @@ mod tests {
             b"L",
             1,
             0,
+            7,
         );
         frames[3] = Bytes::from_static(b"\xff");
         assert_eq!(
@@ -453,6 +549,7 @@ mod tests {
             layout.as_bytes(),
             1,
             0,
+            7,
         );
         let registration = RegistrationInfo::from_frames(&frames).unwrap();
         assert_eq!(registration.session_id, "10.0.0.1:5000");
@@ -495,6 +592,7 @@ mod tests {
             b"L",
             4,
             2,
+            7,
         );
         assert!(!is_cancellation(&registration));
         assert!(cancellation_route(&registration).is_err());
@@ -538,5 +636,62 @@ mod tests {
         assert!(
             cancellation_route(&[Bytes::from_static(b"Cancel "), ascii(1), ascii("s")]).is_err()
         );
+    }
+
+    #[test]
+    fn a_registration_carries_the_id_it_is_acknowledged_by() {
+        let frames = registration_frames(
+            "10.0.0.1",
+            4000,
+            "10.0.0.1:5000",
+            "cache-a",
+            0x1000,
+            b"L",
+            4,
+            2,
+            u64::MAX,
+        );
+        assert_eq!(frames.len(), 10);
+        assert_eq!(registration_id(&frames), Ok(Some(u64::MAX)));
+        // The nine frames of an older Decode rank still route, unacknowledged.
+        assert_eq!(
+            registration_route(&frames[..9]),
+            Ok(("10.0.0.1".to_owned(), 4000, "cache-a".to_owned()))
+        );
+        assert_eq!(registration_id(&frames[..9]), Ok(None));
+        let mut bad = frames.clone();
+        for id in [b"07".as_slice(), b"", b"x", b"18446744073709551616"] {
+            bad[9] = Bytes::copy_from_slice(id);
+            assert!(registration_id(&bad).is_err());
+        }
+        let mut long = frames;
+        long.push(Bytes::new());
+        assert!(registration_route(&long).is_err());
+    }
+
+    #[test]
+    fn a_registration_acknowledgment_round_trips() {
+        let frames = registration_ack_frames(9, "cache-a", 3);
+        assert!(is_registration_ack(&frames));
+        assert!(!is_cancellation_ack(&frames) && !is_registration(&frames));
+        assert!(!is_registration_reject(&frames));
+        assert_eq!(registration_ack(&frames), Ok((9, "cache-a".to_owned(), 3)));
+        let rejection = registration_reject_frames(9, "cache-a", 3, "bad layout");
+        assert!(is_registration_reject(&rejection) && !is_registration_ack(&rejection));
+        assert_eq!(
+            registration_reject(&rejection),
+            Ok((9, "cache-a".to_owned(), 3, "bad layout".to_owned()))
+        );
+        assert!(registration_reject(&rejection[..4]).is_err());
+        assert!(registration_ack(&rejection[..4]).is_err());
+        assert!(registration_ack(&frames[..3]).is_err());
+        assert!(!is_registration_ack(&cancellation_ack_frames(
+            9, "cache-a", 3
+        )));
+        for (index, frame) in [(1, b"09".as_slice()), (2, b""), (3, b"-1")] {
+            let mut bad = frames.clone();
+            bad[index] = Bytes::copy_from_slice(frame);
+            assert!(registration_ack(&bad).is_err());
+        }
     }
 }
