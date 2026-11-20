@@ -76,6 +76,11 @@ bool StorageTransferManager::HasCurrentPending() const {
     return std::ranges::any_of(operations_, [](const auto& entry) { return !entry.second.retained_after_clear; });
 }
 
+bool StorageTransferManager::HasProgressPending() const {
+    return std::ranges::any_of(
+        operations_, [](const auto& entry) { return !entry.second.retained_after_clear && !entry.second.quarantined; });
+}
+
 std::size_t StorageTransferManager::NumRetainedOperations() const {
     return std::ranges::count_if(operations_, [](const auto& entry) { return entry.second.retained_after_clear; });
 }

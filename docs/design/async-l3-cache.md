@@ -501,6 +501,19 @@ Old queue age is excluded from current pressure; clearing also resets backend
 health with a new health epoch, so old failures cannot close the new generation.
 A new unproven result in the current generation again blocks new I/O until clear.
 The aggregate unsafe-I/O metric and shutdown proof remain conservative.
+
+Storage exposes separate ownership and progress observations. Physical pending
+includes every ticket and continues governing strict clear and resource budgets.
+Current pending also includes the active generation's terminal quarantine, so
+an explicit clear still isolates it. Progress pending excludes retained tickets
+and terminal quarantine, which cannot produce an accepted result for a waiting
+request. A current query or Ready lease still counts as progress pending.
+Frontend idle waiting, metrics activity transitions and no-progress diagnostics
+use the progress view; idle does not release any storage reference or stop the
+normal completion polls and rank agreement. Warm-up waits for model requests
+and Device copies, then enters its explicit budgeted clear even if background
+PUTs remain outstanding. Each later startup phase can therefore proceed after
+storage isolation instead of waiting forever before it reaches clear.
 Historical unsafe prefixes are tracked separately from the active prefix.
 Later healthy clears can delete the safe active namespace and clear its indexes
 while keeping old references, without rotating into yet another private scope.

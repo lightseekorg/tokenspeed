@@ -44,6 +44,9 @@ public:
     bool CanStart() const;
     bool HasRetainedOperations() const;
     bool HasCurrentPending() const;
+    // Current work that can still advance through completion, request state
+    // or deadlines. Retained and terminal-unknown tickets only hold resources.
+    bool HasProgressPending() const;
     std::size_t NumRetainedOperations() const;
     std::size_t NumRetainedHostBlocks() const;
     // Called by the planning round, not by read-only stats/preflight queries.

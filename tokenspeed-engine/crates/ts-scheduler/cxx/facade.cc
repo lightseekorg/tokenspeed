@@ -516,6 +516,7 @@ bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::St
 
 bool storage_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StoragePending(); }
 bool storage_current_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StorageCurrentPending(); }
+bool storage_progress_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StorageProgressPending(); }
 std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler) {
     return scheduler.StorageBlockingQuarantined();
 }

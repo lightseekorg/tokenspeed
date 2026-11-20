@@ -185,6 +185,7 @@ public:
     }
     bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
     bool StorageCurrentPending() const { return storage_transfers_ && storage_transfers_->HasCurrentPending(); }
+    bool StorageProgressPending() const { return storage_transfers_ && storage_transfers_->HasProgressPending(); }
     std::size_t StorageBlockingQuarantined() const {
         return storage_transfers_ ? storage_transfers_->NumBlockingQuarantined() : 0;
     }

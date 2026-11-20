@@ -1378,6 +1378,8 @@ struct Rank {
     weight_load_checks: Arc<AtomicUsize>,
     /// Every rank's own control results, including non-frontend mirrors.
     control_replies: Arc<Mutex<Vec<ControlOutput>>>,
+    /// Recent receive wait arguments on this rank's frontend.
+    frontend_waits: Arc<Mutex<VecDeque<Option<Duration>>>>,
     applied: Applied,
     epd_admitted: Arc<Mutex<Vec<String>>>,
     epd_released: Arc<Mutex<Vec<usize>>>,
@@ -1410,10 +1412,18 @@ struct Engine {
 struct ObservedFrontend<F> {
     inner: F,
     replies: Arc<Mutex<Vec<ControlOutput>>>,
+    waits: Arc<Mutex<VecDeque<Option<Duration>>>>,
 }
 
 impl<F: Frontend> Frontend for ObservedFrontend<F> {
     fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        {
+            let mut waits = self.waits.lock().unwrap();
+            if waits.len() == 16 {
+                waits.pop_front();
+            }
+            waits.push_back(wait);
+        }
         self.inner.receive(wait)
     }
 
@@ -1977,11 +1987,13 @@ async fn start_ranks_with(
                 weight_load_refused: device.weight_load_refused.clone(),
                 weight_load_checks: device.weight_load_checks.clone(),
                 control_replies: Arc::default(),
+                frontend_waits: Arc::default(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
                 epd_released: device.epd_released.clone(),
             };
             let control_replies = handle.control_replies.clone();
+            let frontend_waits = handle.frontend_waits.clone();
             let spec = RankSpec {
                 rank,
                 layout,
@@ -1997,6 +2009,7 @@ async fn start_ranks_with(
                 // attention-DP rank is its own engine.
                 let frontend = || ObservedFrontend {
                     replies: control_replies,
+                    waits: frontend_waits,
                     inner: (rank % tp_size == 0).then(|| {
                         let engine_index = (rank / tp_size) as u16;
                         let mut ready = EngineCoreReadyResponse {
@@ -5919,6 +5932,270 @@ async fn wait_for_store_put(store: &StorageProbe) {
     })
     .await
     .expect("the PUT did not reach the Store");
+}
+
+async fn assert_frontend_can_wait(engine: &Engine) {
+    engine.ranks[0].frontend_waits.lock().unwrap().clear();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if engine.ranks[0]
+                .frontend_waits
+                .lock()
+                .unwrap()
+                .back()
+                .is_some_and(|wait| wait.is_some_and(|duration| !duration.is_zero()))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("terminal or retained storage kept the frontend in polling mode");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_and_retained_unsafe_storage_allow_the_idle_frontend_to_wait() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        let remote = Arc::new(MemoryStore::new());
+        let stores: Vec<_> = (0..layout.sizes().0)
+            .map(|rank| {
+                Arc::new(StorageProbe {
+                    memory: remote.clone(),
+                    failed_put_retirement: Mutex::new((rank == 0).then_some(false)),
+                    ..StorageProbe::default()
+                })
+            })
+            .collect();
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::L3,
+            Setup {
+                l3_stores: stores.clone(),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let ids: Vec<i32> = (1..=65).collect();
+        assert_eq!(
+            tokens(
+                &run(
+                    &engine.client,
+                    routed_prompt("before-idle-recovery", &ids, None)
+                )
+                .await
+            ),
+            [1000, 1001, 1002, 1003]
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stores
+                .iter()
+                .any(|store| store.put_results.lock().unwrap().is_empty())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the Store calls did not return their retirement facts");
+        assert!(stores[0].put_results.lock().unwrap().contains(&false));
+        admission_on_every_rank(&engine).await;
+        admission_on_every_rank(&engine).await;
+        // A final unretired completion cannot advance on another poll.
+        // Waiting for new ingress must be possible even before recovery.
+        assert_frontend_can_wait(&engine).await;
+        tokio::time::timeout(Duration::from_millis(200), flush_until_idle(&engine))
+            .await
+            .expect("idle waiting hid a current unsafe operation from clear recovery");
+        admission_on_every_rank(&engine).await;
+        let retained = admission_on_every_rank(&engine).await;
+        for capacity in &retained {
+            assert!(capacity.host_free_blocks > 0);
+            assert!(capacity.host_free_blocks < capacity.host_total_blocks);
+            assert_eq!(capacity.host_free_blocks, retained[0].host_free_blocks);
+        }
+        // Historical native references still consume physical capacity,
+        // but they cannot make ordinary empty rounds spin indefinitely.
+        assert_frontend_can_wait(&engine).await;
+        let after_wait = admission_on_every_rank(&engine).await;
+        for (before, after) in retained.iter().zip(after_wait) {
+            assert_eq!(after.host_free_blocks, before.host_free_blocks);
+            assert_eq!(after.host_total_blocks, before.host_total_blocks);
+        }
+        drop(engine);
+        assert!(!stores[0].closed.load(Ordering::SeqCst));
+        assert!(stores
+            .iter()
+            .skip(1)
+            .all(|store| store.closed.load(Ordering::SeqCst)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_loop_consumes_late_storage_retirement_without_new_ingress() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let handle = Arc::new(Mutex::new(None));
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            l3_store: Some(store.clone()),
+            l3_clear_cache_drain_timeout: Some(Duration::ZERO),
+            scheduler: Some(handle.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let ids: Vec<i32> = (1..=65).collect();
+    run(
+        &engine.client,
+        routed_prompt("before-idle-late-retirement", &ids, None),
+    )
+    .await;
+    wait_for_store_put(&store).await;
+    flush_until_idle(&engine).await;
+    assert_frontend_can_wait(&engine).await;
+    let scheduler = handle.lock().unwrap().clone().unwrap();
+    let before = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(scheduler) = scheduler.try_lock() {
+                break scheduler.storage_stats();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the idle loop did not hand the scheduler to its observer");
+    assert!(before.retained_operations > 0);
+    assert!(before.retained_host_blocks > 0);
+    assert!(store.put_results.lock().unwrap().is_empty());
+
+    // No generate or control message follows. The bounded idle receive must
+    // return on its own so the loop consumes the worker's late completion.
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while store.put_results.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the released native PUT did not return");
+    let receipt = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(scheduler) = scheduler.try_lock() {
+                let stats = scheduler.storage_stats();
+                if stats.retained_operations == 0 && stats.held_blocks == 0 {
+                    assert_eq!(stats.retained_host_blocks, 0);
+                    assert_eq!(stats.operations, 0);
+                    break scheduler.shared_prefix_publication(&ids, 64).unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("late storage retirement required a new frontend message to advance");
+    assert_ne!(receipt.status, "published");
+    assert!(!store.memory.keys().is_empty());
+    drop(engine);
+    assert!(store.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_phases_clear_with_a_budget_while_an_old_put_is_still_running() {
+    const IN_FLIGHT_DEPTH: usize = 1;
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        let gate = Gate::closed();
+        let remote = Arc::new(MemoryStore::new());
+        let stores: Vec<_> = (0..layout.sizes().0)
+            .map(|_| {
+                Arc::new(StorageProbe {
+                    memory: remote.clone(),
+                    put_gate: Some(gate.clone()),
+                    ..StorageProbe::default()
+                })
+            })
+            .collect();
+        let _release = ReleaseStoreGate(gate.clone());
+        let engine = tokio::time::timeout(
+            Duration::from_secs(2),
+            start_ranks_with(
+                layout,
+                IN_FLIGHT_DEPTH,
+                Tiers::L3,
+                Setup {
+                    l3_stores: stores.clone(),
+                    l3_clear_cache_drain_timeout: Some(Duration::from_millis(40)),
+                    startup: vec![
+                        startup::Phase {
+                            batch: 1,
+                            prompt_len: 65,
+                        },
+                        startup::Phase {
+                            batch: 1,
+                            prompt_len: 81,
+                        },
+                    ],
+                    ..Setup::default()
+                },
+            ),
+        )
+        .await
+        .expect("startup waited for a background PUT before entering its clear budget");
+        let _release_engine = ReleaseStoreGate(gate.clone());
+        let original = ts_l3::keys::key_prefix("serving", "v1", "");
+        for (rank, store) in stores.iter().enumerate() {
+            let puts = store.puts.lock().unwrap();
+            assert!(!puts.is_empty());
+            assert!(puts[0].iter().all(|key| key.starts_with(&original)));
+            assert!(store.put_results.lock().unwrap().is_empty());
+            // Release records the fake device's physical samples, including
+            // the extra dispatched step beyond the accepted output budget.
+            let physical_samples = (STARTUP_OUTPUT_TOKENS + IN_FLIGHT_DEPTH) as i32;
+            assert_eq!(
+                engine.released_on(rank),
+                [
+                    (format!("{}0_0", startup::RID_PREFIX), physical_samples),
+                    (format!("{}1_0", startup::RID_PREFIX), physical_samples),
+                ]
+            );
+        }
+        let ids: Vec<i32> = (1001..=1065).collect();
+        let outputs = publication_on_every_rank(&engine, "after-budgeted-startup", &ids).await;
+        assert_ne!(agreed_namespace(&outputs, "v1"), original);
+        let capacities = admission_on_every_rank(&engine).await;
+        assert!(capacities
+            .iter()
+            .all(|capacity| capacity.host_free_blocks < capacity.host_total_blocks));
+        assert_eq!(
+            tokens(
+                &tokio::time::timeout(
+                    Duration::from_secs(2),
+                    run(
+                        &engine.client,
+                        routed_prompt("after-budgeted-startup", &ids, None),
+                    ),
+                )
+                .await
+                .expect("the attached frontend could not serve after startup recovery")
+            ),
+            [1000, 1001, 1002, 1003]
+        );
+        assert!(stores
+            .iter()
+            .all(|store| store.put_results.lock().unwrap().is_empty()));
+        gate.open();
+        drop(engine);
+        assert!(stores
+            .iter()
+            .all(|store| store.closed.load(Ordering::SeqCst)));
+    }
 }
 
 fn waiting_reload(id: &str, timeout_s: Option<f64>) -> ControlRequest {

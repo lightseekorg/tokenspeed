@@ -698,6 +698,7 @@ mod ffi {
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_current_pending(scheduler: &Scheduler) -> bool;
+        fn storage_progress_pending(scheduler: &Scheduler) -> bool;
         fn storage_blocking_quarantined(scheduler: &Scheduler) -> usize;
         fn storage_non_storage_clearable(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
@@ -1043,6 +1044,12 @@ impl Scheduler {
     /// Current-generation tickets remain, including unknown retirement.
     pub fn storage_current_pending(&self) -> bool {
         ffi::storage_current_pending(self.get())
+    }
+
+    /// Current storage work can still advance through completion or deadlines.
+    /// Retained and terminal-unknown tickets keep their resources but do not count.
+    pub fn storage_progress_pending(&self) -> bool {
+        ffi::storage_progress_pending(self.get())
     }
 
     /// Current-generation quarantined tickets blocking new storage work.

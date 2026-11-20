@@ -839,10 +839,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
 }
 
 void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
-    // With nothing out, only a new submission or an abort can change the next
-    // plan.
-    const bool stalled = forward_allowed_ && (!storage_transfers_ || !storage_transfers_->HasPending()) &&
-                         num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+    // Retained and terminal-unknown storage only protect their own addresses;
+    // waiting for them cannot make a blocked request progress.
+    const bool stalled = forward_allowed_ && !StorageProgressPending() && num_live_requests > 0 && plan_is_empty &&
+                         !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
                              return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
                          });

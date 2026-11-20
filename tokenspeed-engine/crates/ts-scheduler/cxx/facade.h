@@ -104,6 +104,7 @@ std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::St
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
 bool storage_current_pending(const tokenspeed::Scheduler& scheduler);
+bool storage_progress_pending(const tokenspeed::Scheduler& scheduler);
 std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler);
 bool storage_non_storage_clearable(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);

@@ -737,7 +737,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if self.round_with(stop.load(Ordering::Relaxed), received)? {
                     return Ok(true);
                 }
-                if self.converge(self.idle() && self.dp_idle)? {
+                // Background backups need not finish before entering clear:
+                // the clear itself owns their bounded drain/isolation policy.
+                if self.converge(self.requests_idle() && self.dp_idle)? {
                     break;
                 }
             }
@@ -774,21 +776,24 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     fn idle(&self) -> bool {
+        self.cache_clear_started.is_none()
+            && self.requests_idle()
+            && !self.scheduler.storage_progress_pending()
+    }
+
+    /// The model requests and Device copies drained. Storage I/O has its own
+    /// lifetime; warm-up must reach clear even if a background PUT is stuck.
+    fn requests_idle(&self) -> bool {
         // The scheduler's counts are a pass over its requests per state: ask
         // for them only once the loop's own state says nothing runs.
         if !self.in_flight.is_empty()
-            || self.cache_clear_started.is_some()
             || self.cache_ops.open() != 0
             || self.outputs.num_running() != 0
         {
             return false;
         }
         let sizes = self.scheduler.sizes();
-        sizes.waiting == 0
-            && sizes.prefilling == 0
-            && sizes.decoding == 0
-            && sizes.retracted == 0
-            && !self.scheduler.storage_pending()
+        sizes.waiting == 0 && sizes.prefilling == 0 && sizes.decoding == 0 && sizes.retracted == 0
     }
 
     /// One round, with this rank's stop request. Returns whether the ranks
@@ -1753,14 +1758,17 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// Sample the L3 tier's metrics: at most once a second, and whenever
-    /// storage turns pending or idle. Observations never feed the agreement
+    /// Sample L3 metrics once a second while stable, plus each transition
+    /// between progress-pending and idle. Observations never feed the agreement
     /// or the scheduler.
     fn record_storage_metrics(&mut self) -> Result<(), LoopError> {
         let (Some(l3), Some(metrics)) = (self.l3.as_mut(), self.l3_metrics.as_mut()) else {
             return Ok(());
         };
-        if !l3.agreement.metrics_due(self.scheduler.storage_pending()) {
+        if !l3
+            .agreement
+            .metrics_due(self.scheduler.storage_progress_pending())
+        {
             return Ok(());
         }
         let snapshot = l3.executor.snapshot();

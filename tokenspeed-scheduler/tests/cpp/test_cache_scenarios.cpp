@@ -2596,10 +2596,12 @@ TEST_F(L3LeaseLifetimeSuite, ClearPreparationDetachesAReadyLeaseSoHealthyStorage
     PlanOnce();
     ASSERT_EQ(scheduler_->GetStorageStats().ready_requests, 1u);
     ASSERT_TRUE(scheduler_->StorageCurrentPending());
+    ASSERT_TRUE(scheduler_->StorageProgressPending()) << "Ready can still advance through admission or expiry";
     ASSERT_TRUE(scheduler_->StorageNonStorageClearable());
 
     scheduler_->CancelStorageForClear();
     EXPECT_FALSE(scheduler_->StorageCurrentPending());
+    EXPECT_FALSE(scheduler_->StorageProgressPending());
     EXPECT_FALSE(scheduler_->StoragePending());
     EXPECT_EQ(scheduler_->GetStorageStats().ready_requests, 0u);
     EXPECT_EQ(scheduler_->StorageHeldBlocks(), 0u);
@@ -2688,6 +2690,96 @@ TEST_F(L3BackupClearSuite, RejectedClearWithAPeerExportDoesNotCancelADispatchedP
     peer.blocks.clear();
     Retire(put.op_id, put.keys.size());
     for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
+class L3LoneNoProgressSuite : public L3BackupClearSuite {
+protected:
+    std::vector<CacheBlockRef> BlockDeviceAndSubmit() {
+        // These owners are outside every request, as external cache users can
+        // be. The lone prompt fits its configured limit, but no Device parent
+        // can be freed by eviction or compaction.
+        auto& pool = SchedulerTestAccess::Pool(*scheduler_);
+        auto held = pool.AcquireBlocks(0, scheduler_->AvailableLcmBlocks());
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+        ExecutionEvent tick;
+        tick.With(cache::StorageTick{2, true, false, StoragePressure{0, 0, 0}});
+        scheduler_->Advance(std::move(tick));
+        Submit(MakeRequestSpec("impossible", /*num_pages=*/2));
+        return held;
+    }
+
+    void ExpectLoneNoProgressAbort() {
+        for (std::int64_t stalled = 1; stalled < Scheduler::kNoProgressAbortPlans; ++stalled) {
+            const auto plan = PlanOnce();
+            ASSERT_TRUE(FindForwardBatch(plan)->request_ids.empty()) << stalled;
+            ASSERT_TRUE(plan.aborts.empty()) << stalled;
+        }
+        const auto plan = PlanOnce();
+        ASSERT_EQ(plan.aborts.size(), 1u);
+        EXPECT_EQ(plan.aborts.front().request_id, "impossible");
+        EXPECT_EQ(plan.aborts.front().reason, AbortReason::kNoProgress);
+        EXPECT_NE(plan.aborts.front().detail.find(
+                      "no progress for " + std::to_string(Scheduler::kNoProgressAbortPlans) + " consecutive plans"),
+                  std::string::npos);
+    }
+};
+
+TEST_F(L3LoneNoProgressSuite, RetainedUnknownIoDoesNotSuppressALoneImpossibleRequestsAbort) {
+    const auto put = StartBackup();
+    ExecutionEvent unknown;
+    unknown.With(cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 0), false,
+                                    std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(unknown));
+    ASSERT_TRUE(scheduler_->ClearCacheRetainingStorage());
+    ASSERT_TRUE(scheduler_->StoragePending());
+    ASSERT_FALSE(scheduler_->StorageCurrentPending());
+    ASSERT_FALSE(scheduler_->StorageProgressPending());
+    const auto held = BlockDeviceAndSubmit();
+    ExpectLoneNoProgressAbort();
+    EXPECT_TRUE(scheduler_->StoragePending());
+    EXPECT_EQ(scheduler_->GetStorageStats().retained_operations, 1u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "physical unknown ownership still prevents a strict clear";
+}
+
+TEST_F(L3LoneNoProgressSuite, CurrentTerminalUnknownIoDoesNotSuppressALoneImpossibleRequestsAbort) {
+    const auto put = StartBackup();
+    ExecutionEvent unknown;
+    unknown.With(cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 0), false,
+                                    std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(unknown));
+    ASSERT_TRUE(scheduler_->StorageCurrentPending());
+    ASSERT_FALSE(scheduler_->StorageProgressPending());
+    const auto held = BlockDeviceAndSubmit();
+    ExpectLoneNoProgressAbort();
+    EXPECT_EQ(scheduler_->StorageBlockingQuarantined(), 1u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+}
+
+TEST_F(L3LoneNoProgressSuite, AnActiveCurrentQuerySuppressesStallCountingUntilItsLeaseAndCompletionRetire) {
+    auto& storage = SchedulerTestAccess::Storage(*scheduler_);
+    const auto hashes = scheduler_->PrefixHashesForTokens({10, 11, 12});
+    const auto keys = scheduler_->ExpandPrefixKeys(hashes);
+    auto query = storage.StartQuery(keys, std::vector<std::int32_t>(keys.size(), 2));
+    ASSERT_TRUE(query);
+    // The real query has already left the scheduler's outbox. No synthetic
+    // storage command in a later plan can reset the diagnostic on its behalf.
+    ASSERT_EQ(storage.TakeCommands().size(), 1u);
+    const auto held = BlockDeviceAndSubmit();
+    for (std::int64_t round = 0; round < Scheduler::kNoProgressAbortPlans + 8; ++round) {
+        const auto plan = PlanOnce();
+        ASSERT_TRUE(plan.aborts.empty()) << round;
+        ASSERT_TRUE(scheduler_->StorageProgressPending()) << round;
+    }
+    ExecutionEvent done;
+    done.With(cache::StorageDone{query.OperationId(), std::vector<std::uint8_t>(keys.size(), 0), true,
+                                 std::vector<std::uint8_t>(keys.size(), 0)});
+    scheduler_->Advance(std::move(done));
+    ASSERT_TRUE(scheduler_->StorageProgressPending()) << "an attached completed query still has a state owner";
+    query.reset();
+    ASSERT_FALSE(scheduler_->StoragePending());
+    ASSERT_FALSE(scheduler_->StorageProgressPending());
+    ExpectLoneNoProgressAbort();
 }
 
 // With KV events on, an L3 read registers Host entries for a prefix this
