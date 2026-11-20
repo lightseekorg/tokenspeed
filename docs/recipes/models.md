@@ -301,7 +301,6 @@ On AMD, the command is Inkling 2 Small's with three changes:
   Inkling 2 Mini yet.
 
 ```bash
-# amd (4x MI350X)
 ts serve thinkingmachines/Inkling-2-Mini \
     --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
     --max-model-len 262120 --sampling-backend triton \
