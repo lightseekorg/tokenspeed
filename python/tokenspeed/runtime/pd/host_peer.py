@@ -138,7 +138,9 @@ class DecodeSettings:
         tp_size: The attention TP size.
         tp_rank: The attention TP rank.
         waiting_timeout_s: Maximum wait before manifest publication and, separately,
-            from publication until KV arrival; cancellation still fences remote writes.
+            from publication until KV arrival; cancellation still fences remote writes,
+            and a failed receive still unfenced after another such wait revokes the
+            transfer engine.
         heartbeat_interval_s: How often the Prefill nodes' health is checked.
         heartbeat_max_failures: Failed checks after which a node is lost.
     """
