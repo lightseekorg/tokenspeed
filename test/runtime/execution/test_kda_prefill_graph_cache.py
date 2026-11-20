@@ -373,8 +373,10 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
-@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
-def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
+@pytest.mark.parametrize(
+    ("backend_name", "heads"), [("cutedsl_kda", 8), ("cutedsl_kda", 96), ("cudnn", 8)]
+)
+def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, heads):
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
@@ -394,7 +396,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     if not cutedsl_kda_supported():
         pytest.skip("native CuteDSL KDA requires NVIDIA SM100 or SM103")
     torch.manual_seed(42)
-    bucket, heads, dim = 2048, 8, 128
+    bucket, dim = 2048, 128
     channels = heads * dim
     conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
     states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
