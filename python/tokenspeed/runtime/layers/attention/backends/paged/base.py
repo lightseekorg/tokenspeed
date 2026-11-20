@@ -636,6 +636,7 @@ class PagedMLABackend(PagedAttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
+                extend_with_prefix=extend_with_prefix,
                 page_table=page_table[:num_extends],
                 page_table_cpu=page_table_cpu,
             )
@@ -654,6 +655,7 @@ class PagedMLABackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
         page_table: torch.Tensor,
         page_table_cpu: torch.Tensor | None,
     ) -> None:

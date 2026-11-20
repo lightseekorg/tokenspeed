@@ -49,6 +49,7 @@ def test_storage_group_does_not_change_compute_or_routing(rank):
     assert mapping.attn.dp_rank == rank
     assert mapping.attn.tp_group == mapping.moe.tp_ep_group == (rank,)
     assert not mapping.requires_forward_coordination
+    assert mapping.all_reduce_groups == ()
     manager = CommManager(mapping, 0, True, False, False, query_sharded=False)
     ctx = ForwardContext(
         attn_backend=None,

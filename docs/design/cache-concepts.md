@@ -2139,19 +2139,29 @@ make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
-By default, all Qwen4-Exp target and draft cache fields share one
-`flatkv_atoms` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
-form one state group, with each layer's SSM and convolution fields together.
+By default, Qwen4-Exp cache fields share one FlatKV plane per pipeline stage
+(uniform per-view K/V heads, no MXFP8). The complete cache plan gives each
+stage a plane containing only its fields, including independent draft fields
+on the last stage. All stages use the same group packing, block IDs, and
+agreed parent count. The packer computes field offsets, page strides, and
+plane size from the fields on each stage. Capacity uses the local plane size
+and the int32 address limits of all stages.
+All GDN layers form one state group, with each layer's SSM and convolution
+fields together.
 Qwen3.8-Flash-Next has five groups: full attention, GDN state, PLE, compressed
 QSA and recent QSA. `--no-qwen4-exp-flat-kv` selects the ordinary layout,
 which retains its plane-based GDN grouping.
-The recipe sizes the shared parent to fit the largest group while tightly
-packing full-attention K/V. Each other group packs as many pages as its
-payload and stride alignment permit. A parent still belongs to one group at
-a time; sharing the plane does not mix their allocation or prefix matching.
+The recipe derives packing from the fields on each plane. On each stage
+with K/V, the largest local block rounded to a whole aligned K/V block
+bounds the K/V count. These stages use the smallest of those counts.
+The packer sizes each plane for that count and a block of each other
+resident group. Each side group then packs as many blocks as fit on all
+of its owning stages at those plane sizes. A group confined to one stage,
+such as PLE in Qwen3.8-Flash-Next PP2, takes its count from that plane
+alone. A parent still belongs to one group at a time.
 
-The `flatkv_atoms` plane id explicitly selects contiguous atom views for
-full-history fields: both K/V and compressed QSA. Native byte-page layouts
+The `flatkv_atoms` plane ID (with a stage suffix under PP) selects
+contiguous atom views for K/V and compressed QSA. Native byte-page layouts
 such as DeepSeek V4.1 keep their `flatkv` plane and explicit page strides.
 State, PLE and recent QSA retain raw
 scheduler IDs and explicit page strides. Other padded K/V fields, including
@@ -2746,23 +2756,29 @@ including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
 Side-stream allocations retain their own workspace owner through execution,
 separate from scratch that main-stream operations can overwrite.
-Ascend DSA/MLA Prefill gathers only the batch's referenced cache pages into
-compact temporary buffers. History and current rows have separate readiness;
-DSA packs KV and Indexer-K together in each phase. Persistent cache planes stay
-separate. The batch page table defines receive addresses and owner writeback.
-`chunk_prefill_kv_size` is only the scheduler's admission budget: omitting it
-never selects a different Prefill implementation.
+Ascend DSA/MLA Prefill gathers the batch's referenced pages into a bounded
+workspace shared by its layers. The recipe reserves the workspace tensor's bytes
+before sizing the cache arena; startup checks planned and allocated bytes.
+Historical KV and Indexer-K receive directly into separate attention planes;
+current rows share a packed transfer and a fused owner-cache/boundary-page write.
+The batch page table defines compact receive addresses and owner writeback.
 
-A model may submit history gathering at the first preceding KDA layer. The
-attention entry ensures the same batch/layer history exists before consumption.
-An active gather owns its tensors through the final queued read; another batch
-or layer cannot reuse those tensors. Gather, copies, commit, and consumers use
-one fixed execution stream. Synchronous HCCL submissions join their internal
-stream onto it; allocator stream tracking protects temporary storage through
-queued consumers. Finish releases references, and shutdown drains execution
-before destroying the communicator. Only one layer's receive buffers are live;
-allocation follows actual referenced pages and current rows, not cache capacity.
-The null page and receive alignment are physical overhead.
+The model plugin supplies the historical-row capacity in its cache recipe.
+It can use the page-rounded `chunk_prefill_kv_size` or the model context length. The bound covers the **sum** of request
+KV pages, including cached prefixes, rather than one request's length. The
+backend publishes it to scheduler startup, which applies the smaller of this
+capacity and an explicit admission bound. Decode remains limited by its cache
+arena. This option changes capacity, not the Prefill implementation.
+
+`AscendQCPPrefill.prepare_batch_metadata` prepares page mappings and query bounds
+once per batch. Each attention layer calls `prepare_layer_kv` at its own entry
+with its cache tensors; history gather, current gather, owner writes and attention
+run in order on the model stream. The next layer reuses the workspace after those
+consumers. There is no earlier KDA-layer submission or per-layer finish/close
+protocol. A single persistent Torch allocation holds the attention planes, shared
+gather send buffer and current-only receive buffer. PyTorch controls its lifetime
+and page policy. The layout budgets the null page, current-row alignment and a
+send buffer large enough for unequal page ownership.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

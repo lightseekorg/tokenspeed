@@ -101,6 +101,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         owns_ep_communication=mega_moe,
         use_native=False,
         use_trtllm=not mega_moe,
+        use_cutedsl=False,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
         decode_chain=False,

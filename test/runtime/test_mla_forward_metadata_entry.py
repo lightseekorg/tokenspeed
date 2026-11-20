@@ -164,6 +164,26 @@ def test_override_num_extends_restores_after_an_error(make_leaf, backend):
     assert leaf.forward_decode_metadata.num_extends == 2
 
 
+def test_flashmla_prefill_plans_from_the_flag_it_is_given(make_leaf):
+    leaf = make_leaf("flashmla", is_draft=False)
+    extend_cpu = torch.tensor([4, 3], dtype=torch.int32)
+    table_cpu = torch.tensor([[2, 5, 1, 0], [4, 3, 1, 0]], dtype=torch.int32)
+    for prefix_cpu, with_prefix in (([65, 17], True), ([0, 0], False)):
+        prefix_cpu = torch.tensor(prefix_cpu, dtype=torch.int32)
+        leaf._init_prefill_metadata(
+            seq_lens=(prefix_cpu + extend_cpu).cuda(),
+            extend_prefix_lens=prefix_cpu.cuda(),
+            extend_prefix_lens_cpu=prefix_cpu,
+            extend_seq_lens=extend_cpu.cuda(),
+            extend_seq_lens_cpu=extend_cpu,
+            extend_with_prefix=with_prefix,
+            page_table=table_cpu.cuda(),
+            page_table_cpu=table_cpu,
+        )
+        # Prefixed requests read paged history; prefix-free ones plan ragged.
+        assert leaf.forward_prefill_metadata.use_ragged == (not with_prefix)
+
+
 @pytest.mark.parametrize("backend", LEAVES)
 def test_decode_forward_is_refused(make_leaf, backend):
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode

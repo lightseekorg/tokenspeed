@@ -400,6 +400,7 @@ pub struct EngineMetrics {
     pub peer: Arc<PeerMetrics>,
     labels: [String; 3],
     spec_decode_accept_length: Metric,
+    request_spec_decode_accept_length: Metric,
     prefix_cache_hit_ratio: Metric,
     prefix_device_hit_ratio: Metric,
     prefix_host_hit_ratio: Metric,
@@ -473,6 +474,13 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:spec_decode_accept_length",
                 "Accepted tokens including bonus per verify request-slot.",
+                names,
+                &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+            ),
+            request_spec_decode_accept_length: Metric::histogram(
+                exporter,
+                "tokenspeed:request_spec_decode_accept_length",
+                "Mean output tokens per verify round, including bonus, per ended speculative request.",
                 names,
                 &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
             ),
@@ -1075,6 +1083,12 @@ impl EngineMetrics {
     pub fn observe_request_completion_tokens(&self, count: u64) {
         self.request_completion_tokens
             .observe(&self.labels(), count as f64);
+    }
+
+    /// One speculative request's mean output tokens per verify round, including bonus.
+    pub fn observe_request_spec_decode_accept_length(&self, accept_length: f64) {
+        self.request_spec_decode_accept_length
+            .observe(&self.labels(), accept_length);
     }
 
     /// Local decode admission hits; never the remote prefill response's usage.

@@ -53,6 +53,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import HistoryPrefillPlan
+from tokenspeed.runtime.layers.attention.dcp.comm import ValueProjection
 from tokenspeed.runtime.layers.attention.dcp.indexer import (
     DCPIndexMetadata,
     build_dcp_index_metadata,
@@ -1765,6 +1766,11 @@ class GlmDsaSparseAttentionMixin:
         owned = {"topk_owned": True} if topk_owned else {}
         if gathered_query is not None:
             owned["gathered_query"] = gathered_query
+        value_weight = self.owned_decode_value_weight() if topk_owned else None
+        if value_weight is not None:
+            owned["value_projection"] = ValueProjection(
+                weight=value_weight, gate=output_gate, out=output
+            )
         attn_output = self.attn_mqa(
             Q,
             k=None,
@@ -1775,9 +1781,19 @@ class GlmDsaSparseAttentionMixin:
             topk_lens=topk_lens,
             **owned,
         )
+        if value_weight is not None:
+            return output
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         self.project_latent_values(attn_output, output, output_gate)
         return output
+
+    def owned_decode_value_weight(self) -> torch.Tensor | None:
+        """The ``w_vc`` an owned decode top-k's KVP combine projects with, or None.
+
+        With a weight the combine projects as it merges (``ValueProjection``);
+        without one the values project after it.
+        """
+        return None
 
     def project_latent_values(
         self,

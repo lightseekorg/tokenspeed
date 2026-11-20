@@ -198,6 +198,15 @@ ranks have completed admission.
 it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off it once, at construction.
 
+Ordinary communication buffers are prepared for the model's execution groups
+after model-specific communication preparation and before cache memory
+profiling. Large warmup batches can select RCCL while a later small prefix hit
+selects Iris, so warmup traversal alone cannot initialize every serving route.
+Preparation reuses model-owned capacities and follows the mapping's group-role
+order on every rank, so overlapping groups retain symmetric heap offsets.
+Pipeline, weight-sharing and named groups keep their separate communication
+lifecycles.
+
 The transfer itself is the host's (`ts-pd`): the routes between unequal rank
 sets, the block manifests read off each plan's block tables, the layerwise
 chunks and the copies are planned there, over the cache transfer contract the
@@ -687,6 +696,13 @@ Generation throughput counts tokens committed by decode forwards; on a plain
 worker the first token normally comes from prefill. Completion counts are
 role-local: the bootstrap token appears in both P and D totals. Use decode
 completion totals for a disaggregated service's output-token count.
+Speculative acceptance has separate verify-slot and request-level views.
+`tokenspeed:spec_decode_accept_length` remains weighted by the decode slots in
+each verify round. `tokenspeed:request_spec_decode_accept_length` observes one
+unweighted sample per ended request with at least one verify round, using
+`(output_tokens - 1) / verify_rounds`: the bootstrap token is excluded and each
+round's bonus token is included. Requests without a verify round emit no
+sample, and draining the output processor cannot duplicate a request's sample.
 L3 query hits count the token span of each successful storage key. Cache
 groups can cover the same prompt positions, so this measures storage hits
 per group rather than unique prompt tokens.
