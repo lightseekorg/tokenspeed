@@ -267,6 +267,33 @@ def projection_gather_mm(
     return backend.projection_gather_mm(tensor, rows, weight, out, workspace)
 
 
+def projection_mm_reduce_scatter(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Project all rows through this rank's weight shard and sum every rank's
+    partial into owner rows.
+
+    Args:
+        tensor: All ``[rows_total, K / TP]`` rows, ``rows_total <= TP * rows``;
+            owner ``p`` owns rows ``[p * rows, (p + 1) * rows)``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N, K / TP]`` input shard.
+        workspace: A collectively prepared ``scatter`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        This owner's ``[rows, N]`` sums, owned by the caller.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_mm_reduce_scatter(tensor, rows, weight, workspace)
+
+
 def projection_all_to_all(
     tensor: torch.Tensor,
     rows: int,
