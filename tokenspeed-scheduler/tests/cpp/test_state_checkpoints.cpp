@@ -5926,17 +5926,23 @@ TEST_F(DeferredStateCheckpointSuite, FinishHoldsPagesAndSlotUntilMaterialization
     SendFinish("deferred");
     const auto held = scheduler_->ActiveLcmBlocks();
     EXPECT_GT(held, 0);
+    EXPECT_TRUE(scheduler_->HasStateRetirements());
+    EXPECT_FALSE(scheduler_->CanClearCache());
+    EXPECT_FALSE(scheduler_->ClearL1Cache());
     Submit(RequestWithTokens("next", {11, 12, 13, 14}));
     const auto pending = PlanOnce();
     ASSERT_EQ(pending.state_materializations.size(), 1u);
+    EXPECT_FALSE(pending.state_materializations.front().discard_replay);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(pending).empty());
     const auto id = pending.state_materializations.front().op_id;
     Materialized(id + 100);
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), held);
+    EXPECT_TRUE(scheduler_->HasStateRetirements());
     EXPECT_TRUE(PlanOnce().state_materializations.empty());
     Materialized(id);
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_FALSE(scheduler_->HasStateRetirements());
     EXPECT_EQ(PlanAndStateRow("next").size(), 2u);
 }
 
@@ -5962,12 +5968,14 @@ TEST_F(DeferredStateCheckpointSuite, RetractionImagesOnlyMaterializedState) {
     SendForwardDone("deferred", {6, 7, 8, 9});
     const auto pending = PlanOnce();
     ASSERT_EQ(pending.state_materializations.size(), 1u);
+    EXPECT_FALSE(pending.state_materializations.front().discard_replay);
     EXPECT_TRUE(ExtractCacheOpsOfKind<SnapshotStoreBatch>(pending).empty());
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     EXPECT_TRUE(PlanOnce().state_materializations.empty());
     Materialized(pending.state_materializations.front().op_id);
     const auto image = PlanOnce();
     EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_TRUE(image.state_materializations.empty());
     EXPECT_EQ(ExtractCacheOpsOfKind<SnapshotStoreBatch>(image).size(), 1u);
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
@@ -6004,48 +6012,60 @@ TEST_F(DeferredStateCheckpointSuite, RepeatedPdCompletionCannotReleaseMaterializ
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(DeferredStateCheckpointSuite, AbortWaitsForQueuedForwardAndMaterializesBeforeReuse) {
+TEST_F(DeferredStateCheckpointSuite, AbortWaitsForQueuedForwardAndDiscardsBeforeReuse) {
     StartDecode();
     const auto held = scheduler_->ActiveLcmBlocks();
+    SendFinish("deferred");
+    SendAbortEvent("deferred");
     SendAbortEvent("deferred");
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), held);
     EXPECT_TRUE(PlanOnce().state_materializations.empty());
     SendForwardDone("deferred", {6, 7, 8, 9});
     const auto pending = PlanOnce();
     ASSERT_EQ(pending.state_materializations.size(), 1u);
+    EXPECT_TRUE(pending.state_materializations.front().discard_replay);
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(pending).empty());
     Materialized(pending.state_materializations.front().op_id);
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(DeferredStateCheckpointSuite, NormalReadyCompletionPublishesWithoutMaterialization) {
-    StartDecode();
-    SendForwardDone("deferred", {6, 7, 8, 9});
-    ExecutionEvent event;
-    event.With(forward::RecurrentStateReady{"deferred"});
-    event.With(forward::Finish{"deferred"});
-    scheduler_->Advance(event);
+TEST_F(DeferredStateCheckpointSuite, FinishWithoutDecodeReleasesWithoutRetiringState) {
+    Submit(RequestWithTokens("prefill", {1, 2, 3, 4}));
+    PlanAndStateRow("prefill");
+    SendForwardDone("prefill", {5});
+    SendFinish("prefill");
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
     EXPECT_TRUE(PlanOnce().state_materializations.empty());
 }
 
-TEST_F(DeferredStateCheckpointSuite, OlderReadyResultCannotClearAYoungerForward) {
-    config_.overlap_schedule_depth = 1;
+TEST_F(DeferredStateCheckpointSuite, FinishWithoutForwardPlanningStillDispatchesRetirement) {
+    StartDecode();
+    SendForwardDone("deferred", {6, 7, 8, 9});
+    ExecutionEvent paused;
+    paused.With(cache::StorageTick{.now_us = 0, .allow_forward = false, .allow_storage = false, .pressure = {}});
+    paused.With(forward::Finish{"deferred"});
+    scheduler_->Advance(paused);
+    EXPECT_TRUE(scheduler_->HasStateRetirements());
+    const auto pending = PlanOnce();
+    ASSERT_EQ(pending.state_materializations.size(), 1u);
+    EXPECT_EQ(FindForwardBatch(pending), nullptr);
+    EXPECT_FALSE(scheduler_->ClearL1Cache());
+    Materialized(pending.state_materializations.front().op_id);
+    EXPECT_FALSE(scheduler_->HasStateRetirements());
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+}
+
+TEST_F(DeferredStateCheckpointSuite, FinishAfterRetractionAckDoesNotRetireAgain) {
+    config_.debug_force_retraction_interval = 1;
     scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
     StartDecode();
-    PlanAndStateRow("deferred");
     SendForwardDone("deferred", {6, 7, 8, 9});
-    ExecutionEvent event;
-    event.With(forward::RecurrentStateReady{"deferred"});
-    scheduler_->Advance(event);
-    SendAbortEvent("deferred");
-    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
-    EXPECT_TRUE(PlanOnce().state_materializations.empty());
-    SendForwardDone("deferred", {});
     const auto pending = PlanOnce();
     ASSERT_EQ(pending.state_materializations.size(), 1u);
     Materialized(pending.state_materializations.front().op_id);
+    SendFinish("deferred");
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_TRUE(PlanOnce().state_materializations.empty());
 }
 
 }  // namespace tokenspeed::test

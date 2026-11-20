@@ -39,7 +39,7 @@ from tokenspeed.runtime.execution.slot_state import (
 
 def deferred_gdn_metadata_bytes(*, layers: int, capacity: int, slot_count: int) -> int:
     """Bytes allocated for slot records and two batch metadata banks."""
-    return 32 * slot_count + (81 + 16 * layers) * capacity + 12
+    return 32 * slot_count + (77 + 16 * layers) * capacity + 12
 
 
 class GdnPendingState:
@@ -121,9 +121,6 @@ class GdnPendingState:
         self.request_workspaces = torch.empty(
             (2, self.capacity + 1), dtype=torch.int32, device=payload.device
         )
-        self.status = torch.empty(
-            self.capacity, dtype=torch.int32, device=payload.device
-        )
         self.group_indices = group_indices
         self.buffers = {
             name: value
@@ -154,11 +151,11 @@ class GdnPendingState:
         recurrent state. Mixed/unsupported forwards still need this variant.
         """
         self.materialize(None)
+        self.materialize(self.slots[:1])
         # Target capture does not include the runner's acceptance. Prepare
         # those metadata stages too, while every slot and length is zero.
         self.prepare_acceptance(self.current_stopped, self.current_frontier)
         self.accept(self.current_steps)
-        self.pending_status(self.slots)
         gdn_replay_commit(
             self.payload[0],
             self.parameters,
@@ -168,6 +165,7 @@ class GdnPendingState:
             write_indices=self.pages[0],
             accepted_length=self.steps[0],
             request_mask=None,
+            selected_requests=None,
             draft_token_num=4,
             geometry=self.geometry,
             state_dtype=torch.bfloat16,
@@ -206,7 +204,7 @@ class GdnPendingState:
             requested=requested,
         )
 
-    def _commit(self, selection: torch.Tensor, *, current: bool) -> None:
+    def _commit(self, selection: torch.Tensor | None, *, current: bool) -> None:
         for bank in range(2):
             pages = self.pages[bank]
             gdn_replay_commit(
@@ -217,8 +215,13 @@ class GdnPendingState:
                 read_indices=self.reads if current else pages,
                 write_indices=self.writes if current else pages,
                 accepted_length=self.current_steps if current else self.steps[bank],
-                request_mask=selection[bank],
-                request_workspace=self.request_workspaces[bank],
+                request_mask=None if selection is None else selection[bank],
+                selected_requests=(
+                    self.request_workspaces[bank] if selection is None else None
+                ),
+                request_workspace=(
+                    self.request_workspaces[bank] if selection is not None else None
+                ),
                 draft_token_num=4,
                 geometry=self.geometry,
                 state_dtype=torch.bfloat16,
@@ -226,16 +229,28 @@ class GdnPendingState:
             )
 
     def materialize(self, slots: torch.Tensor | None) -> None:
-        if slots is not None:
+        """Write pending state for unique device slots, or for all slots."""
+        if slots is None:
+            self._metadata("materialize", batch=0, requested=0)
+            self._commit(self.flush, current=False)
+            self._metadata("retire", batch=0, requested=0)
+        elif slots.numel() > 0:
             slots = slots.to(dtype=torch.int64)
-        self._metadata(
-            "materialize",
-            input_slots=slots,
-            batch=0,
-            requested=-1 if slots is None else slots.numel(),
-        )
-        self._commit(self.flush, current=False)
-        self._metadata("retire", batch=0, requested=0)
+            self._metadata(
+                "select_slots", input_slots=slots, batch=0, requested=slots.numel()
+            )
+            self._commit(None, current=False)
+            self.discard(slots)
+
+    def discard(self, slots: torch.Tensor) -> None:
+        """Retire replay inputs for unique device slots without state writes."""
+        if slots.numel() > 0:
+            self._metadata(
+                "discard_slots",
+                input_slots=slots.to(dtype=torch.int64),
+                batch=0,
+                requested=slots.numel(),
+            )
 
     def prepare(
         self,
@@ -279,16 +294,6 @@ class GdnPendingState:
             "accept", input_accepted=accepted, batch=accepted.numel(), requested=0
         )
         self._commit(self.immediate, current=True)
-
-    def pending_status(self, slots: torch.Tensor) -> torch.Tensor:
-        """Capture readiness before the normal completion's asynchronous D2H."""
-        self._metadata(
-            "status",
-            input_slots=slots.to(dtype=torch.int64),
-            batch=slots.numel(),
-            requested=0,
-        )
-        return self.status[: slots.numel()]
 
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         return [self.records[slot]]

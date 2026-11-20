@@ -310,6 +310,10 @@ class GdnAttnBackend(CapacityPrefillBackend):
         if self._pending_state is not None:
             self._pending_state.materialize(slots)
 
+    def discard_recurrent_state(self, slots: torch.Tensor) -> None:
+        if self._pending_state is not None:
+            self._pending_state.discard(slots)
+
     def _replay_inputs(self, layer_id, seq_len, a, b, *, A_log, dt_bias):
         payload, av, bv = super()._replay_inputs(
             layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
@@ -320,11 +324,6 @@ class GdnAttnBackend(CapacityPrefillBackend):
                 payload, av, bv, pending.bank, pending.payload.stride(0)
             )
         return payload, av, bv
-
-    def recurrent_state_pending(self, slots: torch.Tensor) -> torch.Tensor | None:
-        if self._pending_state is None:
-            return None
-        return self._pending_state.pending_status(slots)
 
     def _pending_replay_descriptor(
         self, layer_id: int, batch: int

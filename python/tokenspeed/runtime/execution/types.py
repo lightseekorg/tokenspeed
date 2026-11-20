@@ -330,9 +330,6 @@ class ModelExecutionResult:
     copy_event: torch.cuda.Event | RoundFence | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
-    # CPU snapshot after accepted-state commit, covered by copy_event.
-    # None means no backend supplied readiness information.
-    recurrent_state_pending: torch.Tensor | None = None
     # Per-position fp32 logprob of the sampled token, same layout as output_tokens.
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.

@@ -91,8 +91,6 @@ mod ffi {
         /// PD: a failed or cancelled transfer stopped on every rank; the
         /// request's pages may return (`pd::TransferStoppedEvent`).
         PdTransferStopped,
-        /// Normal completion observed committed recurrent state.
-        RecurrentStateReady,
     }
 
     /// A forward event fed back to the scheduler. Fields other kinds do not
@@ -193,7 +191,7 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
-        /// Accepted recurrent state must land before its pages are consumed.
+        /// Retire recurrent State before its pages can be consumed or reused.
         StateMaterialize,
     }
 
@@ -255,7 +253,7 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
-        /// Deferred recurrent state is materialized.
+        /// A recurrent State retirement finished (`cache::StateMaterialized`).
         StateMaterialized,
     }
 
@@ -678,6 +676,7 @@ mod ffi {
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
+        fn has_state_retirements(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -1034,6 +1033,12 @@ impl Scheduler {
     /// Whether [`Scheduler::clear_cache`] would succeed now; changes nothing.
     pub fn can_clear_cache(&self) -> bool {
         ffi::can_clear_cache(self.get())
+    }
+
+    /// Whether any recurrent State retirement still owns its pages and slot,
+    /// including work queued before the next execution plan.
+    pub fn has_state_retirements(&self) -> bool {
+        ffi::has_state_retirements(self.get())
     }
 
     /// The most tokens one request can hold in the cache.

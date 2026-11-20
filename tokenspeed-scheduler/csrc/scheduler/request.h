@@ -218,9 +218,6 @@ public:
                           state_);
     }
 
-    bool RecurrentStatePending() const { return forwardResources("RecurrentStatePending").recurrent_state_pending; }
-    void MarkRecurrentStateReady() { forwardResources("MarkRecurrentStateReady").recurrent_state_pending = false; }
-    void MarkRecurrentStatePending() { forwardResources("MarkRecurrentStatePending").recurrent_state_pending = true; }
     void StartStateMaterialization(std::uint32_t op_id, fsm::MaterializationAction action);
     bool CompleteStateMaterialization(std::uint32_t op_id);
     bool TakeMaterializedRetraction() { return std::exchange(materialized_retraction_, false); }

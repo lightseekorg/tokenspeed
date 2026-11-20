@@ -1269,23 +1269,23 @@ def gdn_pending_metadata(
 
     ``buffers`` is the stable workspace allocated by GdnPendingState; each
     operation writes only its defined metadata fields. ``batch`` and
-    ``requested`` are runtime counts (-1 selects all slots for materialize).
+    ``requested`` are runtime counts.
     No operation reads recurrent states or synchronizes with the host.
 
     Args:
         operation: One of begin, snapshot, dropouts, retire, accept_facts,
-            accept, materialize, or status; the stream orders these ownership stages.
+            accept, materialize, select_slots, or discard_slots.
         buffers: Stable device slot records, two batch metadata banks,
             current row mappings and group indices; payload determines dtype.
         input_slots: Current padded request slots for snapshot, or requested
-            slots for materialize. Other operations use the workspace mapping.
+            unique slots for select_slots and discard_slots.
         input_frontier: Slot-indexed logical cache lengths for snapshot/facts.
         input_stopped: Slot-indexed stop flags for accept_facts.
         input_accepted: Current batch's stop-truncated accepted lengths.
         input_reads: Group-major state read indices for snapshot.
         input_writes: Matching group-major state destinations.
         batch: Current padded request count for snapshot/accept.
-        requested: Materialization slot count; -1 selects every pending row.
+        requested: Number of slots for select_slots or discard_slots.
 
     Returns:
         None. Updates the workspace metadata on the current stream.
@@ -1318,6 +1318,7 @@ def gdn_replay_commit(
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
     request_mask: torch.Tensor | None,
+    selected_requests: torch.Tensor | None,
     request_workspace: torch.Tensor | None = None,
     draft_token_num: int,
     geometry: tuple[int, int, int, int],
@@ -1346,8 +1347,10 @@ def gdn_replay_commit(
         write_indices: Accepted-state destination pages shaped ``[L, B]``.
         accepted_length: Accepted verified-token count per request, shaped ``[B]``.
         request_mask: Optional contiguous device bool [B] selection. Unselected
-            CTAs skip before reading the state or payload. Pass None explicitly
-            to commit every request.
+            CTAs skip before reading the state or payload.
+        selected_requests: Optional precompacted device int32 [B+1] selection.
+            The first count entries contain unique row indices and the last
+            entry contains the count. Specify at most one selection.
         request_workspace: Optional device int32 [B+1] compaction scratch.
             Omission allocates scratch for this call. Requires request_mask.
         draft_token_num: Number of verify positions per request (``T``).
@@ -1390,6 +1393,16 @@ def gdn_replay_commit(
         raise ValueError(
             "request_workspace requires a mask and contiguous device int32 [B+1]"
         )
+    if selected_requests is not None and (
+        request_mask is not None
+        or selected_requests.shape != (accepted_length.numel() + 1,)
+        or selected_requests.dtype != torch.int32
+        or selected_requests.device != payload.device
+        or not selected_requests.is_contiguous()
+    ):
+        raise ValueError(
+            "selected_requests requires no mask and contiguous device int32 [B+1]"
+        )
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
     num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
@@ -1425,6 +1438,7 @@ def gdn_replay_commit(
             accepted_length=accepted_length,
             request_mask=request_mask,
             request_workspace=request_workspace,
+            selected_requests=selected_requests,
             draft_token_num=draft_token_num,
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,

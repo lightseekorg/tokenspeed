@@ -166,18 +166,14 @@ class CachePoolBinding:
             )
 
     def materialize_recurrent_state(self, slots: torch.Tensor | None) -> None:
-        """Enqueue masked replay before publication, export or page reuse."""
+        """Replay unique device slots, or all rows when slots is None."""
         for backend in self.child_backends():
             backend.materialize_recurrent_state(slots)
 
-    def recurrent_state_pending(self, slots: torch.Tensor) -> torch.Tensor | None:
-        """Snapshot pending rows for the normal forward-completion feedback."""
-        combined = None
+    def discard_recurrent_state(self, slots: torch.Tensor) -> None:
+        """Retire pending replay for unique device slots without writing state."""
         for backend in self.child_backends():
-            pending = backend.recurrent_state_pending(slots)
-            if pending is not None:
-                combined = pending if combined is None else combined | pending
-        return combined
+            backend.discard_recurrent_state(slots)
 
     def fixed_workspace_bytes(self) -> int:
         """Return recipe-reserved workspace bytes, excluding the shared arena.

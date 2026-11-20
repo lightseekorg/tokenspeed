@@ -568,20 +568,31 @@ class DeviceHandle:
             # draft round.
             self.settle()
         if materializations:
-            slots = sorted(
-                {
-                    int(slot)
-                    for operation in materializations
-                    for slot in operation.request_pool_indices
-                }
-            )
-            # Retain each pinned source until the completion event lands;
+            preserve_slots: set[int] = set()
+            discard_slots: set[int] = set()
+            for operation in materializations:
+                slots = discard_slots if operation.discard_replay else preserve_slots
+                slots.update(operation.request_pool_indices)
+            if preserve_slots & discard_slots:
+                raise ValueError("a recurrent state slot has conflicting exit actions")
+            preserve_count = len(preserve_slots)
+            # Retain the pinned source until the completion event lands;
             # a pageable tensor's upload would synchronize this thread.
-            staged_slots = torch.tensor(slots, dtype=torch.int64, pin_memory=True)
+            staged_slots = torch.tensor(
+                sorted(preserve_slots) + sorted(discard_slots),
+                dtype=torch.int64,
+                pin_memory=True,
+            )
             with executor.device_module.stream(executor.execution_stream):
-                executor.attn_backend.materialize_recurrent_state(
-                    staged_slots.to(executor.device, non_blocking=True)
-                )
+                device_slots = staged_slots.to(executor.device, non_blocking=True)
+                if preserve_slots:
+                    executor.attn_backend.materialize_recurrent_state(
+                        device_slots[:preserve_count]
+                    )
+                if discard_slots:
+                    executor.attn_backend.discard_recurrent_state(
+                        device_slots[preserve_count:]
+                    )
                 event = executor.device_module.Event()
                 event.record(executor.execution_stream)
             self._state_materializations.append(

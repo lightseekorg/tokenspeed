@@ -845,6 +845,7 @@ class MambaAttnBackend(AttentionBackend):
             rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
             **tables,
             request_mask=None,
+            selected_requests=None,
         )
 
     def tree_support(self) -> TreeSupport:

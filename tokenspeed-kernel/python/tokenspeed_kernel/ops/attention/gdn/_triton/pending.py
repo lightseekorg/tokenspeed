@@ -27,7 +27,23 @@
 from tokenspeed_kernel._triton import tl, triton
 
 
-@triton.jit(do_not_specialize=["C", "B", "S", "N"])
+@triton.jit
+def _owned_replay(records, row_slots, generations, valid, slot, C, S):
+    live = (slot > 0) & (slot < S - 1)
+    record = records + slot * 4
+    code = tl.load(record + 1, live, -1)
+    generation = tl.load(record, live, -1)
+    in_range = (code >= 0) & (code < 2 * C)
+    owned = tl.load(valid + code, in_range, False)
+    owned &= tl.load(row_slots + code, in_range, -1) == slot
+    owned &= tl.load(generations + code, in_range, -1) == generation
+    return code, owned
+
+
+@triton.jit(
+    do_not_specialize=["C", "B", "S", "N"],
+    do_not_specialize_on_alignment=["input_slots"],
+)
 def pending_metadata(
     records,
     row_slots,
@@ -47,7 +63,7 @@ def pending_metadata(
     consumed,
     flush,
     group_indices,
-    status,
+    request_workspaces,
     input_slots,
     input_frontier,
     input_stopped,
@@ -114,10 +130,7 @@ def pending_metadata(
             tl.store(record + 1, -1, selected)
             tl.store(valid + code, False, selected)
         else:
-            requested = tl.zeros((BLOCK,), tl.int1) | (N < 0)
-            for i in range(N):
-                requested |= slot == tl.load(input_slots + i)
-            tl.store(flush + code, owned & requested, within)
+            tl.store(flush + code, owned, within)
     elif OP == 4:
         row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         slot = tl.load(slots + row, row < C, 0).to(tl.int64)
@@ -172,7 +185,29 @@ def pending_metadata(
             live & ~defer & ((count > 0) | needs_copy) & (current_bank == 1),
         )
     elif OP == 7:
+        # Each bank compacts its selected requests directly from the slot list.
+        # The list is unique, so no replay row can occupy two entries.
+        selected_bank = tl.program_id(0).to(tl.int64)
+        selected = request_workspaces + selected_bank * (C.to(tl.int64) + 1)
+        count = tl.full((), 0, tl.int32)
+        for first in range(tl.cdiv(N, BLOCK)):
+            offsets = first.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+            slot = tl.load(input_slots + offsets, offsets < N, 0).to(tl.int64)
+            code, owned = _owned_replay(
+                records, row_slots, generations, valid, slot, C, S
+            )
+            keep = owned & (code // C == selected_bank)
+            prefix = tl.cumsum(keep.to(tl.int32))
+            tl.store(
+                selected + (count + prefix - 1).to(tl.int64),
+                (code % C).to(tl.int32),
+                keep,
+            )
+            count += tl.sum(keep.to(tl.int32))
+        tl.store(selected + C, count)
+    elif OP == 8:
         row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        slot = tl.load(input_slots + row, row < B, 0).to(tl.int64)
-        code = tl.load(records + slot * 4 + 1, row < B, -1)
-        tl.store(status + row, (code >= 0).to(tl.int32), row < B)
+        slot = tl.load(input_slots + row, row < N, 0).to(tl.int64)
+        code, owned = _owned_replay(records, row_slots, generations, valid, slot, C, S)
+        tl.store(records + slot * 4 + 1, -1, owned)
+        tl.store(valid + code, False, owned)

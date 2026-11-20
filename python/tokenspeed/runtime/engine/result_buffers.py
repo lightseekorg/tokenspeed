@@ -74,7 +74,7 @@ def completed_result(
             top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
             top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
         )
-    columns = (
+    return (
         results.output_tokens.tolist(),
         results.output_lengths.tolist(),
         result_buffer(results.output_logprobs),
@@ -93,6 +93,3 @@ def completed_result(
         logprobs,
         result_buffer(results.output_token_cumulative_probs),
     )
-    if results.recurrent_state_pending is None:
-        return columns
-    return (*columns, results.recurrent_state_pending.tolist())

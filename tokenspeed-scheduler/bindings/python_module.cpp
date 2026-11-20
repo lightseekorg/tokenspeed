@@ -257,10 +257,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens)
         .def_rw("spec_candidate_ids", &tokenspeed::forward::ExtendResult::spec_candidate_ids);
 
-    nb::class_<tokenspeed::forward::RecurrentStateReady>(forward_event, "RecurrentStateReady")
-        .def(nb::init<>())
-        .def_rw("request_id", &tokenspeed::forward::RecurrentStateReady::request_id);
-
     nb::class_<tokenspeed::forward::Finish>(forward_event, "Finish")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::Finish::request_id);
@@ -660,9 +656,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // A request the scheduler finished on its own while building the plan:
     // the last resort of a capacity retraction whose victim's KV image did not
     // fit the host budgets, or a lone request on the fused role that made no
-    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. Already
-    // Finished on every rank; the runtime fails it toward the client with
-    // `detail` as the message.
+    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. The
+    // runtime fails it toward the client with `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
         .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
         .value("NoProgress", tokenspeed::AbortReason::kNoProgress);
@@ -673,7 +668,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::StateMaterialization>(m, "StateMaterialization")
         .def_ro("op_id", &tokenspeed::StateMaterialization::op_id)
-        .def_ro("request_pool_indices", &tokenspeed::StateMaterialization::request_pool_indices);
+        .def_ro("request_pool_indices", &tokenspeed::StateMaterialization::request_pool_indices)
+        .def_ro("discard_replay", &tokenspeed::StateMaterialization::discard_replay);
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
@@ -800,6 +796,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
+        .def("has_state_retirements", &tokenspeed::Scheduler::HasStateRetirements)
         .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
         .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks,
              "Empty Host L2 pool parents; a parent with any occupied slot counts as used.")

@@ -3324,8 +3324,8 @@ consumes them or materializes dropouts. Only the small slot/generation records
 are slot state, owned by `GdnPendingState` through `SlotStateExporter`.
 Export and import reject records that still name a pending payload.
 
-A pending live State block remains owned by its request. Before publication,
-snapshot, migration or reuse, the scheduler waits for the runtime's explicit
-materialization acknowledgment. The bank and live block together describe
-the logical frontier until that acknowledgment; the block alone is not yet
-a reusable checkpoint. This exception adds no new State slot or cache span.
+A request keeps its live State block and slot until the runtime acknowledges
+the exit operation. When another consumer needs the state, the runtime
+materializes it before acknowledgment. Otherwise it may discard the replay.
+While replay remains outstanding, the bank and live block together describe
+the logical frontier. This exception adds no new State slot or cache span.

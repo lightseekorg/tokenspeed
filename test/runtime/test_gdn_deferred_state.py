@@ -284,7 +284,7 @@ def test_graph_target_with_eager_acceptance_reenables_deferral_after_prefill():
     )
 
 
-def test_device_materialization_ack_fences_real_pending_state_without_kvstore():
+def test_device_retirement_batches_preserve_and_discard_without_kvstore():
     from dataclasses import dataclass
 
     from tokenspeed_engine.scheduler import (
@@ -320,38 +320,51 @@ def test_device_materialization_ack_fences_real_pending_state_without_kvstore():
         )
     ]
     scheduler = Scheduler(config)
-    request = RequestSpec()
-    request.request_id = "materialize"
-    request.tokens = [1, 2, 3]
-    request.max_new_tokens = 32
-    scheduler.submit_requests([request])
+    preserve = RequestSpec()
+    preserve.request_id = "preserve"
+    preserve.tokens = [1, 2, 3]
+    preserve.max_new_tokens = 32
+    discard = RequestSpec()
+    discard.request_id = "discard"
+    discard.tokens = [7, 8, 9]
+    discard.max_new_tokens = 32
+    requests = (preserve, discard)
+    scheduler.submit_requests(list(requests))
     scheduler.next_execution_plan()
-    result = ForwardEvent.ExtendResult()
-    result.request_id, result.tokens = request.request_id, [4]
-    scheduler.advance(ExecutionEvent().add_event(result))
+    prefill_results = ExecutionEvent()
+    for request in requests:
+        result = ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = request.request_id, [4]
+        prefill_results.add_event(result)
+    scheduler.advance(prefill_results)
     scheduler.next_execution_plan()
-    result = ForwardEvent.ExtendResult()
-    result.request_id, result.tokens = request.request_id, [5, 6, 7, 8]
+    decode_results = ExecutionEvent()
+    for request in requests:
+        result = ForwardEvent.ExtendResult()
+        result.request_id, result.tokens = request.request_id, [5, 6, 7, 8]
+        decode_results.add_event(result)
     finish = ForwardEvent.Finish()
-    finish.request_id = request.request_id
-    scheduler.advance(ExecutionEvent().add_event(result).add_event(finish))
+    finish.request_id = preserve.request_id
+    abort = ForwardEvent.Abort()
+    abort.request_id = discard.request_id
+    scheduler.advance(decode_results.add_event(finish).add_event(abort))
     plan = scheduler.next_execution_plan()
-    assert len(plan.state_materializations) == 1
-    slot = plan.state_materializations[0].request_pool_indices[0]
-    assert slot == 1
+    assert len(plan.state_materializations) == 2
+    assert {operation.discard_replay for operation in plan.state_materializations} == {
+        False,
+        True,
+    }
+    assert scheduler.active_lcm_blocks() > 0
 
-    value = case(True)
+    value, reference = case(True), case(False)
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     frontier = torch.zeros(10, device="cuda", dtype=torch.int32)
     stopped = torch.zeros(10, device="cuda", dtype=torch.bool)
-    refresh(value, [1, 2])
-    run(
-        value,
-        slots,
-        frontier,
-        stopped,
-        torch.tensor([4, 2], device="cuda", dtype=torch.int32),
-    )
+    accepted = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    before = value.state.clone()
+    for current in (value, reference):
+        refresh(current, [1, 2])
+        run(current, slots, frontier, stopped, accepted)
 
     @dataclass
     class Executor:
@@ -376,12 +389,24 @@ def test_device_materialization_ack_fences_real_pending_state_without_kvstore():
         torch.cuda.set_sync_debug_mode(previous_debug)
     executor.default_stream.synchronize()
     acknowledgments = handle.poll_cache_results()
-    assert len(acknowledgments) == 1
-    assert acknowledgments[0].op_id == plan.state_materializations[0].op_id
-    scheduler.advance(ExecutionEvent().add_event(acknowledgments[0]))
+    assert len(acknowledgments) == 2
+    assert {ack.op_id for ack in acknowledgments} == {
+        operation.op_id for operation in plan.state_materializations
+    }
+    completion = ExecutionEvent()
+    for ack in acknowledgments:
+        completion.add_event(ack)
+    scheduler.advance(completion)
     assert scheduler.active_lcm_blocks() == 0
-    assert value.backend._pending_state.records[slot, 1].item() == -1
-    assert value.backend._pending_state.records[2, 1].item() >= 0
+    for operation in plan.state_materializations:
+        (slot,) = operation.request_pool_indices
+        page = 5 if slot == 1 else 6
+        if operation.discard_replay:
+            torch.testing.assert_close(value.state[page], before[page], rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                value.state[page], reference.state[page], rtol=2e-2, atol=1e-3
+            )
     assert handle.poll_cache_results() == []
 
 
@@ -402,6 +427,7 @@ def test_pending_metadata_and_mode_switch_materialization_do_not_recompile():
     spec.loader.exec_module(helper)
     value = case(True)
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    retiring_slots = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int64)[1:]
     frontier = torch.zeros(10, device="cuda", dtype=torch.int32)
     stopped = torch.zeros(10, device="cuda", dtype=torch.bool)
     accepted = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
@@ -419,10 +445,10 @@ def test_pending_metadata_and_mode_switch_materialization_do_not_recompile():
     ):
         refresh(value, [1, 2])
         run(value, slots, frontier, stopped, accepted)
-        assert value.backend.recurrent_state_pending(slots).tolist() == [1, 1]
         frontier.index_add_(0, slots.long(), accepted)
-        value.backend.materialize_recurrent_state(slots[:1])
-        value.backend.materialize_recurrent_state(slots[:0])
+        value.backend.materialize_recurrent_state(retiring_slots[:1])
+        value.backend.discard_recurrent_state(retiring_slots)
+        value.backend.materialize_recurrent_state(retiring_slots[:0])
         refresh(value, [1])
         run(value, slots[:1], frontier, stopped, accepted[:1])
         value.backend.prepare_pending_recurrent_state(
@@ -430,31 +456,27 @@ def test_pending_metadata_and_mode_switch_materialization_do_not_recompile():
         )
 
 
-def test_readiness_snapshot_survives_later_materialization_without_host_sync():
-    value = case(True)
-    slots = torch.tensor([1, 2], device="cuda", dtype=torch.int64)
+def test_discarded_replay_cannot_write_to_the_next_owner_of_the_same_slot_and_page():
+    value, reference = case(True), case(False)
+    slots = torch.tensor([1, 0], device="cuda", dtype=torch.int64)
     frontier = torch.zeros(10, device="cuda", dtype=torch.int32)
     stopped = torch.zeros(10, device="cuda", dtype=torch.bool)
-    refresh(value, [1, 2])
-    run(
-        value,
-        slots,
-        frontier,
-        stopped,
-        torch.tensor([4, 2], device="cuda", dtype=torch.int32),
-    )
-    previous_debug = torch.cuda.get_sync_debug_mode()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        snapshot = value.backend.recurrent_state_pending(slots).to(
-            "cpu", non_blocking=True
-        )
-        copied = torch.cuda.Event()
-        copied.record()
-        value.backend.materialize_recurrent_state(None)
-        current = value.backend.recurrent_state_pending(slots)
-    finally:
-        torch.cuda.set_sync_debug_mode(previous_debug)
-    copied.synchronize()
-    assert snapshot.tolist() == [1, 1]
-    assert current.tolist() == [0, 0]
+    accepted = torch.tensor([4, 0], device="cuda", dtype=torch.int32)
+    refresh(value, [1])
+    run(value, slots, frontier, stopped, accepted)
+    state_before_discard = value.state[5].clone()
+    value.backend.discard_recurrent_state(slots[:1])
+    value.backend.materialize_recurrent_state(slots[:1])
+    torch.testing.assert_close(value.state[5], state_before_discard, rtol=0, atol=0)
+
+    # The new owner starts at the same frontier on the same page. Only the
+    # discarded replay would distinguish it from a fresh reference forward.
+    frontier[1] = 4
+    value.state[5].copy_(reference.state[5])
+    conv = value.pool.get_component(0, "conv_state")
+    conv[5].copy_(reference.pool.get_component(0, "conv_state")[5])
+    refresh(value, [1])
+    refresh(reference, [1])
+    actual = run(value, slots, frontier, stopped, accepted)
+    expected = run(reference, slots, frontier, stopped, accepted)
+    torch.testing.assert_close(actual[:, :4], expected[:, :4], rtol=2e-2, atol=8e-4)

@@ -39,11 +39,6 @@ struct ExtendResult {
     std::vector<std::int32_t> spec_candidate_ids;
 };
 
-// Normal forward completion observed no pending recurrent state on device.
-struct RecurrentStateReady {
-    std::string request_id;
-};
-
 struct Finish {
     std::string request_id;
 };
@@ -59,7 +54,7 @@ struct Abort {
 
 }  // namespace forward
 
-using ForwardEvent = std::variant<forward::ExtendResult, forward::RecurrentStateReady, forward::Finish, forward::Abort,
-                                  forward::UpdateReserveNumTokens>;
+using ForwardEvent =
+    std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::UpdateReserveNumTokens>;
 
 }  // namespace tokenspeed

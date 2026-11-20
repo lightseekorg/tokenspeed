@@ -218,7 +218,6 @@ def run(args):
             )
             backend.commit_verified_state(accepted, accepted_path=None)
             frontier.index_add_(0, slots.long(), accepted)
-            backend.recurrent_state_pending(slots)
 
         ms = timed(step, execution=args.execution, repetitions=args.repetitions)
         measurements = {
@@ -304,7 +303,6 @@ def run(args):
                 pending.prepare_acceptance(stopped, frontier)
                 pending.accept(accepted)
                 frontier.index_add_(0, slots.long(), accepted)
-                backend.recurrent_state_pending(slots)
 
             recurrent_ms = timed(
                 recurrent_step, execution=args.execution, repetitions=args.repetitions

@@ -1832,6 +1832,7 @@ def triton_gdn_replay_commit(
     accepted_length: torch.Tensor,
     request_mask: torch.Tensor | None,
     request_workspace: torch.Tensor | None,
+    selected_requests: torch.Tensor | None,
     draft_token_num: int,
     num_k_heads: int,
     num_v_heads: int,
@@ -1856,6 +1857,8 @@ def triton_gdn_replay_commit(
             shaped ``[B]`` and bounded by ``T``.
         request_mask: Device bool [B] selection, or None for every request.
         request_workspace: Optional device int32 [B+1] compaction scratch.
+        selected_requests: Optional precompacted row indices, followed by
+            the count at offset B, for a replay without a request mask.
         draft_token_num: Verify-window length ``T``.
         num_k_heads: Key-head count ``H``.
         num_v_heads: Value/state-head count ``HV``.
@@ -1872,7 +1875,6 @@ def triton_gdn_replay_commit(
         address in one commit launch (plus mask compaction when selected).
     """
     enable_pdl = pdl_enabled()
-    selected_requests = None
     if request_mask is not None:
         selected_requests = request_workspace
         if selected_requests is None:
@@ -1905,7 +1907,7 @@ def triton_gdn_replay_commit(
                         1024, accepted_length.numel() * num_k_heads * payload.shape[0]
                     )
                 ),
-                payload.shape[0] if request_mask is None else 1,
+                payload.shape[0] if selected_requests is None else 1,
             )
         ](
             payload,
@@ -2040,11 +2042,17 @@ def triton_gdn_pending_metadata(
         "accept_facts": 4,
         "accept": 5,
         "materialize": 6,
-        "status": 7,
+        "select_slots": 7,
+        "discard_slots": 8,
     }
     op = operations[operation]
     size = slot_count if op == 0 else 2 * capacity if op in (2, 3, 6) else capacity
-    grid = (size if op in (1, 5) else triton.cdiv(size, 128),)
+    if op == 7:
+        grid = (2,)
+    elif op == 8:
+        grid = (triton.cdiv(requested, 128),)
+    else:
+        grid = (size if op in (1, 5) else triton.cdiv(size, 128),)
     pending_metadata[grid](
         buffers["records"],
         buffers["row_slots"],
@@ -2064,7 +2072,7 @@ def triton_gdn_pending_metadata(
         buffers["consumed"],
         buffers["flush"],
         buffers["group_indices"],
-        buffers["status"],
+        buffers["request_workspaces"],
         input_slots,
         input_frontier,
         input_stopped,

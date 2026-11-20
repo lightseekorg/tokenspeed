@@ -2928,10 +2928,8 @@ that would remove the opportunity to share the next WY state read. Scheduler
 materialization operations explicitly fence consumers of the live state
 ([scheduler](scheduler.md#deferred-recurrent-state)).
 
-Readiness is copied with the normal forward output, after acceptance, under
-the same completion event. The slot-record snapshot has its own batch buffer,
-so a later forward cannot change the result already in flight to the host.
-All metadata stages, including acceptance and readiness outside target capture,
-are warmed before serving. Scheduler-requested slot uploads use pinned,
-nonblocking copies and retain their sources through the materialization event.
-The first implementation keeps pipeline-parallel execution on immediate commit.
+At a scheduler-requested exit, the device looks up the affected slots in the
+same records to select replay for writeback or discard. The pinned slot
+uploads remain alive through the completion event. All metadata stages,
+including acceptance and exit operations outside target capture, are warmed
+before serving. Pipeline-parallel execution commits immediately.

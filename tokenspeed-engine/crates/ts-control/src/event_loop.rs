@@ -770,6 +770,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             && sizes.prefilling == 0
             && sizes.decoding == 0
             && sizes.retracted == 0
+            && !self.scheduler.has_state_retirements()
             && !self.scheduler.storage_pending()
     }
 
@@ -1947,7 +1948,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             ControlRequest::ReloadForward(_) => self.complete_reload(&op, flushed)?,
             _ if flush_refused => (
                 false,
-                "cache flush failed; retry the update after in-flight Host cache ops drain \
+                "cache flush failed; retry the update after in-flight Host cache ops and State retirements drain \
                  and no request is suspended with a retraction image (retracted or restoring)"
                     .to_owned(),
             ),
@@ -2162,8 +2163,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .is_none_or(|transfer| !transfer.has_in_flight())
     }
 
-    /// The local scheduler, including parked PD transfers, drained and no
-    /// forward or cancelled embedding receive can still finish a request.
+    /// The local scheduler drained, including parked PD transfers and State
+    /// retirements, and no forward or cancelled embedding receive can still
+    /// finish a request.
     fn drained(&self) -> bool {
         let sizes = self.scheduler.sizes();
         if sizes.waiting != 0
@@ -2174,7 +2176,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         {
             return false;
         }
-        if !self.in_flight.is_empty() {
+        // A retirement can be queued by this round's results, after the plan
+        // dispatched. It owns the State pages even before cache_ops counts it.
+        if !self.in_flight.is_empty() || self.scheduler.has_state_retirements() {
             return false;
         }
         // EPD: a request the drain cancelled (or its client aborted) ends

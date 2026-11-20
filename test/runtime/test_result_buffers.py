@@ -95,7 +95,6 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
         output_token_cumulative_probs=torch.tensor(
             [0.875], dtype=torch.float32, device="cpu"
         ),
-        recurrent_state_pending=torch.tensor([1], dtype=torch.int32),
         copy_event=event,
     )
     result.sync()
@@ -114,7 +113,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
     del result
     gc.collect()
     assert exported[8].tolist() == [0.875]
-    assert exported[9] == [1]
+    assert len(exported) == 9
 
 
 def test_completed_result_keeps_absent_columns_absent():

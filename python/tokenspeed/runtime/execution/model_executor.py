@@ -3044,13 +3044,6 @@ class ModelExecutor:
                 else:
                     forward_logprobs = ForwardLogprobs()
 
-                recurrent_state_pending = self.attn_backend.recurrent_state_pending(
-                    self.input_buffers.req_pool_indices_buf[:bs]
-                )
-                if recurrent_state_pending is not None:
-                    recurrent_state_pending = recurrent_state_pending.to(
-                        dtype=torch.int32
-                    ).to("cpu", non_blocking=True)
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
@@ -3092,7 +3085,6 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
-            recurrent_state_pending=recurrent_state_pending,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a

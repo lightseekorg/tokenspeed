@@ -250,9 +250,6 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
                             to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
                     });
                     break;
-                case ForwardEventKind::RecurrentStateReady:
-                    execution_event.With(tokenspeed::forward::RecurrentStateReady{.request_id = std::move(request_id)});
-                    break;
                 case ForwardEventKind::Finish:
                     execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
                     break;
@@ -545,6 +542,8 @@ bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
 
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler) { return scheduler.CanClearCache(); }
+
+bool has_state_retirements(const tokenspeed::Scheduler& scheduler) { return scheduler.HasStateRetirements(); }
 
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler) {
     return scheduler.MaxSingleRequestTokens();

@@ -189,8 +189,6 @@ struct ForwardResources {
     // still writes KV into this request's tables -- retract it mid-flight
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
-    // Conservative: a scheduled verify may leave accepted recurrent replay.
-    bool recurrent_state_pending{false};
 
     std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
     void TrackScheduledForward() { ++results_in_flight; }
@@ -382,14 +380,18 @@ struct Restoring {
 // retraction victim. Cancellation with queued forwards uses the same state
 // to retain their resources, but releases them without publishing a frontier.
 struct Finishing {
-    Finishing(ForwardResources resources, bool publish_completed_pages)
-        : resources{std::move(resources)}, publish_completed_pages{publish_completed_pages} {}
+    Finishing(ForwardResources resources, bool publish_completed_pages, bool retire_decode_state)
+        : resources{std::move(resources)},
+          publish_completed_pages{publish_completed_pages},
+          retire_decode_state{retire_decode_state} {}
 
     void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
 
     ForwardResources resources;
     // A cancelled request waits for its forwards too, but publishes nothing.
     bool publish_completed_pages;
+    // Set on exit from decode, and cleared when the device has retired the slot.
+    bool retire_decode_state;
 };
 
 enum class MaterializationAction { kRetract, kFinish, kAbort };
@@ -398,10 +400,10 @@ enum class MaterializationAction { kRetract, kFinish, kAbort };
 // the request-pool slot can be reclaimed until the execution-stream ACK.
 struct StateMaterializing {
     ForwardResources resources;
-    ResumeShape shape;
     MaterializationAction action;
     std::uint32_t op_id;
     std::int32_t frontier;
+    std::int32_t reserve_num_tokens_in_next_schedule_event;
 };
 
 struct Finished {};

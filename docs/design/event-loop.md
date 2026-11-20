@@ -1286,9 +1286,11 @@ the data plane; see [distributed immutable weights](distributed-weights.md).
 
 ## Recurrent-state materialization feedback
 
-State materialization uses the existing execution-plan and cache-op feedback
-queues. `StateMaterializing` in the scheduler retains request resources; the
-loop holds only operation IDs and counts, never payloads, device masks or
-accepted lengths. The data plane polls a stream event and reports
-`StateMaterializedEvent`, which participates in the same replica agreement
-as cache-copy acknowledgments before the scheduler advances the request.
+The scheduler sends recurrent-state exit operations through the existing
+execution-plan and cache-op feedback queues. `StateMaterializing` retains the
+request's resources while the data plane handles replay. The data plane
+reports `StateMaterializedEvent` after its stream event completes, using the
+same replica agreement as cache-copy acknowledgments. The loop checks the
+scheduler for outstanding exits when draining, including operations still
+waiting for their first plan. This keeps cache reuse and memory release behind
+the work they depend on.

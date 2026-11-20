@@ -315,6 +315,11 @@ For rows that leave the batch, pass the device request mask to
 `gdn_replay_commit`. Masked replay compacts selected rows before
 reading their state.
 
+A scheduler-requested exit looks up the requested slot records directly.
+It verifies ownership before selecting the bank rows to write back or
+invalidating replay for a discarded request. The replay kernels use the
+selected row counts on device, so an empty selection does no State I/O.
+
 The banked WY kernel uses V32 tiles and two state stages. It splits the
 value tiles across CTAs for small batches and streams the tiles within
 a CTA for larger batches. Both variants warm at startup. Batch sizes,

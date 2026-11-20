@@ -138,14 +138,11 @@ void Scheduler::settleFinishedRequests() {
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
-        if (request->RecurrentStatePending()) {
-            const auto action = request->GetIf<fsm::Finishing>()->publish_completed_pages
-                                    ? fsm::MaterializationAction::kFinish
-                                    : fsm::MaterializationAction::kAbort;
-            materializeState(*request, action);
-            continue;
-        }
-        if (request->GetIf<fsm::Finishing>()->publish_completed_pages) {
+        const auto action = request->GetIf<fsm::Finishing>()->publish_completed_pages
+                                ? fsm::MaterializationAction::kFinish
+                                : fsm::MaterializationAction::kAbort;
+        if (tryRetireRecurrentState(*request, action)) continue;
+        if (action == fsm::MaterializationAction::kFinish) {
             if (auto store = publishCompletedPages(*request)) {
                 pending_write_back_operations_.push_back(std::move(*store));
             }
@@ -155,7 +152,6 @@ void Scheduler::settleFinishedRequests() {
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
-    _assert(!request.RecurrentStatePending(), "pending recurrent state cannot be published");
     ProfileSpan profile_span{"Scheduler::publishCompletedPages"};
     // Every forward has landed. Advance the finishing owner's progress in
     // place; its references and hash storage live through publication and
@@ -415,14 +411,6 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
     }
 }
 
-void Scheduler::handleEvent(const forward::RecurrentStateReady& event) {
-    if (Request* request = findRequest(event.request_id)) {
-        // An older result cannot clear the conservative mark of a younger
-        // queued forward. Its own completion will provide the final fact.
-        if (request->HoldsPages() && request->ResultsInFlight() == 0) request->MarkRecurrentStateReady();
-    }
-}
-
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
         abortRequest(*request);
@@ -433,21 +421,31 @@ void Scheduler::abortRequest(Request& request) {
     if (pdTransferInFlight(request)) {
         // The transport stops the transfer; the pages wait for it.
         request.Apply(fsm::StopPdTransferEvent{});
-    } else if (request.Is<fsm::StateMaterializing>()) {
-        request.Apply(fsm::AbortEvent{&coordinator_});
-    } else if (request.ResultsInFlight() > 0 || (request.HoldsPages() && request.RecurrentStatePending())) {
+    } else if (request.ResultsInFlight() > 0) {
         request.Apply(fsm::AbortInFlightEvent{});
-    } else {
+    } else if (!tryRetireRecurrentState(request, fsm::MaterializationAction::kAbort)) {
         request.Apply(fsm::AbortEvent{&coordinator_});
     }
 }
 
-void Scheduler::materializeState(Request& request, fsm::MaterializationAction action) {
+bool Scheduler::tryRetireRecurrentState(Request& request, fsm::MaterializationAction action) {
+    if (!config_.defer_recurrent_state || config_.role == Role::kP) return false;
+    const auto* finishing = request.GetIf<fsm::Finishing>();
+    if (!request.Is<fsm::Decoding>() && (finishing == nullptr || !finishing->retire_decode_state)) return false;
+    // A finish or abort can arrive after the retraction's ACK and before the
+    // plan that would have imaged it. The device already retired this slot.
+    if (request.TakeMaterializedRetraction()) return false;
+
     const auto op_id = next_state_materialization_id_++;
     _assert(op_id != 0, "state materialization operation id overflow");
     const auto slot = request.RequestPoolIndex();
     request.StartStateMaterialization(op_id, action);
-    pending_state_materializations_.push_back(StateMaterialization{op_id, {slot}});
+    pending_state_materializations_.push_back(StateMaterialization{
+        .op_id = op_id,
+        .request_pool_indices = {slot},
+        .discard_replay = action == fsm::MaterializationAction::kAbort,
+    });
+    return true;
 }
 
 void Scheduler::handleEvent(const cache::StateMaterialized& event) {

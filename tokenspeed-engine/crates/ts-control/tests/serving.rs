@@ -139,12 +139,18 @@ fn new_scheduler(
     role: Role,
     kv_shard_count: usize,
     device_pages: usize,
+    defer_recurrent_state: bool,
 ) -> Scheduler {
     interpreter();
     let role = match role {
         Role::Plain => "Fused",
         Role::Prefill => "P",
         Role::Decode => "D",
+    };
+    let defer_recurrent_state = if defer_recurrent_state {
+        "True"
+    } else {
+        "False"
     };
     let tiers = match tiers {
         Tiers::DeviceOnly => "",
@@ -197,6 +203,12 @@ cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granula
                                         total_pages={device_pages}, attn_kind=ts.AttnKind.Full,
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
+cfg.defer_recurrent_state = {defer_recurrent_state}
+if cfg.defer_recurrent_state:
+    cfg.cache_groups = cfg.cache_groups + [ts.CacheGroupConfig(
+        group_id="recurrent_state", block_granularity=0, total_pages={device_pages},
+        attn_kind=ts.AttnKind.State, cache_blocks_per_lcm_block={kv_shard_count},
+        shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
@@ -204,7 +216,7 @@ if cfg.role != ts.SchedulerConfig.Role.Fused:
 if cfg.num_host_pages > 1:
     cfg.num_host_pages = 1024 // {kv_shard_count} + 1
 if cfg.num_host_pages > 1 or cfg.num_snapshot_pages > 1:
-    cfg.host_group_packing = [{kv_shard_count}]
+    cfg.host_group_packing = [{kv_shard_count}] * len(cfg.cache_groups)
 result = ts.Scheduler(cfg)
 "#
     );
@@ -1293,6 +1305,8 @@ struct Setup {
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
+    /// Requests retire recurrent State before the scheduler releases their pages.
+    defer_recurrent_state: bool,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
@@ -1423,6 +1437,7 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let Setup {
         device_pages,
+        defer_recurrent_state,
         pd,
         eplb,
         grammar,
@@ -1477,6 +1492,7 @@ fn run_rank<F: Frontend>(
         role,
         kv_shard_count,
         device_pages.unwrap_or(513),
+        defer_recurrent_state,
     )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
@@ -5157,6 +5173,57 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     );
     let chunks = run(&engine.client, request("r2", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[test]
+fn memory_release_waits_for_a_state_retirement_queued_by_the_last_forward() {
+    let sleeping = || {
+        EngineRequest::Control(Box::new(ControlRequest::IsSleeping(IsSleepingReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })))
+    };
+    let mut script = vec![Vec::new(); 8];
+    script[0].push(EngineRequest::Add(Box::new(request("r", 3, budget(2)))));
+    // A weights-only release exercises drain itself without a cache clear.
+    script[0].push(EngineRequest::Control(Box::new(
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: Some(vec!["weights".to_owned()]),
+        }),
+    )));
+    // The two forwards have finished at the tail of round 1, which just
+    // queued the retirement. It reaches the device in round 2 and waits two
+    // cache polls before its ACK can release the request's resources.
+    script[2].push(sleeping());
+    script[4].push(sleeping());
+    script[6].push(sleeping());
+    let ranks = run_scripted(
+        Layout::Single,
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            defer_recurrent_state: true,
+            cache_ack_polls: Some(|_| 2),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    let rank = &ranks[0];
+    assert_scripted_tokens(rank, "r", 2);
+    assert_eq!(rank.cache_ops, [CacheOpKind::StateMaterialize]);
+    assert_eq!(rank.device_ops, ["release weights"]);
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [
+            ("IsSleepingReqOutput", false),
+            ("IsSleepingReqOutput", false),
+            ("ReleaseMemoryOccupationReqOutput", true),
+            ("IsSleepingReqOutput", true),
+        ]
+    );
 }
 
 #[test]

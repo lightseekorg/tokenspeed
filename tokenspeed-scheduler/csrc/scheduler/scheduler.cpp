@@ -216,11 +216,17 @@ bool Scheduler::CanClearCache() const {
     return cacheIsClearable(true);
 }
 
+bool Scheduler::HasStateRetirements() const {
+    return config_.defer_recurrent_state && std::ranges::any_of(requests_, [](const auto& request) {
+               return request->template Is<fsm::StateMaterializing>();
+           });
+}
+
 bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
-    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
+    if (has_pd_transfers || has_tier_transfers || HasStateRetirements() || RetractedSize() > 0) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -240,10 +246,13 @@ bool Scheduler::clearCache(bool include_host) {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
+    const bool has_state_retirements = HasStateRetirements();
     const std::size_t suspended = RetractedSize();
-    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
-        spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
-                     include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
+    if (has_pd_transfers || has_tier_transfers || has_state_retirements || suspended > 0) {
+        spdlog::info(
+            "[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} state_retirements={} "
+            "suspended_requests={}",
+            include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, has_state_retirements, suspended);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
@@ -729,12 +738,11 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     for (auto& operation : storage_operations) {
         plan.With(CacheOperation{std::move(operation)});
     }
-    plan.state_materializations = std::exchange(pending_state_materializations_, {});
     trackStalledRounds(num_live_requests,
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
                            built.snapshot_restores.empty() && plan.aborts.empty() &&
-                           plan.state_materializations.empty());
+                           pending_state_materializations_.empty());
     // The no-progress abort (docs/design/scheduler.md §1.4, §2), decided on
     // the diagnostic's own count: at the kNoProgressAbortPlans-th consecutive
     // stalled plan, unless lone-request compaction moved or published
@@ -766,9 +774,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
             .reason = AbortReason::kNoProgress,
             .detail = detail,
         });
-        stuck.Apply(fsm::AbortEvent{&coordinator_});
+        abortRequest(stuck);
         stalled_rounds_ = 0;
     }
+    plan.state_materializations = std::exchange(pending_state_materializations_, {});
     return plan;
 }
 

@@ -180,6 +180,7 @@ def _replay(
         solution="triton",
         rows_aligned=rows_aligned,
         request_mask=None,
+        selected_requests=None,
     )
 
 
@@ -487,6 +488,7 @@ def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
             request_mask=(
                 torch.ones(batch, device=device, dtype=torch.bool) if masked else None
             ),
+            selected_requests=None,
         )
         torch.cuda.synchronize()
 
@@ -568,6 +570,7 @@ def test_gdn_replay_commit_tp4_graph_refresh(
             solution="triton",
             rows_aligned=rows_aligned,
             request_mask=None,
+            selected_requests=None,
         )
 
     commit()
@@ -877,6 +880,7 @@ def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
         solution="triton",
         rows_aligned=False,
         request_mask=None,
+        selected_requests=None,
     )
 
     for layer_pool, layer_write, layer_expected in zip(pools, writes, expected):
@@ -959,6 +963,7 @@ def test_gdn_replay_commit_layer_offsets_beyond_int32(device: str, require):
             solution="triton",
             rows_aligned=False,
             request_mask=None,
+            selected_requests=None,
         )
 
     commit(payload, parameters, pools)
@@ -969,7 +974,10 @@ def test_gdn_replay_commit_layer_offsets_beyond_int32(device: str, require):
 
 @pytest.mark.parametrize("rows_aligned", [False, True])
 @pytest.mark.parametrize("layers", [1, 3])
-def test_masked_replay_skips_unselected_state_reads(device, rows_aligned, layers):
+@pytest.mark.parametrize("precompacted", [False, True])
+def test_selected_replay_skips_unselected_state_reads(
+    device, rows_aligned, layers, precompacted
+):
     k, v, a, b, A, bias, pool, read, write, accepted = _inputs(
         device, torch.bfloat16, head_k_dim=128, head_v_dim=128
     )
@@ -979,6 +987,11 @@ def test_masked_replay_skips_unselected_state_reads(device, rows_aligned, layers
     payload = payload.repeat(layers, 1, 1)
     pools = [pool.clone() for _ in range(layers)]
     mask = torch.tensor([True, False, True, False], device=device)
+    selection = (
+        torch.tensor([0, 2, 0, 0, 2], device=device, dtype=torch.int32)
+        if precompacted
+        else None
+    )
     expected = _reference_states(k, v, a, b, A, bias, pool[read.long()], accepted)
     original = pool.clone()
     # These pages must never be dereferenced, even in an empty materialization.
@@ -996,7 +1009,8 @@ def test_masked_replay_skips_unselected_state_reads(device, rows_aligned, layers
         read_indices=read[None].repeat(layers, 1),
         write_indices=write[None].repeat(layers, 1),
         accepted_length=accepted,
-        request_mask=mask,
+        request_mask=None if precompacted else mask,
+        selected_requests=selection,
         draft_token_num=4,
         geometry=(k.shape[2], v.shape[2], 128, 128),
         state_dtype=torch.bfloat16,
@@ -1006,6 +1020,8 @@ def test_masked_replay_skips_unselected_state_reads(device, rows_aligned, layers
     for state in pools:
         torch.testing.assert_close(state, original, rtol=2e-2, atol=1e-3)
     mask.zero_()
+    if selection is not None:
+        selection[-1].zero_()
     gdn_replay_commit(
         payload,
         torch.stack((A, bias))[None].repeat(layers, 1, 1),
@@ -1016,7 +1032,8 @@ def test_masked_replay_skips_unselected_state_reads(device, rows_aligned, layers
         read_indices=read[None].repeat(layers, 1),
         write_indices=write[None].repeat(layers, 1),
         accepted_length=accepted,
-        request_mask=mask,
+        request_mask=None if precompacted else mask,
+        selected_requests=selection,
         draft_token_num=4,
         geometry=(k.shape[2], v.shape[2], 128, 128),
         state_dtype=torch.bfloat16,

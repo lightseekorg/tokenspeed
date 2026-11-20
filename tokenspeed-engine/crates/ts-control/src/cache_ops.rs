@@ -20,9 +20,8 @@
 
 //! Cache-op accounting and rank-synchronized acknowledgment.
 //!
-//! A plan's cache ops -- the Host L2 tier's write-backs and load-backs and
-//! the retraction snapshot's stores and restores -- run on the data plane
-//! from the same plan; each is acknowledged on its own. While any is open,
+//! The data plane runs a plan's Host L2 copies, retraction snapshot copies
+//! and recurrent State retirements. Each operation has its own ACK. While any is open,
 //! the loop polls the data plane at the head of every round and advances the
 //! acknowledgments before it plans, so a cache-gated admission waits no
 //! extra round.

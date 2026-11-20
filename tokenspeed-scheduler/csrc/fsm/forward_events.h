@@ -169,10 +169,16 @@ private:
 struct AbortInFlightEvent : InvalidTransitionHandler<AbortInFlightEvent> {
     using InvalidTransitionHandler<AbortInFlightEvent>::operator();
 
+    Finishing operator()(Finishing&& state) {
+        state.publish_completed_pages = false;
+        return std::move(state);
+    }
+
     template <typename State>
         requires HoldsForwardResources<std::remove_cvref_t<State>>
     Finishing operator()(State&& state) {
-        return Finishing{std::move(state.resources), /*publish_completed_pages=*/false};
+        return Finishing{std::move(state.resources), /*publish_completed_pages=*/false,
+                         /*retire_decode_state=*/std::same_as<std::remove_cvref_t<State>, Decoding>};
     }
 };
 

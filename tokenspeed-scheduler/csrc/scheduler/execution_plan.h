@@ -36,7 +36,7 @@ namespace tokenspeed {
 enum class AbortReason : std::uint8_t {
     // A capacity retraction chose it and its KV image did not fit the host
     // budgets (snapshot pool, blob slots or Host L2), so its pages were freed
-    // by aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
+    // by aborting it instead of imaging it; or
     // the debug knob's retraction was refused after publishing its pages.
     kImageDoesNotFit = 0,
     // On the fused role, alone (or beside requests holding no pages) and
@@ -48,10 +48,9 @@ enum class AbortReason : std::uint8_t {
     kNoProgress = 1,
 };
 
-// A request the scheduler finished this round: already Finished on every
-// rank (the plan is built identically), so the runtime only has to fail it
-// toward the client with `detail` as the message. A later Abort/Finish for
-// the id is harmless.
+// A request the scheduler aborted this round. The runtime fails it toward
+// the client with `detail` as the message, while the scheduler may still
+// retain resources for a device retirement. A later Abort/Finish is harmless.
 struct SchedulerAbort {
     std::string request_id;
     AbortReason reason{AbortReason::kImageDoesNotFit};
@@ -63,6 +62,8 @@ struct SchedulerAbort {
 struct StateMaterialization {
     std::uint32_t op_id;
     std::vector<std::int32_t> request_pool_indices;
+    // Only a cancellation with no consumer can drop replay without committing it.
+    bool discard_replay;
     bool operator==(const StateMaterialization&) const = default;
 };
 
