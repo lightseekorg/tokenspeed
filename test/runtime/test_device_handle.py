@@ -224,7 +224,10 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         device,
         "current_platform",
         lambda: SimpleNamespace(
-            is_nvidia=False, is_cdna4=False, restore_stack_limit=nullcontext
+            is_nvidia=False,
+            is_amd=True,
+            is_cdna4=False,
+            restore_stack_limit=nullcontext,
         ),
     )
     monkeypatch.setattr(

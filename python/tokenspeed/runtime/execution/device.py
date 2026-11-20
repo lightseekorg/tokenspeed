@@ -1799,18 +1799,21 @@ def build_device_side(
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
         _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
-        # Kernels warmed above read the probe's small KV arena. Triton keys a
-        # compilation on whether each tensor's storage fits in 2 GB (AMD
-        # buffer ops address it with 32-bit offsets), so their variants do
-        # not serve the full-size arena: without this, each one compiles on
-        # its first live batch instead, mid-serve. Warm again on the final
-        # pools with the tactics tuned above; tuning now would allocate
-        # workspaces outside the reserve the rebind sized.
-        with (
-            startup_phase("kernels.rewarm"),
-            current_platform().restore_stack_limit(),
-        ):
-            executor.warm_kernels()
+        if current_platform().is_amd:
+            # Kernels warmed above read the probe's small KV arena. On AMD,
+            # Triton keys a compilation on whether each tensor's storage fits
+            # in 2 GB (buffer ops address it with 32-bit offsets), so those
+            # variants do not serve the full-size arena: without this, each
+            # one compiles on its first live batch instead, mid-serve. Other
+            # platforms' kernels do not key on the arena's size and skip the
+            # second warm-up. Warm again on the final pools with the tactics
+            # tuned above; tuning now would allocate workspaces outside the
+            # reserve the rebind sized.
+            with (
+                startup_phase("kernels.rewarm"),
+                current_platform().restore_stack_limit(),
+            ):
+                executor.warm_kernels()
 
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (on by default on the roles that retract), or

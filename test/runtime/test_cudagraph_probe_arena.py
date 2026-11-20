@@ -451,6 +451,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         lambda: SimpleNamespace(
             restore_stack_limit=restore_stack_limit,
             is_nvidia=is_nvidia,
+            is_amd=not is_nvidia,
             is_cdna4=False,
         ),
     )
