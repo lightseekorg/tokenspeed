@@ -28,12 +28,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-from monokernel_testing import fill, payloads
 from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from monokernel_testing import fill, payloads  # noqa: E402
 from tokenspeed_kernel.ops.attention.prologue import gqa_prologue  # noqa: E402
 from tokenspeed_kernel.ops.attention.prologue.types import (  # noqa: E402
     ConvBatch,

@@ -21,7 +21,12 @@
 """The Inkling2 local-layer plan satisfies the framework's invariants."""
 
 import pytest
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.inkling2.plan import (
+
+# The CPU-side helpers come from the AMD kernel package, which other vendors
+# do not install.
+pytest.importorskip("tokenspeed_kernel_amd")
+
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.inkling2.plan import (  # noqa: E402
     FULL_SPLITS,
     GEOMETRIES,
     later_pass_plan,

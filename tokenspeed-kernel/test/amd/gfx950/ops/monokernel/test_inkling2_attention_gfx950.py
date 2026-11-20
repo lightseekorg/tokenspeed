@@ -28,12 +28,12 @@ import math
 
 import pytest
 import torch
-from monokernel_testing import fill, payloads, words
 from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from monokernel_testing import fill, payloads, words  # noqa: E402
 from tokenspeed_kernel.ops.attention.rmha import (  # noqa: E402
     rel_mha_decode_with_kvcache,
 )

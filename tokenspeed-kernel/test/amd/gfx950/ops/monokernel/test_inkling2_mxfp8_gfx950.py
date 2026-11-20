@@ -26,12 +26,12 @@ from __future__ import annotations
 
 import pytest
 import torch
-from monokernel_testing import fill, fill_words, payloads, words
 from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from monokernel_testing import fill, fill_words, payloads, words  # noqa: E402
 from test_inkling2_experts_gfx950 import (  # noqa: E402
     _route_ids,
     _route_pairs,
