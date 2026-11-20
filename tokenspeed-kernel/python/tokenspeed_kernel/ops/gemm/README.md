@@ -50,13 +50,22 @@ a contiguous output; CuTe-DSL also requires 16-byte alignment. Triton writes
 using output strides; FlashInfer can copy a temporary result into a strided or
 unaligned output. The common `mm` API still requires
 the output's innermost stride to be one. DeepGEMM also requires contiguous
-weight scales; FlashInfer and CuTe-DSL normalize their scale layouts internally.
+weight scales; FlashInfer normalizes its scale layouts internally.
 For 128x128 block FP8, both CuTe-DSL and FlashInfer require 16-byte-aligned A/B
 pointers. A contiguous offset view that breaks this alignment falls back to
 Triton. CuTe-DSL selection also requires aligned scale pointers; an unaligned
 scale view falls back to FlashInfer where its M range permits, or Triton.
 This scale check is conservative even when a layout copy would align the view.
 Online quantization supplies freshly allocated, aligned activations and scales.
+
+Activation-scale storage is part of selection. CuTe-DSL reads MN-major scales
+(`stride(0) == 1`) in place and FlashInfer reads K-major ones; each registration
+declares this as `a_scales_layout`, and `mm` derives the trait from `A_scales`.
+A one-row or one-column tensor fits both. Callers that quantize first ask
+`mm_activation_scale_layout` which layout the selected kernel reads, so neither
+the quantizer nor the GEMM copies scales into another layout. Online
+quantization writes K-major scales and transposes them explicitly when the
+selected kernel reads MN-major.
 
 ## Dense FP32 output
 
