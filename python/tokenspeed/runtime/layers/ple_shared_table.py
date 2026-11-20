@@ -18,22 +18,66 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ctypes
+import ctypes.util
+import logging
 import mmap
 import os
+import sys
 import tempfile
 import weakref
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel import host_memory
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
+
+logger = logging.getLogger(__name__)
+
+
+def _prefer_local_numa(address: int, length: int, nodes: tuple[int, ...]) -> None:
+    """Place shared pages near their GPU readers before registration faults them."""
+    if sys.platform != "linux":
+        return
+    try:
+        library = ctypes.util.find_library("numa")
+        if library is None:
+            raise OSError("libnuma is unavailable")
+        bind = ctypes.CDLL(library, use_errno=True).mbind
+        bind.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_uint,
+        ]
+        bind.restype = ctypes.c_int
+        mask = None
+        maxnode = 0
+        policy = 4  # MPOL_LOCAL when GPU topology is unavailable.
+        if nodes:
+            maxnode = max(nodes) + 1
+            word_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+            mask = (ctypes.c_ulong * ((maxnode + word_bits - 1) // word_bits))()
+            for node in nodes:
+                mask[node // word_bits] |= 1 << (node % word_bits)
+            # Linux consumes maxnode - 1 bits from this bitmap.
+            maxnode = len(mask) * word_bits + 1
+            policy = 1 if len(nodes) == 1 else 3  # PREFERRED / INTERLEAVE.
+        if bind(address, length, policy, mask, maxnode, 0) != 0:
+            raise OSError(ctypes.get_errno(), f"mbind(policy={policy}) failed")
+        logger.info(f"PLE shared-memory NUMA policy={policy}, GPU host nodes={nodes}")
+    except (OSError, AttributeError) as exc:
+        logger.warning(f"Cannot set PLE shared-memory NUMA policy: {exc!s}")
 
 
 class PLESharedTable:
     """GPU-mapped host PLE rows shared by workers on one host."""
 
-    def __init__(self, mapping, source: torch.Tensor, layout: str):
+    def __init__(self, mapping, source: torch.Tensor, layout: str, alloc: str):
         ranks = mapping.attn.world_group
         local = [r for r in ranks if r // mapping.nprocs_per_node == mapping.node_rank]
         peer = layout == "peer_sharded"
@@ -47,7 +91,35 @@ class PLESharedTable:
             else None
         )
         nbytes = source.numel() * source.element_size()
-        tables = self._mmap_tables(ranks, owners, nbytes)
+        device = torch.cuda.current_device()
+        try:
+            node = host_memory.host_numa_node(device)
+        except (RuntimeError, AttributeError, OSError) as exc:
+            logger.warning(f"Cannot query PLE GPU NUMA topology: {exc}")
+            node = None
+        topology = self._exchange(node, len(ranks))
+        readers = [mapping.rank] if peer else local
+        nodes = [topology[ranks.index(r)] for r in readers]
+        nodes = tuple(sorted(set(nodes))) if None not in nodes else ()
+        tables = None
+        if alloc in ("auto", "cumem"):
+            tables, reason = self._cumem_tables(
+                mapping.rank, ranks, owners, len(local) > 1, nbytes, nodes, device
+            )
+            if reason:
+                if alloc == "cumem":
+                    raise RuntimeError(
+                        f"PLE host-NUMA cuMem allocation failed: {reason}"
+                    )
+                if mapping.rank == ranks[0]:
+                    logger.warning(
+                        f"PLE cuMem unavailable, falling back to mmap: {reason}"
+                    )
+        elif alloc != "mmap":
+            raise ValueError(f"Unsupported PLE host table allocator: {alloc}")
+        self.backend = "cumem" if tables is not None else "mmap"
+        if tables is None:
+            tables = self._mmap_tables(ranks, owners, nbytes, nodes)
         self.tables = [t.view(source.dtype).view(source.shape) for t in tables]
         self.weight = self.tables[owners.index(mapping.rank) if peer else 0]
         self.peer_ptrs = (
@@ -59,8 +131,62 @@ class PLESharedTable:
             if peer
             else None
         )
+        if self.is_writer:
+            logger.info(
+                f"PLE {layout} host table: backend={self.backend}, NUMA nodes={nodes}"
+            )
 
-    def _mmap_tables(self, ranks, owners, nbytes):
+    def _cumem_tables(self, rank, ranks, owners, exportable, nbytes, nodes, device):
+        owned = exported = error = None
+        mapped = []
+        probe = host_memory.probe_host_memory(device, exportable)
+        errors = [
+            f"rank {r}: {err}"
+            for r, err in zip(ranks, self._exchange(probe, len(ranks)))
+            if err
+        ]
+        if errors:
+            return None, "; ".join(errors)
+        try:
+            if self.is_writer:
+                owned = host_memory.create_host_memory(
+                    nbytes, nodes, device, exportable, 2 << 30, 0.05
+                )
+                if exportable:
+                    exported = owned.export()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        metadata = self._exchange((exported, error), len(ranks))
+        errors = [f"rank {r}: {err}" for r, (_, err) in zip(ranks, metadata) if err]
+        if not errors:
+            try:
+                for owner in owners:
+                    memory = (
+                        owned
+                        if owner == rank
+                        else host_memory.import_host_memory(
+                            metadata[ranks.index(owner)][0], device
+                        )
+                    )
+                    mapped.append(memory)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            errors = [
+                f"rank {r}: {err}"
+                for r, err in zip(ranks, self._exchange(error, len(ranks)))
+                if err
+            ]
+        if errors:
+            for memory in mapped:
+                if memory is not owned:
+                    memory.close()
+            if owned is not None:
+                owned.close()
+            self.publish()
+            return None, "; ".join(errors)
+        return [memory.tensor for memory in mapped], None
+
+    def _mmap_tables(self, ranks, owners, nbytes, nodes):
         path = None
         error = None
         try:
@@ -70,6 +196,10 @@ class PLESharedTable:
                         prefix="ts-ple-", dir="/dev/shm", delete=False
                     ) as f:
                         path = f.name
+                        os.ftruncate(f.fileno(), nbytes)
+                        with mmap.mmap(f.fileno(), nbytes) as region:
+                            addr = ctypes.addressof(ctypes.c_char.from_buffer(region))
+                            _prefer_local_numa(addr, nbytes, nodes)
                         os.posix_fallocate(f.fileno(), 0, nbytes)
                 except OSError as exc:
                     error = str(exc)

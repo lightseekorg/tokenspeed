@@ -220,6 +220,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offload=offload_embedding,
             table_layout=config.ple_table_layout,
             enable_hot_cache=config.enable_ple_hot_cache,
+            host_table_alloc=config.ple_host_table_alloc,
             prefix=table_prefix,
         )
         if self.ple_layer_index == 0 and offload_embedding:

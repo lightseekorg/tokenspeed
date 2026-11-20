@@ -135,6 +135,7 @@ class PLELookup(nn.Module):
         offload: bool,
         table_layout: str,
         enable_hot_cache: bool,
+        host_table_alloc: str,
         prefix: str,
     ):
         super().__init__()
@@ -206,7 +207,7 @@ class PLELookup(nn.Module):
             from tokenspeed.runtime.layers.ple_shared_table import PLESharedTable
 
             self.shared_table = PLESharedTable(
-                mapping, self.ngram_embedding.weight, table_layout
+                mapping, self.ngram_embedding.weight, table_layout, host_table_alloc
             )
             self.peer_ptrs = self.shared_table.peer_ptrs
             materialize_ngram_table_on_host(
