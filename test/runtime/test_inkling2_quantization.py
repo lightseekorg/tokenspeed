@@ -342,6 +342,27 @@ def test_released_modelopt_summary_defers_to_the_manifest(
     assert model._parse_quant_hf_config() == summary
 
 
+def test_released_modelopt_summary_fetches_the_manifest_on_a_cold_cache(
+    tmp_path, manifest: dict, monkeypatch
+) -> None:
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(manifest))
+    calls = []
+
+    def snapshot_download(repo_id, *, revision, allow_patterns, local_files_only):
+        calls.append(local_files_only)
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    model = _loader_model("org/released-checkpoint", None)
+    model.hf_config.architectures = ["Inkling2LoopForConditionalGeneration"]
+    model.hf_config.quantization_config = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4",
+    }
+    assert model._parse_quant_hf_config() == manifest
+    assert calls == [False]
+
+
 def test_empty_inline_config_is_unquantized_only_for_the_inkling2_draft(
     tmp_path, manifest: dict
 ) -> None:

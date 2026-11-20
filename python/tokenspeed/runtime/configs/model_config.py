@@ -1177,7 +1177,9 @@ class ModelConfig:
                         self.model_path,
                         revision=self.revision,
                         allow_patterns=["*.json"],
-                        local_files_only=True,
+                        # Only the manifest overrides the summary; a cold
+                        # cache holds just config.json.
+                        local_files_only=not inkling2_summary,
                     )
                 except Exception as exc:
                     logger.debug(
