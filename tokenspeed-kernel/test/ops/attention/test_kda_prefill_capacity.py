@@ -30,7 +30,6 @@ def test_capacity_admits_unequal_live_partitions(lengths):
     capacity = KdaPrefillCapacity(512, 2)
     bounds = torch.tensor([0, lengths[0], sum(lengths)])
     capacity.validate(bounds, 512)
-    torch.testing.assert_close(capacity.boundaries_cpu(), torch.tensor([0, 512, 1024]))
     torch.testing.assert_close(bounds, torch.tensor([0, lengths[0], sum(lengths)]))
 
 

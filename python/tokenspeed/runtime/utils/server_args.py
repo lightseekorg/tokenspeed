@@ -4205,7 +4205,7 @@ class ServerArgs:
             "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
             "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
-            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). 'cudnn' uses FlashInfer's "
+            "FlashInfer CuTe DSL KDA prefill kernel on SM100/SM103. 'cudnn' uses FlashInfer's "
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(

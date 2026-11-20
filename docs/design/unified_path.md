@@ -2116,6 +2116,11 @@ query boundaries. KDA layers share it for scan ABIs instead of casting
 per layer; the host int64 mirror still supplies launch planning without
 D2H. Decode refresh/capture does not allocate this prefill-only mirror.
 
+CuTe KDA may select an ordinary or persistent scan internally. Both consume
+the live device boundaries and zero-padded inputs supplied by the runtime;
+the persistent scan may load whole tail tiles. Scheduling scratch belongs to
+the invocation or captured graph, and replay rebuilds it from the live bounds.
+
 Each metadata build allocates fresh index storage, including when two
 forwards have the same total token count but different request partitions.
 No subsequent forward refills a buffer an earlier forward may still read.
