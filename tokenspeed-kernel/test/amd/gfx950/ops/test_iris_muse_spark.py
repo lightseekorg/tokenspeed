@@ -192,7 +192,13 @@ def _logical_cdna4_scales(
     rows: int,
     cols: int,
 ) -> torch.Tensor:
-    """Read the logical values from a padded CDNA4 scale allocation."""
+    """Read the logical values from a padded CDNA4 scale allocation.
+
+    Allocations are panel-major (one ``cols * 32``-byte panel per 32 rows) and
+    may be returned as the transposed ``[cols * 32, panels]`` view, so offsets
+    index storage order, not the view's logical order: a padded last panel's
+    unwritten bytes would otherwise be read as real rows.
+    """
     logical_m = torch.arange(rows, device=scales.device)[:, None]
     logical_k = torch.arange(cols, device=scales.device)[None, :]
     m_in_block = logical_m % 32
@@ -203,7 +209,11 @@ def _logical_cdna4_scales(
     k_lo = logical_k % 4
     swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
     offsets = swizzled_k + (logical_m // 32) * (cols * 32)
-    return scales.view(torch.uint8).flatten()[offsets]
+    storage = scales.view(torch.uint8)
+    if storage.dim() == 2 and storage.stride(0) == 1 and storage.shape[1] > 1:
+        storage = storage.t()
+    assert storage.is_contiguous(), (tuple(scales.shape), scales.stride())
+    return storage.reshape(-1)[offsets]
 
 
 def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
@@ -1625,7 +1635,9 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
         )
 
     # 128 rows exceed the pull variant's 84 ready flags; Lamport needs none.
-    for rows in (1, 3, 16, 128):
+    # 129 and 172 rows end in a padded 32-row scale panel; 160 ends exactly
+    # on a panel boundary.
+    for rows in (1, 3, 16, 128, 129, 160, 172):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, width),))[0]
             local = published[:, rank * local_width : (rank + 1) * local_width]
