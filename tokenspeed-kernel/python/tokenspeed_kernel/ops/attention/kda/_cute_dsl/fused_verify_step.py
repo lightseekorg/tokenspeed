@@ -46,14 +46,11 @@ Each accepted U contributes its key's dot product with the new k or q,
 weighted by subsequent decays. Up to 16 accepted tokens use this projection.
 For longer prefixes the kernel replays into a private shared-memory tile.
 
-One CTA of four warps covers one (request, head). It bulk-copies the
-checkpoint into shared memory while thread t convolves channel t of q, k and
-v. For the gate projection and the checkpoint product, warp w takes 32 keys
-or 32 checkpoint rows and lane l elements [4l, 4l + 4) of each row, so every
-warp-wide load reads one contiguous row, and a transposing butterfly leaves
-each row's total in one lane. Weights, the checkpoint and the convolution
-history are read before the programmatic dependency wait (none is written by
-the previous launch); the projection's rows after it.
+One CTA covers a request and head. Four warps convolve the incoming row,
+four project the gate, and four compute decay products for the retained keys.
+Once these operands are ready, the convolution warps project the checkpoint
+while the other eight warps project the retained updates. The output warps
+combine the two contributions and apply the optional gated RMSNorm.
 """
 
 from __future__ import annotations
@@ -196,6 +193,24 @@ def _transpose_sum(values, lane: Int32):
     return values[0]
 
 
+@dsl_user_op
+def _sync_output_warps(*, loc=None, ip=None):
+    """Synchronize the four convolution and output warps."""
+    _asm(None, [], "bar.sync 1, 128;", "", True, loc, ip)
+
+
+@dsl_user_op
+def _sync_history_warps(*, loc=None, ip=None):
+    """Publish both projection coefficients from all eight history warps."""
+    _asm(None, [], "bar.sync 2, 256;", "", True, loc, ip)
+
+
+@dsl_user_op
+def _sync_suffix_warps(*, loc=None, ip=None):
+    """Publish the initialized copy barrier to the four suffix warps."""
+    _asm(None, [], "bar.sync 3, 128;", "", True, loc, ip)
+
+
 class FusedVerifyStep:
     """One-token verify with fused producers for one head shape."""
 
@@ -218,11 +233,12 @@ class FusedVerifyStep:
         self.fp32_checkpoint = fp32_checkpoint
         self.packed_history = packed_history
         self.width = heads * THREADS
-        # The checkpoint, then raw keys, raw queries, decays and values, then
-        # the four cross-warp sum partials; 128 bytes cover the mbarrier.
+        # Checkpoint, convolution and gate vectors, reduction partials and copy barriers.
         self.smem_bytes = 4 * (THREADS * THREADS + 4 * THREADS + 4 * WARPS) + 128
         # U, K and decay prefixes, cumulative decay, and the two dot products
         # for each record. Allow for alignment between shared allocations.
+        # Key and query projections from the checkpoint and retained updates.
+        self.smem_bytes += 4 * THREADS * 4
         self.smem_bytes += (
             4
             * (
@@ -314,7 +330,7 @@ class FusedVerifyStep:
             gate_token_stride,
         ).launch(
             grid=[state_indices.shape[0], self.heads, 1],
-            block=[THREADS, 1, 1],
+            block=[3 * THREADS, 1, 1],
             smem=self.smem_bytes,
             stream=stream,
             use_pdl=True,
@@ -365,10 +381,12 @@ class FusedVerifyStep:
         K = self.key_dim
         V = self.value_dim
         P = self.width
-        tidx, _, _ = cute.arch.thread_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        tidx = thread % THREADS
         request, head, _ = cute.arch.block_idx()
-        warp = tidx // 32
-        lane = tidx % 32
+        warp = thread // 32
+        lane = thread % 32
+        output_warp = thread < THREADS
 
         smem = cutlass.memory.SmemAllocator()
         tile = smem.allocate_tensor(
@@ -389,7 +407,20 @@ class FusedVerifyStep:
         partials = smem.allocate_tensor(
             Float32, cute.make_layout((4 * WARPS,)), byte_alignment=16
         )
+        state_k = smem.allocate_tensor(
+            Float32, cute.make_layout((THREADS,)), byte_alignment=16
+        )
+        history_k = smem.allocate_tensor(
+            Float32, cute.make_layout((THREADS,)), byte_alignment=16
+        )
+        history_q = smem.allocate_tensor(
+            Float32, cute.make_layout((THREADS,)), byte_alignment=16
+        )
+        state_q = smem.allocate_tensor(
+            Float32, cute.make_layout((THREADS,)), byte_alignment=16
+        )
         barrier = smem.allocate_array(Int64, num_elems=1)
+        history_barrier = smem.allocate_array(Int64, num_elems=1)
         history_layout = cute.make_layout((_MAX_PROJECTED_HISTORY * THREADS,))
         history_decay = smem.allocate_tensor(
             Float32, cute.make_layout((THREADS,)), byte_alignment=128
@@ -410,29 +441,20 @@ class FusedVerifyStep:
         raw_queries_addr = Int32(raw_queries.iterator.toint())
         decays_addr = Int32(decays.iterator.toint())
 
-        # Weights first: they do not depend on the previous launch.
-        q_channel = head * K + tidx
-        k_channel = P + q_channel
-        v_channel = 2 * P + head * V + tidx
-        q_taps = _ldg_bf16x4((conv_weights + q_channel * CONV_TAPS).toint())
-        k_taps = _ldg_bf16x4((conv_weights + k_channel * CONV_TAPS).toint())
-        v_taps = _ldg_bf16x4((conv_weights + v_channel * CONV_TAPS).toint())
-        # Warp w projects gate keys [32 w, 32 w + 32), lane l reading elements
-        # [4l, 4l + 4) of each f_b row; after the butterfly lane l holds key
-        # 32 w + l, which is thread tidx's own key.
-        f_b_rows = f_b + (head * K + 32 * warp) * self.gate_rank + 4 * lane
-        if tidx == 0:
+        if thread == 0:
             head_f_b = f_b + head * K * self.gate_rank
             _prefetch_l2(head_f_b.toint(), K * self.gate_rank * 2)
-        gate_scale = _exp(_load(a_log, head).to(Float32))
-        gate_bias = _load(dt_bias, head * K + tidx).to(Float32)
-        norm_scale = Float32(0.0)
-        if const_expr(self.gated_norm):
-            norm_scale = _load(norm_weight, tidx).to(Float32)
 
-        # The batch layout, the checkpoint and the convolution history were
-        # written before this forward, not by the previous launch: the
-        # checkpoint copy and the history loads overlap the projection too.
+        # The gate weights are immutable across launches. Issue their loads before
+        # waiting for the current token's gate input.
+        gate_weights = cute.make_rmem_tensor((32, 4), Float32)
+        if (warp >= WARPS) & (warp < 2 * WARPS):
+            first_weight = (head * K + (warp - WARPS) * 32) * self.gate_rank + 4 * lane
+            for j in cutlass.range_constexpr(32):
+                frag = _ldg_bf16x4((f_b + first_weight + j * self.gate_rank).toint())
+                for e in cutlass.range_constexpr(4):
+                    gate_weights[j, e] = frag[e]
+        # Page metadata and retained state are ready before the input projections.
         token_start = Int64(_load(query_start_loc, request))
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
@@ -442,10 +464,26 @@ class FusedVerifyStep:
         accepted = Int32(0)
         packed_checkpoint = Boolean(False)
         if live:
-            if tidx == 0:
+            if thread == 0:
                 cute.arch.mbarrier_init(barrier, 1)
+            if thread == 2 * THREADS:
+                cute.arch.mbarrier_init(history_barrier, 1)
             cute.arch.mbarrier_init_fence()
-            cute.arch.barrier()
+            if const_expr(
+                self.fp32_checkpoint and self.capacity <= _MAX_PROJECTED_HISTORY
+            ):
+                if thread == 0:
+                    tile_src = (
+                        state
+                        + live_page * state_page_stride
+                        + Int64(head) * state_head_stride
+                    )
+                    cute.arch.mbarrier_arrive_and_expect_tx(barrier, V * K * 4)
+                    _bulk_load(
+                        tile_addr, tile_src.toint(), V * K * 4, Int32(barrier.toint())
+                    )
+            if (warp >= 2 * WARPS) & (warp < 3 * WARPS):
+                _sync_suffix_warps()
             accepted = retained_length(retained, live_page)
             projected_history = (accepted > 0) & (accepted <= _MAX_PROJECTED_HISTORY)
             if (accepted == 0) | projected_history:
@@ -456,39 +494,37 @@ class FusedVerifyStep:
                 if const_expr(self.packed_history):
                     if projected_history:
                         record_bytes = accepted * K * 4
-                # The checkpoint and three accepted prefixes share one completion barrier.
+                # The suffix warps can consume the history while the checkpoint copy runs.
                 history_bytes = 3 * record_bytes
                 if const_expr(self.fp32_checkpoint):
-                    if tidx == 0:
-                        size = V * K * 4
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            barrier, size + history_bytes
-                        )
-                        _bulk_load(
-                            tile_addr, tile_src.toint(), size, Int32(barrier.toint())
-                        )
-                else:
-                    packed_checkpoint = (tile_src.toint() & Int64(15)) == Int64(0)
-                    if packed_checkpoint:
-                        if tidx == 0:
-                            size = V * K * 2
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                barrier, size + history_bytes
-                            )
+                    if const_expr(self.capacity > _MAX_PROJECTED_HISTORY):
+                        if thread == 0:
+                            size = V * K * 4
+                            cute.arch.mbarrier_arrive_and_expect_tx(barrier, size)
                             _bulk_load(
                                 tile_addr,
                                 tile_src.toint(),
                                 size,
                                 Int32(barrier.toint()),
                             )
-                    elif const_expr(self.packed_history):
-                        if projected_history and tidx == 0:
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                barrier, history_bytes
+                else:
+                    packed_checkpoint = (tile_src.toint() & Int64(15)) == Int64(0)
+                    if packed_checkpoint:
+                        if thread == 0:
+                            size = V * K * 2
+                            cute.arch.mbarrier_arrive_and_expect_tx(barrier, size)
+                            _bulk_load(
+                                tile_addr,
+                                tile_src.toint(),
+                                size,
+                                Int32(barrier.toint()),
                             )
                 if projected_history:
                     if const_expr(self.packed_history):
-                        if tidx == 0:
+                        if thread == 2 * THREADS:
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                history_barrier, history_bytes
+                            )
                             destinations = (
                                 history_u,
                                 weighted_history_keys,
@@ -504,239 +540,324 @@ class FusedVerifyStep:
                                     Int32(destinations[i].iterator.toint()),
                                     base.toint(),
                                     record_bytes,
-                                    Int32(barrier.toint()),
+                                    Int32(history_barrier.toint()),
                                 )
                     else:
-                        for rec in cutlass.range(accepted, unroll=2):
-                            history_u[rec * THREADS + tidx] = load_element(
-                                retained[1], live_page, head, rec, tidx
-                            )
-                            weighted_history_keys[rec * THREADS + tidx] = load_element(
-                                retained[2], live_page, head, rec, tidx
-                            )
-                            record_decay[rec * THREADS + tidx] = load_element(
-                                retained[3], live_page, head, rec, tidx
-                            )
+                        if output_warp:
+                            for rec in cutlass.range(accepted, unroll=2):
+                                history_u[rec * THREADS + tidx] = load_element(
+                                    retained[1], live_page, head, rec, tidx
+                                )
+                                weighted_history_keys[rec * THREADS + tidx] = (
+                                    load_element(
+                                        retained[2], live_page, head, rec, tidx
+                                    )
+                                )
+                                record_decay[rec * THREADS + tidx] = load_element(
+                                    retained[3], live_page, head, rec, tidx
+                                )
                 if const_expr(not self.fp32_checkpoint):
                     if not packed_checkpoint:
-                        _load_empty_step_tile(
-                            tile, retained[0], live_page, head, tidx, V, K
-                        )
-                        if (tidx == 0) & (record_bytes == 0):
+                        if output_warp:
+                            _load_empty_step_tile(
+                                tile, retained[0], live_page, head, tidx, V, K
+                            )
+                        cute.arch.barrier()
+                        if thread == 0:
                             cute.arch.mbarrier_arrive(barrier)
             else:
-                _replay_step_tile(tile, retained, live_page, head, tidx, accepted, V, K)
-                if tidx == 0:
+                if output_warp:
+                    _replay_step_tile(
+                        tile, retained, live_page, head, tidx, accepted, V, K
+                    )
+                cute.arch.barrier()
+                if thread == 0:
                     cute.arch.mbarrier_arrive(barrier)
-        # Padding pages see a zero history, as the split producer's do.
-        history = conv_states + page * conv_page_stride
-        channels = [q_channel, k_channel, v_channel]
-        pasts = []
-        for c in cutlass.range_constexpr(3):
-            for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                past = Float32(0.0)
-                if (valid > 0) & (page >= 0):
-                    past = _load(history, channels[c] * 3 + i).to(Float32)
-                pasts.append(past)
-
         cute.arch.griddepcontrol_wait()
         cute.arch.griddepcontrol_launch_dependents()
 
+        beta_gate = Float32(0.0)
+        norm_scale = Float32(0.0)
+        sigmoid = Float32(0.0)
+        key_scale = Float32(0.0)
+        query_scale = Float32(0.0)
+        output_coeff = Float32(0.0)
         if valid > 0:
-            # Convolution over the committed window and this row.
-            row = qkv + token_start * qkv_token_stride
-            raw = [_load(row, channel) for channel in channels]
-            taps = [q_taps, k_taps, v_taps]
-            convolved = []
-            for c in cutlass.range_constexpr(3):
-                acc = Float32(0.0)
-                for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                    acc = acc + pasts[c * (CONV_TAPS - 1) + i] * taps[c][i]
-                acc = acc + raw[c].to(Float32) * taps[c][CONV_TAPS - 1]
-                convolved.append(_bf16(_silu(acc)))
-            query, key_value, value = convolved
-            kept = original + token_start * original_token_stride
-            for c in cutlass.range_constexpr(3):
-                _store_bf16_if(
-                    Int32(1), (kept + channels[c]).toint(), raw[c].to(Float32)
-                )
-
-            if live:
-                raw_keys[tidx] = key_value
-                raw_queries[tidx] = query
-                values[tidx] = value
-                sums = [key_value * key_value, query * query, query * key_value]
-                for i in cutlass.range_constexpr(3):
-                    sums[i] = cute.arch.warp_reduction_sum(sums[i])
-                if lane == 0:
-                    for i in cutlass.range_constexpr(3):
-                        partials[WARPS * i + warp] = sums[i]
-                slot = Int64(request)
-                generation = Int64(0)
-                start = Int64(0)
-                if const_expr(self.has_metadata):
-                    slot = Int64(_load(metadata, request * 3))
-                    generation = Int64(_load(metadata, request * 3 + 1))
-                    start = Int64(_load(metadata, request * 3 + 2))
-                position = Int64(start % ring_capacity)
-                if const_expr(self.has_metadata):
-                    if (head == 0) & (tidx == 0):
-                        stamp = cute.make_tensor(
-                            stamps + (slot * ring_capacity + position) * 2,
-                            cute.make_layout((2,)),
-                        )
-                        stamp[0] = start
-                        stamp[1] = generation
-
-                # Gate projection, one contiguous f_b row per warp-wide load.
-                f_a_part = _ldg_bf16x4(
-                    (f_a + token_start * f_a_token_stride + 4 * lane).toint()
-                )
-                gate_parts = []
-                for j in cutlass.range_constexpr(32):
-                    weights = _ldg_bf16x4((f_b_rows + j * self.gate_rank).toint())
-                    part = Float32(0.0)
-                    for e in cutlass.range_constexpr(4):
-                        part = part + f_a_part[e] * weights[e]
-                    gate_parts.append(part)
-                gate = _bf16(_transpose_sum(gate_parts, lane))
-                x = gate + gate_bias
-                step = Float32(0.0)
-                if const_expr(self.bounded_gate):
-                    step = lower_bound * _div(
-                        Float32(1.0), Float32(1.0) + _exp(-(gate_scale * x))
+            if output_warp:
+                if live:
+                    beta_raw = _load(beta, token_start * beta_token_stride + head).to(
+                        Float32
                     )
-                else:
-                    softplus = x
-                    if x <= Float32(20.0):
-                        softplus = cute.math.log(Float32(1.0) + _exp(x), fastmath=True)
-                    step = -gate_scale * softplus
-                if step < Float32(GATE_FLOOR):
-                    step = Float32(GATE_FLOOR)
-                decays[tidx] = _exp(step)
-                beta_raw = _load(beta, token_start * beta_token_stride + head).to(
-                    Float32
-                )
-                beta_gate = _div(Float32(1.0), Float32(1.0) + _exp(-beta_raw))
-                cute.arch.mbarrier_wait(barrier, 0)
-                if (accepted > 0) & (accepted <= _MAX_PROJECTED_HISTORY):
-                    # Each lane weights its K channel in place, from newest to oldest.
-                    if accepted <= 2:
-                        decay1 = Float32(1.0)
-                        k1 = Float32(0.0)
-                        if accepted == 2:
-                            decay1 = record_decay[THREADS + tidx]
-                            k1 = weighted_history_keys[THREADS + tidx]
-                        history_decay[tidx] = record_decay[tidx] * decay1
-                        weighted_history_keys[tidx] = (
-                            weighted_history_keys[tidx] * decay1
-                        )
-                        weighted_history_keys[THREADS + tidx] = k1
-                    else:
-                        suffix = Float32(1.0)
-                        for i in cutlass.range(accepted, unroll=4):
-                            suffix_record = Int32(accepted - 1 - i)
-                            weighted_history_keys[suffix_record * THREADS + tidx] = (
-                                weighted_history_keys[suffix_record * THREADS + tidx]
-                                * suffix
-                            )
-                            suffix = (
-                                suffix * record_decay[suffix_record * THREADS + tidx]
-                            )
-                        history_decay[tidx] = suffix
-                cute.arch.barrier()
-
-                totals = [
-                    partials[WARPS * i]
-                    + partials[WARPS * i + 1]
-                    + partials[WARPS * i + 2]
-                    + partials[WARPS * i + 3]
-                    for i in range(3)
-                ]
-                key_scale = _rsqrt(totals[0] + Float32(1e-6))
-                query_scale = _rsqrt(totals[1] + Float32(1e-6)) * Float32(K**-0.5)
-                for field, value in (
-                    (retained[2], key_value * key_scale),
-                    (retained[3], decays[tidx]),
-                ):
-                    dst_offset = (
+                    beta_gate = _div(Float32(1.0), Float32(1.0) + _exp(-beta_raw))
+                    if const_expr(self.gated_norm):
+                        norm_scale = _load(norm_weight, tidx).to(Float32)
+                        logit = _load(
+                            norm_gate, token_start * gate_token_stride + head * V + tidx
+                        ).to(Float32)
+                        sigmoid = _div(Float32(1.0), Float32(1.0) + _exp(-logit))
+                q_channel = head * K + tidx
+                k_channel = P + q_channel
+                v_channel = 2 * P + head * V + tidx
+                q_taps = _ldg_bf16x4((conv_weights + q_channel * CONV_TAPS).toint())
+                k_taps = _ldg_bf16x4((conv_weights + k_channel * CONV_TAPS).toint())
+                v_taps = _ldg_bf16x4((conv_weights + v_channel * CONV_TAPS).toint())
+                history = conv_states + page * conv_page_stride
+                channels = [q_channel, k_channel, v_channel]
+                pasts = []
+                for c in cutlass.range_constexpr(3):
+                    for i in cutlass.range_constexpr(CONV_TAPS - 1):
+                        past = Float32(0.0)
+                        if (valid > 0) & (page >= 0):
+                            past = _load(history, channels[c] * 3 + i).to(Float32)
+                        pasts.append(past)
+                # Convolution over the committed window and this row.
+                row = qkv + token_start * qkv_token_stride
+                raw = [_load(row, channel) for channel in channels]
+                taps = [q_taps, k_taps, v_taps]
+                convolved = []
+                for c in cutlass.range_constexpr(3):
+                    acc = Float32(0.0)
+                    for i in cutlass.range_constexpr(CONV_TAPS - 1):
+                        acc = acc + pasts[c * (CONV_TAPS - 1) + i] * taps[c][i]
+                    acc = acc + raw[c].to(Float32) * taps[c][CONV_TAPS - 1]
+                    convolved.append(_bf16(_silu(acc)))
+                query, key_value, value = convolved
+                kept = original + token_start * original_token_stride
+                for c in cutlass.range_constexpr(3):
+                    _store_bf16_if(
+                        Int32(1), (kept + channels[c]).toint(), raw[c].to(Float32)
+                    )
+                if live:
+                    raw_keys[tidx] = key_value
+                    raw_queries[tidx] = query
+                    values[tidx] = value
+                    sums = [key_value * key_value, query * query, query * key_value]
+                    for i in cutlass.range_constexpr(3):
+                        sums[i] = cute.arch.warp_reduction_sum(sums[i])
+                    if lane == 0:
+                        for i in cutlass.range_constexpr(3):
+                            partials[WARPS * i + warp] = sums[i]
+                    _sync_output_warps()
+                    totals = [
+                        partials[WARPS * i]
+                        + partials[WARPS * i + 1]
+                        + partials[WARPS * i + 2]
+                        + partials[WARPS * i + 3]
+                        for i in range(3)
+                    ]
+                    key_scale = _rsqrt(totals[0] + Float32(1e-6))
+                    query_scale = _rsqrt(totals[1] + Float32(1e-6)) * Float32(K**-0.5)
+                    output_coeff = query_scale * key_scale * totals[2]
+                    field = retained[2]
+                    index = (
                         live_page * field.stride[0]
                         + Int64(head) * field.stride[1]
                         + Int64(accepted) * field.stride[2]
                         + Int64(tidx) * field.stride[3]
                     )
-                    cute.make_tensor(
-                        field.iterator + dst_offset, cute.make_layout((1,))
-                    )[0] = value
+                    cute.make_tensor(field.iterator + index, cute.make_layout((1,)))[
+                        0
+                    ] = (key_value * key_scale)
+                else:
+                    dst = out + (token_start * out_token_stride + head * V + tidx)
+                    _store_if(Int32(1), dst.toint(), Float32(0.0), True)
+            if live:
+                if const_expr(self.has_metadata):
+                    if (head == 0) & (thread == 2 * THREADS - 1):
+                        meta = metadata + Int64(request) * 3
+                        slot = Int64(_load(meta, 0))
+                        generation = Int64(_load(meta, 1))
+                        start = Int64(_load(meta, 2))
+                        position = Int64(0)
+                        if ring_capacity == self.capacity:
+                            position = start % Int64(self.capacity)
+                        else:
+                            position = start % ring_capacity
+                        tag = cute.make_tensor(
+                            stamps + (slot * ring_capacity + position) * 2,
+                            cute.make_layout((2,)),
+                        )
+                        tag[0] = start
+                        tag[1] = generation
+                projected_history = (accepted > 0) & (
+                    accepted <= _MAX_PROJECTED_HISTORY
+                )
+                if const_expr(not self.packed_history):
+                    cute.arch.barrier()
+                if (warp >= 2 * WARPS) & (warp < 3 * WARPS):
+                    suffix_channel = thread - 2 * THREADS
+                    if projected_history:
+                        if const_expr(self.packed_history):
+                            cute.arch.mbarrier_wait(history_barrier, 0)
+                        # Each lane weights its K channel in place, from newest to oldest.
+                        if accepted <= 2:
+                            decay1 = Float32(1.0)
+                            k1 = Float32(0.0)
+                            if accepted == 2:
+                                decay1 = record_decay[THREADS + suffix_channel]
+                                k1 = weighted_history_keys[THREADS + suffix_channel]
+                            history_decay[suffix_channel] = (
+                                record_decay[suffix_channel] * decay1
+                            )
+                            weighted_history_keys[suffix_channel] = (
+                                weighted_history_keys[suffix_channel] * decay1
+                            )
+                            weighted_history_keys[THREADS + suffix_channel] = k1
+                        else:
+                            suffix = Float32(1.0)
+                            for i in cutlass.range(accepted, unroll=4):
+                                suffix_record = Int32(accepted - 1 - i)
+                                weighted_history_keys[
+                                    suffix_record * THREADS + suffix_channel
+                                ] = (
+                                    weighted_history_keys[
+                                        suffix_record * THREADS + suffix_channel
+                                    ]
+                                    * suffix
+                                )
+                                suffix = (
+                                    suffix
+                                    * record_decay[
+                                        suffix_record * THREADS + suffix_channel
+                                    ]
+                                )
+                            history_decay[suffix_channel] = suffix
+                if (warp >= WARPS) & (warp < 2 * WARPS):
+                    gate_warp = warp - WARPS
+                    gate_row = gate_warp * 32 + lane
 
-                output_coeff = query_scale * key_scale * totals[2]
+                    gate_scale = _exp(_load(a_log, head).to(Float32))
+                    gate_bias = _load(dt_bias, head * K + gate_row).to(Float32)
+                    # Gate projection, one contiguous f_b row per warp-wide load.
+                    f_a_part = _ldg_bf16x4(
+                        (f_a + token_start * f_a_token_stride + 4 * lane).toint()
+                    )
+                    gate_parts = []
+                    for j in cutlass.range_constexpr(32):
+                        weights = [gate_weights[j, e] for e in range(4)]
+                        part = Float32(0.0)
+                        for e in cutlass.range_constexpr(4):
+                            part = part + f_a_part[e] * weights[e]
+                        gate_parts.append(part)
+                    gate = _bf16(_transpose_sum(gate_parts, lane))
+                    x = gate + gate_bias
+                    step = Float32(0.0)
+                    if const_expr(self.bounded_gate):
+                        step = lower_bound * _div(
+                            Float32(1.0), Float32(1.0) + _exp(-(gate_scale * x))
+                        )
+                    else:
+                        softplus = x
+                        if x <= Float32(20.0):
+                            softplus = cute.math.log(
+                                Float32(1.0) + _exp(x), fastmath=True
+                            )
+                        step = -gate_scale * softplus
+                    if step < Float32(GATE_FLOOR):
+                        step = Float32(GATE_FLOOR)
+                    new_decay = _exp(step)
+                    decays[gate_row] = new_decay
+                    field = retained[3]
+                    index = (
+                        live_page * field.stride[0]
+                        + Int64(head) * field.stride[1]
+                        + Int64(accepted) * field.stride[2]
+                        + Int64(gate_row) * field.stride[3]
+                    )
+                    cute.make_tensor(field.iterator + index, cute.make_layout((1,)))[
+                        0
+                    ] = new_decay
+                cute.arch.barrier()
                 lane_decays = _lds_f32x4(decays_addr + 16 * lane)
                 lane_keys = _lds_f32x4(raw_keys_addr + 16 * lane)
                 lane_queries = _lds_f32x4(raw_queries_addr + 16 * lane)
                 decayed_keys = [lane_keys[i] * lane_decays[i] for i in range(4)]
                 decayed_queries = [lane_queries[i] * lane_decays[i] for i in range(4)]
-
-                projected_history = (accepted > 0) & (
-                    accepted <= _MAX_PROJECTED_HISTORY
-                )
-                if projected_history:
+                if (warp >= WARPS) & projected_history:
+                    history_warp = warp - WARPS
                     history_addr = (
                         Int32(weighted_history_keys.iterator.toint()) + 16 * lane
                     )
-                    if accepted <= WARPS:
-                        record = Int32(warp)
-                        if record < accepted:
-                            _store_history_projection(
-                                record,
-                                history_addr,
-                                lane,
-                                decayed_keys,
-                                decayed_queries,
-                                key_coefficients,
-                                query_coefficients,
+                    # Each warp handles two records. The butterfly leaves the four
+                    # key/query coefficients in separate groups of eight lanes.
+                    if history_warp < accepted:
+                        w0 = _lds_f32x4(history_addr + history_warp * (4 * THREADS))
+                        w1 = [Float32(0.0) for _ in range(4)]
+                        if history_warp + 8 < accepted:
+                            w1 = _lds_f32x4(
+                                history_addr + (history_warp + 8) * (4 * THREADS)
                             )
-                    else:
-                        for group in cutlass.range(
-                            (accepted + WARPS - 1) // WARPS, unroll=1
-                        ):
-                            record = Int32(group) * WARPS + Int32(warp)
-                            if record < accepted:
-                                _store_history_projection(
-                                    record,
-                                    history_addr,
-                                    lane,
-                                    decayed_keys,
-                                    decayed_queries,
-                                    key_coefficients,
-                                    query_coefficients,
-                                )
-                    suffix = _lds_f32x4(
-                        Int32(history_decay.iterator.toint()) + 16 * lane
+                        k0 = Float32(0.0)
+                        k1 = Float32(0.0)
+                        q0 = Float32(0.0)
+                        q1 = Float32(0.0)
+                        for e in cutlass.range_constexpr(4):
+                            k0 = k0 + w0[e] * decayed_keys[e]
+                            k1 = k1 + w1[e] * decayed_keys[e]
+                            q0 = q0 + w0[e] * decayed_queries[e]
+                            q1 = q1 + w1[e] * decayed_queries[e]
+                        upper = (lane & 16) != 0
+                        keepk = k1 if upper else k0
+                        sendk = k0 if upper else k1
+                        keepq = q1 if upper else q0
+                        sendq = q0 if upper else q1
+                        dk = keepk + cute.arch.shuffle_sync_bfly(sendk, offset=16)
+                        dq = keepq + cute.arch.shuffle_sync_bfly(sendq, offset=16)
+                        odd = (lane & 8) != 0
+                        keep = dq if odd else dk
+                        send = dk if odd else dq
+                        coeff = keep + cute.arch.shuffle_sync_bfly(send, offset=8)
+                        for stage in cutlass.range_constexpr(3):
+                            coeff = coeff + cute.arch.shuffle_sync_bfly(
+                                coeff, offset=4 >> stage
+                            )
+                        record = history_warp + (lane // 16) * 8
+                        if (lane & 7) == 0:
+                            if odd:
+                                query_coefficients[record] = coeff
+                            else:
+                                key_coefficients[record] = coeff
+                    _sync_history_warps()
+                    # The two half-warps accumulate even and odd U records for
+                    # the same 16 value channels, then add their partial sums.
+                    member = lane // 16
+                    channel = history_warp * 16 + lane % 16
+                    history_key_total = Float32(0.0)
+                    history_query_total = Float32(0.0)
+                    for group in cutlass.range_constexpr(8):
+                        rec = group * 2 + member
+                        if rec < accepted:
+                            u = history_u[rec * THREADS + channel]
+                            history_key_total = (
+                                history_key_total + u * key_coefficients[rec]
+                            )
+                            history_query_total = (
+                                history_query_total + u * query_coefficients[rec]
+                            )
+                    history_key_total = history_key_total + cute.arch.shuffle_sync_bfly(
+                        history_key_total, offset=16
                     )
-                    for e in cutlass.range_constexpr(4):
-                        decayed_keys[e] = decayed_keys[e] * suffix[e]
-                        decayed_queries[e] = decayed_queries[e] * suffix[e]
-
-                # S0 times the decayed keys and queries: warp w takes rows
-                # [32 w, 32 w + 32), one contiguous row per warp-wide load.
-                key_total = Float32(0.0)
-                query_total = Float32(0.0)
-                if const_expr(self.fp32_checkpoint):
-                    key_total, query_total = _project_state_tile(
-                        tile_addr, warp, lane, K, decayed_keys, decayed_queries, False
+                    history_query_total = (
+                        history_query_total
+                        + cute.arch.shuffle_sync_bfly(history_query_total, offset=16)
                     )
-                else:
-                    if packed_checkpoint:
-                        key_total, query_total = _project_state_tile(
-                            tile_addr,
-                            warp,
-                            lane,
-                            K,
-                            decayed_keys,
-                            decayed_queries,
-                            True,
+                    if member == 0:
+                        history_k[channel] = history_key_total
+                        history_q[channel] = history_query_total
+                if warp < WARPS:
+                    cute.arch.mbarrier_wait(barrier, 0)
+                    if projected_history:
+                        suffix = _lds_f32x4(
+                            Int32(history_decay.iterator.toint()) + 16 * lane
                         )
-                    else:
+                        for e in cutlass.range_constexpr(4):
+                            decayed_keys[e] = decayed_keys[e] * suffix[e]
+                            decayed_queries[e] = decayed_queries[e] * suffix[e]
+                    # S0 times the decayed keys and queries: warp w takes rows
+                    # [32 w, 32 w + 32), one contiguous row per warp-wide load.
+                    key_total = Float32(0.0)
+                    query_total = Float32(0.0)
+                    if const_expr(self.fp32_checkpoint):
                         key_total, query_total = _project_state_tile(
                             tile_addr,
                             warp,
@@ -746,65 +867,65 @@ class FusedVerifyStep:
                             decayed_queries,
                             False,
                         )
-                # Lane l now holds value row 32 w + l, thread tidx's own channel.
-                if projected_history:
-                    # All warps can complete the dense products while each retained
-                    # record's owner publishes its two projection coefficients.
-                    cute.arch.barrier()
-                    if accepted <= 2:
-                        u0 = history_u[tidx]
-                        key_total = key_total + u0 * key_coefficients[0]
-                        query_total = query_total + u0 * query_coefficients[0]
-                        if accepted == 2:
-                            u1 = history_u[THREADS + tidx]
-                            key_total = key_total + u1 * key_coefficients[1]
-                            query_total = query_total + u1 * query_coefficients[1]
                     else:
-                        for value_record in cutlass.range(accepted, unroll=2):
-                            value_index = Int32(value_record)
-                            value_update = history_u[value_index * THREADS + tidx]
-                            key_total = (
-                                key_total + value_update * key_coefficients[value_index]
+                        if packed_checkpoint:
+                            key_total, query_total = _project_state_tile(
+                                tile_addr,
+                                warp,
+                                lane,
+                                K,
+                                decayed_keys,
+                                decayed_queries,
+                                True,
                             )
-                            query_total = (
-                                query_total
-                                + value_update * query_coefficients[value_index]
+                        else:
+                            key_total, query_total = _project_state_tile(
+                                tile_addr,
+                                warp,
+                                lane,
+                                K,
+                                decayed_keys,
+                                decayed_queries,
+                                False,
                             )
-                corrected = (values[tidx] - key_scale * key_total) * beta_gate
-                output = query_scale * query_total + output_coeff * corrected
-                if const_expr(self.gated_norm):
-                    # The norm kernel's math on the BF16 output: x rsqrt(mean
-                    # x^2 + eps) w sigmoid(gate), multiplied left to right.
-                    output = _bf16(output)
-                    logit = _load(
-                        norm_gate, token_start * gate_token_stride + head * V + tidx
-                    ).to(Float32)
-                    square = cute.arch.warp_reduction_sum(output * output)
-                    if lane == 0:
-                        partials[3 * WARPS + warp] = square
-                    cute.arch.barrier()
-                    total = (
-                        partials[3 * WARPS]
-                        + partials[3 * WARPS + 1]
-                        + partials[3 * WARPS + 2]
-                        + partials[3 * WARPS + 3]
+                    value_row = warp * 32 + lane
+                    state_k[value_row] = key_total
+                    state_q[value_row] = query_total
+                cute.arch.barrier()
+                if output_warp:
+                    key_total = state_k[tidx]
+                    query_total = state_q[tidx]
+                    # Lane l now holds value row 32 w + l, thread tidx's own channel.
+                    if projected_history:
+                        key_total = key_total + history_k[tidx]
+                        query_total = query_total + history_q[tidx]
+                    corrected = (values[tidx] - key_scale * key_total) * beta_gate
+                    output = query_scale * query_total + output_coeff * corrected
+                    if const_expr(self.gated_norm):
+                        # The norm kernel's math on the BF16 output: x rsqrt(mean
+                        # x^2 + eps) w sigmoid(gate), multiplied left to right.
+                        output = _bf16(output)
+                        square = cute.arch.warp_reduction_sum(output * output)
+                        if lane == 0:
+                            partials[3 * WARPS + warp] = square
+                        _sync_output_warps()
+                        total = (
+                            partials[3 * WARPS]
+                            + partials[3 * WARPS + 1]
+                            + partials[3 * WARPS + 2]
+                            + partials[3 * WARPS + 3]
+                        )
+                        inverse_rms = _rsqrt(_div(total, Float32(V)) + norm_eps)
+                        output = output * inverse_rms * norm_scale * sigmoid
+                    dst = out + (token_start * out_token_stride + head * V + tidx)
+                    _store_if(Int32(1), dst.toint(), output, True)
+                    entry = correction + (
+                        live_page * correction_slot_stride
+                        + head * correction_head_stride
+                        + Int64(accepted) * correction_position_stride
+                        + tidx
                     )
-                    inverse_rms = _rsqrt(_div(total, Float32(V)) + norm_eps)
-                    sigmoid = _div(Float32(1.0), Float32(1.0) + _exp(-logit))
-                    output = output * inverse_rms * norm_scale * sigmoid
-                dst = out + (token_start * out_token_stride + head * V + tidx)
-                _store_if(Int32(1), dst.toint(), output, True)
-                entry = correction + (
-                    live_page * correction_slot_stride
-                    + head * correction_head_stride
-                    + Int64(accepted) * correction_position_stride
-                    + tidx
-                )
-                _store_if(Int32(1), entry.toint(), corrected, False)
-            else:
-                # Padding pages: zero outputs, no records.
-                dst = out + (token_start * out_token_stride + head * V + tidx)
-                _store_if(Int32(1), dst.toint(), Float32(0.0), True)
+                    _store_if(Int32(1), entry.toint(), corrected, False)
 
 
 @cute.jit
@@ -832,24 +953,6 @@ def _project_state_tile(
 
 
 @cute.jit
-def _store_history_projection(
-    record, address, lane, keys, queries, key_coefficients, query_coefficients
-):
-    """One warp computes and publishes both dot products for a retained key."""
-    weights = _lds_f32x4(address + record * (4 * THREADS))
-    key_part = Float32(0.0)
-    query_part = Float32(0.0)
-    for e in cutlass.range_constexpr(4):
-        key_part = key_part + weights[e] * keys[e]
-        query_part = query_part + weights[e] * queries[e]
-    key_sum = cute.arch.warp_reduction_sum(key_part)
-    query_sum = cute.arch.warp_reduction_sum(query_part)
-    if lane == 0:
-        key_coefficients[record] = key_sum
-        query_coefficients[record] = query_sum
-
-
-@cute.jit
 def _load_empty_step_tile(
     tile,
     state,
@@ -861,7 +964,6 @@ def _load_empty_step_tile(
 ):
     for value in cutlass.range_constexpr(rows):
         tile[value * keys + tidx] = load_element(state, page, head, value, tidx)
-    cute.arch.barrier()
 
 
 @dsl_user_op
@@ -926,7 +1028,6 @@ def _replay_step_tile(
         tile[(first + 1) * keys + tidx] = s1
         tile[(first + 2) * keys + tidx] = s2
         tile[(first + 3) * keys + tidx] = s3
-    cute.arch.barrier()
 
 
 @functools.cache

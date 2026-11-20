@@ -47,12 +47,14 @@ verify core.
 The one-token fused kernel projects the accepted history onto the current
 query and key. For 1–16 accepted records, it scales the query and key by
 the cumulative decay before multiplying them by the dense base. It adds
-each retained U vector weighted by its key's two dot products. The block stages
-the accepted U, K and decay rows in shared memory while it computes the gate.
-When the rows for each head are contiguous and 16-byte aligned, it issues one
-bulk copy per field alongside the checkpoint copy. Threads load strided views
-using their tensor strides. One warp computes both dot products for a retained
-record. Empty histories need only the base products.
+each retained U vector weighted by its key's two dot products. Four warps compute the convolution, four compute the gate, and
+four apply the accepted decay factors to the retained keys. The checkpoint
+and packed history have independent bulk-copy completion barriers. Strided
+history uses its tensor strides. Once the gate and convolution are ready,
+four warps project the checkpoint while eight project the retained records.
+Each history warp computes both products for up to two keys. It combines
+the even and odd U contributions in FP32. Empty histories use only the
+checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
 The native tiled consolidation kernel runs only for source copies and capacity
 boundaries; convolution and accepted-length publication use the common

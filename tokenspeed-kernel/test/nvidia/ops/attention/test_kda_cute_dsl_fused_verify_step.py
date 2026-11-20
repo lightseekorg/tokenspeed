@@ -317,7 +317,21 @@ def test_fused_step_matches_split_with_mixed_retained_lengths(
     reference.history.length.copy_(history.length)
     ref_x = dict(x, state_pool=x["state_pool"].clone())
     expected, _ = _split(ref_x, (reference, buffers))
-    actual = _verify(x, records, None, override="cute_dsl_kda_fused_paged_verify_step")
+    norm = None
+    if record_layout == "packed":
+        # Exercise the shared reductions used by retained replay and gated RMSNorm
+        # together, including padded requests and both sides of the length cutoff.
+        norm = _output_norm(x, torch.float32)
+        expected = rmsnorm_gated_sigmoid(
+            expected.view(-1, WIDTH),
+            norm.gate,
+            norm.weight,
+            norm.eps,
+            HEADS,
+            DIM,
+            enable_pdl=False,
+        )
+    actual = _verify(x, records, norm, override="cute_dsl_kda_fused_paged_verify_step")
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-4, rtol=1e-2)
     for field, peer in (
         (history.correction, reference.history.correction),
