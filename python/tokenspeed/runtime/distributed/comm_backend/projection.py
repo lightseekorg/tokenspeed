@@ -41,12 +41,19 @@ if TYPE_CHECKING:
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
 _FUSED_COL_TP_SIZES = (2, 4)
-_FUSED_COL_MIN_ROWS = 64
-# Smaller output projections retain the ordinary path.
+_FUSED_BF16_COL_MIN_ROWS = 32
+_FUSED_FP8_COL_MIN_ROWS = 64
 _FUSED_ROW_TP_SIZES = (2, 4)
-_FUSED_ROW_MIN_ROWS = 64
+_FUSED_BF16_ROW_MIN_ROWS = 64
+_FUSED_FP8_ROW_MIN_ROWS = 64
 
 logger = logging.getLogger(__name__)
+
+
+def _fused_min_rows(kind: Literal["column", "row"], bf16: bool) -> int:
+    if kind == "row":
+        return _FUSED_BF16_ROW_MIN_ROWS if bf16 else _FUSED_FP8_ROW_MIN_ROWS
+    return _FUSED_BF16_COL_MIN_ROWS if bf16 else _FUSED_FP8_COL_MIN_ROWS
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,8 @@ class ProjectionSpec:
     Sequential layers may share a prepared object with the same spec. Separate
     streams or concurrently executing models must prepare separate objects.
     Sizes are full (unsharded) widths; max_tokens is physical rows per owner.
+    Weight dtype fixes native GEMM preparation and is part of the sharing key.
+
     Column and row projections take owner rows and return them complete. A
     gather projection returns every owner's rows through this rank's output
     shard, and a scatter projection reduces every rank's partial of all rows
@@ -68,6 +77,7 @@ class ProjectionSpec:
     output_size: int
     max_tokens: int
     dtype: torch.dtype
+    weight_dtype: torch.dtype
     device: torch.device
 
     @property
@@ -552,43 +562,46 @@ class ProjectionBackend:
                 host_identity,
             )
 
-            supported = (
-                fused_tp_row_projection_supported
-                if spec.kind == "row"
-                else fused_tp_column_projection_supported
-            )
-            fused_tp_sizes = (
-                _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_COL_TP_SIZES
-            )
-            min_fused_rows = (
-                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
-            )
-            if spec.kind in ("gather", "scatter"):
-                fused_disabled_reason = f"a {spec.kind} has no fused projection"
-            elif batch_invariant:
-                fused_disabled_reason = "batch-invariant collectives are enabled"
-            elif len(spec.group) not in fused_tp_sizes:
-                fused_disabled_reason = (
-                    f"automatic TP{len(spec.group)} fusion is disabled"
-                )
-            elif spec.max_tokens < min_fused_rows:
-                fused_disabled_reason = (
-                    f"prepared capacity {spec.max_tokens} is below the "
-                    f"TP{len(spec.group)} minimum of {min_fused_rows} rows"
-                )
-            elif not supported(
-                len(spec.group),
-                spec.input_size,
-                spec.output_size,
-                spec.max_tokens,
-                spec.dtype,
-                spec.device,
-            ):
-                fused_disabled_reason = (
-                    "unsupported device, activation dtype, or projection dimensions"
-                )
+            kind = spec.kind
+            if kind == "gather" or kind == "scatter":
+                fused_disabled_reason = f"a {kind} has no fused projection"
             else:
-                fused_disabled_reason = None
+                supported = (
+                    fused_tp_row_projection_supported
+                    if kind == "row"
+                    else fused_tp_column_projection_supported
+                )
+                fused_tp_sizes = (
+                    _FUSED_ROW_TP_SIZES if kind == "row" else _FUSED_COL_TP_SIZES
+                )
+                min_fused_rows = _fused_min_rows(
+                    kind, spec.weight_dtype == torch.bfloat16
+                )
+                if batch_invariant:
+                    fused_disabled_reason = "batch-invariant collectives are enabled"
+                elif len(spec.group) not in fused_tp_sizes:
+                    fused_disabled_reason = (
+                        f"automatic TP{len(spec.group)} fusion is disabled"
+                    )
+                elif spec.max_tokens < min_fused_rows:
+                    fused_disabled_reason = (
+                        f"prepared capacity {spec.max_tokens} is below the "
+                        f"TP{len(spec.group)} minimum of {min_fused_rows} rows"
+                    )
+                elif not supported(
+                    len(spec.group),
+                    spec.input_size,
+                    spec.output_size,
+                    spec.max_tokens,
+                    spec.dtype,
+                    spec.device,
+                    weight_dtype=spec.weight_dtype,
+                ):
+                    fused_disabled_reason = (
+                        "unsupported device, activation dtype, or projection dimensions"
+                    )
+                else:
+                    fused_disabled_reason = None
             hosts = [None] * len(spec.group)
             dist.all_gather_object(
                 hosts,
@@ -603,7 +616,8 @@ class ProjectionBackend:
                 raise ValueError(
                     "Batch-invariant collective setting differs across ranks"
                 )
-            if len({value[0] for value in hosts}) == 1 or group_has_fabric(spec.group):
+            node_local = len({value[0] for value in hosts}) == 1
+            if node_local or group_has_fabric(spec.group):
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if spec.kind == "gather":
                     workspace.copy_engine = CopyEngineGather(
@@ -629,6 +643,7 @@ class ProjectionBackend:
                             spec.max_tokens,
                             spec.input_size,
                             spec.output_size,
+                            weight_dtype=spec.weight_dtype,
                         )
                     else:
                         workspace.fused_column = (
@@ -638,6 +653,7 @@ class ProjectionBackend:
                                 spec.max_tokens,
                                 spec.input_size,
                                 spec.output_size,
+                                weight_dtype=spec.weight_dtype,
                             )
                         )
                 elif fused_disabled_reason is None:
@@ -672,28 +688,40 @@ class ProjectionBackend:
     ) -> bool:
         """Run fused DP column-linear, or leave out untouched and return False."""
         # Use the subgroup maximum so unequal or empty owners take the same
-        # collective path. TP2 and TP4 share one cutoff across all row buckets.
+        # collective path. Each weight format has one cutoff across row buckets.
         rows = max(owner_rows)
         if len(owner_rows) not in _FUSED_COL_TP_SIZES:
             return False
+        bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_column is None
-            or rows < _FUSED_COL_MIN_ROWS
-            or weight_scales is None
-            or weight.dtype != torch.float8_e4m3fn
-            or weight_scales.dtype != torch.float32
+            or rows < _fused_min_rows("column", bf16)
+            or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
-            or not weight_scales.is_contiguous()
         ):
             return False
-        from tokenspeed_kernel.ops.communication.cute_dsl import (
-            cute_dsl_fused_fp8_dp_column_linear,
-        )
+        if bf16:
+            if inputs.dtype != torch.bfloat16 or weight_scales is not None:
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_bf16_dp_column_linear as fused,
+            )
+        else:
+            if (
+                weight.dtype != torch.float8_e4m3fn
+                or weight_scales is None
+                or weight_scales.dtype != torch.float32
+                or not weight_scales.is_contiguous()
+            ):
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_fp8_dp_column_linear as fused,
+            )
 
         _check_workspace(rows, workspace, self._fallback)
-        cute_dsl_fused_fp8_dp_column_linear(
+        fused(
             workspace.fused_column,
-            inputs.contiguous(),
+            inputs,
             weight,
             weight_scales,
             owner_rows,
@@ -717,13 +745,39 @@ class ProjectionBackend:
         rows = max(owner_rows)
         if len(owner_rows) not in _FUSED_ROW_TP_SIZES:
             return False
+        bf16 = workspace.spec.weight_dtype == torch.bfloat16
         if (
             workspace.fused_row is None
-            or rows < _FUSED_ROW_MIN_ROWS
-            or weight_scales is None
-            or weight.dtype != torch.float8_e4m3fn
-            or weight_scales.dtype != torch.float32
+            or rows < _fused_min_rows("row", bf16)
+            or weight.dtype != workspace.spec.weight_dtype
             or not weight.is_contiguous()
+        ):
+            return False
+        if bf16:
+            if (
+                inputs.dtype != torch.bfloat16
+                or input_scales is not None
+                or weight_scales is not None
+            ):
+                return False
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_fused_bf16_dp_row_linear,
+            )
+
+            _check_workspace(rows, workspace, self._fallback)
+            cute_dsl_fused_bf16_dp_row_linear(
+                workspace.fused_row,
+                inputs,
+                weight,
+                None,
+                owner_rows,
+                out[: inputs.shape[0]],
+            )
+            return True
+        if (
+            weight.dtype != torch.float8_e4m3fn
+            or weight_scales is None
+            or weight_scales.dtype != torch.float32
             or not weight_scales.is_contiguous()
         ):
             return False
@@ -734,14 +788,12 @@ class ProjectionBackend:
         _check_workspace(rows, workspace, self._fallback)
         cute_dsl_fused_fp8_dp_row_linear(
             workspace.fused_row,
-            inputs.contiguous(),
+            inputs,
             weight,
             weight_scales,
             owner_rows,
             out[: inputs.shape[0]],
-            input_scales=(
-                input_scales.contiguous() if input_scales is not None else None
-            ),
+            input_scales=input_scales,
         )
         return True
 

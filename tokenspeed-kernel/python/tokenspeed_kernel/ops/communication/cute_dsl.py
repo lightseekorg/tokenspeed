@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused block-FP8 DP projections and paged-row all-gather on SM100 and SM103."""
+"""CuTe DSL projection and communication kernels for NVIDIA Blackwell."""
 
 import logging
 from typing import TYPE_CHECKING
@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 cute_dsl_fused_fp8_dp_column_linear = error_fn
 cute_dsl_fused_fp8_dp_row_linear = error_fn
+cute_dsl_fused_bf16_dp_column_linear = error_fn
+cute_dsl_fused_bf16_dp_row_linear = error_fn
 cute_dsl_paged_row_all_gather = error_fn
 cute_dsl_ll_all_gather = error_fn
 cute_dsl_ll_all_to_all = error_fn
@@ -75,6 +77,8 @@ def create_fused_tp_column_projection_state(
     max_rows: int,
     input_size: int,
     output_size: int,
+    *,
+    weight_dtype: torch.dtype,
 ) -> "FusedTPProjectionState":
     """Allocate and compile column-projection state before graph capture.
 
@@ -83,7 +87,8 @@ def create_fused_tp_column_projection_state(
         device: This peer's SM100 or SM103 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by 128.
-        output_size: Padded output width, divisible by group size times 128.
+        output_size: Padded output width, divisible by group size times tile alignment.
+        weight_dtype: BF16 or E4M3 weights; fixes the prepared GEMM variant.
 
     Returns:
         Model-owned state; serialize calls and close after destroying graphs.
@@ -92,8 +97,16 @@ def create_fused_tp_column_projection_state(
         FusedTPProjectionState,
     )
 
+    if weight_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("Fused TP projection requires BF16 or E4M3 weights")
     return FusedTPProjectionState(
-        group, device, max_rows, input_size, output_size, row_parallel=False
+        group,
+        device,
+        max_rows,
+        input_size,
+        output_size,
+        row_parallel=False,
+        quantized=weight_dtype == torch.float8_e4m3fn,
     )
 
 
@@ -103,6 +116,8 @@ def create_fused_tp_row_projection_state(
     max_rows: int,
     input_size: int,
     output_size: int,
+    *,
+    weight_dtype: torch.dtype,
 ) -> "FusedTPProjectionState":
     """Collectively allocate and compile a workspace before graph capture.
 
@@ -111,7 +126,8 @@ def create_fused_tp_row_projection_state(
         device: This peer's SM100 or SM103 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by group size times 128.
-        output_size: Padded output width, divisible by group size times 128.
+        output_size: Padded output width, divisible by group size times tile alignment.
+        weight_dtype: BF16 or E4M3 weights; fixes the prepared GEMM variant.
 
     Returns:
         Model-owned state; serialize calls and close after destroying graphs.
@@ -120,8 +136,16 @@ def create_fused_tp_row_projection_state(
         FusedTPProjectionState,
     )
 
+    if weight_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("Fused TP projection requires BF16 or E4M3 weights")
     return FusedTPProjectionState(
-        group, device, max_rows, input_size, output_size, row_parallel=True
+        group,
+        device,
+        max_rows,
+        input_size,
+        output_size,
+        row_parallel=True,
+        quantized=weight_dtype == torch.float8_e4m3fn,
     )
 
 
@@ -132,6 +156,8 @@ def fused_tp_column_projection_supported(
     max_rows: int,
     dtype: torch.dtype,
     device: torch.device,
+    *,
+    weight_dtype: torch.dtype,
 ) -> bool:
     """Return whether the layout and device support fused column projection.
 
@@ -142,22 +168,39 @@ def fused_tp_column_projection_supported(
         max_rows: Positive prepared capacity per owner.
         dtype: Unquantized activation/output dtype.
         device: Device owning the workspace.
+        weight_dtype: Prepared BF16 or block-FP8 weight storage.
 
     Returns:
         Whether this fixed schedule can be prepared. The caller must separately
         agree on peer-memory reachability and eligibility across the group.
     """
-    return (
+    if not (
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4, 8)
+        and max_rows >= 1
+        and dtype == torch.bfloat16
         and input_size >= 128
         and input_size % 128 == 0
         and output_size >= group_size * 128
-        and output_size % (group_size * 128) == 0
-        and max_rows >= 1
-        and dtype == torch.bfloat16
-        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+    ):
+        return False
+    device_arch = torch.cuda.get_device_capability(device)
+    if device_arch not in ((10, 0), (10, 3)):
+        return False
+    aligned_output = output_size % (group_size * 128) == 0
+    if weight_dtype == torch.float8_e4m3fn:
+        return aligned_output
+    # BF16 TP4 DSA QKV-A uses 96-channel alignment for each output shard.
+    dsa_tp4_shape = (
+        device_arch == (10, 3)
+        and group_size == 4
+        and (input_size, output_size) == (7168, 14592)
+    )
+    return (
+        weight_dtype == torch.bfloat16
+        and group_size in (2, 4)
+        and (aligned_output or dsa_tp4_shape)
     )
 
 
@@ -168,6 +211,8 @@ def fused_tp_row_projection_supported(
     max_rows: int,
     dtype: torch.dtype,
     device: torch.device,
+    *,
+    weight_dtype: torch.dtype,
 ) -> bool:
     """Return whether the static layout and device match the kernel constraints.
 
@@ -178,6 +223,7 @@ def fused_tp_row_projection_supported(
         max_rows: Positive prepared capacity per owner.
         dtype: Unquantized activation/output dtype.
         device: Device owning the workspace.
+        weight_dtype: Prepared BF16 or block-FP8 weight storage.
 
     Returns:
         Whether this fixed schedule can be prepared. The caller must separately
@@ -187,12 +233,13 @@ def fused_tp_row_projection_supported(
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4)
+        and max_rows >= 1
+        and dtype == torch.bfloat16
+        and weight_dtype in (torch.bfloat16, torch.float8_e4m3fn)
         and input_size >= group_size * 128
         and input_size % (group_size * 128) == 0
         and output_size >= group_size * 128
         and output_size % (group_size * 128) == 0
-        and max_rows >= 1
-        and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
     )
 
@@ -573,6 +620,94 @@ if current_platform().is_nvidia:
         return state.run(
             inputs, weight, weight_scales, owner_rows, out, input_scales=input_scales
         )
+
+    @register_kernel(
+        "communication",
+        "dp_column_linear",
+        name="cute_dsl_fused_bf16_dp_column_linear",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures={
+            format_signature(
+                inputs=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+                out=dense_tensor_format(torch.bfloat16),
+            )
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_fused_bf16_dp_column_linear(
+        state: "FusedTPProjectionState",
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run BF16 all-gather, column GEMM and inverse all-to-all together.
+
+        Args:
+            state: Collectively prepared BF16 state, used serially on one stream.
+            inputs: Contiguous BF16 [R, K] rows owned by this rank.
+            weight: Contiguous BF16 [N/P, K] output-channel shard.
+            weight_scales: Explicit None; BF16 operands are not quantized.
+            owner_rows: Physical row counts in group-rank order on every peer;
+                counts may differ or be zero.
+            out: Caller-owned contiguous BF16 [R, N] destination.
+
+        Returns:
+            out, valid across later calls and state teardown. Destroy graphs
+            referencing state before closing it collectively.
+        """
+        return state.run(inputs, weight, weight_scales, owner_rows, out)
+
+    @register_kernel(
+        "communication",
+        "dp_row_linear",
+        name="cute_dsl_fused_bf16_dp_row_linear",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures={
+            format_signature(
+                inputs=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+                out=dense_tensor_format(torch.bfloat16),
+            )
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_fused_bf16_dp_row_linear(
+        state: "FusedTPProjectionState",
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run BF16 all-to-all, row GEMM and reduce-scatter together.
+
+        Args:
+            state: Collectively prepared BF16 state, used serially on one stream.
+            inputs: Contiguous BF16 [R, K] rows owned by this rank.
+            weight: Contiguous BF16 [N, K/P] input-channel shard.
+            weight_scales: Explicit None; BF16 operands are not quantized.
+            owner_rows: Physical row counts in group-rank order on every peer;
+                counts may differ or be zero.
+            out: Caller-owned contiguous BF16 [R, N] destination.
+
+        Returns:
+            out. GEMM partials round to BF16 before a rank-ordered FP32 sum and
+            final BF16 rounding. Destroy graphs before collective state teardown.
+        """
+        return state.run(inputs, weight, weight_scales, owner_rows, out)
 
     @register_kernel(
         "communication",

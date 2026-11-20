@@ -92,10 +92,9 @@ def validate_projection_settings(
     return qkv, output
 
 
-def projection_storage_rows(rows: int, tp_size: int, block_fp8: bool) -> int:
-    """Pad at the end so each output shard meets its GEMM/scale alignment."""
-    alignment = 128 if block_fp8 else 16
-    return ceil_div(rows, tp_size * alignment) * tp_size * alignment
+def projection_storage_rows(rows: int, tp_size: int) -> int:
+    """Pad each BF16/FP8 output shard to the fused GEMM's 128-row alignment."""
+    return ceil_div(rows, tp_size * 128) * tp_size * 128
 
 
 def projection_fp8_config() -> Fp8Config:
@@ -172,9 +171,7 @@ class KimiKDAColumnProj(DPColumnParallelLinear):
         super().__init__(
             input_size=hidden,
             output_size=used_rows,
-            padded_output_size=projection_storage_rows(
-                used_rows, parallel.tp_size, block_fp8
-            ),
+            padded_output_size=projection_storage_rows(used_rows, parallel.tp_size),
             parallel=parallel,
             params_dtype=torch.bfloat16,
             quant_config=projection_fp8_config() if block_fp8 else None,
@@ -282,8 +279,13 @@ class KimiMLAColumnProj(DPColumnParallelLinear):
         super().__init__(
             input_size=hidden,
             output_size=rows,
-            padded_output_size=projection_storage_rows(
-                rows, parallel.tp_size, block_fp8
+            padded_output_size=(
+                ceil_div(rows, parallel.tp_size * 96) * parallel.tp_size * 96
+                if not block_fp8
+                and parallel.tp_size == 4
+                and hidden == 7168
+                and rows == 14400
+                else projection_storage_rows(rows, parallel.tp_size)
             ),
             parallel=parallel,
             params_dtype=torch.bfloat16,
@@ -301,9 +303,17 @@ class KimiMLAColumnProj(DPColumnParallelLinear):
         begin_size: int | None = None,
     ) -> None:
         if begin_size is None:
-            super().weight_loader(param, source)
-            return
-        # BF16 q_a / kv_a / gate stream into the canonical fused layout.
+            if param is not self.weight or param.dtype != torch.bfloat16:
+                super().weight_loader(param, source)
+                return
+            logical_shape = (self.logical_output_size, self.input_size)
+            padded_shape = (self.output_size, self.input_size)
+            if source.shape not in (logical_shape, padded_shape):
+                raise ValueError(
+                    f"MLA projection weight shape {tuple(source.shape)} "
+                    f"must be {logical_shape} or {padded_shape}"
+                )
+            begin_size = 0
         if source.dtype != param.dtype:
             raise TypeError(f"MLA projection expects {param.dtype}, got {source.dtype}")
         _load_intersection(
@@ -325,3 +335,9 @@ class KimiMLAColumnProj(DPColumnParallelLinear):
         if block_scale is not None or output_dtype not in (None, x.dtype):
             raise ValueError("DP MLA projection requires unquantized local activations")
         return super().forward(x, ctx=ctx)
+
+    def forward_intermediate(
+        self, x: torch.Tensor, *, ctx: "ForwardContext"
+    ) -> torch.Tensor:
+        """Project local rows for consumption before the next same-stream call."""
+        return self._forward_projection(x, ctx=ctx, borrow_output=True)
