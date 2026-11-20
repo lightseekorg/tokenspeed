@@ -3784,6 +3784,8 @@ def test_ple_sharding_from_server_args(tmp_path, layout):
     ]
     if layout:
         argv.extend(["--ple-table-layout", layout])
+    if layout in ("shared", "peer_sharded"):
+        argv.extend(["--ple-host-table-alloc", "auto"])
     args = prepare_server_args(argv)
     args.mapping.rank = 5
     model = ModelConfig(
@@ -3794,6 +3796,9 @@ def test_ple_sharding_from_server_args(tmp_path, layout):
         dtype="float32",
     )
     assert model.hf_text_config.ple_table_layout == (layout or "global_sharded")
+    assert model.hf_text_config.ple_host_table_alloc == (
+        "auto" if layout in ("shared", "peer_sharded") else "mmap"
+    )
 
     def build():
         return Qwen4ExpNGramEmbedding(

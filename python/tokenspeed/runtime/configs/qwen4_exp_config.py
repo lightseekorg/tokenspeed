@@ -90,6 +90,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         # row at load time.
         self.ple_embed_dtype = ple_embed_dtype
         self.ple_table_layout = ple_table_layout
+        self.ple_host_table_alloc = "mmap"
         # When enabled, keep the n-gram table in page-locked host memory and
         # let the gather kernel read it over PCIe/C2C. The table scales with
         # ngram_vocab_size_base and does not fit in device memory at production
