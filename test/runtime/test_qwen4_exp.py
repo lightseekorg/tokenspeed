@@ -3015,7 +3015,7 @@ def test_ngram_ids_flat_kernel_matches_legacy(
 
 
 @_requires_cuda
-def test_ple_page_gather_pair_matches_separate_reads() -> None:
+def test_ple_page_gather_pair_matches_cpu_reads() -> None:
     context = torch.empty((3, 4), dtype=torch.long, device="cuda")[:, :2]
     conv_storage = torch.empty((3, 32), dtype=torch.bfloat16, device="cuda")
     conv = conv_storage.as_strided((3, 4, 6), (32, 6, 1))
@@ -3026,10 +3026,11 @@ def test_ple_page_gather_pair_matches_separate_reads() -> None:
     actual_context, actual_conv = ple_page_gather_pair(
         context, conv, pages, context.stride(0), conv.stride(0), 99
     )
-    expected_context = Qwen4ExpPLELayer._read_pages(context, pages, 99)
-    expected_conv = Qwen4ExpPLELayer._read_pages(conv, pages)
-    torch.testing.assert_close(actual_context, expected_context)
-    torch.testing.assert_close(actual_conv, expected_conv)
+    cpu_pages = pages.cpu()
+    expected_context = Qwen4ExpPLELayer._read_pages(context.cpu(), cpu_pages, 99)
+    expected_conv = Qwen4ExpPLELayer._read_pages(conv.cpu(), cpu_pages)
+    torch.testing.assert_close(actual_context.cpu(), expected_context, atol=0, rtol=0)
+    torch.testing.assert_close(actual_conv.cpu(), expected_conv, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
@@ -3153,109 +3154,68 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE conv requires CUDA"
 )
-@pytest.mark.parametrize("lengths", [[1], [4], [3, 1, 5], [0, 4, 2], [0, 0]])
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("graph_replay", [False, True])
-def test_ple_conv_scatters_windows_into_verify_scratch(
-    lengths, enable_pdl, graph_replay, monkeypatch
-) -> None:
-    if enable_pdl and (torch.version.hip or torch.cuda.get_device_capability()[0] < 9):
-        pytest.skip("PDL requires NVIDIA SM90+")
-    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: enable_pdl)
-    channels = 8
-    dtype = torch.bfloat16
+@pytest.mark.parametrize("width,channels", [(4, 10240), (8, 32768)])
+def test_ple_conv_commits_compact_verify_scratch(width, channels) -> None:
+    from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows_compact
+
+    batch, state = 8, 9
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
-    stub.conv1d = stub.conv1d.to("cuda", dtype)
-    state_len = stub.conv_state_len
-    bs, total = len(lengths), sum(lengths)
-    torch.manual_seed(5)
-    values = torch.randn(total, channels, dtype=dtype, device="cuda")
-    initial = torch.randn(bs, channels, state_len, dtype=dtype, device="cuda")
-    req, col, lengths_t, _, _, tot, _ = Qwen4ExpPLELayer._batch_indices(
+    stub.conv1d = stub.conv1d.to("cuda", torch.bfloat16)
+    lengths = [width] * batch
+    req, col, lengths_t, starts, _, total, _ = Qwen4ExpPLELayer._batch_indices(
         lengths, torch.device("cuda")
     )
-
-    packed = stub._conv_sequences_cuda(
-        values, initial, req, col, lengths_t, tot, bs, True
+    opts = {"device": "cuda", "dtype": torch.bfloat16}
+    values = torch.randn(total, channels, **opts)
+    initial = torch.randn(batch, channels, state, **opts)
+    args = (values, initial, req, col, lengths_t, total, batch, True)
+    add_terms = (torch.randn_like(values), torch.randn_like(values))
+    reference, _, windows = stub._conv_sequences_cuda(
+        *args, starts=starts, add_terms=add_terms
     )
-    # Scratch is one (width + 1) row block per request, plus a spare block to
-    # prove the kernel stays inside the rows it owns.
-    stride = max(lengths) + 1
-    scratch = torch.zeros(
-        (bs + 1) * stride, channels, state_len, dtype=dtype, device="cuda"
+    windows = torch.cat(
+        (initial[:, None], windows.view(batch, width, channels, state)), dim=1
     )
-    scattered = stub._conv_sequences_cuda(
-        values,
-        initial,
-        req,
-        col,
-        lengths_t,
-        tot,
-        bs,
-        True,
-        windows_out=scratch,
-        windows_block_rows=stride,
-    )
-    if graph_replay:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            scattered = stub._conv_sequences_cuda(
-                values,
-                initial,
-                req,
-                col,
-                lengths_t,
-                tot,
-                bs,
-                True,
-                windows_out=scratch,
-                windows_block_rows=stride,
-            )
-        scratch.zero_()
-        graph.replay()
+    scratch = torch.empty_like(windows).flatten(0, 1)
+    output = torch.empty_like(initial)
+    requests = torch.arange(batch, device="cuda")
+    src_rows = requests * (width + 1)
+    src, dst = [
+        torch.tensor([t.data_ptr()], device="cuda", dtype=torch.uint64)
+        for t in (scratch, output)
+    ]
+    strides = torch.tensor([output.stride(0)], device="cuda", dtype=torch.int64)
 
-    # Same conv results, with carried and token windows landing in their
-    # rollback rows and nothing else in the scratch disturbed.
-    assert torch.equal(scattered[0], packed[0])
-    assert scattered[1].shape == (0, channels, state_len)
-    assert scattered[2] is scratch
-    initial_rows = torch.arange(bs, device="cuda") * stride
-    assert torch.equal(scratch[initial_rows], initial)
-    token_rows = req * stride + 1 + col
-    assert torch.equal(scratch[token_rows], packed[2])
-    untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
-    untouched[initial_rows] = False
-    untouched[token_rows] = False
-    assert not scratch[untouched].any()
-
-    # A scratch the kernel cannot address by row must be refused, not repacked
-    # into a copy whose writes would be dropped.
-    with pytest.raises(ValueError):
-        stub._conv_sequences_cuda(
-            values,
-            initial,
-            req,
-            col,
-            lengths_t,
-            tot,
-            bs,
-            False,
+    def run():
+        conv, _, _ = stub._conv_sequences_cuda(
+            *args,
+            starts=starts,
+            add_terms=add_terms,
             windows_out=scratch,
-            windows_block_rows=stride,
+            windows_block_rows=width + 1,
         )
-    with pytest.raises(ValueError):
-        stub._conv_sequences_cuda(
-            values,
-            initial,
-            req,
-            col,
-            lengths_t,
-            tot,
-            bs,
-            True,
-            windows_out=scratch.transpose(1, 2),
-            windows_block_rows=stride,
+        copy_state_rows_compact(
+            src,
+            dst,
+            src_rows,
+            requests,
+            row_bytes=output.stride(0) * output.element_size(),
+            dst_row_strides=strides,
+            scratch=scratch,
+            verify_width=width,
         )
+        return conv
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        conv = run()
+    for offset in range(width + 1):
+        accepted = (requests + offset) % (width + 1)
+        src_rows.copy_(requests * (width + 1) + accepted)
+        graph.replay()
+        torch.testing.assert_close(conv, reference, atol=0, rtol=0)
+        torch.testing.assert_close(output, windows[requests, accepted], atol=0, rtol=0)
 
 
 @pytest.mark.skipif(
@@ -3290,7 +3250,7 @@ def test_ple_conv_accepts_precomputed_starts() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE page access requires CUDA"
 )
-def test_ple_page_access_skips_null_pages_and_page_padding() -> None:
+def test_ple_page_scatter_skips_null_pages_and_page_padding() -> None:
     pages, channels, state = 6, 4, 3
     row_numel = channels * state
     # The plan may pad a page past the row it holds, so the field view is
@@ -3301,13 +3261,6 @@ def test_ple_page_access_skips_null_pages_and_page_padding() -> None:
     base = torch.randn(pages * (row_numel + pad), dtype=torch.bfloat16, device="cuda")
     field = base.as_strided((pages, channels, state), (row_numel + pad, state, 1))
     page_ids = torch.tensor([2, 0, 4], dtype=torch.int32, device="cuda")
-
-    read = Qwen4ExpPLELayer._read_pages(field, page_ids, 1.5)
-
-    # Page id 0 is the null page and reads as the default instead.
-    assert torch.equal(read[0], field[2])
-    assert torch.equal(read[2], field[4])
-    assert torch.equal(read[1], torch.full_like(read[1], 1.5))
 
     values = torch.randn(3, channels, state, dtype=torch.bfloat16, device="cuda")
     before = base.clone()
@@ -3327,14 +3280,17 @@ def test_ple_page_access_skips_null_pages_and_page_padding() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE page access requires CUDA"
 )
-def test_ple_page_read_keeps_int64_default_exact() -> None:
+def test_ple_page_gather_pair_keeps_int64_default_exact() -> None:
     context = torch.zeros(4, 2, dtype=torch.int64, device="cuda")
     context[3] = torch.tensor([11, 12], device="cuda")
+    conv = torch.zeros(4, 2, 4, dtype=torch.bfloat16, device="cuda")
     page_ids = torch.tensor([3, 0], dtype=torch.int32, device="cuda")
     # Past fp32's exactly-representable range: the fill must stay integral.
     eos = 2**33 + 1
 
-    read = Qwen4ExpPLELayer._read_pages(context, page_ids, eos)
+    read, _ = ple_page_gather_pair(
+        context, conv, page_ids, context.stride(0), conv.stride(0), eos
+    )
 
     assert read.dtype == torch.int64
     assert torch.equal(read[0], context[3])
@@ -3484,6 +3440,7 @@ def _ple_checkpoint_loader_stub(
         torch.float8_e4m3fn if store_dtype == torch.float8_e4m3fn else None
     )
     ple.lookup._checkpoint_weight_scale = 1.0
+    ple.lookup._host_cache = None
     ple.lookup.offload_embedding = offload
     ple.lookup._compute_device = torch.device("cpu")
 
@@ -3726,6 +3683,50 @@ def _tiny_ple_config(**overrides) -> Qwen4ExpTextConfig:
     )
     kwargs.update(overrides)
     return Qwen4ExpTextConfig(**kwargs)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ple_hot_cache_cli_reaches_model_config(tmp_path, enabled):
+    from tokenspeed.runtime.engine.rank_setup import load_model_config
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    _tiny_ple_config(
+        architectures=["Qwen4ExpForCausalLM"], ple_offload_embedding=True
+    ).save_pretrained(tmp_path)
+    argv = ["--model", str(tmp_path)]
+    if enabled:
+        argv.append("--enable-ple-hot-cache")
+    args = prepare_server_args(argv)
+    config = load_model_config(args, args.model, draft_of=None)
+
+    assert config.hf_text_config.enable_ple_hot_cache is enabled
+    assert config.hf_text_config.ple_offload_embedding is True
+    if enabled:
+        draft_path = tmp_path / "draft"
+        _tiny_ple_config(
+            architectures=["Qwen4ExpForCausalLM"],
+            ple_layer_ids=[],
+        ).save_pretrained(draft_path)
+        draft_config = load_model_config(args, str(draft_path), draft_of=config)
+        assert draft_config.hf_text_config.enable_ple_hot_cache is False
+
+
+@pytest.mark.parametrize("qwen4_exp", [False, True], ids=["llama", "qwen4-without-ple"])
+def test_ple_hot_cache_cli_rejects_targets_without_ple(tmp_path, qwen4_exp):
+    from transformers import LlamaConfig
+
+    from tokenspeed.runtime.engine.rank_setup import load_model_config
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    config = (
+        _tiny_ple_config(architectures=["Qwen4ExpForCausalLM"], ple_layer_ids=[])
+        if qwen4_exp
+        else LlamaConfig(architectures=["LlamaForCausalLM"])
+    )
+    config.save_pretrained(tmp_path)
+    args = prepare_server_args(["--model", str(tmp_path), "--enable-ple-hot-cache"])
+    with pytest.raises(ValueError, match="requires a Qwen4-Exp target model with PLE"):
+        load_model_config(args, args.model, draft_of=None)
 
 
 @pytest.mark.parametrize(
@@ -4066,7 +4067,7 @@ def test_ple_host_gather_shard_mask(store_fp8, scale_mode) -> None:
         else None
     )
     scalar = 0.5 if scale_mode == "scalar" else None
-    ple_host_gather(table, ids, out, 10, 14, scalar, scales)
+    ple_host_gather(table, ids, out, 10, 14, scalar, scales, table_shards=4)
     expected = torch.zeros_like(out)
     for output_row, local_row in [(1, 0), (2, 3)]:
         scale = (

@@ -1097,10 +1097,12 @@ select another kernel) requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`, and a
 fixed prefill token budget. Eager execution and ordinary breakable prefill
 graphs are supported.
-The weight-sharing size must divide the instance size. Shared-expert and
-attention-projection TP overrides must also remain local. The additional
-staging memory is allocated before KV cache sizing. Live checkpoint replacement
-requires restarting these workers.
+The routed experts run on FlashInfer's TRT-LLM-Gen kernels
+(`--moe-backend flashinfer_trtllm`) or, for NVFP4, its CuTe DSL kernels
+(`--moe-backend flashinfer_cutedsl`). The weight-sharing size must divide the
+instance size. Shared-expert and attention-projection TP overrides must also
+remain local. The additional staging memory is allocated before KV cache sizing.
+Live checkpoint replacement requires restarting these workers.
 
 See [distributed immutable weights](../design/distributed-weights.md) for
 storage ownership and stream-ordering invariants.

@@ -238,6 +238,62 @@ def projection_all_gather(
     return backend.projection_all_gather(tensor, rows, quantize, workspace)
 
 
+def projection_gather_mm(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Gather every owner's rows and project them through this rank's weight shard.
+
+    Args:
+        tensor: This owner's ``[local_rows, K]`` rows, ``local_rows <= rows``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N / TP, K]`` output shard.
+        out: Caller-owned ``[TP * rows, N / TP]`` destination; owner ``p``'s
+            rows land at ``[p * rows, (p + 1) * rows)``, with zero rows for its
+            padding.
+        workspace: A collectively prepared ``gather`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        out.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_gather_mm(tensor, rows, weight, out, workspace)
+
+
+def projection_mm_reduce_scatter(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Project all rows through this rank's weight shard and sum every rank's
+    partial into owner rows.
+
+    Args:
+        tensor: All ``[rows_total, K / TP]`` rows, ``rows_total <= TP * rows``;
+            owner ``p`` owns rows ``[p * rows, (p + 1) * rows)``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N, K / TP]`` input shard.
+        workspace: A collectively prepared ``scatter`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        This owner's ``[rows, N]`` sums, owned by the caller.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_mm_reduce_scatter(tensor, rows, weight, workspace)
+
+
 def projection_all_to_all(
     tensor: torch.Tensor,
     rows: int,
@@ -503,6 +559,29 @@ def prepare_all_reduce_buffers(
         producer_direct_max_numel=producer_direct_max_numel,
         dtype=dtype,
     )
+
+
+def prepare_all_reduce_runtime(
+    groups: tuple[Group, ...],
+    dtype: torch.dtype,
+    backend: CommBackend | None,
+) -> bool:
+    """Prepare ordinary reductions before profiling memory or capturing graphs.
+
+    Args:
+        groups: Shared device groups in collective preparation order.
+        dtype: Model activation dtype.
+        backend: Backend to prepare, or None for the configured global backend.
+
+    Returns:
+        Whether any group has a prepared ordinary all-reduce implementation.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    prepared = False
+    for group in groups:
+        prepared = backend.prepare_all_reduce_runtime(group, dtype) or prepared
+    return prepared
 
 
 def prepare_all_reduce_fusion(

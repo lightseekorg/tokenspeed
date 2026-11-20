@@ -280,15 +280,24 @@ def scheduler_config_from_args(
         peer_config: Peer prefix sharing's limits (``cache/peer.py``), or
             None without peer sharing.
     """
+    # Both explicit batching policy and allocated device workspace constrain the
+    # same summed-page budget. Decode capacity remains the cache arena's limit.
+    prefill_limits = [
+        limit
+        for limit in (
+            server_args.chunk_prefill_kv_size,
+            specs.cache_storage.get("prefill_kv_capacity", 0),
+        )
+        if limit
+    ]
+    prefill_kv_rows = min(prefill_limits) if prefill_limits else 0
     geometry = specs.cache_geometry
     has_l3 = server_args.kvstore_storage_backend is not None
     config = make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
         max_kv_page_num=(
-            0
-            if server_args.chunk_prefill_kv_size is None
-            else (server_args.chunk_prefill_kv_size + geometry.prefix_granularity - 1)
+            (prefill_kv_rows + geometry.prefix_granularity - 1)
             // geometry.prefix_granularity
         ),
         max_batch_size=max_batch_size,
@@ -303,6 +312,7 @@ def scheduler_config_from_args(
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
         host_write_policy=server_args.kvstore_write_policy,
+        decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,

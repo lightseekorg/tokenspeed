@@ -114,6 +114,15 @@ class EngineMetrics:
             labelnames=labelnames,
             buckets=[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
         )
+        self.request_spec_decode_accept_length = factory.histogram(
+            name="tokenspeed:request_spec_decode_accept_length",
+            documentation=(
+                "Mean output tokens per verify round, including bonus, "
+                "per ended speculative request."
+            ),
+            labelnames=labelnames,
+            buckets=[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0],
+        )
         self.prefix_cache_hit_ratio = factory.histogram(
             name="tokenspeed:prefix_cache_hit_ratio",
             documentation="Admission cache hits divided by prompt tokens, weighted by prompt tokens.",
@@ -680,6 +689,12 @@ class EngineMetrics:
         if self.enabled:
             self.request_completion_tokens.labels(**self.labels).observe(count)
 
+    def observe_request_spec_decode_accept_length(self, accept_length: float) -> None:
+        if self.enabled:
+            self.request_spec_decode_accept_length.labels(**self.labels).observe(
+                accept_length
+            )
+
     def record_decode_prefix_hits(self, prompt: int, hit: int) -> None:
         if not self.enabled or prompt <= 0:
             return
@@ -771,7 +786,10 @@ class KVTransferMetrics:
             ],
         )
         # `stage` is the bounded TransferPoll state the request was stuck in:
-        # "bootstrapping" (prefill never received the cache manifest) or
+        # "bootstrapping" (prefill never received the cache manifest),
+        # "waiting_for_announcement" (a prefill under deferred allocation
+        # never admitted the request: decode never announced it),
+        # "waiting_for_admission" (decode never published its manifest) or
         # "waiting_for_input" (decode never received the transfer-done signal).
         self.kv_transfer_timeouts = factory.counter(
             name="tokenspeed:kv_transfer_timeouts",

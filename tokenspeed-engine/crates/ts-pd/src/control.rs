@@ -102,8 +102,16 @@ pub struct RemotePrefill {
 /// A transfer whose state the replica agreed changed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PdEvent {
-    /// The request's peers are connected.
+    /// The request may be admitted. D role: its peers are connected and,
+    /// when the prefill node defers the decode allocation, that node holds every
+    /// page of the prompt. P role under early decode allocation: every
+    /// decode rank allocated its destination. P role under deferred
+    /// decode allocation: its decode node announced it; the destination has
+    /// its own event.
     Bootstrapped(String),
+    /// P role, deferred decode allocation: every decode rank allocated
+    /// the request's destination.
+    DestinationReady(String),
     /// The request's transfer failed. Its readers or writers may still be
     /// stopping: [`PdEvent::Stopped`] follows.
     Failed(String),

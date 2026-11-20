@@ -932,6 +932,16 @@ class ModelConfig:
             # draft's config has no such class: load_model_config declares
             # the field on it from its target.
             self.hf_text_config.decode_monokernel = True
+        is_qwen4_exp_model = is_qwen4_exp(self.hf_config)
+        enable_ple_hot_cache = server_args.enable_ple_hot_cache and not is_draft_worker
+        if enable_ple_hot_cache and (
+            not is_qwen4_exp_model or not self.hf_text_config.ple_layer_ids
+        ):
+            raise ValueError(
+                "--enable-ple-hot-cache requires a Qwen4-Exp target model with PLE layers"
+            )
+        if is_qwen4_exp_model:
+            self.hf_text_config.enable_ple_hot_cache = enable_ple_hot_cache
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 

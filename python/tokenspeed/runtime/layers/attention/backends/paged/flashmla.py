@@ -225,8 +225,6 @@ class FlashMLABackend(PagedMLABackend):
         # graph recorded alive for the graph's lifetime.
         self._decode_tile_metadata: object | None = None
         self._decode_tile_metadata_keepalive: list[object] = []
-        # The current forward's extend_with_prefix, read by the prefill hook.
-        self._extend_with_prefix = False
 
     # ------------------------------------------------------------------
     # Metadata init
@@ -402,12 +400,6 @@ class FlashMLABackend(PagedMLABackend):
                 self.prefill_wrapper_ragged
             )
 
-    def init_forward_metadata(self, *args, extend_with_prefix: bool, **kwargs) -> None:
-        self._extend_with_prefix = extend_with_prefix
-        super().init_forward_metadata(
-            *args, extend_with_prefix=extend_with_prefix, **kwargs
-        )
-
     def _renew_decode_tile_metadata(self, *, for_graph: bool) -> None:
         """Bind a fresh (uninitialized) FlashMLASchedMeta for the seq_lens just
         written; the next kernel call builds its schedule from them.
@@ -443,10 +435,11 @@ class FlashMLABackend(PagedMLABackend):
         extend_seq_lens_cpu: torch.Tensor,
         page_table: torch.Tensor,
         *,
+        extend_with_prefix: bool,
         page_table_cpu: torch.Tensor | None,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
-        extend_no_prefix = not self._extend_with_prefix
+        extend_no_prefix = not extend_with_prefix
         if extend_no_prefix and bool(extend_prefix_lens_cpu.any()):
             # The ragged plan sizes its paged kv_indices by the prefix sum
             # (zero here), so a prefixed row would overrun it in-kernel.

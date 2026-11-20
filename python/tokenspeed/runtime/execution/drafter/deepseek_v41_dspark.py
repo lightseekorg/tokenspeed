@@ -1519,7 +1519,7 @@ class DeepseekV41DSpark(BaseDrafter):
                                     states.token_limits[:bs].fill_(
                                         torch.iinfo(torch.int32).max
                                     )
-                                    prepare_metadata()
+                                    prepare_metadata(q)
 
                                 rank_sizes = [bs] * len(drafter._verification_group)
 

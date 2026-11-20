@@ -26,7 +26,9 @@ smallest one with fewer live) in three radix digits of 11, 11, and 10 bits, and
 keeps this rank's candidates above it, then the ties at it through the ranks in
 order and within a rank in candidate order, ``topk`` in all: this rank's share
 of the merge's selection. Kept candidates map to local slots through the local
-page table in candidate order, ``-1`` after.
+page table in candidate order, ``-1`` after. A row with at most ``topk`` live
+keys in all (a history no longer than the top-k) keeps every one without the
+digits.
 """
 
 from __future__ import annotations
@@ -128,6 +130,45 @@ class OwnedSelect:
                 shared_add(hist.iterator + ((key >> Uint32(shift)) & mask), 1)
         cute.arch.sync_threads()
 
+    @cute.jit
+    def threshold(self, hist, info, scan, keys, own_keys, rank, tid, warp, lane):
+        """Find the row's threshold key and this rank's tie quota at it.
+
+        Three radix digits run over the row's live keys (more than ``W``
+        whenever this runs) to find the ``W``-th largest. Returns the threshold,
+        the ties to take at it, and this thread's first tie's rank among them
+        (lower ranks' ties first, then candidate order).
+        """
+        W = self.width
+        self.digit(hist, info, keys, 21, 0x7FF, 32, Uint32(0), tid)
+        need = cutlass.min(Uint32(info[4]), Uint32(W))
+        topdown(hist, BINS, need, info, scan, tid, warp, lane)
+        c0 = Uint32(info[2])
+        need -= Uint32(info[3])
+        self.digit(hist, info, keys, 10, 0x7FF, 21, c0, tid)
+        topdown(hist, BINS, need, info, scan, tid, warp, lane)
+        c1 = Uint32(info[2])
+        need -= Uint32(info[3])
+        prefix = (c0 << Uint32(11)) | c1
+        self.digit(hist, info, keys, 0, 0x3FF, 10, prefix, tid)
+        topdown(hist, LOW_BINS, need, info, scan, tid, warp, lane)
+        threshold = (prefix << Uint32(10)) | Uint32(info[2])
+        # The ties at the threshold to take, through the ranks in order: one
+        # scan sums the lower ranks' ties (high half) and ranks this rank's.
+        take = need - Uint32(info[3])
+        ties = Uint32(0)
+        for i in cutlass.range_constexpr(self.keys):
+            column = tid + THREADS * i
+            if keys[i] == threshold and keys[i] != Uint32(0):
+                if column // W < rank:
+                    ties += Uint32(1 << 16)
+        for e in cutlass.range_constexpr(self.own):
+            if own_keys[e] == threshold and own_keys[e] != Uint32(0):
+                ties += Uint32(1)
+        tie_rank, tie_total = block_exclusive(ties, scan, warp, lane)
+        tie_rank = (tie_rank & Uint32(0xFFFF)) + (tie_total >> Uint32(16))
+        return threshold, take, tie_rank
+
     @cute.kernel
     def kernel(self, scores, positions, table, requests, out, lens, rank):
         """Select rank ``rank``'s share of one row's merged top-k.
@@ -186,35 +227,17 @@ class OwnedSelect:
         cute.arch.sync_threads()
         if lane == 0:
             shared_add(info.iterator + 4, live)
+        cute.arch.sync_threads()
 
-        # The threshold: three radix digits over the live keys.
-        self.digit(hist, info, keys, 21, 0x7FF, 32, Uint32(0), tid)
-        need = cutlass.min(Uint32(info[4]), Uint32(W))
-        topdown(hist, BINS, need, info, scan, tid, warp, lane)
-        c0 = Uint32(info[2])
-        need -= Uint32(info[3])
-        self.digit(hist, info, keys, 10, 0x7FF, 21, c0, tid)
-        topdown(hist, BINS, need, info, scan, tid, warp, lane)
-        c1 = Uint32(info[2])
-        need -= Uint32(info[3])
-        prefix = (c0 << Uint32(11)) | c1
-        self.digit(hist, info, keys, 0, 0x3FF, 10, prefix, tid)
-        topdown(hist, LOW_BINS, need, info, scan, tid, warp, lane)
-        threshold = (prefix << Uint32(10)) | Uint32(info[2])
-        # The ties at the threshold to take, through the ranks in order: one
-        # scan sums the lower ranks' ties (high half) and ranks this rank's.
-        take = need - Uint32(info[3])
-        ties = Uint32(0)
-        for i in cutlass.range_constexpr(self.keys):
-            column = tid + THREADS * i
-            if keys[i] == threshold and keys[i] != Uint32(0):
-                if column // W < rank:
-                    ties += Uint32(1 << 16)
-        for e in cutlass.range_constexpr(self.own):
-            if own_keys[e] == threshold and own_keys[e] != Uint32(0):
-                ties += Uint32(1)
-        tie_rank, tie_total = block_exclusive(ties, scan, warp, lane)
-        tie_rank = (tie_rank & Uint32(0xFFFF)) + (tie_total >> Uint32(16))
+        # At most ``W`` live keys in all (a row no longer than the top-k): every
+        # live key is kept, so threshold 0 with no ties gives the same selection.
+        threshold = Uint32(0)
+        take = Uint32(0)
+        tie_rank = Uint32(0)
+        if Uint32(info[4]) > Uint32(W):
+            threshold, take, tie_rank = self.threshold(
+                hist, info, scan, keys, own_keys, rank, tid, warp, lane
+            )
         kept = Uint32(0)
         kept_slots = []
         for e in cutlass.range_constexpr(self.own):

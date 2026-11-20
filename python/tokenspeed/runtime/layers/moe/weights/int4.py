@@ -88,7 +88,6 @@ def create_int4_weight_pair(
     layer.w4a4_gmm_is_transposed = transposed
     layer.w4a4_scale_strategy = scale_strategy
     layer._int4_loaded: set[tuple[str, int, str]] = set()
-    layer._int4_plan = None
     shapes = {
         "w13_weight": (e, 2 * i, h // 8) if transposed else (e, 2 * i // 8, h),
         "w2_weight": (e, h, i // 8) if transposed else (e, h // 8, i),

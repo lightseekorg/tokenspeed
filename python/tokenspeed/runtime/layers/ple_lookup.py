@@ -29,6 +29,8 @@ import torch
 from torch import nn
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
@@ -116,6 +118,7 @@ def host_gather_ngram_rows(
         embedding.shard_indices.org_vocab_end_index,
         scale,
         None,
+        table_shards=embedding.tp_size,
     )
 
 
@@ -131,9 +134,14 @@ class PLELookup(nn.Module):
         output_dtype: torch.dtype,
         offload: bool,
         table_layout: str,
+        enable_hot_cache: bool,
         prefix: str,
     ):
         super().__init__()
+        if enable_hot_cache and not offload:
+            raise ValueError(
+                "--enable-ple-hot-cache requires ple_offload_embedding=true"
+            )
         from tokenspeed.runtime.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
         )
@@ -154,6 +162,10 @@ class PLELookup(nn.Module):
         ):
             raise ValueError(f"Unsupported PLE table layout: {table_layout}")
         mapped = table_layout in ("shared", "peer_sharded")
+        if table_layout == "peer_sharded" and enable_hot_cache:
+            raise ValueError(
+                "--enable-ple-hot-cache cannot read peer_sharded PLE tables"
+            )
         if mapped and not offload:
             raise ValueError(f"PLE layout {table_layout} requires host offloading")
         self.gather_dp_ids = mapping.attn.has_dp and table_layout == "global_sharded"
@@ -175,6 +187,7 @@ class PLELookup(nn.Module):
         self.offload_embedding = offload
         self._checkpoint_weight_scale = 1.0
         self._gather_stream: torch.cuda.Stream | None = None
+        self._host_cache: PLEHostCache | None = None
         self._pending: PendingLookup | None = None
         with torch.device("meta") if offload else nullcontext():
             self.ngram_embedding = VocabParallelEmbedding(
@@ -207,6 +220,21 @@ class PLELookup(nn.Module):
             if offload
             else self.ngram_embedding.weight.device
         )
+        if enable_hot_cache:
+            from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+
+            from tokenspeed.runtime.utils.env import envs
+
+            shard = self.ngram_embedding.shard_indices
+            self._host_cache = PLEHostCache(
+                slot_count=envs.TOKENSPEED_PLE_HOST_CACHE_SLOTS.get(),
+                table=self.ngram_embedding.weight,
+                ngram_heads=ngram_heads,
+                output_dtype=output_dtype,
+                vocab_start=shard.org_vocab_start_index,
+                vocab_end=shard.org_vocab_end_index,
+                device=self._compute_device,
+            )
 
     def make_layout(self, global_num_tokens, local_tokens: int) -> LookupTokenLayout:
         if not self.gather_dp_ids:
@@ -266,14 +294,27 @@ class PLELookup(nn.Module):
         completion = None
         if self.offload_embedding:
             out = self.allocate_lookup_buffer(gathered_ids.shape[0], ids.device)
+            cache = self._host_cache
+            use_cache = cache is not None and cache.can_gather(gathered_ids)
             if self._gather_stream is None:
                 self._gather_stream = torch.cuda.Stream(device=ids.device)
             stream = self._gather_stream
-            stream.wait_stream(torch.cuda.current_stream(ids.device))
+            stream.wait_stream(execution_stream)
             gathered_ids.record_stream(stream)
             out.record_stream(stream)
             with torch.cuda.stream(stream):
-                self.gather_host(gathered_ids, out)
+                if use_cache:
+                    cache.gather(
+                        gathered_ids,
+                        out.view(-1, self.head_dim),
+                        scale=(
+                            self._checkpoint_weight_scale
+                            if self.embed_store_dtype is not None
+                            else None
+                        ),
+                    )
+                else:
+                    self.gather_host(gathered_ids, out)
                 completion = torch.cuda.Event()
                 completion.record(stream)
         else:
@@ -322,6 +363,17 @@ class PLELookup(nn.Module):
             device=device,
         )
 
+    def warmup_host_cache(self) -> None:
+        cache = self._host_cache
+        if cache is not None:
+            cache.warmup(
+                scale=(
+                    self._checkpoint_weight_scale
+                    if self.embed_store_dtype is not None
+                    else None
+                )
+            )
+
     def gather_host(self, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Read the ``ids`` rows from host memory into ``out``.
 
@@ -343,6 +395,7 @@ class PLELookup(nn.Module):
                 table.org_vocab_size,
                 scale,
                 None,
+                table_shards=table.tp_size,
                 shard_ptrs=self.peer_ptrs,
             ).view_as(out)
         host_gather_ngram_rows(
@@ -470,6 +523,8 @@ class PLELookup(nn.Module):
         """
         writer = self.shared_table is None or self.shared_table.is_writer
         rows = self.shard_rows(weight, shard_index, split_parts) if writer else None
+        if self._host_cache is not None and (rows is not None or not writer):
+            self._host_cache.invalidate()
         if self.needs_online_quantization(weight):
             if not prescanned:
                 if split_parts != 1:
@@ -498,10 +553,13 @@ class PLELookup(nn.Module):
                 f"{scale}"
             )
 
-        if self.embed_store_dtype is None and (
-            self.shared_table is None or self.shared_table.is_writer
-        ):
+        if self.embed_store_dtype is None:
             # Compute-dtype target: rescale any raw FP8 rows copied before the
             # scale tensor. Future shard copies multiply by the new value.
-            self.ngram_embedding.weight.data.mul_(scale / self._checkpoint_weight_scale)
+            if self._host_cache is not None:
+                self._host_cache.invalidate()
+            if self.shared_table is None or self.shared_table.is_writer:
+                self.ngram_embedding.weight.data.mul_(
+                    scale / self._checkpoint_weight_scale
+                )
         self._checkpoint_weight_scale = scale

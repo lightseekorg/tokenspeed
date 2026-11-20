@@ -1240,6 +1240,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             for count in request.completion_token_samples {
                 metrics.observe_request_completion_tokens(count);
             }
+            for accept_length in request.spec_decode_accept_length_samples {
+                metrics.observe_request_spec_decode_accept_length(accept_length);
+            }
             metrics.record_grammar_queue(self.grammar_queue.len() as i64);
             let hits = self.scheduler.prefix_hit_stats();
             let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
@@ -2764,6 +2767,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 PdEvent::Bootstrapped(rid) => {
                     self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
+                }
+                PdEvent::DestinationReady(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdDestinationReady, &rid, -1));
                 }
                 PdEvent::Succeeded(rid) => {
                     events.push(pd_event(ForwardEventKind::PdSucceeded, &rid, -1));
