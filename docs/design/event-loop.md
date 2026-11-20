@@ -1002,14 +1002,15 @@ polls and keep the pages until the retirement event and local forwards complete.
 
 The prefill control receiver handles cancellation even when no native request
 claimed the room or its scheduler is paused. Unclaimed rooms therefore need
-not wait for the bootstrap timeout after the decode request is cancelled.
-P and D must run versions supporting this cancellation protocol. If a target
+not wait for the bootstrap timeout after the decode request is cancelled. P
+and D must run versions supporting this cancellation protocol. If a target
 cannot acknowledge retirement, the receiver retains its pages and the drain
 remains pending; a transport failure alone cannot make those pages safe to
-reuse. Cancellation tombstones are retired with their destination cache
-identities. A prefill cancellation that never learns a destination identity
-must retain its room tombstone until that peer exits, since an arbitrarily
-late manifest must not revive the transfer.
+reuse. Only a revocation (below) releases them without the acknowledgment.
+Cancellation tombstones are retired with their destination cache identities. A
+prefill cancellation that never learns a destination identity must retain its
+room tombstone until that peer exits, since an arbitrarily late manifest must
+not revive the transfer.
 
 These records include every prefill failure and bootstrap timeout, not just
 explicit client cancellation. There is currently no count or age limit:
@@ -1034,8 +1035,43 @@ with memory release, from completing. Recovery requires verified retirement
 of the writers or transport invalidation that makes further access to these
 registrations impossible; local forwards must also have completed before
 pages are released. A timeout can trigger diagnostics or recovery but cannot
-authorize page reuse; the current protocol provides no forced retirement
-for an uncertain room.
+authorize page reuse.
+
+**PD receive revocation.** A failed receive whose cancellation some target
+has still not acknowledged `waiting_timeout` after it failed, while its
+manifest names the current transfer engine, starts a revocation off the
+scheduling loop: the writer died, restarted at another control port, or has
+a write that may still land. The decode peer registers its cache under a
+fresh transfer engine and cache identity and makes it the one transfers use
+and registrations name; every receive attached to the replaced transport
+fails, whether it published a manifest or still waits for admission; then
+the cache is deregistered from the replaced engine. An RDMA NIC checks every
+incoming write against the destination's registration, and deregistration
+returns only once the NIC no longer uses it (this relies on the Mooncake
+library deregistering synchronously on every device), so after it succeeds
+no write through the replaced engine's keys lands: the receives whose
+manifests named that engine retire without acknowledgments. The fence, not
+the timeout, authorizes the reuse; the timeout only picks when to pay for
+it. If the deregistration fails, those receives keep waiting for
+acknowledgments and no longer trigger revocations of later engines, and
+since the replaced engine may still reach the cache, the cache is never
+released. Nor is it released while a revocation runs. Each room's
+cancellation, and its announcement under `deferred` decode allocation, names
+the cache identity its route registered, so a receive that failed before
+admission still reaches prefill under an identity it knows. Rooms that were
+still connecting, including those waiting for a registration acknowledgment,
+connect again under the fresh identity, registering it with their prefill
+ranks, and a failed receive never publishes its manifest later. The replaced
+engine stays alive for the peer's lifetime without the cache registered, so
+its session (host and RPC port) cannot be reused by a later engine that a
+revoked writer resolving its old session would reach. Only the `rdma`
+transport revokes; with others such receives stay pinned. Each outcome is
+logged as an event: `ts_decode_revocation_fenced`,
+`ts_decode_revocation_unfenced` (with the pinned rooms), or
+`ts_decode_revocation_not_started`; a release refused for an unfenced cache
+logs `ts_decode_release_refused_unfenced`. Each revocation costs every
+receive attached to that rank at that moment, which its replica peers fail
+too through the agreed transfer status, and one idle engine.
 
 **PD failure isolation.** Control messages use one bounded FIFO per destination
 endpoint. Connect and send each have a five-second deadline; a failed endpoint
@@ -1066,12 +1102,12 @@ rejects the registration replies with its reason, which fails the room at
 once. A room whose route is not acknowledged within 10 seconds fails before
 publishing a manifest, so it retires locally, and the next room registers
 again; since one worker serves a bootstrap address, an unreachable target
-delays that address's later rooms by up to as long. Recording a route when its
-registration is merely queued would leave a lost registration's route recorded
-but unknown to prefill: every later room on it would fail and keep its pages
-pinned. Prefill ranks still install the id-less registration of an older
-decode rank, without acknowledging it; a decode rank needs prefill ranks that
-acknowledge, so prefill ranks are upgraded first.
+delays that address's later rooms by up to 10 seconds. Recording a route when
+its registration is merely queued would leave a lost registration's route
+recorded but unknown to prefill: every later room on it would fail and keep
+its pages pinned. Prefill ranks still install the id-less registration of an
+older decode rank, without acknowledging it; a decode rank needs prefill ranks
+that acknowledge, so prefill ranks are upgraded first.
 
 Decode bootstrap lookups are serialized per bootstrap address, with independent
 workers for other addresses. Polling (including idle polls) and registration
