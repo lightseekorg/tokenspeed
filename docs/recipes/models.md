@@ -279,6 +279,52 @@ ts serve thinkingmachines/Inkling-2-Small \
     --speculative-algorithm DSPARK
 ```
 
+### Inkling 2 Mini
+
+Inkling 2 Mini, `thinkingmachines/Inkling-2-Mini`, is a looped Inkling 2: 24
+layers of width 2304, NVFP4 experts in layers 0-19, MXFP8 experts in layers
+20-23, everything else BF16. Its core, layers 6-17, runs three times per token.
+The checkpoint declares the architecture
+`Inkling2LoopForConditionalGeneration`. As with Inkling 2 Small, the DSpark
+draft ships in the same directory and `ts serve` selects the `inkling2`
+reasoning parser. The checkpoint sets no draft width, so DSpark proposes three
+tokens per round.
+
+On AMD, the command is Inkling 2 Small's with three changes:
+
+- `--decode-monokernel`: decode steps of 1, 2, 4 or 8 requests run each layer
+  in persistent gfx950 kernels, with the same output as without the flag.
+- `--max-model-len 262120`: the context Inkling 2 Mini is validated at. The
+  checkpoint covers 1,048,576 positions, 24 fewer with the draft.
+- `--cudagraph-capture-sizes 1 2 4 8 16 32 64`: decode graphs for up to 64
+  requests. Graph capture at the default sizes, up to 80, does not finish on
+  Inkling 2 Mini yet.
+
+```bash
+# amd (4x MI350X)
+ts serve thinkingmachines/Inkling-2-Mini \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 262120 --sampling-backend triton \
+    --attention-backend triton --drafter-attention-backend triton \
+    --mm-attention-backend triton_attn \
+    --speculative-algorithm DSPARK --decode-monokernel \
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64
+```
+
+Each pass of the core keeps its own KV and convolution caches. Two options
+change the loop:
+
+- `--inkling2-loop-num-passes N`: run the core N times instead of three. With a
+  DSpark draft only the checkpoint's count is accepted, and with
+  `--decode-monokernel` at most 4.
+- `--inkling2-loop-share-cache`: the passes of a core layer share its KV cache,
+  so the cache does not grow with the pass count. Each pass keeps its own
+  convolution state.
+
+Layerwise PD cache transfer and sequence-parallel prefill are not supported
+for looped checkpoints: a PD prefill server must pass
+`--disaggregation-layerwise-interval 0`.
+
 ## MiniMax M3
 
 MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
