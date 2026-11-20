@@ -967,6 +967,7 @@ if _fused_indexer is not None:
             index_k_cache: Contiguous packed ``fp8_scaled`` plane ``[slots,
                 132]`` of whole 64-slot pages.
             pages: The rows' compact owned pages and local lengths.
+            row_lengths: Int32 ``[rows]`` keys each row sees over every rank.
             query_group_size: Consecutive rows of one request (1-8).
             page_size: Tokens per plane page (64).
             topk: Candidates per row.
