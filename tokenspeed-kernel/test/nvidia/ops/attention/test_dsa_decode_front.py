@@ -247,14 +247,15 @@ def test_a_kvp_placement_writes_only_its_rows_at_local_slots(slot_dtype, rank) -
     (null block 0 and blocks past the count included).
     """
     rows_per_page, degree = 2 * PAGE, 4
-    # The plane's 12 local blocks hold every owner's share of 44 virtual ones.
-    blocks = degree * (PAGES * PAGE // rows_per_page - 1) + 1
+    # 40 virtual blocks fill local blocks 1-10; a past-count write would hit 11.
+    blocks = degree * (PAGES * PAGE // rows_per_page - 2) + 1
     case = _case(24, seed=29 + rank, slot_dtype=slot_dtype, norm_dtype=torch.float32)
     generator = torch.Generator(device="cuda").manual_seed(rank)
     virtual = torch.randperm((blocks - 1) * rows_per_page, device="cuda", generator=generator)  # fmt: skip
     virtual = virtual[:24] + rows_per_page
     virtual[0] = 5  # the null block
-    virtual[1] = blocks * rows_per_page + 7  # past the virtual blocks
+    # Past the count, in a block this rank would own.
+    virtual[1] = (blocks + rank) * rows_per_page + 7
     case["slots"] = virtual.to(slot_dtype)
     case["slot_owner"] = (rows_per_page, blocks, degree, rank)
     owned = ((virtual // rows_per_page - 1) % degree == rank)[2:]
