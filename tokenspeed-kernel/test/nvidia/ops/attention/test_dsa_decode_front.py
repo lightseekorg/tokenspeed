@@ -347,6 +347,17 @@ def test_rows_outside_one_to_64_are_refused(rows) -> None:
         _front(case)
 
 
+@pytest.mark.parametrize(
+    "slot_owner", [(128, 41, 1, 0), (128, 1, 4, 0), (96, 41, 4, 0), (128, 41, 4, 4)]
+)
+def test_a_slot_owner_off_a_kvp_placement_is_refused(slot_owner) -> None:
+    """A slot owner of one rank, one block, part pages, or no rank is refused."""
+    case = _case(4, seed=5, slot_dtype=torch.int64, norm_dtype=torch.float32)
+    case["slot_owner"] = slot_owner
+    with pytest.raises(ValueError, match="slot_owner must be"):
+        _front(case)
+
+
 def test_misaligned_rows_are_refused() -> None:
     case = _case(4, seed=5, slot_dtype=torch.int64, norm_dtype=torch.float32)
     shifted = torch.zeros(4, PACKED + 1, dtype=torch.bfloat16, device="cuda")[:, 1:]

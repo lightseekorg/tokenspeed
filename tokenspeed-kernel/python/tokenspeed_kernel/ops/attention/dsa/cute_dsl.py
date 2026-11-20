@@ -676,8 +676,9 @@ if _decode_front is not None:
             slots: Contiguous int64 or int32 ``[rows]`` non-negative plane
                 slots, or virtual slots under ``slot_owner``.
             slot_owner: None, or ``virtual_slots_to_local``'s ``(rows_per_page,
-                virtual_block_count, degree, rank)`` of a KVP placement: only
-                this rank's rows are written, at their local plane slots.
+                virtual_block_count, degree, rank)`` of a KVP placement over
+                two or more ranks: only this rank's rows are written, at their
+                local plane slots.
             page_size: Slots per plane page (64).
             softmax_scale: Score scale folded into the head weights.
 
@@ -760,14 +761,15 @@ if _decode_front is not None:
             if (
                 rows_per_page <= 0
                 or rows_per_page % _FUSED_PAGE
-                or virtual_blocks <= 0
+                or virtual_blocks < 2
+                or degree < 2
                 or not 0 <= rank < degree
                 or rows_per_page * virtual_blocks >= 2**31
             ):
                 raise ValueError(
                     "slot_owner must be (rows_per_page, virtual_block_count, "
-                    f"degree, rank) of whole {_FUSED_PAGE}-slot pages, got "
-                    f"{slot_owner}"
+                    f"degree, rank) of whole {_FUSED_PAGE}-slot pages over two "
+                    f"or more ranks, got {slot_owner}"
                 )
         q_norm = torch.empty((rows, _FRONT_Q_LORA), dtype=torch.bfloat16, device=device)
         projected = torch.empty((rows, width), dtype=torch.bfloat16, device=device)
