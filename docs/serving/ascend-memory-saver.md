@@ -2,8 +2,9 @@
 
 Memory Saver releases selected physical NPU memory between rollout windows.
 Workers stay alive and wake with their original decode graphs and virtual
-addresses. Only managed backing is released; budget separately for resident
-executables, HCCL groups/workspaces and unmanaged allocations.
+addresses. Once all managed allocations on a rank are paused, the worker calls
+`torch.npu.empty_cache()` once to release unused allocator cache. Budget
+separately for resident executables, HCCL workspaces and live unmanaged allocations.
 
 ## Before you start
 

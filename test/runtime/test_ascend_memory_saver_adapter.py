@@ -136,6 +136,9 @@ class CpuNativeLibrary:
         if self.fail_pause:
             return 1
         tag = tag.decode() if tag is not None else None
+        for block in self.blocks:
+            if tag is None or block["tag"] == tag:
+                block["phase"] = "paused"
         for allocation in self.memory.allocations:
             if allocation.tag is not None and (tag is None or allocation.tag == tag):
                 if allocation.backup:
@@ -145,6 +148,9 @@ class CpuNativeLibrary:
 
     def resume(self, tag):
         tag = tag.decode() if tag is not None else None
+        for block in self.blocks:
+            if tag is None or block["tag"] == tag:
+                block["phase"] = "active"
         for allocation in self.memory.allocations:
             if allocation.tag is not None and (tag is None or allocation.tag == tag):
                 if allocation.backup:
@@ -289,6 +295,56 @@ def runtime(monkeypatch, tmp_path):
     _, shared, module = saver_modules(monkeypatch)
     monkeypatch.setattr(module.ctypes, "CDLL", lambda path: memory.library)
     return Runtime(module, shared, memory, module.AscendMemorySaverAdapter())
+
+
+@pytest.mark.parametrize("has_graph", [False, True])
+def test_trim_once_when_last_allocated_tag_pauses(runtime, monkeypatch, has_graph):
+    calls = []
+    monkeypatch.setattr(
+        runtime.memory, "empty_cache", lambda: calls.append(1), raising=False
+    )
+    adapter = runtime.adapter
+    adapter.pause(None)
+    adapter.resume(None)
+    tags = ["weights", "kv_cache"] + (["acl_graph"] if has_graph else [])
+    for tag in tags:
+        runtime.memory.library.blocks.append({"tag": tag, "phase": "active"})
+    for tag in tags[:-1]:
+        adapter.pause(tag)
+    assert calls == []
+    adapter.pause(tags[-1])
+    adapter.pause(None)
+    if not has_graph:
+        adapter.resume("acl_graph")
+        adapter.pause("acl_graph")
+    assert calls == [1]
+    adapter.resume("kv_cache")
+    adapter.pause("kv_cache")
+    assert calls == [1, 1]
+
+
+def test_failed_native_pause_or_cache_trim_can_be_retried(runtime, monkeypatch):
+    calls = []
+
+    def trim():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("injected cache trim failure")
+
+    monkeypatch.setattr(runtime.memory, "empty_cache", trim, raising=False)
+    runtime.memory.library.blocks.append({"tag": "weights", "phase": "active"})
+    runtime.memory.library.fail_pause = True
+    with pytest.raises(RuntimeError, match="native pause failure"):
+        runtime.adapter.pause("weights")
+    assert calls == []
+    runtime.memory.library.fail_pause = False
+    with pytest.raises(RuntimeError, match="cache trim failure"):
+        runtime.adapter.pause("weights")
+    with pytest.raises(RuntimeError):
+        runtime.adapter.assert_active()
+    runtime.adapter.pause("weights")
+    runtime.adapter.pause("weights")
+    assert calls == [1, 1]
 
 
 def test_all_owners_share_one_pool_across_adapter_instances(runtime, monkeypatch):

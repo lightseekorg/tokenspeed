@@ -69,6 +69,7 @@ def _library_path() -> str:
 class NativeBackend:
     def __init__(self, library: str):
         self.library = ctypes.CDLL(library)
+        self._trimmed_tags: set[str] = set()
         self.library.saver_abi_version.argtypes = []
         self.library.saver_abi_version.restype = ctypes.c_int
         self.library.saver_has_callback_fault.argtypes = []
@@ -100,8 +101,18 @@ class NativeBackend:
 
     def pause(self, tag: str | None) -> None:
         self._call(self.library.saver_pause, tag)
+        if self._trimmed_tags:
+            return
+        # Eager workers can have no graph allocation. Use the actual segments.
+        blocks = self.stats()["blocks"]
+        if blocks and all(block["phase"] == "paused" for block in blocks):
+            torch.npu.empty_cache()
+            self._trimmed_tags = {block["tag"] for block in blocks}
 
     def resume(self, tag: str | None) -> None:
+        if tag is None or tag in self._trimmed_tags:
+            # A failed native resume can still restore some mappings.
+            self._trimmed_tags.clear()
         self._call(self.library.saver_resume, tag)
 
     def stats(self) -> dict:
