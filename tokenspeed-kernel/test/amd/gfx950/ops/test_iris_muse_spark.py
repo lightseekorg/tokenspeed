@@ -2021,6 +2021,7 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
         None,
         1,
         return_pre_fp32=False,
+        pre_fp8_out=None,
     )
     return out_stream, pre_bf16
 

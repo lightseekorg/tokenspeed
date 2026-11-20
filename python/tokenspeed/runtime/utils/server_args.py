@@ -33,6 +33,7 @@ from typing import Literal
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    BITWISE_ENVELOPES,
     BLOCKWISE_LOGPROB_ORDERS,
     DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
@@ -218,6 +219,8 @@ DECODE_MONOKERNEL_ARCHITECTURES = (
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
+# Checkpoint architectures that run --dense-fp8-small-m's FP8 projections.
+DENSE_FP8_SMALL_M_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
 # Draft architectures with decode monokernels, and the target architectures
 # whose drafts they serve. Under --decode-monokernel such a draft of such a
 # target takes the switch too; any other draft (a Qwen3.8 target's DFlash2
@@ -254,6 +257,17 @@ def decode_monokernel_refusal(architectures: list[str]) -> str | None:
     return (
         f"--decode-monokernel: no decode monokernel for {architectures or 'this model'} "
         f"(models with one: {', '.join(DECODE_MONOKERNEL_ARCHITECTURES)})"
+    )
+
+
+def dense_fp8_small_m_refusal(architectures: list[str]) -> str | None:
+    """Why ``--dense-fp8-small-m`` cannot serve a checkpoint of
+    ``architectures``, or None when one of them runs its FP8 projections."""
+    if any(a in DENSE_FP8_SMALL_M_ARCHITECTURES for a in architectures):
+        return None
+    return (
+        f"no FP8 projections for {architectures or 'this model'} (models with "
+        f"them: {', '.join(DENSE_FP8_SMALL_M_ARCHITECTURES)})"
     )
 
 
@@ -825,6 +839,12 @@ class ServerArgs:
     # element instead of 2, and a numerics change. Decode and verify forwards
     # stay BF16.
     prefill_collective_payload: str = "bf16"
+    # Muse Spark small-M dense GEMMs in FP8 on gfx950 (a numerics change):
+    # "qkv-down" projects decode and verify forwards' QKV (+ output gate) rows
+    # at 17-256 rows and this rank's pre-expert latent columns at 17-172 rows
+    # (the fused gather's limit) through FP8 E4M3 weights (per-channel scales,
+    # converted after loading) and per-row FP8 activations. "none" keeps BF16.
+    dense_fp8_small_m: str = "none"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1158,6 +1178,12 @@ class ServerArgs:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
                 raise ValueError(refusal)
+        if self.dense_fp8_small_m != "none" and architectures is not None:
+            refusal = dense_fp8_small_m_refusal(architectures)
+            if refusal is not None:
+                raise ValueError(
+                    f"--dense-fp8-small-m {self.dense_fp8_small_m}: {refusal}"
+                )
         self._beam_checkpoint = (
             None if architectures is None else "BeamForCausalLM" in architectures
         )
@@ -2365,6 +2391,20 @@ class ServerArgs:
                 "numerics; --numerics rl-bitwise needs bf16"
             )
         resolve_numerics_envelope(self)
+        _require_choice(
+            "--dense-fp8-small-m", self.dense_fp8_small_m, ("none", "qkv-down")
+        )
+        if self.dense_fp8_small_m != "none" and (
+            self.numerics in BITWISE_ENVELOPES or self.batch_invariant_collectives
+        ):
+            # The FP8 GEMM's split-K count follows the batch's row count, so a
+            # row's bits depend on the batch. Run-to-run determinism
+            # (--force-deterministic-rsag) still holds and is not refused.
+            raise ValueError(
+                f"--dense-fp8-small-m {self.dense_fp8_small_m} is not "
+                f"batch-invariant: it cannot run under --numerics {self.numerics} "
+                f"or --batch-invariant-collectives"
+            )
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
             self.enable_allreduce_fusion = False
@@ -5241,6 +5281,22 @@ class ServerArgs:
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "
             "BF16.",
+        )
+        parser.add_argument(
+            "--dense-fp8-small-m",
+            type=str,
+            default=ServerArgs.dense_fp8_small_m,
+            choices=["none", "qkv-down"],
+            help="Muse Spark on gfx950: run decode forwards' QKV projection at "
+            "17-256 rows and pre-expert latent projection at 17-172 rows as FP8 "
+            "GEMMs (per-row FP8 activations x per-channel FP8 weights). The "
+            "pre-expert FP8 projection needs TP > 1 without attention DP (its "
+            "fused gather). TP4 only: the TP8 pre-expert slice has no tuned "
+            "FP8 GEMM and is refused at load. FP8 weight copies take 44 MiB a "
+            "layer a rank (2.7 GiB over 62 layers), logged at startup. A "
+            "numerics "
+            "change, not batch-invariant (refused under bitwise --numerics and "
+            "--batch-invariant-collectives); none keeps BF16.",
         )
         parser.add_argument(
             "--numerics",

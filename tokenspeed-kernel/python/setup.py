@@ -1196,6 +1196,8 @@ setup(
             "csrc/include/*",
         ],
         "tokenspeed_kernel.thirdparty.vllm_recoverssm": ["LICENSE"],
+        # Vendored SGLang small-M FP8 GEMM: its license and provenance.
+        "tokenspeed_kernel.thirdparty.sglang": ["LICENSE", "README.md"],
         # Petit Gluon compiles its small HIP VMM binding lazily on first use.
         "tokenspeed_kernel.thirdparty.gluon_petit": [
             "LICENSE.txt",

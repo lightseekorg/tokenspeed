@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
+from tokenspeed.runtime.models import muse_spark  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     HIDDEN,
     MAX_ROWS,
@@ -421,3 +422,55 @@ def test_other_baked_in_values_keep_the_regular_path(override, reason) -> None:
     """The kernel bakes Muse Spark Open's dimensions and constants in: a
     checkpoint with other values has no monokernel."""
     assert model_reasons(_config(**override), _mapping(8, 1)) == [reason]
+
+
+def _fp8_projection(enabled: bool) -> muse_spark._DenseFp8Weight:
+    """A QKV projection's FP8 copy (--dense-fp8-small-m qkv-down), with the
+    widest window. Preparing runs the FP8 GEMM, so on the host a placeholder
+    copy stands in for the converted weight: the launches only ask the
+    window predicate."""
+    fp8 = muse_spark._DenseFp8Weight(
+        "qkv_proj", enabled, muse_spark._DENSE_FP8_MAX_ROWS
+    )
+    if enabled:
+        fp8.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
+        fp8.scale = torch.empty(0)
+    return fp8
+
+
+def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
+    """The launches run every dense projection in BF16, so they must never
+    take the rows that the regular layer projects in FP8: every decode or
+    verify step that takes the kernels (at most 2 requests of at most 8
+    rows) is below the FP8 window, which starts at 17 rows."""
+    fp8 = _fp8_projection(True)
+    assert fp8.applies(17, decode=True) and not fp8.applies(16, decode=True)
+    for bs in range(1, 5):
+        for rows in range(bs, 300, bs):
+            ctx = _ctx(ForwardMode.DECODE, bs, rows)
+            assert not (
+                takes_monokernels(rows, ctx) and fp8.applies(rows, decode=True)
+            ), (bs, rows)
+
+
+def test_a_launch_refuses_an_fp8_copy_of_its_input_rows() -> None:
+    """A launch projects in BF16: an FP8 copy of its input rows handed to it
+    fails the step instead of being dropped. The refusal comes before the
+    launch reads any packed state."""
+    layer = muse_spark.MuseSparkMonokernelDecoderLayer.__new__(
+        muse_spark.MuseSparkMonokernelDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.layer_id = 1
+    rows = torch.zeros(1, HIDDEN)
+    with pytest.raises(RuntimeError, match="layer 1 got an FP8 copy"):
+        layer._decode(
+            1,
+            positions=torch.zeros(1, dtype=torch.int64),
+            hidden_states=rows,
+            ctx=None,
+            attention_input=rows.to(torch.bfloat16),
+            attention_input_fp8=(rows.to(torch.float8_e4m3fn), torch.ones(1)),
+            next_input_layernorm=None,
+            owned_global_rows=None,
+        )

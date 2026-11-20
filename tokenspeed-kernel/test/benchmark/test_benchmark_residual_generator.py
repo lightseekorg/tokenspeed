@@ -293,7 +293,8 @@ def test_post_norm_residual_pre_norm_rejects_invalid_parameters(updates, match) 
 @pytest.mark.parametrize(
     ("updates", "outputs"),
     [
-        ({"outputs": "bf16"}, (torch.float32, torch.bfloat16)),
+        # The BF16 entry's third result is the FP8 next input it was not asked for.
+        ({"outputs": "bf16"}, (torch.float32, torch.bfloat16, None)),
         (
             {"outputs": "fp32_and_bf16", "post_weighted": False},
             (torch.float32, torch.float32, torch.bfloat16),

@@ -29,6 +29,9 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import (
+    _quantize_rows_kernel as _quantize_rows_amax_div,
+)
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 
@@ -829,6 +832,77 @@ def triton_quantize_fp8_per_token_portable(
         enable_pdl=enable_pdl,
     )
     return values.reshape(shape), scales.reshape(*shape[:-1], 1)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token_amax_div",
+    solution="triton",
+    features={"token_fp8_amax_div"},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    # Below the shared token quantizer: only callers asking for this recipe
+    # (required_features={"token_fp8_amax_div"}) select it.
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_per_token_amax_div(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token E4M3 quantization by division by the row's amax scale.
+
+    The scale is ``max(row amax, 1e-20) / 448`` and the codes are
+    ``x / scale``, by Triton's FP32 division (SGLang's per-row recipe,
+    ``thirdparty/sglang``). The split-K FP8 GEMM's activation producers use
+    it, and the layer boundary's FP8 copy writes the same bits. The shared
+    token quantizer floors the scale at ``1 / (448 * 512)`` and multiplies by
+    a rounded reciprocal, so its codes differ in the last bit for some
+    elements. ``x`` must be finite; a row holding an infinite or NaN element gets an
+    unspecified scale and codes.
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations, contiguous.
+        granularity: Must be ``"token"``.
+        group_size: Must be None.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Must be False.
+
+    Returns:
+        FP8 E4M3 ``[M, K]`` codes and FP32 ``[M, 1]`` dequant scales.
+    """
+    if (
+        granularity != "token"
+        or group_size is not None
+        or scale_encoding != "float32"
+        or enable_pdl
+        or x.dim() != 2
+        or not x.is_contiguous()
+    ):
+        raise ValueError(
+            "the amax-division FP8 token quantizer takes a contiguous 2-D x, "
+            "token granularity, float32 scales and no PDL"
+        )
+    m, k = x.shape
+    codes = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m:
+        _quantize_rows_amax_div[(m,)](
+            x, codes, scales, k, triton.next_power_of_2(k), num_warps=8
+        )
+    return codes, scales
 
 
 # The widest SwiGLU half (intermediate size) one program holds: a row per

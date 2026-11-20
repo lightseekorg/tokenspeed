@@ -26,6 +26,7 @@ The `tokenspeed-kernel` package acknowledges and thanks:
 - `deepseek-ai/FlashMLA`
 - `Dao-AILab/fast-hadamard-transform`
 - `sgl-kernel`
+- `sgl-project/sglang`
 - `flashinfer-ai/flashinfer`
 
 ## tokenspeed-mla

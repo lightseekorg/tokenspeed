@@ -268,6 +268,15 @@ distinct from block scaling. Native FP8 matrix arithmetic uses FP32
 accumulators but need not match sequential FP32 arithmetic.
 The small-row Triton and PyTorch rowwise GEMMs support NVIDIA SM100 and newer.
 
+On gfx950, `triton_mm_fp8_channel_splitk` serves up to 256 rows of the
+`(N, K)` shapes in its tuning table (`thirdparty/sglang` plus local entries):
+SK programs along K each write an FP32 partial, and a second launch sums them,
+applies the row and channel scales and rounds once to BF16. Its activations
+come from the `token_fp8_amax_div` token quantizer, and weights from
+`prepare_fp8_channel_weight`. Outside its table `mm` selects
+`triton_mm_fp8_scaled`; a caller that needs the split-K numerics names it with
+`override`.
+
 ## Startup tuning coverage
 
 During `ops.tuning.autotune`, FlashInfer MXFP8, per-tensor FP8, CUTLASS NVFP4,

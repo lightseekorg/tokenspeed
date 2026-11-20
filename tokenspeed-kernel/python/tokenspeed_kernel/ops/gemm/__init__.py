@@ -147,6 +147,7 @@ __all__ = [
     "mxfp4_swiglu_linear",
     "prepare_mxfp4_linear",
     "mm",
+    "prepare_fp8_channel_weight",
     "prepare_mxfp8_weight_scales",
     "prepare_nvfp4_a16_weights",
 ]
@@ -695,6 +696,29 @@ def mm_activation_scale_layout(
         "gemm", "mm", signature, traits=traits, solution=solution, override=override
     )
     return "mn_major" if _reads_mn_major_scales(kernel.name) else "k_major"
+
+
+def prepare_fp8_channel_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a BF16 ``[N, K]`` weight for ``mm(quant="fp8")`` with channel scales.
+
+    The conversion SGLang applies at load (``thirdparty/sglang``): each output
+    channel's scale is ``max(channel amax, 1e-12)`` times FP32 ``1 / 448``
+    and its codes the channel divided by that scale. ``weight`` must be
+    finite.
+
+    Args:
+        weight: ``[N, K]`` BF16 weight.
+
+    Returns:
+        A contiguous FP8 E4M3 ``[N, K]`` copy and its FP32 ``[N]`` scales.
+    """
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        raise ValueError(
+            f"expected a 2-D BF16 weight, got {weight.dtype} {weight.dim()}-D"
+        )
+    return quantize_weight_fp8_channel(weight)
 
 
 def mm(
@@ -4358,6 +4382,10 @@ import tokenspeed_kernel.ops.gemm.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.native  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton_fp8_channel  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.triton_fp8_channel_splitk  # noqa: E402,F401
+from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import (  # noqa: E402
+    quantize_weight_fp8_channel,
+)
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: E402,F401
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm  # noqa: E402
 from tokenspeed_kernel.ops.gemm.cute_dsl import (  # noqa: E402

@@ -31,6 +31,7 @@ from tokenspeed_kernel.signature import (
     format_signature,
     format_signatures,
 )
+from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import fp8_row_codes
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
@@ -109,6 +110,8 @@ def _post_norm_residual_pre_norm_kernel(
     out_stream_ptr,
     out_pre_fp32_ptr,
     out_pre_bf16_ptr,
+    out_pre_fp8_ptr,
+    out_pre_scale_ptr,
     width: tl.constexpr,
     post_eps: tl.constexpr,
     post_weight_offset: tl.constexpr,
@@ -124,6 +127,7 @@ def _post_norm_residual_pre_norm_kernel(
     MAILBOX: tl.constexpr,
     MAILBOX_BLOCK_WIDTH: tl.constexpr,
     MAILBOX_BLOCK_STRIDE: tl.constexpr,
+    RETURN_PRE_FP8: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
@@ -179,9 +183,14 @@ def _post_norm_residual_pre_norm_kernel(
         pre *= _centered_bf16(weight, pre_weight_offset)
         if RETURN_PRE_FP32:
             tl.store(out_pre_fp32_ptr + row * width + offsets, pre, mask=mask)
-        tl.store(
-            out_pre_bf16_ptr + row * width + offsets, pre.to(tl.bfloat16), mask=mask
-        )
+        pre_bf16 = pre.to(tl.bfloat16)
+        tl.store(out_pre_bf16_ptr + row * width + offsets, pre_bf16, mask=mask)
+        if RETURN_PRE_FP8:
+            # Per-row FP8 E4M3 copy of the BF16 row, by quantize_rows_fp8's
+            # own row code.
+            codes, scale = fp8_row_codes(pre_bf16.to(tl.float32), mask)
+            tl.store(out_pre_fp8_ptr + row * width + offsets, codes, mask=mask)
+            tl.store(out_pre_scale_ptr + row, scale)
 
 
 @register_kernel(
@@ -230,6 +239,7 @@ def triton_post_norm_residual_pre_norm(
         branch_sentinel,
         branch_ranks,
         return_pre_fp32=True,
+        pre_fp8_out=None,
     )
 
 
@@ -249,12 +259,15 @@ def _launch_post_norm_residual_pre_norm(
     branch_ranks: int,
     *,
     return_pre_fp32: bool,
+    pre_fp8_out: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """The fused layer boundary as one Triton program per row.
 
     Same contract as the dispatcher ``post_norm_residual_pre_norm``, except that
     a mailbox branch holds one block per rank to gather, never partials to
     reduce; every step stays FP32 and only the BF16 pre-norm rounds.
+    ``pre_fp8_out`` (FP8 E4M3 ``[rows, width]`` codes, FP32 ``[rows]``
+    scales) also receives the per-row FP8 copy of the BF16 pre-norm rows.
     """
     if stream.ndim != 2:
         raise ValueError("the residual stream must be [rows, width]")
@@ -305,6 +318,8 @@ def _launch_post_norm_residual_pre_norm(
         else None
     )
     sentinel = 0 if branch_sentinel is None else branch_sentinel
+    if pre_fp8_out is not None and not has_pre:
+        raise ValueError("an FP8 pre-norm copy needs the pre-norm")
     if rows == 0:
         return out_stream, pre_fp32, pre_bf16
     block = triton.next_power_of_2(width)
@@ -322,6 +337,8 @@ def _launch_post_norm_residual_pre_norm(
         out_stream,
         pre_fp32 if pre_fp32 is not None else out_stream,
         pre_bf16 if has_pre else branch_values,
+        pre_fp8_out[0] if pre_fp8_out is not None else branch_values,
+        pre_fp8_out[1] if pre_fp8_out is not None else stream_values,
         width=width,
         post_eps=post_eps,
         post_weight_offset=post_weight_offset,
@@ -338,6 +355,7 @@ def _launch_post_norm_residual_pre_norm(
         MAILBOX=branch_sentinel is not None,
         MAILBOX_BLOCK_WIDTH=block_width,
         MAILBOX_BLOCK_STRIDE=block_stride,
+        RETURN_PRE_FP8=pre_fp8_out is not None,
         # Six live row-wide vectors spill at 4 warps on an 8192 row.
         num_warps=16,
         **launch,

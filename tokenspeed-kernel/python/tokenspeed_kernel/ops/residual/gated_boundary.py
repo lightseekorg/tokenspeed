@@ -182,12 +182,116 @@ def post_norm_residual_pre_norm_bf16(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    *,
+    return_pre_fp8: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
     """Return the residual stream and BF16 next input, using the same selection.
 
     Arguments match ``post_norm_residual_pre_norm``. Triton skips the unused
     FP32 normalized output; other selected implementations may still compute it.
+    With ``return_pre_fp8`` (needs ``pre_weight``), the third result is the
+    per-row FP8 E4M3 copy of the BF16 next input, by the amax-division token
+    quantizer (``quantize_fp8`` with ``token_fp8_amax_div``): ``[rows, width]``
+    codes and FP32 ``[rows]`` scales (row amax / 448). Triton writes it in the same launch; other implementations
+    quantize the BF16 rows afterwards. Otherwise the third result is None.
     """
+    stream_out, _, next_input, next_input_fp8 = _boundary_with_copies(
+        stream,
+        branch,
+        post_weight,
+        post_eps,
+        post_weight_offset,
+        alpha,
+        beta,
+        pre_weight,
+        pre_eps,
+        pre_weight_offset,
+        enable_pdl,
+        branch_sentinel,
+        branch_ranks,
+        return_pre_fp32=False,
+        return_pre_fp8=return_pre_fp8,
+    )
+    return stream_out, next_input, next_input_fp8
+
+
+def post_norm_residual_pre_norm_fp8(
+    stream: torch.Tensor,
+    branch: torch.Tensor,
+    post_weight: torch.Tensor | None,
+    post_eps: float,
+    post_weight_offset: float,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    pre_weight: torch.Tensor,
+    pre_eps: float,
+    pre_weight_offset: float,
+    enable_pdl: bool,
+    branch_sentinel: int | None,
+    branch_ranks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """``post_norm_residual_pre_norm`` plus the per-row FP8 copy of its BF16 rows.
+
+    Arguments match ``post_norm_residual_pre_norm`` (``pre_weight`` is
+    required). For a boundary whose pre-normed rows feed both an FP32
+    consumer (the router) and the FP8 split-K GEMM: Triton writes the FP8 copy
+    in the same launch with that quantizer's row code, so its bits are the
+    quantizer's of the BF16 rows; other implementations quantize the BF16
+    rows afterwards.
+
+    Returns:
+        ``(new_stream, pre_fp32, pre_bf16, (codes, scales))``: as
+        ``post_norm_residual_pre_norm``, plus FP8 E4M3 ``[rows, width]``
+        codes and FP32 ``[rows]`` scales (row amax / 448).
+    """
+    return _boundary_with_copies(
+        stream,
+        branch,
+        post_weight,
+        post_eps,
+        post_weight_offset,
+        alpha,
+        beta,
+        pre_weight,
+        pre_eps,
+        pre_weight_offset,
+        enable_pdl,
+        branch_sentinel,
+        branch_ranks,
+        return_pre_fp32=True,
+        return_pre_fp8=True,
+    )
+
+
+def _boundary_with_copies(
+    stream: torch.Tensor,
+    branch: torch.Tensor,
+    post_weight: torch.Tensor | None,
+    post_eps: float,
+    post_weight_offset: float,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    pre_weight: torch.Tensor | None,
+    pre_eps: float,
+    pre_weight_offset: float,
+    enable_pdl: bool,
+    branch_sentinel: int | None,
+    branch_ranks: int,
+    *,
+    return_pre_fp32: bool,
+    return_pre_fp8: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    tuple[torch.Tensor, torch.Tensor] | None,
+]:
+    """The selected boundary kernel with the requested pre-norm copies:
+    ``(new_stream, pre_fp32, pre_bf16, pre_fp8)``. Triton writes every copy in
+    one launch and skips the FP32 one unless asked; other implementations
+    return their usual outputs and quantize the BF16 rows afterwards."""
+    if return_pre_fp8 and pre_weight is None:
+        raise ValueError("an FP8 next input needs the pre-norm")
     kernel = select_kernel(
         "residual",
         "post_norm_residual_pre_norm",
@@ -205,12 +309,20 @@ def post_norm_residual_pre_norm_bf16(
             )
         },
     )
+    next_input_fp8 = None
     if kernel.name == "triton_post_norm_residual_pre_norm":
         from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
             _launch_post_norm_residual_pre_norm,
         )
 
-        stream_out, _, next_input = _launch_post_norm_residual_pre_norm(
+        if return_pre_fp8:
+            next_input_fp8 = (
+                torch.empty(
+                    stream.shape, dtype=torch.float8_e4m3fn, device=stream.device
+                ),
+                torch.empty(stream.shape[0], dtype=torch.float32, device=stream.device),
+            )
+        stream_out, pre_fp32, next_input = _launch_post_norm_residual_pre_norm(
             stream,
             branch,
             post_weight,
@@ -224,10 +336,11 @@ def post_norm_residual_pre_norm_bf16(
             enable_pdl,
             branch_sentinel,
             branch_ranks,
-            return_pre_fp32=False,
+            return_pre_fp32=return_pre_fp32,
+            pre_fp8_out=next_input_fp8,
         )
     else:
-        stream_out, _, next_input = kernel(
+        stream_out, pre_fp32, next_input = kernel(
             stream,
             branch,
             post_weight,
@@ -242,7 +355,19 @@ def post_norm_residual_pre_norm_bf16(
             branch_sentinel,
             branch_ranks,
         )
-    return stream_out, next_input
+        if return_pre_fp8:
+            # The row quantization the FP8 split-K GEMM's callers use.
+            from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+            codes, scales = quantize_fp8(
+                next_input,
+                granularity="token",
+                scale_encoding="float32",
+                enable_pdl=False,
+                required_features=frozenset({"token_fp8_amax_div"}),
+            )
+            next_input_fp8 = (codes, scales.reshape(-1))
+    return stream_out, pre_fp32, next_input, next_input_fp8
 
 
 __all__ = [

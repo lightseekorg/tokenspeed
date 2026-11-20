@@ -176,12 +176,7 @@ def test_boundary_can_omit_router_output_during_replay(device: str) -> None:
     alpha, beta = residual_gate_coefficients(torch.randn_like(post_weight), 0.3, 1e-3)
 
     def run(return_pre_fp32: bool, has_pre: bool):
-        boundary = (
-            post_norm_residual_pre_norm
-            if return_pre_fp32
-            else post_norm_residual_pre_norm_bf16
-        )
-        return boundary(
+        args = (
             stream,
             branch,
             post_weight,
@@ -196,6 +191,9 @@ def test_boundary_can_omit_router_output_during_replay(device: str) -> None:
             None,
             1,
         )
+        if return_pre_fp32:
+            return post_norm_residual_pre_norm(*args)
+        return post_norm_residual_pre_norm_bf16(*args, return_pre_fp8=False)
 
     run(True, True)
     run(False, True)

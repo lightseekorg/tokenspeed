@@ -34,7 +34,9 @@ Two consequences of 3 are enforced at startup, so a model that cannot meet
 them is refused under rl-bitwise with the reason: MoE TP must be 1 (the
 slot-order MoE combine folds over the EP group inside the leaf), and the
 vocabulary must be a whole number of `BLOCKWISE_VOCAB_BLOCK`-wide blocks (the
-trainer's log-softmax folds fixed blocks).
+trainer's log-softmax folds fixed blocks). Switches that trade batch invariance
+for speed are refused too: `--dense-fp8-small-m` (its FP8 GEMM's split-K count
+follows the batch's row count) under rl-bitwise or `--batch-invariant-collectives`.
 
 ## The hierarchy
 

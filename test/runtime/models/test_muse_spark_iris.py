@@ -591,16 +591,19 @@ def _muse_tp_routes_worker(rank, world_size, device):
         dist.barrier()
 
 
-def _muse_tp_owned_forward_worker(
-    rank, world_size, device, *, quantized: bool, down_columns: bool
+def _muse_tp_moe(
+    rank,
+    world_size,
+    device,
+    *,
+    quantized: bool,
+    down_columns: bool,
+    expert_tp_size: int,
 ):
-    """Exercise the real router/pool/gather/expert/unpool caller on uneven rows.
-
-    MXFP4 experts at expert TP8 build the column-split down copy. With
-    ``down_columns`` the owned rows take it (assembled from every rank's down
-    shard) and must agree with the full-row path within BF16 rounding; without
-    it the test drops the copy to check the full-row path.
-    """
+    """A one-layer MuseSparkMoE at attention TP ``world_size`` on random
+    weights, experts at TP ``expert_tp_size`` and EP ``world_size //
+    expert_tp_size``. MXFP4 experts at expert TP build the column-split down
+    copy; ``down_columns`` keeps it (assembled from every rank's down shard)."""
     from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
@@ -617,8 +620,8 @@ def _muse_tp_owned_forward_worker(
         world_size=world_size,
         attn_tp_size=world_size,
         dense_tp_size=world_size,
-        moe_tp_size=world_size,
-        moe_ep_size=1,
+        moe_tp_size=expert_tp_size,
+        moe_ep_size=world_size // expert_tp_size,
         vision_tp_size=world_size,
         linear_attn_tp_size=world_size,
         nprocs_per_node=world_size,
@@ -673,7 +676,8 @@ def _muse_tp_owned_forward_worker(
     )
     with torch.device(device):
         moe = MuseSparkMoE(config, mapping, quant_config, 0, "model.layers.0.mlp", None)
-    assert (moe.down_columns is not None) == quantized
+    if expert_tp_size == world_size:
+        assert (moe.down_columns is not None) == quantized
     if not down_columns:
         moe.down_columns = None
     torch.manual_seed(117)
@@ -708,6 +712,27 @@ def _muse_tp_owned_forward_worker(
         moe.experts.w2_weight.normal_(0, 0.02)
     moe.experts.process_weights_after_loading(moe.experts)
     moe.gate.process_weights_after_loading(moe.gate)
+    return moe
+
+
+def _muse_tp_owned_forward_worker(
+    rank, world_size, device, *, quantized: bool, down_columns: bool
+):
+    """Exercise the real router/pool/gather/expert/unpool caller on uneven rows.
+
+    MXFP4 experts at expert TP8 build the column-split down copy. With
+    ``down_columns`` the owned rows take it (assembled from every rank's down
+    shard) and must agree with the full-row path within BF16 rounding; without
+    it the test drops the copy to check the full-row path.
+    """
+    moe = _muse_tp_moe(
+        rank,
+        world_size,
+        device,
+        quantized=quantized,
+        down_columns=down_columns,
+        expert_tp_size=world_size,
+    )
     _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
     for rows in (192, 193, 1029):
         local_rows = (rows + world_size - 1) // world_size
@@ -719,12 +744,28 @@ def _muse_tp_owned_forward_worker(
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
             expected_rows, _ = moe(
-                full, full.float(), rows, rows, None, project=True, payload="bf16"
+                full,
+                full.float(),
+                None,
+                rows,
+                rows,
+                None,
+                project=True,
+                payload="bf16",
+                decode=True,
             )
             expected_rows = expected_rows.clone()
             expected = expected_rows[first : first + valid]
             actual, _ = moe(
-                local, local.float(), rows, rows, rows, project=True, payload="bf16"
+                local,
+                local.float(),
+                None,
+                rows,
+                rows,
+                rows,
+                project=True,
+                payload="bf16",
+                decode=True,
             )
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
@@ -740,15 +781,108 @@ def _muse_tp_owned_forward_worker(
                     rows_in = full[:small].contiguous()
                     router_in = rows_in.float()
                     assert (
-                        moe._route_and_quantize_inputs(rows_in, router_in) is not None
+                        moe._route_and_quantize_inputs(
+                            rows_in, router_in, None, decode=True
+                        )
+                        is not None
                     )
                     decode, _ = moe(
-                        rows_in, router_in, small, small, None, True, payload="bf16"
+                        rows_in,
+                        router_in,
+                        None,
+                        small,
+                        small,
+                        None,
+                        project=True,
+                        payload="bf16",
+                        decode=True,
                     )
                     torch.testing.assert_close(
                         decode, expected_rows[:small], atol=2**-7, rtol=2**-7
                     )
         dist.barrier()
+
+
+def _muse_fp8_decode_routing_worker(rank, world_size, device):
+    """--dense-fp8-small-m qkv-down at the served TP4 / EP4 layout: decode
+    rows in the pre-expert FP8 window route and quantize in the fused launch,
+    bit for bit as the FP8 projection with its gather and quantize, the router
+    and the top-k run apart; past the window the fused path is not taken.
+    TP8's pre-expert slice [512, 8192] has no tuned FP8 GEMM, so it runs at
+    TP4 only."""
+    if world_size != 4:
+        return
+    from tokenspeed_kernel.platform import pdl_enabled
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+        swizzle_cdna4_mxfp4_scale,
+    )
+
+    from tokenspeed.runtime.models import muse_spark as module
+
+    moe = _muse_tp_moe(
+        rank, world_size, device, quantized=True, down_columns=False, expert_tp_size=1
+    )
+    _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    projection, norm = moe.pre_expert_proj, moe.pre_expert_norm
+    torch.manual_seed(5)
+    projection.weight.normal_(0, 0.02)
+    projection.dense_fp8 = module._DenseFp8Weight(
+        "pre_expert_proj", True, module._GATHER_MXFP4_FP8_MAX_ROWS
+    )
+    # The fused gather reads the copy here, so the attention boundary writes
+    # it (MuseSparkDecoderLayer.attention_boundary_writes_fp8 asks this).
+    assert moe.reads_fp8_input()
+    assert moe.cap_fp8_rows()
+    projection.prepare_fp8_weight()
+    for rows, takes in ((16, False), (17, True), (172, True), (173, False)):
+        assert moe.takes_fp8_input(rows, decode=True) == takes, rows
+        assert not moe.takes_fp8_input(rows, decode=False), rows
+    for rows in (16, 17, 64, 128, 129, 172, 173):
+        torch.manual_seed(rows)
+        hidden = torch.randn(rows, 8192, device=device).bfloat16()
+        router_input = hidden.float()
+        fused = moe._route_and_quantize_inputs(hidden, router_input, None, decode=True)
+        assert fused is not None, rows
+        _, (packed, scales), logits, weights, ids = (
+            (
+                value.clone()
+                if isinstance(value, torch.Tensor)
+                else tuple(v.clone() for v in value)
+            )
+            for value in fused
+        )
+        _, (expected_packed, expected_scales) = projection.forward_mxfp4(
+            hidden, None, norm.weight, norm.eps, norm.weight_offset, decode=True
+        )
+        # A non-decode forward keeps the BF16 projection's bits. Inside the
+        # window (17-172 rows) the fused route took the FP8 projection, so its
+        # packed rows differ from them; at 16 and 173 rows they are the same.
+        _, (bf16_packed, _) = projection.forward_mxfp4(
+            hidden, None, norm.weight, norm.eps, norm.weight_offset, decode=False
+        )
+        in_window = 17 <= rows <= module._GATHER_MXFP4_FP8_MAX_ROWS
+        assert torch.equal(packed, bf16_packed) != in_window, rows
+        expected_logits = moe.gate(router_input, pdl_enabled())
+        expected_weights, expected_ids = moe._select_experts(expected_logits, None)
+        # The scale allocation pads rows and columns; compare the logical bytes.
+        logical = (
+            swizzle_cdna4_mxfp4_scale(
+                torch.ones(
+                    rows, packed.shape[1] // 16, dtype=torch.uint8, device=device
+                )
+            )
+            .view(scales.shape)
+            .bool()
+        )
+        for name, actual, expected in (
+            ("packed", packed, expected_packed),
+            ("scales", scales[logical], expected_scales[logical]),
+            ("logits", logits, expected_logits),
+            ("weights", weights, expected_weights),
+            ("ids", ids, expected_ids),
+        ):
+            assert torch.equal(actual, expected), f"{name} rows {rows}"
+    dist.barrier()
 
 
 def _muse_owned_routed_wt_worker(rank, world_size, device):
@@ -1271,6 +1405,7 @@ def _muse_boundary_warmup_worker(rank, world_size, device):
             "nccl",
             id="tp_owned_forward",
         ),
+        pytest.param(_muse_fp8_decode_routing_worker, "nccl", id="fp8_decode_routing"),
     ],
 )
 @pytest.mark.parametrize("world_size", [4, 8])

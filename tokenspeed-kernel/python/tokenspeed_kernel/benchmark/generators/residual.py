@@ -877,14 +877,9 @@ def prepare_post_norm_residual_pre_norm(
         )
     except NoKernelFoundError as error:
         raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
-    entry = (
-        residual_ops.post_norm_residual_pre_norm_bf16
-        if outputs == "bf16"
-        else residual_ops.post_norm_residual_pre_norm
-    )
 
     def invoke() -> object:
-        return entry(
+        args = (
             stream,
             branch,
             post_weight,
@@ -899,6 +894,11 @@ def prepare_post_norm_residual_pre_norm(
             None,
             1,
         )
+        if outputs == "bf16":
+            return residual_ops.post_norm_residual_pre_norm_bf16(
+                *args, return_pre_fp8=False
+            )
+        return residual_ops.post_norm_residual_pre_norm(*args)
 
     return PreparedBenchmark(
         registration=_registered_spec(kernel.name),
