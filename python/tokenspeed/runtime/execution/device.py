@@ -138,7 +138,7 @@ import contextlib
 import enum
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -395,6 +395,8 @@ class DeviceHandle:
     the control thread calls (see the module docstring); none of them returns
     anything the caller could then use to bypass the rest.
     """
+
+    _additional_discard_reload_types: tuple[type, ...] = ()
 
     def __init__(
         self,
@@ -805,6 +807,26 @@ class DeviceHandle:
         self.settle()
         self._executor.device_module.synchronize()
 
+    @contextlib.contextmanager
+    def complete_memory_transition(self) -> Iterator[None]:
+        """Wait for device work before reporting a successful transition."""
+        with allow_host_sync(
+            "memory transitions wait for the device before rank agreement"
+        ):
+            yield
+            self.synchronize()
+
+    def check_memory_transition(
+        self, tags: list[str], *, release: bool
+    ) -> tuple[bool, str]:
+        """Check the local weight and KV state without changing either."""
+        if self._weight_memory is not None:
+            try:
+                self._weight_memory.check_memory_transition(tags, release=release)
+            except RuntimeError as error:
+                return False, str(error)
+        return True, ""
+
     def empty_cache(self) -> None:
         """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
         if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
@@ -855,7 +877,7 @@ class DeviceHandle:
         else:
             self._weight_memory.resume(operation)
 
-    def finish_kv_resume(self) -> None:
+    def finish_kv_resume(self, *, synchronize_before_registration: bool) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
 
         Re-mapped memory holds garbage, so the arena is zeroed first. The
@@ -867,6 +889,10 @@ class DeviceHandle:
         self.settle()
         self._executor.token_to_kv_pool.clear_kv_buffers()
         if self._kv_transfer is not None:
+            if synchronize_before_registration:
+                # NPU transfer registration can expose pages without ordering
+                # against the stream that cleared them.
+                self._executor.device_module.synchronize()
             self._kv_transfer.restore_cache_registration()
         if self._weight_memory is not None:
             self._weight_memory.mark_kv_resumed()
@@ -1044,6 +1070,7 @@ class DeviceHandle:
         if (
             state.policy == "discard"
             and type(req) is not UpdateWeightsFromMooncakeReqInput
+            and type(req) not in self._additional_discard_reload_types
         ):
             return False, "Discard policy requires a complete Model Updater SDK update"
         try:
@@ -2015,13 +2042,20 @@ def build_device_side(
             policy=server_args.weight_memory_policy, models=update_models
         )
 
+    handle_type: type[DeviceHandle] = DeviceHandle
+    if server_args.enable_memory_saver and executor.device == "npu":
+        from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+            AscendMemorySaverDeviceHandle,
+        )
+
+        handle_type = AscendMemorySaverDeviceHandle
     return DeviceBuild(
         host_cache=host_cache,
         peer_geometry=peer_geometry,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,
-        handle=DeviceHandle(
+        handle=handle_type(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,

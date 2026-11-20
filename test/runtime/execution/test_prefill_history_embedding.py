@@ -234,7 +234,7 @@ def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_emb
         _pool(),
         ib,
         _config(),
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
         num_warmup=1,
     )
     history_ids = torch.full((4, 64), 7, dtype=torch.int32, device="cuda")
@@ -301,7 +301,7 @@ def test_history_model_without_embedding_seam_stays_eager():
         _pool(),
         InputBuffers(2, 32, 4),
         _config(),
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
     owner.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     assert not owner.can_run(owner.make_dummy_batch(16, 1))
@@ -319,7 +319,7 @@ def test_dp_multimodal_restriction_follows_active_model(active):
         _pool(),
         InputBuffers(2, 32, 4),
         config,
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
     assert bool(owner.capture_plan) is not active
 
@@ -334,7 +334,7 @@ def test_supplied_embeddings_bypass_history_in_eager_forward():
         _pool(),
         InputBuffers(2, 32, 4),
         _config(),
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
     ctx = owner.make_dummy_batch(16, 1)
     ids = torch.arange(16, device="cuda")
@@ -354,7 +354,7 @@ def test_decode_uses_model_owned_history_embedding():
         _pool(),
         InputBuffers(2, 32, 4),
         _config(),
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
     ctx = owner.make_dummy_batch(1, 1)
     ctx.forward_mode = ForwardMode.DECODE

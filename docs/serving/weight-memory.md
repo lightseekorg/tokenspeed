@@ -1,5 +1,8 @@
 # Weight memory policies
 
+For Ascend-specific policies, dependencies and disk replacement, see the
+[Ascend guide](ascend-memory-saver.md). The CUDA/ROCm contract follows.
+
 Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 `--weight-memory-policy discard`. Both use the existing memory tags and control
 routes. Rebuild the Python runtime, native host and kernel package together;

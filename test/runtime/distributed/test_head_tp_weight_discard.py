@@ -72,7 +72,7 @@ def _worker():
         head_tp_exchange_max_rows=16,
         numerics="auto",
     )
-    saver = TorchMemorySaverAdapter.create(True)
+    saver = TorchMemorySaverAdapter.create(True, device="cuda")
     torch.set_default_dtype(torch.bfloat16)
     with torch.device(device), saver.region(tag="weights", enable_cpu_backup=False):
         model = DeepseekV3AttentionMLA(

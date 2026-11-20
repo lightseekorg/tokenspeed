@@ -1837,7 +1837,7 @@ def test_kv_release_quiesces_copies_and_deregisters_the_peer():
     ]
     trace.clear()
 
-    handle.finish_kv_resume()
+    handle.finish_kv_resume(synchronize_before_registration=False)
     # Zero the re-mapped garbage before a peer can write into it again.
     assert trace == ["clear_kv_buffers", "peer.register"]
 
@@ -1847,7 +1847,7 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     handle = DeviceHandle(_SleepExecutor(trace))
 
     handle.prepare_kv_release()
-    handle.finish_kv_resume()
+    handle.finish_kv_resume(synchronize_before_registration=False)
     handle.synchronize()
 
     assert trace == [
@@ -1856,6 +1856,49 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
         "clear_kv_buffers",
         "device.synchronize",
     ]
+
+
+def test_replica_kv_resume_completes_clear_before_registration_and_reply():
+    trace = []
+    handle = DeviceHandle(
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
+    )
+
+    with handle.complete_memory_transition():
+        handle.finish_kv_resume(synchronize_before_registration=True)
+
+    assert trace == [
+        "clear_kv_buffers",
+        "device.synchronize",
+        "peer.register",
+        "device.synchronize",
+    ]
+
+
+@pytest.mark.parametrize("operation", ["plan_without_forward", "idle_forward"])
+def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+    from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
+
+    class UnavailableMemorySaver:
+        def assert_active(self):
+            raise RuntimeError("Memory is unavailable")
+
+    executor = _SleepExecutor([])
+    executor.model_runner = SimpleNamespace(
+        memory_saver_adapter=UnavailableMemorySaver()
+    )
+    handle = AscendMemorySaverDeviceHandle(
+        executor, weight_memory=WeightMemoryState(policy="cpu_backup", models=[])
+    )
+
+    with pytest.raises(RuntimeError, match="Memory is unavailable"):
+        if operation == "plan_without_forward":
+            handle.execute(None, None, cache_ops=())
+        else:
+            handle.run_idle_forward(None)
 
 
 @pytest.mark.parametrize(
