@@ -88,6 +88,7 @@ class DFlash2(DFlash):
             top_k=torch.ones((1,), dtype=torch.int32, device=device),
             top_p=torch.ones((1,), dtype=torch.float32, device=device),
             seed=torch.zeros((1,), dtype=torch.int64, device=device),
+            verify_reads_draft_q=torch.zeros((1,), dtype=torch.int32, device=device),
         )
         # Where the walk records q for verify; None while drafting greedily.
         self._draft_q: DraftTreeQ | None = None
@@ -269,14 +270,17 @@ class DFlash2(DFlash):
         """Walk the lattice into ``out`` (clamped to the vocabulary) and,
         when sampling, record its q for the next round's verify.
 
-        One kernel for every row: greedy rows (and every row while the flag
-        is off) take the best edge; sampling rows draw from q, with noise
-        keyed by the request's seed, this round's position and the drawn
-        token id, so every TP rank draws the same token from the same
-        replicated scores. With the flag on, the kernel writes each request's
-        chain straight into ``RuntimeStates.future_draft_q`` (a request that
-        proposes nothing gets slot -1 on every node); with it off, into a
-        private scratch table nothing reads. Tensor-only, so it records into
+        One kernel for every row. Greedy rows take the best edge. So does
+        every row while speculative sampling is off, and while the batch's
+        verify does not read the recorded q
+        (``SpeculativeSamplingPools.verify_reads_draft_q``). Sampling rows
+        draw from q, with noise keyed by the request's seed, this round's
+        position and the drawn token id, so every TP rank draws the same token
+        from the same replicated scores. With speculative sampling on, the
+        kernel writes each request's chain straight into
+        ``RuntimeStates.future_draft_q`` (a request that proposes nothing gets
+        slot -1 on every node); with it off, into a private scratch table
+        nothing reads. Tensor-only, so it records into
         the draft graph.
         """
         bs = candidate_ids.shape[0]
@@ -315,4 +319,5 @@ class DFlash2(DFlash):
             tables.q_ids,
             tables.pos,
             tables.slot,
+            pools.verify_reads_draft_q,
         )

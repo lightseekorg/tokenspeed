@@ -296,6 +296,9 @@ class SonicSamplingBackend(SamplingBackend):
                 .repeat(1, self.pool_rows)
                 .contiguous()
             )
+            # Always 0: this verifier reads the dense draft probs, never the
+            # DFlash2 walk's sparse q (SpeculativeSamplingPools.verify_reads_draft_q).
+            self._verify_reads_draft_q = torch.zeros((1,), dtype=torch.int32)
 
         # The slot-indexed state every launch gathers at ``slot_mapping[row]``; never-admitted slots keep the backend's seed.
         self.state = SlotState.allocate(
@@ -370,6 +373,7 @@ class SonicSamplingBackend(SamplingBackend):
             top_k=self.state.top_k,
             top_p=self._exact_state.top_p,
             seed=self.state.seeds,
+            verify_reads_draft_q=self._verify_reads_draft_q,
         )
 
     def _gather_pairs(

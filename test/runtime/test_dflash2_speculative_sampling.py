@@ -40,9 +40,6 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed_kernel.ops.sampling.triton import dflash2_sample_path  # noqa: E402
-from tokenspeed_kernel.ops.sampling.triton.common import (  # noqa: E402
-    TOP_K_DISABLED,
-)
 
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.drafter.dflash import DFlash  # noqa: E402
@@ -65,6 +62,7 @@ from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
     TritonSamplingBackend,
 )
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ  # noqa: E402
 
 N = 4  # verify width: anchor + 3 drafts
@@ -112,6 +110,14 @@ def _triton_backend(
         return TritonSamplingBackend(config)
 
 
+def _params(rid: str, *, temperature: float, top_k: int, top_p: float):
+    """One request's sampling parameters, as the engine admits them."""
+    params = SamplingParams(temperature=temperature, top_k=top_k, top_p=top_p)
+    params.resolve_seed(rid)
+    params.normalize(None)
+    return params
+
+
 def _publish(states: RuntimeStates, slots: list[int], has_proposal: list[int]):
     """Record chains for ``slots`` as the walk kernel writes them; returns
     ``(q, q_ids, lane)``."""
@@ -154,10 +160,21 @@ def test_the_sampled_walk_records_each_chain_at_its_state_write_slot():
         state_write_padding_pool_index=POOL,
         device=device,
     )
-    # Request 0 samples (top-k off); request 1 is greedy; row 2 is padding.
+    # Request 0 samples (top-k 8); request 1 is greedy; row 2 is padding. Both
+    # requests carry a finite top-k, so the batch takes the top-k route, whose
+    # verify reads the recorded q.
     pool_slots, write_slots = [2, 5, 0], [2, 5, POOL]
+    backend.prepare_step(
+        [1, 2],
+        pool_slots[:2],
+        [
+            _params("a", temperature=0.7, top_k=8, top_p=1.0),
+            _params("b", temperature=0.0, top_k=-1, top_p=1.0),
+        ],
+    )
     pools = drafter._walk_pools
-    pools.temperature[2], pools.top_k[2] = 0.7, TOP_K_DISABLED
+    assert pools.verify_reads_draft_q.tolist() == [1]
+    pools.temperature[2], pools.top_k[2] = 0.7, 8
     pools.temperature[5], pools.top_k[5] = 1.0, 1
     pools.seed[2], pools.seed[5] = 123, 456
     states.valid_cache_lengths[2], states.valid_cache_lengths[5] = 40, 90
@@ -201,6 +218,7 @@ def test_the_sampled_walk_records_each_chain_at_its_state_write_slot():
         expected.q_ids,
         expected.pos,
         expected.slot,
+        pools.verify_reads_draft_q,
     )
     assert torch.equal(out, expected_out)
     for name in ("q", "q_ids", "pos", "slot"):
@@ -279,6 +297,7 @@ def _dflash2(states: RuntimeStates) -> DFlash2:
         top_k=torch.ones(1, dtype=torch.int32),
         top_p=torch.ones(1),
         seed=torch.zeros(1, dtype=torch.int64),
+        verify_reads_draft_q=torch.zeros(1, dtype=torch.int32),
     )
     drafter._draft_q = None
     return drafter
@@ -409,6 +428,114 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     # record no q, so verify would reject every draft.
     assert isinstance(drafter.draft_sampler, DraftProposalSampler)
     assert not drafter.logits_processor.do_argmax
+
+
+@pytest.mark.parametrize(
+    ("batch", "reads_q"),
+    [
+        ([dict(temperature=1.0, top_k=-1, top_p=1.0)] * 2, 1),  # no filter
+        ([dict(temperature=0.8, top_k=20, top_p=1.0)] * 2, 1),  # top-k
+        ([dict(temperature=0.8, top_k=20, top_p=0.9)] * 2, 1),  # top-k and top-p
+        (  # greedy beside top-k: still the top-k route
+            [
+                dict(temperature=0.0, top_k=-1, top_p=1.0),
+                dict(temperature=0.8, top_k=20, top_p=1.0),
+            ],
+            1,
+        ),
+        ([dict(temperature=0.8, top_k=-1, top_p=0.9)] * 2, 0),  # top-p only
+        (  # top-k beside no filter: a mixed batch
+            [
+                dict(temperature=0.8, top_k=20, top_p=1.0),
+                dict(temperature=1.0, top_k=-1, top_p=1.0),
+            ],
+            0,
+        ),
+        (  # greedy beside no filter: a mixed batch
+            [
+                dict(temperature=0.0, top_k=-1, top_p=1.0),
+                dict(temperature=1.0, top_k=-1, top_p=1.0),
+            ],
+            0,
+        ),
+    ],
+)
+def test_the_backend_tells_the_walk_whether_verify_reads_its_q(batch, reads_q):
+    """The flag follows the batch's sampling route: only the routes whose
+    verify runs rejection sampling against the recorded q read it."""
+    backend = _triton_backend(enable_speculative_sampling=True)
+    pools = backend.speculative_sampling_pools()
+    params = [_params(f"r{i}", **kwargs) for i, kwargs in enumerate(batch)]
+
+    backend.prepare_step(list(range(1, len(params) + 1)), [1, 2], params)
+
+    assert pools.verify_reads_draft_q.tolist() == [reads_q]
+
+
+def test_the_flag_stays_off_without_speculative_sampling():
+    backend = _triton_backend(enable_speculative_sampling=False)
+    params = [_params(f"r{i}", temperature=1.0, top_k=-1, top_p=1.0) for i in (0, 1)]
+
+    backend.prepare_step([1, 2], [1, 2], params)
+
+    assert backend.speculative_sampling_pools().verify_reads_draft_q.tolist() == [0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_a_mixed_batch_walks_the_best_lane_and_records_no_proposal():
+    """Greedy beside an unfiltered sampling request verifies by exact match,
+    so the walk proposes the best lane for both and records slot -1 at both
+    state-write slots, instead of drawing a token verify would not weigh."""
+    torch.manual_seed(2)
+    device = "cuda"
+    states = RuntimeStates(
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device=device,
+    )
+    drafter = _dflash2(states)
+    backend = _triton_backend(enable_speculative_sampling=True, device=device)
+    drafter.bind_sampling_backend(backend)
+    drafter.draft_vocab_size = VOCAB
+    drafter.input_buffers = InputBuffers(
+        max_bs=MAX_BS,
+        max_num_tokens=MAX_BS * N,
+        state_write_padding_pool_index=POOL,
+        device=device,
+    )
+    pool_slots = [2, 5]
+    backend.prepare_step(
+        [1, 2],
+        pool_slots,
+        [
+            _params("a", temperature=1.0, top_k=-1, top_p=1.0),
+            _params("b", temperature=0.0, top_k=-1, top_p=1.0),
+        ],
+    )
+    assert drafter._walk_pools.verify_reads_draft_q.tolist() == [0]
+    drafter.input_buffers.req_pool_indices_buf[:2] = torch.tensor(pool_slots)
+    drafter.input_buffers.state_write_req_pool_indices_buf[:2] = torch.tensor(
+        pool_slots
+    )
+    candidate_ids = torch.randint(VOCAB, (2, STEPS, K), device=device)
+    scores = torch.randn(2, STEPS, K, K, device=device)
+    anchors = torch.randint(VOCAB, (2,), device=device)
+
+    out = torch.empty(2, N, dtype=torch.int32, device=device)
+    drafter._walk(candidate_ids, scores, anchors, out)
+
+    best = []
+    for row in range(2):
+        lane, tokens = 0, [int(anchors[row])]
+        for step in range(STEPS):
+            lane = int(torch.argmax(scores[row, step, lane]))
+            tokens.append(int(candidate_ids[row, step, lane]))
+        best.append(tokens)
+    assert out.tolist() == best
+    for slot in pool_slots:
+        assert states.future_draft_q.slot[slot].tolist() == [-1] * N
 
 
 if __name__ == "__main__":

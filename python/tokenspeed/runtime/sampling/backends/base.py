@@ -70,6 +70,11 @@ class SpeculativeSamplingPools:
     top_k: torch.Tensor  # int32; greedy requests carry 1
     top_p: torch.Tensor  # fp32
     seed: torch.Tensor  # int64 Philox seed
+    # int32 [1], read on the device when the drafter runs: 1 while the
+    # current batch's verify route reads the sparse draft q a DFlash2 walk
+    # records, else 0, standing in for the next verify's route. Backends whose
+    # verify never reads that q keep it 0.
+    verify_reads_draft_q: torch.Tensor
 
 
 @dataclass

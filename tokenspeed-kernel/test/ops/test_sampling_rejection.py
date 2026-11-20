@@ -257,6 +257,8 @@ class _WalkPools:
             device=device, dtype=torch.int64
         )
         self.table_size = pool_rows + 2
+        # The batch's verify reads the recorded q unless a test says otherwise.
+        self.verify_reads_draft_q = torch.ones(1, dtype=torch.int32, device=device)
 
 
 _WALK_VOCAB = 1000
@@ -291,6 +293,7 @@ def _walk(candidate_ids, scores, anchors, pools: _WalkPools):
         q_ids,
         pos,
         slot,
+        pools.verify_reads_draft_q,
     )
     # Rows no request writes keep their contents.
     untouched = torch.ones(rows, dtype=torch.bool, device=device)
@@ -328,6 +331,7 @@ def _walk_reference(candidate_ids, scores, anchors, pools: _WalkPools):
         pools.top_k[index],
         pools.top_p[index],
         gumbel.view(bs, steps, top_k),
+        bool(pools.verify_reads_draft_q.item()),
     )
 
 
@@ -386,6 +390,28 @@ def test_dflash2_sample_path_greedy_rows_match_the_old_walk(device: str) -> None
     assert has_proposal.tolist() == [0] * 5
     expected_q = torch.nn.functional.one_hot(lanes.long(), 16).float()
     assert torch.equal(q, expected_q)
+
+
+def test_dflash2_sample_path_draws_nothing_while_verify_skips_q(device: str) -> None:
+    """A batch whose verify does not read the recorded q (a mix of sampling
+    parameters falls back to exact match) walks every request's best lane:
+    a draw would only lower the chance of matching the target's own pick."""
+    candidate_ids, scores, anchors = _lattice(6, 7, 16, device, seed=5)
+    pools = _WalkPools(**_MIXED_WALK, device=device)
+    pools.verify_reads_draft_q.zero_()
+
+    tokens, q, lanes, has_proposal = _walk(candidate_ids, scores, anchors, pools)
+    ref_tokens, ref_q, ref_lanes, ref_has = _walk_reference(
+        candidate_ids, scores, anchors, pools
+    )
+
+    assert tokens.tolist() == _old_greedy_walk(candidate_ids, scores, anchors)
+    assert has_proposal.tolist() == [0] * 6
+    assert torch.equal(q, torch.nn.functional.one_hot(lanes.long(), 16).float())
+    assert tokens.tolist() == ref_tokens.tolist()
+    assert lanes.tolist() == ref_lanes.tolist()
+    assert ref_has.tolist() == [0] * 6
+    torch.testing.assert_close(q, ref_q, rtol=1e-6, atol=1e-7)
 
 
 def test_dflash2_sample_path_follows_the_selected_predecessor(device: str) -> None:

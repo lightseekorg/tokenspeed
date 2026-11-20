@@ -63,6 +63,7 @@ def _dflash2_sample_path_kernel(
     q_ids_ptr,
     pos_ptr,
     slot_ptr,
+    verify_reads_draft_q_ptr,
     tokens_row_stride,
     offset_scale,
     max_token_id,
@@ -93,6 +94,10 @@ def _dflash2_sample_path_kernel(
     # back to exact match, which the best lane passes more often than a draw.
     sampled = (top_k != 1) & (raw_temperature > 0.0)
     sampled = sampled & ~((top_k == TOP_K_OFF) & (top_p < TOP_P_ONE))
+    # So does every request while this batch's verify does not read the
+    # recorded q (a batch mixing sampling parameters falls back to exact
+    # match): a draw would only lower the chance of matching the target.
+    sampled = sampled & (tl.load(verify_reads_draft_q_ptr) != 0)
     proposal = sampled
 
     tokens_base = req * tokens_row_stride
@@ -183,6 +188,7 @@ def dflash2_sample_path(
     q_ids: torch.Tensor,
     pos: torch.Tensor,
     slot: torch.Tensor,
+    verify_reads_draft_q: torch.Tensor,
 ) -> torch.Tensor:
     """Walk the lattice, sampling each step's lane or taking the best one.
 
@@ -225,6 +231,9 @@ def dflash2_sample_path(
         q_ids: ``[rows, L, K]`` int32 table; each step's candidate ids.
         pos: ``[rows, L + 1]`` int32 table; each node's lane (0 for node 0).
         slot: ``[rows, L + 1]`` int32 table; each node's q row, or -1.
+        verify_reads_draft_q: ``[1]`` int32 device flag, read when the kernel
+            runs: 1 while the batch's verify reads this q; 0 makes every
+            request take the best lane and propose nothing.
 
     Returns:
         ``tokens``, filled in place.
@@ -268,6 +277,7 @@ def dflash2_sample_path(
         ("top_k_pool", top_k_pool, torch.int32),
         ("seed_pool", seed_pool, torch.int64),
         ("valid_cache_lengths", valid_cache_lengths, torch.int32),
+        ("verify_reads_draft_q", verify_reads_draft_q, torch.int32),
     ):
         if tensor.dtype != dtype:
             raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
@@ -287,6 +297,10 @@ def dflash2_sample_path(
         raise ValueError(
             "candidate_ids, scores, q, q_ids, pos, slot, req_pool_indices and "
             "table_rows must be contiguous"
+        )
+    if verify_reads_draft_q.shape != (1,):
+        raise ValueError(
+            f"verify_reads_draft_q shape {tuple(verify_reads_draft_q.shape)} must be (1,)"
         )
     if tokens.stride(1) != 1:
         raise ValueError("tokens rows must be contiguous")
@@ -308,6 +322,7 @@ def dflash2_sample_path(
         q_ids,
         pos,
         slot,
+        verify_reads_draft_q,
     )
     if not all(tensor.device.type == "cuda" for tensor in tensors):
         raise ValueError("dflash2_sample_path requires CUDA tensors")
@@ -330,6 +345,7 @@ def dflash2_sample_path(
         q_ids,
         pos,
         slot,
+        verify_reads_draft_q,
         tokens.stride(0),
         offset_scale,
         vocab_size - 1,

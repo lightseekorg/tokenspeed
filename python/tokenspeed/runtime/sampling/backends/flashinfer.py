@@ -333,6 +333,11 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._seed_pool = torch.zeros(
             (pool_rows,), dtype=torch.int64, device=config.device
         )
+        # Always 0: this verifier reads the dense draft probs, never the
+        # DFlash2 walk's sparse q (SpeculativeSamplingPools.verify_reads_draft_q).
+        self._verify_reads_draft_q = torch.zeros(
+            (1,), dtype=torch.int32, device=config.device
+        )
 
         # The legacy coin stream advances outside the graph and its retraction
         # image carries the generator state. The position-keyed chain stream
@@ -354,6 +359,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             top_k=self._top_k_pool,
             top_p=self._top_p_pool,
             seed=self._seed_pool,
+            verify_reads_draft_q=self._verify_reads_draft_q,
         )
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:

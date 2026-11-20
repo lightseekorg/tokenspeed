@@ -577,6 +577,8 @@ class _GreedyWalk:
         self.top_k = torch.ones(1, dtype=torch.int32, device=device)
         self.top_p = torch.ones(1, dtype=torch.float32, device=device)
         self.seed = torch.zeros(1, dtype=torch.int64, device=device)
+        # Greedy pool: no verify reads this walk's q.
+        self.verify_reads_draft_q = torch.zeros(1, dtype=torch.int32, device=device)
         self.valid_cache_lengths = torch.zeros(1, dtype=torch.int32, device=device)
         self.table_rows = torch.arange(batch_size, dtype=torch.int64, device=device)
         self.q = torch.empty(batch_size, num_steps, top_k, device=device)
@@ -615,6 +617,7 @@ class _GreedyWalk:
             self.q_ids,
             self.pos,
             self.slot,
+            self.verify_reads_draft_q,
         )
         return out
 
