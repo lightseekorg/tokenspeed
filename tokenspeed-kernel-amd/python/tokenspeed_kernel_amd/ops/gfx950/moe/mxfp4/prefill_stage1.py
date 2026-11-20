@@ -979,7 +979,10 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
     )
 
 
-@gluon.jit
+# The token count follows the batch and only bounds the route masks; without
+# do_not_specialize, Triton compiles separate binaries for counts that are and
+# are not multiples of 16.
+@gluon.jit(do_not_specialize=["num_tokens"])
 def gluon_mxfp4_moe_stage1_kernel(
     a_ptr,
     b_ptr,

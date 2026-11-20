@@ -186,7 +186,10 @@ def _xcd_m_fast_tile(flat_tile, valid_pid_m, num_pid_m, num_pid_n, NUM_XCDS):
 # ---------------------------------------------------------------------------
 
 
-@gluon.jit
+# The token count follows the batch and only bounds the route masks; without
+# do_not_specialize, Triton compiles separate binaries for counts that are and
+# are not multiples of 16.
+@gluon.jit(do_not_specialize=["token_num"])
 def gluon_mxfp4_moe_stage2_1x2_kernel(
     a_ptr,
     b_ptr,

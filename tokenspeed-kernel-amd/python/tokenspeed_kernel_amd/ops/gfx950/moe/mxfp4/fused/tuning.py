@@ -522,7 +522,8 @@ def package_prefill_row_families(
     Covers all-local experts with precomputed routes and E2M1 activations, as
     the sorted gate/up and down halves run them. Compile-time values follow
     the grouped configuration, the sort's route tile width, and the divisibility
-    by 16 that Triton keys on for the runtime token and route counts.
+    by 16 that Triton keys on for the runtime route count. The token count
+    is not specialized on, so it does not split the families.
     """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import route_chunks
 
@@ -548,7 +549,7 @@ def package_prefill_row_families(
             use_minimum_route_chunks=config.use_minimum_route_chunks,
             runtime_rows=config.runtime_rows,
         )
-        key = (config, route_tile, rows % 16 == 0, rows * top_k % 16 == 0)
+        key = (config, route_tile, rows * top_k % 16 == 0)
         first_rows.setdefault(key, rows)
     return sorted(first_rows.values())
 
