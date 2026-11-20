@@ -44,7 +44,7 @@ use crate::{
     store::{HostBuffer, IoResult, Store},
 };
 
-/// The executor's limits: the scheduler's storage credits and the workers.
+/// L3 runtime limits: storage credits, workers and the control-plane drain budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutorConfig {
     /// Operations the scheduler keeps in flight (`StorageConfig`).
@@ -61,6 +61,9 @@ pub struct ExecutorConfig {
     pub failure_threshold: u32,
     /// How long an open backend refuses calls before one probe.
     pub recovery_interval: Duration,
+    /// Control-plane grace period for healthy I/O before clear isolates it.
+    /// Zero skips waiting; it never proves retirement or releases unsafe blocks.
+    pub clear_cache_drain_timeout: Duration,
 }
 
 /// A monotonic clock, in seconds.
@@ -1222,6 +1225,7 @@ mod tests {
         write_workers: 1,
         failure_threshold: 1,
         recovery_interval: Duration::from_secs(30),
+        clear_cache_drain_timeout: Duration::from_millis(500),
     };
 
     /// Group 0 has 8-byte blocks, group 1 16-byte ones, one each per LCM

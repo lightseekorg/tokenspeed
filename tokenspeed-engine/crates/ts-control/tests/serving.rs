@@ -1183,7 +1183,13 @@ fn l3_layout(rank: usize, shards: usize, host_blocks: usize) -> HostLayout {
 
 /// One rank's L3 executor over `store` and a pool of its own, which lives
 /// for the process.
-fn l3_executor(store: ScriptedStore, rank: usize, shards: usize, host_blocks: usize) -> Executor {
+fn l3_executor(
+    store: ScriptedStore,
+    rank: usize,
+    shards: usize,
+    host_blocks: usize,
+    clear_cache_drain_timeout: Duration,
+) -> Executor {
     let layout = l3_layout(rank, shards, host_blocks);
     let pool: &'static mut [u8] = vec![0_u8; layout.bytes()].leak();
     Executor::start(
@@ -1206,6 +1212,7 @@ fn l3_executor(store: ScriptedStore, rank: usize, shards: usize, host_blocks: us
             write_workers: 1,
             failure_threshold: 1,
             recovery_interval: Duration::from_secs(30),
+            clear_cache_drain_timeout,
         },
         monotonic_clock(),
     )
@@ -1261,6 +1268,7 @@ fn put_cancellation_retires_queued_work_but_waits_for_running_native_io() {
         0,
         1,
         1024,
+        Duration::from_millis(500),
     );
     let _release = Release(gate.clone());
     executor.submit(&[storage_put(1, "running", 1)]).unwrap();
@@ -1321,6 +1329,7 @@ fn cancelling_a_running_put_does_not_turn_unknown_source_retirement_into_safety(
         0,
         1,
         1024,
+        Duration::from_millis(500),
     );
     executor.submit(&[storage_put(1, "unknown", 1)]).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1580,6 +1589,10 @@ struct Setup {
     l3_stores: Vec<Arc<StorageProbe>>,
     /// L3: bound the Host cache for eviction-driven cold reads.
     l3_host_blocks: Option<usize>,
+    /// L3: budget for healthy native work before clear isolates its buffers.
+    l3_clear_cache_drain_timeout: Option<Duration>,
+    /// L3: optional owner-specific budgets for agreement coverage.
+    l3_clear_cache_drain_timeouts: Vec<Duration>,
     /// The polls each rank's cache ops wait after the first before they are
     /// acknowledged; none when unset.
     cache_ack_polls: Option<fn(usize) -> usize>,
@@ -1835,6 +1848,12 @@ fn run_rank<F: Frontend>(
                     rank % tp_size,
                     kv_shard_count,
                     setup.l3_host_blocks.unwrap_or(1024),
+                    setup
+                        .l3_clear_cache_drain_timeouts
+                        .get(rank)
+                        .copied()
+                        .or(setup.l3_clear_cache_drain_timeout)
+                        .unwrap_or(Duration::from_millis(500)),
                 )
             }),
             peer: None,
@@ -6258,6 +6277,136 @@ async fn a_healthy_pending_put_drains_without_blocking_controls_or_rotating_the_
     }
     drop(engine);
     assert!(store.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_clear_drain_budgets_choose_between_waiting_and_isolating_healthy_io() {
+    for (layout, budgets, release_after) in [
+        (Layout::Single, vec![Duration::ZERO], None),
+        (Layout::Single, vec![Duration::from_millis(40)], None),
+        (
+            Layout::Single,
+            vec![Duration::from_millis(300)],
+            Some(Duration::from_millis(100)),
+        ),
+        (
+            Layout::Tp(2),
+            vec![Duration::ZERO, Duration::from_millis(300)],
+            None,
+        ),
+    ] {
+        let gate = Gate::closed();
+        let remote = Arc::new(MemoryStore::new());
+        let stores: Vec<_> = (0..layout.sizes().0)
+            .map(|_| {
+                Arc::new(StorageProbe {
+                    memory: remote.clone(),
+                    put_gate: Some(gate.clone()),
+                    ..StorageProbe::default()
+                })
+            })
+            .collect();
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::L3,
+            Setup {
+                l3_stores: stores.clone(),
+                l3_clear_cache_drain_timeouts: budgets.clone(),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let _release = ReleaseStoreGate(gate.clone());
+        let ids: Vec<i32> = (1..=65).collect();
+        run(
+            &engine.client,
+            routed_prompt("before-configured-clear", &ids, None),
+        )
+        .await;
+        for store in &stores {
+            wait_for_store_put(store).await;
+        }
+        admission_on_every_rank(&engine).await;
+        admission_on_every_rank(&engine).await;
+        let original = ts_l3::keys::key_prefix("serving", "v1", "");
+        let started = std::time::Instant::now();
+        let flush = control(
+            &engine,
+            ControlRequest::FlushCache(FlushCacheReqInput {
+                rid: None,
+                http_worker_ipc: None,
+            }),
+        );
+        if let Some(release_after) = release_after {
+            let flush_finished = AtomicBool::new(false);
+            let flush = async {
+                let result = tokio::time::timeout(Duration::from_secs(2), flush)
+                    .await
+                    .expect("configured healthy drain did not finish after source retirement");
+                flush_finished.store(true, Ordering::SeqCst);
+                result
+            };
+            let release = async {
+                tokio::time::sleep(release_after).await;
+                tokio::time::timeout(Duration::from_millis(100), admission_on_every_rank(&engine))
+                    .await
+                    .expect("the configured drain blocked the event loop");
+                assert!(!flush_finished.load(Ordering::SeqCst));
+                assert!(stores
+                    .iter()
+                    .all(|store| store.put_results.lock().unwrap().is_empty()));
+                gate.open();
+            };
+            let (flushed, ()) = tokio::join!(flush, release);
+            assert!(flushed.iter().all(|(_, success)| *success));
+            for output in publication_on_every_rank(&engine, "configured-normal-clear", &ids).await
+            {
+                assert_eq!(output.storage_namespace, original);
+            }
+            for store in &stores {
+                assert_eq!(*store.removed.lock().unwrap(), [format!("{original}_")]);
+            }
+            for capacity in admission_on_every_rank(&engine).await {
+                assert_eq!(capacity.host_free_blocks, capacity.host_total_blocks);
+            }
+        } else {
+            let flushed = tokio::time::timeout(Duration::from_millis(200), flush)
+                .await
+                .unwrap_or_else(|_| panic!("clear did not honor owner budgets {budgets:?}"));
+            assert!(flushed.iter().all(|(_, success)| *success));
+            if budgets.iter().all(|budget| !budget.is_zero()) {
+                assert!(started.elapsed() >= Duration::from_millis(20));
+            }
+            assert!(stores
+                .iter()
+                .all(|store| store.put_results.lock().unwrap().is_empty()));
+            let outputs =
+                publication_on_every_rank(&engine, "configured-isolated-clear", &ids).await;
+            let namespace = agreed_namespace(&outputs, "v1");
+            assert_ne!(namespace, original);
+            let capacities = admission_on_every_rank(&engine).await;
+            for capacity in &capacities {
+                assert!(capacity.host_free_blocks < capacity.host_total_blocks);
+                assert_eq!(capacity.host_free_blocks, capacities[0].host_free_blocks);
+            }
+            // A DP/replica copy of the same request may have already purged
+            // the safe new generation; it can never purge the held prefix.
+            assert!(stores.iter().all(|store| {
+                store
+                    .removed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|prefix| prefix == &format!("{namespace}_"))
+            }));
+            gate.open();
+        }
+        drop(engine);
+        assert!(stores
+            .iter()
+            .all(|store| store.closed.load(Ordering::SeqCst)));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

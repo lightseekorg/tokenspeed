@@ -1476,6 +1476,33 @@ class TestMooncakeConfigTest:
 
 
 class TestStorageRuntimeConfigTest:
+    def test_clear_cache_drain_uses_the_existing_500_ms_default(self):
+        config = StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=32, prefix_granularity=2
+        )
+        assert config.clear_cache_drain_timeout_ms == 500
+
+    @pytest.mark.parametrize("timeout_ms", [123, 0, (2**63 - 1) // 1000])
+    def test_clear_cache_drain_accepts_custom_budget_or_no_wait(self, timeout_ms):
+        config = StorageRuntimeConfig.from_extra_config(
+            json.dumps({"async": {"clear_cache_drain_timeout_ms": timeout_ms}}),
+            host_blocks=32,
+            prefix_granularity=2,
+        )
+        assert config.clear_cache_drain_timeout_ms == timeout_ms
+
+    @pytest.mark.parametrize(
+        "timeout_ms",
+        [True, False, -1, 1.5, 0.0, "123", None, [], {}, (2**63 - 1) // 1000 + 1],
+    )
+    def test_clear_cache_drain_rejects_invalid_budget(self, timeout_ms):
+        with pytest.raises(ValueError, match="clear_cache_drain_timeout_ms"):
+            StorageRuntimeConfig.from_extra_config(
+                json.dumps({"async": {"clear_cache_drain_timeout_ms": timeout_ms}}),
+                host_blocks=32,
+                prefix_granularity=2,
+            )
+
     @pytest.mark.parametrize(
         "name",
         [

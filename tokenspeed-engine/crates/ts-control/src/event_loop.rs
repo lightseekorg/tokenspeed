@@ -195,9 +195,6 @@ const RELOAD_GATE_CODE: i64 = 7;
 
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
-// Cache administration yields to ordinary rounds while healthy I/O drains.
-// Beyond this budget it can isolate old storage references without waiting.
-const CACHE_CLEAR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A failure of a data-plane operation; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
@@ -2034,8 +2031,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let pending = self.scheduler.storage_current_pending();
         if !self.converge(!pending)? {
-            let expired = self.cache_clear_started.expect("clear started").elapsed()
-                >= CACHE_CLEAR_DRAIN_TIMEOUT;
+            let budget = self.l3.as_ref().map_or(Duration::ZERO, |l3| {
+                l3.executor.config().clear_cache_drain_timeout
+            });
+            let expired = self.cache_clear_started.expect("clear started").elapsed() >= budget;
             if !self.converge(!expired)? {
                 return self.clear_cache_retaining_storage().map(Some);
             }

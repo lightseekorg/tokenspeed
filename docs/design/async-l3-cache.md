@@ -451,7 +451,10 @@ the adapter's return-code contract; real transport fault tests remain part of
 hardware validation.
 
 A full clear with healthy outstanding storage work first yields to normal
-control rounds for up to 500 ms. Pending standalone flush replies and the
+control rounds for `async.clear_cache_drain_timeout_ms` (default 500 ms).
+The JSON value is an integer in `[0, (2**63 - 1) // 1000]`; `0` skips this
+healthy-drain wait and isolates pending work immediately, without claiming
+retirement or freeing its references. Pending standalone flush replies and the
 original weight-operation queue head remain pending; no weight load or new
 forward/storage plan begins meanwhile. The rounds still poll, agree and apply
 completions and answer control queries. If the jobs retire, clear purges the
@@ -465,7 +468,10 @@ non-storage owners rather than requiring old retained tickets to disappear;
 the eventual clear still drains or isolates current storage work normally.
 An active-generation quarantine/unproven namespace goes directly to recovery;
 otherwise only exhaustion of the drain budget selects recovery. Every decision
-is agreed across the replica and attention-DP ranks. Preflight still refuses Device/PD/tier transfers,
+is agreed across the replica and attention-DP ranks. Configure the same budget
+on all cooperating ranks; exhaustion on any member selects isolation for all.
+The budget applies only to healthy completion draining, not the ordinary
+synchronous remote namespace purge RPC. Preflight still refuses Device/PD/tier transfers,
 suspended retraction images and owners outside the storage tickets. The cache
 owner checks the exact block identities and reference counts, including
 unindexed GET destinations, before changing any index. Requests drop their
