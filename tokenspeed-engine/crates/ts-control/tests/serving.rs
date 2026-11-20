@@ -143,6 +143,7 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, setup: &Setup)
     let device_pages = setup.device_pages.unwrap_or(513);
     let resident_requests = setup.resident_requests.unwrap_or(8);
     let host_blocks = setup.l3_host_blocks.unwrap_or(1024);
+    let forced_interval = setup.debug_force_retraction_interval.unwrap_or(3);
     let policy = if setup.deferred_allocation {
         "Deferred"
     } else {
@@ -158,7 +159,7 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, setup: &Setup)
         Tiers::ForcedRetraction => {
             "cfg.num_snapshot_pages = 65\n\
              cfg.max_retracted_requests = 8\n\
-             cfg.debug_force_retraction_interval = 3"
+             cfg.debug_force_retraction_interval = forced_interval"
         }
         Tiers::HostL2 => {
             "cfg.disable_l2_cache = False\n\
@@ -177,7 +178,7 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, setup: &Setup)
              cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack\n\
              cfg.num_snapshot_pages = 65\n\
              cfg.max_retracted_requests = 8\n\
-             cfg.debug_force_retraction_interval = 3"
+             cfg.debug_force_retraction_interval = forced_interval"
         }
         Tiers::L3 => {
             "cfg.disable_l2_cache = False\n\
@@ -204,6 +205,7 @@ cfg.max_batch_size = 8
 cfg.max_resident_requests = {resident_requests}
 cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
+forced_interval = {forced_interval}
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
                                         total_pages={device_pages}, attn_kind=ts.AttnKind.Full,
                                         cache_blocks_per_lcm_block={kv_shard_count},
@@ -1370,6 +1372,7 @@ fn cancelling_a_running_put_does_not_turn_unknown_source_retirement_into_safety(
 /// What a test reads back from one rank.
 struct Rank {
     thread: Option<thread::JoinHandle<()>>,
+    scheduler: Arc<Mutex<Option<SharedScheduler>>>,
     released: Arc<Mutex<Vec<(String, i32)>>>,
     plans: Arc<Mutex<Vec<ExecutedPlan>>>,
     /// What the rank's cache acknowledgments wait on.
@@ -1591,6 +1594,8 @@ struct Setup {
     prefill_delay: Option<PrefillDelay>,
     /// PD, prefill: admit without waiting for the decode allocation.
     deferred_allocation: bool,
+    /// Override periodic debug retraction when a test requires a snapshot.
+    debug_force_retraction_interval: Option<i32>,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1736,6 +1741,7 @@ struct RankSpec {
     setup: Setup,
     mesh_listener: Listener,
     addresses: Vec<String>,
+    scheduler_observer: Option<Arc<Mutex<Option<SharedScheduler>>>>,
 }
 
 /// Connect `spec`'s rank to the others, build its loop over `device`,
@@ -1756,6 +1762,7 @@ fn run_rank<F: Frontend>(
         setup,
         mesh_listener,
         addresses,
+        scheduler_observer,
     } = spec;
     let (world, tp_size, num_engines) = layout.sizes();
     let mesh = Mesh::connect(rank, mesh_listener, &addresses, Duration::from_secs(20)).unwrap();
@@ -1822,6 +1829,9 @@ fn run_rank<F: Frontend>(
     };
     // Attached once the startup requests ran, as the host does.
     if let Some(handle) = scheduler_handle {
+        *handle.lock().unwrap() = Some(scheduler.clone());
+    }
+    if let Some(handle) = scheduler_observer {
         *handle.lock().unwrap() = Some(scheduler.clone());
     }
     let mut event_loop = EventLoop::new(
@@ -1987,6 +1997,7 @@ async fn start_ranks_with(
             });
             let handle = Rank {
                 thread: None,
+                scheduler: Arc::default(),
                 released: device.released.clone(),
                 plans: device.plans.clone(),
                 ack_gate: device.ack_gate.clone(),
@@ -2023,6 +2034,7 @@ async fn start_ranks_with(
                 setup: setup.clone(),
                 mesh_listener,
                 addresses: addresses.clone(),
+                scheduler_observer: Some(handle.scheduler.clone()),
             };
             let (handshake, stop) = (handshake.clone(), stop.clone());
             let thread = thread::spawn(move || {
@@ -2188,6 +2200,7 @@ fn run_scripted(
                 setup: setup.clone(),
                 mesh_listener,
                 addresses: addresses.clone(),
+                scheduler_observer: None,
             };
             let (stop, done) = (stop.clone(), done.clone());
             let thread = thread::spawn(move || {
@@ -3351,7 +3364,12 @@ async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
             layout,
             1,
             Tiers::HostL2WriteBackForcedRetraction,
-            held.clone(),
+            Setup {
+                // Leave decode rounds between forced images so the requests
+                // after the abort can make forward progress too.
+                debug_force_retraction_interval: Some(5),
+                ..held.clone()
+            },
         )
         .await;
         let doomed = engine
@@ -6045,6 +6063,41 @@ async fn wait_for_store_put(store: &StorageProbe) {
     .expect("the PUT did not reach the Store");
 }
 
+/// Wait for completed requests and Device copies, while permitting the test's
+/// native storage jobs to remain held. A response or a fixed number of control
+/// rounds does not establish this state on every mirrored rank.
+async fn wait_for_storage_only_clear(engine: &Engine) {
+    let schedulers: Vec<SharedScheduler> = engine
+        .ranks
+        .iter()
+        .map(|rank| rank.scheduler.lock().unwrap().clone().unwrap())
+        .collect();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let schedulers = schedulers.clone();
+            // Queue real waiters: try_lock polling can miss every fairness
+            // bump while a running native job keeps the event loop busy.
+            let ready = tokio::task::spawn_blocking(move || {
+                schedulers.iter().all(|scheduler| {
+                    // Release this guard before inspecting another mirror;
+                    // an event-loop collective may need that mirror's lock.
+                    let scheduler = scheduler.lock();
+                    let sizes = scheduler.sizes();
+                    sizes.allocated_request_slots == 0 && scheduler.can_prepare_storage_clear()
+                })
+            })
+            .await
+            .unwrap();
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("model requests and Device copies did not retire before the storage-only control");
+}
+
 async fn assert_frontend_can_wait(engine: &Engine) {
     engine.ranks[0].frontend_waits.lock().unwrap().clear();
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -6110,8 +6163,7 @@ async fn terminal_and_retained_unsafe_storage_allow_the_idle_frontend_to_wait() 
         .await
         .expect("the Store calls did not return their retirement facts");
         assert!(stores[0].put_results.lock().unwrap().contains(&false));
-        admission_on_every_rank(&engine).await;
-        admission_on_every_rank(&engine).await;
+        wait_for_storage_only_clear(&engine).await;
         // A final unretired completion cannot advance on another poll.
         // Waiting for new ingress must be possible even before recovery.
         assert_frontend_can_wait(&engine).await;
@@ -6170,6 +6222,7 @@ async fn an_idle_loop_consumes_late_storage_retirement_without_new_ingress() {
     )
     .await;
     wait_for_store_put(&store).await;
+    wait_for_storage_only_clear(&engine).await;
     flush_until_idle(&engine).await;
     assert_frontend_can_wait(&engine).await;
     let scheduler = handle.lock().unwrap().clone().unwrap();
@@ -6249,6 +6302,7 @@ async fn an_old_blocked_write_worker_does_not_close_new_generation_read_pressure
     )
     .await;
     wait_for_store_put(&store).await;
+    wait_for_storage_only_clear(&engine).await;
     flush_until_idle(&engine).await;
     let namespace = agreed_namespace(
         &publication_on_every_rank(&engine, "blocked-writer-new-generation", &old_ids).await,
@@ -6475,6 +6529,7 @@ fn failed_nonce_preparation_keeps_weight_namespace_metadata_on_the_previous_vers
             })
             .await
             .expect("the old A PUT did not report unknown retirement");
+            wait_for_storage_only_clear(&engine).await;
             flush_until_idle(&engine).await;
             *store.failed_put_retirement.lock().unwrap() = None;
             let load = |version: &str, flush_cache: bool| {
@@ -6674,8 +6729,7 @@ async fn ending_a_reload_during_storage_drain_restores_forward_progress() {
         for store in &stores {
             wait_for_store_put(store).await;
         }
-        admission_on_every_rank(&engine).await;
-        admission_on_every_rank(&engine).await;
+        wait_for_storage_only_clear(&engine).await;
         let reloaded = {
             let reload = control(
                 &engine,
@@ -6770,8 +6824,7 @@ async fn a_weight_load_refused_after_storage_drain_started_restores_forward_prog
     for store in &stores {
         wait_for_store_put(store).await;
     }
-    admission_on_every_rank(&engine).await;
-    admission_on_every_rank(&engine).await;
+    wait_for_storage_only_clear(&engine).await;
     let loaded = {
         let load = control(
             &engine,
@@ -6882,6 +6935,7 @@ async fn retained_unsafe_storage_does_not_prevent_a_forward_reload_from_becoming
     .await
     .expect("the original owners did not finish their native calls");
     assert!(stores[0].put_results.lock().unwrap().contains(&false));
+    wait_for_storage_only_clear(&engine).await;
     flush_until_idle(&engine).await;
     *stores[0].failed_put_retirement.lock().unwrap() = None;
     admission_on_every_rank(&engine).await;
@@ -6942,8 +6996,7 @@ async fn a_healthy_pending_put_drains_without_blocking_controls_or_rotating_the_
         [1000, 1001, 1002, 1003]
     );
     wait_for_store_put(&store).await;
-    admission_on_every_rank(&engine).await;
-    admission_on_every_rank(&engine).await;
+    wait_for_storage_only_clear(&engine).await;
     let namespace = ts_l3::keys::key_prefix("serving", "v1", "");
     let flush_finished = AtomicBool::new(false);
     let flush = async {
@@ -7035,8 +7088,7 @@ async fn configured_clear_drain_budgets_choose_between_waiting_and_isolating_hea
         for store in &stores {
             wait_for_store_put(store).await;
         }
-        admission_on_every_rank(&engine).await;
-        admission_on_every_rank(&engine).await;
+        wait_for_storage_only_clear(&engine).await;
         let original = ts_l3::keys::key_prefix("serving", "v1", "");
         let started = std::time::Instant::now();
         let flush = control(
@@ -7150,8 +7202,7 @@ async fn weight_operations_keep_their_order_and_load_once_after_async_storage_dr
     for store in &stores {
         wait_for_store_put(store).await;
     }
-    admission_on_every_rank(&engine).await;
-    admission_on_every_rank(&engine).await;
+    wait_for_storage_only_clear(&engine).await;
     let first_finished = AtomicBool::new(false);
     let second_finished = AtomicBool::new(false);
     let first = async {
@@ -7244,7 +7295,6 @@ async fn weight_operations_keep_their_order_and_load_once_after_async_storage_dr
 #[tokio::test(flavor = "multi_thread")]
 async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waiting_forever() {
     let gate = Gate::closed();
-    let scheduler_handle = Arc::new(Mutex::new(None));
     let store = Arc::new(StorageProbe {
         put_gate: Some(gate.clone()),
         ..StorageProbe::default()
@@ -7255,7 +7305,6 @@ async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waitin
         Tiers::L3,
         Setup {
             l3_store: Some(store.clone()),
-            scheduler: Some(scheduler_handle.clone()),
             ..Setup::default()
         },
     )
@@ -7268,33 +7317,7 @@ async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waitin
     )
     .await;
     wait_for_store_put(&store).await;
-    let scheduler = scheduler_handle.lock().unwrap().clone().unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let request_released = engine
-                .released_on(0)
-                .iter()
-                .any(|(rid, _)| rid == "slow-healthy-writer");
-            if request_released {
-                let scheduler = scheduler.clone();
-                // The loop owns its guard between rounds. Queue a real
-                // waiter so its fairness bump can hand the scheduler over.
-                let ready = tokio::task::spawn_blocking(move || {
-                    scheduler.lock().can_prepare_storage_clear()
-                })
-                .await
-                .unwrap();
-                if ready {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect(
-        "model execution and Device-to-Host copies did not finish before the storage-only clear",
-    );
+    wait_for_storage_only_clear(&engine).await;
     let started = std::time::Instant::now();
     assert_eq!(
         tokio::time::timeout(
@@ -7380,6 +7403,7 @@ async fn returning_to_a_weight_version_with_old_unsafe_io_isolates_its_old_remot
     })
     .await
     .expect("the old weight namespace did not receive its unsafe result");
+    wait_for_storage_only_clear(&engine).await;
     flush_until_idle(&engine).await;
     *store.failed_put_retirement.lock().unwrap() = None;
     let load = |version: &str| {
@@ -7456,6 +7480,7 @@ async fn a_keep_pause_allows_an_already_running_put_to_publish() {
     let ids: Vec<i32> = (1..=65).collect();
     run(&engine.client, routed_prompt("paused-writer", &ids, None)).await;
     wait_for_store_put(&store).await;
+    wait_for_storage_only_clear(&engine).await;
     assert_eq!(
         control(&engine, pause("keep")).await,
         [("PauseSchedulerReqOutput", true)]
@@ -7492,6 +7517,7 @@ async fn a_non_storage_flush_refusal_keeps_an_existing_backup_attached() {
     let ids: Vec<i32> = (1..=65).collect();
     run(&engine.client, routed_prompt("existing-backup", &ids, None)).await;
     wait_for_store_put(&store).await;
+    wait_for_storage_only_clear(&engine).await;
     let previous_stores = engine.cache_ops(CacheOpKind::WriteBack);
     *engine.ranks[0].ack_gate.open.lock().unwrap() = false;
     let pending_ids: Vec<i32> = (1001..=1065).collect();
@@ -7589,8 +7615,7 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         assert!(stores[1].put_results.lock().unwrap().is_empty());
         let old_namespace = ts_l3::keys::key_prefix("serving", "v1", "");
 
-        admission_on_every_rank(&engine).await;
-        admission_on_every_rank(&engine).await;
+        wait_for_storage_only_clear(&engine).await;
         tokio::time::timeout(Duration::from_millis(200), flush_until_idle(&engine))
             .await
             .expect("current unsafe I/O should recover without waiting for the drain deadline");
@@ -7719,6 +7744,7 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         .await;
         // The current generation is healthy even though old sources remain
         // unsafe. Normal clear must purge this namespace and keep its name.
+        wait_for_storage_only_clear(&engine).await;
         flush_until_idle(&engine).await;
         wait_for_retained_capacity(&engine, &retained).await;
         for output in
@@ -7789,8 +7815,7 @@ async fn unequal_data_parallel_host_capacity_keeps_new_l3_generations_and_forwar
         .all(|retired| !retired));
     assert!(stores[1].puts.lock().unwrap().is_empty());
     assert!(engine.released_on(1).is_empty());
-    admission_on_every_rank(&engine).await;
-    admission_on_every_rank(&engine).await;
+    wait_for_storage_only_clear(&engine).await;
     tokio::time::timeout(Duration::from_millis(200), flush_until_idle(&engine))
         .await
         .expect("current unsafe I/O should recover without the drain deadline");
@@ -7893,6 +7918,7 @@ async fn unequal_data_parallel_host_capacity_keeps_new_l3_generations_and_forwar
         assert_eq!(output.storage_namespace, namespace);
         assert_ne!(output.status, "published");
     }
+    wait_for_storage_only_clear(&engine).await;
     flush_until_idle(&engine).await;
     wait_for_retained_capacity(&engine, &retained).await;
     for output in
@@ -8704,6 +8730,7 @@ fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
         setup,
         mesh_listener: mesh_listeners.pop().unwrap(),
         addresses,
+        scheduler_observer: None,
     };
 
     let _recording = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -8837,6 +8864,7 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         setup,
         mesh_listener: mesh_listeners.pop().unwrap(),
         addresses,
+        scheduler_observer: None,
     };
 
     let _recording = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
