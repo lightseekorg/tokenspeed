@@ -3441,8 +3441,10 @@ class ServerArgs:
             "run complete in the same forward instead of waiting for the long "
             "prompt's chunk to pass. The chunk ends on an earlier page and gives "
             "up fewer than N plus one page, only while such prompts wait and "
-            "only what they take. 0 (default) is off; at most half of "
-            "--chunked-prefill-size. A decode server ignores it. See "
+            "only what they take. 0 (default) is off: no chunk gives way; at "
+            "most half of --chunked-prefill-size. A decode server ignores it. "
+            "Whatever N, a prefill server fills the budget a chunk leaves on "
+            "its own with bootstrapped prompts that fit whole in it. See "
             "docs/design/scheduler.md section 1.1.",
         )
         parser.add_argument(
