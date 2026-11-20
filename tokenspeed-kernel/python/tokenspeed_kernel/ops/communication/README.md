@@ -271,6 +271,6 @@ runs on every SM, a smaller one on 64 CTAs.
 `AutoBackend.all_gather_float_words_single` takes it where it serves the size;
 the owned decode top-k gathers its scores and query rider through it, so the
 KVP decode prepares it only for DSA models. On 8 GB300s over two nodes a
-per-rank gather of 123 KB takes 6.7 us (NCCL 23.6 us),
-967 KB 18.1 us (46.3 us), 1.9 MB 31.5 us (47.7 us), 3.9 MB 59.4 us (72.2 us)
-and 7.7 MB 124 us (137 us).
+per-rank gather of 120 KiB takes 6.7 us (NCCL 23.6 us), 944 KiB 18.1 us
+(46.3 us), 1.84 MiB 31.5 us (47.7 us), 3.69 MiB 59.4 us (72.2 us) and
+7.38 MiB 124 us (137 us).
