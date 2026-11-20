@@ -2768,6 +2768,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
                 }
+                PdEvent::DestinationReady(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdDestinationReady, &rid, -1));
+                }
                 PdEvent::Succeeded(rid) => {
                     events.push(pd_event(ForwardEventKind::PdSucceeded, &rid, -1));
                     absorb(self.outputs.finish_prefill(&rid), events, outputs, released);

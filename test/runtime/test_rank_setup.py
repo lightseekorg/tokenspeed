@@ -52,6 +52,7 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
 )
 
 import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
+import tokenspeed.runtime.engine.scheduler_utils as scheduler_utils  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -373,8 +374,8 @@ def test_an_engine_with_l3_passes_its_prefetch_threshold():
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pd_roles_configure_their_pools_as_resolved(role):
-    # The prefill role resolves to no pool and no forced retraction; the
-    # decode role keeps both.
+    # The prefill role resolves to no pool, no forced retraction and early
+    # admission; the decode role keeps both and has no admission policy.
     args = ServerArgs(
         model="x",
         max_num_seqs=8,
@@ -389,6 +390,23 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == pool
     assert cfg.debug_force_retraction_interval == (0 if role == "prefill" else 3)
+    assert cfg.decode_allocation_policy == (
+        ts.SchedulerConfig.DecodeAllocationPolicy.Early if role == "prefill" else None
+    )
+
+
+def test_deferred_allocation_reaches_the_prefill_scheduler():
+    args = ServerArgs(
+        model="x",
+        disaggregation_mode="prefill",
+        disaggregation_decode_allocation_policy="deferred",
+        disaggregation_layerwise_interval=0,
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    assert (
+        cfg.decode_allocation_policy
+        == ts.SchedulerConfig.DecodeAllocationPolicy.Deferred
+    )
 
 
 @pytest.mark.parametrize(
