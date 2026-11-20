@@ -82,6 +82,7 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     _store_if,
     _value_tile_rows,
 )
+from tokenspeed_kernel.thirdparty.cute_dsl.argmax import mbarrier_wait_acquire_cluster
 
 __all__ = ["fused_verify_window", "fused_verify_window_supported"]
 
@@ -586,7 +587,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
                 if const_expr(self.cluster == 1):
                     cute.arch.barrier()
                 else:
-                    cute.arch.mbarrier_wait(shared.token_barrier, 0)
+                    # The peers' st.async complete the word at cluster scope.
+                    mbarrier_wait_acquire_cluster(shared.token_barrier, 0)
                     # The v tile is this CTA's own plain stores.
                     cute.arch.barrier()
                 # Reduce the 64-bit start before narrowing so ring positions stay exact.
@@ -899,7 +901,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
                             squares[t],
                             barrier_addr,
                         )
-            cute.arch.mbarrier_wait(shared.norm_barrier, 0)
+            # The peers' st.async complete the word at cluster scope.
+            mbarrier_wait_acquire_cluster(shared.norm_barrier, 0)
         normed = []
         for t in cutlass.range_constexpr(W):
             total = shared.norm[t]
