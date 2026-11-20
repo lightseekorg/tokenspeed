@@ -161,14 +161,17 @@ _GATHER_WORKSPACE_ROWS = 64
 _GATHER_MAILBOX_ROWS = 512
 # Past this, multicasting a full partial per rank costs more than the two-shot all-reduce (128 rows: 73 us vs 29).
 _REDUCE_MAILBOX_ROWS = 64
-# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path. It is the
-# TP4 Lamport mailbox capacity (43 * 4096 elements, i.e. 172 rows of a
-# 1024-wide shard), and TP8 uses the same limit. In measurements the fused
-# path was faster than the column gather plus a separate quantize at every
-# row count tested above 64, up to 191 rows at TP8 and 172 at TP4. Pre-expert
-# workspace rows past 64 serve only as the fused path's placeholder for the
-# gathered BF16 rows, which it returns but does not fill.
-_GATHER_MXFP4_MAX_ROWS = 172
+# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path: the TP4
+# Lamport mailbox capacity (ProducerAllReduce.LAMPORT_CAPACITY_ELEMENTS, 320
+# rows of a 1024-wide shard); TP8 uses the same limit. In TP4 graph replay the
+# fused path beat the column gather plus a separate quantize at every row
+# count tested, 64 to 320, with the same bits. Pre-expert workspace rows past 64 serve only as the fused path's
+# placeholder for the gathered BF16 rows, which it returns but does not fill.
+_GATHER_MXFP4_MAX_ROWS = 320
+# Row limit of the fused gather + RMSNorm (BF16 output) path, the one-shot
+# Lamport window (172 rows of a 1024-wide shard). It matches the separate norm
+# within one BF16 ulp, not bit for bit, so it keeps its bound.
+_GATHER_RMSNORM_MAX_ROWS = 172
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
@@ -548,7 +551,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             iris is not None
             and norm.weight is not None
             and self.workspace is not None
-            and x.shape[0] <= min(_GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0])
+            and x.shape[0] <= min(_GATHER_RMSNORM_MAX_ROWS, self.workspace.shape[0])
         ):
             local_weight = self._local_weight()
             local = x.new_empty((x.shape[0], local_weight.shape[0]))
@@ -1072,6 +1075,7 @@ class MuseSparkAttention(nn.Module):
             )
             prepared = self.attn.store_prepared(q, k, v, ctx)
             output = self.attn.attend(prepared.q, prepared.k, prepared.v, ctx)
+            gated = False
         else:
             if gathered:
                 owned = self.owned_projections
@@ -1087,35 +1091,48 @@ class MuseSparkAttention(nn.Module):
             q, k, v, output_gate = qkv_gate.split(
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
-            output = self.attn(q, k, v, positions, ctx)
-        output = output.contiguous()
-        # One row normalizes and gates inside the output projection's GEMV.
-        projection_out = (
-            self._acquire_projection_output(output)
-            if output.shape[0] == 1
-            and mv_weightless_rmsnorm_gated_sigmoid_supported(
-                output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
+            # Attention gates its own output (in the decode kernel's store
+            # where it can); a single row keeps it for the output GEMV below.
+            gated = q.shape[0] > 1
+            gate_kwargs = (
+                {"rmsnorm_output_gate": (output_gate, self.rms_norm_eps)}
+                if gated
+                else {}
             )
-            else None
-        )
-        if projection_out is not None:
-            projected = mv_weightless_rmsnorm_gated_sigmoid(
+            output = self.attn(q, k, v, positions, ctx, **gate_kwargs)
+        if not gated:
+            output = output.contiguous()
+            # One row normalizes and gates inside the output projection's GEMV.
+            projection_out = (
+                self._acquire_projection_output(output)
+                if output.shape[0] == 1
+                and mv_weightless_rmsnorm_gated_sigmoid_supported(
+                    output,
+                    output_gate,
+                    self.o_proj.weight,
+                    self.num_heads,
+                    self.head_dim,
+                )
+                else None
+            )
+            if projection_out is not None:
+                projected = mv_weightless_rmsnorm_gated_sigmoid(
+                    output,
+                    output_gate,
+                    self.o_proj.weight,
+                    self.num_heads,
+                    self.rms_norm_eps,
+                    projection_out,
+                )
+                return projected, None, 1
+            output = weightless_rmsnorm_gated_sigmoid(
                 output,
                 output_gate,
-                self.o_proj.weight,
                 self.num_heads,
+                self.head_dim,
                 self.rms_norm_eps,
-                projection_out,
+                pdl_enabled(),
             )
-            return projected, None, 1
-        output = weightless_rmsnorm_gated_sigmoid(
-            output,
-            output_gate,
-            self.num_heads,
-            self.head_dim,
-            self.rms_norm_eps,
-            pdl_enabled(),
-        )
         if gathered:
             # NVIDIA returns its owned rows already reduced.
             return (
@@ -1873,13 +1890,14 @@ class MuseSparkMoE(nn.Module):
         ]
         | None
     ):
-        """Route and quantize decode rows in two launches, or None.
+        """Route and quantize decode rows in two or three launches, or None.
 
-        The router shares a launch with this rank's pre-expert columns, and the
-        top-k shares one with the column gather, RMSNorm and MXFP4
-        quantization. Neither launch has a dependency between its halves, so
-        this replaces four launches with two. Returns the BF16 placeholder
-        rows, the MXFP4 rows, the router logits and the top-k weights and ids.
+        The top-k shares a launch with the column gather, RMSNorm and MXFP4
+        quantization, and up to the router's shared-launch row limit the router
+        shares one with this rank's pre-expert columns. Neither launch has a
+        dependency between its halves, so this replaces four launches with two
+        (three past that limit). Returns the BF16 placeholder rows, the MXFP4
+        rows, the router logits and the top-k weights and ids.
         """
         iris = self.iris_state
         projection = self.pre_expert_proj
@@ -1897,16 +1915,19 @@ class MuseSparkMoE(nn.Module):
         weight = projection._local_weight()
         local = hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
         bias = self.gate.e_score_correction_bias
-        if not (
-            self.gate.supports_with_mm(router_input, hidden_states, weight)
-            and iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
-                local, norm.weight, bias, self.topk
-            )
+        if not iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
+            local, norm.weight, bias, self.topk
         ):
             return None
-        router_logits = self.gate.forward_with_mm(
-            router_input, hidden_states, weight, local
-        )
+        if self.gate.supports_with_mm(router_input, hidden_states, weight):
+            router_logits = self.gate.forward_with_mm(
+                router_input, hidden_states, weight, local
+            )
+        else:
+            # Rows past the router's shared-launch limit leave the router and
+            # this rank's pre-expert columns a launch each.
+            router_logits = self.gate(router_input, pdl_enabled())
+            projection._project(hidden_states, weight, local)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,
@@ -3381,6 +3402,19 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         self.model.iris_state = state
         # Startup might not reduce any payload in the two-shot pull's window.
         state.warmup_reduce_outputs()
+        # The attention boundary's Lamport push changes peer order with the
+        # row count, and capture may reach only one order; every layer shares
+        # the boundary's norms' eps and center.
+        post_norm = self.model.layers[0].post_attention_layernorm
+        pre_norm = self.model.layers[0].pre_feedforward_layernorm
+        state.warmup_symmetric_boundary(
+            post_norm.weight,
+            pre_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+        )
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state

@@ -171,6 +171,41 @@ def test_router_kernel_compiles_once_per_row_bucket() -> None:
             _launch(x[:rows].contiguous(), prepared, MULTIPLIER)
 
 
+def test_startup_warmup_compiles_every_router_row_bucket() -> None:
+    """A router call in the startup warm-up compiles every row bucket.
+
+    The warm forwards reach the router only at large row counts, which take
+    BLAS; a short eager extend later picks a GEMV row bucket of its own.
+    A width used by no other test keeps the compiles this test checks its own.
+    """
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    hidden, columns = 6144, 96
+    plan = fp32_router_gemv_plan(
+        hidden_size=hidden,
+        output_size=columns,
+        dtype=torch.float32,
+        solution=None,
+        batch_invariant=False,
+    )
+    x, weight = _problem(2 * MAX_ROWS, hidden, columns, 29)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    counters = fp32_router_gemv_counters(columns, x.device)
+    with kernel_warmup(enabled=True):
+        fp32_router_gemv_execute(plan, x, prepared, MULTIPLIER, counters, False)
+    with assert_no_triton_compile(
+        gluon_fp32_router_gemv_gfx950, gluon_fp32_router_gemv_splitk_gfx950
+    ):
+        for rows in range(1, MAX_ROWS + 1):
+            out = fp32_router_gemv_execute(
+                plan, x[:rows].contiguous(), prepared, MULTIPLIER, counters, False
+            )
+            expected = (x[:rows].double() @ weight.double()) * MULTIPLIER
+            torch.testing.assert_close(
+                out.double(), expected, rtol=0, atol=2e-6 * hidden**0.5
+            )
+
+
 # Both counts exceed the measured split-K buckets and take BLAS with alpha.
 @pytest.mark.parametrize("rows", [97, 1031])
 def test_planned_router_matches_scaled_matmul_bitwise(rows: int) -> None:

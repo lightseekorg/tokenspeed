@@ -152,8 +152,17 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
 
         def autotune(self, *, keep_loaded_tactics):
             assert not keep_loaded_tactics
+            events.append(("autotune", self.generation))
             if has_draft and not prefill_only:
-                self.warmup_decode_path(batch_sizes=(1,), graph_phase=False)
+                # Two requests, so the rebound DFlash warm-up stays distinct.
+                self.warmup_decode_path(batch_sizes=(2,), graph_phase=False)
+
+        def warm_kernels(self):
+            events.append(("warm_kernels", self.generation))
+            if has_draft and not prefill_only:
+                # ModelExecutor._warm_kernels runs its forwards under no_grad.
+                with torch.no_grad():
+                    self.warmup_decode_path(batch_sizes=(2,), graph_phase=False)
 
         def release_graphs(self):
             events.append(("release", self.generation))
@@ -279,15 +288,22 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         rebind_index = events.index(("rebind", 1, "target2", "draft2"))
         assert probe_index < rebind_index
         if has_draft and not prefill_only:
-            assert events.index(("warmup", 0, (1,), False)) < probe_index
+            assert events.index(("warmup", 0, (2,), False)) < probe_index
         if expected_rewarm:
             assert rebind_index < events.index(rebound_warmup)
         if warmup_fails:
             assert ("capture", 1, None) not in events
         else:
             assert events[-1] == ("capture", 1, None)
+            # The probe boot tunes; kernels warm again, tuning nothing, on the
+            # final pools after the rebind and before the serving capture.
+            warms = [e for e in events if e[0] in ("autotune", "warm_kernels")]
+            assert warms == [("autotune", 0), ("warm_kernels", 1)]
+            assert rebind_index < events.index(("warm_kernels", 1))
     else:
         assert events[-1] == ("capture", 0, None)
+        warms = [e for e in events if e[0] in ("autotune", "warm_kernels")]
+        assert warms == [("autotune", 0)]
 
 
 def _peer(trace=None):
