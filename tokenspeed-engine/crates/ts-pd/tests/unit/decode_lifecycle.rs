@@ -74,6 +74,82 @@ fn event(peer: &mut DecodePeer, mesh: &mut Mesh, group: &Group, expected: PdEven
     until(|| peer.poll(mesh, group).unwrap().contains(&expected));
 }
 
+/// A Prefill control socket that answers each registration, at the endpoint
+/// it names, with the messages `answer` builds from its id and cache
+/// identity; everything it receives is passed on to the returned receiver.
+fn answering_prefill(
+    answer: impl Fn(u64, &str) -> Vec<Vec<bytes::Bytes>> + Send + 'static,
+) -> (Arc<Sockets>, mpsc::Receiver<Vec<bytes::Bytes>>) {
+    let (incoming, arriving) = mpsc::channel::<Vec<bytes::Bytes>>();
+    let (forward, received) = mpsc::channel();
+    let sockets = Arc::new(Sockets::start("127.0.0.1", incoming).unwrap());
+    // Weak: the thread ends once the test drops the socket.
+    let replies = Arc::downgrade(&sockets);
+    thread::spawn(move || {
+        while let Ok(frames) = arriving.recv() {
+            let Some(replies) = replies.upgrade() else {
+                return;
+            };
+            if let (true, Ok(Some(id)), Ok((endpoint, port, cache_id))) = (
+                wire::is_registration(&frames),
+                wire::registration_id(&frames),
+                wire::registration_route(&frames),
+            ) {
+                for reply in answer(id, &cache_id) {
+                    let _ = replies.send(&endpoint, port, reply);
+                }
+            }
+            let _ = forward.send(frames);
+        }
+    });
+    (sockets, received)
+}
+
+/// A bootstrap server whose single Prefill rank listens at `port`, with its
+/// decode allocation policy if it states one.
+fn bootstrap_to(port: u16, policy: Option<&str>) -> BootstrapServer {
+    let server = BootstrapServer::start(0, Registry::CacheLayouts).unwrap();
+    let mut registration = serde_json::json!({
+        "role": "Prefill", "world_size": 1, "dp_size": 1, "pp_size": 1,
+        "rank_ip": "127.0.0.1", "rank_port": port, "engine_rank": 0,
+        "cache_layout": crate::layout::contract::tests::wire(),
+        "cache_fields_by_stage": [["layer.0.kv", "layer.1.state"]]
+    });
+    if let Some(policy) = policy {
+        registration["decode_allocation_policy"] = policy.into();
+    }
+    http::put_json(
+        &format!("http://127.0.0.1:{}/route", server.port()),
+        &registration,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    server
+}
+
+/// Acknowledge a registration as Prefill rank 0.
+fn acknowledge(id: u64, cache_id: &str) -> Vec<Vec<bytes::Bytes>> {
+    vec![wire::registration_ack_frames(id, cache_id, 0)]
+}
+
+/// Poll until `rid` stopped, within `wait`; returns every event seen.
+fn until_stopped(
+    peer: &mut DecodePeer,
+    mesh: &mut Mesh,
+    group: &Group,
+    rid: &str,
+    wait: Duration,
+) -> Vec<PdEvent> {
+    let deadline = Instant::now() + wait;
+    let mut events = Vec::new();
+    while !events.contains(&PdEvent::Stopped(rid.to_owned())) {
+        assert!(Instant::now() < deadline, "{rid} did not stop: {events:?}");
+        events.extend(peer.poll(mesh, group).unwrap());
+        thread::sleep(Duration::from_millis(5));
+    }
+    events
+}
+
 #[test]
 fn lost_routes_release_workers_on_idle_polls_and_recreate_them_on_demand() {
     let native = NativeLibrary::new();
@@ -82,21 +158,9 @@ fn lost_routes_release_workers_on_idle_polls_and_recreate_them_on_demand() {
     // Each worker owns a Shared reference; returning to this count proves
     // that it exited, rather than merely losing the map's sender.
     let owners = Arc::strong_count(&peer.shared);
-    let (incoming, _received) = mpsc::channel();
-    let sink = Sockets::start("127.0.0.1", incoming).unwrap();
+    let (sink, _received) = answering_prefill(acknowledge);
     for endpoint in 0..4 {
-        let server = BootstrapServer::start(0, Registry::CacheLayouts).unwrap();
-        http::put_json(
-            &format!("http://127.0.0.1:{}/route", server.port()),
-            &serde_json::json!({
-                "role": "Prefill", "world_size": 1, "dp_size": 1, "pp_size": 1,
-                "rank_ip": "127.0.0.1", "rank_port": sink.port(), "engine_rank": 0,
-                "cache_layout": crate::layout::contract::tests::wire(),
-                "cache_fields_by_stage": [["layer.0.kv", "layer.1.state"]]
-            }),
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let server = bootstrap_to(sink.port(), None);
         for attempt in 0..2 {
             let rid = format!("request-{endpoint}-{attempt}");
             let info = bootstrap(server.port(), endpoint * 2 + attempt);
@@ -181,30 +245,18 @@ fn failed_first_lookups_do_not_leave_workers_behind() {
     }
 }
 
-/// A Prefill node's control socket with what a Decode rank sends it, and the
-/// bootstrap server its rank registered at, with its decode allocation
-/// policy if it states one.
+/// A Prefill node's control socket, acknowledging every registration, with
+/// what a Decode rank sends it, and the bootstrap server its rank registered
+/// at, with its decode allocation policy if it states one.
 fn prefill_node(
     policy: Option<&str>,
-) -> (Sockets, mpsc::Receiver<Vec<bytes::Bytes>>, BootstrapServer) {
-    let (incoming, received) = mpsc::channel();
-    let socket = Sockets::start("127.0.0.1", incoming).unwrap();
-    let server = BootstrapServer::start(0, Registry::CacheLayouts).unwrap();
-    let mut registration = serde_json::json!({
-        "role": "Prefill", "world_size": 1, "dp_size": 1, "pp_size": 1,
-        "rank_ip": "127.0.0.1", "rank_port": socket.port(), "engine_rank": 0,
-        "cache_layout": crate::layout::contract::tests::wire(),
-        "cache_fields_by_stage": [["layer.0.kv", "layer.1.state"]]
-    });
-    if let Some(policy) = policy {
-        registration["decode_allocation_policy"] = policy.into();
-    }
-    http::put_json(
-        &format!("http://127.0.0.1:{}/route", server.port()),
-        &registration,
-        Duration::from_secs(2),
-    )
-    .unwrap();
+) -> (
+    Arc<Sockets>,
+    mpsc::Receiver<Vec<bytes::Bytes>>,
+    BootstrapServer,
+) {
+    let (socket, received) = answering_prefill(acknowledge);
+    let server = bootstrap_to(socket.port(), policy);
     (socket, received, server)
 }
 
@@ -395,4 +447,118 @@ fn a_heartbeat_repeats_a_bounded_number_of_announcements_and_covers_every_room_i
     }
     assert_eq!(peer.shared.announce_waiting(212), 0);
     assert_eq!(announced(1), BTreeSet::from([299]));
+}
+
+#[test]
+fn replies_for_another_cache_id_or_rank_do_not_settle_a_registration() {
+    let native = NativeLibrary::new();
+    let (mut peer, _outbox, mut mesh, group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    let (prefill, _received) = answering_prefill(|id, cache_id| {
+        vec![
+            wire::registration_ack_frames(id, "another-cache", 0),
+            wire::registration_ack_frames(id + 1, cache_id, 0),
+            wire::registration_ack_frames(id, cache_id, 1),
+            wire::registration_reject_frames(id, "another-cache", 0, "stale"),
+            wire::registration_reject_frames(id, cache_id, 1, "not a target"),
+        ]
+    });
+    let server = bootstrap_to(prefill.port(), None);
+    let started = Instant::now();
+    peer.register("stray", &bootstrap(server.port(), 1))
+        .unwrap();
+    let events = until_stopped(
+        &mut peer,
+        &mut mesh,
+        &group,
+        "stray",
+        REGISTRATION_TIMEOUT + Duration::from_secs(5),
+    );
+    // Only the deadline ended it: no stray reply settled it either way.
+    assert!(started.elapsed() >= REGISTRATION_TIMEOUT);
+    assert!(!events.contains(&PdEvent::Bootstrapped("stray".to_owned())));
+    assert!(peer.shared.state().connections.is_empty());
+}
+
+#[test]
+fn a_rejected_registration_fails_its_room_at_once() {
+    let native = NativeLibrary::new();
+    let (mut peer, _outbox, mut mesh, group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    let (prefill, _received) = answering_prefill(|id, cache_id| {
+        vec![wire::registration_reject_frames(
+            id,
+            cache_id,
+            0,
+            "incompatible layout",
+        )]
+    });
+    let server = bootstrap_to(prefill.port(), None);
+    peer.register("rejected", &bootstrap(server.port(), 1))
+        .unwrap();
+    let events = until_stopped(
+        &mut peer,
+        &mut mesh,
+        &group,
+        "rejected",
+        REGISTRATION_TIMEOUT / 2,
+    );
+    assert!(!events.contains(&PdEvent::Bootstrapped("rejected".to_owned())));
+    assert!(peer.shared.state().connections.is_empty());
+}
+
+#[test]
+fn a_full_control_queue_delays_a_registration_instead_of_failing_its_room() {
+    let native = NativeLibrary::new();
+    let (mut peer, _outbox, mut mesh, group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    let (prefill, _received) = answering_prefill(acknowledge);
+    // A relay in front of the Prefill socket leaves its first connection
+    // silent, so the queue behind it fills until the connect deadline drops
+    // that connection with its backlog; later connections are relayed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay = listener.local_addr().unwrap().port();
+    let target = prefill.port();
+    thread::spawn(move || {
+        let mut silent = Vec::new();
+        for (index, client) in listener.incoming().enumerate() {
+            let Ok(client) = client else { return };
+            if index == 0 {
+                silent.push(client);
+                continue;
+            }
+            let server = std::net::TcpStream::connect(("127.0.0.1", target)).unwrap();
+            for (mut from, mut to) in [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ] {
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut from, &mut to);
+                    let _ = to.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        }
+    });
+    let mut queued = 0;
+    while peer
+        .shared
+        .transport
+        .sockets
+        .send("127.0.0.1", relay, vec![crate::net::ascii(queued)])
+        .is_ok()
+    {
+        queued += 1;
+        assert!(queued <= 4096, "the control queue never filled");
+    }
+    let server = bootstrap_to(relay, None);
+    peer.register("queued", &bootstrap(server.port(), 1))
+        .unwrap();
+    let deadline = Instant::now() + REGISTRATION_TIMEOUT;
+    let mut events = Vec::new();
+    while !events.contains(&PdEvent::Bootstrapped("queued".to_owned())) {
+        assert!(Instant::now() < deadline, "not connected: {events:?}");
+        events.extend(peer.poll(&mut mesh, &group).unwrap());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(events, [PdEvent::Bootstrapped("queued".to_owned())]);
 }
