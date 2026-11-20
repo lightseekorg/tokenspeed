@@ -197,11 +197,14 @@ def _use_warp_pipeline(
 def _launch_options(
     num_warps: int, *, element_size: int, window_left: int, single_request: bool
 ) -> dict:
-    """Compile options of an extend launch with num_warps waves a work-group,
-    K/V elements of element_size bytes and window_left (-1: full attention):
-    the 8-wave tile of a one-request batch (single_request) under full
-    attention with FP8 K/V also takes four waves a SIMD. The warm-up
-    compiles both values of single_request, so no launch compiles."""
+    """Compile options of an extend launch.
+
+    The launch has num_warps waves a work-group, K/V elements of
+    element_size bytes and window_left (-1: full attention). The 8-wave tile
+    of a one-request batch (single_request) under full attention with FP8
+    K/V also takes four waves a SIMD. The warm-up compiles both values of
+    single_request, so no launch compiles.
+    """
     options = dict(num_warps=num_warps, **extern_compile_options())
     if (
         num_warps == _WARP_PIPELINE_NUM_WARPS
@@ -1859,14 +1862,13 @@ def _extend(
                 limit = min(
                     2 * num_kv_splits, MAX_KV_SPLITS, builtins.max(1, num_pages // 2)
                 )
-                num_kv_splits = min(
-                    range(1, limit + 1),
-                    key=lambda splits: (
-                        triton.cdiv(eight_wave_groups * splits, _GFX950_SM_COUNT)
-                        / splits,
-                        splits,
-                    ),
-                )
+
+                def split_cost(splits: int) -> tuple[float, int]:
+                    # Rounds of the CUs per split, then the split count.
+                    rounds = triton.cdiv(eight_wave_groups * splits, _GFX950_SM_COUNT)
+                    return rounds / splits, splits
+
+                num_kv_splits = min(range(1, limit + 1), key=split_cost)
 
     # Bound on q-blocks with query rows: the dense count plus one partial
     # block for each further request.
