@@ -219,6 +219,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
+            table_layout=config.ple_table_layout,
             prefix=table_prefix,
         )
         if self.ple_layer_index == 0 and offload_embedding:

@@ -71,12 +71,15 @@ def ple_host_gather(
     vocab_end: int,
     scale: float | None,
     row_scale: torch.Tensor | None,
+    *,
+    shard_ptrs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather global n-gram IDs from a sharded table in pinned host memory.
 
     Args:
-        table: Contiguous page-locked CPU table shaped ``[local_vocab, head_dim]``.
-            Its mapped address must be accessible to the GPU.
+        table: Contiguous mapped host table shaped ``[local_vocab, head_dim]``.
+            May be a page-locked CPU tensor or a zero-copy CUDA alias of shared
+            host storage. A CUDA alias does not imply that the bytes occupy HBM.
         ids: Device int64 global row IDs in any shape; flattened for lookup.
         out: Device output with ``ids.numel() * head_dim`` elements, reshapeable
             to ``[ids.numel(), head_dim]``. Rows outside this shard are zeroed.
@@ -86,7 +89,10 @@ def ple_host_gather(
             ``None`` when using per-row scaling or compute-dtype storage.
         row_scale: Device tensor with one dequantization factor per local row
             for an online-quantized FP8 table, or ``None`` for scalar scaling
-            or compute-dtype storage. At most one scale mode is used.
+            or compute-dtype storage. With shard_ptrs this contains device-visible
+            base addresses for the per-shard scale buffers.
+        shard_ptrs: Optional device int64 array of mapped shard addresses in vocab order.
+            All shards have the same physical row count as table, including padding.
 
     Returns:
         The supplied ``out`` tensor, filled with gathered and dequantized rows.
@@ -97,7 +103,11 @@ def ple_host_gather(
         return out
     head_dim = out.shape[-1]
     _ple_host_gather_kernel[(rows,)](
-        current_platform().device_visible_data_ptr(table),
+        (
+            current_platform().device_visible_data_ptr(table)
+            if shard_ptrs is None
+            else shard_ptrs
+        ),
         ids.reshape(-1),
         scale if scale is not None else 1.0,
         row_scale if row_scale is not None else out,
@@ -105,6 +115,7 @@ def ple_host_gather(
         head_dim,
         vocab_start,
         vocab_end,
+        SHARD_ROWS=table.shape[0] if shard_ptrs is not None else 0,
         IS_FP8=table.dtype == torch.float8_e4m3fn,
         HAS_SCALE=row_scale is not None or scale is not None,
         ROW_SCALE=row_scale is not None,

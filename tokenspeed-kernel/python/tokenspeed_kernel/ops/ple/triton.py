@@ -308,6 +308,7 @@ def _ple_host_gather_kernel(
     HAS_SCALE: tl.constexpr,
     ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SHARD_ROWS: tl.constexpr = 0,
 ):
     """Gather one n-gram row per program straight out of pinned host memory.
 
@@ -327,10 +328,16 @@ def _ple_host_gather_kernel(
     it here -- before the reduce -- stays correct under tensor parallelism.
     """
 
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     global_id = tl.load(ids_ptr + row)
     in_range = (global_id >= vocab_start) & (global_id < vocab_end)
     local_id = tl.where(in_range, global_id - vocab_start, 0)
+    if SHARD_ROWS:
+        owner = local_id // SHARD_ROWS
+        local_id = local_id % SHARD_ROWS
+        table_address = tl.load(table_address + owner)
+        if ROW_SCALE:
+            scale_ptr = tl.load(scale_ptr + owner).to(tl.pointer_type(tl.float32))
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < head_dim
     out_dtype = out_ptr.dtype.element_ty
