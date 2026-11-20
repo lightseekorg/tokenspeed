@@ -1320,6 +1320,22 @@ def _heads_to_owners_applies(
     )
 
 
+def _heads_refusal(cause: str) -> str:
+    return (
+        "--owned-attention-output all-to-all needs Muse Spark's Iris owned-row "
+        f"prefill, which this server does not run ({cause}); serve with "
+        "--owned-attention-output reduce-scatter"
+    )
+
+
+def _payload_refusal(cause: str) -> str:
+    return (
+        "--prefill-collective-payload int8-block16 needs Muse Spark's Iris "
+        f"owned-row prefill, which this server does not run ({cause}); serve with "
+        "--prefill-collective-payload bf16"
+    )
+
+
 def _collective_payload(forward_mode: ForwardMode) -> str:
     """The payload encoding of an owned-row collective: the
     --prefill-collective-payload choice for extend forwards; decode (and
@@ -3478,28 +3494,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         heads_to_owners = any(
             layer.self_attn.owned_heads_to_owners for layer in self.model.layers
         )
-        if heads_to_owners and (
-            unprepared is not None or max_num_tokens < MUSE_OWNED_ROWS_MIN_TOKENS
-        ):
+        if heads_to_owners and unprepared is not None:
             # The flag would gather every output projection and refuse weight
             # updates while never running: refuse it instead.
-            raise RuntimeError(
-                "--owned-attention-output all-to-all needs Muse Spark's Iris "
-                f"owned-row prefill, which this server does not run ("
-                f"{unprepared or f'max forward tokens {max_num_tokens} below {MUSE_OWNED_ROWS_MIN_TOKENS}'}); "
-                "serve with --owned-attention-output reduce-scatter"
-            )
-        if global_server_args_dict["prefill_collective_payload"] != "bf16" and (
-            unprepared is not None or max_num_tokens < MUSE_OWNED_ROWS_MIN_TOKENS
+            raise RuntimeError(_heads_refusal(f"Iris is not prepared: {unprepared}"))
+        if (
+            global_server_args_dict["prefill_collective_payload"] != "bf16"
+            and unprepared is not None
         ):
             # The payload encodes only Iris owned-row collectives; refuse a
             # flag that would never apply.
-            raise RuntimeError(
-                "--prefill-collective-payload int8-block16 needs Muse Spark's Iris "
-                f"owned-row prefill, which this server does not run ("
-                f"{unprepared or f'max forward tokens {max_num_tokens} below {MUSE_OWNED_ROWS_MIN_TOKENS}'}); "
-                "serve with --prefill-collective-payload bf16"
-            )
+            raise RuntimeError(_payload_refusal(f"Iris is not prepared: {unprepared}"))
         if unprepared is not None:
             if self.model.config.decode_monokernel:
                 # The launches' mailbox scratch lives on the Iris heap that
@@ -3577,6 +3582,26 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         ):
             raise RuntimeError(
                 "Muse communication was prepared below the requested capacity"
+            )
+        if (
+            global_server_args_dict["prefill_collective_payload"] != "bf16"
+            and state.payload_codes is None
+        ):
+            # Prepared Iris without the payload buffers: the owned-row layout
+            # cannot serve these forwards (too few rows for its row boundary),
+            # so the flag would never apply.
+            raise RuntimeError(
+                _payload_refusal(
+                    f"no owned-row layout for forwards of up to {max_num_tokens} tokens"
+                )
+            )
+        if heads_to_owners and not state.can_use_owned_rows(MUSE_OWNED_ROWS_MIN_TOKENS):
+            # Prepared Iris whose owned-row layout serves no forward here (too
+            # few rows for its row boundary): the all-to-all would never run.
+            raise RuntimeError(
+                _heads_refusal(
+                    f"no owned-row layout for forwards of up to {max_num_tokens} tokens"
+                )
             )
         self.model.iris_state = state
         # Startup might not reduce any payload in the two-shot pull's window.

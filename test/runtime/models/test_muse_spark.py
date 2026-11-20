@@ -1530,6 +1530,78 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
         MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("prefill_collective_payload", "int8-block16"),
+        ("owned_attention_output", "all-to-all"),
+        ("owned_rows_max_tokens", 24576),
+    ],
+)
+def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
+    tmp_path, flag: str, value
+) -> None:
+    """The three owned-row prefill flags apply to Muse Spark only: off their
+    defaults, another architecture's checkpoint is refused."""
+    import json
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"]})
+    )
+    args = ServerArgs(model="x")
+    args.model = str(tmp_path)
+    setattr(args, flag, value)
+    with pytest.raises(ValueError, match="apply to Muse Spark"):
+        args.resolve_model_defaults()
+    setattr(args, flag, ServerArgs.__dataclass_fields__[flag].default)
+    args.resolve_model_defaults()
+
+
+def test_heads_all_to_all_without_iris_fails_startup_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--owned-attention-output all-to-all runs only on Iris owned rows: a
+    server whose Iris cannot be prepared refuses it at startup instead of
+    gathering output weights it would never use."""
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(owned_heads_to_owners=True),
+        mlp=SimpleNamespace(down_columns=None),
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[layer],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
+def test_int8_payload_without_iris_fails_startup_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prefill-collective-payload int8-block16 encodes only Iris owned-row
+    collectives: a server whose Iris cannot be prepared refuses it at startup
+    instead of serving with the flag inert."""
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", "int8-block16"
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
 @requires_gpu
 def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
     bf16_default_dtype,
@@ -2131,6 +2203,8 @@ def test_owned_row_flags_are_validated_in_server_args() -> None:
         ServerArgs(
             model="x", owned_attention_output="all-to-all", numerics="rl-bitwise"
         )
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(model="x", owned_rows_max_tokens=24576, numerics="rl-bitwise")
     assert ServerArgs(model="x").owned_rows_max_tokens == 8192
     assert (
         ServerArgs(model="x", owned_rows_max_tokens=24576).owned_rows_max_tokens
