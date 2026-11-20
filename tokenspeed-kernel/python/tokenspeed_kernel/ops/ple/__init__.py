@@ -72,6 +72,7 @@ def ple_host_gather(
     row_scale: torch.Tensor | None,
     *,
     table_shards: int,
+    shard_ptrs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather global n-gram IDs from a sharded table in pinned host memory.
 
@@ -88,7 +89,10 @@ def ple_host_gather(
             ``None`` when using per-row scaling or compute-dtype storage.
         row_scale: Device tensor with one dequantization factor per local row
             for an online-quantized FP8 table, or ``None`` for scalar scaling
-            or compute-dtype storage. At most one scale mode is used.
+            or compute-dtype storage. With shard_ptrs this contains device-visible
+            base addresses for the per-shard scale buffers.
+        shard_ptrs: Optional device int64 array of mapped shard addresses in vocab order.
+            All shards have the same physical row count as table, including padding.
         table_shards: Number of table partitions, or one for a complete table.
             Large lookups can be sorted when the table has one partition.
 
@@ -103,7 +107,7 @@ def ple_host_gather(
         return out
     head_dim = out.shape[-1]
     flat_ids = ids.reshape(-1)
-    if table_shards == 1 and rows >= 131072:
+    if shard_ptrs is None and table_shards == 1 and rows >= 131072:
         block_rows = 32
         sms = torch.cuda.get_device_properties(ids.device).multi_processor_count
         grid = min(_triton.cdiv(rows, block_rows), sms)
@@ -130,7 +134,11 @@ def ple_host_gather(
         return out
     block_rows = 4 if rows >= 256 else 1
     _ple_host_gather_kernel[(_triton.cdiv(rows, block_rows),)](
-        current_platform().device_visible_data_ptr(table),
+        (
+            current_platform().device_visible_data_ptr(table)
+            if shard_ptrs is None
+            else shard_ptrs
+        ),
         flat_ids,
         scale if scale is not None else 1.0,
         row_scale if row_scale is not None else out,
@@ -139,6 +147,7 @@ def ple_host_gather(
         vocab_start,
         vocab_end,
         rows,
+        SHARD_ROWS=table.shape[0] if shard_ptrs is not None else 0,
         IS_FP8=table.dtype == torch.float8_e4m3fn,
         HAS_SCALE=row_scale is not None or scale is not None,
         ROW_SCALE=row_scale is not None,

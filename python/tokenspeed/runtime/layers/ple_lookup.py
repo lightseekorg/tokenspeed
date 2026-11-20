@@ -78,12 +78,20 @@ _PLE_FP8_MAX = 448.0  # torch.float8_e4m3fn finite maximum
 _PLE_QUANT_CHUNK_ELEMENTS = 1 << 20
 
 
-def materialize_ngram_table_on_host(embedding: VocabParallelEmbedding) -> None:
+def materialize_ngram_table_on_host(
+    embedding: VocabParallelEmbedding, storage: torch.Tensor | None = None
+) -> None:
     """Give a meta-constructed n-gram table page-locked host storage."""
 
     source = embedding.weight
     host_weight = nn.Parameter(
-        torch.empty(source.shape, dtype=source.dtype, device="cpu", pin_memory=True),
+        (
+            storage
+            if storage is not None
+            else torch.empty(
+                source.shape, dtype=source.dtype, device="cpu", pin_memory=True
+            )
+        ),
         requires_grad=False,
     )
     for name, value in vars(source).items():
@@ -125,6 +133,7 @@ class PLELookup(nn.Module):
         storage_dtype: torch.dtype | None,
         output_dtype: torch.dtype,
         offload: bool,
+        table_layout: str,
         enable_hot_cache: bool,
         prefix: str,
     ):
@@ -145,11 +154,29 @@ class PLELookup(nn.Module):
             raise ValueError("Unsupported PLE compute dtype")
         if offload and not torch.cuda.is_available():
             raise RuntimeError("PLE host offloading requires CUDA UVA")
-        self.has_dp = mapping.attn.has_dp
+        if table_layout not in (
+            "global_sharded",
+            "attn_tp_sharded",
+            "shared",
+            "peer_sharded",
+        ):
+            raise ValueError(f"Unsupported PLE table layout: {table_layout}")
+        mapped = table_layout in ("shared", "peer_sharded")
+        if table_layout == "peer_sharded" and enable_hot_cache:
+            raise ValueError(
+                "--enable-ple-hot-cache cannot read peer_sharded PLE tables"
+            )
+        if mapped and not offload:
+            raise ValueError(f"PLE layout {table_layout} requires host offloading")
+        self.gather_dp_ids = mapping.attn.has_dp and table_layout == "global_sharded"
+        self.shared_table = None
+        self.peer_ptrs = None
         self.dp_group = mapping.attn.dp_group
         self.dp_rank = self.dp_group.index(mapping.rank)
         self.table_group = (
-            mapping.attn.world_group if self.has_dp else mapping.attn.tp_group
+            mapping.attn.tp_group
+            if table_layout == "attn_tp_sharded"
+            else mapping.attn.world_group
         )
         self.table_rank = self.table_group.index(mapping.rank)
         self.ngram_heads = ngram_heads
@@ -169,11 +196,24 @@ class PLELookup(nn.Module):
                 org_num_embeddings=vocab_size,
                 params_dtype=storage_dtype or output_dtype,
                 prefix=prefix,
-                tp_rank=self.table_rank,
-                tp_size=len(self.table_group),
-                tp_group=self.table_group,
+                tp_rank=0 if table_layout == "shared" else self.table_rank,
+                tp_size=1 if table_layout == "shared" else len(self.table_group),
+                tp_group=(
+                    (mapping.rank,) if table_layout == "shared" else self.table_group
+                ),
             )
-        if offload:
+        if mapped:
+            from tokenspeed.runtime.layers.ple_shared_table import PLESharedTable
+
+            self.shared_table = PLESharedTable(
+                mapping, self.ngram_embedding.weight, table_layout
+            )
+            self.peer_ptrs = self.shared_table.peer_ptrs
+            materialize_ngram_table_on_host(
+                self.ngram_embedding, self.shared_table.weight
+            )
+            self.ngram_embedding.weight.ple_shared_storage = True
+        elif offload:
             materialize_ngram_table_on_host(self.ngram_embedding)
         self._compute_device = (
             torch.device("cuda", torch.cuda.current_device())
@@ -197,7 +237,7 @@ class PLELookup(nn.Module):
             )
 
     def make_layout(self, global_num_tokens, local_tokens: int) -> LookupTokenLayout:
-        if not self.has_dp:
+        if not self.gather_dp_ids:
             return LookupTokenLayout((local_tokens,))
         if global_num_tokens is None or len(global_num_tokens) <= max(self.dp_group):
             raise ValueError("Global PLE lookup requires global-rank token extents")
@@ -207,12 +247,12 @@ class PLELookup(nn.Module):
 
     def _gather_ids(self, ids, layout):
         sizes = layout.physical_extents
-        if len(sizes) != (len(self.dp_group) if self.has_dp else 1):
+        if len(sizes) != (len(self.dp_group) if self.gather_dp_ids else 1):
             raise ValueError("PLE token layout does not match the DP group")
-        rank = self.dp_rank if self.has_dp else 0
+        rank = self.dp_rank if self.gather_dp_ids else 0
         if ids.shape[0] > sizes[rank]:
             raise ValueError("PLE query rows exceed the DP token layout")
-        if not self.has_dp:
+        if not self.gather_dp_ids:
             return ids, slice(0, ids.shape[0])
         start = sum(sizes[:rank])
         local_slice = slice(start, start + ids.shape[0])
@@ -343,6 +383,21 @@ class PLELookup(nn.Module):
         happens inside the kernel instead of materializing an fp32 temporary.
         """
         scale = self._checkpoint_weight_scale if self.embed_store_dtype else None
+        if self.peer_ptrs is not None:
+            from tokenspeed_kernel.ops.ple import ple_host_gather
+
+            table = self.ngram_embedding
+            return ple_host_gather(
+                table.weight,
+                ids,
+                out.view(-1, self.head_dim),
+                0,
+                table.org_vocab_size,
+                scale,
+                None,
+                table_shards=table.tp_size,
+                shard_ptrs=self.peer_ptrs,
+            ).view_as(out)
         host_gather_ngram_rows(
             self.ngram_embedding,
             ids,
@@ -354,7 +409,11 @@ class PLELookup(nn.Module):
     def reduce_lookup(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Combine per-rank shard contributions of a gathered lookup."""
 
-        if self.ngram_embedding.tp_size > 1 and embeddings.numel():
+        if (
+            self.shared_table is None
+            and self.ngram_embedding.tp_size > 1
+            and embeddings.numel()
+        ):
             return _all_reduce(embeddings, self.ngram_embedding.tp_group)
         return embeddings
 
@@ -462,8 +521,9 @@ class PLELookup(nn.Module):
         the table, which is required when ``split_parts`` is greater than 1;
         raises ``ValueError`` when a split table was not prescanned.
         """
-        rows = self.shard_rows(weight, shard_index, split_parts)
-        if rows is not None and self._host_cache is not None:
+        writer = self.shared_table is None or self.shared_table.is_writer
+        rows = self.shard_rows(weight, shard_index, split_parts) if writer else None
+        if self._host_cache is not None and (rows is not None or not writer):
             self._host_cache.invalidate()
         if self.needs_online_quantization(weight):
             if not prescanned:
@@ -498,5 +558,8 @@ class PLELookup(nn.Module):
             # scale tensor. Future shard copies multiply by the new value.
             if self._host_cache is not None:
                 self._host_cache.invalidate()
-            self.ngram_embedding.weight.data.mul_(scale / self._checkpoint_weight_scale)
+            if self.shared_table is None or self.shared_table.is_writer:
+                self.ngram_embedding.weight.data.mul_(
+                    scale / self._checkpoint_weight_scale
+                )
         self._checkpoint_weight_scale = scale
