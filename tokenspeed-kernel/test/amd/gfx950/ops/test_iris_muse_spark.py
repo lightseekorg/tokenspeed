@@ -3611,11 +3611,13 @@ def test_int8_block16_encode_matches_the_reference_bit_for_bit():
         assert torch.equal(
             device_scales.cpu().view(torch.int32), scales.view(torch.int32)
         ), name
+        # Decode on the host, as the reference does: this test is about the
+        # encoder's codes and scales, and the collectives' tests cover the
+        # kernels' own decode.
         device_decoded = (
-            (device_codes.float().view(-1, 16) * device_scales.view(-1, 1))
+            (device_codes.cpu().float().view(-1, 16) * device_scales.cpu().view(-1, 1))
             .bfloat16()
             .reshape(-1)
-            .cpu()
         )
         assert torch.equal(device_decoded.view(torch.int16), decoded.view(torch.int16))
 
