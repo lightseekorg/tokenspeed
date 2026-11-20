@@ -21,7 +21,11 @@
 //! The Mooncake store as an L3 store: zero-copy gets and puts against the
 //! registered Host pool, as SGLang's HiCache and vLLM's connector use it.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use ts_mooncake::store::{regex_escape, Store as Client, StoreLibrary, StoreSetup};
 
@@ -37,11 +41,77 @@ const OBJECT_ALREADY_EXISTS: i32 = -705;
 /// `NO_AVAILABLE_HANDLE`: the master's allocation rejection, before any
 /// source transfer.
 const NO_AVAILABLE_HANDLE: i32 = -200;
+/// Ownership rejection before transfer, or at End after source reads finish.
+const ILLEGAL_CLIENT: i32 = -601;
+const RPC_FAIL: i32 = -900;
+const RPC_TIMEOUT: i32 = -901;
 
 /// A store client with the Host pool registered.
 pub struct MooncakeStore {
     client: Client,
     host: HostBuffer,
+    in_flight_puts: InFlightPuts,
+}
+
+/// One Store client is shared by several workers. Keep its concurrent writes
+/// to the same complete object key from reusing that client's write ownership.
+#[derive(Default)]
+struct InFlightPuts {
+    keys: Mutex<HashSet<String>>,
+}
+
+struct PutClaim<'a> {
+    registry: &'a InFlightPuts,
+    entries: Vec<(usize, String)>,
+    release_on_drop: bool,
+}
+
+impl InFlightPuts {
+    fn claim<'a>(&'a self, keys: &[String], candidates: &[usize]) -> PutClaim<'a> {
+        let mut claimed = self.keys.lock().expect("Mooncake in-flight PUT lock");
+        let entries = candidates
+            .iter()
+            .filter_map(|&index| {
+                claimed
+                    .insert(keys[index].clone())
+                    .then(|| (index, keys[index].clone()))
+            })
+            .collect();
+        PutClaim {
+            registry: self,
+            entries,
+            release_on_drop: true,
+        }
+    }
+}
+
+impl PutClaim<'_> {
+    fn native_started(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    fn native_finished(&mut self, source_retired: bool, results: &[i32]) {
+        // A timeout/lost response may leave an old End RPC running. Source
+        // retirement releases Host bytes, but does not authorize another write
+        // with the same client identity while that control result is unknown.
+        self.release_on_drop =
+            source_retired && !results.iter().any(|r| [RPC_FAIL, RPC_TIMEOUT].contains(r));
+    }
+}
+
+impl Drop for PutClaim<'_> {
+    fn drop(&mut self) {
+        if !self.release_on_drop {
+            // The executor quarantines the source too. Do not let another
+            // worker begin a new write while the old native access is unknown.
+            return;
+        }
+        // A guard can drop during unwinding; another panic would abort.
+        let mut claimed = self.registry.keys.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, key) in &self.entries {
+            claimed.remove(key);
+        }
+    }
 }
 
 impl MooncakeStore {
@@ -62,7 +132,11 @@ impl MooncakeStore {
             segment = setup.global_segment_size,
             "Mooncake Store L3 ready"
         );
-        Ok(Self { client, host })
+        Ok(Self {
+            client,
+            host,
+            in_flight_puts: InFlightPuts::default(),
+        })
     }
 
     fn addresses(host: HostBuffer, ranges: &[Range]) -> (Vec<usize>, Vec<usize>) {
@@ -102,23 +176,48 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
     }
 }
 
-/// A PUT's outcome: the objects that already `exist` succeed without a
-/// write, and each `missing` key takes its write's result. An existing
-/// object (another writer's) is a success; an allocation rejection retires
-/// as a failure the scheduler offers again; other errors do not prove that
-/// the source bytes are no longer read.
-fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
-    let mut success = exists;
+/// A duplicate PUT is published only if a metadata query confirms it readable.
+/// Native lifetime evidence is independent of publication. The legacy Host
+/// C ABI uses the default reliable memory policy: End follows all successful
+/// transfers, and a failed transfer is not hidden by a later Revoke rejection.
+/// Thus ILLEGAL_CLIENT retires sources without proving publication. Unknown
+/// results in the same batch, or explicit negative lifetime evidence, do not.
+fn put_outcome(
+    published: Vec<bool>,
+    missing: &[usize],
+    results: &[i32],
+    source_retired: Option<bool>,
+) -> IoResult {
+    let mut success = published;
     for (&index, &result) in missing.iter().zip(results) {
-        success[index] = result == 0 || result == OBJECT_ALREADY_EXISTS;
+        success[index] = if publication_needs_query(result, source_retired) {
+            success[index]
+        } else {
+            result == 0
+        };
     }
     IoResult {
         object_failures: vec![false; success.len()],
         success,
-        retired: results
-            .iter()
-            .all(|&result| [0, OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE].contains(&result)),
+        retired: source_retired.unwrap_or_else(|| {
+            results.iter().all(|&result| {
+                [
+                    0,
+                    OBJECT_ALREADY_EXISTS,
+                    NO_AVAILABLE_HANDLE,
+                    ILLEGAL_CLIENT,
+                ]
+                .contains(&result)
+            })
+        }),
     }
+}
+
+fn publication_needs_query(result: i32, source_retired: Option<bool>) -> bool {
+    // The legacy SDK also turns a duplicate's ALREADY_EXISTS into zero, even
+    // when the other writer has not published. The v1 extension preserves that
+    // rejection and reserves zero for this write's successful End.
+    result == OBJECT_ALREADY_EXISTS || (result == 0 && source_retired.is_none())
 }
 
 /// The objects of the namespace `prefix`, as the store's regular expression.
@@ -181,7 +280,7 @@ impl Store for MooncakeStore {
         }
         // A metadata failure precedes any access to the source bytes: no
         // write starts, and nothing is left reading them.
-        let exists = match self.batch_exists(keys) {
+        let mut exists = match self.batch_exists(keys) {
             Ok(exists) => exists,
             Err(error) => {
                 tracing::error!(%error, "Mooncake existence query before PUT failed");
@@ -192,18 +291,45 @@ impl Store for MooncakeStore {
                 });
             }
         };
-        let missing: Vec<usize> = (0..keys.len()).filter(|&i| !exists[i]).collect();
+        let candidates: Vec<usize> = (0..keys.len()).filter(|&i| !exists[i]).collect();
+        let mut claim = self.in_flight_puts.claim(keys, &candidates);
+        let missing: Vec<usize> = claim.entries.iter().map(|(index, _)| *index).collect();
         if missing.is_empty() {
-            return Ok(put_outcome(exists, &missing, &[]));
+            return Ok(put_outcome(exists, &missing, &[], Some(true)));
         }
         let put_keys: Vec<String> = missing.iter().map(|&i| keys[i].clone()).collect();
         let put_ranges: Vec<Range> = missing.iter().map(|&i| ranges[i]).collect();
         let (addrs, sizes) = Self::addresses(host, &put_ranges);
-        let results = self
+        claim.native_started();
+        let outcome = self
             .client
-            .batch_put_from(&put_keys, &addrs, &sizes)
+            .batch_put_from_with_retirement(&put_keys, &addrs, &sizes)
             .map_err(failed)?;
-        Ok(put_outcome(exists, &missing, &results))
+        // A duplicate may still be in progress. Legacy SDKs can also collapse
+        // that rejection into zero, so both legacy statuses need confirmation.
+        let unconfirmed: Vec<usize> = outcome
+            .results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &result)| {
+                publication_needs_query(result, outcome.source_retired).then_some(i)
+            })
+            .collect();
+        if !unconfirmed.is_empty() {
+            let unconfirmed_keys: Vec<String> =
+                unconfirmed.iter().map(|&i| put_keys[i].clone()).collect();
+            match self.batch_exists(&unconfirmed_keys) {
+                Ok(published) => {
+                    for (&i, readable) in unconfirmed.iter().zip(published) {
+                        exists[missing[i]] = readable;
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "PUT publication is unconfirmed"),
+            }
+        }
+        let result = put_outcome(exists, &missing, &outcome.results, outcome.source_retired);
+        claim.native_finished(result.retired, &outcome.results);
+        Ok(result)
     }
 
     fn remove_by_prefix(&self, prefix: &str) -> bool {
@@ -236,17 +362,103 @@ impl Store for MooncakeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn put_claims_filter_only_overlapping_objects_and_release_before_submission() {
+        let registry = InFlightPuts::default();
+        let keys = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "a".to_owned(),
+        ];
+        let first = registry.claim(&keys, &[0, 1, 3]);
+        assert_eq!(first.entries, [(0, "a".to_owned()), (1, "b".to_owned())]);
+        let second = registry.claim(&keys, &[1, 2]);
+        assert_eq!(second.entries, [(2, "c".to_owned())]);
+        drop(first); // No native call occurred, including an early local error.
+        let next = registry.claim(&keys, &[0, 1, 2]);
+        assert_eq!(next.entries, [(0, "a".to_owned()), (1, "b".to_owned())]);
+        drop(next);
+        drop(second);
+        assert!(registry.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_put_claims_are_released_only_with_retirement_evidence() {
+        for retired in [true, false] {
+            let registry = InFlightPuts::default();
+            let keys = vec!["a".to_owned()];
+            let mut claim = registry.claim(&keys, &[0]);
+            claim.native_started();
+            claim.native_finished(retired, &[0]);
+            drop(claim);
+            let next = registry.claim(&keys, &[0]);
+            assert_eq!(next.entries.is_empty(), !retired);
+        }
+    }
+
+    #[test]
+    fn source_retirement_does_not_release_a_claim_with_an_unknown_end_rpc() {
+        for result in [RPC_FAIL, RPC_TIMEOUT] {
+            let registry = InFlightPuts::default();
+            let keys = vec!["a".to_owned()];
+            let mut claim = registry.claim(&keys, &[0]);
+            claim.native_started();
+            let outcome = put_outcome(vec![false], &[0], &[result], Some(true));
+            assert_eq!(outcome.success, [false]);
+            assert!(outcome.retired); // The buffer can be released independently.
+            claim.native_finished(outcome.retired, &[result]);
+            drop(claim);
+            assert!(registry.claim(&keys, &[0]).entries.is_empty());
+            let next_namespace = vec!["v2/a".to_owned()];
+            assert_eq!(registry.claim(&next_namespace, &[0]).entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_workers_claim_one_shared_key_without_serializing_other_keys() {
+        let registry = Arc::new(InFlightPuts::default());
+        let barrier = Arc::new(Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let keys = vec!["shared".to_owned(), format!("private-{worker}")];
+                    barrier.wait();
+                    let claim = registry.claim(&keys, &[0, 1]);
+                    let shared = claim.entries.iter().any(|(index, _)| *index == 0);
+                    assert!(claim.entries.iter().any(|(index, _)| *index == 1));
+                    barrier.wait(); // Every claim stays live until all workers saw it.
+                    shared
+                })
+            })
+            .collect();
+        let shared_writers = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(shared_writers, 1);
+        assert!(registry.keys.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn existing_objects_are_not_rewritten_and_rejections_retire() {
         // `existing` is stored; `saved` writes; `pressure` meets a full
         // store, a failure the scheduler offers again.
-        let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
+        let outcome = put_outcome(
+            vec![true, true, false],
+            &[1, 2],
+            &[0, NO_AVAILABLE_HANDLE],
+            None,
+        );
         assert_eq!(outcome.success, [true, true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false, false, false]);
-        // Another writer's concurrent create is a success.
-        let outcome = put_outcome(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]);
+        // Another writer's create succeeds only after publication is verified.
+        let outcome = put_outcome(vec![true], &[0], &[OBJECT_ALREADY_EXISTS], None);
         assert_eq!(outcome.success, [true]);
         assert!(outcome.retired);
     }
@@ -254,10 +466,78 @@ mod tests {
     #[test]
     fn a_failed_put_does_not_retire() {
         for error in [-1, -800] {
-            let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, error]);
+            let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, error], None);
             assert_eq!(outcome.success, [true, true, false]);
             assert!(!outcome.retired);
         }
+    }
+
+    #[test]
+    fn an_in_progress_duplicate_is_retired_without_publication() {
+        for result in [0, OBJECT_ALREADY_EXISTS] {
+            let outcome = put_outcome(vec![false], &[0], &[result], None);
+            assert_eq!(outcome.success, [false]);
+            assert!(outcome.retired);
+            assert_eq!(outcome.object_failures, [false]);
+        }
+        // V1 has an authoritative successful End, independent of a later query.
+        let outcome = put_outcome(vec![false], &[0], &[0], Some(true));
+        assert_eq!(outcome.success, [true]);
+    }
+
+    #[test]
+    fn publication_confirmation_never_proves_source_retirement() {
+        for result in [0, OBJECT_ALREADY_EXISTS] {
+            let outcome = put_outcome(vec![true], &[0], &[result], Some(false));
+            assert_eq!(outcome.success, [true]);
+            assert!(!outcome.retired);
+        }
+    }
+
+    #[test]
+    fn metadata_rejection_retires_the_default_host_put_unless_native_proof_denies_it() {
+        for (native, retired) in [(None, true), (Some(false), false), (Some(true), true)] {
+            let outcome = put_outcome(vec![true, false], &[0, 1], &[0, ILLEGAL_CLIENT], native);
+            assert_eq!(outcome.success, [true, false]);
+            assert_eq!(outcome.retired, retired);
+            assert_eq!(outcome.object_failures, [false, false]);
+        }
+        // A backend's explicit lack of proof overrides a successful return code.
+        let outcome = put_outcome(vec![false], &[0], &[0], Some(false));
+        assert!(!outcome.retired);
+    }
+
+    #[test]
+    fn a_legacy_owner_rejection_does_not_hide_another_keys_unknown_transfer() {
+        for unknown in [-800, RPC_FAIL, RPC_TIMEOUT, -1] {
+            let outcome = put_outcome(
+                vec![false, false],
+                &[0, 1],
+                &[ILLEGAL_CLIENT, unknown],
+                None,
+            );
+            assert_eq!(outcome.success, [false, false]);
+            assert!(!outcome.retired);
+            assert_eq!(outcome.object_failures, [false, false]);
+        }
+    }
+
+    #[test]
+    fn retired_legacy_owner_rejections_are_failed_writes_without_poisoning_objects() {
+        let outcome = put_outcome(
+            vec![false; 4],
+            &[0, 1, 2, 3],
+            &[
+                ILLEGAL_CLIENT,
+                0,
+                OBJECT_ALREADY_EXISTS,
+                NO_AVAILABLE_HANDLE,
+            ],
+            None,
+        );
+        assert_eq!(outcome.success, [false; 4]);
+        assert!(outcome.retired);
+        assert_eq!(outcome.object_failures, [false; 4]);
     }
 
     #[test]

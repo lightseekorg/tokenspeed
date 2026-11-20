@@ -23,7 +23,8 @@
 //! `tokenspeed-mooncake` ships `libmooncake_store.so` beside its Python
 //! module: upstream's store C ABI (`mooncake/include/store_c.h`), built so
 //! it exports only the `mooncake_store_*` functions, plus TokenSpeed's
-//! `mooncake_store_setup_with_tenant`. The calls behave as the Python
+//! `mooncake_store_setup_with_tenant`. An upstream SDK with only the original
+//! setup entry point supports the default tenant explicitly. The calls behave as the Python
 //! `MooncakeDistributedStore` methods of the same names. The library is
 //! loaded at run time, so an engine without the L3 store never loads it.
 
@@ -41,7 +42,7 @@ pub const STORE_LIBRARY_NAME: &str = "libmooncake_store.so";
 
 type Create = unsafe extern "C" fn() -> *mut c_void;
 type Destroy = unsafe extern "C" fn(*mut c_void);
-type Setup = unsafe extern "C" fn(
+type SetupWithTenant = unsafe extern "C" fn(
     *mut c_void,
     *const c_char,
     *const c_char,
@@ -52,6 +53,22 @@ type Setup = unsafe extern "C" fn(
     *const c_char,
     *const c_char,
 ) -> c_int;
+type SetupDefaultTenant = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const c_char,
+    u64,
+    u64,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+) -> c_int;
+
+#[derive(Clone, Copy)]
+enum Setup {
+    WithTenant(SetupWithTenant),
+    DefaultTenant(SetupDefaultTenant),
+}
 type RegisterBuffer = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> c_int;
 type UnregisterBuffer = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type BatchIsExist =
@@ -74,6 +91,26 @@ type BatchPutFrom = unsafe extern "C" fn(
     *mut c_int,
 ) -> c_int;
 type RemoveByRegex = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> i64;
+type BatchPutFromWithRetirement = unsafe extern "C" fn(
+    *mut c_void,
+    *const *const c_char,
+    *const *mut c_void,
+    *const usize,
+    usize,
+    *const c_void,
+    *mut c_int,
+    *mut u8,
+) -> c_int;
+
+/// Publication results and the native source-buffer lifetime, independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutOutcome {
+    /// Per key, zero for a successful End, or the SDK's negative status.
+    /// Legacy SDKs may also collapse a duplicate rejection into zero.
+    pub results: Vec<i32>,
+    /// None for an SDK without the retirement extension; false means unknown.
+    pub source_retired: Option<bool>,
+}
 
 /// The loaded store library.
 pub struct StoreLibrary {
@@ -86,6 +123,7 @@ pub struct StoreLibrary {
     batch_is_exist: BatchIsExist,
     batch_get_into: BatchGetInto,
     batch_put_from: BatchPutFrom,
+    batch_put_from_with_retirement: Option<BatchPutFromWithRetirement>,
     remove_by_regex: RemoveByRegex,
     /// Keeps the functions above mapped.
     _library: libloading::Library,
@@ -107,9 +145,12 @@ impl StoreLibrary {
                 path: path.to_owned(),
                 create: *library.get(b"mooncake_store_create").map_err(load_error)?,
                 destroy: *library.get(b"mooncake_store_destroy").map_err(load_error)?,
-                setup: *library
-                    .get(b"mooncake_store_setup_with_tenant")
-                    .map_err(load_error)?,
+                setup: match library.get::<SetupWithTenant>(b"mooncake_store_setup_with_tenant") {
+                    Ok(symbol) => Setup::WithTenant(*symbol),
+                    Err(_) => Setup::DefaultTenant(
+                        *library.get(b"mooncake_store_setup").map_err(load_error)?,
+                    ),
+                },
                 register_buffer: *library
                     .get(b"mooncake_store_register_buffer")
                     .map_err(load_error)?,
@@ -125,6 +166,12 @@ impl StoreLibrary {
                 batch_put_from: *library
                     .get(b"mooncake_store_batch_put_from")
                     .map_err(load_error)?,
+                batch_put_from_with_retirement: library
+                    .get::<BatchPutFromWithRetirement>(
+                        b"mooncake_store_batch_put_from_with_retirement_v1",
+                    )
+                    .ok()
+                    .map(|symbol| *symbol),
                 remove_by_regex: *library
                     .get(b"mooncake_store_remove_by_regex")
                     .map_err(load_error)?,
@@ -198,6 +245,14 @@ impl CKeys {
 impl Store {
     /// Create a client and connect it to the store.
     pub fn connect(library: Arc<StoreLibrary>, setup: &StoreSetup) -> Result<Self, Error> {
+        if matches!(library.setup, Setup::DefaultTenant(_)) && setup.tenant_id != "default" {
+            // The upstream ABI has no tenant argument. Never silently connect a
+            // named tenant to the shared default namespace.
+            return Err(Error::Setup {
+                master: setup.master_server_address.clone(),
+                status: -1012, // NOT_SUPPORTED
+            });
+        }
         // SAFETY: plain constructor.
         let raw = unsafe { (library.create)() };
         let raw =
@@ -215,17 +270,29 @@ impl Store {
         let tenant = CString::new(setup.tenant_id.as_str()).map_err(|_| Error::Nul("tenant"))?;
         // SAFETY: the strings outlive the call; the client copies them.
         let status = unsafe {
-            (store.library.setup)(
-                store.raw.as_ptr(),
-                hostname.as_ptr(),
-                metadata.as_ptr(),
-                setup.global_segment_size,
-                setup.local_buffer_size,
-                protocol.as_ptr(),
-                device.as_ptr(),
-                master.as_ptr(),
-                tenant.as_ptr(),
-            )
+            match store.library.setup {
+                Setup::WithTenant(call) => call(
+                    store.raw.as_ptr(),
+                    hostname.as_ptr(),
+                    metadata.as_ptr(),
+                    setup.global_segment_size,
+                    setup.local_buffer_size,
+                    protocol.as_ptr(),
+                    device.as_ptr(),
+                    master.as_ptr(),
+                    tenant.as_ptr(),
+                ),
+                Setup::DefaultTenant(call) => call(
+                    store.raw.as_ptr(),
+                    hostname.as_ptr(),
+                    metadata.as_ptr(),
+                    setup.global_segment_size,
+                    setup.local_buffer_size,
+                    protocol.as_ptr(),
+                    device.as_ptr(),
+                    master.as_ptr(),
+                ),
+            }
         };
         if status != 0 {
             // Dropping `store` destroys the half-set-up client.
@@ -269,7 +336,7 @@ impl Store {
     /// (`batch_is_exist`).
     pub fn batch_is_exist(&self, keys: &[String]) -> Result<Vec<i32>, Error> {
         let keys_c = CKeys::new(keys)?;
-        let mut results = vec![0 as c_int; keys.len()];
+        let mut results = vec![-1 as c_int; keys.len()];
         // SAFETY: the key array and the result buffer hold `keys.len()`
         // entries and outlive the call.
         let status = unsafe {
@@ -361,6 +428,55 @@ impl Store {
             });
         }
         Ok(results)
+    }
+
+    /// Store bytes, using an explicit lifetime result when the SDK supports it.
+    /// A legacy SDK preserves its existing conservative return-code contract.
+    pub fn batch_put_from_with_retirement(
+        &self,
+        keys: &[String],
+        addrs: &[usize],
+        sizes: &[usize],
+    ) -> Result<PutOutcome, Error> {
+        let Some(call) = self.library.batch_put_from_with_retirement else {
+            return self
+                .batch_put_from(keys, addrs, sizes)
+                .map(|results| PutOutcome {
+                    results,
+                    source_retired: None,
+                });
+        };
+        if keys.len() != addrs.len() || keys.len() != sizes.len() {
+            return Err(Error::Shape("keys, addresses and sizes"));
+        }
+        let keys_c = CKeys::new(keys)?;
+        let buffers: Vec<*mut c_void> = addrs.iter().map(|&addr| addr as *mut c_void).collect();
+        let mut results = vec![-1 as c_int; keys.len()];
+        let mut retired = 0_u8;
+        // SAFETY: the v1 extension has the declared C signature; all arrays and
+        // the lifetime output remain allocated for the duration of the call.
+        let status = unsafe {
+            call(
+                self.raw.as_ptr(),
+                keys_c.pointers.as_ptr(),
+                buffers.as_ptr(),
+                sizes.as_ptr(),
+                keys.len(),
+                std::ptr::null(),
+                results.as_mut_ptr(),
+                &mut retired,
+            )
+        };
+        if status != 0 || retired > 1 {
+            return Err(Error::Call {
+                call: "batch_put_from_with_retirement_v1",
+                status: if status != 0 { i64::from(status) } else { -1 },
+            });
+        }
+        Ok(PutOutcome {
+            results,
+            source_retired: Some(retired == 1),
+        })
     }
 
     /// Remove every object whose key matches `pattern`; the count removed,

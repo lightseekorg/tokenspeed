@@ -50,6 +50,7 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    io::Read,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1951,22 +1952,84 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(agreed != 0)
     }
 
-    /// Drop the prefix caches on every rank or on none: the ranks agree the
-    /// flush can happen before any of them clears.
+    /// Drop the prefix caches on every rank or on none. Storage recovery
+    /// retains the same tickets across each replica and moves new L3 work to
+    /// a fresh generation; native
+    /// retirement remains required for reclaiming those physical blocks.
     fn clear_cache(&mut self) -> Result<bool, LoopError> {
+        self.scheduler.cancel_storage_backups();
+        let storage_needs_retention = self.scheduler.storage_pending()
+            || self.scheduler.storage_has_retained_operations()
+            || self
+                .l3
+                .as_ref()
+                .is_some_and(|l3| l3.executor.snapshot().unsafe_io);
+        // Select one path across both the replica and attention-DP engines;
+        // a local native flag never decides which mirrored blocks to retain.
+        if !self.converge(!storage_needs_retention)? {
+            return self.clear_cache_retaining_storage();
+        }
         let can_clear = self.scheduler.can_clear_cache();
         if !self.converge(can_clear)? {
+            tracing::warn!(
+                can_clear,
+                l3_idle = self.l3.as_ref().map(|l3| l3.executor.is_idle()),
+                l3_unsafe_io = self.l3.as_ref().map(|l3| l3.executor.snapshot().unsafe_io),
+                "cache flush refused at scheduler preflight"
+            );
             return Ok(false);
         }
         // The L3 objects go first, in a phase of its own: a store that
         // fails to delete must leave every rank's indexes untouched.
         if let Some(l3) = &self.l3 {
             let deleted = l3.executor.delete_namespace();
+            let l3_idle = l3.executor.is_idle();
+            let l3_unsafe_io = l3.executor.snapshot().unsafe_io;
             if !self.converge(deleted)? {
+                tracing::warn!(
+                    deleted,
+                    l3_idle,
+                    l3_unsafe_io,
+                    "cache flush refused at L3 namespace deletion"
+                );
                 return Ok(false);
             }
         }
         Ok(self.scheduler.clear_cache())
+    }
+
+    /// Isolate old native I/O, then allow L3 in a fresh namespace using only
+    /// the remaining Host capacity. Old jobs keep their keys and addresses.
+    fn clear_cache_retaining_storage(&mut self) -> Result<bool, LoopError> {
+        let can_clear = self.scheduler.can_clear_cache_retaining_storage();
+        if !self.converge(can_clear)? {
+            tracing::warn!(
+                can_clear,
+                "cache recovery refused: non-storage resources remain held"
+            );
+            return Ok(false);
+        }
+        let mut nonce = [0u8; 16];
+        let generated = std::fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .is_ok();
+        if !self.converge(generated)? {
+            tracing::warn!("cache recovery could not allocate a fresh namespace generation");
+            return Ok(false);
+        }
+        let group = self.ranks.dp.as_ref().unwrap_or(&self.ranks.replica);
+        let nonce = self.ranks.mesh.broadcast(group, 0, nonce.to_vec())?;
+        let generation: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        if let Some(l3) = &self.l3 {
+            l3.executor.begin_cache_generation(&generation)?;
+        }
+        let cleared = self.scheduler.clear_cache_retaining_storage();
+        let cleared = self.converge(cleared)?;
+        tracing::warn!(
+            cleared,
+            "cache indexes cleared with storage references retained; L3 uses a fresh generation; remote purge deferred"
+        );
+        Ok(cleared)
     }
 
     /// Finish a gated weight operation: its result is agreed across the

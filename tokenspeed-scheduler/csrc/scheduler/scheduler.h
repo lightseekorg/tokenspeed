@@ -160,13 +160,24 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
-    // Same in-flight, pin and suspended-request checks as ClearCache, with no
-    // mutation. Weight updates MIN-reduce this across the replica before any
+    // Cancel best-effort PUTs before flush preflight. Runtime cancellation is
+    // carried by the next plan; source pins still require retired completion.
+    void CancelStorageBackups();
+    // Inspect current in-flight, pin and suspended-request checks with no
+    // mutation or cancellation. Weight updates cancel backups separately and
+    // MIN-reduce this across the replica before any
     // rank clears. Every flush refuses while RetractedSize() > 0: a
     // suspended request's image would otherwise resume old KV under a flushed
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
     bool CanClearCache() const;
+    // Explicit recovery. Old I/O blocks remain unavailable; new namespace
+    // operations can use the remaining Host space and global I/O credits.
+    bool CanClearCacheRetainingStorage() const;
+    bool ClearCacheRetainingStorage();
+    bool StorageHasRetainedOperations() const {
+        return storage_transfers_ && storage_transfers_->HasRetainedOperations();
+    }
     bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
     std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
     std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }

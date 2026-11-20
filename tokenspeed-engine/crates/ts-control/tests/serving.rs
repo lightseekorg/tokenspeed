@@ -27,7 +27,7 @@
 //! connected by a real collective mesh.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::CString,
     path::{Path, PathBuf},
     sync::{
@@ -59,7 +59,7 @@ use ts_control::{
 };
 use ts_l3::{
     monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
-    Namespace, Range, Store, StoreError,
+    MemoryStore, Namespace, Operation, Range, StorageCompletion, StorageKey, Store, StoreError,
 };
 use ts_metrics::{EngineLabels, EngineMetrics, Exporter, MetricsConfig};
 use ts_pd::{
@@ -72,10 +72,11 @@ use ts_scheduler::{
 use ts_wire::{
     codec::Dict,
     control::{
-        FlushCacheReqInput, IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput,
-        ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
-        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
-        PROFILE_START,
+        FlushCacheReqInput, GetAdmissionReqInput, GetAdmissionReqOutput,
+        GetSharedPrefixPublicationReqInput, GetSharedPrefixPublicationReqOutput,
+        IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput, ProfileReq,
+        ReleaseMemoryOccupationReqInput, ReloadForwardReqInput, ResumeMemoryOccupationReqInput,
+        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput, PROFILE_START,
     },
     multimodal::{Modality, MultimodalDataItem, MultimodalInputs},
     ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineRequest, SamplingParams,
@@ -143,6 +144,7 @@ fn new_scheduler(
     device_pages: usize,
     resident_requests: usize,
     deferred: bool,
+    host_blocks: usize,
 ) -> Scheduler {
     interpreter();
     let policy = if deferred { "Deferred" } else { "Early" };
@@ -183,7 +185,7 @@ fn new_scheduler(
              cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
              cfg.enable_l3_storage = True\n\
              cfg.storage_config = ts.StorageConfig(\n\
-                 8, 8, 64, 64, 1024, 1, 10**9, 10**9,\n\
+                 8, 8, storage_host_credits, 64, 1024, 1, 10**9, 10**9,\n\
                  ts.StoragePressure(64, 2**40, 10**9),\n\
                  ts.StoragePressure(32, 2**39, 5 * 10**8))"
         }
@@ -207,9 +209,10 @@ if cfg.role == ts.SchedulerConfig.Role.P:
     cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.{policy}
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
+storage_host_credits = min(64, {host_blocks} // {kv_shard_count})
 {tiers}
 if cfg.num_host_pages > 1:
-    cfg.num_host_pages = 1024 // {kv_shard_count} + 1
+    cfg.num_host_pages = {host_blocks} // {kv_shard_count} + 1
 if cfg.num_host_pages > 1 or cfg.num_snapshot_pages > 1:
     cfg.host_group_packing = [{kv_shard_count}]
 result = ts.Scheduler(cfg)
@@ -1036,6 +1039,23 @@ impl Gate {
     }
 }
 
+/// A remote store shared by the ranks, with observable namespace contents.
+#[derive(Default)]
+struct StorageProbe {
+    memory: Arc<MemoryStore>,
+    queries: Mutex<Vec<(Vec<String>, Vec<bool>)>>,
+    puts: Mutex<Vec<Vec<String>>>,
+    put_results: Mutex<Vec<bool>>,
+    get_keys: Mutex<Vec<Vec<String>>>,
+    removed: Mutex<Vec<String>>,
+    remove_fails: AtomicBool,
+    closed: AtomicBool,
+    /// A failed PUT's source retirement, or normal memory-store writes.
+    failed_put_retirement: Mutex<Option<bool>>,
+    /// Keep a native PUT active until the test permits its return.
+    put_gate: Option<Arc<Gate>>,
+}
+
 /// The L3 store behind one rank's executor (`Tiers::L3`): it holds every key
 /// a query asks for, once `gate` lets the query through; a get lands its
 /// leading `landed` keys (every key when `None`) and a put stores
@@ -1045,6 +1065,7 @@ struct ScriptedStore {
     gate: Arc<Gate>,
     queries: Arc<Mutex<usize>>,
     gets: Arc<Mutex<usize>>,
+    probe: Option<Arc<StorageProbe>>,
 }
 
 impl Store for ScriptedStore {
@@ -1055,16 +1076,29 @@ impl Store for ScriptedStore {
     fn batch_exists(&self, keys: &[String]) -> Result<Vec<bool>, StoreError> {
         *self.queries.lock().unwrap() += 1;
         self.gate.pass();
+        if let Some(probe) = &self.probe {
+            let exists = probe.memory.batch_exists(keys)?;
+            probe
+                .queries
+                .lock()
+                .unwrap()
+                .push((keys.to_vec(), exists.clone()));
+            return Ok(exists);
+        }
         Ok(vec![true; keys.len()])
     }
 
     fn batch_get_into(
         &self,
         keys: &[String],
-        _: HostBuffer,
-        _: &[Range],
+        host: HostBuffer,
+        ranges: &[Range],
     ) -> Result<IoResult, StoreError> {
         *self.gets.lock().unwrap() += 1;
+        if let Some(probe) = &self.probe {
+            probe.get_keys.lock().unwrap().push(keys.to_vec());
+            return probe.memory.batch_get_into(keys, host, ranges);
+        }
         let landed = self.landed.unwrap_or(keys.len());
         Ok(IoResult {
             success: (0..keys.len()).map(|key| key < landed).collect(),
@@ -1076,9 +1110,26 @@ impl Store for ScriptedStore {
     fn batch_put_from(
         &self,
         keys: &[String],
-        _: HostBuffer,
-        _: &[Range],
+        host: HostBuffer,
+        ranges: &[Range],
     ) -> Result<IoResult, StoreError> {
+        if let Some(probe) = &self.probe {
+            probe.puts.lock().unwrap().push(keys.to_vec());
+            if let Some(gate) = &probe.put_gate {
+                gate.pass();
+            }
+            if let Some(retired) = *probe.failed_put_retirement.lock().unwrap() {
+                probe.put_results.lock().unwrap().push(retired);
+                return Ok(IoResult {
+                    success: vec![false; keys.len()],
+                    retired,
+                    object_failures: vec![false; keys.len()],
+                });
+            }
+            let result = probe.memory.batch_put_from(keys, host, ranges)?;
+            probe.put_results.lock().unwrap().push(result.retired);
+            return Ok(result);
+        }
         Ok(IoResult {
             success: vec![true; keys.len()],
             retired: true,
@@ -1086,33 +1137,42 @@ impl Store for ScriptedStore {
         })
     }
 
-    fn remove_by_prefix(&self, _: &str) -> bool {
+    fn remove_by_prefix(&self, prefix: &str) -> bool {
+        if let Some(probe) = &self.probe {
+            probe.removed.lock().unwrap().push(prefix.to_owned());
+            return !probe.remove_fails.load(Ordering::SeqCst)
+                && probe.memory.remove_by_prefix(prefix);
+        }
         true
     }
 
-    fn close(&self) {}
+    fn close(&self) {
+        if let Some(probe) = &self.probe {
+            probe.closed.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// `Tiers::L3`'s Host pool: the scheduler's 1024 Host pages, one 8-byte
-/// block each, owned by every rank.
-fn l3_layout(rank: usize) -> HostLayout {
+/// block each, dealt among `shards` owners as the scheduler addresses them.
+fn l3_layout(rank: usize, shards: usize, host_blocks: usize) -> HostLayout {
     HostLayout {
         groups: vec![GroupLayout {
             packing: 1,
             block_bytes: 8,
-            shard_count: 1,
+            shard_count: shards,
         }],
         lcm_block_bytes: 8,
-        num_lcm_blocks: 1024,
-        owner_rank: 0,
+        num_lcm_blocks: host_blocks / shards,
+        owner_rank: rank % shards,
         tp_rank: rank,
     }
 }
 
 /// One rank's L3 executor over `store` and a pool of its own, which lives
 /// for the process.
-fn l3_executor(store: ScriptedStore, rank: usize) -> Executor {
-    let layout = l3_layout(rank);
+fn l3_executor(store: ScriptedStore, rank: usize, shards: usize, host_blocks: usize) -> Executor {
+    let layout = l3_layout(rank, shards, host_blocks);
     let pool: &'static mut [u8] = vec![0_u8; layout.bytes()].leak();
     Executor::start(
         Box::new(store),
@@ -1139,6 +1199,139 @@ fn l3_executor(store: ScriptedStore, rank: usize) -> Executor {
     )
 }
 
+fn storage_put(op_id: u64, hash: &str, host_block: i32) -> Operation {
+    Operation::Put {
+        op_id,
+        keys: vec![StorageKey {
+            group: 0,
+            content_hash: hash.to_owned(),
+            page_offset: 0,
+        }],
+        host_blocks: vec![host_block],
+    }
+}
+
+fn wait_for_storage(executor: &Executor, count: usize) -> Vec<StorageCompletion> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut completions = Vec::new();
+    while completions.len() < count {
+        assert!(std::time::Instant::now() < deadline, "{completions:?}");
+        completions.extend(executor.poll().completions);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(completions.len(), count, "{completions:?}");
+    completions
+}
+
+#[test]
+fn put_cancellation_retires_queued_work_but_waits_for_running_native_io() {
+    let gate = Gate::closed();
+    // A failed assertion still releases the stand-in native call before
+    // the executor closes; cancellation itself must never release it.
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+    let probe = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let mut executor = l3_executor(
+        ScriptedStore {
+            landed: None,
+            gate: Gate::opened(),
+            queries: Arc::default(),
+            gets: Arc::default(),
+            probe: Some(probe.clone()),
+        },
+        0,
+        1,
+        1024,
+    );
+    let _release = Release(gate.clone());
+    executor.submit(&[storage_put(1, "running", 1)]).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while probe.puts.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    executor
+        .submit(&[
+            storage_put(2, "queued", 2),
+            Operation::Cancel { op_id: 2 },
+            Operation::Cancel { op_id: 1 },
+        ])
+        .unwrap();
+    let queued = wait_for_storage(&executor, 1).remove(0);
+    assert_eq!(queued.op_id, 2);
+    assert_eq!(queued.success, [false]);
+    assert!(queued.retired);
+    assert_eq!(queued.object_failures, [false]);
+    assert_eq!(probe.puts.lock().unwrap().len(), 1);
+    assert!(executor.poll().completions.is_empty());
+    assert!(!executor.is_idle());
+    assert!(!executor.delete_namespace());
+    assert!(executor.set_weight_version("v2").is_err());
+    assert!(probe.memory.keys().is_empty());
+
+    gate.open();
+    let running = wait_for_storage(&executor, 1).remove(0);
+    assert_eq!(running.op_id, 1);
+    // Cancel cannot retract a native PUT's successful remote publication.
+    // The scheduler must discard its own receipt when abandoning that PUT.
+    assert_eq!(running.success, [true]);
+    assert!(running.retired);
+    assert_eq!(probe.memory.keys().len(), 1);
+    assert_eq!(probe.puts.lock().unwrap().len(), 1);
+    assert!(executor.is_idle());
+    executor.set_weight_version("v2").unwrap();
+    executor.close(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn cancelling_a_running_put_does_not_turn_unknown_source_retirement_into_safety() {
+    let gate = Gate::closed();
+    let probe = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        failed_put_retirement: Mutex::new(Some(false)),
+        ..StorageProbe::default()
+    });
+    let mut executor = l3_executor(
+        ScriptedStore {
+            landed: None,
+            gate: Gate::opened(),
+            queries: Arc::default(),
+            gets: Arc::default(),
+            probe: Some(probe.clone()),
+        },
+        0,
+        1,
+        1024,
+    );
+    executor.submit(&[storage_put(1, "unknown", 1)]).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while probe.puts.lock().unwrap().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            gate.open();
+            panic!("the PUT never reached native I/O");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    executor.submit(&[Operation::Cancel { op_id: 1 }]).unwrap();
+    assert!(executor.poll().completions.is_empty());
+    gate.open();
+    let completion = wait_for_storage(&executor, 1).remove(0);
+    assert_eq!(completion.success, [false]);
+    assert!(!completion.retired);
+    assert!(executor.snapshot().unsafe_io);
+    assert!(!executor.is_idle());
+    assert!(!executor.delete_namespace());
+    assert!(executor.set_weight_version("v2").is_err());
+    assert!(executor.close(Duration::from_secs(2)).is_err());
+}
+
 /// What a test reads back from one rank.
 struct Rank {
     thread: Option<thread::JoinHandle<()>>,
@@ -1160,6 +1353,8 @@ struct Rank {
     device_ops: Arc<Mutex<Vec<String>>>,
     weight_commits: Arc<Mutex<Vec<bool>>>,
     weight_load_refused: Arc<AtomicBool>,
+    /// Every rank's own control results, including non-frontend mirrors.
+    control_replies: Arc<Mutex<Vec<ControlOutput>>>,
     applied: Applied,
     epd_admitted: Arc<Mutex<Vec<String>>>,
     epd_released: Arc<Mutex<Vec<usize>>>,
@@ -1185,6 +1380,32 @@ struct Engine {
     client: EngineClient,
     stop: Arc<AtomicBool>,
     ranks: Vec<Rank>,
+}
+
+/// Observe each mirror's control result before its normal frontend decides
+/// whether to send it to the client. The non-owner ranks have no transport.
+struct ObservedFrontend<F> {
+    inner: F,
+    replies: Arc<Mutex<Vec<ControlOutput>>>,
+}
+
+impl<F: Frontend> Frontend for ObservedFrontend<F> {
+    fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        self.inner.receive(wait)
+    }
+
+    fn closed(&self) -> bool {
+        self.inner.closed()
+    }
+
+    fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load) {
+        self.inner.send(outputs, load);
+    }
+
+    fn reply(&mut self, output: ControlOutput) {
+        self.replies.lock().unwrap().push(output.clone());
+        self.inner.reply(output);
+    }
 }
 
 impl Engine {
@@ -1339,6 +1560,12 @@ struct Setup {
     l3_landed_keys: Option<fn(usize) -> usize>,
     /// L3: the stores' queries wait until the test opens their gates.
     l3_held_queries: bool,
+    /// L3: real in-memory objects and controllable remote cache failures.
+    l3_store: Option<Arc<StorageProbe>>,
+    /// L3: distinct backend outcomes on individual owners of a replica.
+    l3_stores: Vec<Arc<StorageProbe>>,
+    /// L3: bound the Host cache for eviction-driven cold reads.
+    l3_host_blocks: Option<usize>,
     /// The polls each rank's cache ops wait after the first before they are
     /// acknowledged; none when unset.
     cache_ack_polls: Option<fn(usize) -> usize>,
@@ -1414,7 +1641,8 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             } else {
                 vec!["kv_cache".to_owned(), "weights".to_owned()]
             },
-            shared_weight_version: None,
+            shared_weight_version: (setup.l3_store.is_some() || !setup.l3_stores.is_empty())
+                .then(|| "v1".to_owned()),
             allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {
@@ -1534,6 +1762,7 @@ fn run_rank<F: Frontend>(
         device_pages.unwrap_or(513),
         resident_requests.unwrap_or(8),
         deferred_allocation,
+        setup.l3_host_blocks.unwrap_or(1024),
     )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
@@ -1586,7 +1815,14 @@ fn run_rank<F: Frontend>(
                 grammars
             }),
             l3_metrics: None,
-            l3: store.map(|store| l3_executor(store, rank)),
+            l3: store.map(|store| {
+                l3_executor(
+                    store,
+                    rank % tp_size,
+                    kv_shard_count,
+                    setup.l3_host_blocks.unwrap_or(1024),
+                )
+            }),
             peer: None,
         },
     );
@@ -1679,6 +1915,11 @@ async fn start_ranks_with(
                 gate: storage_gate.clone(),
                 queries: Arc::new(Mutex::new(0)),
                 gets: Arc::new(Mutex::new(0)),
+                probe: setup
+                    .l3_stores
+                    .get(rank)
+                    .cloned()
+                    .or_else(|| setup.l3_store.clone()),
             });
             let handle = Rank {
                 thread: None,
@@ -1700,10 +1941,12 @@ async fn start_ranks_with(
                 device_ops: device.device_ops.clone(),
                 weight_commits: device.weight_commits.clone(),
                 weight_load_refused: device.weight_load_refused.clone(),
+                control_replies: Arc::default(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
                 epd_released: device.epd_released.clone(),
             };
+            let control_replies = handle.control_replies.clone();
             let spec = RankSpec {
                 rank,
                 layout,
@@ -1717,8 +1960,9 @@ async fn start_ranks_with(
             let thread = thread::spawn(move || {
                 // The TP group's first member owns the frontend; each
                 // attention-DP rank is its own engine.
-                let frontend = || {
-                    (rank % tp_size == 0).then(|| {
+                let frontend = || ObservedFrontend {
+                    replies: control_replies,
+                    inner: (rank % tp_size == 0).then(|| {
                         let engine_index = (rank / tp_size) as u16;
                         let mut ready = EngineCoreReadyResponse {
                             max_model_len: 4096,
@@ -1735,7 +1979,7 @@ async fn start_ranks_with(
                             Duration::from_secs(20),
                         )
                         .unwrap()
-                    })
+                    }),
                 };
                 run_rank(spec, device, store, frontend, &stop).unwrap();
             });
@@ -5414,6 +5658,507 @@ fn disk_load() -> ControlRequest {
     })
 }
 
+async fn controls_on_every_rank(engine: &Engine, request: ControlRequest) -> Vec<ControlOutput> {
+    let offsets: Vec<usize> = engine
+        .ranks
+        .iter()
+        .map(|rank| rank.control_replies.lock().unwrap().len())
+        .collect();
+    let tag = request.reply_tag();
+    tokio::time::timeout(Duration::from_secs(10), engine.client.control(request))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let outputs: Vec<Option<ControlOutput>> = engine
+                .ranks
+                .iter()
+                .zip(&offsets)
+                .map(|(rank, &offset)| {
+                    rank.control_replies.lock().unwrap()[offset..]
+                        .iter()
+                        .find(|output| output.tag() == tag)
+                        .cloned()
+                })
+                .collect();
+            if outputs.iter().all(Option::is_some) {
+                break outputs.into_iter().map(Option::unwrap).collect();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a mirror did not record its control result")
+}
+
+async fn admission_on_every_rank(engine: &Engine) -> Vec<GetAdmissionReqOutput> {
+    controls_on_every_rank(
+        engine,
+        ControlRequest::GetAdmission(GetAdmissionReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        }),
+    )
+    .await
+    .into_iter()
+    .map(|output| match output {
+        ControlOutput::GetAdmission(output) => output,
+        _ => unreachable!(),
+    })
+    .collect()
+}
+
+async fn publication_on_every_rank(
+    engine: &Engine,
+    query_id: &str,
+    input_ids: &[i32],
+) -> Vec<GetSharedPrefixPublicationReqOutput> {
+    controls_on_every_rank(
+        engine,
+        ControlRequest::GetSharedPrefixPublication(GetSharedPrefixPublicationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            query_id: query_id.to_owned(),
+            input_ids: input_ids.to_vec(),
+            max_prefix_tokens: input_ids.len() as i32 - 1,
+        }),
+    )
+    .await
+    .into_iter()
+    .map(|output| match output {
+        ControlOutput::GetSharedPrefixPublication(output) => output,
+        _ => unreachable!(),
+    })
+    .collect()
+}
+
+fn storage_calls(
+    engine: &Engine,
+    stores: &[Arc<StorageProbe>],
+) -> Vec<(usize, usize, usize, usize)> {
+    engine
+        .ranks
+        .iter()
+        .zip(stores)
+        .map(|(rank, store)| {
+            (
+                *rank.storage_queries.lock().unwrap(),
+                *rank.storage_gets.lock().unwrap(),
+                store.puts.lock().unwrap().len(),
+                store.removed.lock().unwrap().len(),
+            )
+        })
+        .collect()
+}
+
+fn routed_prompt(rid: &str, input_ids: &[i32], dp_rank: Option<i64>) -> TokenizedGenerateReqInput {
+    TokenizedGenerateReqInput {
+        input_ids: Some(input_ids.to_vec()),
+        data_parallel_rank: dp_rank,
+        ..request(rid, input_ids.len(), budget(4))
+    }
+}
+
+fn agreed_namespace(outputs: &[GetSharedPrefixPublicationReqOutput], version: &str) -> String {
+    let namespace = outputs[0].storage_namespace.clone();
+    let base = ts_l3::keys::key_prefix("serving", version, "");
+    assert!(
+        namespace == base || namespace.starts_with(&format!("{base}-g")),
+        "{outputs:?}"
+    );
+    for mirror in outputs {
+        assert_eq!(mirror.storage_namespace, namespace);
+    }
+    namespace
+}
+
+async fn wait_for_publication(
+    engine: &Engine,
+    input_ids: &[i32],
+    owners: &[usize],
+    namespace: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let outputs = publication_on_every_rank(engine, "await-new-put", input_ids).await;
+            if owners.iter().all(|&owner| {
+                outputs[owner].storage_namespace == namespace
+                    && outputs[owner].status == "published"
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the new generation's PUT did not publish on every owner");
+}
+
+async fn wait_for_retained_capacity(engine: &Engine, expected: &[GetAdmissionReqOutput]) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let now = admission_on_every_rank(engine).await;
+            if now.iter().zip(expected).all(|(now, expected)| {
+                now.host_total_blocks == expected.host_total_blocks
+                    && now.host_free_blocks == expected.host_free_blocks
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("retired new-generation holds did not drain to the original unsafe capacity");
+}
+
+async fn evict_and_restore_from_l3(
+    engine: &Engine,
+    stores: &[Arc<StorageProbe>],
+    input_ids: &[i32],
+    dp_rank: Option<i64>,
+    owners: &[usize],
+    namespace: &str,
+    target_keys: &HashSet<String>,
+) {
+    // Both tiers have 32 virtual blocks. Six independent nine-block prompts
+    // evict the target through ordinary cache policy, without clearing the
+    // new remote namespace or changing its generation.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for churn in 0..6 {
+            let start = 10_000 + churn * 1_000;
+            let ids: Vec<i32> = (start..start + 129).collect();
+            let chunks = run(
+                &engine.client,
+                routed_prompt(&format!("churn-{dp_rank:?}-{churn}"), &ids, dp_rank),
+            )
+            .await;
+            assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+        }
+    })
+    .await
+    .expect("bounded cache eviction did not finish");
+    let before = storage_calls(engine, stores);
+    let get_offsets: Vec<usize> = stores
+        .iter()
+        .map(|store| store.get_keys.lock().unwrap().len())
+        .collect();
+    let chunks = run(
+        &engine.client,
+        routed_prompt("restored-from-new-generation", input_ids, dp_rank),
+    )
+    .await;
+    assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+    assert!(chunks.last().unwrap().cached_tokens > 0);
+    let after = storage_calls(engine, stores);
+    for &owner in owners {
+        assert!(after[owner].1 > before[owner].1, "owner {owner} did no GET");
+        let keys = stores[owner].get_keys.lock().unwrap();
+        let cold = &keys[get_offsets[owner]..];
+        assert!(!cold.is_empty());
+        assert!(cold
+            .iter()
+            .flatten()
+            .all(|key| { key.starts_with(namespace) && target_keys.contains(key) }));
+    }
+    for output in publication_on_every_rank(engine, "after-cold-get", input_ids).await {
+        assert_eq!(output.storage_namespace, namespace);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_generation() {
+    for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
+        let late = Gate::closed();
+        let remote = Arc::new(MemoryStore::new());
+        let stores = vec![
+            Arc::new(StorageProbe {
+                memory: remote.clone(),
+                failed_put_retirement: Mutex::new(Some(false)),
+                ..StorageProbe::default()
+            }),
+            Arc::new(StorageProbe {
+                memory: remote.clone(),
+                put_gate: Some(late.clone()),
+                ..StorageProbe::default()
+            }),
+        ];
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::L3,
+            Setup {
+                device_pages: Some(33),
+                l3_host_blocks: Some(32),
+                l3_stores: stores.clone(),
+                ..Setup::default()
+            },
+        )
+        .await;
+        struct Release(Arc<Gate>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.open();
+            }
+        }
+        let _release = Release(late.clone());
+        let old_ids: Vec<i32> = (1..=65).collect();
+        let target_ids: Vec<i32> = (1001..=1065).collect();
+        assert_eq!(
+            tokens(&run(&engine.client, routed_prompt("old-weights", &old_ids, None)).await),
+            [1000, 1001, 1002, 1003]
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stores[0].put_results.lock().unwrap().is_empty()
+                || stores[1].puts.lock().unwrap().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both owners must reach their old Store PUT");
+        assert!(stores[0]
+            .put_results
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|retired| !retired));
+        assert!(stores[1].put_results.lock().unwrap().is_empty());
+        let old_namespace = ts_l3::keys::key_prefix("serving", "v1", "");
+
+        flush_until_idle(&engine).await;
+        // The first following round consumes the recovery's queued-cancel
+        // reports. Measure permanent holds after those safe tickets retire.
+        admission_on_every_rank(&engine).await;
+        let retained = admission_on_every_rank(&engine).await;
+        for mirror in &retained {
+            assert!(mirror.success);
+            assert!(mirror.host_free_blocks > 0, "{layout:?}: {mirror:?}");
+            assert!(mirror.host_free_blocks < mirror.host_total_blocks);
+            assert_eq!(mirror.host_free_blocks, retained[0].host_free_blocks);
+            assert_eq!(mirror.host_total_blocks, retained[0].host_total_blocks);
+        }
+        let first = publication_on_every_rank(&engine, "first-generation", &old_ids).await;
+        let first_namespace = agreed_namespace(&first, "v1");
+        assert_ne!(first_namespace, old_namespace);
+        // A second clear must isolate even an earlier recovery's jobs with a
+        // fresh namespace, while preserving exactly the same unsafe capacity.
+        flush_until_idle(&engine).await;
+        let second = publication_on_every_rank(&engine, "second-generation", &old_ids).await;
+        assert_ne!(agreed_namespace(&second, "v1"), first_namespace);
+        let second_capacity = admission_on_every_rank(&engine).await;
+        for (before, after) in retained.iter().zip(second_capacity) {
+            assert_eq!(before.host_free_blocks, after.host_free_blocks);
+        }
+        assert!(stores
+            .iter()
+            .all(|store| store.removed.lock().unwrap().is_empty()));
+        // Only the old call is uncertain. The backend can service new jobs.
+        *stores[0].failed_put_retirement.lock().unwrap() = None;
+        let load = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            model_path: "/checkpoint-v2".to_owned(),
+            load_format: None,
+            weight_version: Some("v2".to_owned()),
+            flush_cache: true,
+        });
+        assert!(control(&engine, load).await.iter().all(|(_, ok)| *ok));
+        assert_weight_commits(&engine, &[true]).await;
+        let switched = publication_on_every_rank(&engine, "after-switch", &old_ids).await;
+        let namespace = agreed_namespace(&switched, "v2");
+        assert!(switched.iter().all(|output| output.status != "published"));
+        let put_offsets: Vec<usize> = stores
+            .iter()
+            .map(|store| store.puts.lock().unwrap().len())
+            .collect();
+        let fresh = run(
+            &engine.client,
+            routed_prompt("new-weights", &target_ids, None),
+        )
+        .await;
+        assert_eq!(tokens(&fresh), [1000, 1001, 1002, 1003]);
+        assert_eq!(fresh.last().unwrap().cached_tokens, 0);
+
+        // The healthy worker is still in the old native call. Once released,
+        // that call must keep its old keys and then service new-generation PUTs.
+        late.open();
+        wait_for_publication(&engine, &target_ids, &[0, 1], &namespace).await;
+        assert!(remote
+            .keys()
+            .iter()
+            .any(|key| key.starts_with(&old_namespace)));
+        assert!(stores[1].puts.lock().unwrap()[0]
+            .iter()
+            .all(|key| key.starts_with(&old_namespace)));
+        let mut target_keys = HashSet::new();
+        for (owner, store) in stores.iter().enumerate() {
+            let puts = store.puts.lock().unwrap();
+            let new: Vec<_> = puts[put_offsets[owner]..]
+                .iter()
+                .flatten()
+                .filter(|key| key.starts_with(&namespace))
+                .cloned()
+                .collect();
+            assert!(!new.is_empty(), "owner {owner} did no new-generation PUT");
+            target_keys.extend(new);
+        }
+        for output in publication_on_every_rank(&engine, "old-late-receipt", &old_ids).await {
+            assert_eq!(output.storage_namespace, namespace);
+            assert_ne!(output.status, "published");
+        }
+        evict_and_restore_from_l3(
+            &engine,
+            &stores,
+            &target_ids,
+            None,
+            &[0, 1],
+            &namespace,
+            &target_keys,
+        )
+        .await;
+        // The cold GET above used the same namespace. A later administrative
+        // clear may rotate again; only the original unsafe capacity remains.
+        flush_until_idle(&engine).await;
+        wait_for_retained_capacity(&engine, &retained).await;
+        engine.settle().await;
+        assert_eq!(engine.released_on(0), engine.released_on(1));
+        drop(engine);
+        assert!(stores[1].closed.load(Ordering::SeqCst));
+        assert!(!stores[0].closed.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unequal_data_parallel_host_capacity_keeps_new_l3_generations_and_forwards_in_step() {
+    let remote = Arc::new(MemoryStore::new());
+    let stores = vec![
+        Arc::new(StorageProbe {
+            memory: remote.clone(),
+            failed_put_retirement: Mutex::new(Some(false)),
+            ..StorageProbe::default()
+        }),
+        Arc::new(StorageProbe {
+            memory: remote,
+            ..StorageProbe::default()
+        }),
+    ];
+    let engine = start_ranks_with(
+        Layout::Dp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            device_pages: Some(33),
+            l3_host_blocks: Some(32),
+            l3_stores: stores.clone(),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let old_ids: Vec<i32> = (1..=65).collect();
+    assert_eq!(
+        tokens(
+            &run(
+                &engine.client,
+                routed_prompt("old-on-dp0", &old_ids, Some(0))
+            )
+            .await
+        ),
+        [1000, 1001, 1002, 1003]
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stores[0].put_results.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("DP rank 0 must receive its unretired PUT result");
+    assert!(stores[0]
+        .put_results
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|retired| !retired));
+    assert!(stores[1].puts.lock().unwrap().is_empty());
+    assert!(engine.released_on(1).is_empty());
+    flush_until_idle(&engine).await;
+    admission_on_every_rank(&engine).await;
+    let retained = admission_on_every_rank(&engine).await;
+    assert_eq!(retained[0].host_total_blocks, retained[1].host_total_blocks);
+    assert!(retained[0].host_free_blocks > 0);
+    assert!(retained[0].host_free_blocks < retained[1].host_free_blocks);
+    assert_eq!(retained[1].host_free_blocks, retained[1].host_total_blocks);
+    assert!(stores
+        .iter()
+        .all(|store| store.removed.lock().unwrap().is_empty()));
+    *stores[0].failed_put_retirement.lock().unwrap() = None;
+    let load = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        model_path: "/checkpoint-v2".to_owned(),
+        load_format: None,
+        weight_version: Some("v2".to_owned()),
+        flush_cache: true,
+    });
+    assert_eq!(
+        control(&engine, load).await,
+        [
+            ("UpdateWeightFromDiskReqOutput", true),
+            ("UpdateWeightFromDiskReqOutput", true)
+        ]
+    );
+    assert_weight_commits(&engine, &[true]).await;
+    let outputs = publication_on_every_rank(&engine, "unequal-dp-after-switch", &old_ids).await;
+    let namespace = agreed_namespace(&outputs, "v2");
+    assert!(outputs.iter().all(|output| output.status != "published"));
+    let after_switch = admission_on_every_rank(&engine).await;
+    for (before, after) in retained.iter().zip(after_switch) {
+        assert_eq!(before.host_free_blocks, after.host_free_blocks);
+    }
+    for rank in 0..2 {
+        let peer = 1 - rank;
+        let idle_before = engine.idle_forwards(peer);
+        let start = 1001 + rank as i32 * 1000;
+        let target_ids: Vec<i32> = (start..start + 65).collect();
+        let put_offset = stores[rank].puts.lock().unwrap().len();
+        let fresh = run(
+            &engine.client,
+            routed_prompt(&format!("new-on-dp{rank}"), &target_ids, Some(rank as i64)),
+        )
+        .await;
+        assert_eq!(tokens(&fresh), [1000, 1001, 1002, 1003]);
+        assert_eq!(fresh.last().unwrap().cached_tokens, 0);
+        wait_for_publication(&engine, &target_ids, &[rank], &namespace).await;
+        let target_keys: HashSet<String> = stores[rank].puts.lock().unwrap()[put_offset..]
+            .iter()
+            .flatten()
+            .filter(|key| key.starts_with(&namespace))
+            .cloned()
+            .collect();
+        assert!(!target_keys.is_empty());
+        evict_and_restore_from_l3(
+            &engine,
+            &stores,
+            &target_ids,
+            Some(rank as i64),
+            &[rank],
+            &namespace,
+            &target_keys,
+        )
+        .await;
+        assert!(engine.idle_forwards(peer) > idle_before);
+    }
+    for output in publication_on_every_rank(&engine, "unequal-dp-old-receipt", &old_ids).await {
+        assert_eq!(output.storage_namespace, namespace);
+        assert_ne!(output.status, "published");
+    }
+    flush_until_idle(&engine).await;
+    wait_for_retained_capacity(&engine, &retained).await;
+    drop(engine);
+    assert!(stores[1].closed.load(Ordering::SeqCst));
+    assert!(!stores[0].closed.load(Ordering::SeqCst));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_weight_flush_commits_nothing_and_can_be_retried() {
     for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2), Layout::Pp(2)] {
@@ -6271,6 +7016,7 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         gate: Gate::closed(),
         queries: Arc::new(Mutex::new(0)),
         gets: Arc::new(Mutex::new(0)),
+        probe: None,
     };
     let (queries, gets) = (store.queries.clone(), store.gets.clone());
     let notes = Arc::new(Mutex::new(RoundNotes::default()));

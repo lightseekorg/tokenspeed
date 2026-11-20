@@ -98,7 +98,7 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
                                  [&](const auto& key) { return storage_transfers_->WasPublished(key); })) {
         result.status = "published";
         result.confirmed_prefix_tokens = max_prefix_tokens;
-    } else if (storage_transfers_->PressureGateClosed() || storage_transfers_->NumQuarantined() > 0) {
+    } else if (storage_transfers_->PressureGateClosed() || storage_transfers_->NumBlockingQuarantined() > 0) {
         result.status = "pressure";
     }
     return result;

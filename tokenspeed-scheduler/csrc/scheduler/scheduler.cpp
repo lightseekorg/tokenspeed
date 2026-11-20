@@ -209,11 +209,47 @@ bool Scheduler::ClearL1Cache() {
 }
 
 bool Scheduler::ClearCache() {
+    CancelStorageBackups();
     return clearCache(true);
+}
+
+void Scheduler::CancelStorageBackups() {
+    if (storage_transfers_) storage_transfers_->CancelBackups();
 }
 
 bool Scheduler::CanClearCache() const {
     return cacheIsClearable(true);
+}
+
+bool Scheduler::CanClearCacheRetainingStorage() const {
+    const bool has_pd_transfers = std::ranges::any_of(
+        requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
+    if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    std::vector<const CacheBlockRef*> retained;
+    if (storage_transfers_) {
+        std::vector<std::uint64_t> leases;
+        for (const auto& request : requests_) {
+            if (const auto* prefetch = request->GetIf<fsm::Prefetching>(); prefetch && prefetch->lease) {
+                leases.push_back(prefetch->lease.OperationId());
+            }
+            if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_hold) {
+                leases.push_back(admission->storage_hold->lease.OperationId());
+            }
+        }
+        if (!storage_transfers_->CanRetainForClear(leases)) return false;
+        retained = storage_transfers_->HeldBlockRefs();
+    }
+    return coordinator_.CacheIsClearableRetainingStorage(retained);
+}
+
+bool Scheduler::ClearCacheRetainingStorage() {
+    if (!CanClearCacheRetainingStorage()) return false;
+    for (auto& request : requests_) releaseStorage(*request);
+    CancelStorageBackups();
+    if (storage_transfers_) storage_transfers_->RetainForClear();
+    coordinator_.ClearCacheRetainingStorage();
+    spdlog::info("[Scheduler] flush completed with old storage references retained; remaining L3 capacity available");
+    return true;
 }
 
 bool Scheduler::cacheIsClearable(bool include_host) const {
@@ -724,7 +760,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         if (storage_allowed_)
             storage_transfers_->StartBackups();
         else
-            storage_transfers_->DropBackups();
+            storage_transfers_->CancelBackups();
         storage_operations = storage_transfers_->TakeCommands();
     }
 

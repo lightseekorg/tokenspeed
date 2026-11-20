@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <numeric>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -251,6 +252,107 @@ TEST(SharedPrefixPublicationTest, OnlySuccessfulRetiredPutsCreateReceiptsAndFlus
     EXPECT_FALSE(cache.storage.WasPublished(keys[0]));
     EXPECT_FALSE(cache.storage.WasPublished(keys[1]));
     EXPECT_EQ(cache.storage.NumQuarantined(), 1u);
+}
+
+TEST(SharedPrefixPublicationTest, CancellingUndispatchedBackupsReleasesTheirHostReferences) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    ASSERT_EQ(cache.storage.NumOperations(), 1u);
+    ASSERT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    // Candidates that have not acquired references must be dropped too.
+    cache.storage.QueueBackups(keys);
+    ASSERT_EQ(cache.storage.NumBackupCandidates(), keys.size());
+
+    cache.storage.CancelBackups();
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_FALSE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    EXPECT_EQ(cache.storage.NumBackupCandidates(), 0u);
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 0u);
+    EXPECT_NO_THROW(cache.storage.ClearMetadata());
+}
+
+TEST(SharedPrefixPublicationTest, CancellingDispatchedBackupsWaitsForRetirementAndDiscardsLateReceipts) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    const auto issued = cache.storage.TakeCommands();
+    ASSERT_EQ(issued.size(), 1u);
+    const auto put = std::get<StoragePutOperation>(issued[0]);
+
+    cache.storage.CancelBackups();
+    cache.storage.CancelBackups();
+    const auto cancel = cache.storage.TakeCommands();
+    ASSERT_EQ(cancel.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<StorageCancelOperation>(cancel[0]));
+    EXPECT_EQ(std::get<StorageCancelOperation>(cancel[0]).op_id, put.op_id);
+    EXPECT_TRUE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    EXPECT_THROW(cache.storage.ClearMetadata(), std::logic_error);
+
+    cache.storage.Complete({put.op_id, {1, 1}, true, {0, 0}});
+    EXPECT_FALSE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 0u);
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_NO_THROW(cache.storage.ClearMetadata());
+}
+
+TEST(SharedPrefixPublicationTest, CancellingBackupsDoesNotReleaseUnretiredSources) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    const auto put = std::get<StoragePutOperation>(cache.storage.TakeCommands()[0]);
+    cache.storage.CancelBackups();
+    cache.storage.TakeCommands();
+    cache.storage.Complete({put.op_id, {1, 1}, false, {0, 0}});
+
+    EXPECT_TRUE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    EXPECT_EQ(cache.storage.NumQuarantined(), 1u);
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 0u);
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    EXPECT_THROW(cache.storage.ClearMetadata(), std::logic_error);
+}
+
+TEST(SharedPrefixPublicationTest, CancellingBackupsLeavesQueriesAndReadsAttached) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto prefix = prompt.Prefix(8, false);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prefix, 256).keys;
+    auto query = cache.storage.StartQuery(keys, {4, 4});
+    auto read = cache.storage.StartRead(prefix, keys);
+    ASSERT_TRUE(query);
+    ASSERT_TRUE(read);
+    const auto issued = cache.storage.TakeCommands();
+    ASSERT_EQ(issued.size(), 2u);
+
+    cache.storage.CancelBackups();
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_EQ(cache.storage.NumOperations(), 2u);
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    cache.storage.Complete({query.OperationId(), {1, 1}, true, {0, 0}});
+    cache.storage.Complete({read.OperationId(), {1, 1}, true, {0, 0}});
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), keys.size());
+    query.reset();
+    read.reset();
+    EXPECT_FALSE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
 }
 
 TEST(SharedPrefixPublicationTest, DetachedOrUnretiredGetsCannotConfirmSharedObjects) {

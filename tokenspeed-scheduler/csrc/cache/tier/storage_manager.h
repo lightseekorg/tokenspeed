@@ -42,6 +42,15 @@ public:
     StorageTransferManager(CacheCoordinator& coordinator, StorageConfig config);
     const StorageConfig& Config() const { return config_; }
     bool CanStart() const;
+    bool HasRetainedOperations() const;
+    // Borrowed until the next manager mutation; does not change ref counts.
+    std::vector<const CacheBlockRef*> HeldBlockRefs() const;
+    // Every attached request operation needs a real lease the scheduler can
+    // reset normally before retaining old-namespace operations. PUT has no request lease.
+    bool CanRetainForClear(std::span<const std::uint64_t> request_lease_ids) const;
+    // All remaining tickets must be detached. Marks their old-namespace I/O
+    // owners retained and clears metadata; new work can use remaining credits.
+    void RetainForClear();
     void UpdatePressure(const StoragePressure& pressure);
     bool PressureGateClosed() const { return pressure_gate_closed_; }
     std::uint64_t NumPressureDroppedBackups() const { return pressure_dropped_backup_keys_; }
@@ -53,6 +62,7 @@ public:
     std::size_t NumOperations() const { return operations_.size(); }
     std::size_t NumHeldBlocks() const;
     std::size_t NumQuarantined() const;
+    std::size_t NumBlockingQuarantined() const;
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
@@ -75,6 +85,9 @@ public:
     void QueueBackups(std::span<const CacheKey> keys);
     void StartBackups();
     void DropBackups();
+    // Abandon queued and dispatched backups. Dispatched sources remain held
+    // until a retired completion, and their late results cannot add receipts.
+    void CancelBackups();
     void ClearMetadata();
     std::vector<StorageOperation> TakeCommands();
 
@@ -92,6 +105,7 @@ private:
         std::optional<TailPublication> tail;
         bool detached{false};
         bool quarantined{false};
+        bool retained_after_clear{false};
 
         // Every admitted L3 operation has keys. Even an all-failed completion
         // supplies one result per key; no results means the operation is pending.
@@ -102,6 +116,7 @@ private:
     void detach(std::uint64_t id) noexcept;
     void rememberNegative(const CacheKey& key);
     void rememberPublished(const CacheKey& key);
+    void clearMetadata();
     std::size_t availableHostCredits() const;
     CacheCoordinator& coordinator_;
     const StorageConfig config_;

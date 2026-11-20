@@ -550,6 +550,20 @@ PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
 
 bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache(); }
 
+void cancel_storage_backups(tokenspeed::Scheduler& scheduler) { scheduler.CancelStorageBackups(); }
+
+bool can_clear_cache_retaining_storage(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.CanClearCacheRetainingStorage();
+}
+
+bool clear_cache_retaining_storage(tokenspeed::Scheduler& scheduler) {
+    return scheduler.ClearCacheRetainingStorage();
+}
+
+bool storage_has_retained_operations(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.StorageHasRetainedOperations();
+}
+
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
 
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler) { return scheduler.CanClearCache(); }

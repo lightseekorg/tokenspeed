@@ -692,6 +692,10 @@ mod ffi {
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn cancel_storage_backups(scheduler: Pin<&mut Scheduler>);
+        fn can_clear_cache_retaining_storage(scheduler: &Scheduler) -> bool;
+        fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
@@ -1048,12 +1052,36 @@ impl Scheduler {
         ffi::clear_cache(self.pinned())
     }
 
+    /// Abandon best-effort PUTs before a flush. The next plan carries any
+    /// runtime cancellations; dispatched sources stay pinned until retired.
+    pub fn cancel_storage_backups(&mut self) {
+        ffi::cancel_storage_backups(self.pinned());
+    }
+
+    /// Whether a full clear may retain only the storage tickets' Host blocks.
+    /// Other cache pins, Device transfers and suspended requests still refuse.
+    pub fn can_clear_cache_retaining_storage(&self) -> bool {
+        ffi::can_clear_cache_retaining_storage(self.get())
+    }
+
+    /// Clear cache indexes while preserving detached old storage references.
+    /// The runtime must move subsequent work to a fresh cache generation.
+    pub fn clear_cache_retaining_storage(&mut self) -> bool {
+        ffi::clear_cache_retaining_storage(self.pinned())
+    }
+
+    /// Old storage references survived a clear and still consume capacity.
+    pub fn storage_has_retained_operations(&self) -> bool {
+        ffi::storage_has_retained_operations(self.get())
+    }
+
     /// Drop the Device L1 prefix index only, under the same refusals.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
     }
 
-    /// Whether [`Scheduler::clear_cache`] would succeed now; changes nothing.
+    /// Whether current references permit a full clear, without cancelling
+    /// backups or changing any state.
     pub fn can_clear_cache(&self) -> bool {
         ffi::can_clear_cache(self.get())
     }

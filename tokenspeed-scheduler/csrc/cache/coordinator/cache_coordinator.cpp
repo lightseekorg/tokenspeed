@@ -118,6 +118,57 @@ bool CacheCoordinator::CacheIsClearable(bool include_host) const {
     return host_.IsClearable();
 }
 
+bool CacheCoordinator::CacheIsClearableRetainingStorage(std::span<const CacheBlockRef* const> storage_refs) const {
+    if (evictor_.HasSegments() || !deviceCacheIsClearable() || store_.ActiveParentGauge().Count() != 0) {
+        return false;
+    }
+    std::size_t device_entries = 0;
+    for (const auto& group : store_.Groups()) device_entries += group.Index().NumEntries(store_.DevicePool());
+    // An active, not-yet-indexed Device block is protected too.
+    if (device_entries != static_cast<std::size_t>(store_.DevicePool().NumOccupiedSlots())) return false;
+
+    const BlockPool* pool = store_.HostPool();
+    if (pool == nullptr) return storage_refs.empty();
+    struct References {
+        std::size_t storage{0};
+        std::size_t indexed{0};
+        std::uint32_t observed{0};
+    };
+    std::unordered_map<const CacheBlock*, References> counts;
+    for (const CacheBlockRef* ref : storage_refs) {
+        if (ref == nullptr || !*ref || !ref->IsOwnedBy(*pool)) return false;
+        auto& count = counts[ref->operator->()];
+        ++count.storage;
+        count.observed = ref->use_count();
+    }
+    for (const auto& group : store_.Groups()) {
+        group.Index().ForEachBlockRef(*pool, [&](const CacheBlockRef& ref) {
+            auto& count = counts[ref.operator->()];
+            ++count.indexed;
+            count.observed = ref.use_count();
+        });
+    }
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> locations;
+    for (const auto& [block, count] : counts) {
+        if (!block->IsOwnedBy(*pool) || !pool->IsOccupied(block->Location()) || count.indexed > 1 ||
+            count.observed != count.storage + count.indexed || !locations.insert(block->Location()).second) {
+            return false;
+        }
+    }
+    // This catches unindexed, non-storage Host owners as well as pins on an
+    // indexed block shared by storage and an active request or tier transfer.
+    return locations.size() == static_cast<std::size_t>(pool->NumOccupiedSlots());
+}
+
+void CacheCoordinator::ClearCacheRetainingStorage() {
+    FatalCheck(ClearDeviceCache(), "retaining-storage clear keeps its Device preflight valid");
+    if (BlockPool* pool = store_.HostPool()) {
+        for (auto& group : store_.Groups()) group.Index().Invalidate(*pool);
+    }
+    store_.Boundaries().ClearAfterCacheClear();
+    store_.Checkpoints().Clear();
+}
+
 bool CacheCoordinator::ClearDeviceCache() {
     // Every plan drains what its admissions, restores and compactions recorded; a clear
     // runs between plans and drops what it evicts.

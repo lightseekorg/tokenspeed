@@ -204,6 +204,27 @@ not the cached bytes. Independently mounted data segments can outlive inference
 workers: setting `global_segment_size=0` explicitly makes an inference worker
 a client without mounting storage of its own.
 
+For the default Host C ABI, a legacy `ILLEGAL_CLIENT` PUT result is an ownership
+rejection, either before I/O or at End after every allocated memory transfer
+succeeded. Failed transfers keep their own error even if Revoke also fails.
+A complete batch containing only success, duplicate/allocation rejection and
+`ILLEGAL_CLIENT` therefore retires its sources; the rejected write still fails
+and cannot add a publication receipt. Any transfer/RPC/unknown error in the
+same batch keeps whole-batch retirement unknown. An SDK's explicit
+`source_retired=false` always overrides this legacy inference. This contract
+does not cover flexible memory/NoF policies or other transfer backends.
+
+A full-clear attempt or frozen storage round cancels best-effort backups.
+Candidates and PUTs still in the scheduler outbox are discarded immediately;
+dispatched PUTs are detached and receive one cancellation command through the
+ordinary plan. Their late success cannot add a publication receipt. Source
+references remain held until every owner reports retirement. Cancelling a
+running executor job currently does not abort its native call, so this does
+not make an active or quarantined PUT safe to free, nor guarantee that the
+remote object was never published. A refused flush can therefore cancel
+backups while leaving all cache indexes intact. Storage recovery, described
+below, can clear those indexes while keeping the outstanding references.
+
 ## Controller queues, monitor and bounds
 
 Host allocation uses the ordinary per-node rank share and actual rounded
@@ -345,12 +366,46 @@ permissions disabled, allowing completions, expiration and cancellation.
 For the Mooncake adapter, exact byte counts prove GET success. Nonnegative
 short reads are retired failures. `OBJECT_NOT_FOUND` (`-704`) is a metadata
 miss before destination transfer submission. PUT `OBJECT_ALREADY_EXISTS`
-(`-705`) is a create-only rejection before source transfer and is idempotent
-success. PUT `NO_AVAILABLE_HANDLE` (`-200`) is the master's allocation
+(`-705`) is a create-only rejection before source transfer. PUT
+`NO_AVAILABLE_HANDLE` (`-200`) is the master's allocation
 rejection before any source transfer: a retired per-page failure that leaves
 the page unacknowledged for the scheduler to re-offer, never a quarantine.
 Other negative transfer errors, exceptions after native submission,
 and malformed transfer results do not prove retirement.
+
+For PUT, a duplicate-create rejection is not itself a publication ACK: an SDK
+may also return it for another writer still in progress. Legacy SDKs can also
+collapse this rejection into zero. The adapter confirms readability before
+acknowledging either legacy result; an unconfirmed duplicate retires without
+publishing and remains eligible for a later write attempt.
+
+Workers sharing one Mooncake client admit at most one in-flight PUT per complete
+object key. Partly overlapping batches still write their other keys; duplicate
+positions retire without a write or publication ACK. A claim is released only
+before native submission or after proven source retirement. Unknown native
+retirement retains both the claim and the executor's existing quarantine. This
+is local write coalescing, not cross-client ownership or a replacement for the
+master's write-generation checks.
+
+A lost or timed-out End RPC retains the key claim even if native source access
+has retired: an old RPC could otherwise affect a new write by that same client.
+This key-local hold does not quarantine safely retired Host bytes or prevent a
+switch to a new weight namespace. An existence query cannot settle the old
+RPC's lifetime.
+
+The optional Mooncake `batch_put_from_with_retirement_v1` C ABI extension reports
+source retirement separately from per-key publication results. A native proof of
+retirement lets a metadata rejection finish as a failed cache write, without
+quarantining Host memory or claiming publication. Without the extension, the
+adapter retains its conservative legacy error classification; `ILLEGAL_CLIENT`
+alone never proves retirement. A metadata existence query cannot replace this
+native lifetime evidence. The v1 extension preserves duplicate rejections and
+reserves zero for this write's successful End, so only its duplicate statuses
+need an extra metadata query.
+
+The upstream SDK's original setup ABI can connect only the explicit `default`
+tenant. A named tenant requires the tenant-aware entry point; its absence is a
+connection error, never a change to the requested tenant.
 
 `Store::failures_retire` declares the store's guarantee when a call fails or
 returns a malformed result: whether it has stopped accessing the supplied Host
@@ -370,22 +425,73 @@ work. The executor reports facts and does not choose negative-cache policy.
 
 An unretired result quarantines every reference of that job. It is never
 published, freed or repaired by an existence recheck. One generic negative
-transfer result is enough: the executor rejects all further submissions,
-and `close()` reports that a process restart is required. The first version
-stops new L3 work for the replica after quarantine and requires process
-restart to reclaim that storage safely. Ordinary computation and valid L2
-hits can continue within the remaining capacity. A deployment SDK must honor
+transfer result is enough: the executor rejects further submissions in that
+generation until explicit clear recovery. `close()` still reports that a
+process restart is required to reclaim that
+storage safely. Ordinary computation and valid L2 hits can continue within
+the remaining capacity. A deployment SDK must honor
 the adapter's return-code contract; real transport fault tests remain part of
 hardware validation.
 
-A full cache clear, namespace rotation or weight update must reject outstanding
-storage operations, including Ready holds and quarantine; it must not
-synchronously drain QUERY/GET/PUT on the scheduling thread. After replica-agreed
-preflight, remote namespace deletion retains the existing synchronous
-administrative call on the control thread. This purge can delay request and
-control processing until the backend returns; preparation soft timeouts do not
-bound or cancel it. A deletion failure prevents local cache clearing.
-Asynchronous administrative purge is outside the first-version scope.
+A full clear with outstanding storage work takes a separate recovery entry.
+The replica and attention-DP engines agree to use it if any engine needs to
+retain storage work. Preflight still refuses Device/PD/tier transfers,
+suspended retraction images and owners outside the storage tickets. The cache
+owner checks the exact block identities and reference counts, including
+unindexed GET destinations, before changing any index. Requests drop their
+storage leases normally; all old tickets detach. The Host and Device indexes,
+tail hints, negative metadata and publication receipts are invalidated, while
+the old native I/O references keep their physical blocks allocated.
+
+Recovery cancels queued jobs without waiting for workers, retains running jobs'
+immutable keys and addresses, and starts subsequent L3 work in a fresh cache
+generation. Its 128-bit random id is broadcast across the replica and attention
+DP ranks. The active prefix adds `-g` and this id to the normal weight prefix,
+so an old PUT finishing after clear cannot recreate an active-generation
+object. Full keys and a local I/O epoch are captured together; a job crossing
+the generation cut before submission is rejected without native access.
+
+Old tickets stay detached. Late results cannot republish entries or receipts;
+a retired completion releases its references, while unknown retirement remains
+charged for the process lifetime. No timer changes that fact, and no separate
+late-retirement notification is currently available. These old tickets do not
+block new L3 merely because they are quarantined, nor suppress a new generation's
+backup of the same logical key. They still consume real Host credits and the
+global operation limit. New computation, L2 and L3 use the remaining capacity.
+Old queue age is excluded from current pressure; clearing also resets backend
+health with a new health epoch, so old failures cannot close the new generation.
+A new unproven result in the current generation again blocks new I/O until clear.
+The aggregate unsafe-I/O metric and shutdown proof remain conservative.
+
+Weight metadata advances only after every rank successfully loads the weights.
+An actual change to another immutable weight version restores its standard
+shared weight namespace across independent engines. Reapplying the same version
+keeps the clear-generation suffix. A same-version recovery clear is local to
+the engines sharing that control agreement. Independent Prefill services remain
+in separate recovery namespaces until a new weight version; sharing a recovery
+generation would require an additional common-generation control protocol.
+Weight-version identity
+still requires that a version never denotes different weight contents.
+
+Native retirement is ANDed across all owners before a mirrored scheduler sees
+completion. Recovery therefore retains the same virtual blocks and allocator
+order on every member of a TP/PP replica, including an owner with no local
+payload for a sharded block. Local `unsafe_io` flags or physical unsafe byte
+counts may differ; they never select blocks to release locally. Independent
+DP replicas may retain different capacities and keep their existing batch
+agreement. Matching only the number of free blocks would not preserve the
+owner routing or the descriptors of mirrored operations.
+
+Recovery performs no remote purge: new work cannot read the retired namespace,
+and old running PUTs may still complete under their original keys. Physical
+deletion is deferred to store administration or
+recovery after retirement; a successful recovery clear promises local logical
+invalidation and safe retained ownership, not immediate remote deletion.
+It does not repair Mooncake's ownership protocol or cancel its transport.
+With no retained storage work, the ordinary clear still uses replica-agreed
+preflight and synchronous remote namespace deletion before clearing local
+indexes. A deletion failure there still prevents local clearing. That normal
+administrative call can delay control processing until its backend returns.
 L1-only clear may proceed while Host-only storage I/O remains active.
 Shutdown closes the L3 executor when the host's event loop ends, before the
 data plane's device-copy cleanup. L3 joins its workers with a deadline and then
