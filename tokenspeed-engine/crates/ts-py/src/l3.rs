@@ -22,13 +22,200 @@
 //! tests and tools that drive the storage tier against a data plane's Host
 //! pool. An engine rank's host runs its own.
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
-use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyList};
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+    types::PyList,
+};
 use ts_l3::{Executor, Operation, Settings, StorageKey};
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{mpsc, Arc, Barrier};
+
+    use super::*;
+    use ts_l3::{
+        monotonic_clock, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
+        MemoryStore, Namespace, Range, Store, StoreError,
+    };
+
+    struct WaitingStore {
+        memory: MemoryStore,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Store for WaitingStore {
+        fn failures_retire(&self) -> bool {
+            true
+        }
+
+        fn batch_exists(&self, keys: &[String]) -> Result<Vec<bool>, StoreError> {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            self.memory.batch_exists(keys)
+        }
+
+        fn batch_get_into(
+            &self,
+            keys: &[String],
+            host: HostBuffer,
+            ranges: &[Range],
+        ) -> Result<IoResult, StoreError> {
+            self.memory.batch_get_into(keys, host, ranges)
+        }
+
+        fn batch_put_from(
+            &self,
+            keys: &[String],
+            host: HostBuffer,
+            ranges: &[Range],
+        ) -> Result<IoResult, StoreError> {
+            self.memory.batch_put_from(keys, host, ranges)
+        }
+
+        fn remove_by_prefix(&self, prefix: &str) -> bool {
+            self.memory.remove_by_prefix(prefix)
+        }
+        fn close(&self) {
+            self.memory.close();
+        }
+    }
+
+    fn executor(store: Box<dyn Store>, pool: &mut [u8]) -> Executor {
+        Executor::start(
+            store,
+            HostBuffer {
+                base: pool.as_mut_ptr() as usize,
+                len: pool.len(),
+            },
+            HostLayout {
+                groups: vec![GroupLayout {
+                    packing: 1,
+                    block_bytes: 1,
+                    shard_count: 1,
+                }],
+                lcm_block_bytes: 1,
+                num_lcm_blocks: pool.len(),
+                owner_rank: 0,
+                tp_rank: 0,
+            },
+            Namespace {
+                deployment_id: "python-close-test".to_owned(),
+                has_draft: false,
+            },
+            "v1",
+            ExecutorConfig {
+                max_operations: 4,
+                max_keys_per_operation: 4,
+                query_workers: 1,
+                read_workers: 1,
+                write_workers: 1,
+                failure_threshold: 1,
+                recovery_interval: Duration::from_secs(1),
+            },
+            monotonic_clock(),
+        )
+    }
+
+    #[test]
+    fn simultaneous_python_closes_cannot_report_a_pending_close_as_success() {
+        Python::initialize();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut pool = vec![0_u8; 4];
+        let running = executor(
+            Box::new(WaitingStore {
+                memory: MemoryStore::new(),
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+            &mut pool,
+        );
+        running
+            .submit(&[Operation::Query {
+                op_id: 1,
+                keys: vec![StorageKey {
+                    group: 0,
+                    content_hash: "waiting".to_owned(),
+                    page_offset: 0,
+                }],
+            }])
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let binding = Arc::new(Python::attach(|py| {
+            Py::new(
+                py,
+                L3Executor {
+                    executor: Mutex::new(Some(running)),
+                },
+            )
+            .unwrap()
+        }));
+        let start = Arc::new(Barrier::new(3));
+        let closers: Vec<_> = (0..2)
+            .map(|_| {
+                let (binding, start) = (Arc::clone(&binding), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    Python::attach(|py| binding.bind(py).call_method1("close", (0.5,)).is_err())
+                })
+            })
+            .collect();
+        start.wait();
+        let results: Vec<bool> = closers
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let readable = Python::attach(|py| binding.bind(py).call_method0("snapshot").is_ok());
+        release_tx.send(()).unwrap();
+        Python::attach(|py| {
+            binding.bind(py).call_method1("close", (2.0,)).unwrap();
+        });
+        assert_eq!(results, [true, true]);
+        assert!(
+            readable,
+            "failed closes must keep the diagnostics available"
+        );
+    }
+
+    #[test]
+    fn invalid_python_close_timeouts_leave_the_executor_usable() {
+        Python::initialize();
+        let mut pool = vec![0_u8; 4];
+        let running = executor(Box::new(MemoryStore::new()), &mut pool);
+        Python::attach(|py| {
+            let binding = Py::new(
+                py,
+                L3Executor {
+                    executor: Mutex::new(Some(running)),
+                },
+            )
+            .unwrap();
+            for timeout in [-1.0, f64::NAN, f64::INFINITY, 1e19] {
+                let error = binding
+                    .bind(py)
+                    .call_method1("close", (timeout,))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+                assert!(binding.bind(py).call_method0("snapshot").is_ok());
+            }
+            binding.bind(py).call_method1("close", (2.0,)).unwrap();
+        });
+    }
 }
 
 /// One rank's L3 executor, started from an ``L3Settings``.
@@ -203,13 +390,26 @@ impl L3Executor {
 
     /// Stop the workers within ``timeout_s`` and release the store; raises
     /// when native I/O could not prove its retirement (the store and the
-    /// Host pool's registration then stay for the process).
+    /// Host pool's registration then stay for the process). A failed close
+    /// keeps the executor: its snapshot and counters stay readable for
+    /// diagnosis, the quarantine gauges included, and a later call
+    /// retries. A successful close is final; later calls do nothing.
     fn close(&self, py: Python<'_>, timeout_s: f64) -> PyResult<()> {
-        let executor = self.executor.lock().expect("L3 executor lock").take();
-        let Some(mut executor) = executor else {
-            return Ok(());
-        };
-        py.detach(|| executor.close(Duration::from_secs_f64(timeout_s)))
-            .map_err(runtime_error)
+        let timeout = Duration::try_from_secs_f64(timeout_s)
+            .map_err(|_| PyValueError::new_err("timeout_s must be finite and nonnegative"))?;
+        Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| PyValueError::new_err("timeout_s exceeds the clock range"))?;
+        py.detach(|| {
+            // Serialize closes without holding the GIL. A pending close
+            // must not look like a successful close to another caller.
+            let mut slot = self.executor.lock().expect("L3 executor lock");
+            if let Some(executor) = slot.as_mut() {
+                executor.close(timeout).map_err(runtime_error)?;
+                // Only successful retirement makes the handle terminal.
+                *slot = None;
+            }
+            Ok(())
+        })
     }
 }
