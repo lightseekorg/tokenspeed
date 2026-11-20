@@ -511,6 +511,7 @@ impl Shared {
                 // A room's pre-allocation follows on these same sockets. A
                 // refused enqueue (a full or retiring queue) is retried on the
                 // next resend, within the deadline.
+                refused = None;
                 for target in &unacknowledged {
                     if let Err(error) =
                         self.transport
