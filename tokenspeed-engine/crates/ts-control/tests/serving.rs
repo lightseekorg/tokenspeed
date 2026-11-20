@@ -1419,6 +1419,7 @@ struct Engine {
     client: EngineClient,
     stop: Arc<AtomicBool>,
     ranks: Vec<Rank>,
+    replica_size: usize,
 }
 
 /// Observe each mirror's control result before its normal frontend decides
@@ -1502,12 +1503,18 @@ impl Engine {
                 .collect()
         };
         for _ in 0..500 {
-            let first = rids(0);
-            if (1..self.ranks.len()).all(|rank| rids(rank) == first) {
+            if (0..self.ranks.len())
+                .step_by(self.replica_size)
+                .all(|first| {
+                    let expected = rids(first);
+                    (first + 1..first + self.replica_size).all(|rank| rids(rank) == expected)
+                })
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!("mirrored ranks did not release the same requests");
     }
 }
 
@@ -2055,6 +2062,7 @@ async fn start_ranks_with(
         client: listener.accept().await.unwrap(),
         stop,
         ranks,
+        replica_size: tp_size,
     }
 }
 
@@ -7236,6 +7244,7 @@ async fn weight_operations_keep_their_order_and_load_once_after_async_storage_dr
 #[tokio::test(flavor = "multi_thread")]
 async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waiting_forever() {
     let gate = Gate::closed();
+    let scheduler_handle = Arc::new(Mutex::new(None));
     let store = Arc::new(StorageProbe {
         put_gate: Some(gate.clone()),
         ..StorageProbe::default()
@@ -7246,6 +7255,7 @@ async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waitin
         Tiers::L3,
         Setup {
             l3_store: Some(store.clone()),
+            scheduler: Some(scheduler_handle.clone()),
             ..Setup::default()
         },
     )
@@ -7258,8 +7268,33 @@ async fn a_healthy_put_that_outlasts_the_clear_budget_is_isolated_without_waitin
     )
     .await;
     wait_for_store_put(&store).await;
-    admission_on_every_rank(&engine).await;
-    admission_on_every_rank(&engine).await;
+    let scheduler = scheduler_handle.lock().unwrap().clone().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let request_released = engine
+                .released_on(0)
+                .iter()
+                .any(|(rid, _)| rid == "slow-healthy-writer");
+            if request_released {
+                let scheduler = scheduler.clone();
+                // The loop owns its guard between rounds. Queue a real
+                // waiter so its fairness bump can hand the scheduler over.
+                let ready = tokio::task::spawn_blocking(move || {
+                    scheduler.lock().can_prepare_storage_clear()
+                })
+                .await
+                .unwrap();
+                if ready {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect(
+        "model execution and Device-to-Host copies did not finish before the storage-only clear",
+    );
     let started = std::time::Instant::now();
     assert_eq!(
         tokio::time::timeout(
@@ -8332,6 +8367,41 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{case}");
+            // The final streamed token can reach the client before a mirror
+            // finishes that round. Start the release experiment only after
+            // the model requests retired and all mirrors dispatched the same
+            // held Host writes. Other DP replicas own independent requests.
+            let mirrored = layout.sizes().1;
+            let host_ops = |rank: usize| -> Vec<u32> {
+                engine.ranks[rank]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(_, _, operations)| operations)
+                    .filter(|operation| operation.kind == CacheOpKind::WriteBack)
+                    .map(|operation| operation.op_id)
+                    .collect()
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let expected_ops = host_ops(0);
+                    if (0..mirrored).all(|rank| {
+                        let released = engine.released_on(rank);
+                        released.len() == prompts.len()
+                            && released
+                                .iter()
+                                .zip(prompts)
+                                .all(|((rid, _), (expected, _, _))| rid == expected)
+                            && host_ops(rank) == expected_ops
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("Host-store preconditions did not settle on {case}"));
             for rank in &engine.ranks {
                 assert!(rank.acknowledged.lock().unwrap().is_empty(), "{case}");
             }
@@ -8354,7 +8424,23 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             }
             let released = tokio::time::timeout(Duration::from_secs(10), release)
                 .await
-                .expect("no reply to the release once the stores landed")
+                .unwrap_or_else(|_| {
+                    let progress: Vec<_> = engine
+                        .ranks
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, member)| {
+                            (
+                                rank,
+                                engine.released_on(rank),
+                                host_ops(rank),
+                                member.acknowledged.lock().unwrap().clone(),
+                                member.device_ops.lock().unwrap().clone(),
+                            )
+                        })
+                        .collect();
+                    panic!("no reply after Host gates opened on {case}: {progress:?}");
+                })
                 .unwrap();
             assert_eq!(
                 outcome(released),
