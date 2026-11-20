@@ -220,8 +220,9 @@ class CachePoolBinding:
 
     def gates_decode_output(self, layer: PagedAttention) -> bool:
         """Whether ``forward_decode`` for ``layer`` takes
-        ``rmsnorm_output_gate`` and applies it where its kernels store the
-        output (:meth:`PagedAttention.attend`)."""
+        ``rmsnorm_output_gate`` and returns the gated output: from the store
+        of a kernel that can gate, else by running the separate op itself
+        (:meth:`PagedAttention.attend`)."""
         return False
 
     def query_dtype(

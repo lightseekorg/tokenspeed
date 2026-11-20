@@ -1938,9 +1938,10 @@ class ProducerAllReduce:
     # applied to any width: the producer pull beat RCCL up to these sizes
     # (1024 rows at TP8, 256 at TP4); past them RCCL was as fast or faster.
     ORDINARY_MAX_BYTES = {4: 4 << 20, 8: 16 << 20}
-    # Smallest payload for which reduce_ordinary uses the push at TP4: it
-    # beat the producer pull from 64 to 128 rows of 8192 and lost from 22 to
-    # 48 rows. TP8 never selects it.
+    # Smallest payload of reduce_ordinary's push window at TP4: the push beat
+    # the producer pull from 64 to 128 rows of 8192 and lost from 22 to 48
+    # rows. Payloads in the window that the Lamport two-shot serves take it
+    # (the push's sum order); the push keeps the others. TP8 has no window.
     ORDINARY_PUSH_MIN_BYTES = {4: 1 << 20}
     # BF16 elements in 16 packed 8-byte words.
     _ORDINARY_GRANULE = 64
@@ -2162,8 +2163,8 @@ class ProducerAllReduce:
         The result lives in the caller's storage, never in this state's, so
         later collectives cannot overwrite it and another stream may read it
         once ordered after this call. Payloads within a Lamport window are
-        pushed through its mailboxes and summed in place; at TP4, payloads in
-        the push window are pushed and copied back. Other payloads are copied
+        pushed through its mailboxes and summed in place, at TP4 only inside
+        the push window, whose other payloads are pushed and copied back. Other payloads are copied
         into the producer buffer and reduced by the generic producer pull,
         which beat run's two-shot pull at every size measured (129 to 1024
         rows of 8192 at TP8). Callers must

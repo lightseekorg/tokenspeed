@@ -222,7 +222,7 @@ def assert_uniform_groups_bitwise(inputs, groups):
 @pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("window", [2047, -1])
 def test_uniform_row_groups_keep_every_bit_at_draft_shapes(running, kv_dtype, window):
-    """The DFlash draft's attention (8 positions, 16 query / 2 KV heads, dim 128)
+    """A block drafter's attention (8 positions, 16 query / 2 KV heads, dim 128)
     over ragged lengths: tiny, around a page boundary, around the window edge
     and long."""
     if not is_cdna4():
@@ -257,3 +257,52 @@ def test_uniform_row_groups_keep_every_bit_at_draft_shapes(running, kv_dtype, wi
         **inputs, solution="gluon", block_draft=False, uniform_row_groups=positions
     )
     assert torch.equal(grouped.view(torch.int16), rows.view(torch.int16))
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("window", [2047, -1])
+def test_uniform_row_groups_with_an_output_gate_keep_every_bit(kv_dtype, window):
+    """A grouped block with an output gate (64-wide heads, the gate's range)
+    stores what its one-row requests followed by the separate gated norm
+    give, bit for bit."""
+    if not is_cdna4():
+        pytest.skip("requires gfx950")
+    from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+
+    torch.manual_seed(11)
+    running, positions, page, heads, dim = 9, 8, 64, 16, 64
+    lengths = torch.tensor(
+        [1, 63, 64, 65, 2047, 2048, 2049, 30001, 129], device="cuda", dtype=torch.int32
+    )
+    width = int(lengths.max()) // page + 2
+    pages = running * width
+    k = torch.randn(pages, page, 2, dim, device="cuda").to(kv_dtype)
+    v = torch.randn(pages, page, 2, dim, device="cuda").to(kv_dtype)
+    table = torch.randperm(pages, device="cuda").view(running, width).to(torch.int32)
+    rows = running * positions
+    inputs = {
+        "q": torch.randn(rows, heads, dim, device="cuda").to(kv_dtype),
+        "k_cache": k,
+        "v_cache": v,
+        "page_table": table.repeat_interleave(positions, dim=0),
+        "cache_seqlens": lengths.repeat_interleave(positions),
+        "max_seqlen_k": 262144,
+        "max_seqlen_q": 1,
+        "window_left": window,
+    }
+    gate = torch.randn(rows, heads * dim, device="cuda").bfloat16()
+    plain = mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False)
+    expected = weightless_rmsnorm_gated_sigmoid(
+        plain.view(rows, heads * dim), gate, heads, dim, 1e-6, False
+    )
+    grouped = mha_decode_with_kvcache(
+        **inputs,
+        solution="gluon",
+        block_draft=False,
+        uniform_row_groups=positions,
+        output_gate=gate,
+        output_gate_eps=1e-6,
+    )
+    assert torch.equal(
+        grouped.view(rows, -1).view(torch.int16), expected.view(torch.int16)
+    )

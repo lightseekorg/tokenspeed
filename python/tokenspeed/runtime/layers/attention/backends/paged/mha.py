@@ -575,7 +575,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             output_gate_eps=(
                 None if rmsnorm_output_gate is None else rmsnorm_output_gate[1]
             ),
-            # A DFlash block's positions share their request's page-table row
+            # A draft block's positions share their request's page-table row
             # and length (refresh_decode_metadata): one key read per block.
             uniform_row_groups=self.block_decode_expansion,
             solution=self.kernel_solution,
