@@ -45,6 +45,9 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection import (
         FusedTPProjectionState,
     )
+    from tokenspeed_kernel.ops.communication._cute_dsl.gemm_reduce_scatter import (
+        GemmReduceScatterState,
+    )
     from tokenspeed_kernel.ops.communication._cute_dsl.ll_exchange import (
         LLExchangeState,
     )
@@ -56,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 cute_dsl_fused_fp8_dp_column_linear = error_fn
 cute_dsl_fused_fp8_dp_row_linear = error_fn
+cute_dsl_gemm_reduce_scatter = error_fn
 cute_dsl_paged_row_all_gather = error_fn
 cute_dsl_ll_all_gather = error_fn
 cute_dsl_ll_all_to_all = error_fn
@@ -195,6 +199,63 @@ def fused_tp_row_projection_supported(
         and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
     )
+
+
+def gemm_reduce_scatter_supported(
+    group_size: int,
+    out_features: int,
+    in_features: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    """Return whether ``create_gemm_reduce_scatter_state`` can prepare this layout.
+
+    Args:
+        group_size: Number of ranks in an NVLink-connected group.
+        out_features: Weight rows N.
+        in_features: Weight columns K of this rank's shard.
+        dtype: Operand and output dtype.
+        device: Device owning the workspace.
+
+    Returns:
+        Whether the kernel serves the layout. The caller must separately agree
+        on NVLink multicast support across the group.
+    """
+    return (
+        current_platform().is_nvidia
+        and device.type == "cuda"
+        and group_size in (2, 4, 8)
+        and out_features % 256 == 0
+        and in_features % 64 == 0
+        and dtype == torch.bfloat16
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+    )
+
+
+def create_gemm_reduce_scatter_state(
+    group: dist.ProcessGroup,
+    device: torch.device,
+    max_rows: int,
+    out_features: int,
+    in_features: int,
+) -> "GemmReduceScatterState":
+    """Collectively allocate the workspace and compile before graph capture.
+
+    Args:
+        group: Two, four, or eight NVLink-connected ranks with multicast.
+        device: This rank's SM100 or SM103 CUDA device.
+        max_rows: Most rows of all ranks' blocks one call takes.
+        out_features: Weight rows N, divisible by 256.
+        in_features: Weight columns K, divisible by 64.
+
+    Returns:
+        State for ``cute_dsl_gemm_reduce_scatter``, shared only by serial calls.
+    """
+    from tokenspeed_kernel.ops.communication._cute_dsl.gemm_reduce_scatter import (
+        GemmReduceScatterState,
+    )
+
+    return GemmReduceScatterState(group, device, max_rows, out_features, in_features)
 
 
 def create_paged_row_all_gather_state(
@@ -573,6 +634,39 @@ if current_platform().is_nvidia:
         return state.run(
             inputs, weight, weight_scales, owner_rows, out, input_scales=input_scales
         )
+
+    @register_kernel(
+        "communication",
+        "gemm_reduce_scatter",
+        name="cute_dsl_gemm_reduce_scatter",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("x", "weight"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_gemm_reduce_scatter(
+        state: "GemmReduceScatterState", x: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's block of ``reduce_scatter(x @ weight.T)`` in one kernel.
+
+        Each rank's BF16 partial tiles are summed in FP32 by their block's
+        owner and rounded once, so the result is at least as precise as a
+        BF16 GEMM followed by a ring reduce-scatter.
+
+        Args:
+            state: From ``create_gemm_reduce_scatter_state``.
+            x: Contiguous BF16 ``[ranks * B, K]``, rank ``r``'s block rows
+                ``[r * B, (r + 1) * B)``, equal shape on every rank.
+            weight: Contiguous BF16 ``[N, K]``.
+
+        Returns:
+            BF16 ``[B, N]``: block ``rank`` of the summed product.
+        """
+        return state.run(x, weight)
 
     @register_kernel(
         "communication",

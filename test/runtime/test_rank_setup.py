@@ -52,6 +52,7 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
 )
 
 import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
+import tokenspeed.runtime.engine.scheduler_utils as scheduler_utils  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -73,6 +74,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     return SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
+        cache_storage={},
         host_group_packing=(),
         num_host_pages=num_host_pages,
         num_snapshot_pages=num_snapshot_pages,
@@ -372,8 +374,8 @@ def test_an_engine_with_l3_passes_its_prefetch_threshold():
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pd_roles_configure_their_pools_as_resolved(role):
-    # The prefill role resolves to no pool and no forced retraction; the
-    # decode role keeps both.
+    # The prefill role resolves to no pool, no forced retraction and early
+    # admission; the decode role keeps both and has no admission policy.
     args = ServerArgs(
         model="x",
         max_num_seqs=8,
@@ -388,6 +390,23 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == pool
     assert cfg.debug_force_retraction_interval == (0 if role == "prefill" else 3)
+    assert cfg.decode_allocation_policy == (
+        ts.SchedulerConfig.DecodeAllocationPolicy.Early if role == "prefill" else None
+    )
+
+
+def test_deferred_allocation_reaches_the_prefill_scheduler():
+    args = ServerArgs(
+        model="x",
+        disaggregation_mode="prefill",
+        disaggregation_decode_allocation_policy="deferred",
+        disaggregation_layerwise_interval=0,
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    assert (
+        cfg.decode_allocation_policy
+        == ts.SchedulerConfig.DecodeAllocationPolicy.Deferred
+    )
 
 
 @pytest.mark.parametrize(
@@ -663,6 +682,32 @@ def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatc
             ts.SchedulerConfig.HostWritePolicy.WriteBack,
             (5, 8),
         ),
+        (
+            [
+                "--disaggregation-mode",
+                "decode",
+                "--kvstore-write-policy",
+                "write_back",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "decode",
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "8",
+                "--decode-context-parallel-size",
+                "8",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
     ],
     ids=[
         "default",
@@ -674,6 +719,8 @@ def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatc
         "fused_write_back_attention_tp",
         "fused_write_back_dcp",
         "fused_write_back_tp_wider_than_dcp",
+        "decode_write_back",
+        "decode_write_back_dcp",
     ],
 )
 def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
@@ -688,20 +735,6 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
 @pytest.mark.parametrize(
     "flags, refused",
     [
-        (["--disaggregation-mode", "decode"], "--disaggregation-mode decode"),
-        (
-            [
-                "--disaggregation-mode",
-                "decode",
-                "--attn-tp-size",
-                "8",
-                "--kv-parallel-size",
-                "8",
-                "--decode-context-parallel-size",
-                "8",
-            ],
-            "--disaggregation-mode decode",
-        ),
         (
             ["--disaggregation-mode", "prefill", "--disable-kvstore"],
             "--disable-kvstore (no Host L2)",
@@ -733,10 +766,10 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
         ),
         (["--pipeline-parallel-size", "2"], "--pipeline-parallel-size > 1"),
     ],
-    ids=["decode", "decode_dcp", "no_host", "encode", "l3", "qcp", "pp", "fused_pp"],
+    ids=["no_host", "encode", "l3", "qcp", "pp", "fused_pp"],
 )
 def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeypatch):
-    # The scheduler writes back on every role but decode; the runtime with
+    # The scheduler writes back on every role; the runtime with
     # Host L2 and no L3, on one pipeline stage, and not yet under a query
     # shard. Attention TP and KV parallelism are accepted (above). Each case
     # breaks one prerequisite, which the write_back check names. The debug
@@ -1181,3 +1214,16 @@ def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
             speculative_draft_model_revision="v2",
             **draft,
         )
+
+
+@pytest.mark.parametrize(
+    "explicit,workspace,expected",
+    [(None, 512, 32), (1024, 512, 32), (256, 512, 16), (None, 0, 0)],
+)
+def test_prefill_page_budget_respects_reserved_workspace(explicit, workspace, expected):
+    args = ServerArgs(model="x", max_num_seqs=8, chunk_prefill_kv_size=explicit)
+    specs = _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0)
+    specs.cache_storage["prefill_kv_capacity"] = workspace
+    cfg = _config(args, specs)
+    assert cfg.max_kv_page_num == expected
+    assert cfg.num_device_pages == specs.cache_geometry.num_device_pages

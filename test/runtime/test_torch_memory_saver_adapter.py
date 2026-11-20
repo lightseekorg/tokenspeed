@@ -403,7 +403,18 @@ def _check_managed_metadata_on_cuda():
 
     saver = arena.memory_saver_adapter
     target, draft = ModelMetadata(), ModelMetadata()
-    retained = [(table, address, expected)]
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(global_server_args_dict, "enable_memory_saver", True)
+        rows = MoESourceRows(
+            Mapping(rank=0, world_size=1), device="cuda", max_rows_per_rank=8
+        )
+    rows.publish((5,))
+    counts = rows.source_token_counts
+    retained = [(table, address, expected), (counts, counts.data_ptr(), counts.cpu())]
     for count, host_tables in ((1, False), (257, True), (3, False)):
         arrays = np.ones((count, 2), dtype=np.int32)
         spans = np.tile(np.array([0, 2], dtype=np.int32), (count, 1))
@@ -463,6 +474,77 @@ def _check_managed_metadata_on_cuda():
             for tensor, pointer, reference in retained:
                 assert tensor.data_ptr() == pointer
                 torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+
+    from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
+
+    if cutedsl_kda_supported():
+        # Exercise lazy compilation and both workspace routes, including growth.
+        for tokens, heads, sequences in (
+            (32, 12, 1),
+            (257, 96, 1),
+            (384, 96, 3),
+            (128, 12, 1),
+        ):
+            host_bounds = torch.arange(sequences + 1, dtype=torch.int64) * (
+                tokens // sequences
+            )
+            with saver.named_region("runtime_states"):
+                packed = torch.full(
+                    (1, tokens, 3, heads, 128), 0.1, device="cuda", dtype=torch.bfloat16
+                )
+                gate = torch.zeros(
+                    (1, tokens, heads, 128), device="cuda", dtype=torch.bfloat16
+                )
+                beta = torch.zeros(
+                    (1, tokens, heads), device="cuda", dtype=torch.bfloat16
+                )
+                decay = torch.zeros(heads, device="cuda")
+                bias = torch.zeros(heads, 128, device="cuda")
+                state = torch.zeros(sequences, heads, 128, 128, device="cuda")
+                bounds = host_bounds.to("cuda")
+
+            def scan():
+                return kda_paged_prefill(
+                    *packed.unbind(2),
+                    gate,
+                    beta,
+                    decay,
+                    bias,
+                    initial_state=state,
+                    cu_seqlens=bounds,
+                    cu_seqlens_cpu=host_bounds,
+                    capacity=None,
+                    lower_bound=-5.0,
+                    solution="cutedsl_kda",
+                    recurrent_layout="v_major",
+                )
+
+            result = scan()
+            expected_out, expected_state = result.out.cpu(), result.final_state.cpu()
+            del result
+            pointer = packed.data_ptr()
+            for _ in range(2):
+                torch.cuda.synchronize()
+                saver.pause(tag="weights")
+                torch.cuda.empty_cache()
+                ordinary_bytes = sum(
+                    segment["total_size"]
+                    for segment in torch.cuda.memory_snapshot()
+                    if segment["device"] == torch.cuda.current_device()
+                    and tuple(segment["segment_pool_id"]) == (0, 0)
+                )
+                assert ordinary_bytes == 0, ordinary_bytes
+                saver.resume(tag="weights")
+                assert packed.data_ptr() == pointer
+                result = scan()
+                torch.testing.assert_close(
+                    result.out.cpu(), expected_out, rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    result.final_state.cpu(), expected_state, rtol=0, atol=0
+                )
+                del result
 
 
 @pytest.mark.skipif(

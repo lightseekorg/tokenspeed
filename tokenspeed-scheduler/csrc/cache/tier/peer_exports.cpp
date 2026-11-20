@@ -170,6 +170,7 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
         return;
     }
     lease.phase = Phase::kHard;
+    lease.pinned_us = now_us;
     lease.deadline_us = Deadline(now_us, hard_pin_us_);
     lease.access_epoch = exported.access_epoch;
     for (CacheCoordinator::ExportedBlock& block : exported.blocks) {
@@ -181,7 +182,7 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
     }
 }
 
-void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release) {
+void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release, std::int64_t now_us) {
     const auto it = leases_.find(release.lease);
     if (it == leases_.end()) {
         return;
@@ -190,6 +191,9 @@ void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerReleas
     // The pins go first: a demotion skips an entry anything holds.
     Lease lease = std::move(it->second);
     leases_.erase(it);
+    if (held && observe_pins_) {
+        pin_samples_.push_back({now_us - lease.pinned_us, lease.deadline_us - now_us, false});
+    }
     lease.pins.clear();
     if (held && release.demote) {
         coordinator.DemoteExportedChain(lease.keys, lease.access_epoch);
@@ -197,19 +201,26 @@ void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerReleas
 }
 
 void PeerExports::Expire(std::int64_t now_us) {
-    std::erase_if(leases_, [&](auto& entry) {
-        Lease& lease = entry.second;
+    // Older libstdc++ versions pass const entries to erase_if predicates.
+    // Expiration also updates hard pins, so walk the mutable entries directly.
+    for (auto it = leases_.begin(); it != leases_.end();) {
+        Lease& lease = it->second;
         if (now_us < lease.deadline_us) {
-            return false;
+            ++it;
+            continue;
         }
         if (lease.phase != Phase::kHard) {
-            return true;
+            it = leases_.erase(it);
+            continue;
+        }
+        if (observe_pins_) {
+            pin_samples_.push_back({now_us - lease.pinned_us, lease.deadline_us - now_us, true});
         }
         lease.phase = Phase::kExpired;
         lease.pins.clear();
         lease.deadline_us = Deadline(now_us, hard_pin_us_);
-        return false;
-    });
+        ++it;
+    }
 }
 
 std::size_t PeerExports::NumPinnedBlocks() const {

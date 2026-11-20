@@ -3817,10 +3817,11 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
                                                       /*awaits_result=*/true});
     ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
 
-    request.Apply(fsm::ExtendResultEvent{{}});  // an older intermediate chunk's empty result
+    // An older intermediate chunk's empty result.
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});
     EXPECT_TRUE(request.Is<fsm::PrefillAwaitingResult>()) << "an empty result must not end the wait";
 
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});  // the final chunk's token
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.LastToken(), 42);
 }
@@ -3863,12 +3864,13 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
     ASSERT_EQ(request.ResultsInFlight(), 2);
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token, ahead of chunk 1's result
+    // The final chunk's token, ahead of chunk 1's result.
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 1) << "chunk 1's forward is still out against these pages";
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // chunk 1's empty result, late
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});  // chunk 1's empty result, late
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 0);
 }
@@ -3904,7 +3906,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     request.TrackScheduledForward();
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // the first chunk landed
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});  // the first chunk landed
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     const auto* retracted = request.GetIf<fsm::Retracted>();
@@ -3989,9 +3991,9 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7), /*await_destination=*/false});
     ASSERT_EQ(request.GeneratedTokens(), 1000);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -4053,9 +4055,9 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7), /*await_destination=*/false});
     ASSERT_EQ(request.GeneratedTokens(), 4097);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -4269,6 +4271,24 @@ protected:
         return rows;
     }
 };
+
+TEST_F(PrefillChunkYieldCapacitySuite, InflightCountsOnlyFinalResultsAwaitingTransferCompletion) {
+    SubmitBootstrapped("prompt", MakeTokens(14, 1000));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 0, 8}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "intermediate prefill is still computation";
+    EXPECT_EQ(scheduler_->PdTransferSize(), 1u) << "page pinning already starts during prefill";
+    SendForwardDone("prompt");
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 8, 14}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "the final forward result has not landed";
+    SendForwardDone("prompt", {900});
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "ready before remote dispatch";
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "transfer dispatched, still awaiting ACK";
+    SendPdSucceeded("prompt");
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+}
 
 TEST_F(PrefillChunkYieldCapacitySuite, AFailedCarriedPromptEndsTheFillAndTheChunkThatGaveWayIsAdmittedFirst) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 32);
@@ -5628,7 +5648,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
 
     // The last chunk's ExtendResult lands while still PrefillDone.
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     EXPECT_TRUE(request.Is<fsm::Retracted>());

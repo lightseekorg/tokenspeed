@@ -54,6 +54,7 @@ struct PeerEventView;
 struct PeerAnswerView;
 struct PeerLookupView;
 struct PeerFetchView;
+struct PinSampleView;
 struct PeerStatsView;
 struct PeerLeaseView;
 struct PeerPageView;
@@ -72,6 +73,7 @@ bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventVie
                       rust::Slice<const PeerPageView> pages);
 bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
 std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler);
+rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler);
 PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler);
 std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
@@ -109,6 +111,7 @@ bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan);
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);

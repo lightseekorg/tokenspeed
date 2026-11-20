@@ -1311,8 +1311,12 @@ object:
 ```
 
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
-  FP8 to save memory, quantizing a BF16 table per row at load. When omitted,
-  the table keeps the checkpoint's format: checkpoints that ship it in FP8,
+  FP8 to save memory. A BF16 checkpoint uses one BF16 scale for the whole
+  table, including across ranks. For a split BF16 table, the prescan requires
+  a standard safetensors checkpoint. Each rank scans its own rows for the
+  absolute maximum. The ranks reduce these maxima and use the resulting
+  scale to quantize each shard during normal weight loading. When omitted, the table keeps the checkpoint's
+  format: checkpoints that ship it in FP8,
   such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
   keep it in FP8, and other checkpoints store it in the model's compute dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
@@ -1321,6 +1325,23 @@ object:
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
+
+### Optional PLE hot cache
+
+Pass `--enable-ple-hot-cache` to cache recently read PLE table rows in HBM.
+The cache defaults to off and applies only to offloaded BF16 or scalar-scaled
+FP8 tables with 16 n-gram heads and head dimension 160 or 512 on supported
+NVIDIA GPUs. `TOKENSPEED_PLE_HOST_CACHE_SLOTS` sets the capacity per shard
+when the flag is enabled (default 524288 slots; must be a power of two greater than one).
+At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16 per
+shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively. Miss
+staging is temporary and adds to those amounts.
+
+Enabling the flag requires a Qwen4-Exp target with PLE layers and offloading.
+Unsupported model, cache geometry, dtype, or GPU configurations fail at startup.
+CUDA library loading errors propagate directly. Online-quantized and checkpoint FP8 tables both use the table-wide scale for hot-cache lookups.
+Small lookups (fewer than 256 tokens) and CUDA graph capture/replay also use
+regular host gather.
 
 ### FlatKV cache
 

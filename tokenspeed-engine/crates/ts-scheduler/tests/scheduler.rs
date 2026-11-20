@@ -1503,3 +1503,27 @@ fn python_event_lists_keep_their_payload_after_cache_clear() {
         .unwrap();
     });
 }
+
+#[test]
+fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("paused", vec![1, 2, 3])])
+        .unwrap();
+    let mut frozen = tick(1);
+    frozen.tick.as_mut().unwrap().allow_forward = false;
+    scheduler.advance_head(&frozen, &[]).unwrap();
+    // Exceed the scheduler's no-progress threshold while forwards are forbidden.
+    for _ in 0..8192 {
+        let plan = scheduler.next_execution_plan(false, false);
+        assert!(plan.forward_batches().is_empty());
+        assert!(plan.aborts().is_empty());
+        assert_eq!(scheduler.sizes().waiting, 1);
+    }
+    scheduler.advance_head(&tick(2), &[]).unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(plan.aborts().is_empty());
+    assert_eq!(plan.forward_batches()[0].request_ids, ["paused"]);
+}
