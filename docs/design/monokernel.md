@@ -77,7 +77,7 @@ each stage with a torch reference of TokenSpeed's math, with tight tolerances
 per stage and looser ones per layer. A model's monokernel may go further and
 equal the regular kernels bit for bit: each stage then reproduces the kernel it
 replaces at that kernel's decode launch (its MFMA shapes and K orders, split
-boundaries and partial-sum orders, reduction layouts, transcendental functions
+boundaries and partial-sum orders, reduction layouts, transcendental functions,
 and FP contraction), and its test compares the two with `torch.equal`. Prefer
 it: speculative decoding then accepts exactly the regular path's tokens, while
 last-bit differences can flip greedy continuations that sit on near ties
