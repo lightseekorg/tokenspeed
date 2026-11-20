@@ -18,11 +18,135 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer cuDNN KDA integration."""
+"""FlashInfer KDA prefill integration."""
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
+
+
+@lru_cache(maxsize=None)
+def _compile_cutedsl_kda(device: int, gate_dtype: torch.dtype, lower_bound: float):
+    import cutlass
+    import cutlass.cute as cute
+    from flashinfer.kda_kernels import kda_chunked_bt16 as kda
+
+    gate_type = {torch.bfloat16: cutlass.BFloat16, torch.float32: cutlass.Float32}[
+        gate_dtype
+    ]
+    fakes, checkpoints, checkpoint_starts, checkpoint_indices = kda._unified_fakes(
+        cutlass.BFloat16, cutlass.Float32, True, True, False, False, False, gate_type
+    )
+    # The public wrapper updates state in place and retains GPU scratch globally.
+    # Use its compiled kernel with separate state output and invocation-owned scratch.
+    with torch.cuda.device(device):
+        return cute.compile(
+            kda.host_unified,
+            *fakes,
+            kda.make_fake_stream(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            kda.DEFAULT_SCALE,
+            checkpoints,
+            checkpoint_starts,
+            checkpoint_indices,
+            True,
+            lower_bound * kda.LOG2_E,
+            kda.THREADS_PER_CTA,
+            None,
+            gate_type,
+            options="--enable-tvm-ffi",
+        )
+
+
+def cutedsl_kda_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run FlashInfer's ordinary CuTe prefill with live packed boundaries.
+
+    Args:
+        q/k/v: BF16 [1, capacity, heads, 128], with dense head/features and
+            16-byte-aligned bases and token strides. Token rows may be strided.
+        g_raw: BF16 or FP32 raw gate with the same shape as q.
+        beta_logits: BF16 [1, capacity, heads] raw beta logits.
+        A_log/dt_bias: FP32 per-head decay and per-channel gate bias.
+        initial_state: FP32 [sequences, heads, V, K] gathered cache state.
+        cu_seqlens: Device int64 boundaries [sequences + 1]. Live lengths may
+            change on replay and their sum may be less than token capacity.
+        lower_bound: Negative safe-gate bound, fixed for the model.
+
+    Returns:
+        Packed BF16 output and separate FP32 final state. Input state is
+        unchanged; scratch belongs to this call or its CUDA graph pool.
+    """
+    from cuda.bindings.driver import CUstream
+    from flashinfer.kda_kernels import kda_chunked_bt16 as kda
+
+    heads, tokens = q.shape[2], q.shape[1]
+    sequences = cu_seqlens.numel() - 1
+    compiled = _compile_cutedsl_kda(q.device.index, g_raw.dtype, lower_bound)
+    route = kda._route_for_workspace(sequences, heads, q.device, "auto")
+    # The engine never reads the decomposition workspace; one chunk supplies
+    # the ABI's required views without retaining a process-global GPU cache.
+    chunks = (tokens + 15) // 16 + sequences - 1 if route == "decomp" else 1
+    workspace = torch.empty(
+        kda._decomp_ws_bytes(heads, chunks), dtype=torch.uint8, device=q.device
+    )
+    scratch = kda._partition_workspace(workspace, heads, chunks)
+    cu_chunks = torch.empty(sequences + 1, dtype=torch.int32, device=q.device)
+    order = torch.empty(sequences, dtype=torch.int32, device=q.device)
+    num_ctas, chunks_per_cta = kda._k1_grid(chunks, heads)
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    final_state = torch.empty_like(initial_state)
+    compiled(
+        q,
+        k,
+        v,
+        g_raw.contiguous(),
+        A_log.contiguous(),
+        dt_bias.reshape(heads, 128).contiguous(),
+        beta_logits.contiguous(),
+        cu_seqlens,
+        order,
+        1,
+        None,
+        cu_chunks,
+        1,
+        scratch["kd"],
+        scratch["qd"],
+        scratch["w"],
+        scratch["qk"],
+        scratch["diag"],
+        initial_state,
+        out,
+        final_state,
+        CUstream(torch.cuda.current_stream(q.device).cuda_stream),
+        1,
+        kda._device_sm_count(q.device),
+        0,
+        num_ctas,
+        chunks_per_cta,
+        q.shape[-1] ** -0.5,
+        None,
+        None,
+        None,
+    )
+    return out, final_state
 
 
 def cudnn_kda_prefill(

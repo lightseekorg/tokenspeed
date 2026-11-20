@@ -1,5 +1,16 @@
 # KDA kernels
 
+## CuTe prefill (`cutedsl_kda`)
+
+The backend uses FlashInfer's ordinary CuTe KDA scan, reading token-strided
+Q/K/V directly from convolution output. FP32 initial and final states are
+separate; the runtime retains its LCM gather/writeback and checkpoint policy.
+Live device boundaries build the scan plan for both eager execution and
+capacity-based CUDA graphs. Scratch belongs to each invocation or its graph
+pool; only compiled code is cached. The FlashInfer adapter owns the pinned
+native launch ABI, avoiding the public wrapper's in-place state updates and
+persistent GPU scratch.
+
 ## RecoverSSM verify (`kda_recoverssm_verify`)
 
 Speculative verify reads each request's checkpoint, runs the candidate window
