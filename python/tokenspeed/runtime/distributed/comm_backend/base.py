@@ -104,8 +104,11 @@ class CommBackend(ABC):
     def all_gather_float_words_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
-        """``all_gather_single`` of float words (FP32, BF16 pairs, or E4M3
-        bytes), whose NaN words may come back with other NaN bits."""
+        """Run ``all_gather_single`` over float words.
+
+        The words are FP32, BF16 pairs, or E4M3 bytes; a NaN word may come
+        back with other NaN bits.
+        """
         self.all_gather_single(output, input, group)
 
     def try_shard_exchange(

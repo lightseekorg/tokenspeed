@@ -69,7 +69,12 @@ def _bytes(count, generator, device):
 def _exchange_matches_nccl(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     state = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group,
+        device,
+        cap_bytes=CAP_BYTES,
+        float_cap_bytes=CAP_BYTES,
+        timeout_ns=TIMEOUT_NS,
+        eligible=True,
     )
     assert state is not None
     generator = torch.Generator(device=device).manual_seed(1000 + rank)
@@ -95,10 +100,14 @@ def _exchange_matches_nccl(rank, size, rendezvous):
     # another NaN.
     for payload in SIZES:
         words = torch.randint(
-            -(2**31), 2**31 - 1, (payload // 4,), dtype=torch.int32, device=device,
+            -(2**31),
+            2**31 - 1,
+            (payload // 4,),
+            dtype=torch.int32,
+            device=device,
             generator=generator,
         )
-        words[:: 97] = -1
+        words[::97] = -1
         expected = torch.empty(size * words.numel(), dtype=torch.int32, device=device)
         dist.all_gather_into_tensor(expected, words)
         expected[expected == -1] = 0x7FFFFFFF
@@ -116,7 +125,12 @@ def _exchange_matches_nccl(rank, size, rendezvous):
 def _graph_replays_fresh_inputs(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     state = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group,
+        device,
+        cap_bytes=CAP_BYTES,
+        float_cap_bytes=CAP_BYTES,
+        timeout_ns=TIMEOUT_NS,
+        eligible=True,
     )
     generator = torch.Generator(device=device).manual_seed(2000 + rank)
     payloads = (4096, 65536, 16, 262144)
@@ -156,7 +170,12 @@ def _graph_replays_fresh_inputs(rank, size, rendezvous):
 def _epochs_skip_zero(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     state = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group,
+        device,
+        cap_bytes=CAP_BYTES,
+        float_cap_bytes=CAP_BYTES,
+        timeout_ns=TIMEOUT_NS,
+        eligible=True,
     )
     # Three calls before a 32-bit epoch would wrap to the zeroed slots' 0: the
     # calls past it must still wait for their peers' stores.
@@ -182,15 +201,30 @@ def _refusals(rank, size, rendezvous):
     device, group = _init(rank, size, rendezvous)
     # One ineligible rank keeps every rank on its collectives.
     refused = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=rank != 1
+        group,
+        device,
+        cap_bytes=CAP_BYTES,
+        float_cap_bytes=CAP_BYTES,
+        timeout_ns=TIMEOUT_NS,
+        eligible=rank != 1,
     )
     assert refused is None
     unaligned = create_ll_exchange_state(
-        group, device, cap_bytes=CAP_BYTES + 8, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group,
+        device,
+        cap_bytes=CAP_BYTES + 8,
+        float_cap_bytes=CAP_BYTES,
+        timeout_ns=TIMEOUT_NS,
+        eligible=True,
     )
     assert unaligned is None
     state = create_ll_exchange_state(
-        group, device, cap_bytes=4096, float_cap_bytes=CAP_BYTES, timeout_ns=TIMEOUT_NS, eligible=True
+        group,
+        device,
+        cap_bytes=4096,
+        float_cap_bytes=CAP_BYTES,
+        timeout_ns=TIMEOUT_NS,
+        eligible=True,
     )
     assert state.serves(4096, floats=False) and not state.serves(4112, floats=False)
     assert not state.serves(24, floats=False) and state.serves(4112, floats=True)

@@ -531,9 +531,7 @@ def prepare_small_exchange(
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.prepare_small_exchange(
-        group, cap_bytes, float_cap_bytes, timeout_ns
-    )
+    return backend.prepare_small_exchange(group, cap_bytes, float_cap_bytes, timeout_ns)
 
 
 def prepare_all_reduce_buffers(

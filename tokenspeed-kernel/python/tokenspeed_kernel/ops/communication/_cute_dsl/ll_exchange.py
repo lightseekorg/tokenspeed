@@ -124,7 +124,7 @@ SENTINEL = 0xFFFFFFFF
 
 @dsl_user_op
 def _push_float_unit(src, dst, *, loc=None, ip=None):
-    """Store the 16 bytes at ``src`` at ``dst``, a sentinel word as 0x7FFFFFFF."""
+    """Store the 16 bytes at ``src`` at ``dst``, a sentinel as 0x7FFFFFFF."""
     code = "{ .reg .b32 w0, w1, w2, w3; .reg .pred p;\n"
     code += "ld.global.nc.v4.b32 {w0, w1, w2, w3}, [$0];\n"
     for w in range(4):
@@ -135,7 +135,7 @@ def _push_float_unit(src, dst, *, loc=None, ip=None):
 
 @dsl_user_op
 def _poll_float_unit(slot, out, deadline, *, loc=None, ip=None):
-    """Wait until no word at ``slot`` is the sentinel, store the words, re-arm it."""
+    """Wait for every word at ``slot`` to land, store them, and re-arm it."""
     code = "{ .reg .b32 w0, w1, w2, w3; .reg .b64 now; .reg .pred p;\n"
     code += "SENT_WAIT${:uid}:\n"
     code += "ld.relaxed.sys.global.v4.b32 {w0, w1, w2, w3}, [$0];\n"
@@ -148,7 +148,9 @@ def _poll_float_unit(slot, out, deadline, *, loc=None, ip=None):
     code += "trap;\n"
     code += "SENT_DONE${:uid}:\n"
     code += "st.global.v4.b32 [$1], {w0, w1, w2, w3};\n"
-    code += f"st.global.v4.b32 [$0], {{{SENTINEL}, {SENTINEL}, {SENTINEL}, {SENTINEL}}}; }}"
+    code += (
+        f"st.global.v4.b32 [$0], {{{SENTINEL}, {SENTINEL}, {SENTINEL}, {SENTINEL}}}; }}"
+    )
     _asm(code, "l,l,l", [slot, out, deadline], loc, ip)
 
 
@@ -311,8 +313,8 @@ class LLExchangeState:
             )
             self.multicast_ptr = int(self.handle.multicast_ptr) if multicast else 0
             # The float exchange's slots start armed with the sentinel.
-            self.float_workspace, self.float_handle, self.float_peers = (
-                self._workspace(group, self.float_cap_units * UNIT, 0xFF, device)
+            self.float_workspace, self.float_handle, self.float_peers = self._workspace(
+                group, self.float_cap_units * UNIT, 0xFF, device
             )
             self.float_multicast_ptr = (
                 int(self.float_handle.multicast_ptr) if multicast else 0
@@ -332,8 +334,11 @@ class LLExchangeState:
         dist.barrier(group=group)
 
     def _workspace(self, group, slot_bytes: int, fill: int, device):
-        """Two parities of ``slot_bytes`` per rank, filled with ``fill`` and
-        mapped by every rank: (workspace, handle, peer addresses)."""
+        """Return a mapped workspace as (workspace, handle, peer addresses).
+
+        It holds two parities of ``slot_bytes`` per rank, filled with ``fill``
+        and mapped by every rank.
+        """
         workspace = symm_mem.empty(
             (2 * self.ranks * max(slot_bytes, UNIT),), dtype=torch.uint8, device=device
         )
@@ -343,8 +348,10 @@ class LLExchangeState:
         return workspace, handle, peers
 
     def serves(self, payload_bytes: int, *, floats: bool) -> bool:
-        """Whether a per-rank payload of this size fits one call; ``floats``:
-        one of float words (an all-gather)."""
+        """Whether a per-rank payload of this size fits one call.
+
+        ``floats`` asks for a payload of float words (an all-gather).
+        """
         cap = self.float_cap_bytes if floats else self.cap_bytes
         return 0 < payload_bytes <= cap and payload_bytes % UNIT == 0
 
@@ -352,7 +359,9 @@ class LLExchangeState:
         self, src: torch.Tensor, out: torch.Tensor, *, gather: bool, floats: bool
     ) -> None:
         """Run one call; the public entries validate the tensors first.
-        ``floats`` (gathers only) sends float words as themselves."""
+
+        ``floats`` (gathers only) sends float words as themselves.
+        """
         payload = src.numel() * src.element_size() // (1 if gather else self.ranks)
         units = payload // UNIT
         # A large float gather is bandwidth-bound and takes every SM it can
