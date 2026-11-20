@@ -30,7 +30,8 @@ import pytest
     not os.environ.get("TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY"),
     reason="requires the native Ascend saver library and an NPU",
 )
-def test_graph_discard_preserves_persistent_buffers():
+@pytest.mark.parametrize("graph_policy", ["discard", "cpu_backup"])
+def test_graph_policy_preserves_persistent_buffers(graph_policy):
     import torch
 
     pytest.importorskip("torch_npu")
@@ -48,10 +49,16 @@ def test_graph_discard_preserves_persistent_buffers():
         inputs * inputs + constant
     torch.npu.synchronize()
 
+    native_policy = "backup" if graph_policy == "cpu_backup" else "discard"
+
     def blocks():
         stats = saver.stats()
         assert not stats["callback_fault"]
-        return [block for block in stats["blocks"] if block["tag"] == "acl_graph"]
+        return [
+            block
+            for block in stats["blocks"]
+            if block["tag"] == "acl_graph" and block["policy"] == native_policy
+        ]
 
     try:
         with saver.npu_graph(
@@ -59,17 +66,22 @@ def test_graph_discard_preserves_persistent_buffers():
             pool=None,
             stream=torch.npu.Stream(),
             tag="acl_graph",
-            policy="discard",
-            pool_scope="test_graph_discard",
+            policy=graph_policy,
+            pool_scope="decode",
             auto_dispatch_capture=True,
         ):
             output = inputs * inputs + constant
         graph.replay()
         torch.npu.synchronize()
-        expected = output.cpu()
-        addresses = {block["ptr"] for block in blocks()}
-        assert addresses
+        expected = inputs.cpu().square() + 7
+        torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+        capture_blocks = blocks()
         output_ptr = output.data_ptr()
+        assert any(
+            0 <= output_ptr - int(block["ptr"], 16) < block["aligned_bytes"]
+            for block in capture_blocks
+        )
+        addresses = {block["ptr"] for block in capture_blocks}
         memset = ctypes.CDLL("libascendcl.so").aclrtMemset
         memset.argtypes = [
             ctypes.c_void_p,
@@ -88,17 +100,20 @@ def test_graph_discard_preserves_persistent_buffers():
                 block["reserved"]
                 and not block["physical_live"]
                 and not block["mapped"]
-                and not block["backup_valid"]
+                and block["backup_valid"] == (graph_policy == "cpu_backup")
                 for block in paused
             )
             saver.resume()
             resumed = blocks()
             assert {block["ptr"] for block in resumed} == addresses
-            # Poison only owned discard storage: replay must overwrite all reads.
-            for block in resumed:
-                assert block["policy"] == "discard" and block["mapped"]
-                size = block["aligned_bytes"]
-                assert memset(int(block["ptr"], 16), size, 0xA5, size) == 0
+            assert all(block["mapped"] for block in resumed)
+            if graph_policy == "cpu_backup":
+                torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+            else:
+                # Poison discard storage to verify replay overwrites all reads.
+                for block in resumed:
+                    size = block["aligned_bytes"]
+                    assert memset(int(block["ptr"], 16), size, 0xA5, size) == 0
             graph.replay()
             torch.npu.synchronize()
             assert output.data_ptr() == output_ptr

@@ -23,7 +23,7 @@ reservation. Managed frees must work outside the original allocation scope.
 | Independent draft parameters | `retain` uses CPU backup; `refresh` requires complete target and draft streams in one version. The target alone owns shared parameters. |
 | Persistent buffers | `executor_inputs`, `runtime_states`, `attention_state` and `workspace` alias `PoolKey("weights", CPU_BACKUP, "persistent_buffers")`, distinct from parameter-discard pools. Contents and addresses survive either parameter policy. |
 | Device KV | Discard and clear on wake; synchronize zeroing before admission. Target and draft share the arena. Scheduler cache references are cleared after release readiness agreement. |
-| Decode graph private pool | Discard temporary storage; replay must write every value before reading it. Executables and reserved virtual addresses survive. |
+| Decode graph private pool | Default `discard` releases temporary storage; `cpu_backup` preserves its contents in host memory. Executables and reserved virtual addresses survive. |
 | Communication and unmanaged storage | HCCL groups, communication workspaces and allocations outside managed regions stay resident. |
 
 Pool identity includes tag, retention policy and allocation scope. Several pools
@@ -38,7 +38,7 @@ allocation scopes are invalid. Communication initialization is deferred until
 the outer managed allocation scope exits. Shared workspace growth follows the
 same persistent owner as its initial allocation.
 
-Graph-pool discard is independent of the parameter policy. Remapped storage has
+The graph-pool policy is independent of the parameter policy. With `discard`, remapped storage has
 undefined contents; it is not zero-initialized. Values initialized outside
 replay must live outside this pool, in resident storage or a persistent backup
 pool. Replay must overwrite every value it reads, including padded batches and
@@ -92,9 +92,10 @@ normal kernel selection. Replay writes Q, workspace and outputs.
 FIA descriptors use live host lengths while tasks consume device data in graph
 order. Shared masks, sampler inputs and attention metadata stay resident.
 
-The NPU launcher opts in to restoring the original main thread-state after
-Python log cleanup, before native exit handlers run. This also applies with
-Memory Saver disabled. Other launchers retain the default-false detached exit.
+The launcher passes the rank device in the child environment so older hosts
+can use the same command line. On NPU the matching host restores the original
+main thread-state after Python log cleanup and before native exit handlers
+run, including when Memory Saver is disabled.
 Before native exit, NPU workers explicitly close process groups: the host skips
 Python atexit, where PTA normally performs this cleanup.
 Build and ABI details belong to the [native README](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-kernel-npu/memory-saver/README.md).

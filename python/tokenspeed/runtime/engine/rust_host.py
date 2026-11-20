@@ -82,7 +82,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.engine import zmq_wire
+from tokenspeed.runtime.engine import memory_protocol, zmq_wire
 from tokenspeed.runtime.engine.gc_hooks import (
     FULL_COLLECTION_INTERVAL,
     GcHooks,
@@ -90,12 +90,6 @@ from tokenspeed.runtime.engine.gc_hooks import (
 )
 from tokenspeed.runtime.engine.logprobs import LogprobServability
 from tokenspeed.runtime.engine.memory_occupation import memory_regions
-from tokenspeed.runtime.engine.memory_protocol import (
-    WEIGHT_UPDATE_PROTOCOL,
-    WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL,
-    gather_collective_addresses,
-    supports_replica_memory_transitions,
-)
 from tokenspeed.runtime.engine.profiler import Profiler
 from tokenspeed.runtime.engine.rank_setup import (
     init_distributed,
@@ -349,25 +343,22 @@ def start_rust_host(
                 "notset": "trace",
             }.get(level, level),
         )
-        command = [
-            (
-                f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
-                if server_args.disaggregation_mode == "encode"
-                else rank_process_title(server_args.mapping)
-            ),
-            "--python",
-            sys.executable,
-            "--control-fd",
-            str(child.fileno()),
-            "--enable-async-logging",
-            str(server_args.enable_async_logging).lower(),
-        ]
-        if server_args.device == "npu":
-            # Triton-Ascend's native exit handlers can release Python objects
-            # during libc exit, including when the memory saver is disabled.
-            command.extend(["--restore-gil-for-exit", "true"])
+        # Older hosts ignore the device hint and accept the same command line.
+        host_env["TS_HOST_DEVICE"] = server_args.device
         popen = subprocess.Popen(
-            command,
+            [
+                (
+                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
+                    if server_args.disaggregation_mode == "encode"
+                    else rank_process_title(server_args.mapping)
+                ),
+                "--python",
+                sys.executable,
+                "--control-fd",
+                str(child.fileno()),
+                "--enable-async-logging",
+                str(server_args.enable_async_logging).lower(),
+            ],
             executable=binary,
             env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
@@ -1755,7 +1746,7 @@ class HostBootstrap:
 
     def collective_addresses(self, port: int) -> list[str]:
         """Agree on the memory protocol and exchange the rank mesh addresses."""
-        return gather_collective_addresses(
+        return memory_protocol.gather_collective_addresses(
             self._world_cpu_group,
             join_host_port(self._collective_host, port),
             replica_memory_transitions=self._replica_memory_transitions,
@@ -1838,62 +1829,61 @@ class HostBootstrap:
 def prepare_bootstrap(
     control_fd: int, *, validate_memory_protocol: bool
 ) -> tuple[bool, Callable[..., HostBootstrap | EncodeBootstrap]]:
-    """Read the launcher arguments and return the memory capability and rank starter."""
+    """Read the launch pipe once so the host can select a protocol before building the rank."""
     connection = Connection(control_fd)
-    server_args, port_args, metrics_relay_endpoint = connection.recv()
-    role = server_args.disaggregation_mode
-    replica_memory_transitions = supports_replica_memory_transitions(
-        checked_startup=validate_memory_protocol,
-        memory_saver=server_args.enable_memory_saver,
-        backend_capable=TorchMemorySaverAdapter.adapter_class(
-            enable=server_args.enable_memory_saver, device=server_args.device
-        ).supports_replica_memory_transitions,
-        role=role,
+    launch_args = connection.recv()
+    server_args, _, _ = launch_args
+    requires_v3 = (
+        server_args.enable_memory_saver
+        and server_args.disaggregation_mode != "encode"
+        and TorchMemorySaverAdapter.adapter_class(
+            enable=True, device=server_args.device
+        ).supports_replica_memory_transitions
+    )
+    minimum_protocol = (
+        memory_protocol.WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
+        if requires_v3
+        else memory_protocol.WEIGHT_UPDATE_PROTOCOL
+    )
+    enabled = validate_memory_protocol and requires_v3
+    return enabled, functools.partial(
+        _build_rank, connection, launch_args, minimum_protocol, enabled
     )
 
-    def start(
-        pd_outbox, protocol: int, host_spans, peer_outbox=None
-    ) -> HostBootstrap | EncodeBootstrap:
-        # Protocol 2 agrees on weight-load prerequisites and commits. Protocol
-        # 3 also agrees on memory transitions, when the host supports it.
-        if (
-            server_args.enable_memory_saver
-            and server_args.device.split(":", 1)[0] == "npu"
-            and role != "encode"
-            and protocol < WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
-        ):
-            raise RuntimeError(
-                "Ascend memory saver requires ts-host protocol 3 for replica-wide "
-                "memory transitions. Please rebuild tokenspeed-engine together with "
-                "this runtime"
-            )
-        if server_args.enable_memory_saver and protocol < WEIGHT_UPDATE_PROTOCOL:
-            raise RuntimeError(
-                "Memory saver requires a ts-host binary with weight-update commit "
-                "protocol 2; rebuild tokenspeed-engine together with this runtime"
-            )
-        if server_args.peer_prefix_port is not None and peer_outbox is None:
-            raise RuntimeError(
-                "--peer-prefix-port requires a ts-host binary with peer prefix "
-                "sharing; rebuild tokenspeed-engine together with this runtime"
-            )
-        if role == "encode":
-            return EncodeBootstrap(server_args, port_args, connection)
-        return HostBootstrap(
-            server_args,
-            port_args,
-            connection,
-            pd_outbox,
-            host_spans,
-            metrics_relay_endpoint,
-            peer_outbox,
-            replica_memory_transitions=(
-                replica_memory_transitions
-                and protocol >= WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
-            ),
-        )
 
-    return replica_memory_transitions, start
+def _build_rank(
+    connection,
+    launch_args,
+    minimum_protocol: int,
+    replica_memory_transitions: bool,
+    pd_outbox,
+    protocol: int,
+    host_spans,
+    peer_outbox=None,
+) -> HostBootstrap | EncodeBootstrap:
+    server_args, port_args, metrics_relay_endpoint = launch_args
+    if server_args.enable_memory_saver and protocol < minimum_protocol:
+        raise RuntimeError(
+            f"Memory saver requires ts-host protocol {minimum_protocol}; "
+            "rebuild tokenspeed-engine together with this runtime"
+        )
+    if server_args.peer_prefix_port is not None and peer_outbox is None:
+        raise RuntimeError(
+            "--peer-prefix-port requires a ts-host binary with peer prefix "
+            "sharing; rebuild tokenspeed-engine together with this runtime"
+        )
+    if server_args.disaggregation_mode == "encode":
+        return EncodeBootstrap(server_args, port_args, connection)
+    return HostBootstrap(
+        server_args,
+        port_args,
+        connection,
+        pd_outbox,
+        host_spans,
+        metrics_relay_endpoint,
+        peer_outbox,
+        replica_memory_transitions=replica_memory_transitions,
+    )
 
 
 def bootstrap(

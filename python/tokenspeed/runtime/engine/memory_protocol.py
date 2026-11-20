@@ -35,13 +35,6 @@ WEIGHT_UPDATE_PROTOCOL = 2
 WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL = 3
 
 
-def supports_replica_memory_transitions(
-    *, checked_startup: bool, memory_saver: bool, backend_capable: bool, role: str
-) -> bool:
-    """Select v3 for checked startup and an integrated memory-saver backend."""
-    return checked_startup and memory_saver and backend_capable and role != "encode"
-
-
 def gather_collective_addresses(
     group: dist.ProcessGroup,
     address: str,

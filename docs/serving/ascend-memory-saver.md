@@ -106,7 +106,7 @@ tokenspeed serve "$CHECKPOINT_A" \
 | --- | --- |
 | `weights` | Parameters follow the explicit weight policy. Persistent executor inputs, runtime state, attention metadata and shared workspaces always use a separate CPU-backed pool under this same tag, including with parameter discard. |
 | `kv_cache` | Discard shared target/draft device KV; clear and synchronize on wake. |
-| `acl_graph` | Discard graph-private temporaries while retaining the original executable and virtual addresses. Replay rewrites consumed values. Releasing this tag also discards resident device KV. Graph-only wake keeps KV asleep. |
+| `acl_graph` | The default `--acl-graph-memory-policy discard` releases temporaries that replay overwrites. Select `cpu_backup` to restore their bytes from host memory. Both retain the executable and virtual addresses. Releasing this tag also discards resident device KV. Graph-only wake keeps KV asleep. |
 
 Persistent backup consumes pinned host memory and adds transfer time. HCCL and
 its workspaces stay resident with the default `TORCH_HCCL_ZERO_COPY=0`;

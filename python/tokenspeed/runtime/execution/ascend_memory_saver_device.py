@@ -22,6 +22,7 @@
 
 from collections.abc import Sequence
 
+from tokenspeed.runtime.engine.io_struct import UpdateWeightFromDiskReqInput
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -32,6 +33,8 @@ from tokenspeed.runtime.execution.types import (
 
 class AscendMemorySaverDeviceHandle(DeviceHandle):
     """Additional launch and weight-update checks for managed Ascend pools."""
+
+    _additional_discard_reload_types = (UpdateWeightFromDiskReqInput,)
 
     _TRAINER_WEIGHT_UPDATE_UNSUPPORTED = (
         "This trainer weight-update path uses CUDA tensors and is not implemented "
@@ -58,17 +61,9 @@ class AscendMemorySaverDeviceHandle(DeviceHandle):
         self._require_active_pools()
         super().run_idle_forward(dp_metadata)
 
-    def _supports_discard_reload(self, req) -> bool:
-        from tokenspeed.runtime.engine.io_struct import UpdateWeightFromDiskReqInput
-
-        if type(req) is UpdateWeightFromDiskReqInput:
-            return True
-        return super()._supports_discard_reload(req)
-
     def check_weight_update(self, req) -> tuple[bool, str]:
         """Validate Ascend saver updates before the replica starts a load."""
         from tokenspeed.runtime.engine.io_struct import (
-            UpdateWeightFromDiskReqInput,
             UpdateWeightsFromDistributedReqInput,
         )
 

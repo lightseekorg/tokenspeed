@@ -863,6 +863,9 @@ class ServerArgs:
     # Dev: permit the reload_forward control call; nothing reloads until it arrives.
     allow_reload_forward: bool = False
     weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
+    acl_graph_memory_policy: Literal["discard", "cpu_backup"] = dataclasses.field(
+        default="discard", kw_only=True
+    )
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
 
@@ -3049,6 +3052,15 @@ class ServerArgs:
             )
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
+        if self.acl_graph_memory_policy not in ("discard", "cpu_backup"):
+            raise ValueError("--acl-graph-memory-policy must be discard or cpu_backup")
+        if self.acl_graph_memory_policy == "cpu_backup" and (
+            self.device != "npu" or not self.enable_memory_saver
+        ):
+            raise ValueError(
+                "--acl-graph-memory-policy cpu_backup requires --device npu "
+                "and --enable-memory-saver"
+            )
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
@@ -4978,6 +4990,13 @@ class ServerArgs:
                 "Required with memory saver: back up weights to CPU, or discard "
                 "them until a complete update. Frozen draft weights retain CPU backup."
             ),
+        )
+        parser.add_argument(
+            "--acl-graph-memory-policy",
+            choices=["discard", "cpu_backup"],
+            default=ServerArgs.acl_graph_memory_policy,
+            help="Ascend memory saver policy for the decode graph private pool. "
+            "Discard temporaries on release (default), or back them up to CPU.",
         )
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",

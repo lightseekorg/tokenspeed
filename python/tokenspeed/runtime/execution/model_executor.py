@@ -512,6 +512,7 @@ class ModelExecutorConfig:
     # The scheduler may give extend rows in-forward State checkpoints
     # (--enable-state-checkpoint-in-forward).
     state_checkpoint_in_forward: bool = False
+    acl_graph_memory_policy: str = ServerArgs.acl_graph_memory_policy
 
     @property
     def spec_draft_tree(self) -> bool:
@@ -584,6 +585,7 @@ class ModelExecutorConfig:
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             enable_memory_saver=server_args.enable_memory_saver,
+            acl_graph_memory_policy=server_args.acl_graph_memory_policy,
             data_parallel_size=server_args.mapping.attn.dp_size,
             attention_tp_size=server_args.mapping.attn.tp_size,
             moe_tp_ep_size=server_args.mapping.moe.tp_ep_size,
@@ -1118,12 +1120,12 @@ class ModelExecutor:
         captures every graph.
         """
         workspace_pool(self.device).freeze()
-        # Enforce-eager boots capture nothing and skip freeze_gc's collections.
-        if self.forward_step.disable and self.prefill_graph.disable:
-            return
-
-        # Freeze once for all captures; prefill and drafter captures collect on entry.
-        with freeze_gc(self.config.enable_cudagraph_gc):
+        # Eager and prefill-only boots still validate their managed weights and KV.
+        with (
+            contextlib.nullcontext()
+            if self.forward_step.disable and self.prefill_graph.disable
+            else freeze_gc(self.config.enable_cudagraph_gc)
+        ):
             if not self.forward_step.disable:
                 self.forward_step.capture(entries=entries, observer=observer)
             if not self.prefill_graph.disable:

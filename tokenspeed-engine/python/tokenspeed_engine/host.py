@@ -34,9 +34,6 @@ def main() -> None:
         "--enable-async-logging", choices=("true", "false"), required=True
     )
     parser.add_argument("--process-title", required=True)
-    parser.add_argument(
-        "--restore-gil-for-exit", choices=("true", "false"), default="false"
-    )
     args = parser.parse_args()
     # Rust owns shutdown. Do not chain CPython's KeyboardInterrupt handler.
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -49,11 +46,7 @@ def main() -> None:
     # As in the embedded host, the external Python wrapper must use the C++
     # scheduler linked into this host, so plans share their native types.
     sys.modules["tokenspeed_scheduler.tokenspeed_scheduler_ext"] = scheduler
-    run_host(
-        args.control_fd,
-        args.enable_async_logging == "true",
-        args.restore_gil_for_exit == "true",
-    )
+    run_host(args.control_fd, args.enable_async_logging == "true")
 
 
 if __name__ == "__main__":

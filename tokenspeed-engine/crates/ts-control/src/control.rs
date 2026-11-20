@@ -876,6 +876,9 @@ impl Controls {
             return Err("memory saver not enabled (--enable-memory-saver)".to_owned());
         }
         let mut tags = self.normalize_tags(tags, self.memory_region_order())?;
+        if tags.is_empty() {
+            return Err("no memory regions to release".to_owned());
+        }
         if tags.iter().any(|tag| tag == "acl_graph")
             && !tags.iter().any(|tag| tag == "kv_cache")
             && !self.released.iter().any(|tag| tag == "kv_cache")
@@ -911,10 +914,7 @@ impl Controls {
     fn release(&mut self, tags: Option<&[String]>, refusal: Option<String>) {
         match self.release_tags(tags, refusal) {
             Ok(tags) => self.begin_release(tags),
-            Err(message) => {
-                self.release_pending = false;
-                self.refuse_memory_transition(true, &message);
-            }
+            Err(message) => self.refuse_memory_transition(true, &message),
         }
     }
 
