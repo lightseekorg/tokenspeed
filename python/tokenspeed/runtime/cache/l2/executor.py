@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.cache.host_allocation import HOST_BUFFER_ALIGNMENT_BYTES
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
     compute_host_group_packing,
@@ -282,7 +283,9 @@ class HostCacheExecutor:
         )
         # CUDA host registration is an allocator setting, not a dispatched kernel.
         host_register_threads = 8 if l2_tier and current_platform().is_nvidia else None
-        alignment_padding = 4095 if host_register_threads is not None else 0
+        alignment_padding = (
+            HOST_BUFFER_ALIGNMENT_BYTES - 1 if host_register_threads is not None else 0
+        )
         # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes

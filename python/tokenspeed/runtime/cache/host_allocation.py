@@ -22,6 +22,8 @@
 
 from contextlib import contextmanager
 
+HOST_BUFFER_ALIGNMENT_BYTES = 4096
+
 
 def validate_host_register_threads(threads: int) -> None:
     if (
@@ -93,6 +95,10 @@ def allocate_host_buffer(nbytes: int, *, register_threads: int | None):
     if not torch.cuda.is_available() or torch.version.cuda is None:
         raise ValueError("Parallel Host registration requires CUDA")
     with host_register_settings(register_threads):
-        backing = torch.empty(nbytes + 4095, dtype=torch.uint8, pin_memory=True)
-    offset = (-backing.data_ptr()) % 4096
+        backing = torch.empty(
+            nbytes + HOST_BUFFER_ALIGNMENT_BYTES - 1,
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+    offset = (-backing.data_ptr()) % HOST_BUFFER_ALIGNMENT_BYTES
     return backing[offset : offset + nbytes]

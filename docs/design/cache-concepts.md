@@ -129,9 +129,9 @@ payload geometry rather than giving the same block ID different meanings.
 
 On NVIDIA CUDA, Host L2 uses eight parallel page-touch threads and
 `cudaHostRegister` during its synchronous startup allocation. The storage retains
-a 4 KiB-aligned tensor view; the executor budgets the alignment padding as part
-of the pinned reservation. The override is scoped to L2, never the snapshot
-pool; other platforms retain their existing allocation policy.
+a 4 KiB-aligned tensor view; allocation and the executor's pinned reservation
+derive their padding from the same alignment constant. The override is scoped
+to L2, never the snapshot pool; other platforms retain their existing allocation policy.
 PyTorch's controls are process-wide, so this allocation must complete before
 other threads allocate pinned buffers. Both effective settings and their original
 configuration string are restored even if allocation fails; tensor ownership and
