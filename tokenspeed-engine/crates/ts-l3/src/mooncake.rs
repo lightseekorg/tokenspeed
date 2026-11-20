@@ -179,6 +179,10 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
 /// later Revoke rejection. ILLEGAL_CLIENT therefore retires sources without
 /// proving publication. This does not generalize to flexible memory/NoF or
 /// custom backend policies; see docs/design/async-l3-cache.md for source links.
+/// The SDK is dynamically loaded; this adapter performs no runtime policy or
+/// capability validation. These retirement assumptions depend on the selected
+/// library preserving the audited default Host ABI's behavior and must not be
+/// generalized to arbitrary SDK builds.
 fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
     let mut success = exists;
     for (&index, &result) in missing.iter().zip(results) {
