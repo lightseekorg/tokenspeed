@@ -297,7 +297,8 @@ def start_rust_host(
         binary: The ``ts-host`` executable.
         server_args: The rank's server arguments.
         port_args: The engine's ports.
-        start_context: Entered around starting the process.
+        start_context: Entered before capturing the child environment and
+            starting the process, including allocator preload configuration.
         metrics_relay_endpoint: The node's metrics relay
             (``metrics/relay.py``), which runs the output plugins; None
             when no plugin is selected.
@@ -319,6 +320,12 @@ def start_rust_host(
         # Set each native writer's fallback before the host initializes logging.
         level = server_args.log_level.lower()
         host_env = os.environ.copy()
+        if host_env.get("LD_PRELOAD"):
+            # Nested allocator contexts can repeat an inherited hook. Preserve
+            # library order without changing the parent's environment.
+            host_env["LD_PRELOAD"] = ":".join(
+                dict.fromkeys(filter(None, host_env["LD_PRELOAD"].split(":")))
+            )
         host_env.setdefault(
             "TS_HOST_LOG",
             {
@@ -1425,11 +1432,7 @@ class HostBootstrap:
                 context_len=model_config.context_len,
                 max_single_request_tokens=self._max_single_request_tokens,
                 decode_input_tokens=decode_input_tokens,
-                max_kv_page_num=(
-                    0
-                    if server_args.chunk_prefill_kv_size is None
-                    else scheduler_config.max_kv_page_num
-                ),
+                max_kv_page_num=scheduler_config.max_kv_page_num,
                 prefix_granularity=geometry.prefix_granularity,
             )
             self._max_total_num_tokens = geometry.token_capacity

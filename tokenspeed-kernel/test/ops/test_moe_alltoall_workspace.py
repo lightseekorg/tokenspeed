@@ -47,7 +47,6 @@ def test_workspaces_are_shared_by_layers_but_separate_for_models(monkeypatch) ->
         top_k=2,
         num_experts=8,
         dtype=torch.bfloat16,
-        weights_dtype=torch.bfloat16,
     )
     target = flashinfer.get_flashinfer_moe_alltoall(model_scope="target", **kwargs)
     assert target is flashinfer.get_flashinfer_moe_alltoall(
@@ -82,7 +81,6 @@ def test_missing_fabric_keeps_reference_transport(monkeypatch) -> None:
             top_k=2,
             num_experts=8,
             dtype=torch.bfloat16,
-            weights_dtype=torch.bfloat16,
         )
         is None
     )

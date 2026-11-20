@@ -486,6 +486,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             server_args=server_args,
             # Kimi-K3.1-like: the aggregated role agrees on its prefill plan.
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 context_len=4096,
                 is_multimodal_active=False,
                 dsa_padded_prefill_replay=True,

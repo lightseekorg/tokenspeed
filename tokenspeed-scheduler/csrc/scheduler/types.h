@@ -79,9 +79,10 @@ struct SchedulerConfig {
     enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
     HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
 
-    // The D role streams no ordinary Device cache entry to Host; its Host
-    // cache holds only the published pages of retracted requests (the image's
-    // L2 leg) until they are restored.
+    // Under write-through the D role streams no ordinary Device cache entry
+    // to Host: it would copy every landed prompt. Under write-back it writes
+    // back what its admissions evict, as every role does, and its remote
+    // admission loads a Host hit below the landing (ProbeDecodePrefix).
     bool StreamsDeviceCacheToHost() const {
         return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
     }

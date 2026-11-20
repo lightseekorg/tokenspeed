@@ -45,13 +45,15 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def group(tmp_path_factory):
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+    torch.cuda.set_device(device)
+    # Bind NCCL before symmetric-memory rendezvous and graph capture.
     if "RANK" in os.environ:
-        dist.init_process_group("nccl")
+        dist.init_process_group("nccl", device_id=device)
     else:
         path = tmp_path_factory.mktemp("deepgemm") / "rendezvous"
         dist.init_process_group(
-            "nccl", init_method=f"file://{path}", rank=0, world_size=1
+            "nccl", init_method=f"file://{path}", rank=0, world_size=1, device_id=device
         )
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False

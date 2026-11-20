@@ -90,6 +90,9 @@ installed. The scheduler source is bundled in its crate; the grammar build
 downloads the pinned, SHA256-checked xgrammar source release and therefore
 needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
 
+For `cargo test --locked`, install `numpy` and `prometheus-client` in that
+interpreter too. The metrics tests read the real Prometheus multiprocess files.
+
 Install a development build with `pip install -e tokenspeed-engine` from the
 repository root. It builds both native extensions and the scheduler together.
 `tokenspeed_engine.host_binary()` still names the `ts-host` launcher. It keeps

@@ -403,7 +403,18 @@ def _check_managed_metadata_on_cuda():
 
     saver = arena.memory_saver_adapter
     target, draft = ModelMetadata(), ModelMetadata()
-    retained = [(table, address, expected)]
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(global_server_args_dict, "enable_memory_saver", True)
+        rows = MoESourceRows(
+            Mapping(rank=0, world_size=1), device="cuda", max_rows_per_rank=8
+        )
+    rows.publish((5,))
+    counts = rows.source_token_counts
+    retained = [(table, address, expected), (counts, counts.data_ptr(), counts.cpu())]
     for count, host_tables in ((1, False), (257, True), (3, False)):
         arrays = np.ones((count, 2), dtype=np.int32)
         spans = np.tile(np.array([0, 2], dtype=np.int32), (count, 1))

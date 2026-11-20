@@ -8,6 +8,7 @@ check the fused triton fills against the same torch reference.
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import sys
 import textwrap
@@ -1804,47 +1805,48 @@ class TestCacheGroupRouterRebindTest:
 
 
 class TestPagedLeafRebindTest:
-    """Every leaf forgets the per-forward and per-graph state it annotates as optional.
-
-    The gate reads ``self.<name>: <Type> | None = None`` annotations in ``__init__``
-    whose name mentions ``metadata`` or ends in ``_buf``; state declared another way
-    (DSA's page-table alias, FlashMLA's keepalive list) gets its own test below.
-    """
+    """Rebinding drops forward/graph views, including state owned by a base class."""
 
     def _optional_slots(self, backend_cls):
-        import inspect
-
-        init = ast.parse(textwrap.dedent(inspect.getsource(backend_cls.__init__)))
-        slots = []
-        for node in ast.walk(init):
-            if (
-                isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Attribute)
-                and isinstance(node.target.value, ast.Name)
-                and node.target.value.id == "self"
-                and ast.unparse(node.annotation).endswith("| None")
-            ):
-                slots.append(node.target.attr)
+        slots = set()
+        for owner in backend_cls.__mro__:
+            # Common paged state has separate rebind coverage above. Include
+            # intermediate owners such as MLAMetadataBackend in the leaf check.
+            if owner is PagedAttentionBackend:
+                break
+            init = owner.__dict__.get("__init__")
+            if init is None:
+                continue
+            tree = ast.parse(textwrap.dedent(inspect.getsource(init)))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Attribute)
+                    and isinstance(node.target.value, ast.Name)
+                    and node.target.value.id == "self"
+                    and ast.unparse(node.annotation).endswith("| None")
+                ):
+                    slots.add(node.target.attr)
         return slots
 
     def _check(self, backend_cls, expected, **publish_reads):
         slots = self._optional_slots(backend_cls)
         assert slots
-        assert (sorted(slots)) == (sorted(expected))
+        assert sorted(slots) == sorted(expected)
         leaf = backend_cls.__new__(backend_cls)
         leaf._init_pool_binding()
         leaf.cache_pool = object()
         for name, value in publish_reads.items():
             setattr(leaf, name, value)
         stale = object()
-        for name in slots:
+        for name in expected:
             setattr(leaf, name, stale)
         pool = object()
 
         leaf.set_cache_pool(pool)
 
         assert (leaf.cache_pool) is (pool)
-        for name in slots:
+        for name in expected:
             _pytest_obj_1 = getattr(leaf, name)
             _pytest_msg_2 = name
             assert _pytest_obj_1 is None, _pytest_msg_2

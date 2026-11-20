@@ -18,11 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -64,6 +66,13 @@ struct AgedCacheConfig {
         Require(prefix_granularity > 0 && prefix_granularity % 128 == 0, "pages must be whole 128-token blocks");
         Require(history_tokens % prefix_granularity == 0, "histories must be page aligned");
         Require(evict_percent >= 0 && evict_percent <= 100, "evict percent must be in [0, 100]");
+        const std::int32_t max_packing =
+            std::max({packing.swa, packing.global_r2, packing.global_r1, packing.compressor_tail});
+        Require(static_cast<std::int64_t>(parents) * max_packing < std::numeric_limits<std::int32_t>::max(),
+                "every group's pages, with the null page, must fit int32");
+        // A sample hashes one page past the chunk.
+        Require(chunk_tokens <= std::numeric_limits<std::int32_t>::max() - prefix_granularity,
+                "the chunk and one more page must fit int32");
     }
 };
 
@@ -93,7 +102,8 @@ SchedulerConfig MakeSchedulerConfig(const AgedCacheConfig& workload) {
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = id,
             .block_granularity = granularity,
-            .total_pages = workload.parents * packing + 1,
+            // Validate bounds the product within int32.
+            .total_pages = static_cast<std::int32_t>(static_cast<std::int64_t>(workload.parents) * packing + 1),
             .cache_blocks_per_lcm_block = packing,
             .attn_kind = window ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window_tokens = window,
@@ -127,7 +137,7 @@ public:
     }
 
     std::int64_t CachedBlocks() {
-        return Coordinator().GroupPrefixIndex(kGlobalR1).NumEntries(Pool()) +
+        return std::int64_t{Coordinator().GroupPrefixIndex(kGlobalR1).NumEntries(Pool())} +
                Coordinator().GroupPrefixIndex(kGlobalR2).NumEntries(Pool());
     }
 

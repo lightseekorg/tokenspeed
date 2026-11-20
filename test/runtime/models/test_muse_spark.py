@@ -1183,6 +1183,7 @@ def test_owned_attention_stores_prepared_rows_once(
         tp_group=tuple(range(world_size)),
     )
     attention._project = lambda value: (value, None, 1)
+    attention.nccl_owned_rows = None
 
     attention.iris_state = SimpleNamespace(
         all_to_all_transpose_qkvg_norm_rope=lambda *args: (
@@ -1486,6 +1487,7 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
         model=SimpleNamespace(
             layers=[SimpleNamespace(mlp=mlp)],
             config=SimpleNamespace(decode_monokernel=False),
+            nccl_owned_rows=None,
         ),
     )
 
@@ -1504,7 +1506,9 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
     owner = SimpleNamespace(
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
         model=SimpleNamespace(
-            layers=[], config=SimpleNamespace(decode_monokernel=True)
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=True),
+            nccl_owned_rows=None,
         ),
     )
 
