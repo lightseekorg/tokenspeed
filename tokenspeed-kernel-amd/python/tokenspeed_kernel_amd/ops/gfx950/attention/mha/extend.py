@@ -1832,8 +1832,8 @@ def _extend(
         if warp_pipeline and k_cache.element_size() == 1:
             # FP8 P is quantized against each split's running maximum, so the
             # split boundaries are part of the FP8 numerics: the 8-wave tile
-            # takes the split count the 4-wave tile would, and with it the same
-            # pages per split.
+            # starts from the split count the 4-wave tile would take (the same
+            # pages per split where the grid fills whole rounds; see below).
             _, rect, ragged = grid_q_blocks(
                 _select_extend_tile(max_seqlen_q, group_size, False)[1]
             )
@@ -1851,13 +1851,13 @@ def _extend(
             # work-groups at 2560). Where the grid does not fill whole rounds,
             # take the split count, up to twice the 4-wave one, that finishes
             # soonest: rounds of the CUs per split of the KV stream, fewer
-            # splits on a tie. Where it does, the split count is unchanged.
+            # splits on a tie. Where it does, the 4-wave count stands.
             # These rounds count one 8-wave work-group a CU, as at the
-            # compiler's occupancy; _WARP_PIPELINE_WAVES_PER_EU fits two, but
-            # the split counts stay as they were because they are part of the
-            # FP8 numerics.
+            # compiler's occupancy. A one-request launch compiled at
+            # _WARP_PIPELINE_WAVES_PER_EU fits two, and takes the same split
+            # count so that its bits do not depend on the request count.
             eight_wave_groups = grid_num_q_blocks * n_kv_heads
-            if eight_wave_groups * num_kv_splits % _GFX950_SM_COUNT:
+            if eight_wave_groups * num_kv_splits % _GFX950_SM_COUNT != 0:
                 limit = min(
                     2 * num_kv_splits, MAX_KV_SPLITS, builtins.max(1, num_pages // 2)
                 )
