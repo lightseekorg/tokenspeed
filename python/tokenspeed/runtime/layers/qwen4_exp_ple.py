@@ -31,7 +31,6 @@ from tokenspeed_kernel.ops.ple import (
     ple_conv_sequences,
     ple_gate_norm,
     ple_ngram_ids,
-    ple_page_gather,
     ple_page_gather_pair,
     ple_page_scatter,
     prepare_ngram_reciprocals,
@@ -219,6 +218,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
+            enable_hot_cache=config.enable_ple_hot_cache,
             prefix=table_prefix,
         )
         if self.ple_layer_index == 0 and offload_embedding:
@@ -522,20 +522,13 @@ class Qwen4ExpPLELayer(nn.Module):
         page_ids: torch.Tensor,
         default: int | float = 0,
     ) -> torch.Tensor:
-        """One cache row per page id, with null pages read as ``default``."""
+        """Read cache rows on the CPU, substituting ``default`` for null pages."""
 
-        if not field.is_cuda:
-            page_ids = page_ids.to(torch.long)
-            valid = page_ids > 0
-            values = field.index_select(0, page_ids.clamp_min(0))
-            mask = valid.view(-1, *([1] * (values.ndim - 1)))
-            return torch.where(mask, values, torch.full_like(values, default))
-        return ple_page_gather(
-            field,
-            page_ids,
-            Qwen4ExpPLELayer._page_row_stride(field),
-            default,
-        )
+        page_ids = page_ids.to(torch.long)
+        valid = page_ids > 0
+        values = field.index_select(0, page_ids.clamp_min(0))
+        mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        return torch.where(mask, values, torch.full_like(values, default))
 
     @staticmethod
     def _write_pages(
@@ -702,8 +695,8 @@ class Qwen4ExpPLELayer(nn.Module):
 
         ``add_terms`` are full-width ``[tokens, channels]`` tensors folded into
         the conv output in order, letting callers skip separate tensor adds.
-        On CUDA, ``windows_out`` receives the carried row and per-token state
-        windows directly and the unused final-state result has zero rows.
+        On GPU, ``windows_out`` receives the carried state and the compact
+        per-token inputs. The unused final-state result has zero rows.
         The fallback caller fills its carried row separately.
         """
         device = values.device
@@ -803,6 +796,7 @@ class Qwen4ExpPLELayer(nn.Module):
             windows=windows,
             windows_block_rows=windows_block_rows,
             scatter_windows=windows_out is not None,
+            compact_windows=windows_out is not None,
         )
 
     def _conv_sequences_torch(
@@ -1034,13 +1028,12 @@ class Qwen4ExpPLELayer(nn.Module):
         ``[pages, hc_count * hidden, conv_state_len]`` are the pools as
         page-indexed views of the cache arena; ``page_in`` holds each
         request's input page. The kernel does the lookup, the gate and the
-        conv, and writes the state after each row's token to row ``page_out`` of
-        ``context_out`` and ``conv_out``: in decode the pools and the output
-        pages (as a :meth:`start_prefetch` plus :meth:`forward` pair would);
-        in a target verify (``T`` tokens per request, request-major rows)
-        the verify scratch, row ``r * (T + 1) + 1 + t`` for token ``t`` of
-        request ``r``, as the regular verify does, and the post-verify
-        commit then copies the accepted row to the pages.
+        conv. Decode writes the resulting context and conv state to the
+        cache pages in ``page_out``. Target verify writes the context and
+        normalized conv input for request ``r`` and token ``t`` to scratch
+        row ``r * (T + 1) + 1 + t``, with the carried conv state in row
+        ``r * (T + 1)``. State commit reconstructs the accepted window directly
+        in the cache page.
 
         Args:
             ctx: The forward's context.
@@ -1134,7 +1127,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if plan is None:
             return hidden_states
         (hidden_states,) = slice_to_real_tokens(plan.num_real_tokens, hidden_states)
-        req, col, lengths_t, starts, _, total, _ = plan.index
+        req, col, _, starts, _, total, _ = plan.index
         lengths = plan.lengths
         flat_ids = plan.flat_ids
         initial_context = plan.initial_context
