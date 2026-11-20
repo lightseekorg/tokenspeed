@@ -299,9 +299,11 @@ class MuseIrisState:
             all_reduce.producer_pull, enable_lamport=enable_lamport
         )
         self.gather = IrisAllGather(all_reduce.producer)
+        # The fused routed Lamport's bound against the separate routed norm
+        # plus two-shot was measured at TP8; TP4 keeps the one-shot window.
         self.routed_lamport_max_rows = (
             _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS
-            if self.reduction.lamport_two_shot_max_numel
+            if self.world_size == 8 and self.reduction.lamport_two_shot_max_numel
             else self.reduction.lamport_max_numel // _MUSE_ROUTE_WIDTH
         )
         peers = all_reduce.peers
@@ -362,7 +364,7 @@ class MuseIrisState:
             self.reduction.lamport_two_shot_max_numel
             // (_MUSE_TOPK * _MUSE_ROUTE_WIDTH)
             + 1
-            if self.reduction.lamport_two_shot_max_numel
+            if self.world_size == 8 and self.reduction.lamport_two_shot_max_numel
             else None
         )
         self.owned_route_input = (
@@ -1347,12 +1349,104 @@ class MuseIrisState:
                 WAIT_VMEM=self._arch.wait_vmem,
             )
             return out_stream, pre_fp32, pre_bf16
-        assert self.boundary_mailbox is not None
-        assert self.boundary_epochs is not None
         out_stream = torch.empty_like(stream)
         pre_fp32 = torch.empty_like(stream)
         pre_bf16 = torch.empty_like(branch)
-        iris_fused_lamport_allreduce_muse_attntail[(rows, _MUSE_BOUNDARY_SENDERS + 1)](
+        self._launch_lamport_boundary(
+            branch,
+            stream,
+            post_weight,
+            alpha,
+            beta,
+            pre_weight,
+            out_stream,
+            pre_fp32,
+            pre_bf16,
+            post_eps,
+            post_weight_offset,
+            pre_eps,
+            pre_weight_offset,
+            rotate_peers=rows >= _MUSE_BOUNDARY_ROTATE_MIN_ROWS,
+            compile_only=False,
+        )
+        return out_stream, pre_fp32, pre_bf16
+
+    def warmup_symmetric_boundary(
+        self,
+        post_weight: torch.Tensor | None,
+        pre_weight: torch.Tensor,
+        post_eps: float,
+        post_weight_offset: float,
+        pre_eps: float,
+        pre_weight_offset: float,
+    ) -> None:
+        """Compile the small-boundary Lamport push for each peer order without
+        running it.
+
+        Rows pick the peer order at launch (staggered from
+        ``_MUSE_BOUNDARY_ROTATE_MIN_ROWS`` rows), and startup's warmup and
+        capture may reach only one side, so the first batch on the other side
+        would compile it while peers wait in the exchange.
+        """
+        if (
+            not self.boundary_max_rows
+            or self.all_reduce.producer is None
+            or self.all_reduce.producer.data is None
+        ):
+            return
+        device = self.all_reduce.device
+        # The serving branch is the producer output view; its storage is part
+        # of the specialization, so warm with the same view.
+        branch = self.all_reduce.acquire_outputs(((1, _MUSE_BOUNDARY_WIDTH),))[0]
+        stream = torch.empty(branch.shape, dtype=torch.float32, device=device)
+        alpha = torch.empty((_MUSE_BOUNDARY_WIDTH,), dtype=torch.float32, device=device)
+        beta = torch.empty_like(alpha)
+        for rotate_peers in (
+            (False, True)
+            if self.boundary_max_rows >= _MUSE_BOUNDARY_ROTATE_MIN_ROWS
+            else (False,)
+        ):
+            self._launch_lamport_boundary(
+                branch,
+                stream,
+                post_weight,
+                alpha,
+                beta,
+                pre_weight,
+                torch.empty_like(stream),
+                torch.empty_like(stream),
+                torch.empty_like(branch),
+                post_eps,
+                post_weight_offset,
+                pre_eps,
+                pre_weight_offset,
+                rotate_peers=rotate_peers,
+                compile_only=True,
+            )
+
+    def _launch_lamport_boundary(
+        self,
+        branch: torch.Tensor,
+        stream: torch.Tensor,
+        post_weight: torch.Tensor | None,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_weight: torch.Tensor,
+        out_stream: torch.Tensor,
+        pre_fp32: torch.Tensor,
+        pre_bf16: torch.Tensor,
+        post_eps: float,
+        post_weight_offset: float,
+        pre_eps: float,
+        pre_weight_offset: float,
+        *,
+        rotate_peers: bool,
+        compile_only: bool,
+    ) -> None:
+        assert self.boundary_mailbox is not None
+        assert self.boundary_epochs is not None
+        kernel = iris_fused_lamport_allreduce_muse_attntail
+        args = (
             branch,
             self.boundary_mailbox,
             stream,
@@ -1365,9 +1459,11 @@ class MuseIrisState:
             pre_bf16,
             self.boundary_epochs,
             self.all_reduce.peers.addresses[: self.world_size],
+        )
+        options = dict(
             RANK=self.all_reduce.rank_in_group,
             WORLD_SIZE=self.all_reduce.world_size,
-            WIDTH=width,
+            WIDTH=branch.shape[1],
             MAX_ROWS=self.boundary_max_rows,
             POST_EPS=post_eps,
             POST_WEIGHT_OFFSET=post_weight_offset,
@@ -1375,13 +1471,16 @@ class MuseIrisState:
             PRE_WEIGHT_OFFSET=pre_weight_offset,
             POST_HAS_WEIGHT=post_weight is not None,
             SENDERS=_MUSE_BOUNDARY_SENDERS,
-            ROTATE_PEERS=rows >= _MUSE_BOUNDARY_ROTATE_MIN_ROWS,
+            ROTATE_PEERS=rotate_peers,
             ELEMENTS_PER_THREAD=8,
             NUM_WARPS=16,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
         )
-        return out_stream, pre_fp32, pre_bf16
+        if compile_only:
+            kernel.warmup(*args, grid=(1,), **options)
+        else:
+            kernel[(branch.shape[0], _MUSE_BOUNDARY_SENDERS + 1)](*args, **options)
 
     def _sliding_attention_config(
         self,

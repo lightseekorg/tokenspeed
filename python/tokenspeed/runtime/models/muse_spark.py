@@ -1069,6 +1069,7 @@ class MuseSparkAttention(nn.Module):
             )
             prepared = self.attn.store_prepared(q, k, v, ctx)
             output = self.attn.attend(prepared.q, prepared.k, prepared.v, ctx)
+            gated = False
         else:
             if gathered:
                 owned = self.owned_projections
@@ -1084,35 +1085,52 @@ class MuseSparkAttention(nn.Module):
             q, k, v, output_gate = qkv_gate.split(
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
-            output = self.attn(q, k, v, positions, ctx)
-        output = output.contiguous()
-        # One row normalizes and gates inside the output projection's GEMV.
-        projection_out = (
-            self._acquire_projection_output(output)
-            if output.shape[0] == 1
-            and mv_weightless_rmsnorm_gated_sigmoid_supported(
-                output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
+            # Attention gates its own output (in the decode kernel's store
+            # where it can); a single row keeps it for the output GEMV below.
+            gated = q.shape[0] > 1
+            output = self.attn(
+                q,
+                k,
+                v,
+                positions,
+                ctx,
+                rmsnorm_output_gate=(
+                    (output_gate, self.rms_norm_eps) if gated else None
+                ),
             )
-            else None
-        )
-        if projection_out is not None:
-            projected = mv_weightless_rmsnorm_gated_sigmoid(
+        if not gated:
+            output = output.contiguous()
+            # One row normalizes and gates inside the output projection's GEMV.
+            projection_out = (
+                self._acquire_projection_output(output)
+                if output.shape[0] == 1
+                and mv_weightless_rmsnorm_gated_sigmoid_supported(
+                    output,
+                    output_gate,
+                    self.o_proj.weight,
+                    self.num_heads,
+                    self.head_dim,
+                )
+                else None
+            )
+            if projection_out is not None:
+                projected = mv_weightless_rmsnorm_gated_sigmoid(
+                    output,
+                    output_gate,
+                    self.o_proj.weight,
+                    self.num_heads,
+                    self.rms_norm_eps,
+                    projection_out,
+                )
+                return projected, None, 1
+            output = weightless_rmsnorm_gated_sigmoid(
                 output,
                 output_gate,
-                self.o_proj.weight,
                 self.num_heads,
+                self.head_dim,
                 self.rms_norm_eps,
-                projection_out,
+                pdl_enabled(),
             )
-            return projected, None, 1
-        output = weightless_rmsnorm_gated_sigmoid(
-            output,
-            output_gate,
-            self.num_heads,
-            self.head_dim,
-            self.rms_norm_eps,
-            pdl_enabled(),
-        )
         if gathered:
             # NVIDIA returns its owned rows already reduced.
             return (
@@ -3378,6 +3396,19 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         self.model.iris_state = state
         # Startup might not reduce any payload in the two-shot pull's window.
         state.warmup_reduce_outputs()
+        # The attention boundary's Lamport push changes peer order with the
+        # row count, and capture may reach only one order; every layer shares
+        # the boundary's norms' eps and center.
+        post_norm = self.model.layers[0].post_attention_layernorm
+        pre_norm = self.model.layers[0].pre_feedforward_layernorm
+        state.warmup_symmetric_boundary(
+            post_norm.weight,
+            pre_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+        )
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state
