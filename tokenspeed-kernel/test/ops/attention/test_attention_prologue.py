@@ -2531,12 +2531,28 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
     stated = {}
 
     def spy(mode, dtype, traits, features, solution, override):
-        stated[mode] = {key for key, _ in traits}
+        stated[mode] = stated.get(mode, set()) | {key for key, _ in traits}
         raise LookupError
 
     monkeypatch.setattr(prologue, "_select", spy)
     with pytest.raises(LookupError):
         gqa_prologue(**_gqa_request())
+    request = _gqa_request()
+    with pytest.raises(LookupError):
+        prologue.gqa_prologue_split_k(
+            prologue.SplitKQKVG(
+                torch.zeros((2, 4, 8 * 64), device="cuda"),
+                torch.ones(4, device="cuda"),
+                torch.ones(8 * 64, device="cuda"),
+            ),
+            num_q_heads=4,
+            norm=request["norm"],
+            rotary=request["rotary"],
+            cache=request["cache"],
+            query_dtype=torch.bfloat16,
+            solution=None,
+            override=None,
+        )
     with pytest.raises(LookupError):
         mla_prologue(**_mla_request())
     for mode, keys in stated.items():

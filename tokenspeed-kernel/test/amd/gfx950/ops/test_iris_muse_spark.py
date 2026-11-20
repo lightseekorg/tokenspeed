@@ -1377,8 +1377,10 @@ def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
     assert page_loads >= 2, "the split no longer loads page indices ahead"
 
 
-def test_gather_lamport_polling_codegen():
-    """The Lamport gather rereads all remote packs and votes once per retry."""
+@pytest.mark.parametrize("split_k", [0, 4])
+def test_gather_lamport_polling_codegen(split_k: int):
+    """The Lamport gather rereads all remote packs and votes once per retry,
+    also when it finishes a split-K GEMM's partials, and spills nothing."""
     rank = 5
     from tokenspeed_kernel.ops.communication._iris.all_gather import (
         iris_fused_lamport_allgather_rmsnorm_mxfp4 as fn,
@@ -1387,7 +1389,10 @@ def test_gather_lamport_polling_codegen():
 
     policy = iris_arch_policy(ArchVersion(9, 5))
     types = {
-        "local_input": "*bf16",
+        "local_input": "*fp32" if split_k else "*bf16",
+        "row_scales": "*fp32",
+        "col_scales": "*fp32",
+        "partial_plane": "i32",
         "weight": "*bf16",
         "packed_output": "*u8",
         "scale_output": "*u8",
@@ -1409,6 +1414,7 @@ def test_gather_lamport_polling_codegen():
             "max_elements": 43 * 4096,
             "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
             "WAIT_STORES": policy.wait_stores,
+            "SPLIT_K": split_k,
         },
         num_warps=1,
     )
@@ -1804,6 +1810,97 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
             state.all_gather_rmsnorm_mxfp4_quant_topk(
                 local, weight, 1e-6, 1.0, logits, bias, topk, scale
             )
+    torch.cuda.synchronize()
+    dist.barrier()
+    region = state.reduction.lamport_region.view(torch.int32)
+    assert bool((region == -(2**31)).all())
+
+
+def _muse_lamport_gather_split_k_worker(rank, world_size, device):
+    """The top-k gather fed a split-K FP8 GEMM's partials writes the bytes it
+    writes when fed that GEMM's _sum_scaled output, at the decode row counts
+    the FP8 projection takes, without a compile per row count."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+        iris_fused_lamport_allgather_rmsnorm_mxfp4_topk,
+    )
+    from tokenspeed_kernel.ops.gemm import (
+        mm,
+        mm_split_k_partials,
+        prepare_fp8_channel_weight,
+    )
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+        swizzle_cdna4_mxfp4_scale,
+    )
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 128, True)
+    # The pre-expert projection: 4096 columns, [1024, 8192] per TP4 rank.
+    local_width, k, experts, topk, scale = 4096 // world_size, 8192, 256, 8, 2.5
+    width = local_width * world_size
+    torch.manual_seed(rank)
+    weight_fp8, weight_scale = prepare_fp8_channel_weight(
+        (torch.randn(local_width, k, device=device) * 0.02).bfloat16()
+    )
+    torch.manual_seed(world_size)
+    norm = (torch.randn(width, device=device) * 0.1).bfloat16()
+    bias = torch.randn(experts, device=device) * 0.01
+
+    def check(rows: int) -> None:
+        # Every rank projects the same rows and routes the same logits.
+        generator = torch.Generator(device=device).manual_seed(rows)
+        x = torch.randn((rows, k), generator=generator, device=device).bfloat16()
+        logits = torch.randn((rows, experts), generator=generator, device=device)
+        codes, scales = quantize_fp8(
+            x,
+            granularity="token",
+            scale_encoding="float32",
+            enable_pdl=False,
+            required_features=frozenset({"token_fp8_amax_div"}),
+        )
+        scales = scales.reshape(-1)
+        partials = mm_split_k_partials(
+            codes, weight_fp8.t(), A_scales=scales, B_scales=weight_scale
+        )
+        assert partials is not None
+        local = mm(
+            codes,
+            weight_fp8.t(),
+            A_scales=scales,
+            B_scales=weight_scale,
+            out_dtype=torch.bfloat16,
+            quant="fp8",
+        )
+        assert state.can_all_gather_rmsnorm_mxfp4_quant_topk(partials, norm, bias, topk)
+        expected = state.all_gather_rmsnorm_mxfp4_quant_topk(
+            local, norm, 1e-6, 1.0, logits, bias, topk, scale
+        )
+        actual = state.all_gather_rmsnorm_mxfp4_quant_topk(
+            partials, norm, 1e-6, 1.0, logits, bias, topk, scale
+        )
+        (packed, scale_bytes), weights, ids = actual
+        (expected_packed, expected_scales), expected_weights, expected_ids = expected
+        assert torch.equal(packed, expected_packed), rows
+        # The scale allocation pads rows and columns; compare the bytes the
+        # swizzle of the logical [rows, width // 32] scales occupies.
+        logical = (
+            swizzle_cdna4_mxfp4_scale(
+                torch.ones(rows, width // 32, dtype=torch.uint8, device=device)
+            )
+            .view(scale_bytes.shape)
+            .bool()
+        )
+        assert int(logical.sum()) == rows * width // 32
+        assert torch.equal(scale_bytes[logical], expected_scales[logical]), rows
+        assert torch.equal(weights, expected_weights)
+        assert torch.equal(ids, expected_ids)
+
+    for rows in (17, 32, 64, 96, 128):
+        check(rows)
+    # Rows and the partial plane are runtime arguments.
+    with assert_no_triton_compile(iris_fused_lamport_allgather_rmsnorm_mxfp4_topk):
+        for rows in (24, 48, 80, 120):
+            check(rows)
     torch.cuda.synchronize()
     dist.barrier()
     region = state.reduction.lamport_region.view(torch.int32)
@@ -3538,6 +3635,11 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
             _muse_lamport_gather_mxfp4_topk_worker,
             "nccl",
             id="lamport_gather_mxfp4_topk",
+        ),
+        pytest.param(
+            _muse_lamport_gather_split_k_worker,
+            "nccl",
+            id="lamport_gather_split_k",
         ),
         pytest.param(
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"

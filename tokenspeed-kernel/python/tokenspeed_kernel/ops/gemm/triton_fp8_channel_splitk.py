@@ -33,6 +33,8 @@ scales before the one BF16 rounding.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
@@ -46,7 +48,11 @@ from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import (
 )
 
 __all__ = [
+    "PARTIAL_SUM_SPLITS",
+    "SplitKPartials",
+    "fp8_channel_splitk_parts",
     "triton_mm_fp8_channel_splitk",
+    "triton_mm_fp8_channel_splitk_partials",
 ]
 
 _FP8 = torch.float8_e4m3fn
@@ -81,6 +87,39 @@ def _config(m: int, n: int, k: int) -> tuple[int, int, int, int, int] | None:
 
 def _supports_problem(m: int, n: int, k: int) -> bool:
     return 0 < m <= _MAX_M and _config(m, n, k) is not None
+
+
+# Split counts whose _sum_scaled order a consumer of the partials reproduces.
+# _sum_scaled lays its [SK, 512] tile on warps [2, 2] (sizePerThread [1, 4]):
+# a thread holds rows r, r + 2, r + 4, ... of one parity, sums them in-thread
+# as a balanced tree, and the two parities' warps are added last. So the sum
+# is p0, p0 + p1, (p0 + p2) + (p1 + p3), and at 8
+# ((p0 + p2) + (p4 + p6)) + ((p1 + p3) + (p5 + p7)) -- not neighbour pairs.
+# Other splits stay with _sum_scaled.
+PARTIAL_SUM_SPLITS = (1, 2, 4, 8)
+
+
+def _supports_partials_problem(m: int, n: int, k: int) -> bool:
+    return fp8_channel_splitk_parts(m, n, k) in PARTIAL_SUM_SPLITS
+
+
+@dataclass(frozen=True)
+class SplitKPartials:
+    """A split-K FP8 GEMM stopped before its reduction.
+
+    The BF16 result is ``bf16(sum(partials) * row_scales[:, None] *
+    col_scales)`` with the sum over the split axis in ``_sum_scaled``'s order
+    (``PARTIAL_SUM_SPLITS``); the consumer finishes it.
+
+    Attributes:
+        partials: FP32 ``[split_k, rows, n]`` partial products.
+        row_scales: FP32 ``[rows]`` activation scales.
+        col_scales: FP32 ``[n]`` weight channel scales.
+    """
+
+    partials: torch.Tensor
+    row_scales: torch.Tensor
+    col_scales: torch.Tensor
 
 
 _FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
@@ -193,6 +232,13 @@ def triton_mm_fp8_channel_splitk(
     return out
 
 
+def fp8_channel_splitk_parts(m: int, n: int, k: int) -> int | None:
+    """Split-K slices of ``triton_mm_fp8_channel_splitk`` at this problem, or
+    None where it does not run (no tuned config, or more than 256 rows)."""
+    config = _config(m, n, k)
+    return config[2] if config is not None and 0 < m <= _MAX_M else None
+
+
 def _fp8_channel_splitk_partials(A: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """The split-K FP32 partial sums of ``A @ weight^T``, before ``_sum_scaled``.
 
@@ -236,3 +282,51 @@ def _fp8_channel_splitk_partials(A: torch.Tensor, weight: torch.Tensor) -> torch
         matrix_instr_nonkdim=16,
     )
     return partials
+
+
+@register_kernel(
+    "gemm",
+    "mm_split_k_partials",
+    name="triton_mm_fp8_channel_splitk_partials",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=format_signatures(
+        ("a", "b"), "scaled-fp8", {_FP8}, scale=_FP8_CHANNEL_SCALE
+    ),
+    traits={
+        "mnk_problem_filter": frozenset({_supports_partials_problem}),
+        "a_inner_stride_one": frozenset({True}),
+        "b_inner_stride_one": frozenset({False}),
+        "b_layout": frozenset({"KN"}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def triton_mm_fp8_channel_splitk_partials(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor,
+    B_scales: torch.Tensor,
+) -> SplitKPartials:
+    """``triton_mm_fp8_channel_splitk`` without its reduction launch.
+
+    Arguments match ``triton_mm_fp8_channel_splitk``. Serves only problems
+    whose split count is in ``PARTIAL_SUM_SPLITS``, the splits whose
+    reduction order a consumer reproduces bit for bit.
+
+    Returns:
+        The unreduced :class:`SplitKPartials` of ``(A * A_scales) @ (B *
+        B_scales^T)``.
+    """
+    m, k = A.shape
+    weight = B.t()
+    if fp8_channel_splitk_parts(m, weight.shape[0], k) not in PARTIAL_SUM_SPLITS:
+        raise ValueError("unsupported split-K FP8 partials problem")
+    return SplitKPartials(
+        _fp8_channel_splitk_partials(A, weight),
+        A_scales.reshape(-1),
+        B_scales.reshape(-1),
+    )

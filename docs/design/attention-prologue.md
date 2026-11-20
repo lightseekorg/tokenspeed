@@ -18,6 +18,10 @@ first:
 
 * `gqa_prologue(q, k, v, *, norm, rotary, cache, query_dtype, return_kv,
   solution, override)` for multi-head and grouped-query attention;
+  `gqa_prologue_split_k(rows, *, num_q_heads, norm, rotary, cache,
+  query_dtype, solution, override)` is the same operation for a decode forward
+  whose query, key, value and output-gate heads arrive as a split-K FP8
+  projection's FP32 partials (`SplitKQKVG`), and also returns the gate heads;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
   cache, solution, override)` for multi-head latent attention; `cache=None`
   rotates without storing and returns the latent for `latent_store(latent,
@@ -169,6 +173,13 @@ offset, so Gemma's `1 + w` never rounds to the activation dtype, except under
 Ascend's norm, which forms it in the weight dtype as before. M-RoPE selects
 each rotation pair's position row and then applies the ordinary rotation, so
 text tokens get exactly the bytes of plain RoPE.
+
+A `SplitKQKVG` input first reduces each element exactly as the split-K GEMM's
+`_sum_scaled` would: its FP32 partials summed in that kernel's order, times the
+row scale and then the channel scale, rounded once to BF16. The steps then run
+on those rows, so the query, the cache rows and the gate heads hold the bytes
+the GEMM's BF16 output would have given `gqa_prologue`. Only the split counts
+whose order the kernel spells out (`SPLIT_K_PARTS`) are served; others raise.
 
 The `composite` solution chains the step kernels and rounds between them, as
 models did before the prologue existed. It is the portable path: every GQA
@@ -387,6 +398,7 @@ native, FP8, or MXFP8 cache; every step but the write is optional.
 | `triton` | one launch; each program takes a tile of tokens of one head (4 at decode sizes, up to 2048 elements past 256 tokens) | AMD and NVIDIA, native or FP8 caches; no relative head steps |
 | `triton` (`triton_relative_gqa_prologue`) | relative head steps and the K/V store in `rel_mha_head_norms`' launch, whose K and V programs first convolve their rows over a decode batch; past 128 tokens the clipped relative heads go through one GEMM | relative head steps, no RoPE, native caches of the activation dtype, K/V convolutions of decode batches |
 | `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store; or `inkling_ring_sconv` per K/V stream, `rel_mha_head_norms`, then the cache store | everything; rounds between steps; the path for MXFP8 caches, Ascend and K/V convolutions of extend batches |
+| `triton` (`triton_gqa_prologue_split_k`) | the tiled kernel reading a `SplitKQKVG`'s partials in place of BF16 rows, plus programs storing the gate heads | `gqa_prologue_split_k`: decode forwards (no returned K/V), 1-D positions, no `round_before_rope`, split counts 1, 2 and 4 |
 
 The tiled Triton kernel beats the CUDA `embedding.rope` with its fused K/V
 store at every size measured (1 to 8192 tokens, 64 to 512 wide heads), so no

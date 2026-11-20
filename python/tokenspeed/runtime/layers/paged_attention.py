@@ -44,7 +44,9 @@ from tokenspeed_kernel.ops.attention.prologue import (
     MLAPrologueOutput,
     RelativeHeadNorm,
     Rotary,
+    SplitKQKVG,
     gqa_prologue,
+    gqa_prologue_split_k,
     latent_store,
     mla_prologue,
 )
@@ -382,6 +384,38 @@ class PagedAttention(nn.Module):
             cache=self._local_target(slots, ctx),
             query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
             return_kv=False,
+            solution=None,
+            override=None,
+        )
+
+    def prologue_split_k(
+        self,
+        rows: SplitKQKVG,
+        num_q_heads: int,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> GQAPrologueOutput:
+        """:meth:`prologue` of a decode forward whose Q/K/V/gate projection is
+        a split-K FP8 GEMM's partials (``gqa_prologue_split_k``): the prologue
+        reduces them with the GEMM's numerics, so the rows, cache and query
+        bytes are those of the projected BF16 rows. Also returns the gate heads.
+        """
+        if not ctx.forward_mode.is_decode():
+            raise ValueError("the split-K prologue serves decode forwards only")
+        norm, rotary = self._steps(positions)
+        num_tokens = rows.partials.shape[1]
+        slots = ctx.attn_backend.padded_write_locations(
+            self, ctx.forward_mode, num_tokens
+        )
+        return gqa_prologue_split_k(
+            rows,
+            num_q_heads=num_q_heads,
+            norm=norm,
+            rotary=rotary,
+            cache=self._local_target(slots, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(
+                self, ctx.forward_mode, torch.bfloat16
+            ),
             solution=None,
             override=None,
         )

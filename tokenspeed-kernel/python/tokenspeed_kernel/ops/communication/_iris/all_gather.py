@@ -591,8 +591,56 @@ def _iris_tile_stage(stages, tile):
 
 
 @gluon.jit
+def _split_k_bf16(
+    base, plane, row_scale, col_scales, columns, mask, SPLIT_K: gl.constexpr
+):
+    """BF16 ``bf16(sum_s(base[s * plane + columns]) * row_scale *
+    col_scales[columns])``, summed in ``_sum_scaled``'s order (see
+    ``PARTIAL_SUM_SPLITS`` in ``triton_fp8_channel_splitk``). Masked-off
+    lanes hold undefined values."""
+    gl.static_assert(SPLIT_K == 1 or SPLIT_K == 2 or SPLIT_K == 4 or SPLIT_K == 8)
+    p = ()
+    for s in gl.static_range(SPLIT_K):
+        p += (gl.load(base + s * plane + columns, mask=mask),)
+    # _sum_scaled's [SPLIT_K, 512] tile sits on warps [2, 2] (TTGIR): a thread
+    # holds splits r, r + 2, r + 4, ... of one parity and tree-sums them
+    # in-thread, then the even and odd warps' sums are added. Hence the
+    # strided pairs below, not neighbour pairs (PARTIAL_SUM_SPLITS).
+    if SPLIT_K == 1:
+        total = p[0]
+    elif SPLIT_K == 2:
+        total = p[0] + p[1]
+    elif SPLIT_K == 4:
+        total = (p[0] + p[2]) + (p[1] + p[3])
+    else:
+        total = ((p[0] + p[2]) + (p[4] + p[6])) + ((p[1] + p[3]) + (p[5] + p[7]))
+    scale = gl.load(col_scales + columns, mask=mask)
+    return (total * row_scale * scale).to(gl.bfloat16)
+
+
+@gluon.jit
+def _split_k_bf16x2(partials, row_scales, col_scales, row, plane, local_width: gl.constexpr, words, mask, SPLIT_K: gl.constexpr,):  # fmt: skip
+    """A split-K FP8 GEMM's BF16 output for row ``row``, finished from its
+    FP32 ``[SPLIT_K, rows, local_width]`` partials as BF16 pairs packed in
+    32-bit words (low half the even column), at word offsets ``words``."""
+    base = partials + row.to(gl.int64) * local_width
+    plane = plane.to(gl.int64)
+    row_scale = gl.load(row_scales + row)
+    low = _split_k_bf16(base, plane, row_scale, col_scales, words * 2, mask, SPLIT_K)
+    high = _split_k_bf16(
+        base, plane, row_scale, col_scales, words * 2 + 1, mask, SPLIT_K
+    )
+    low = low.to(gl.uint16, bitcast=True).to(gl.uint32)
+    high = high.to(gl.uint16, bitcast=True).to(gl.uint32)
+    return low | (high << 16)
+
+
+@gluon.jit
 def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     local_input,
+    row_scales,
+    col_scales,
+    partial_plane,
     weight,
     packed_output,
     scale_output,
@@ -609,12 +657,21 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     max_elements: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     WAIT_STORES: gl.constexpr,
+    SPLIT_K: gl.constexpr,
 ):
     """Gather BF16 row shards through Lamport mailboxes, then RMSNorm + MXFP4.
 
     Launch one single-subgroup program per row. Uses ``ProducerAllReduce``'s
     Lamport mailbox and per-512-element stage counters. Negative zero is sent as
     zero; otherwise outputs match ``iris_fused_pull_allgather_rmsnorm_mxfp4``.
+
+    With ``SPLIT_K`` 0, ``local_input`` holds the BF16 ``[rows, local_width]``
+    shards and the scale and plane arguments are unused. Otherwise the shards
+    are a split-K FP8 GEMM's output this kernel finishes: ``local_input`` is
+    its FP32 ``[SPLIT_K, rows, local_width]`` partials, ``partial_plane`` is
+    ``rows * local_width``, and ``row_scales`` / ``col_scales`` are its FP32
+    row and channel scales; the shards' bits are those ``_sum_scaled`` would
+    have stored.
     """
     WORLD_SIZE: gl.constexpr = len(regions)
     REPS: gl.constexpr = total_width // 1024
@@ -647,7 +704,14 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
     pack_word = gl.arange(0, 4, layout=gl.SliceLayout(0, push_layout))
     push_words = (pack * 4)[:, None] + pack_word[None, :]
     push_stage = _iris_tile_stage(stages, pack * 8 // 512)
-    shard = _iris_sanitize_lamport_bf16x2(gl.load(local_words + push_words))
+    if SPLIT_K == 0:
+        shard = gl.load(local_words + push_words)
+    else:
+        shard = _split_k_bf16x2(
+            local_input, row_scales, col_scales, row, partial_plane, local_width,
+            push_words, None, SPLIT_K,
+        )  # fmt: skip
+    shard = _iris_sanitize_lamport_bf16x2(shard)
     push_offsets = (
         (push_stage * stage_words).to(gl.int32)[:, None]
         + rank * peer_words
@@ -680,7 +744,15 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
         + row_words
     )[:, :, None] + shard_words
     # Every lane's address lies in this row's shard; only own columns use it.
-    own = _iris_sanitize_lamport_bf16x2(gl.load(local_words + shard_words))
+    if SPLIT_K == 0:
+        own = gl.load(local_words + shard_words)
+    else:
+        # Finishing a word reads 2 * SPLIT_K partials, so skip remote columns.
+        own = _split_k_bf16x2(
+            local_input, row_scales, col_scales, row, partial_plane, local_width,
+            shard_words, (~remote)[:, :, None], SPLIT_K,
+        )  # fmt: skip
+    own = _iris_sanitize_lamport_bf16x2(own)
     mailbox = tl.cast(region, gl.pointer_type(gl.uint32))
     # Issue all reads before checking any; arrived packs stay unchanged until
     # this rank clears them, so retries reread them all. Payload high halves are

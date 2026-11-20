@@ -81,6 +81,10 @@ from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
     iris_pull_reduce_scatter,
 )
 from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
+from tokenspeed_kernel.ops.gemm.triton_fp8_channel_splitk import (
+    PARTIAL_SUM_SPLITS,
+    SplitKPartials,
+)
 from tokenspeed_kernel.ops.moe import gather_moe_routes
 from tokenspeed_kernel.platform import current_platform
 
@@ -2344,7 +2348,7 @@ class MuseIrisState:
         # The Lamport variant is limited only by mailbox capacity; the pull
         # variant stages rows in producer storage and needs one ready flag per
         # row.
-        if self._lamport_gathers_rmsnorm_mxfp4(local):
+        if self._lamport_gathers_rmsnorm_mxfp4(*local.shape):
             return True
         return (
             self.all_reduce.producer.data is not None
@@ -2358,9 +2362,8 @@ class MuseIrisState:
             max_bytes=self.all_reduce.producer_direct_max_numel * local.element_size(),
         )
 
-    def _lamport_gathers_rmsnorm_mxfp4(self, local: torch.Tensor) -> bool:
+    def _lamport_gathers_rmsnorm_mxfp4(self, rows: int, local_width: int) -> bool:
         """Whether the gather-and-quantize takes the Lamport mailbox variant."""
-        rows, local_width = local.shape
         total_width = local_width * self.world_size
         return (
             self.reduction.lamport_region is not None
@@ -2384,7 +2387,7 @@ class MuseIrisState:
             and weight.dtype == local.dtype
             and weight.device == local.device
             and weight.is_contiguous()
-            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            and self._lamport_gathers_rmsnorm_mxfp4(*local.shape)
             # The BF16 output matches the separate norm within one ulp, not
             # bit for bit, so it stays inside the one-shot window it is
             # tested in; the rest of the slot serves only the bit-exact
@@ -2449,30 +2452,58 @@ class MuseIrisState:
 
     def can_all_gather_rmsnorm_mxfp4_quant_topk(
         self,
-        local: torch.Tensor,
+        local: torch.Tensor | SplitKPartials,
         weight: torch.Tensor,
         bias: torch.Tensor,
         topk: int,
     ) -> bool:
         """Check the Lamport gather-and-quantize that also routes its rows.
 
-        The rows' FP32 logits must be contiguous ``[rows, bias.shape[0]]``.
+        ``local`` is the BF16 ``[rows, local_width]`` shard, or the split-K
+        FP8 GEMM partials that make it (the kernel finishes the GEMM). The
+        rows' FP32 logits must be contiguous ``[rows, bias.shape[0]]``.
         """
         experts = bias.shape[0] if bias.ndim == 1 else -1
+        if isinstance(local, SplitKPartials):
+            partials = local.partials
+            rows_ok = (
+                current_platform().is_cdna4
+                and self.world_size in (4, 8)
+                and self.all_reduce.dtype == torch.bfloat16
+                and partials.ndim == 3
+                and partials.shape[0] in PARTIAL_SUM_SPLITS
+                and partials.dtype == torch.float32
+                and partials.device == self.all_reduce.device
+                and partials.is_contiguous()
+                and local.row_scales.shape == (partials.shape[1],)
+                and local.col_scales.shape == (partials.shape[2],)
+                and local.row_scales.dtype == torch.float32
+                and local.col_scales.dtype == torch.float32
+                and local.row_scales.is_contiguous()
+                and local.col_scales.is_contiguous()
+                and weight.shape == (partials.shape[2] * self.world_size,)
+                and weight.dtype == torch.bfloat16
+                and weight.device == partials.device
+                and weight.is_contiguous()
+            )
+            shape = partials.shape[1:]
+        else:
+            rows_ok = self.can_all_gather_rmsnorm_mxfp4_quant(local, weight)
+            shape = local.shape
         return (
-            self.can_all_gather_rmsnorm_mxfp4_quant(local, weight)
-            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            rows_ok
+            and self._lamport_gathers_rmsnorm_mxfp4(*shape)
             # The gfx950 top-k body takes power-of-two expert and top-k counts.
             and triton.next_power_of_2(experts) == experts <= 1024
             and triton.next_power_of_2(topk) == topk <= min(16, experts)
             and bias.dtype == torch.float32
             and bias.is_contiguous()
-            and bias.device == local.device
+            and bias.device == weight.device
         )
 
     def all_gather_rmsnorm_mxfp4_quant_topk(
         self,
-        local: torch.Tensor,
+        local: torch.Tensor | SplitKPartials,
         weight: torch.Tensor,
         eps: float,
         weight_offset: float,
@@ -2483,20 +2514,26 @@ class MuseIrisState:
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
         """Gather and quantize the expert inputs, and route the rows, in one launch.
 
+        ``local`` is this rank's BF16 ``[rows, local_width]`` shard, or the
+        split-K FP8 GEMM partials that make it; the kernel then finishes the
+        GEMM itself, to the bits its reduction launch would have stored.
+
         Returns the MXFP4 rows and scales of :meth:`all_gather_rmsnorm_mxfp4_quant`
         and the FP32 weights and int32 ids of the gfx950 biased-sigmoid top-k
         (normalized, then scaled by ``routed_scaling_factor``).
         """
+        split_k = local.partials.shape[0] if isinstance(local, SplitKPartials) else 0
+        rows, local_width = local.partials.shape[1:] if split_k else local.shape
         if not self.can_all_gather_rmsnorm_mxfp4_quant_topk(
             local, weight, bias, topk
         ) or (
-            logits.shape != (local.shape[0], bias.shape[0])
+            logits.shape != (rows, bias.shape[0])
             or logits.dtype != torch.float32
             or not logits.is_contiguous()
-            or logits.device != local.device
+            or logits.device != weight.device
         ):
             raise RuntimeError("unsupported Iris gather, MXFP4 and top-k fusion")
-        if local.data_ptr() % 4:
+        if split_k == 0 and local.data_ptr() % 4:
             # Rank-local fallback could split ranks across protocols.
             raise ValueError(
                 "iris_fused_lamport_allgather_rmsnorm_mxfp4_topk reads BF16 pairs "
@@ -2506,20 +2543,19 @@ class MuseIrisState:
             empty_swizzled_cdna4_mxfp4_scale,
         )
 
-        rows, local_width = local.shape
         total_width = local_width * self.world_size
-        packed = torch.empty(
-            (rows, total_width // 2), dtype=torch.uint8, device=local.device
-        )
+        device = weight.device
+        packed = torch.empty((rows, total_width // 2), dtype=torch.uint8, device=device)
         scales = empty_swizzled_cdna4_mxfp4_scale(
-            rows, total_width // 32, device=local.device
+            rows, total_width // 32, device=device
         )
-        topk_ids = torch.empty((rows, topk), dtype=torch.int32, device=local.device)
-        topk_weights = torch.empty(
-            (rows, topk), dtype=torch.float32, device=local.device
-        )
+        topk_ids = torch.empty((rows, topk), dtype=torch.int32, device=device)
+        topk_weights = torch.empty((rows, topk), dtype=torch.float32, device=device)
         iris_fused_lamport_allgather_rmsnorm_mxfp4_topk[(2 * rows,)](
-            local,
+            local.partials if split_k else local,
+            local.row_scales if split_k else None,
+            local.col_scales if split_k else None,
+            rows * local_width if split_k else 0,
             weight,
             packed,
             scales,
@@ -2544,6 +2580,7 @@ class MuseIrisState:
             EXPERTS=logits.shape[1],
             TOPK=topk,
             ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+            SPLIT_K=split_k,
             num_warps=1,
         )
         return (packed, scales), topk_weights, topk_ids
@@ -2570,7 +2607,7 @@ class MuseIrisState:
         scales = empty_swizzled_cdna4_mxfp4_scale(
             rows, total_width // 32, device=local.device
         )
-        if self._lamport_gathers_rmsnorm_mxfp4(local):
+        if self._lamport_gathers_rmsnorm_mxfp4(*local.shape):
             if local.data_ptr() % 4:
                 # Rank-local fallback could split ranks across protocols.
                 raise ValueError(
@@ -2580,6 +2617,9 @@ class MuseIrisState:
             # Sentinel mailboxes replace both peer rendezvous of the pull path.
             iris_fused_lamport_allgather_rmsnorm_mxfp4[(rows,)](
                 local,
+                None,
+                None,
+                0,
                 weight,
                 packed,
                 scales,
@@ -2596,6 +2636,7 @@ class MuseIrisState:
                 max_elements=self.reduction.lamport_capacity,
                 PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
                 WAIT_STORES=self._arch.wait_stores,
+                SPLIT_K=0,
                 num_warps=1,
             )
             return packed, scales

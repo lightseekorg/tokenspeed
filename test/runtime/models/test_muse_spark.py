@@ -1343,7 +1343,11 @@ def test_qkv_fp8_projection_takes_its_row_window_and_the_producer_copy(
 ) -> None:
     """--dense-fp8-small-m qkv-down runs the QKV projection in FP8 only inside
     its row window and in decode forwards, and a producer's FP8 copy gives the
-    bits the layer's own quantization gives."""
+    bits the layer's own quantization gives. In that window it also hands its
+    split-K partials to the GQA prologue."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import _sum_scaled
+
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
     with torch.device("cuda"):
         # A TP4 rank's shape: Q 2048 + gate 2048 + K 256 + V 256 of 8192.
@@ -1385,6 +1389,26 @@ def test_qkv_fp8_projection_takes_its_row_window_and_the_producer_copy(
         assert torch.equal(
             layer.forward_rows(x[:rows], None, decode=False), layer(x[:rows])[0]
         )
+        # The same projection as split-K partials for the GQA prologue: the
+        # GEMM's own reduction of them gives forward_rows' bytes.
+        split = layer.forward_rows_split_k(x[:rows], None, decode=True)
+        reduced = torch.empty_like(projected)
+        parts, _, columns = split.partials.shape
+        _sum_scaled[(triton.cdiv(rows * columns, 512),)](
+            split.partials,
+            split.row_scales,
+            split.col_scales,
+            reduced,
+            rows,
+            columns,
+            parts,
+            512,
+            num_warps=4,
+        )
+        assert torch.equal(reduced, projected)
+        assert layer.forward_rows_split_k(x[:rows], None, decode=False) is None
+    for rows in (16, 257):
+        assert layer.forward_rows_split_k(x[:rows], None, decode=True) is None
 
 
 @requires_gpu
@@ -1396,7 +1420,11 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     """With --dense-fp8-small-m, a decode forward's attention gets the FP8
-    projection's q/k/v and an extend forward the BF16 projection's."""
+    projection's q/k/v, through the split-K prologue, and an extend forward
+    the BF16 projection's."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import _sum_scaled
+
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
@@ -1438,12 +1466,33 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
         torch.equal(expected, attention.qkv_proj(normalized)[0]) != decode
     )  # only the decode forward projects in FP8
     ctx = SimpleNamespace(forward_mode=ForwardMode[mode])
+    q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
+    received = []
+
+    def prologue_split_k(split, num_heads, positions, ctx):
+        # The prologue reduces the partials as the GEMM would.
+        reduced = torch.empty_like(expected)
+        parts, _, columns = split.partials.shape
+        _sum_scaled[(triton.cdiv(rows * columns, 512),)](
+            split.partials, split.row_scales, split.col_scales, reduced,
+            rows, columns, parts, 512, num_warps=4,
+        )  # fmt: skip
+        received.append(reduced)
+        return SimpleNamespace(q=reduced[:, :q_end], gate=reduced[:, -q_end:])
+
+    attention.attn.prologue_split_k = prologue_split_k
     attention(torch.arange(rows, device="cuda"), normalized, None, ctx, None)
     q, k, v, _, _ = attention.attn.call_args.args
-    q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, expected[:, :q_end])
-    assert torch.equal(k, expected[:, q_end:kv_end])
-    assert torch.equal(v, expected[:, kv_end : kv_end + attention.kv_size])
+    if decode:
+        # The split-K prologue took the FP8 projection's partials, prepared
+        # the query and wrote K / V itself.
+        assert len(received) == 1 and torch.equal(received[0], expected)
+        assert k is None and v is None
+    else:
+        assert not received
+        assert torch.equal(k, expected[:, q_end:kv_end])
+        assert torch.equal(v, expected[:, kv_end : kv_end + attention.kv_size])
 
 
 @requires_gpu
@@ -1607,6 +1656,24 @@ def test_layer_boundaries_write_an_fp8_copy_only_where_it_is_read(
     )
     assert not layer.mlp.reads_fp8_input()
     assert not layer.attention_boundary_writes_fp8(rows, **kwargs)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the FP8 split-K GEMM is gfx950-only"
+)
+def test_split_k_consumer_refuses_a_split_count_the_prologue_does_not_reduce() -> None:
+    """A QKV copy whose GEMM splits K eight ways ([1024, 8192] does) is refused
+    at load, since the split-K attention prologue reduces 1, 2 or 4 slices;
+    the served TP4 QKV slice [4608, 8192] passes."""
+    for shape, refused in (((1024, 8192), True), ((4608, 8192), False)):
+        fp8 = module._DenseFp8Weight("qkv_proj", True, module._DENSE_FP8_MAX_ROWS)
+        fp8.prepare(torch.zeros(*shape, device="cuda", dtype=torch.bfloat16))
+        if refused:
+            with pytest.raises(ValueError, match="splits K into 8 slices"):
+                fp8.check_split_k_consumer()
+        else:
+            fp8.check_split_k_consumer()
 
 
 def test_weight_update_is_refused_with_dense_fp8_copies(bf16_default_dtype) -> None:

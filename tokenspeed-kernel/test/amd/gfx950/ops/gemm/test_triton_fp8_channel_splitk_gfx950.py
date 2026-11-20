@@ -210,3 +210,239 @@ def test_unpinned_fp8_mm_keeps_triton_mm_fp8_scaled(m):
     expected, expected_kernels = launched(override="triton_mm_fp8_scaled")
     assert expected_kernels and selected_kernels == expected_kernels
     assert torch.equal(selected, expected)
+
+
+def quantize_rows_1d(x):
+    """``quantize_rows`` with ``[M]`` scales, as the split-K partials take them."""
+    codes, scales = quantize_rows(x)
+    return codes, scales.reshape(-1)
+
+
+def _split_k_case(heads, m, seed):
+    """The partials, row and column scales and BF16 product of one split-K
+    projection with ``heads`` = (query, KV, gate) heads of 64."""
+    from tokenspeed_kernel.ops.gemm import mm_split_k_partials
+
+    hq, hkv, hg = heads
+    n = (hq + 2 * hkv + hg) * 64
+    torch.manual_seed(seed)
+    weight, weight_scale = prepare_fp8_channel_weight(
+        (torch.randn(n, 8192, device="cuda") * 0.02).bfloat16()
+    )
+    rows, scales = quantize_rows_1d(torch.randn(m, 8192, device="cuda").bfloat16())
+    partials = mm_split_k_partials(
+        rows, weight.t(), A_scales=scales, B_scales=weight_scale
+    ).partials
+    return partials, scales, weight_scale, project(rows, scales, weight, weight_scale)
+
+
+# Muse Spark's Q/K/V/gate projection at TP4 and TP8.
+_QKVG_HEADS = [(32, 4, 32), (16, 2, 16)]
+
+
+@pytest.mark.parametrize("heads", _QKVG_HEADS)
+@pytest.mark.parametrize("m", [17, 24, 32, 33, 48, 64, 65, 96, 128, 129, 200, 256])
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("style", ["neox", "gptj", "none"])
+@pytest.mark.parametrize("with_norm", [True, False])
+def test_split_k_prologue_writes_the_bytes_of_the_bf16_projection(
+    heads, m, cache_dtype, style, with_norm
+):
+    """gqa_prologue_split_k over the partials gives the query, gate and K/V
+    cache bytes of the split-K GEMM's BF16 rows through gqa_prologue."""
+    from tokenspeed_kernel.ops.attention.prologue import (
+        HeadKVCache,
+        HeadNorm,
+        RopeStyle,
+        Rotary,
+        SplitKQKVG,
+        gqa_prologue,
+        gqa_prologue_split_k,
+    )
+
+    hq, hkv, hg = heads
+    partials, scales, weight_scale, projected = _split_k_case(heads, m, m)
+    q, k, v, gate = projected.split((hq * 64, hkv * 64, hkv * 64, hg * 64), dim=-1)
+    norm = (
+        HeadNorm(
+            torch.randn(64, device="cuda").bfloat16(),
+            torch.randn(64, device="cuda").bfloat16(),
+            0.0,
+            1e-5,
+            round_before_rope=False,
+        )
+        if with_norm
+        else None
+    )
+    rotary = (
+        None
+        if style == "none"
+        else Rotary(
+            torch.randn(4096, 64, device="cuda"),
+            torch.randint(0, 4096, (m,), device="cuda"),
+            RopeStyle(style),
+            None,
+        )
+    )
+    slots = torch.randperm(1024, device="cuda")[:m].int()
+
+    def cache():
+        fill = torch.full((1024, hkv, 64), 0.5, device="cuda").to(cache_dtype)
+        return HeadKVCache(fill, fill.clone(), None, slots)
+
+    expected_cache, actual_cache = cache(), cache()
+    expected = gqa_prologue(
+        q,
+        k,
+        v,
+        norm=norm,
+        rotary=rotary,
+        cache=expected_cache,
+        query_dtype=torch.bfloat16,
+        return_kv=False,
+        solution="triton",
+        override=None,
+    )
+    actual = gqa_prologue_split_k(
+        SplitKQKVG(partials, scales, weight_scale),
+        num_q_heads=hq,
+        norm=norm,
+        rotary=rotary,
+        cache=actual_cache,
+        query_dtype=torch.bfloat16,
+        solution=None,
+        override=None,
+    )
+    as_bytes = lambda t: t.contiguous().view(torch.uint8)  # noqa: E731
+    assert torch.equal(as_bytes(actual.q), as_bytes(expected.q))
+    assert torch.equal(as_bytes(actual.gate), as_bytes(gate))
+    assert torch.equal(as_bytes(actual_cache.k_cache), as_bytes(expected_cache.k_cache))
+    assert torch.equal(as_bytes(actual_cache.v_cache), as_bytes(expected_cache.v_cache))
+
+
+def test_split_k_prologue_row_count_does_not_recompile():
+    """Decode row counts (3-16 running requests of 8 verify rows) share the
+    split-K prologue's compiled kernel."""
+    from tokenspeed_kernel.ops.attention.prologue import (
+        HeadKVCache,
+        RopeStyle,
+        Rotary,
+        SplitKQKVG,
+        gqa_prologue_split_k,
+    )
+    from tokenspeed_kernel.ops.attention.prologue.triton import (
+        _gqa_prologue_split_k_kernel,
+    )
+
+    def run(m):
+        partials, scales, weight_scale, _ = _split_k_case((32, 4, 32), m, 0)
+        fill = torch.zeros((1024, 4, 64), device="cuda").to(torch.float8_e4m3fn)
+        gqa_prologue_split_k(
+            SplitKQKVG(partials, scales, weight_scale),
+            num_q_heads=32,
+            norm=None,
+            rotary=Rotary(
+                torch.randn(4096, 64, device="cuda"),
+                torch.arange(m, device="cuda"),
+                RopeStyle.NEOX,
+                None,
+            ),
+            cache=HeadKVCache(
+                fill, fill.clone(), None, torch.arange(m, device="cuda").int()
+            ),
+            query_dtype=torch.bfloat16,
+            solution=None,
+            override=None,
+        )
+
+    # One warm launch per split count and token block (32 / 64 / 128 rows).
+    for m in (24, 72, 128):
+        run(m)
+    with assert_no_triton_compile(_gqa_prologue_split_k_kernel):
+        for m in (24, 32, 40, 48, 56, 64, 72, 80, 96, 104, 112, 120, 128):
+            run(m)
+
+
+def test_split_k_prologue_declines_split_counts_it_does_not_reduce():
+    """No prologue spells out _sum_scaled's order for 8 slices; asking for it
+    raises instead of reducing in another order."""
+    from tokenspeed_kernel.ops.attention.prologue import (
+        HeadKVCache,
+        SplitKQKVG,
+        gqa_prologue_split_k,
+    )
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    partials = torch.zeros((8, 32, 72 * 64), device="cuda")
+    fill = torch.zeros((1024, 4, 64), device="cuda").bfloat16()
+    with pytest.raises(NoKernelFoundError):
+        gqa_prologue_split_k(
+            SplitKQKVG(
+                partials,
+                torch.ones(32, device="cuda"),
+                torch.ones(72 * 64, device="cuda"),
+            ),
+            num_q_heads=32,
+            norm=None,
+            rotary=None,
+            cache=HeadKVCache(
+                fill, fill.clone(), None, torch.arange(32, device="cuda").int()
+            ),
+            query_dtype=torch.bfloat16,
+            solution=None,
+            override=None,
+        )
+
+
+@pytest.mark.parametrize("n", [1024, 4096])
+@pytest.mark.parametrize("m", [17, 32, 64, 96, 128])
+def test_split_k_partials_finish_to_the_gemm_bits(m, n):
+    """The unreduced partials, summed in _sum_scaled's order, scaled and
+    rounded once, give the split-K GEMM's BF16 output bit for bit. [1024,
+    8192] (TP4 pre-expert columns) splits K eight ways, [4096, 8192] four."""
+    from tokenspeed_kernel.ops.gemm import mm_split_k_partials
+
+    torch.manual_seed(m)
+    k = 8192
+    weight, weight_scale = prepare_fp8_channel_weight(
+        (torch.randn(n, k, device="cuda") * 0.02).bfloat16()
+    )
+    rows, scales = quantize_rows_1d(torch.randn(m, k, device="cuda").bfloat16())
+    result = mm_split_k_partials(
+        rows, weight.t(), A_scales=scales, B_scales=weight_scale
+    )
+    assert result is not None
+    p = result.partials
+    if n == 1024:
+        assert p.shape == (8, m, n)
+        total = ((p[0] + p[2]) + (p[4] + p[6])) + ((p[1] + p[3]) + (p[5] + p[7]))
+    else:
+        assert p.shape == (4, m, n)
+        total = (p[0] + p[2]) + (p[1] + p[3])
+    finished = (total * result.row_scales[:, None] * result.col_scales).bfloat16()
+    assert torch.equal(finished, project(rows, scales, weight, weight_scale))
+
+
+def test_split_k_partials_refuse_unserved_problems():
+    """Problems off the tuned table, or past 256 rows, keep the full GEMM: no
+    kernel serves their partials."""
+    from tokenspeed_kernel.ops.gemm import mm_split_k_partials
+    from tokenspeed_kernel.ops.gemm.triton_fp8_channel_splitk import (
+        triton_mm_fp8_channel_splitk_partials,
+    )
+
+    for n, m in ((2048, 32), (1024, 257)):
+        weight, weight_scale = prepare_fp8_channel_weight(
+            (torch.randn(n, 8192, device="cuda") * 0.02).bfloat16()
+        )
+        rows, scales = quantize_rows_1d(torch.randn(m, 8192, device="cuda").bfloat16())
+        assert (
+            mm_split_k_partials(
+                rows, weight.t(), A_scales=scales, B_scales=weight_scale
+            )
+            is None
+        )
+        with pytest.raises(ValueError):
+            triton_mm_fp8_channel_splitk_partials(
+                rows, weight.t(), scales, weight_scale
+            )

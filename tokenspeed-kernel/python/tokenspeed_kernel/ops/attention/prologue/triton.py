@@ -29,6 +29,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.prologue.types import (
     BOOLS,
     ROPE_STYLES,
+    SPLIT_K_PARTS,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -38,6 +39,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     RelativeHeadNorm,
     RopeStyle,
     Rotary,
+    SplitKQKVG,
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
@@ -52,6 +54,9 @@ from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 # Above this the one-launch write loses to the composite (measured at 16-64 heads).
 _MLA_MAX_TOKEN_HEADS = 2048 * 16
+
+# The largest finite FP8 E4M3 value; a scaled cache saturates to it.
+_FP8_E4M3_MAX = tl.constexpr(448.0)
 
 
 @triton.jit
@@ -125,6 +130,53 @@ def _row_inv_rms(
 
 
 @triton.jit
+def _load_rows(
+    src,
+    cols,
+    col_mask,
+    row_mask,
+    part_plane,
+    row_scale,
+    col_scales,
+    SPLIT_K: tl.constexpr,
+):
+    """fp32 ``[tokens, cols]`` of the rows at ``src`` (one pointer per token).
+
+    With SPLIT_K > 0, ``src`` points into the first of SPLIT_K FP32 split-K
+    partial planes ``part_plane`` elements apart, and each element is
+    ``_sum_scaled``'s: the planes summed in the order its ``tl.sum`` over
+    ``[SPLIT_K, 512]`` compiles to (``p0 + p1``; ``(p0 + p2) + (p1 + p3)``),
+    times the row's and then the column's scale, rounded once to BF16. Each
+    plane loads as a plain row tile, so the head steps see today's layout.
+    """
+    mask = row_mask[:, None] & col_mask[None, :]
+    if SPLIT_K == 0:
+        rows = tl.load(src[:, None] + cols[None, :], mask=mask, other=0.0).to(
+            tl.float32
+        )
+    else:
+        tile = src[:, None] + cols[None, :]
+        p0 = tl.load(tile, mask=mask, other=0.0)
+        if SPLIT_K == 1:
+            total = p0
+        elif SPLIT_K == 2:
+            total = p0 + tl.load(tile + part_plane, mask=mask, other=0.0)
+        else:
+            tl.static_assert(SPLIT_K == 4)
+            p1 = tl.load(tile + part_plane, mask=mask, other=0.0)
+            p2 = tl.load(tile + 2 * part_plane, mask=mask, other=0.0)
+            p3 = tl.load(tile + 3 * part_plane, mask=mask, other=0.0)
+            total = (p0 + p2) + (p1 + p3)
+        rows = (
+            total
+            * row_scale[:, None]
+            * tl.load(col_scales + cols, mask=col_mask, other=0.0)[None, :]
+        )
+        rows = rows.to(tl.bfloat16).to(tl.float32)
+    return rows
+
+
+@triton.jit
 def _gqa_prologue_tile(
     src,
     weight_ptr,
@@ -132,6 +184,9 @@ def _gqa_prologue_tile(
     sin,
     row_mask,
     row_inv_rms,
+    part_plane,
+    row_scale,
+    col_scales,
     head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
     weight_offset: tl.constexpr,
@@ -141,24 +196,30 @@ def _gqa_prologue_tile(
     IS_NEOX: tl.constexpr,
     BLOCK: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
+    SPLIT_K: tl.constexpr,
 ):
     """A block of one head's fp32 rows and their rotated pairs: (rows, first
     half, second half). With ROUND_BEFORE_ROPE the rows normalize by
-    ``row_inv_rms`` and round to the input dtype before rotation."""
+    ``row_inv_rms`` and round to the input dtype before rotation. With
+    SPLIT_K > 0 the rows are reduced from split-K partials (``_load_rows``)."""
     offs = tl.arange(0, BLOCK)
-    mask = row_mask[:, None] & (offs < head_dim)[None, :]
-    rows = tl.load(src[:, None] + offs[None, :], mask=mask, other=0.0).to(tl.float32)
+    rows = _load_rows(
+        src, offs, offs < head_dim, row_mask, part_plane, row_scale, col_scales, SPLIT_K
+    )
     half = tl.arange(0, HALF_BLOCK)
     half_mask = half < half_rotary
-    pair_mask = row_mask[:, None] & half_mask[None, :]
     if IS_NEOX:
         i1 = half
         i2 = half + half_rotary
     else:
         i1 = 2 * half
         i2 = 2 * half + 1
-    x1 = tl.load(src[:, None] + i1[None, :], mask=pair_mask, other=0.0).to(tl.float32)
-    x2 = tl.load(src[:, None] + i2[None, :], mask=pair_mask, other=0.0).to(tl.float32)
+    x1 = _load_rows(
+        src, i1, half_mask, row_mask, part_plane, row_scale, col_scales, SPLIT_K
+    )
+    x2 = _load_rows(
+        src, i2, half_mask, row_mask, part_plane, row_scale, col_scales, SPLIT_K
+    )
     if HAS_NORM:
         if ROUND_BEFORE_ROPE:
             inv_rms = row_inv_rms
@@ -204,9 +265,9 @@ def _gqa_store_tile(
     dtype = dst.dtype.element_ty
     if SCALED:
         # A per-tensor scaled FP8 cache holds x / scale, saturated to e4m3's range.
-        rows = tl.clamp(rows.to(tl.float32) * inv_scale, -448.0, 448.0)
-        o1 = tl.clamp(o1.to(tl.float32) * inv_scale, -448.0, 448.0)
-        o2 = tl.clamp(o2.to(tl.float32) * inv_scale, -448.0, 448.0)
+        rows = tl.clamp(rows.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        o1 = tl.clamp(o1.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        o2 = tl.clamp(o2.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
     tl.store(
         dst[:, None] + offs[None, :],
         rows.to(dtype),
@@ -323,6 +384,9 @@ def _gqa_prologue_kernel(
             sin,
             row_mask,
             row_inv_rms,
+            0,
+            0.0,
+            q_ptr,
             head_dim,
             half_rotary,
             weight_offset,
@@ -332,6 +396,7 @@ def _gqa_prologue_kernel(
             IS_NEOX,
             BLOCK,
             HALF_BLOCK,
+            0,
         )
         _gqa_store_tile(
             q_out_ptr + tokens * q_out_stride_t + head * head_dim,
@@ -369,6 +434,9 @@ def _gqa_prologue_kernel(
             sin,
             row_mask,
             row_inv_rms,
+            0,
+            0.0,
+            q_ptr,
             head_dim,
             half_rotary,
             weight_offset,
@@ -378,6 +446,7 @@ def _gqa_prologue_kernel(
             IS_NEOX,
             BLOCK,
             HALF_BLOCK,
+            0,
         )
         if RETURN_K:
             _gqa_store_tile(
@@ -431,8 +500,224 @@ def _gqa_prologue_kernel(
             + offs[None, :]
         )
         if KV_SCALED:
-            value = tl.clamp(value.to(tl.float32) * v_inv_scale, -448.0, 448.0)
+            value = tl.clamp(
+                value.to(tl.float32) * v_inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+            )
         tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
+
+
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_rows", "part_plane"],
+    do_not_specialize_on_alignment=["positions_ptr", "slots_ptr"],
+)
+def _gqa_prologue_split_k_kernel(
+    partials_ptr,
+    row_scales_ptr,
+    col_scales_ptr,
+    q_out_ptr,
+    gate_out_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    slots_ptr,
+    num_tokens,
+    num_rows,
+    part_plane,
+    q_out_stride_t,
+    gate_out_stride_t,
+    cos_sin_stride,
+    k_inv_scale,
+    v_inv_scale,
+    k_cache_stride_s,
+    k_cache_stride_h,
+    v_cache_stride_s,
+    v_cache_stride_h,
+    cache_page_size,
+    k_cache_stride_p,
+    v_cache_stride_p,
+    num_q_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    half_rotary: tl.constexpr,
+    weight_offset: tl.constexpr,
+    eps: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    KV_SCALED: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+):
+    """``_gqa_prologue_kernel`` over a split-K projection's FP32 partials.
+
+    The projection's columns are the query heads, the key heads, the value
+    heads and the gate heads, ``num_q_heads + 2 * num_kv_heads + num_gate``
+    heads of ``head_dim``. Every element is first reduced as ``_sum_scaled``
+    reduces it (``_load_rows``), so the steps see the bytes the BF16
+    projection would hold. Programs past the K/V heads store the gate heads.
+    """
+    tokens = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T).to(
+        tl.int64
+    )
+    row_mask = tokens < num_tokens
+    head = tl.program_id(1).to(tl.int64)
+    # The grid's head programs are the query, K/V and gate heads; the
+    # projection also holds the value heads, which the K/V programs store.
+    width = (tl.num_programs(1).to(tl.int64) + num_kv_heads) * head_dim
+    rows_ptr = partials_ptr + tokens * width
+    row_scale = tl.load(row_scales_ptr + tokens, mask=row_mask, other=0.0)
+    offs = tl.arange(0, BLOCK)
+    col_mask = offs < head_dim
+    cos = 0.0
+    sin = 0.0
+    if half_rotary > 0:
+        cos, sin = _rope_tables(
+            cos_sin_ptr,
+            positions_ptr,
+            tokens,
+            row_mask,
+            cos_sin_stride,
+            0,
+            half_rotary,
+            HALF_BLOCK,
+            False,
+            False,
+            0,
+            0,
+            0,
+        )
+    if head < num_q_heads:
+        rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
+            rows_ptr + head * head_dim,
+            q_weight_ptr,
+            cos,
+            sin,
+            row_mask,
+            0.0,
+            part_plane,
+            row_scale,
+            col_scales_ptr + head * head_dim,
+            head_dim,
+            half_rotary,
+            weight_offset,
+            eps,
+            HAS_NORM,
+            False,
+            IS_NEOX,
+            BLOCK,
+            HALF_BLOCK,
+            SPLIT_K,
+        )
+        _gqa_store_tile(
+            q_out_ptr + tokens * q_out_stride_t + head * head_dim,
+            rows,
+            o1,
+            o2,
+            i1,
+            i2,
+            row_mask,
+            half_mask,
+            1.0,
+            head_dim,
+            2 * half_rotary,
+            BLOCK,
+            False,
+        )
+    elif head < num_q_heads + num_kv_heads:
+        kv_head = head - num_q_heads
+        k_col = (num_q_heads + kv_head) * head_dim
+        rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
+            rows_ptr + k_col,
+            k_weight_ptr,
+            cos,
+            sin,
+            row_mask,
+            0.0,
+            part_plane,
+            row_scale,
+            col_scales_ptr + k_col,
+            head_dim,
+            half_rotary,
+            weight_offset,
+            eps,
+            HAS_NORM,
+            False,
+            IS_NEOX,
+            BLOCK,
+            HALF_BLOCK,
+            SPLIT_K,
+        )
+        write_mask = tokens < num_rows
+        slot = tl.load(slots_ptr + tokens, mask=write_mask, other=0).to(tl.int64)
+        _gqa_store_tile(
+            k_cache_ptr
+            + (slot // cache_page_size) * k_cache_stride_p
+            + (slot % cache_page_size) * k_cache_stride_s
+            + kv_head * k_cache_stride_h,
+            rows,
+            o1,
+            o2,
+            i1,
+            i2,
+            write_mask,
+            half_mask,
+            k_inv_scale,
+            head_dim,
+            2 * half_rotary,
+            BLOCK,
+            KV_SCALED,
+        )
+        v_col = k_col + num_kv_heads * head_dim
+        value = _load_rows(
+            rows_ptr + v_col,
+            offs,
+            col_mask,
+            write_mask,
+            part_plane,
+            row_scale,
+            col_scales_ptr + v_col,
+            SPLIT_K,
+        )
+        dst = (
+            v_cache_ptr
+            + (
+                (slot // cache_page_size) * v_cache_stride_p
+                + (slot % cache_page_size) * v_cache_stride_s
+                + kv_head * v_cache_stride_h
+            )[:, None]
+            + offs[None, :]
+        )
+        if KV_SCALED:
+            value = tl.clamp(value * v_inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        tl.store(
+            dst,
+            value.to(dst.dtype.element_ty),
+            mask=write_mask[:, None] & col_mask[None, :],
+        )
+    else:
+        gate_head = head - num_q_heads - num_kv_heads
+        g_col = (num_q_heads + 2 * num_kv_heads + gate_head) * head_dim
+        gate = _load_rows(
+            rows_ptr + g_col,
+            offs,
+            col_mask,
+            row_mask,
+            part_plane,
+            row_scale,
+            col_scales_ptr + g_col,
+            SPLIT_K,
+        )
+        tl.store(
+            gate_out_ptr
+            + (tokens * gate_out_stride_t + gate_head * head_dim)[:, None]
+            + offs[None, :],
+            gate.to(gate_out_ptr.dtype.element_ty),
+            mask=row_mask[:, None] & col_mask[None, :],
+        )
 
 
 def _block_tokens(num_tokens: int, block: int) -> int:
@@ -575,6 +860,113 @@ def triton_gqa_prologue(
     return GQAPrologueOutput(
         q=q_out, k=k_out if return_kv else None, v=v if return_kv else None
     )
+
+
+@register_kernel(
+    "attention",
+    "gqa_prologue",
+    name="triton_gqa_prologue_split_k",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(("q",), "dense", {torch.float32}),
+    priority=Priority.PERFORMANT,
+    traits={
+        "has_norm": BOOLS,
+        "relative_norm": frozenset({False}),
+        "kv_conv": frozenset({"none"}),
+        "kv_format": frozenset({"native", "fp8", "fp8_per_tensor"}),
+        "kv_convert": BOOLS,
+        "mrope": frozenset({False}),
+        "partial_rotary": BOOLS,
+        "return_kv": frozenset({False}),
+        "rope_style": ROPE_STYLES,
+        "split_k": SPLIT_K_PARTS,
+    },
+)
+def triton_gqa_prologue_split_k(
+    *,
+    rows: SplitKQKVG,
+    num_q_heads: int,
+    norm: HeadNorm | None,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+    query_dtype: torch.dtype,
+) -> GQAPrologueOutput:
+    """``triton_gqa_prologue`` over a split-K projection's partials, which it
+    reduces as ``_sum_scaled`` would, plus the gate heads' BF16 rows."""
+    split_k, num_tokens, columns = rows.partials.shape
+    if split_k * num_tokens * columns >= 2**31:
+        # The kernel keeps plane offsets in int32 for its inner loop; the
+        # split-K GEMM's partials stay below this (at most 256 rows of a
+        # projection), and a larger buffer would wrap them.
+        raise ValueError(
+            f"split-K partials [{split_k}, {num_tokens}, {columns}] exceed "
+            "int32 plane offsets"
+        )
+    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
+    num_gate_heads = columns // head_dim - num_q_heads - 2 * num_kv_heads
+    device = rows.partials.device
+    q_out = torch.empty(
+        (num_tokens, num_q_heads * head_dim), dtype=query_dtype, device=device
+    )
+    gate = torch.empty(
+        (num_tokens, num_gate_heads * head_dim), dtype=torch.bfloat16, device=device
+    )
+    if num_tokens > 0:
+        half_rotary = 0 if rotary is None else rotary.rotary_dim // 2
+        positions = cache.slots if rotary is None else rotary.positions
+        scales = cache.scales if cache.format is KVCacheFormat.FP8_PER_TENSOR else None
+        block_t = _block_tokens(num_tokens, triton.next_power_of_2(head_dim))
+        kernel_launcher(
+            _gqa_prologue_split_k_kernel,
+            (
+                triton.cdiv(num_tokens, block_t),
+                num_q_heads + num_kv_heads + num_gate_heads,
+            ),
+        )(
+            rows.partials,
+            rows.row_scales,
+            rows.col_scales,
+            q_out,
+            gate,
+            rows.partials if norm is None else norm.q_weight,
+            rows.partials if norm is None else norm.k_weight,
+            rows.partials if rotary is None else rotary.cos_sin_cache,
+            positions,
+            cache.k_cache,
+            cache.v_cache,
+            cache.slots,
+            num_tokens,
+            cache.slots.numel(),
+            num_tokens * columns,
+            q_out.stride(0),
+            gate.stride(0),
+            0 if rotary is None else rotary.cos_sin_cache.stride(0),
+            1.0 if scales is None else 1.0 / scales.k,
+            1.0 if scales is None else 1.0 / scales.v,
+            cache.k_cache.stride(-3),
+            cache.k_cache.stride(-2),
+            cache.v_cache.stride(-3),
+            cache.v_cache.stride(-2),
+            cache.k_cache.shape[1] if cache.k_cache.ndim == 4 else 1,
+            cache.k_cache.stride(0),
+            cache.v_cache.stride(0),
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            half_rotary,
+            0.0 if norm is None else norm.weight_offset,
+            0.0 if norm is None else norm.eps,
+            HAS_NORM=norm is not None,
+            IS_NEOX=rotary is not None and rotary.style is RopeStyle.NEOX,
+            KV_SCALED=scales is not None,
+            SPLIT_K=split_k,
+            BLOCK_T=block_t,
+            BLOCK=triton.next_power_of_2(head_dim),
+            HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),
+            num_warps=4,
+        )
+    return GQAPrologueOutput(q=q_out, k=None, v=None, gate=gate)
 
 
 @register_kernel(

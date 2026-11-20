@@ -200,6 +200,9 @@ def iris_pull_allgather_moe_inputs(
 @gluon.jit(do_not_specialize=["rows"])
 def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
     local_input,
+    row_scales,
+    col_scales,
+    partial_plane,
     weight,
     packed_output,
     scale_output,
@@ -224,11 +227,13 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
     EXPERTS: gl.constexpr,
     TOPK: gl.constexpr,
     ROUTED_SCALING_FACTOR: gl.constexpr,
+    SPLIT_K: gl.constexpr,
 ):
     """Gather, normalize and quantize the expert inputs, and route the same rows.
 
     Programs ``[0, rows)`` are ``iris_fused_lamport_allgather_rmsnorm_mxfp4``
-    for their row; programs ``[rows, 2 * rows)`` select row ``program - rows``'s
+    for their row (``SPLIT_K`` and the arguments before ``weight`` as there);
+    programs ``[rows, 2 * rows)`` select row ``program - rows``'s
     biased-sigmoid top-k from ``logits`` as the gfx950 top-k kernel does
     (normalized weights scaled by ``ROUTED_SCALING_FACTOR``). The two halves
     share nothing, so routing costs no launch of its own. Single-subgroup
@@ -237,10 +242,11 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
     program = gl.program_id(0)
     if program < rows:
         iris_fused_lamport_allgather_rmsnorm_mxfp4(
-            local_input, weight, packed_output, scale_output, region, epochs,
-            regions, rank, local_width, total_width, eps, weight_offset,
-            scale_stride_linear, scale_stride_mblock, max_elements,
-            PEER_SIGNAL_STORE_CACHE, WAIT_STORES
+            local_input, row_scales, col_scales, partial_plane, weight,
+            packed_output, scale_output, region, epochs, regions, rank,
+            local_width, total_width, eps, weight_offset, scale_stride_linear,
+            scale_stride_mblock, max_elements, PEER_SIGNAL_STORE_CACHE,
+            WAIT_STORES, SPLIT_K
         )  # fmt: skip
     else:
         sigmoid_bias_topk_row_gfx950(

@@ -31,7 +31,9 @@ any model knowing.
 Two layouts share one vocabulary:
 
 * :func:`gqa_prologue` -- grouped-query (and multi-head) attention
-  with separate K and V cache planes.
+  with separate K and V cache planes; :func:`gqa_prologue_split_k` takes the
+  query, key, value and output-gate heads as a split-K FP8 projection's
+  unreduced partials.
 * :func:`mla_prologue` -- multi-head latent attention with one
   latent-plus-RoPE cache plane.
 
@@ -50,6 +52,7 @@ from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_mla_request,
 )
 from tokenspeed_kernel.ops.attention.prologue.types import (
+    SPLIT_K_PARTS,
     ConvBatch,
     ConvStream,
     FP8TensorScales,
@@ -67,6 +70,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     RelativeHeadNorm,
     RopeStyle,
     Rotary,
+    SplitKQKVG,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -218,6 +222,118 @@ def gqa_prologue(
             query_dtype=query_dtype,
             return_kv=return_kv,
             enable_pdl=pdl_enabled(),
+        )
+
+
+def gqa_prologue_split_k(
+    rows: SplitKQKVG,
+    *,
+    num_q_heads: int,
+    norm: HeadNorm | None,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+    query_dtype: torch.dtype,
+    solution: str | None,
+    override: str | None,
+) -> GQAPrologueOutput:
+    """:func:`gqa_prologue` for a decode forward whose Q/K/V/gate projection
+    is a split-K FP8 GEMM's FP32 partials, reduced inside the prologue.
+
+    Each element is the bytes ``triton_mm_fp8_channel_splitk`` would store
+    (its ``_sum_scaled``: the partials summed, times the row and column
+    scales, rounded once to BF16); the head steps and the cache write then
+    run as :func:`gqa_prologue` runs them on those rows. The gate heads come
+    back as BF16 rows.
+
+    Args:
+        rows: The projection's partials and scales; columns are the query,
+            key, value and gate heads, in that order.
+        num_q_heads: Query heads in ``rows``; the cache gives the K/V heads
+            and the head width, the rest are gate heads.
+        norm: Per-head RMSNorm, or ``None``. ``round_before_rope`` is not
+            supported.
+        rotary: Rotary embedding (1-D positions), or ``None`` for NoPE.
+        cache: KV cache destination; one slot per row.
+        query_dtype: Dtype of the returned query: BF16, or an FP8 dtype.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel name; it must serve the request.
+
+    Returns:
+        The query in ``query_dtype`` and the BF16 gate heads (``gate``).
+    """
+    split_k, num_tokens, columns = rows.partials.shape
+    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
+    if (
+        rows.partials.dtype != torch.float32
+        or not rows.partials.is_contiguous()
+        or rows.row_scales.shape != (num_tokens,)
+        or rows.col_scales.shape != (columns,)
+        or rows.row_scales.dtype != torch.float32
+        or rows.col_scales.dtype != torch.float32
+        or columns % head_dim
+        or columns // head_dim < num_q_heads + 2 * num_kv_heads
+        or cache.slots.numel() > num_tokens
+    ):
+        raise ValueError(
+            "gqa_prologue_split_k takes contiguous FP32 [split_k, tokens, columns] "
+            "partials, FP32 row and column scales, whole query/key/value/gate "
+            "heads and at most one cache slot per row"
+        )
+    if query_dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(
+            f"gqa_prologue_split_k returns BF16 or FP8 queries, not {query_dtype}"
+        )
+    traits = {
+        "head_dim": head_dim,
+        "token_heads": num_tokens * num_q_heads,
+        "has_norm": norm is not None,
+        "relative_norm": False,
+        "kv_conv": "none",
+        "kv_format": cache.format.value,
+        "kv_convert": cache.format is KVCacheFormat.NATIVE
+        and cache.k_cache.dtype is not torch.bfloat16,
+        "mrope": rotary is not None and rotary.positions.ndim == 2,
+        "partial_rotary": rotary is not None and rotary.rotary_dim != head_dim,
+        "return_kv": False,
+        "rope_style": "none" if rotary is None else rotary.style.value,
+        "split_k": split_k,
+    }
+    features = (
+        frozenset({"materialized_qk_norm"})
+        if norm is not None and norm.round_before_rope
+        else frozenset()
+    )
+    kernel = _select(
+        "gqa_prologue",
+        torch.float32,
+        tuple(traits.items()),
+        features,
+        solution,
+        override,
+    )
+    shape_params = {
+        "num_tokens": num_tokens,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+    }
+    ShapeCapture.get().record(
+        "attention", "gqa_prologue", kernel.name, torch.float32, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "gqa_prologue",
+        torch.float32,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            rows=rows,
+            num_q_heads=num_q_heads,
+            norm=norm,
+            rotary=rotary,
+            cache=cache,
+            query_dtype=query_dtype,
         )
 
 
@@ -429,7 +545,10 @@ __all__ = [
     "RelativeHeadNorm",
     "RopeStyle",
     "Rotary",
+    "SPLIT_K_PARTS",
+    "SplitKQKVG",
     "gqa_prologue",
+    "gqa_prologue_split_k",
     "latent_store",
     "mla_prologue",
     "qk_norm_rope",

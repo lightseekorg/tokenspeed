@@ -86,6 +86,7 @@ __all__ = [
     "bmm",
     "mm",
     "mm_activation_scale_layout",
+    "mm_split_k_partials",
     "plan_dense_gemm",
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
@@ -148,6 +149,7 @@ __all__ = [
     "prepare_mxfp4_linear",
     "mm",
     "prepare_fp8_channel_weight",
+    "SplitKPartials",
     "prepare_mxfp8_weight_scales",
     "prepare_nvfp4_a16_weights",
 ]
@@ -696,6 +698,49 @@ def mm_activation_scale_layout(
         "gemm", "mm", signature, traits=traits, solution=solution, override=override
     )
     return "mn_major" if _reads_mn_major_scales(kernel.name) else "k_major"
+
+
+def mm_split_k_partials(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    A_scales: torch.Tensor,
+    B_scales: torch.Tensor,
+) -> SplitKPartials | None:
+    """Run a scaled FP8 ``mm`` up to, not including, its split-K reduction.
+
+    For a consumer that finishes the reduction itself in another launch it
+    already makes. Kernels serve only problems whose reduction order the
+    consumer reproduces, so the result's bits match ``mm``'s.
+
+    Args:
+        A: ``[M, K]`` FP8 E4M3 activation rows.
+        B: ``[K, N]`` FP8 E4M3 weight (a transposed ``[N, K]``).
+        A_scales: FP32 per-row scales ``[M]``.
+        B_scales: FP32 per-channel scales ``[N]``.
+
+    Returns:
+        The :class:`SplitKPartials`, or None when no kernel serves the
+        problem; the caller then runs ``mm``.
+    """
+    M, K = A.shape
+    N = B.shape[-1]
+    traits: dict[str, object] = {
+        "m": M,
+        "n": N,
+        "k": K,
+        "b_layout": "KN",
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "b_inner_stride_one": B.stride(-1) == 1,
+    }
+    signature = _gemm_format_signature(
+        A, B, A_scales, B_scales, torch.bfloat16, "fp8", None
+    )
+    try:
+        kernel = select_kernel("gemm", "mm_split_k_partials", signature, traits=traits)
+    except NoKernelFoundError:
+        return None
+    return kernel(A, B, A_scales, B_scales)
 
 
 def prepare_fp8_channel_weight(
@@ -4385,6 +4430,9 @@ import tokenspeed_kernel.ops.gemm.triton_fp8_channel  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton_fp8_channel_splitk  # noqa: E402,F401
 from tokenspeed_kernel.thirdparty.sglang.fp8_small_m_gemm import (  # noqa: E402
     quantize_weight_fp8_channel,
+)
+from tokenspeed_kernel.ops.gemm.triton_fp8_channel_splitk import (  # noqa: E402
+    SplitKPartials,
 )
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: E402,F401
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm  # noqa: E402

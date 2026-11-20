@@ -31,7 +31,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.attention.prologue import SPLIT_K_PARTS, SplitKQKVG
 from tokenspeed_kernel.ops.gemm import (
+    SplitKPartials,
     fp32_router_gemv_counters,
     fp32_router_gemv_execute,
     fp32_router_gemv_execute_with_mm,
@@ -39,6 +41,7 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_process_weight,
     fp32_router_gemv_with_mm_supported,
     mm,
+    mm_split_k_partials,
     mv,
     mv_weightless_rmsnorm_gated_sigmoid,
     mv_weightless_rmsnorm_gated_sigmoid_supported,
@@ -280,6 +283,53 @@ class _DenseFp8Weight:
             and self.weight is not None
             and _DENSE_FP8_MIN_ROWS <= rows <= self.max_rows
         )
+
+    def project_partials(
+        self, x_fp8: tuple[torch.Tensor, torch.Tensor]
+    ) -> SplitKPartials | None:
+        """``project`` of the FP8 rows ``x_fp8`` stopped before its split-K
+        reduction, for a consumer that finishes it, or None when no kernel
+        serves the problem (``mm_split_k_partials``)."""
+        rows, scales = x_fp8
+        return mm_split_k_partials(
+            rows, self.weight.t(), A_scales=scales, B_scales=self.scale
+        )
+
+    def project_split_k(
+        self,
+        x: torch.Tensor,
+        x_fp8: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> SplitKQKVG | None:
+        """``x @ weight^T`` as the split-K GEMM's unreduced partials and scales,
+        for a consumer that reduces them as the GEMM would (the GQA prologue).
+        Every row count of the window splits K into a count the prologue
+        reduces (``SPLIT_K_PARTS``), checked at load
+        (``check_split_k_consumer``)."""
+        partials = self.project_partials(
+            x_fp8 if x_fp8 is not None else _quantize_rows_fp8(x)
+        )
+        return SplitKQKVG(partials.partials, partials.row_scales, partials.col_scales)
+
+    def check_split_k_consumer(self) -> None:
+        """Refuse, at load, a window row count whose split-K GEMM splits K into
+        a count the GQA prologue does not reduce (``SPLIT_K_PARTS``), or has no
+        partials kernel. A tuned entry holds one split count per row tile, so
+        one row count per tile checks them all."""
+        if self.weight is None:
+            return
+        n, k = self.weight.shape
+        for rows in _DENSE_FP8_PROBE_ROWS:
+            if rows > self.max_rows:
+                continue
+            x = torch.zeros(rows, k, dtype=torch.bfloat16, device=self.weight.device)
+            partials = self.project_partials(_quantize_rows_fp8(x))
+            parts = None if partials is None else partials.partials.shape[0]
+            if parts not in SPLIT_K_PARTS:
+                raise ValueError(
+                    f"--dense-fp8-small-m: the {self.name} projection [{n}, {k}] "
+                    f"at {rows} rows splits K into {parts} slices; the split-K "
+                    f"attention prologue reduces {sorted(SPLIT_K_PARTS)}"
+                )
 
     def project(
         self,
@@ -879,8 +929,10 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
         )
 
     def prepare_fp8_weight(self) -> None:
-        """Make the local weight's FP8 copy from the loaded weight."""
+        """Make the local weight's FP8 copy from the loaded weight; its decode
+        rows go to the split-K attention prologue, so check it reduces them."""
         self.dense_fp8.prepare(self._local_weight().data)
+        self.dense_fp8.check_split_k_consumer()
 
     def forward_rows(
         self,
@@ -896,6 +948,20 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
         if self.dense_fp8.applies(input_.shape[0], decode=decode):
             return self.dense_fp8.project(input_, input_fp8, None)
         return self(input_)[0]
+
+    def forward_rows_split_k(
+        self,
+        input_: torch.Tensor,
+        input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        decode: bool,
+    ) -> SplitKQKVG | None:
+        """:meth:`forward_rows`' projection as split-K partials for
+        ``PagedAttention.prologue_split_k``, where its FP8 path runs with a
+        split count the prologue reduces; else None (call :meth:`forward_rows`)."""
+        if not self.dense_fp8.applies(input_.shape[0], decode=decode):
+            return None
+        return self.dense_fp8.project_split_k(input_, input_fp8)
 
     def _local_weight(self) -> torch.Tensor:
         if not self.replicate_for_owned_rows:
@@ -1293,12 +1359,28 @@ class MuseSparkAttention(nn.Module):
             elif normalized.shape[0] == 0:
                 return normalized.new_empty((0, self.hidden_size)), None, 1
             else:
-                qkv_gate = self.qkv_proj.forward_rows(
+                split = self.qkv_proj.forward_rows_split_k(
                     normalized, normalized_fp8, decode=ctx.forward_mode.is_decode()
                 )
-            q, k, v, output_gate = qkv_gate.split(
-                (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
-            )
+                qkv_gate = (
+                    self.qkv_proj.forward_rows(
+                        normalized, normalized_fp8, decode=ctx.forward_mode.is_decode()
+                    )
+                    if split is None
+                    else None
+                )
+            if qkv_gate is None:
+                # The FP8 projection's partials go to the prologue unreduced;
+                # it reduces them as the GEMM would and returns the gate heads.
+                prepared = self.attn.prologue_split_k(
+                    split, self.num_heads, positions, ctx
+                )
+                q, output_gate = prepared.q, prepared.gate
+                k = v = None
+            else:
+                q, k, v, output_gate = qkv_gate.split(
+                    (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
+                )
             # Attention gates its own output (in the decode kernel's store
             # where it can); a single row keeps it for the output GEMV below.
             gated = q.shape[0] > 1
@@ -1379,13 +1461,20 @@ class MuseSparkAttention(nn.Module):
         can_sliding_attention_boundary. ``normalized_fp8`` is the rows' per-row
         FP8 copy from their producer, or None.
         """
-        qkv_gate = self.qkv_proj.forward_rows(
+        split = self.qkv_proj.forward_rows_split_k(
             normalized, normalized_fp8, decode=ctx.forward_mode.is_decode()
         )
-        q, k, v, output_gate = qkv_gate.split(
-            (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
-        )
-        prepared = self.attn.prologue(q, k, v, positions, ctx)
+        if split is None:
+            qkv_gate = self.qkv_proj.forward_rows(
+                normalized, normalized_fp8, decode=ctx.forward_mode.is_decode()
+            )
+            q, k, v, output_gate = qkv_gate.split(
+                (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
+            )
+            prepared = self.attn.prologue(q, k, v, positions, ctx)
+        else:
+            prepared = self.attn.prologue_split_k(split, self.num_heads, positions, ctx)
+            output_gate = prepared.gate
         return iris.sliding_attention_boundary(
             prepared.q.view(-1, self.num_heads, self.head_dim),
             cache.k_cache,
@@ -2232,9 +2321,21 @@ class MuseSparkMoE(nn.Module):
             # limit, leaves the router and this rank's pre-expert columns a
             # launch each.
             router_logits = self.gate(router_input, pdl_enabled())
-            projection._project_local(
-                hidden_states, local, hidden_states_fp8, decode=decode
-            )
+            partials = None
+            if fp8:
+                # The gather finishes the split-K GEMM itself where a kernel
+                # serves its partials, saving the reduction launch.
+                if hidden_states_fp8 is None:
+                    hidden_states_fp8 = _quantize_rows_fp8(hidden_states)
+                partials = projection.dense_fp8.project_partials(hidden_states_fp8)
+            if partials is not None and iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
+                partials, norm.weight, bias, self.topk
+            ):
+                local = partials
+            else:
+                projection._project_local(
+                    hidden_states, local, hidden_states_fp8, decode=decode
+                )
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,

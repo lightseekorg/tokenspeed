@@ -837,10 +837,22 @@ def _muse_fp8_decode_routing_worker(rank, world_size, device):
     for rows, takes in ((16, False), (17, True), (172, True), (173, False)):
         assert moe.takes_fp8_input(rows, decode=True) == takes, rows
         assert not moe.takes_fp8_input(rows, decode=False), rows
+    from tokenspeed_kernel.ops.gemm import SplitKPartials
+
     for rows in (16, 17, 64, 128, 129, 172, 173):
         torch.manual_seed(rows)
         hidden = torch.randn(rows, 8192, device=device).bfloat16()
         router_input = hidden.float()
+        if 17 <= rows <= module._GATHER_MXFP4_FP8_MAX_ROWS:
+            # This shape's partials are served and gathered, so the fused
+            # route finishes the GEMM in the gather.
+            partials = projection.dense_fp8.project_partials(
+                module._quantize_rows_fp8(hidden)
+            )
+            assert isinstance(partials, SplitKPartials)
+            assert moe.iris_state.can_all_gather_rmsnorm_mxfp4_quant_topk(
+                partials, norm.weight, moe.gate.e_score_correction_bias, moe.topk
+            ), rows
         fused = moe._route_and_quantize_inputs(hidden, router_input, None, decode=True)
         assert fused is not None, rows
         _, (packed, scales), logits, weights, ids = (

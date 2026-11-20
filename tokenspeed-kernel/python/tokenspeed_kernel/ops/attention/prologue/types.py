@@ -31,6 +31,9 @@ import torch
 
 BOOLS = frozenset({True, False})
 ROPE_STYLES = frozenset({"none", "neox", "gptj"})
+# Split counts of a SplitKQKVG the split-K GQA prologue reduces; it spells out
+# _sum_scaled's order for each (tests compare the bytes).
+SPLIT_K_PARTS = frozenset({1, 2, 4})
 # A K/V short convolution's batch: none, decode/verify, or extend.
 KV_CONVS = frozenset({"none", "decode", "extend"})
 # Head widths the CUDA embedding.rope kernel serves.
@@ -336,6 +339,28 @@ class MLAExpandedKV:
 
 
 @dataclass(frozen=True)
+class SplitKQKVG:
+    """A split-K FP8 projection's unreduced output, for ``gqa_prologue_split_k``.
+
+    The projection ``x @ W^T`` of ``num_tokens`` rows, columns laid out as the
+    query heads, the key heads, the value heads, then the output-gate heads
+    (``q_heads + 2 * kv_heads + gate_heads`` heads of ``head_dim``), held as
+    ``split_k`` FP32 partial sums of slices of K with the per-row and
+    per-column FP32 scales still to apply (``triton_mm_fp8_channel_splitk``'s
+    partials before its ``_sum_scaled``).
+
+    Attributes:
+        partials: ``[split_k, num_tokens, columns]`` FP32, contiguous.
+        row_scales: ``[num_tokens]`` FP32 activation scales.
+        col_scales: ``[columns]`` FP32 weight scales.
+    """
+
+    partials: torch.Tensor
+    row_scales: torch.Tensor
+    col_scales: torch.Tensor
+
+
+@dataclass(frozen=True)
 class GQAPrologueOutput:
     """Inputs for GQA core attention.
 
@@ -345,12 +370,15 @@ class GQAPrologueOutput:
         v: Value rows when requested, else ``None``.
         rel_logits: ``[num_tokens, num_q_heads, extent]`` relative logits
             under a ``RelativeHeadNorm``, else ``None``.
+        gate: The output-gate heads ``[num_tokens, gate_heads * head_dim]``
+            of a ``SplitKQKVG`` input, else ``None``.
     """
 
     q: torch.Tensor
     k: torch.Tensor | None
     v: torch.Tensor | None
     rel_logits: torch.Tensor | None = None
+    gate: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
