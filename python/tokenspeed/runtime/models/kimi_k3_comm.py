@@ -508,6 +508,80 @@ class K3AttnComm:
         )
         return (residual if delta is None else residual + delta), None
 
+    def gated_projection_reduce_available(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
+        combine: tuple | None,
+        mlp_wp: torch.Tensor | None,
+    ) -> bool:
+        """Whether ``gated_projection_reduce`` can replace a KDA layer's gated
+        o-projection GEMV and the ``attn_reduce`` of its output.
+
+        Only where ``attn_reduce`` would take the Iris AttnRes combine.
+        """
+        if combine is None or prefix_sum is None or x.ndim != 2:
+            return False
+        num_tokens = x.shape[0]
+        fusion_max_tokens = global_server_args_dict["comm_fusion_max_num_tokens"]
+        if (
+            num_tokens == 0
+            or prefix_sum.shape[0] != num_tokens
+            or attn_ar_eligible(
+                armed=self.cute_ar is not None,
+                has_prefix=True,
+                num_tokens=num_tokens,
+                fusion_max_tokens=fusion_max_tokens,
+            )
+            or (self.attn_ar_fusion_ok and num_tokens <= fusion_max_tokens)
+        ):
+            return False
+        scratch, _, _, out_norm_w, _ = combine
+        return (
+            out_norm_w is not None
+            and self.fused_attnres_reduce_available(
+                prefix_sum, prefix_sum, combine, mlp_wp
+            )
+            and self.iris_state.attnres_projection_supported(
+                x, gate, norm_weight, weight, prefix_sum, mlp_wp, out_norm_w, scratch
+            )
+        )
+
+    def gated_projection_reduce(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        norm_eps: float,
+        prefix_sum: torch.Tensor,
+        combine: tuple,
+        mlp_wp: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``attn_reduce`` of ``mv_rmsnorm_gated_sigmoid(x, gate, norm_weight,
+        weight)``'s rows in one launch, where
+        ``gated_projection_reduce_available`` holds.
+
+        Returns ``(residual, hidden)``; the residual matches bit for bit.
+        """
+        scratch, _, _, out_norm_w, eps = combine
+        h, residual_out = self.iris_state.attnres_projection_combine(
+            x,
+            gate,
+            norm_weight,
+            weight,
+            prefix_sum,
+            mlp_wp,
+            out_norm_w,
+            scratch,
+            norm_eps=norm_eps,
+            eps=eps,
+        )
+        return residual_out, h
+
 
 class K3MoeTailComm:
     """Combine routed and shared expert outputs over 4, 8, or 16 MoE ranks.
@@ -767,8 +841,31 @@ class K3MoeTailComm:
         return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
 
 
+def draft_all_reduce(hidden_states: torch.Tensor, tp_group) -> torch.Tensor:
+    """Sum a draft layer's row-parallel ``[rows, hidden]`` output across
+    ``tp_group``.
+
+    Rows within the target's Lamport windows reduce through its prepared
+    Iris state, which target and draft share in stream order; other widths,
+    groups without a K3 target, and the deterministic-collective modes take
+    the ordinary all-reduce.
+    """
+    state = K3AttnComm.iris_states.get(tp_group)
+    if (
+        state is not None
+        and hidden_states.shape[0] > 0
+        and not global_server_args_dict.get("force_deterministic_rsag", False)
+        and not global_server_args_dict.get("batch_invariant_collectives", False)
+    ):
+        reduced = state.reduce_attention(hidden_states)
+        if reduced is not None:
+            return reduced
+    return all_reduce(hidden_states, tp_group)
+
+
 __all__ = [
     "K3_SHARED_RS_MAX_TOKENS",
     "K3AttnComm",
     "K3MoeTailComm",
+    "draft_all_reduce",
 ]

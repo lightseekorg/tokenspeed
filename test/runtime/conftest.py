@@ -32,6 +32,8 @@ def kimi_recipe(
     text_config=None,
     tp_size: int = 8,
     draft_layers: int = 0,
+    draft_attn: str = "mla",
+    draft_window: int | None = None,
     pd_enabled: bool = False,
     max_bs: int = 1,
     max_scheduled_tokens: int = 128,
@@ -58,6 +60,7 @@ def kimi_recipe(
     from tokenspeed.runtime.layers.attention.configs.linear_attn import (
         LinearAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         KimiK3Recipe,
@@ -117,16 +120,34 @@ def kimi_recipe(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         components=(target_softmax, linear_attn),
     )
-    # The real K3 draft is BF16 MLA over the FP8 target arena.
-    draft_attn_config = (
-        dataclasses.replace(
+    # The real K3 drafts are BF16 over the FP8 target arena: MLA (Inferact
+    # DSpark preview) or a GQA block draft (speculators DSpark, 96 query and
+    # 16 KV heads of 64), whose pages the K3 plan lays out at its own P=128.
+    if not draft_layers:
+        draft_attn_config = None
+    elif draft_attn == "mla":
+        draft_attn_config = dataclasses.replace(
             attn_config,
             kv_cache_dtype=torch.bfloat16,
             components=(mla, linear_attn),
         )
-        if draft_layers
-        else None
-    )
+    elif draft_attn == "mha":
+        gqa = MHAConfig(
+            backend_name="mha",
+            num_attention_heads=96,
+            num_kv_heads=16,
+            head_dim=64,
+            attn_tp_size=tp_size,
+        )
+        draft_attn_config = dataclasses.replace(
+            attn_config,
+            kv_cache_dtype=torch.bfloat16,
+            is_draft=True,
+            draft_block_decode=True,
+            components=(gqa,),
+        )
+    else:
+        raise ValueError(f"unknown draft_attn {draft_attn!r}")
     return KimiK3Recipe(
         server_args=SimpleNamespace(
             kv_offload_config=None,
@@ -141,7 +162,21 @@ def kimi_recipe(
         model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,
         draft_model_config=(
-            SimpleNamespace(num_attention_layers=draft_layers) if draft_layers else None
+            SimpleNamespace(
+                num_attention_layers=draft_layers,
+                # Every draft layer slides over this HF window (speculators
+                # DSpark: 2048).
+                hf_config=(
+                    SimpleNamespace(
+                        layer_types=["sliding_attention"] * draft_layers,
+                        sliding_window=draft_window,
+                    )
+                    if draft_window is not None
+                    else None
+                ),
+            )
+            if draft_layers
+            else None
         ),
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=1 << 34,

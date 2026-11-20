@@ -81,6 +81,7 @@ def _decode_tables_kernel(
     actual_bs,
     tokens_per_req,
     RATIOS: tl.constexpr,
+    ATOM_PAGES: tl.constexpr,
     PAGES: tl.constexpr,
     PAGE_SIZES: tl.constexpr,
     FLOORS: tl.constexpr,
@@ -103,8 +104,8 @@ def _decode_tables_kernel(
                 & (raw_col < group_buffers.columns)
                 & (col < PAGES[g]),
                 other=0,
-            )
-            page = tl.where(raw > 0, raw * RATIOS[g] + col % RATIOS[g], 0)
+            ).to(tl.int64)
+            page = tl.where(raw > 0, raw * ATOM_PAGES[g] + col % RATIOS[g], 0)
             tl.store(
                 tables + g * group_stride.to(tl.int64) + row * table_stride + col,
                 page,
@@ -141,7 +142,7 @@ def _decode_tables_kernel(
                         & (block < group_buffers.columns),
                         other=0,
                     ).to(tl.int64)
-                    window_page = window_raw * RATIOS[g] + index % RATIOS[g]
+                    window_page = window_raw * ATOM_PAGES[g] + index % RATIOS[g]
                     loc = tl.where(
                         window_raw > 0,
                         window_page * PAGE_SIZES[g] + pos % PAGE_SIZES[g],
@@ -166,6 +167,7 @@ def prepare_decode_tables(
     actual_bs: int,
     tokens_per_req: int,
     ratios: tuple[int, ...],
+    atom_pages_per_block: tuple[int, ...],
     pages: tuple[int, ...],
     page_sizes: tuple[int, ...],
     targets: tuple[tuple[torch.Tensor, torch.Tensor, int] | None, ...],
@@ -175,8 +177,10 @@ def prepare_decode_tables(
     ``sources`` contains 2-D int32 scheduler tables in group order. ``tables``
     is the group's stacked int32 destination; ``locations`` stores the trailing
     ``tokens_per_req`` write slots per request. ``lengths`` defines the padded
-    batch. Only ``actual_bs`` source rows are live. ``ratios``, ``pages`` and
-    ``page_sizes`` are model-static geometry. Each target is None or a disjoint
+    batch. Only ``actual_bs`` source rows are live. ``ratios`` counts logical
+    subpages; ``atom_pages_per_block`` gives their physical spacing, including
+    FlatKV padding. Both, ``pages`` and ``page_sizes`` are model-static geometry.
+    Each target is None or a disjoint
     (length buffer, page table, length floor) tuple owned by its leaf. Destinations
     must not alias live sources or each other. Length floors <= 1 preserve the input.
     Non-CUDA tensors use the Torch reference; GPU implementations use the registry.
@@ -194,6 +198,7 @@ def prepare_decode_tables(
             actual_bs,
             tokens_per_req,
             ratios,
+            atom_pages_per_block,
             pages,
             page_sizes,
             targets,
@@ -212,6 +217,7 @@ def prepare_decode_tables(
         actual_bs,
         tokens_per_req,
         ratios,
+        atom_pages_per_block,
         pages,
         page_sizes,
         targets,
@@ -235,6 +241,7 @@ def triton_prepare_decode_tables(
     actual_bs,
     tokens_per_req,
     ratios,
+    atom_pages_per_block,
     pages,
     page_sizes,
     targets,
@@ -268,6 +275,7 @@ def triton_prepare_decode_tables(
         actual_bs,
         tokens_per_req,
         RATIOS=ratios,
+        ATOM_PAGES=atom_pages_per_block,
         PAGES=pages,
         PAGE_SIZES=page_sizes,
         FLOORS=tuple(t[2] if t is not None else 1 for t in targets),

@@ -101,6 +101,11 @@ The upstream implementation at
 contains both behaviors and can be built against the deployment's CUDA toolkit.
 Record the exact source and wheel hashes when using a local build.
 
+With the native CUDA allocator, TokenSpeed temporarily disables expandable
+segments in memory-saver allocation, graph capture, pause, and resume scopes.
+Other allocations can still use expandable segments. PyTorch's setting is
+process-wide, so other CUDA allocation threads must be idle during these scopes.
+
 When CUDA graphs operate on remapped storage, set `NCCL_GRAPH_REGISTER=0` before
 launch so NCCL does not retain graph registrations across remapping. This does
 not suspend NCCL or release its communication buffers.

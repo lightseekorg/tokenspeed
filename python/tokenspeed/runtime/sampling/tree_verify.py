@@ -26,7 +26,12 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["DraftTreeQ", "TreeVerifyBatch", "accepted_path_rows"]
+__all__ = [
+    "DraftTreeQ",
+    "TreeVerifyBatch",
+    "accepted_path_rows",
+    "packed_accepted_path_rows",
+]
 
 
 @dataclass(frozen=True)
@@ -103,3 +108,21 @@ def accepted_path_rows(path: torch.Tensor) -> torch.Tensor:
     nodes = torch.arange(n, device=path.device)
     local = torch.where(path >= 0, path, nodes)
     return (local + torch.arange(bs, device=path.device)[:, None] * n).view(-1)
+
+
+def packed_accepted_path_rows(
+    accept_index: torch.Tensor, query_start_loc: torch.Tensor
+) -> torch.Tensor:
+    """Maps flat chain-verifier acceptance indices to packed target rows.
+
+    ``accept_index[b, i]`` is ``b * width + column`` for an emitted token and
+    ``-1`` past the accepted length. Unused predictions score against the
+    request's anchor row; accept lengths exclude them from the output.
+    """
+    bs, n = accept_index.shape
+    if query_start_loc.shape != (bs + 1,):
+        raise ValueError("packed accepted paths require one CSR bound per request")
+    flat = accept_index.long()
+    request_base = torch.arange(bs, device=flat.device)[:, None] * n
+    columns = torch.where(flat >= 0, flat - request_base, 0)
+    return (query_start_loc[:-1, None] + columns).view(-1)

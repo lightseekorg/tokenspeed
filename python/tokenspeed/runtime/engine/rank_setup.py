@@ -23,7 +23,7 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_engine.scheduler import SchedulerConfig, StorageConfig
+from tokenspeed_engine.scheduler import PeerConfig, SchedulerConfig, StorageConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -260,6 +260,7 @@ def scheduler_config_from_args(
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
+    peer_config: PeerConfig | None,
 ):
     """Build scheduler config from Device facts and separate Host-storage limits.
 
@@ -276,16 +277,27 @@ def scheduler_config_from_args(
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
+        peer_config: Peer prefix sharing's limits (``cache/peer.py``), or
+            None without peer sharing.
     """
+    # Both explicit batching policy and allocated device workspace constrain the
+    # same summed-page budget. Decode capacity remains the cache arena's limit.
+    prefill_limits = [
+        limit
+        for limit in (
+            server_args.chunk_prefill_kv_size,
+            specs.cache_storage.get("prefill_kv_capacity", 0),
+        )
+        if limit
+    ]
+    prefill_kv_rows = min(prefill_limits) if prefill_limits else 0
     geometry = specs.cache_geometry
     has_l3 = server_args.kvstore_storage_backend is not None
-    return make_config(
+    config = make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
         max_kv_page_num=(
-            0
-            if server_args.chunk_prefill_kv_size is None
-            else (server_args.chunk_prefill_kv_size + geometry.prefix_granularity - 1)
+            (prefill_kv_rows + geometry.prefix_granularity - 1)
             // geometry.prefix_granularity
         ),
         max_batch_size=max_batch_size,
@@ -300,6 +312,7 @@ def scheduler_config_from_args(
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
         host_write_policy=server_args.kvstore_write_policy,
+        decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
@@ -324,3 +337,5 @@ def scheduler_config_from_args(
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
         prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )
+    config.peer_config = peer_config
+    return config

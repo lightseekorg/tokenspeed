@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
         IrisPullExchange,
     )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
@@ -61,6 +62,7 @@ class IrisBackend(CommBackend):
         self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._ordinary_all_reduces: dict[Group, ProducerAllReduce] = {}
         self._pull_exchanges: dict[Group, IrisPullExchange] = {}
+        self._word_maxes: dict[Group, LamportWordMax] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -172,6 +174,31 @@ class IrisBackend(CommBackend):
         state.run(tensor)
         return True
 
+    def install_word_max(self, group: Group, state: "LamportWordMax") -> None:
+        """Bind a prepared word MAX without replacing captured mailboxes."""
+        previous = self._word_maxes.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris word max")
+        self._word_maxes[group] = state
+
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        state = self._word_maxes.get(group)
+        if (
+            state is None
+            or words.dtype != torch.int64
+            or words.dim() != 1
+            or not 0 < words.numel() <= state.max_rows
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.iris import iris_lamport_word_max
+
+        # Layout is fixed up locally; every rank still runs the same launch.
+        if words.is_contiguous():
+            iris_lamport_word_max(state, words, out=words)
+        else:
+            words.copy_(iris_lamport_word_max(state, words.contiguous()))
+        return True
+
     def _create(
         self,
         group: Group,
@@ -203,6 +230,13 @@ class IrisBackend(CommBackend):
                 self._producer_direct_max_bytes // dtype.itemsize,
             )
         return state
+
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        """Create the ordinary state without replacing model-prepared capacities."""
+        if len(group) <= 1 or not current_platform().is_amd or dtype != torch.bfloat16:
+            return False
+        self._get_or_create(group, dtype)
+        return True
 
     def prepare_all_reduce_buffers(
         self,

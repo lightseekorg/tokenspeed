@@ -23,6 +23,8 @@ to the SDK call.
 
 The Model Updater SDK is not a dependency: the adapter is exercised against a
 fake module installed in ``sys.modules`` under the configured import path.
+The host bootstrap test sends real ``ServerArgs`` over the control pipe to
+exercise the weight-update protocol check before device initialization.
 """
 
 from __future__ import annotations
@@ -918,6 +920,40 @@ def test_host_protocol_and_capability_agree_before_device_build(
             assert invoke() is built
             if role != "encode":
                 assert build.call_args.kwargs["replica_memory_transitions"] is expected
+
+
+@pytest.mark.parametrize("checked_startup", [False, True])
+@pytest.mark.parametrize("has_peer_outbox", [False, True])
+def test_host_bootstrap_requires_peer_outbox_for_peer_prefix_sharing(
+    monkeypatch, checked_startup, has_peer_outbox
+):
+    from tokenspeed.runtime.engine import rust_host
+
+    built = object()
+    build = mock.Mock(return_value=built)
+    monkeypatch.setattr(rust_host, "HostBootstrap", build)
+    args = ServerArgs(model="x", device="cuda", peer_prefix_port=7100)
+    peer_outbox = object() if has_peer_outbox else None
+    receiver, sender = Pipe(duplex=True)
+    with receiver, sender:
+        sender.send((args, None, None))
+        fd = os.dup(receiver.fileno())
+        if checked_startup:
+            capability, start = rust_host.prepare_bootstrap(
+                fd, validate_memory_protocol=True
+            )
+            assert not capability
+            build.assert_not_called()
+            invoke = lambda: start(None, 2, None, peer_outbox=peer_outbox)
+        else:
+            invoke = lambda: rust_host.bootstrap(fd, None, 2, peer_outbox=peer_outbox)
+        if has_peer_outbox:
+            assert invoke() is built
+            assert build.call_args.args[-1] is peer_outbox
+        else:
+            with pytest.raises(RuntimeError, match="--peer-prefix-port requires"):
+                invoke()
+            build.assert_not_called()
 
 
 @pytest.fixture(autouse=True)

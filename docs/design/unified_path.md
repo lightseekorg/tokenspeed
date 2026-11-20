@@ -20,6 +20,18 @@ path nothing exercised routinely.
 
 ## Invariants
 
+For models with reduce-scattered MoE input, the scheduler already supplies the
+live token count for every attention DP group. Before decode graph replay the
+runner intersects each fixed TP shard with its group's live prefix and copies
+the resulting EP source counts into the model's capture-time buffer. An idle
+DP group's shards all contribute zero rows. Models that publish these counts
+require globally padded decode graphs; startup rejects DP-local graphs because
+the scheduler does not publish peer graph capacities. Startup profiling uploads
+the selected packed tier's query count and restores the full capture metadata
+on exit. With CUDA memory saving enabled, the count vector lives in the
+CPU-backed `runtime_states` region so release/resume preserves its address and
+contents.
+
 ### Slot state belongs to an admission
 
 Persistent request-pool rows are reused across requests. Before a forward,
@@ -136,6 +148,31 @@ NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
 
+### Whole-graph draft overlap
+
+`TOKENSPEED_DRAFT_GRAPH_OVERLAP=1` opts into an external event inside the
+complete decode graph. The graph stays intact on a round stream. After the
+first draft step has saved the accepted frontier and candidate write indices,
+the event releases the execution stream for the verified-state commit, output
+copies and the next target metadata refresh. The next draft metadata refresh
+and model forward still wait for the entire previous round.
+
+The result fence covers both the graph tail and output copies, retaining the
+graph and its events until result retirement. The control plane cannot reclaim
+request slots or pages on the prefix event. A batch membership/slot change,
+extend or history reset joins before modifying request state; other device
+tasks use the existing `DeviceHandle.settle` boundary. Graph release drains
+the round before dropping captured resources.
+
+The opt-in requires NVIDIA decode graphs, an MTP greedy chain with at least
+two draft steps, DP1/PP1, disjoint target/draft cache layers and separate metadata
+owners. The draft model must declare `supports_draft_overlap`: after step one,
+its tail cannot depend on buffers changed by verified-state commit or next-target
+preparation. Model implementations, including subclasses, own this contract.
+Grammar, draft token history, expert-load recording and MegaMoE's shared row
+mask are rejected at startup. Eager, extend and idle execution retain their
+normal stream ordering.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 Request slot capacity is independent of forward batch capacity. PD decode
@@ -211,22 +248,44 @@ directly into persistent consumer buffers. Layers share this result within
 the forward; replay recomputes it from the live request inputs. Eager and Graph
 execution use this same path. This DSA-specific preparation retains the common
 DCP ownership semantics without changing the shared placement implementation.
-Prefill and decode shapes without a prepared fused projection use the same
-persistent metadata outputs. They exchange query and TopK candidates over the
+Decode shapes without a prepared fused projection use the same persistent
+metadata outputs. They exchange query and TopK candidates over the
 existing device group, then merge sparse-attention partials on the model stream.
 That path creates no auxiliary communicator or stream. The model adapter must
 pass ``fused=True`` after fused Prolog and ``fused=False`` after ordinary
 projections. A fused call without its packed query fails before selection;
 a live native error is never retried through the collective path. A model with
-fused decode prepared can still execute ordinary prefill or smaller decode
-buckets. Capturing collective buckets requires HCCL graph support and target
-device validation; eager or fused-only validation does not establish that.
+fused decode prepared can still execute its token-local Prefill path or smaller
+ordinary decode buckets. Capturing collective buckets requires HCCL graph support
+and target device validation; eager or fused-only validation does not establish
+that.
 
-The public ``AscendDSABackend.attention_kernels(is_prefill=...)`` hook returns
-the stage's SFA provider. Plugins may override it while preserving the
-``AscendDSAKernels`` tensor contracts and the common cache/CP metadata. Partial
-outputs use the shared DCP combine: zero empty-shard O before exchange, then
-normalize all-empty LSE rows before the native merge.
+Decode separates implementation choices, per-forward metadata and borrowed native
+resources. The backend selects Index-K storage, index selection and SFA/LSE
+callables through the `attention` registry once at construction. Its forward
+prepares owner-local metadata, commits Index-K unless the fused prologue already
+wrote it, selects indices, publishes cache completion and consumes local KV.
+The main KV write remains the prologue's responsibility. Decode exchanges queries,
+TopK candidates and attention partials; it never gathers the historical KV cache.
+The Ascend DSA model supports Indexer16/32. Indexer64 is rejected during model
+construction, before weight preparation or native resource allocation.
+
+Unified KVP workers retain full Prefill Q-B, K-C, V-C and output projections
+alongside the local Decode shards. Set both phase capabilities explicitly when
+constructing this model on a unified worker.
+
+Partial outputs use the shared DCP combine: zero empty-shard O
+before exchange, then normalize all-empty LSE rows before the native merge.
+
+Fused DSA projection outputs are ordinary PyTorch tensors allocated once by the
+model runtime, shared by its sequential layers. Each bucket has contiguous,
+address-stable query/index-query/score buffers; layer weights remain separate.
+Model-stream ordering protects reuse after each layer's final consumer. The
+runtime is prepared before cache memory profiling, so these allocations already
+reduce the available KV budget. They require no custom allocator or independent
+Tensor shutdown protocol. Native communication registrations and SFA producer
+views retain their explicit owner: teardown drains work and destroys referencing
+graphs before clearing backend bindings and releasing the native window.
 
 For ``T`` query rows and ``H`` global heads, the BF16 gathered query occupies
 ``T * H * 576 * 2`` bytes. Each FP32 partial-output buffer occupies
@@ -1329,7 +1388,7 @@ existing Gumbel/scalar-gather kernels. `_prepare_sampling_offsets` prepares it
 immediately before consumption, on the same stream, in eager execution and
 CUDA graph replay. The executor and graph runner own no sampling-position
 buffer and run no position-preparation prologue. Non-emitting prefill chunks,
-intermediate PP stages, greedy-only backends, and coin-based multi-token
+intermediate PP stages, greedy-only backends, and legacy multi-token
 verification do not prepare offsets they do not read.
 
 Preparation writes only the current call's unique positive request slots in
@@ -1346,10 +1405,12 @@ first target is at `frontier + 1`, regardless of candidate width. A chain adds
 its candidate index and a tree uses node depth. For example, a 2049-token prompt
 predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
-Constructing the base position does not implement MTP acceptance/residual RNG
-or domain separation; multi-token FlashInfer uses its existing coins except
-for sampled adaptive V4.1 DSpark, whose CuTe verifier keys each draw by request,
-position and draft/acceptance/rejection/bonus namespace.
+For a sampled MTP proposal, the drafter keys Gumbel noise by the committed
+frontier after the round and the draft step. This frontier includes the
+prefill input length or the accepted decode inputs. A prompt completed from
+a cached prefix therefore supplies the same position as a cold prefill.
+Sampled adaptive V4.1 DSpark uses its own CuTe verifier, which keys each draw
+by request, position, and its draft, acceptance, rejection, or bonus namespace.
 The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
 DFlash2 draft) keys its accept coins and draft noise by salted offsets
 disjoint from these positions. A row with a recorded draft q then emits an
@@ -1365,11 +1426,17 @@ Random-stream policy, verification geometry, and TP agreement are separate:
 * `per_request_stream` selects the position-keyed direct sampler for a window
   without draft candidates. `has_draft_candidates` describes the window, not a
   model family: wider windows still require acceptance and residual sampling.
-* `_prepare_step_hook` skips coin preparation only where no coins are consumed.
-  Wider per-request windows outside sampled adaptive V4.1 DSpark fall through
-  to `_refill_legacy_coins`; they do not yet have position-keyed accept/residual
-  randomness. That refill
-  owns only generator advancement and buffer writes, not sampler selection.
+* In a per-request FlashInfer chain outside sampled adaptive V4.1 DSpark,
+  `verify()` generates coins immediately before
+  rejection sampling, using the request seed, its first output position in
+  the round, and a distinct counter for each acceptance decision and one for
+  the final draw. The final coin is independent of the decisions that select
+  the rejection residual or the full target distribution for the bonus. A
+  later round starts at a new position, including when it proposes again at
+  a position from the discarded suffix.
+* The batch stream and tree verify use `_refill_legacy_coins` outside capture.
+  That refill owns only generator advancement and buffer writes, not sampler
+  selection.
 * Each selected sampling implementation declares `needs_tp_sync` locally.
   The common epilogue gathers DP-owned rows or broadcasts replicated TP outputs
   as required; it does not infer synchronization from random-stream policy or
@@ -1389,10 +1456,11 @@ changes relative to the old coin-based decode implementation. Logits must still 
 identical for this to imply token equality, and sampling parameters and any
 penalty/grammar state must also match.
 
-Multi-token FlashInfer speculative verification retains rejection sampling and
-its per-slot coin state; this change does not establish its invariance to cache
-hits or speculative scheduling. The `batch` sampling stream is also outside this
-position-based equality guarantee.
+Chain verification retains its distribution-preserving rejection algorithm.
+The fixed-seed replay comparison requires the same logical chain windows and
+identical target and draft scores, including when resuming from a retraction
+snapshot. Candidate generation itself can be schedule-dependent, such as when
+a DUMMY proposal includes the request slot in its arithmetic.
 
 `test_sampling_positions.py` exercises the metadata and slot-write contract
 on CPU and CUDA, including untouched slots and duplicate padding. `test_flashinfer_position_invariance.py` exercises real CUDA sampling,
@@ -2789,6 +2857,18 @@ Native full-width execution retains its original key. Buckets above the layout
 kernel's token bound retain only native full-width capture and replay.
 Packed verification refreshes decode_query_indptr and packed rows in persistent buffers before
 replay; V4.1 pointer-stable views are keyed by (bs, num_tokens).
+Grammar verify candidates are copied to pinned storage on the main stream before
+its fork event, so the side-stream host fill reads pre-packing tokens even when
+packed verification later rewrites `input_ids_buf` in place.
+The same packed row indices gather request-major xgrammar bitmask rows into
+target-logit order. Greedy and sampled FlashInfer verification apply those
+masks and support selected-token output logprobs, as does sampled prefill;
+cumulative output probabilities remain rejected at startup. Chain
+`accept_index` entries stay flat `request * width + column` values. Output
+logprob scoring subtracts the request base before adding the packed CSR start.
+A `-1` tail entry uses the request anchor and remains excluded by the accepted
+length. This mapping is required for requests after the first whenever the
+packed and fixed-width bases differ.
 After target forward, borrowed input storage and collective counts are restored.
 The context's input_num_tokens keeps the packed target extent until sampling and
 NaN checks consume the target outputs.

@@ -1374,6 +1374,11 @@ def test_dsa_topk_plan_spreads_only_small_decode_batches() -> None:
         plan(4, 65536, 2048, device, is_decode=True).block_n
         < plan(16, 65536, 2048, device, is_decode=True).block_n
     )
+    # One 8-row verify request takes the wide tiles too.
+    assert (
+        plan(8, 1 << 20, 2048, device, is_decode=True).block_n
+        == plan(16, 1 << 20, 2048, device, is_decode=True).block_n
+    )
     assert plan(64, 65536, 2048, device, is_decode=True).kind == "oneblock"
     assert plan(4, 65536, 2048, device, is_decode=False).kind != "multi-cta"
     assert plan(4, 2048, 2048, device, is_decode=True).kind == "trivial"

@@ -49,13 +49,12 @@ public:
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
     const std::string& CacheGroupId() const { return cache_group_id_; }
+    const std::string& PeerHolder() const { return peer_holder_; }
     std::span<const std::int32_t> SharedPrefixTokens() const { return shared_prefix_tokens_; }
     // The registration of its group/session owner under the access epoch that
     // its first admission returned: held for the request's whole life, which
     // every later admission, publication and restore under that epoch lies in.
-    void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
-        session_access_ = std::move(session_access);
-    }
+    void HoldSessionAccess(SessionAccess session_access) { session_access_ = std::move(session_access); }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -89,6 +88,13 @@ public:
     // on it spans every chunk.
     std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
     void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+
+    // P role, deferred decode allocation: a pd::DestinationReadyEvent
+    // arrived, so every Decode rank allocated the destination. Until then a
+    // computed prompt waits for it in PrefillAwaitingDestination instead of
+    // sending its KV.
+    bool DestinationReady() const { return destination_ready_; }
+    void MarkDestinationReady() { destination_ready_ = true; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
@@ -333,6 +339,9 @@ public:
             Overloaded{
                 [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [](const fsm::PrefillAwaitingResult& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillAwaitingDestination& state) {
+                    return state.ReserveNumTokensInNextScheduleEvent();
+                },
                 [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
@@ -344,22 +353,26 @@ public:
     }
 
     std::string StateName() const {
-        return std::visit(Overloaded{
-                              [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
-                              [](const fsm::Submitted&) -> std::string { return "Submitted"; },
-                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
-                              [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
-                              [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
-                              [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
-                              [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
-                              [](const fsm::Decoding&) -> std::string { return "Decoding"; },
-                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
-                              [](const fsm::Retracted&) -> std::string { return "Retracted"; },
-                              [](const fsm::Restoring&) -> std::string { return "Restoring"; },
-                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
-                              [](const fsm::Finished&) -> std::string { return "Finished"; },
-                          },
-                          state_);
+        return std::visit(
+            Overloaded{
+                [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
+                [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
+                [](const fsm::PeerLooking&) -> std::string { return "PeerLooking"; },
+                [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                [](const fsm::PeerLanding&) -> std::string { return "PeerLanding"; },
+                [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
+                [](const fsm::PrefillAwaitingDestination&) -> std::string { return "PrefillAwaitingDestination"; },
+                [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
+                [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
+                [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                [](const fsm::Finishing&) -> std::string { return "Finishing"; },
+                [](const fsm::Finished&) -> std::string { return "Finished"; },
+            },
+            state_);
     }
 
 private:
@@ -375,8 +388,9 @@ private:
     std::string id_;
     std::string session_id_;
     std::string cache_group_id_;
+    std::string peer_holder_;
     std::vector<std::int32_t> shared_prefix_tokens_;
-    CacheCoordinator::SessionAccess session_access_;
+    SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
@@ -386,6 +400,7 @@ private:
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
+    bool destination_ready_{false};
     std::int32_t prefix_granularity_{};
     std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
     std::vector<std::uint64_t> kv_event_block_hashes_;

@@ -228,5 +228,199 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     assert not torch.count_nonzero(draft_pool.kv_buffer[0])
 
 
+def test_kimi_k3_gqa_block_draft_kv_pages_join_the_full_attention_group() -> None:
+    """A GQA block draft's K/V pages sit in the MLA group's page-id space at
+    P=128, beside the target's latents, without changing the packing."""
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_arena,
+        create_cache_pool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import CachePoolSpec
+
+    text_config = KimiLinearConfig()
+    num_target_layers = text_config.num_hidden_layers
+    num_draft_layers = 5
+    _, _, target_only = kimi_tp8_layout()
+    recipe, groups, layout = kimi_tp8_layout(
+        draft_layers=num_draft_layers, draft_attn="mha"
+    )
+
+    assert layout.group_packing == target_only.group_packing
+    # One plane per MLA layer plus a K and a V plane per draft layer; the KDA
+    # state still rides inside the MLA planes.
+    assert (
+        len(layout.plane_bytes) == len(target_only.plane_bytes) + 2 * num_draft_layers
+    )
+    full_fields = {
+        field.field_id: field
+        for spec, fields in groups
+        if spec.group_id == FULL_ATTENTION
+        for field in fields
+    }
+    for layer_id in range(num_target_layers, num_target_layers + num_draft_layers):
+        for kind in ("k", "v"):
+            # P=128 pages of 16 KV heads / 8 ranks, head_dim 64.
+            assert full_fields[f"layer.{layer_id}.{kind}"].shape == (128, 2, 64)
+
+    plan = layout.bind(1)
+    merged_spec = CachePoolSpec(
+        family="kimi_k3",
+        memory_plan=plan,
+        layer_types=recipe.layer_types,
+        cache_group_specs=tuple(spec for spec, _ in groups),
+        token_capacity=128,
+    )
+    arena = create_cache_arena(merged_spec, device="cpu", enable_memory_saver=False)
+    target_pool = create_cache_pool(
+        merged_spec.layer_view(first_layer=0, num_layers=num_target_layers),
+        recipe.attn_config,
+        arena,
+        num_layers=num_target_layers,
+        rank=0,
+    )
+    draft_pool = create_cache_pool(
+        merged_spec.layer_view(
+            first_layer=num_target_layers, num_layers=num_draft_layers, family="mha"
+        ),
+        recipe.draft_attn_config,
+        arena,
+        num_layers=num_draft_layers,
+        rank=0,
+        field_layer_offset=num_target_layers,
+    )
+
+    assert type(draft_pool) is MHATokenToKVPool
+    assert draft_pool.arena.buffer is target_pool.arena.buffer
+    assert draft_pool.get_key_buffer(0).dtype == torch.bfloat16
+    target_layer = text_config.full_attention_layer_ids[0]
+    target_before = target_pool.kv_buffer[target_layer].clone()
+    draft_pool.get_key_buffer(0).fill_(1)
+    draft_pool.get_value_buffer(0).fill_(1)
+    assert torch.equal(target_pool.kv_buffer[target_layer], target_before)
+
+
+def _kvp8(recipe):
+    """``recipe`` with its target page-sharded over eight KVP ranks."""
+    from dataclasses import replace
+
+    config = recipe.attn_config
+    recipe.attn_config = replace(
+        config,
+        device="cuda",
+        kvp_size=8,
+        kvp_group=tuple(range(8)),
+        components=(
+            replace(config.components[0], backend_name="flashmla"),
+            *config.components[1:],
+        ),
+    )
+    return recipe
+
+
+def _pool_spec(recipe):
+    from test.runtime.conftest import kimi_layout
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import CachePoolSpec
+
+    groups, layout = kimi_layout(recipe)
+    return CachePoolSpec(
+        family="kimi_k3",
+        memory_plan=layout.bind(1),
+        layer_types=recipe.layer_types,
+        cache_group_specs=tuple(spec for spec, _ in groups),
+        token_capacity=128,
+    )
+
+
+def test_kimi_k3_sliding_gqa_block_draft_owns_an_unsharded_window_group() -> None:
+    """A GQA block draft whose every layer slides keeps its K/V pages in a
+    window group of its own, in the bytes it took inside the MLA group, and
+    KVP shards the MLA group but not that window."""
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        DRAFT_SLIDING_ATTENTION,
+    )
+
+    num_target_layers = KimiLinearConfig().num_hidden_layers
+    num_draft_layers = 5
+    _, _, shared = kimi_tp8_layout(draft_layers=num_draft_layers, draft_attn="mha")
+    recipe, groups, layout = kimi_tp8_layout(
+        draft_layers=num_draft_layers, draft_attn="mha", draft_window=2048
+    )
+
+    window = next(
+        spec for spec, _ in groups if spec.group_id == DRAFT_SLIDING_ATTENTION
+    )
+    assert window.attn_kind == "sliding_window"
+    assert window.sliding_window_tokens == 2048
+    assert not window.replayable
+    field_ids = {
+        spec.group_id: {field.field_id for field in fields} for spec, fields in groups
+    }
+    draft_field_ids = {
+        f"layer.{layer_id}.{kind}"
+        for layer_id in range(num_target_layers, num_target_layers + num_draft_layers)
+        for kind in ("k", "v")
+    }
+    assert field_ids[DRAFT_SLIDING_ATTENTION] == draft_field_ids
+    assert not field_ids[FULL_ATTENTION] & draft_field_ids
+    packing = dict(layout.group_packing)
+    assert packing[DRAFT_SLIDING_ATTENTION] == packing[FULL_ATTENTION]
+    # Plane ids number each group's own layers; the bytes are the same.
+    assert sorted(size for _, size in layout.plane_bytes) == sorted(
+        size for _, size in shared.plane_bytes
+    )
+    assert layout.lcm_block_bytes == shared.lcm_block_bytes
+
+    spec = _pool_spec(_kvp8(recipe))
+    shard_counts = {
+        group.group_id: group.shard_count for group in spec.cache_group_specs
+    }
+    assert shard_counts[FULL_ATTENTION] == 8
+    assert shard_counts[DRAFT_SLIDING_ATTENTION] == 1
+    registry._validate_hybrid_kvp_cache(
+        spec, kvp_size=8, num_target_layers=num_target_layers
+    )
+    registry._validate_unsharded_draft_storage(
+        spec, num_target_layers=num_target_layers
+    )
+
+    # Without a window the draft stays in the MLA group, which KVP shards.
+    shared_spec = _pool_spec(
+        _kvp8(kimi_recipe(draft_layers=num_draft_layers, draft_attn="mha"))
+    )
+    with pytest.raises(ValueError, match="page-shards cache group 'full_attention'"):
+        registry._validate_unsharded_draft_storage(
+            shared_spec, num_target_layers=num_target_layers
+        )
+
+
+def test_drafter_keeps_fused_kv_writes_for_an_unsharded_draft_group() -> None:
+    """Under KVP the fused context-KV scatter stays on when the draft's own
+    group is unsharded; it is asked before the layers' groups are bound."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+    def drafter(kvp_size: int, draft_group: str):
+        specs = (
+            SimpleNamespace(group_id="full_attention", shard_count=kvp_size),
+            SimpleNamespace(group_id="draft_sliding_attention", shard_count=1),
+        )
+        pool = SimpleNamespace(
+            arena=SimpleNamespace(cache_group_specs=specs),
+            history_group_by_layer=lambda: dict.fromkeys(range(5), draft_group),
+        )
+        runner = SimpleNamespace(
+            mapping=SimpleNamespace(attn=SimpleNamespace(kvp_size=kvp_size))
+        )
+        return SimpleNamespace(draft_model_runner=runner, token_to_kv_pool=pool)
+
+    assert not DFlash._draft_cache_page_sharded(drafter(8, "draft_sliding_attention"))
+    assert DFlash._draft_cache_page_sharded(drafter(8, "full_attention"))
+    assert not DFlash._draft_cache_page_sharded(drafter(1, "full_attention"))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -54,9 +54,12 @@ be absent or empty; earlier evidence is never overwritten.
 
 ### Run locally
 
-Prerequisites: a Rust toolchain, and the `tokenspeed-mooncake` wheel pinned
-in `python/pyproject.toml` (it ships `libmooncake_store.so` and
-`mooncake_master`). On Linux the wheel links CUDA 13 and RDMA user-space
+Prerequisites: a Rust toolchain, and the `tokenspeed-mooncake` wheel required
+by `python/pyproject.toml` (it ships `libmooncake_store.so`,
+`libmooncake_store_core.so`, and `mooncake_master`). The shared Store core
+lets the native L3 client coexist with Python Store clients, including an
+online weight-update SDK, without registering the Store flags twice.
+The default PyPI wheel links CUDA 13 and RDMA user-space
 libraries even for host-only TCP tests; the workflow's
 `Install Mooncake master runtime` step lists the exact packages.
 

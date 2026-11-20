@@ -47,6 +47,9 @@ public:
     SegmentedLocationIndex(std::int32_t packing, std::int32_t parents, T empty)
         : packing_{packing}, parents_{parents}, empty_{empty} {}
 
+    // Locations per LCM parent.
+    std::int32_t Packing() const noexcept { return packing_; }
+
     // The entry at `location`, or the empty value.
     T Find(CacheBlockLocation location) const noexcept {
         if (!valid(location)) return empty_;

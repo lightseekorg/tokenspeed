@@ -62,7 +62,7 @@ bool Scheduler::SharedPrefixStorageEnabled() const {
             return group.attn_kind == AttnKind::kState;
         }))
         return false;
-    return storage_transfers_ && coordinator_.HasHostPool() && config_.role != Role::kD &&
+    return storage_transfers_ && coordinator_.Host().HasPool() && config_.role != Role::kD &&
            !config_.disable_prefix_cache && storage_transfers_->Config().max_operations >= 2 &&
            storage_transfers_->Config().max_host_blocks >= 2;
 }
@@ -86,7 +86,7 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
                                 .hash = HashPrefixPage(input.last(tail_tokens),
                                                        hashes.empty() ? ContentHash{} : ContentHash{hashes.back()})}}
                           : std::nullopt;
-    const auto dependencies = coordinator_.SharedPrefixKeys(
+    const auto dependencies = coordinator_.Storage().SharedPrefixKeys(
         {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = tail},
         static_cast<std::size_t>(storage_transfers_->Config().metadata_entries));
     if (dependencies.max_tokens == 0)
@@ -178,14 +178,14 @@ void Scheduler::prepareStorage(Request& request) {
             expireStorage(request);
             return;
         }
-        CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
-                                              .tokens = request.TokenSlice(0, state->max_tokens),
-                                              .max_tokens = state->max_tokens,
-                                              .tail = state->tail,
-                                              .shared_prefix_tokens = request.SharedPrefixTokens()};
+        PromptPrefix prompt{.prefix_hashes = state->hashes,
+                            .tokens = request.TokenSlice(0, state->max_tokens),
+                            .max_tokens = state->max_tokens,
+                            .tail = state->tail,
+                            .shared_prefix_tokens = request.SharedPrefixTokens()};
         // Another request's D2H/GET may have fulfilled this dependency. This
         // bounded local check does not rehash the prompt while it waits.
-        const auto probe = coordinator_.ProbePromptPrefix(prompt);
+        const auto probe = coordinator_.Prober().ProbePromptPrefix(prompt);
         if (std::max(probe.device.num_common_tokens, probe.host.num_common_tokens) >= state->max_tokens) {
             spdlog::debug("[L3] rid={} op_id={} prefetch released: prefix available locally", request.Id(), operation);
             releaseStorage(request);
@@ -200,7 +200,7 @@ void Scheduler::prepareStorage(Request& request) {
             return;
         }
         if (!storage_transfers_->Completed(operation) || !storage_allowed_) return;
-        const auto hits = storage_transfers_->QueryHits(operation);
+        const auto hits = storage_transfers_->RecordQueryHits(operation);
         // The finished query retires before the GET starts: CanStart counts
         // its ticket.
         state->lease.reset();
@@ -244,14 +244,14 @@ void Scheduler::prepareStorage(Request& request) {
         }
     };
     const auto prompt = [&request, &hashes, &bound, &tail]() {
-        return CacheCoordinator::PromptPrefix{.prefix_hashes = hashes,
-                                              .tokens = request.TokenSlice(0, bound),
-                                              .max_tokens = bound,
-                                              .tail = tail,
-                                              .shared_prefix_tokens = request.SharedPrefixTokens()};
+        return PromptPrefix{.prefix_hashes = hashes,
+                            .tokens = request.TokenSlice(0, bound),
+                            .max_tokens = bound,
+                            .tail = tail,
+                            .shared_prefix_tokens = request.SharedPrefixTokens()};
     };
     setBound(max_tokens);
-    const auto probe = coordinator_.ProbePromptPrefix(prompt());
+    const auto probe = coordinator_.Prober().ProbePromptPrefix(prompt());
     const auto local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
     if (max_tokens - local < limits.min_prefetch_tokens) {
         spdlog::debug("[L3] rid={} missing_tokens={} below prefetch minimum={}", request.Id(), max_tokens - local,
@@ -262,7 +262,7 @@ void Scheduler::prepareStorage(Request& request) {
     setBound(static_cast<std::int32_t>(end));
     auto query_prompt = prompt();
     query_prompt.prepared_keys = probe.group_keys;
-    auto query = coordinator_.MissingStorageKeys(query_prompt, limits.max_keys_per_operation);
+    auto query = coordinator_.Storage().MissingStorageKeys(query_prompt, limits.max_keys_per_operation);
     setBound(query.max_tokens);
     auto keys = std::move(query.keys);
     auto key_tokens = std::move(query.key_tokens);

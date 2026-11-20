@@ -20,13 +20,56 @@
 
 """Map runtime allocation owners to shared pools and memory-saver lifecycle tags."""
 
+import os
+import re
 from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+from threading import RLock
 from typing import ClassVar
 
 import torch
+
+_allocator_lock = RLock()
+_allocator_env = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+@contextmanager
+def _non_expandable_allocation():
+    if (
+        torch.version.cuda is None
+        or torch.cuda.memory.get_allocator_backend() != "native"
+    ):
+        yield
+        return
+    # PyTorch's setting is process-wide. Serialize saver scopes at startup and
+    # during drained maintenance, when other CUDA allocators are idle.
+    with _allocator_lock:
+        settings = torch.cuda.memory._snapshot()["allocator_settings"]
+        config = settings["PYTORCH_CUDA_ALLOC_CONF"]
+        expandable = settings["expandable_segments"]
+        previous = {name: os.environ.get(name) for name in _allocator_env}
+        try:
+            if expandable:
+                torch.cuda.memory._set_allocator_settings(
+                    f"{config},expandable_segments:False"
+                )
+            for name, value in previous.items():
+                if value is not None:
+                    os.environ[name] = re.sub(
+                        r"(expandable_segments\s*:\s*)True\b", r"\g<1>False", value
+                    )
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is not None:
+                    os.environ[name] = value
+            if expandable:
+                # The last config string may omit the still-active setting.
+                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+                torch.cuda.memory._set_allocator_settings(config)
+
 
 _NAMED_REGION_POOLS = {
     "executor_inputs": "persistent_buffers",
@@ -107,7 +150,7 @@ class TorchMemorySaverAdapter(ABC):
         return _TorchMemorySaverAdapterReal
 
     @staticmethod
-    def create(enable: bool, *, device: str) -> "TorchMemorySaverAdapter":
+    def create(enable: bool, *, device: str = "cuda") -> "TorchMemorySaverAdapter":
         adapter = TorchMemorySaverAdapter.adapter_class(enable, device=device)
         if (
             adapter is _TorchMemorySaverAdapterReal
@@ -168,7 +211,9 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             return
         token = _active_buffer_pool.set(pool)
         try:
-            with pool.region(tag="weights", enable_cpu_backup=True):
+            with _non_expandable_allocation(), pool.region(
+                tag="weights", enable_cpu_backup=True
+            ):
                 yield
         finally:
             _active_buffer_pool.reset(token)
@@ -186,7 +231,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             pending: list[Callable[[], None]] = []
             token = _communication_initializers.set(pending)
             try:
-                with _primary_memory_saver.region(
+                with _non_expandable_allocation(), _primary_memory_saver.region(
                     tag=tag or "default", enable_cpu_backup=enable_cpu_backup
                 ):
                     yield
@@ -199,22 +244,33 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
 
         return active_region()
 
+    @contextmanager
     def cuda_graph(self, graph, *, pool, stream, tag: str):
+        """Back up graph RNG state before capturing discardable graph buffers."""
+        # PyTorch creates seed/offset storage when the generator is first
+        # registered, before graph capture enters its private allocator pool.
+        with self.named_region("runtime_states"):
+            graph.register_generator_state(
+                torch.cuda.default_generators[torch.cuda.current_device()]
+            )
         # Requires the library's preload hook mode, which configure_subprocess
         # sets up for the scheduler processes.
-        return _primary_memory_saver.cuda_graph(
+        with _non_expandable_allocation(), _primary_memory_saver.cuda_graph(
             cuda_graph=graph,
             pool=pool,
             stream=stream,
             tag=tag,
             enable_cpu_backup=False,
-        )
+        ):
+            yield
 
     def pause(self, tag: str | None = None):
-        return _primary_memory_saver.pause(tag=tag)
+        with _non_expandable_allocation():
+            return _primary_memory_saver.pause(tag=tag)
 
     def resume(self, tag: str | None = None):
-        return _primary_memory_saver.resume(tag=tag)
+        with _non_expandable_allocation():
+            return _primary_memory_saver.resume(tag=tag)
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):

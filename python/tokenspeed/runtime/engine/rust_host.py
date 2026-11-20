@@ -67,7 +67,15 @@ from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
-from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
+from tokenspeed.runtime.cache.peer import (
+    QUARANTINE_S,
+    RECORD_LIFETIME_S,
+    PeerSharingSettings,
+    peer_endpoint_name,
+    peer_incarnation,
+    peer_scheduler_config,
+)
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
@@ -145,7 +153,13 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
-from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
+from tokenspeed.runtime.pd.host_peer import (
+    build_host_peer,
+    enable_mooncake_ipv6_for_host,
+    kv_bootstrap_address,
+    mooncake_library,
+    mooncake_protocol,
+)
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
 from tokenspeed.runtime.plugins.registry import (
     TraceProvider,
@@ -163,7 +177,12 @@ from tokenspeed.runtime.utils.jit_compile_check import (
     install_jit_compile_check,
     mark_jit_compile_serving,
 )
-from tokenspeed.runtime.utils.network import get_ip, join_host_port
+from tokenspeed.runtime.utils.network import (
+    get_ip,
+    get_local_ip_by_remote,
+    join_host_port,
+    wildcard_host_for,
+)
 from tokenspeed.runtime.utils.process import set_parent_death_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
@@ -284,7 +303,8 @@ def start_rust_host(
         binary: The ``ts-host`` executable.
         server_args: The rank's server arguments.
         port_args: The engine's ports.
-        start_context: Entered around starting the process.
+        start_context: Entered before capturing the child environment and
+            starting the process, including allocator preload configuration.
         metrics_relay_endpoint: The node's metrics relay
             (``metrics/relay.py``), which runs the output plugins; None
             when no plugin is selected.
@@ -306,6 +326,12 @@ def start_rust_host(
         # Set each native writer's fallback before the host initializes logging.
         level = server_args.log_level.lower()
         host_env = os.environ.copy()
+        if host_env.get("LD_PRELOAD"):
+            # Nested allocator contexts can repeat an inherited hook. Preserve
+            # library order without changing the parent's environment.
+            host_env["LD_PRELOAD"] = ":".join(
+                dict.fromkeys(filter(None, host_env["LD_PRELOAD"].split(":")))
+            )
         host_env.setdefault(
             "TS_HOST_LOG",
             {
@@ -1202,6 +1228,61 @@ class MemoryMetricSampler(threading.Thread):
                 )
 
 
+def _peer_sharing_settings(
+    server_args: ServerArgs,
+    model_config,
+    draft_model_config,
+    *,
+    host_cache,
+    geometry,
+) -> PeerSharingSettings:
+    """What the host starts this rank's peer sharing from. A collective of
+    the world (the namespace's checkpoint agreement) and of the attention-TP
+    group (one incarnation for the replica, whose members' schedulers must
+    agree on their lease ids)."""
+    mapping = server_args.mapping
+    world_group = (
+        pg_manager.get_process_group("gloo", mapping.world_group)
+        if mapping.world_size > 1
+        else None
+    )
+    deployment_id = cache_deployment_id(
+        server_args,
+        model_config,
+        draft_model_config,
+        host_cache=host_cache,
+        world_cpu_group=world_group,
+    )
+    incarnation = [peer_incarnation()]
+    if mapping.attn.tp_size > 1:
+        dist.broadcast_object_list(
+            incarnation,
+            src=mapping.attn.tp_group[0],
+            group=pg_manager.get_process_group("gloo", mapping.attn.tp_group),
+        )
+    local_ip = get_local_ip_by_remote()
+    enable_mooncake_ipv6_for_host(local_ip)
+    port = server_args.peer_prefix_port + mapping.attn.dp_rank
+    # The name a router's hint carries: the advertised host when given.
+    host = server_args.peer_prefix_host or local_ip
+    return PeerSharingSettings(
+        name=peer_endpoint_name(host, port),
+        bind_host="::" if ":" in local_ip else "0.0.0.0",
+        port=port,
+        incarnation=incarnation[0],
+        deployment_id=deployment_id,
+        weight_version=str(server_args.weight_version),
+        answer_timeout_s=server_args.peer_prefix_answer_timeout_ms / 1000,
+        quarantine_s=QUARANTINE_S,
+        record_lifetime_s=RECORD_LIFETIME_S,
+        library=mooncake_library(),
+        local_ip=local_ip,
+        protocol=mooncake_protocol(),
+        ib_device=server_args.disaggregation_ib_device or "",
+        geometry=geometry,
+    )
+
+
 class HostBootstrap:
     """One rank, built: the scheduler and config for the control thread, and
     the data plane the forward and control threads call."""
@@ -1218,8 +1299,9 @@ class HostBootstrap:
         pd_outbox,
         host_spans,
         metrics_relay_endpoint: str | None,
+        peer_outbox,
         *,
-        replica_memory_transitions: bool,
+        replica_memory_transitions: bool = False,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
@@ -1251,6 +1333,18 @@ class HostBootstrap:
             model_config = load_model_config(
                 server_args, server_args.model, draft_of=None
             )
+            # Refused here, where the model is known, like the layouts
+            # ServerArgs refuses: deferred allocation is not validated
+            # with multimodal inputs.
+            if (
+                model_config.is_multimodal_active
+                and server_args.disaggregation_decode_allocation_policy == "deferred"
+            ):
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy deferred does "
+                    "not support a multimodal model; serve it with "
+                    "--language-model-only"
+                )
             if server_args.speculative_draft_model_path is not None:
                 draft_model_config = load_model_config(
                     server_args,
@@ -1312,6 +1406,9 @@ class HostBootstrap:
                 kv_transfer_builder=functools.partial(
                     build_host_peer, outbox=pd_outbox
                 ),
+                peer_outbox=(
+                    peer_outbox if server_args.peer_prefix_port is not None else None
+                ),
             )
             # The L3 tier the host runs over the shared Host pool; None
             # without a storage backend.
@@ -1331,6 +1428,24 @@ class HostBootstrap:
                 # I/O that cannot prove its retirement keeps it past close.
                 _L3_HOST_POOLS.append(device.host_cache.storage)
             storage_config = l3.runtime.scheduler if l3 is not None else None
+            #: With peer prefix sharing, what the host starts this rank's peer
+            #: endpoint and reads from (``cache/peer.py``); else None.
+            self.peer_sharing = None
+            peer_config = None
+            if device.peer_geometry is not None:
+                self.peer_sharing = _peer_sharing_settings(
+                    server_args,
+                    model_config,
+                    draft_model_config,
+                    host_cache=device.host_cache,
+                    geometry=device.peer_geometry,
+                )
+                peer_config = peer_scheduler_config(
+                    name=self.peer_sharing.name,
+                    incarnation=self.peer_sharing.incarnation,
+                    answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
+                    min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
+                )
             specs = device.specs
             geometry = specs.cache_geometry
             scheduler_config = scheduler_config_from_args(
@@ -1343,6 +1458,7 @@ class HostBootstrap:
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 enable_kv_cache_events=kv_events,
+                peer_config=peer_config,
                 prefix_replay_tokens=resolve_dspark_prefix_replay_tokens(
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
@@ -1360,11 +1476,7 @@ class HostBootstrap:
                 context_len=model_config.context_len,
                 max_single_request_tokens=self._max_single_request_tokens,
                 decode_input_tokens=decode_input_tokens,
-                max_kv_page_num=(
-                    0
-                    if server_args.chunk_prefill_kv_size is None
-                    else scheduler_config.max_kv_page_num
-                ),
+                max_kv_page_num=scheduler_config.max_kv_page_num,
                 prefix_granularity=geometry.prefix_granularity,
             )
             self._max_total_num_tokens = geometry.token_capacity
@@ -1501,8 +1613,11 @@ class HostBootstrap:
                     requires_forward_coordination=specs.requires_forward_coordination,
                     shared_l3=l3 is not None,
                 ),
-                # One node's ranks reach each other on loopback.
-                collective_bind_host="127.0.0.1" if mapping.nnodes == 1 else "0.0.0.0",
+                # One node's ranks reach each other on loopback; across nodes
+                # they dial get_ip(), so listen on its family's wildcard.
+                collective_bind_host=(
+                    "127.0.0.1" if mapping.nnodes == 1 else wildcard_host_for(get_ip())
+                ),
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
@@ -1736,7 +1851,9 @@ def prepare_bootstrap(
         role=role,
     )
 
-    def start(pd_outbox, protocol: int, host_spans) -> HostBootstrap | EncodeBootstrap:
+    def start(
+        pd_outbox, protocol: int, host_spans, peer_outbox=None
+    ) -> HostBootstrap | EncodeBootstrap:
         # Protocol 2 agrees on weight-load prerequisites and commits. Protocol
         # 3 also agrees on memory transitions, when the host supports it.
         if (
@@ -1755,6 +1872,11 @@ def prepare_bootstrap(
                 "Memory saver requires a ts-host binary with weight-update commit "
                 "protocol 2; rebuild tokenspeed-engine together with this runtime"
             )
+        if server_args.peer_prefix_port is not None and peer_outbox is None:
+            raise RuntimeError(
+                "--peer-prefix-port requires a ts-host binary with peer prefix "
+                "sharing; rebuild tokenspeed-engine together with this runtime"
+            )
         if role == "encode":
             return EncodeBootstrap(server_args, port_args, connection)
         return HostBootstrap(
@@ -1764,6 +1886,7 @@ def prepare_bootstrap(
             pd_outbox,
             host_spans,
             metrics_relay_endpoint,
+            peer_outbox,
             replica_memory_transitions=(
                 replica_memory_transitions
                 and protocol >= WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
@@ -1778,13 +1901,14 @@ def bootstrap(
     pd_outbox,
     weight_update_commit_protocol: int = 0,
     host_spans=None,
+    peer_outbox=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build the rank for hosts that call the original bootstrap entry point.
 
-    The host may pass span recording for profiles. Older binaries omit it.
+    The host may pass span recording and the outbox for peer prefix sharing.
     """
     _, start = prepare_bootstrap(control_fd, validate_memory_protocol=False)
-    return start(pd_outbox, weight_update_commit_protocol, host_spans)
+    return start(pd_outbox, weight_update_commit_protocol, host_spans, peer_outbox)
 
 
 def notify_launcher_of_failure() -> None:

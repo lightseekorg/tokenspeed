@@ -507,7 +507,7 @@ Trainer-side contract:
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
-| `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off; at most half of `--chunked-prefill-size`; a decode server ignores it ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
+| `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off: no chunk gives way; at most half of `--chunked-prefill-size`; a decode server ignores it. Whatever N, a prefill server fills the budget a chunk leaves on its own with bootstrapped prompts that fit whole in it; [scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue) describes both. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--enable-short-prefill-first` | Prefill and aggregated servers: rank new local prefills by remaining work after Device/Host prefix reuse, including replay work, with stable ties and oldest-request protection after eight successful bypasses. Resident chunks keep priority. Off by default, preserving submission order ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
 | `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total, so TTFT grows by at most this many decode steps and running decodes stall less often. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md) ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
@@ -600,7 +600,9 @@ split knobs.
 | `--eplb-rebalance-layers-per-chunk` | MoE layers whose experts move in one scheduling round; required with `--enable-eplb`, `1..num MoE layers`. Fewer layers per chunk bound the per-round stall. |
 
 All of these apply only to models that opt in to expert placement
-(LongCat-Flash); other models refuse them at startup. See
+(LongCat-Flash; Inkling2 for static placements; Kimi-K3 with attention DP
+and EP-only MoE, a `static` dispatch and no load recording); other models
+refuse them at startup. See
 [static expert placement](../serving/parallelism.md#static-expert-placement-with-redundant-experts)
 for the record → place → route flow and the two dispatch flavors, and
 [dynamic expert rebalancing](../serving/parallelism.md#dynamic-expert-rebalancing)
@@ -613,6 +615,7 @@ for the online variant.
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--enable-qsa-prefill-bf16-scratch` | Opt-in for QSA sparse-attention models (Qwen4-Exp) with `--kv-cache-dtype fp8_e4m3` (or `fp8`) on SM100 to SM107. A target prefill call of at least 2048 query rows copies the FP8 KV pages it can read into a BF16 scratch and attends there with the CuTe QSA kernel's BF16 path instead of the FP8 prefill kernel (FlashInfer FA2 by default, or the CuTe kernel's FP8 path under a kernel override); smaller or mixed calls, calls whose context exceeds the scratch or 128 cache tokens per query row, decode, verify and drafts keep the FP8 path, and the cache stays FP8. The scratch holds one maximum-length context plus one `--chunked-prefill-size` chunk of pages, with that chunk's remapped slots and attention output; it is reserved from the KV cache budget before the pool is sized, so the pool shrinks by its size (logged at startup). Startup fails for a model without QSA layers, another KV cache dtype (`mxfp8` included), `--chunked-prefill-size` below 2048 or disabled, or a GPU without the CuTe QSA kernel. The decode role, which runs no prefill, reserves no scratch. Part of the L3 storage identity when set. Off by default. |
+| `--qwen4-exp-flat-kv` / `--no-qwen4-exp-flat-kv` | Qwen4-Exp layout: target/draft KV, GDN, PLE and QSA share one physical plane. All GDN layers use one state group; PLE and QSA retain their own groups. Full-history tables translate scheduler blocks to contiguous atom pages; state and recent windows retain explicit strides. Requires PP=1, uniform per-view K/V heads and non-MXFP8 KV. On by default; use `--no-qwen4-exp-flat-kv` for the plane-based layout. L3 identity follows the actual cache layout. |
 | `--moe-backend` | MoE backend. |
 | `--moe-cutlass-fused-finalize` / `--no-moe-cutlass-fused-finalize` | GEMM2 atomic expert combine for unquantized FP16/BF16 MoE on `flashinfer_cutlass`, for both target and draft models. On by default and forced off by `--numerics rl-bitwise`. The fused reduction order is nondeterministic. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -1032,6 +1035,14 @@ on the model and cache layout, this can reduce the reported token capacity
 for the same arena. Receiving all C requests at their maximum context length
 is not guaranteed.
 
+A ready request that waits for an execution permit is a time-to-first-token
+cost, not a decode cost. The decode role's first-token boundary is its first
+local decode output, so the wait measured by
+`tokenspeed:decode_ready_wait_seconds` and RequestStats `decode_wait_ms`
+falls inside `ttft_ms` and outside the `decode_tps` / TPOT window. Compare
+TPOT across different E values together with those waits and the
+`num_decode_ready_waiting_reqs` gauge.
+
 For a concrete capacity-model example, fix B=32 and 4,096 usable LCM blocks
 on a D rank. Use one full-history group with 64-token pages and one State
 group, both with one child block per LCM block; prefix caching and
@@ -1066,6 +1077,68 @@ tokenspeed-engine and any standalone tokenspeed-scheduler from the same
 revision as the Python runtime. The serving host uses the scheduler embedded
 in tokenspeed-engine; upgrading the standalone scheduler wheel alone does
 not update that embedded copy.
+
+### P/D admission
+
+`--disaggregation-decode-allocation-policy` sets what a request's Decode
+allocation gates on a prefill server; the other roles refuse the flag.
+`early`, the default, admits the prefill once every Decode rank of the request
+has allocated its destination, so the KV can stream layer by layer during the
+forward. `early` is deprecated: it will be removed once `deferred` supports
+the layouts that still need it. `deferred` (experimental) defers the Decode
+allocation until the prefill server holds every page of the prompt: it
+computes the prompt without waiting for the allocation and holds only its KV
+transfer, and a computed prompt keeps its pages until the destination is
+allocated. `deferred` requires attention TP 1, `--kv-parallel-size 1`,
+`--pipeline-parallel-size 1`, no `--enable-external-encoder`, an explicit
+`--disaggregation-layerwise-interval 0` and a model without multimodal input
+(or `--language-model-only`); anything else is refused at startup.
+
+Under `deferred`, computed prompts waiting for their destination hold
+prefill pages. New prompts are admitted meanwhile as under `early`, so on a
+tight prefill pool smaller prompts that keep fitting can delay a larger one.
+
+The two servers keep one order under `deferred`: a request takes every page
+it needs on the prefill server before its Decode server allocates its
+destination, so neither holds pages the other waits for. The Decode server
+announces each request to the prefill server. The prefill server admits a
+request once it is announced, and tells the Decode server when the request's
+last chunk is admitted; only then may the Decode server allocate. The Decode
+server's scheduler sees every request whose notice arrived and chooses among
+them as it chooses among the requests of `early` prefill servers. Every Decode
+server of a prefill server that runs `deferred` must understand the
+announcement: an older one sends its manifest unannounced and fails each
+request at once.
+
+`TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s by default) bounds what a
+request waits for from its Decode server on the prefill server. A request its
+Decode server has not announced fails one timeout after its arrival; an
+announcement that waits for the Decode server's registration to be applied
+does not count yet. An admitted request has no clock while it is queued or
+computed, and fails one timeout after it held its pages if its destination is
+not allocated by then. On the Decode server
+`TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT` bounds the wait for the prefill
+server's notice, which covers the prefill server's queue and computation, and
+then again the wait for the allocation.
+
+Known limits. With a tight prefill pool `deferred` is slower than `early` even
+when every Decode server is healthy: prompts wait for destinations with their
+pages. The prefill server computes every request a Decode server announces,
+whether or not that server allocates: a Decode server that does not allocate
+keeps its computed prompts' pages on the prefill server until each fails, one
+timeout after it held its pages, and prompts for other Decode servers wait for
+those pages meanwhile. An admitted request has no timeout on the prefill
+server while it is queued or computed: its Decode server's waiting timeout
+ends it, and if that server is gone, it fails one timeout after it held its
+pages. A computed prompt waiting for its destination publishes its last chunk
+to the prefix cache only with its transfer, so a prompt with the same prefix
+admitted meanwhile computes that chunk again. On a Decode server that is full,
+later smaller requests can be allocated ahead of a larger one, whose prompt
+keeps its pages on the prefill server until it is allocated or one of the two
+timeouts fails it. If a prefill server stops after its notice, the Decode
+server fails the request at its waiting timeout; pages it had already
+allocated go back only when the prefill ranks acknowledge the cancellation,
+which a dead prefill process never does, as under `early`.
 
 ## Observability
 
@@ -1118,7 +1191,12 @@ on the prefill role, waiting for the decode side to allocate their KV pages —
 which the `#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned)`
 suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
-bootstrapping share.
+bootstrapping share. Under
+`--disaggregation-decode-allocation-policy deferred` a prefill request
+bootstraps only until the prefill server admits it, which does not wait for
+the decode allocation; a computed prompt then stays in the `prefill` share
+until its destination is allocated and its transfer starts
+([P/D admission](#pd-admission)).
 
 `tokenspeed:request_queue_time_seconds` is the Prometheus per-request
 queue-wait histogram (`--enable-metrics`): the wall time from a request's
@@ -1222,6 +1300,8 @@ The rank-local histogram tokenspeed:decode_ready_wait_seconds measures E-queue
 wait from the decode host observing complete prefill KV arrival to the first
 decode forward dispatch. It records once per request, including requests that
 dispatch immediately, and excludes requests cancelled or finished before decode.
+This wait is inside the decode role's time to first token and outside its
+decode time.
 It excludes prefill computation and KV transfer; dispatch is the host boundary,
 not a GPU kernel start timestamp. The 0.1-second bucket measures how many observed
 waits meet a 100 ms target. Requests still waiting have no histogram observation
@@ -1232,7 +1312,9 @@ The decode role splits that PD wait into its own gauges.
 prefill peer is working, this rank already holds their destination pages, and
 nothing here is schedulable until the bootstrap token arrives.
 `tokenspeed:num_decode_prealloc_queue_reqs` counts the earlier wait for the peer
-to connect. `tokenspeed:num_decode_transfer_queue_reqs` counts requests whose
+to connect; when the prefill server runs `deferred` it also counts
+the requests waiting for that server's notice (its queueing and computation).
+`tokenspeed:num_decode_transfer_queue_reqs` counts requests whose
 pages a transfer still pins, including requests that already ended (aborted or
 failed) and are only waiting for the transport to report stopped; it is a
 resource count, not a queue depth. The transfer gauge is a superset of
@@ -1324,7 +1406,7 @@ add no remote-prefill batch reads. When both are enabled, they share one read.
 | --- | --- | --- |
 | `TTFTBootstrap` | The prefill replica agrees the room is bootstrapped | Engine registration to bootstrap agreement |
 | `TTFTBreakdown` on Prefill | First engine output or terminal release | Bootstrap, admission to first dispatch after bootstrap, prompt execution, transfer observation and output preparation |
-| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output |
+| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output (including a wait for a decode execution permit) |
 
 Prefill holds its first output until the KV transfer completes. Its normal
 breakdown therefore includes `transfer_observe` and `output_pack`; producing
@@ -1348,6 +1430,9 @@ On P, all prefill chunks contribute to `prefill`; only the last chunk records
 `transfer_done`; the summary normally waits for the next local decode commit.
 A request ended by the bootstrap token completes without that decode, and a
 non-streaming request waits until completion to prepare its output.
+`output_prepared` is this sampled summary's boundary. The role metrics'
+`first_token` is the first local decode output, stamped at the first decode
+commit, so it does not wait for a non-streaming flush.
 
 On P, `admission` splits into `ready_to_plan` and `plan_to_dispatch`. On D,
 `transfer_observe` splits into `remote_admission` and `admission_to_landing`.
@@ -1384,7 +1469,7 @@ the stats from host-side timestamps and counters, adding no GPU synchronization;
 formatting and writing the log still have a CPU cost. Example `request_stats` value:
 
 ```
-Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
+Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=2012.6, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
 ```
 
 | Field | Meaning |
@@ -1394,25 +1479,31 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
 | `queue_ms` | Request-supplied `created_time` → first dispatch into a forward batch. Includes time before Rust registration; differs from the submitted → dispatch metrics histogram. |
 | `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
-| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
-| `ttft_ms` | Request-supplied `created_time` → first output token. On a decode node the first token is the prefill node's bootstrap token, so the endpoint is the engine accepting the landed KV and token. |
+| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. This wait is inside `ttft_ms` and outside the decode window. |
+| `ttft_ms` | Request-supplied `created_time` → this role's first output token. On a decode node the endpoint is the first local decode output, or the bootstrap token when that token ends the request; the remote bootstrap token's landing only starts `decode_wait_ms`, so a wait for a decode execution permit is included. |
 | `total_ms` | Request-supplied `created_time` → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
-| `decode_tps` | Decode throughput (generated tokens / decode window). |
+| `decode_tps` | Decode throughput (generated tokens / decode window). On a decode node the window starts at the first local decode output, so queue, prefill and the decode admission wait are excluded. The bootstrap token and the first local token are delivered together, so the metric counts one zero interval: it is the client-observed average, not the local decode step rate. |
 | `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
 | `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for request-supplied creation / first dispatch / finish. `recv_ts` is copied from `created_time`, not stamped by the Rust transport. |
 
 ### KV cache events
 
-KV cache events publish reusable device prefix-cache mutations from the live
-C++ scheduler path. This initial stream does not publish Host/L2 loadback
-events. The scheduler caches block hash lineage on prefix-cache nodes, so
-publishing a stored block uses the parent node's cached hash instead of
-rebuilding the full ancestor prefix.
+KV cache events publish reusable prefix-cache mutations from the live C++
+scheduler path, on two media: the GPU cache (no medium) and, with Host L2
+(`--enable-kvstore`), the pinned Host cache (medium `CPU_PINNED`). The
+scheduler caches block hash lineage on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
 
-Host L2 entries publish no events. Under `--kvstore-write-policy write_back`,
-a block the GPU evicts is reported `BlockRemoved` even when it is written
-back to the Host.
+Each medium's stream is prefix-closed for a router that continues a GPU match
+into the Host tier: a GPU block is stored once its parent is stored on the
+GPU, and a Host block once its parent is stored on either medium. A block on
+both media is stored on each. Under `--kvstore-write-policy write_back`, a
+block the GPU evicts is reported `BlockRemoved` on the GPU and, once its copy
+lands, `BlockStored` on the Host. A Host block read from L3 for a prefix this
+engine never published carries no tokens to describe it and publishes
+nothing.
 
 Example:
 
@@ -1424,9 +1515,12 @@ The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
 number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
 
 ```python
-[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
-[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size, None, medium]], attn_dp_rank]
+[timestamp, [["BlockRemoved", [block_hash], medium]], attn_dp_rank]
 ```
+
+This is vLLM's layout: the `None` is `lora_id`, and `medium` is `None` for
+the GPU cache or `"CPU_PINNED"` for the Host cache.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
@@ -1441,8 +1535,19 @@ carry the `model_name` and `app_key` labels:
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode, except an interval with nothing for that peer; buckets span 1 ms to 60 s). |
-| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
+| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`), `waiting_for_announcement` (the Decode server never announced the request to a prefill server that runs `deferred`, same timeout), `waiting_for_admission` (decode never published its manifest; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
+
+Every prefill server states its policy ([P/D admission](#pd-admission)) in
+what it registers with the bootstrap server (`decode_allocation_policy`,
+served to Decode servers as `prefill_decode_allocation_policy` in `/route`).
+
+Under `deferred`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
+requests the prefill server has not admitted yet, those waiting for their
+Decode server's announcement, and an admitted request not yet scheduled counts
+in `tokenspeed:num_requests_waiting`. A computed prompt waiting for its
+destination counts in `tokenspeed:num_requests_running`, as one awaiting its
+PD transfer does: both hold their pages and request slot.
 
 ## TokenSpeed-specific runtime knobs
 
@@ -1629,7 +1734,8 @@ prefix cache are copied to Host L2:
 
 - `write_through` (the default): on the fused and prefill roles, every page
   the GPU caches is also copied to the Host, which keeps it after the GPU
-  evicts the page. The decode role's Host L2 holds retraction images only.
+  evicts the page. The decode role copies nothing then: its Host L2 holds
+  retraction images only.
 - `write_back`: nothing is copied when a page is cached. When the GPU
   evicts cached pages to make room for a request, or to resume a retracted
   one, it copies them to the Host in the same scheduling step, and they can
@@ -1644,8 +1750,10 @@ prompt resumes from both. The cost: a step that evicts must finish copying
 the evicted pages to the Host before its forward pass can write over them,
 so the copy adds to that step's time.
 
-`write_back` runs on the fused and prefill roles, not with
-`--disaggregation-mode decode`. Both cached and replayable sliding-window
+`write_back` runs on every role. On `--disaggregation-mode decode` the
+history a decode server evicted stays reusable from its Host: a later
+request's remote admission loads its Host hit, and the prefill server sends
+only the rest ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Both cached and replayable sliding-window
 groups are supported. It requires Host L2,
 `--pipeline-parallel-size 1`, `--query-context-parallel-size 1` and no
 `--kvstore-storage-backend`, and a model with at most 64 cache groups;
@@ -1867,6 +1975,40 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Peer prefix sharing
+
+`--peer-prefix-port PORT` lets replicas reuse each other's cached prefixes
+(design: [RFC 0004](../rfcs/0004-peer-prefix-sharing.md)). A request the
+router sends with a holder (`peer_holder`, the holder's `host:port`) asks
+that replica how much of its prompt it caches, in its GPU or Host cache, and
+reads those pages over RDMA (Mooncake TransferEngine, one-sided READ) into
+its own GPU cache instead of computing them. Every replica serves its own
+cache the same way. If the holder does not answer, or a read fails, the
+request computes the prefix itself.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
+| `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
+| `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
+| `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
+
+Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
+A `--disaggregation-mode decode` server serves the history it decoded, its
+prompts and replies, so the next turn's prefill server reads a reply rather
+than computing it; it never reads itself, since its prefill server sends what
+it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
+`--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
+Peer sharing is refused with
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
+`--query-context-parallel-size > 1`; the
+scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
+groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
+each other only within one namespace: the same checkpoints, cache layout,
+numerics and parallel layout (the L3 deployment id), and the same
+`--weight-version`. A flushed weight update must name its `weight_version`,
+which moves the namespace, as it does for L3.
 
 ### Block verification (experimental)
 

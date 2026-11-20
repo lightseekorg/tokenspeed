@@ -318,6 +318,17 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .reasoning_usage
         .as_ref()
         .map(|grammar| ReasoningTokens::new(grammar, &state.prompt_ids));
+    if request
+        .peer_holder
+        .as_ref()
+        .is_some_and(|holder| !holder.is_empty())
+    {
+        state.peer_usage = Some(crate::request::PeerUsage {
+            expected: request.peer_expected_tokens,
+            disposition: "not_attempted",
+            ..Default::default()
+        });
+    }
     state.created_time = request.created_time;
     state.session_id = request
         .session_params
@@ -371,6 +382,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         session_id: request.cache_session_id.unwrap_or_default(),
         cache_group_id: request.cache_group_id.unwrap_or_default(),
         shared_prefix_tokens: request.shared_prefix_tokens,
+        peer_holder: request.peer_holder.unwrap_or_default(),
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission

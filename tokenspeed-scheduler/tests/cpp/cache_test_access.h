@@ -37,67 +37,72 @@ namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess {
     static std::size_t CacheGroupRegistrySize(const CacheCoordinator& coordinator) {
-        return coordinator.cache_group_tags_.size();
+        return coordinator.sessions_.NumCacheGroupTags();
     }
 
     static auto MatchPrefix(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
-        return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
+        return coordinator.acquirePrefix(coordinator.Prober().ProbePrefix(content_hashes),
+                                         coordinator.history_.IssueAccessEpoch());
     }
     // A probe over the prompt's tokens too (tails included), acquired as an
     // admission would.
-    static auto MatchPromptPrefix(CacheCoordinator& coordinator, const CacheCoordinator::PromptPrefix& prompt) {
-        return coordinator.acquirePrefix(coordinator.ProbePromptPrefix(prompt), ++coordinator.next_access_epoch_);
+    static auto MatchPromptPrefix(CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+        return coordinator.acquirePrefix(coordinator.Prober().ProbePromptPrefix(prompt),
+                                         coordinator.history_.IssueAccessEpoch());
     }
 
-    static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
+    static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) {
+        return coordinator.history_.IssueAccessEpoch();
+    }
 
     // The planner's Device eviction of one entry, with its tail cascade,
     // counted as an admission's.
     static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
-        return coordinator.evictCachedBlock(group_id, location, &CacheCoordinator::DeviceEvictionStats::admission,
-                                            /*write_back_segment=*/nullptr);
+        return coordinator.evictor_.EvictCachedBlock(group_id, location, &CacheEvictor::DeviceEvictionStats::admission,
+                                                     /*write_back_segment=*/nullptr);
     }
 
     // One Device entry's eviction without its cascade, counted under `reason`
     // and recorded into `segment` as an eviction write-back would (nullptr
     // drops it); false when the entry is pinned or gone.
     static bool EvictAloneInto(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location,
-                               CacheCoordinator::DeviceEvictionCounts CacheCoordinator::DeviceEvictionStats::*reason,
-                               CacheCoordinator::EvictedSegment* segment) {
-        return coordinator.evictCachedBlockAlone(group_id, location, reason, segment).has_value();
+                               CacheEvictor::DeviceEvictionCounts CacheEvictor::DeviceEvictionStats::*reason,
+                               CacheEvictor::EvictedSegment* segment) {
+        return coordinator.evictor_.EvictCachedBlockAlone(group_id, location, reason, segment).has_value();
     }
 
     static bool RecordDeviceEviction(CacheCoordinator& coordinator, const CacheKey& key,
-                                     CacheCoordinator::EvictedSegment& segment) {
-        const auto location = coordinator.locationOf(coordinator.pool_, key.group_id, key);
-        return location && coordinator.evictCachedBlock(key.group_id, *location,
-                                                        &CacheCoordinator::DeviceEvictionStats::admission, &segment);
+                                     CacheEvictor::EvictedSegment& segment) {
+        const auto location = coordinator.store_.LocationOf(coordinator.store_.DevicePool(), key.group_id, key);
+        return location && coordinator.evictor_.EvictCachedBlock(
+                               key.group_id, *location, &CacheEvictor::DeviceEvictionStats::admission, &segment);
     }
 
     // A Device-cached block, located rather than referenced: a held reference
     // would pin it against eviction.
     static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,
                                                               std::size_t group_index, const CacheKey& key) {
-        return coordinator.locationOf(coordinator.pool_, group_index, key);
+        return coordinator.store_.LocationOf(coordinator.store_.DevicePool(), group_index, key);
     }
 
     // A Host LRU eviction of the entry under `key` (counted under lru), with
     // its State cascade; false when it is pinned or absent.
     static bool EvictHostCachedBlock(CacheCoordinator& coordinator, const CacheKey& key) {
         const std::optional<CacheBlockLocation> location =
-            coordinator.locationOf(*coordinator.host_pool_, key.group_id, key);
+            coordinator.store_.LocationOf(*coordinator.store_.HostPool(), key.group_id, key);
         if (!location) {
             return false;
         }
-        return coordinator.evictHostCachedBlock(key.group_id, *location, &CacheCoordinator::HostEvictionStats::lru);
+        return coordinator.evictor_.EvictHostCachedBlock(key.group_id, *location,
+                                                         &CacheEvictor::HostEvictionStats::lru);
     }
 
     static const BoundaryTree& BoundaryTreeOf(const CacheCoordinator& coordinator) {
-        return coordinator.boundary_tree_;
+        return coordinator.store_.Boundaries();
     }
 
     static auto NodeEntries(const CacheCoordinator& coordinator, const BlockPool& pool, const ContentHash& hash) {
-        return coordinator.NodeEntries(pool, *coordinator.boundary_tree_.Find(hash));
+        return coordinator.Store().NodeEntries(pool, *coordinator.store_.Boundaries().Find(hash));
     }
 
     // Where the boundary tree disagrees with the indexes, recounted from
@@ -115,11 +120,11 @@ struct CacheCoordinatorTestAccess {
             std::int32_t pairs{0};
         };
         std::unordered_map<ContentHash, Counts> expected;
-        const std::array<const BlockPool*, 2> pools{&coordinator.pool_, coordinator.host_pool_};
-        for (std::size_t i = 0; i < coordinator.groups_.size(); ++i) {
-            const PrefixCacheIndex& index = coordinator.groups_[i].Index();
+        const std::array<const BlockPool*, 2> pools{&coordinator.store_.DevicePool(), coordinator.store_.HostPool()};
+        for (std::size_t i = 0; i < coordinator.store_.Groups().size(); ++i) {
+            const PrefixCacheIndex& index = coordinator.store_.Groups()[i].Index();
             const bool state = coordinator.GroupIsState(i);
-            const bool closed = coordinator.groups_[i].Matcher().IsPrefixClosed();
+            const bool closed = coordinator.store_.Groups()[i].Matcher().IsPrefixClosed();
             for (std::size_t tier = 0; tier < pools.size(); ++tier) {
                 if (pools[tier] == nullptr) {
                     continue;
@@ -138,7 +143,7 @@ struct CacheCoordinatorTestAccess {
             }
         }
         std::vector<std::string> mismatches;
-        const BoundaryTree& tree = coordinator.boundary_tree_;
+        const BoundaryTree& tree = coordinator.store_.Boundaries();
         for (const auto& [hash, counts] : expected) {
             const BoundaryTree::Node* node = tree.Find(hash);
             if (node == nullptr) {
@@ -209,9 +214,9 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
 }
 
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
-                                   std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
+                                   std::span<const std::string> content_hashes, std::int32_t first_prefix_page = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot, CacheBoundaryKind::kChunk);
+                                first_prefix_page, CacheBoundaryKind::kChunk);
 }
 
 // Publishes the newly hashed pages [first_new_prefix_page, prefix_hashes.size())
@@ -246,10 +251,11 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
 // holds for the point its progress publishes (OwnerTail::kCopiedIn), and
 // reserves those of `copy_in_point` for the slots whose blocks it allocates
 // (AdmissionResult::copy_in_blocks).
-inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
-    CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
-    GroupDemand prototype, const RequestProgress& progress, StateStep state_step,
-    std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CacheCoordinator::CopyInPoint> copy_in_point) {
+inline std::optional<AdmissionResult> AdmitForTest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                                   PrefixProbe&& prefix, GroupDemand prototype,
+                                                   const RequestProgress& progress, StateStep state_step,
+                                                   std::span<std::vector<CacheBlockRef>> copy_in_blocks,
+                                                   std::optional<CopyInPoint> copy_in_point) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (std::size_t i = 0; i < tables.size(); ++i) {
@@ -262,43 +268,36 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         demands.push_back(demand);
     }
     return coordinator.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point,
-                             /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                             /*session_id=*/{}, /*cache_group_id=*/{});
+                             /*request_access_epoch=*/std::nullopt, /*session_id=*/{}, /*cache_group_id=*/{});
 }
 
-inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
-    CacheCoordinator& coordinator, std::vector<BlockTable>& tables, CacheCoordinator::PrefixProbe&& prefix,
-    GroupDemand prototype, const RequestProgress& progress,
-    StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
+inline std::optional<AdmissionResult> AdmitForTest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                                   PrefixProbe&& prefix, GroupDemand prototype,
+                                                   const RequestProgress& progress,
+                                                   StateStep state_step = StateStep{StateStep::Kind::kRotate}) {
     return AdmitForTest(coordinator, tables, std::move(prefix), prototype, progress, state_step,
                         /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
 }
 
 // The overloads without progress admit a request that has computed nothing
 // yet: nothing to publish, nothing for retention to reclaim.
-inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                     std::vector<BlockTable>& tables,
-                                                                     CacheCoordinator::PrefixProbe&& prefix,
-                                                                     GroupDemand prototype) {
+inline std::optional<AdmissionResult> AdmitForTest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                                   PrefixProbe&& prefix, GroupDemand prototype) {
     return AdmitForTest(coordinator, tables, std::move(prefix), prototype, RequestProgress{});
 }
 
-inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                     std::vector<BlockTable>& tables,
-                                                                     GroupDemand prototype,
-                                                                     const RequestProgress& progress) {
-    return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype, progress);
+inline std::optional<AdmissionResult> AdmitForTest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                                   GroupDemand prototype, const RequestProgress& progress) {
+    return AdmitForTest(coordinator, tables, coordinator.Prober().ProbePrefix({}), prototype, progress);
 }
 
-inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                     std::vector<BlockTable>& tables,
-                                                                     GroupDemand prototype) {
+inline std::optional<AdmissionResult> AdmitForTest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                                   GroupDemand prototype) {
     return AdmitForTest(coordinator, tables, prototype, RequestProgress{});
 }
 
-inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                     std::vector<BlockTable>& tables,
-                                                                     std::int32_t num_tokens) {
+inline std::optional<AdmissionResult> AdmitForTest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                                   std::int32_t num_tokens) {
     return AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{num_tokens}});
 }
 

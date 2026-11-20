@@ -37,13 +37,19 @@ def rmsnorm(
     if x.shape[0] == 0:
         result = x if out is None else out
         return (result, residual) if residual is not None else result
+    # CANN requires matching activation and scale dtypes. Keep FP32 checkpoint
+    # scales intact, then restore the caller's activation/storage dtype.
+    compute_dtype = torch.promote_types(x.dtype, weight.dtype)
+    norm_x = x.to(compute_dtype)
+    norm_weight = weight.to(compute_dtype)
     if residual is not None:
         result, _, residual_out = torch_npu.npu_add_rms_norm(
-            x, residual, weight, epsilon=eps
+            norm_x, residual.to(compute_dtype), norm_weight, epsilon=eps
         )
         residual.copy_(residual_out)
-        return result, residual
-    result, _ = torch_npu.npu_rms_norm(x, weight, epsilon=eps)
+        return result.to(x.dtype), residual
+    result, _ = torch_npu.npu_rms_norm(norm_x, norm_weight, epsilon=eps)
+    result = result.to(x.dtype)
     if out is not None:
         out.copy_(result)
         result = out

@@ -39,6 +39,7 @@ __all__ = [
     "eagle4_candidate_tail",
     "eagle4_shard_topk",
     "blockwise_logprobs",
+    "chain_verify_coins",
     "prepare_sampling_offsets",
     "VOCAB_SHARD_DRAFT_BLOCK",
     "VOCAB_SHARD_DRAFT_FIELDS",
@@ -46,6 +47,7 @@ __all__ = [
     "vocab_shard_draft_stats",
     "vocab_shard_draft_stats_width",
     "vocab_shard_topk",
+    "vocab_shard_topk_chunks",
     "vocab_shard_topk_supports",
     "vocab_topk_merge",
     "vocab_topk_merge_supports",
@@ -54,6 +56,66 @@ __all__ = [
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
 _SUPPORTED_OUT_DTYPES = (_torch.int32, _torch.int64)
+
+
+def chain_verify_coins(
+    slots: _torch.Tensor,
+    seed_pool: _torch.Tensor,
+    offsets_pool: _torch.Tensor,
+    *,
+    coins: _torch.Tensor,
+    final_coins: _torch.Tensor,
+) -> None:
+    """Fill the verifier's accept and residual/bonus coins in (0, 1).
+
+    Args:
+        slots: Int32 or int64 [B] pool indices in verify row order.
+        seed_pool: Contiguous int64 request seeds, indexed by slot.
+        offsets_pool: Contiguous int64 first target positions, indexed by slot.
+            Positions must be in ``[0, 2**31)`` for the Philox counter layout.
+            Runtime requests are bounded by the scheduler's
+            ``CapacityModel::MaxRequestTokenLimit``, which reserves headroom
+            for verify windows, overlapping steps, and block rounding.
+        coins: Contiguous fp32 [B, N] accept coin output.
+        final_coins: Contiguous fp32 [B] residual/bonus coin output.
+
+    Returns:
+        None. Both output buffers are written in place.
+    """
+    if coins.ndim != 2 or coins.dtype != _torch.float32 or not coins.is_contiguous():
+        raise ValueError("chain verify needs contiguous fp32 [B, N] accept coins")
+    rows, width = coins.shape
+    if not 0 < width < 2**32:
+        raise ValueError("chain verify width must fit a positive uint32")
+    if (
+        final_coins.shape != (rows,)
+        or final_coins.dtype != _torch.float32
+        or not final_coins.is_contiguous()
+    ):
+        raise ValueError("chain verify needs contiguous fp32 [B] final coins")
+    if slots.shape != (rows,) or slots.dtype not in (_torch.int32, _torch.int64):
+        raise ValueError("chain verify needs int32/int64 [B] request slots")
+    if (
+        seed_pool.ndim != 1
+        or offsets_pool.shape != seed_pool.shape
+        or any(
+            t.dtype != _torch.int64 or not t.is_contiguous()
+            for t in (seed_pool, offsets_pool)
+        )
+    ):
+        raise ValueError("chain verify needs contiguous int64 seed and position pools")
+    if any(
+        t.device != coins.device for t in (slots, seed_pool, offsets_pool, final_coins)
+    ):
+        raise ValueError("chain verify coin tensors must share a device")
+    if rows == 0:
+        return
+    kernel = select_kernel(
+        "sampling",
+        "chain_verify_coins",
+        format_signature(coins=dense_tensor_format(coins.dtype)),
+    )
+    kernel(slots, seed_pool, offsets_pool, coins=coins, final_coins=final_coins)
 
 
 def _validate_argmax_out(logits: _torch.Tensor, out: _torch.Tensor) -> None:
@@ -241,12 +303,16 @@ def eagle4_candidate_tail(
     )
 
 
-# A shard column rides in the low 15 bits of a 32-bit selection key next to
-# its 16-bit value key, so a shard holds at most this many columns.
-_VOCAB_TOPK_MAX_SHARD_COLUMNS = 1 << 15
+# A column rides in the low 15 bits of a 32-bit selection key next to its
+# 16-bit value key, so one selection program takes at most this many columns.
+_VOCAB_TOPK_MAX_PROGRAM_COLUMNS = 1 << 15
 # The merge holds every candidate of a row in one program, its rank-major
 # slot in 16 bits next to a 32-bit value key.
 _VOCAB_TOPK_MAX_MERGE_CANDIDATES = 1 << 12
+# Columns one program selects from. A whole vocab shard in one program leaves
+# most CUs idle at a few rows; chunks select in parallel, then one program per
+# row merges their candidates.
+_VOCAB_TOPK_CHUNK_COLUMNS = 2048
 
 
 def vocab_shard_topk_supports(dtype: _torch.dtype, shard_columns: int, k: int) -> bool:
@@ -259,8 +325,29 @@ def vocab_shard_topk_supports(dtype: _torch.dtype, shard_columns: int, k: int) -
     """
     return (
         dtype in (_torch.bfloat16, _torch.float16)
-        and 1 <= k <= shard_columns <= _VOCAB_TOPK_MAX_SHARD_COLUMNS
+        and 1 <= k <= shard_columns
+        and (
+            shard_columns <= _VOCAB_TOPK_MAX_PROGRAM_COLUMNS
+            or vocab_shard_topk_chunks(shard_columns, k) > 1
+        )
     )
+
+
+def vocab_shard_topk_chunks(shard_columns: int, k: int) -> int:
+    """Selection programs ``vocab_shard_topk`` splits each shard row over.
+
+    Chunks of about ``_VOCAB_TOPK_CHUNK_COLUMNS`` columns, as long as each
+    chunk holds ``k`` columns and the merge takes every chunk's ``k``
+    candidates; otherwise 1, the whole row in one program.
+
+    Args:
+        shard_columns: Columns in the shard.
+        k: Candidates kept per row.
+    """
+    chunks = -(-shard_columns // _VOCAB_TOPK_CHUNK_COLUMNS)
+    if -(-shard_columns // chunks) < k or not vocab_topk_merge_supports(chunks, k):
+        return 1
+    return chunks
 
 
 def vocab_topk_merge_supports(ranks: int, k: int) -> bool:
@@ -480,5 +567,6 @@ import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401

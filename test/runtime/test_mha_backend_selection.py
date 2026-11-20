@@ -86,5 +86,46 @@ def test_mha_preserves_target_and_block_draft_geometry(draft, heads, name, solut
         assert plan["extend_mode"] == ("postwrite" if solution is None else "prewrite")
 
 
+@pytest.mark.parametrize(
+    "causal,expected",
+    [
+        # Every row of a non-causal block reads up to the block end.
+        (False, [10, 10, 10, 10, 7, 7, 7, 7]),
+        # A causal block keeps one block-end entry per request; its rows
+        # decode as packed causal query rows.
+        (True, [10, 7]),
+    ],
+)
+def test_block_draft_seq_lens_follow_block_causality(causal, expected):
+    spec = MHAConfig(
+        backend_name="mha",
+        num_attention_heads=12,
+        num_kv_heads=2,
+        head_dim=64,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        context_len=1024,
+        max_bs=4,
+        max_resident_requests=4,
+        speculative_num_draft_tokens=4,
+        is_draft=True,
+        draft_block_decode=True,
+        draft_block_causal=causal,
+        components=(spec,),
+    )
+    backend = _get_backend_cls("mha", AttentionArch.MHA)(
+        config, spec, kernel_page_size=16
+    )
+    backend.init_cuda_graph_state(4)
+    backend.fill_block_decode_seq_lens(2, torch.tensor([10, 7], dtype=torch.int32))
+    assert backend.block_decode_expansion == len(expected) // 2
+    assert backend.seq_lens_buf[: len(expected)].tolist() == expected
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

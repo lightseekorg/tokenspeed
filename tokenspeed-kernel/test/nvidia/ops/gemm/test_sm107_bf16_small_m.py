@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tight numerical contracts for the SM107 admitted bf16 projection set."""
+"""Tight numerical contracts for SM107 small-M BF16 GEMM admission."""
 
 import pytest
 import torch
@@ -34,26 +34,36 @@ pytestmark = pytest.mark.skipif(
     reason="SM107 with FlashInfer CuTe DSL required",
 )
 
+# Admitted by _sm107_cute_dsl_bf16_admits (K % 128 == 0 throughout): N <= 8192,
+# or K >= 2048 with at most 96 MiB of weight. The first rows sit on each
+# boundary; the rest are TP1 and TP4 projection shapes.
 SHAPES = [
-    (2560, 6144),  # attention o_proj, TP1
-    (3584, 2560),  # attention qkv gated proj, TP4
-    (4096, 2560),  # GDN in_proj, TP4
-    (4120, 2560),  # GDN in_proj (padded variant), TP4
-    (4160, 2560),  # GDN in_proj (padded variant), TP4
-    (2560, 1536),  # attention o_proj, TP4
-    (1280, 2560),  # MoE shared-expert gate_up, TP4
-    (2560, 640),  # MoE shared-expert down, TP4
-    (320, 2560),  # small-N router-class proj, TP4
-    (512, 2560),  # small-N gate-up proj, TP4
+    (8192, 1536),  # N boundary, admitted with a short K
+    (8192, 8192),  # N boundary, admitted above 96 MiB
+    (16480, 2048),  # smallest K admitted for a wide N
+    (24576, 2048),  # exactly 96 MiB
+    (16480, 2560),
+    (13312, 2560),
+    (2560, 6144),
+    (2560, 2560),
+    (4160, 2560),
+    (2560, 1536),
+    (1280, 2560),
+    (2560, 640),
+    (640, 2560),
+    (320, 2560),
 ]
 
-# Must keep the original GEMM: microbenchmark losers (full-N projections, LM
-# head) and K misaligned to the 128-element CuTe DSL tile.
+# Decode row counts up to the small-M bound, including ones between buckets.
+ADMITTED_ROWS = [1, 2, 3, 4, 8, 17, 32]
+
+# Keep the original GEMM, one step past each boundary.
 NON_ADMITTED = [
-    (13312, 2560),  # full-N qkv-class projection
-    (16480, 2560),  # full-N GDN in_proj
-    (248320, 2560),  # LM head
-    (2560, 4104),  # K % 8 == 0 but K % 128 != 0
+    (8320, 1536),  # N > 8192 with K < 2048
+    (16480, 1920),  # K just below 2048 for a wide N
+    (24576, 2176),  # wide N, K >= 2048, above 96 MiB
+    (248320, 2560),  # an LM head
+    (2560, 4104),  # K % 128 != 0
 ]
 
 
@@ -81,13 +91,13 @@ def tuned():
     AutoTuner.get().clear_cache()
     with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
         for n, k in SHAPES:
-            for m in (1, 2, 3, 4):
+            for m in (1, 2, 4, 8, 16, 32):
                 x, w = inputs(m, n, k, 19)
                 mm(x, w)
 
 
 @pytest.mark.parametrize("n,k", SHAPES)
-@pytest.mark.parametrize("m", [1, 2, 3, 4])
+@pytest.mark.parametrize("m", ADMITTED_ROWS)
 def test_admitted_projection_eager_and_graph(n, k, m):
     x, w = inputs(m, n, k, 7)
     storage = torch.full((m * n + 32,), 42, device="cuda", dtype=torch.bfloat16)
@@ -95,6 +105,14 @@ def test_admitted_projection_eager_and_graph(n, k, m):
     assert fi.flashinfer_joint_bf16_supported(x, w, out)
     assert mm(x, w, out=out) is out
     check_result(out, x, w)
+    # The measured small-N projection uses the pinned CuTe DSL tile under PDL.
+    if fi.prefer_bf16_small_n_splitk(m, n, k, enable_pdl=pdl_enabled()):
+        expected = fi.flashinfer_mm_bf16_small_n_splitk(
+            x, w, None, None, x.dtype, enable_pdl=True
+        )
+    else:
+        expected = fi.flashinfer_bf16_gemm(x, w, None)
+    assert torch.equal(expected, out)
     # The graph replay contract needs a deterministic runner.
     assert torch.equal(mm(x, w), out)
     stream = torch.cuda.Stream()
@@ -116,13 +134,29 @@ def test_admitted_projection_eager_and_graph(n, k, m):
 
 
 @pytest.mark.parametrize("n,k", SHAPES)
-@pytest.mark.parametrize("m", [5, 32])
-def test_larger_rows_keep_original_gemm(n, k, m):
+@pytest.mark.parametrize("m", [33, 64])
+def test_larger_rows_leave_the_joint_gemm(n, k, m):
     x, w = inputs(m, n, k, 99)
     out = torch.empty(m, n, dtype=x.dtype, device=x.device)
     with pytest.raises(ValueError, match="Unsupported input"):
         fi.flashinfer_bf16_gemm(x, w, out)
-    assert torch.equal(mm(x, w, out=out), x @ w.T)
+    # Rows the TGV policy admits under PDL take its tile.
+    tactic = fi.flashinfer_tgv_decode_tactic(x, w, out)
+    tile = fi.select_tgv_decode_tile(
+        m=m,
+        n=n,
+        k=k,
+        weight_bytes=w.numel() * w.element_size(),
+        arch=fi.platform.arch_version,
+        sm_count=fi.platform.sm_count,
+        pdl=pdl_enabled(),
+    )
+    assert (tactic is None) == (tile is None)
+    expected = (
+        x @ w.T if tactic is None else fi.flashinfer_tgv_decode_gemm(x, w, None, tactic)
+    )
+    assert torch.equal(mm(x, w, out=out), expected)
+    check_result(out, x, w)
 
 
 @pytest.mark.parametrize("n,k", NON_ADMITTED)
@@ -132,7 +166,7 @@ def test_non_admitted_shapes_keep_original_gemm(n, k):
     assert torch.equal(mm(x, w), x @ w.T)
 
 
-@pytest.mark.parametrize("m", [1, 4])
+@pytest.mark.parametrize("m", [1, 4, 32])
 def test_pdl_and_cancellation(m):
     n, k = 2560, 1536
     x, w = inputs(m, n, k, 91)
