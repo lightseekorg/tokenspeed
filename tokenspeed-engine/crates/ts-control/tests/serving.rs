@@ -7556,7 +7556,6 @@ async fn a_non_storage_flush_refusal_keeps_an_existing_backup_attached() {
 async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_generation() {
     for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
         let late = Gate::closed();
-        let scheduler_handle = Arc::new(Mutex::new(None));
         let remote = Arc::new(MemoryStore::new());
         let stores = vec![
             Arc::new(StorageProbe {
@@ -7578,7 +7577,6 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
                 device_pages: Some(33),
                 l3_host_blocks: Some(32),
                 l3_stores: stores.clone(),
-                scheduler: Some(scheduler_handle.clone()),
                 ..Setup::default()
             },
         )
@@ -7679,16 +7677,29 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         // its late result keeps the old keys. Best-effort backups rejected
         // while that worker was full are not replayed automatically.
         late.open();
-        let scheduler = scheduler_handle.lock().unwrap().clone().unwrap();
+        let schedulers: Vec<SharedScheduler> = engine
+            .ranks
+            .iter()
+            .map(|rank| rank.scheduler.lock().unwrap().clone().unwrap())
+            .collect();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(scheduler) = scheduler.try_lock() {
-                    let stats = scheduler.storage_stats();
-                    // Every owner's native result has reached agreement:
-                    // the old mixed-retirement ticket is now quarantined.
-                    if stats.quarantined > 0 && stats.operations == stats.retained_operations {
-                        break;
-                    }
+                let schedulers = schedulers.clone();
+                // Queue real waiters: a mirror without the frontend never
+                // waits idle, so it hands its scheduler only to a queued
+                // locker at its per-round fairness bump, never to try_lock.
+                let retired = tokio::task::spawn_blocking(move || {
+                    schedulers.iter().all(|scheduler| {
+                        let stats = scheduler.lock().storage_stats();
+                        // Every owner's native result has reached agreement:
+                        // the old mixed-retirement ticket is now quarantined.
+                        stats.quarantined > 0 && stats.operations == stats.retained_operations
+                    })
+                })
+                .await
+                .unwrap();
+                if retired {
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
