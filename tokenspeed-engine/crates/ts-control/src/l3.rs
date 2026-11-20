@@ -578,7 +578,10 @@ mod tests {
         for mirrored in outcomes {
             // Even the owners whose own sources retired must retain the
             // same scheduler ticket and virtual Host blocks as their peer.
-            assert_eq!(mirrored[0].as_ref().unwrap().done, [expected.clone()]);
+            assert_eq!(
+                mirrored[0].as_ref().unwrap().done.as_slice(),
+                std::slice::from_ref(&expected)
+            );
         }
     }
 

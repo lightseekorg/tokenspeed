@@ -69,11 +69,8 @@ impl InFlightPuts {
         let mut claimed = self.keys.lock().expect("Mooncake in-flight PUT lock");
         let entries = candidates
             .iter()
-            .filter_map(|&index| {
-                claimed
-                    .insert(keys[index].clone())
-                    .then(|| (index, keys[index].clone()))
-            })
+            .filter(|&&index| claimed.insert(keys[index].clone()))
+            .map(|&index| (index, keys[index].clone()))
             .collect();
         PutClaim {
             registry: self,

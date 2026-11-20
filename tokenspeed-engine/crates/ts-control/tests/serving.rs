@@ -138,18 +138,16 @@ enum Tiers {
 /// shard, so the Device keeps 512 usable Full blocks (64 on
 /// `HostL2WriteBackForcedRetraction`) and a tier with Host pages 1024, the
 /// counts the tests' numbers rely on.
-fn new_scheduler(
-    tiers: Tiers,
-    role: Role,
-    kv_shard_count: usize,
-    device_pages: usize,
-    resident_requests: usize,
-    deferred: bool,
-    host_blocks: usize,
-    l3_default_pressure: bool,
-) -> Scheduler {
+fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, setup: &Setup) -> Scheduler {
     interpreter();
-    let policy = if deferred { "Deferred" } else { "Early" };
+    let device_pages = setup.device_pages.unwrap_or(513);
+    let resident_requests = setup.resident_requests.unwrap_or(8);
+    let host_blocks = setup.l3_host_blocks.unwrap_or(1024);
+    let policy = if setup.deferred_allocation {
+        "Deferred"
+    } else {
+        "Early"
+    };
     let role = match role {
         Role::Plain => "Fused",
         Role::Prefill => "P",
@@ -191,7 +189,11 @@ fn new_scheduler(
                  storage_pressure_high, storage_pressure_low)"
         }
     };
-    let l3_default_pressure = if l3_default_pressure { "True" } else { "False" };
+    let l3_default_pressure = if setup.l3_default_pressure {
+        "True"
+    } else {
+        "False"
+    };
     let code = format!(
         r#"
 import tokenspeed_scheduler as ts
@@ -1753,10 +1755,19 @@ fn run_rank<F: Frontend>(
     let tp_first = rank / tp_size * tp_size;
     let replica = Group::new(1, (tp_first..tp_first + tp_size).collect(), rank).unwrap();
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
+    let role = setup.pd.as_ref().map_or(Role::Plain, |pd| pd.role);
+    let kv_shard_count = match layout {
+        Layout::TpKvp(_, shards) => shards,
+        _ => 1,
+    };
+    let scheduler = Arc::new(parking_lot::Mutex::new(new_scheduler(
+        tiers,
+        role,
+        kv_shard_count,
+        &setup,
+    )));
     let Setup {
-        device_pages,
         metrics_dir,
-        resident_requests,
         pd,
         eplb,
         grammar,
@@ -1767,7 +1778,6 @@ fn run_rank<F: Frontend>(
         deferred_allocation,
         ..
     } = setup;
-    let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
     let outputs = OutputProcessor::new(
         None,
         1,
@@ -1803,21 +1813,7 @@ fn run_rank<F: Frontend>(
         dp,
         ep,
     };
-    let kv_shard_count = match layout {
-        Layout::TpKvp(_, shards) => shards,
-        _ => 1,
-    };
     // Attached once the startup requests ran, as the host does.
-    let scheduler = Arc::new(parking_lot::Mutex::new(new_scheduler(
-        tiers,
-        role,
-        kv_shard_count,
-        device_pages.unwrap_or(513),
-        resident_requests.unwrap_or(8),
-        deferred_allocation,
-        setup.l3_host_blocks.unwrap_or(1024),
-        setup.l3_default_pressure,
-    )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
     }
