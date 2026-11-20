@@ -314,9 +314,10 @@ def test_warmup_covers_every_row_count_in_its_range() -> None:
 
 
 def test_token_counts_reuse_one_compilation_without_warmup() -> None:
-    """Token counts are runtime values of both sorted GEMMs: after one call
-    per tile configuration (64-row blocks at 192-256 and 513-1280 rows here,
-    128-row blocks at 257-512), counts in every integer-specialization class
+    """Token counts are runtime values of both sorted GEMMs and of the scale
+    gather: after one call per tile configuration (64-row blocks at 192-256
+    and 513-1280 rows here, 128-row blocks at 257-512), with warm counts that
+    are not multiples of 16, counts in every integer-specialization class
     (multiples of 16 and not) reuse the compiled kernels."""
     g = torch.Generator(device="cuda").manual_seed(13)
     w = _experts(
@@ -336,10 +337,11 @@ def test_token_counts_reuse_one_compilation_without_warmup() -> None:
         moe_sorted_down(data, scales, routes, weight, out)
 
     run(300)
-    run(640)
+    run(645)
     with assert_no_triton_compile(
         prefill_stage1.gluon_mxfp4_moe_stage1_kernel,
         prefill_stage2.gluon_mxfp4_moe_stage2_1x2_kernel,
+        scale._gather_package_cdna4_scale_kernel,
     ):
         for rows in (192, 199, 208, 257, 511, 512, 1023, 1025, 1100):
             run(rows)

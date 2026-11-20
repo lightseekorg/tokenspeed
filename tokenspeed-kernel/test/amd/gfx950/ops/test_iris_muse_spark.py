@@ -1635,7 +1635,8 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
         )
 
     # 128 rows exceed the pull variant's 84 ready flags; Lamport needs none.
-    # 129-172 rows end in a padded 32-row scale panel.
+    # 129 and 172 rows end in a padded 32-row scale panel; 160 ends exactly
+    # on a panel boundary.
     for rows in (1, 3, 16, 128, 129, 160, 172):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, width),))[0]
