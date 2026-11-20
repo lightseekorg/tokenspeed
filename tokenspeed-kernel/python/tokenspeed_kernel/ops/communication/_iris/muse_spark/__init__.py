@@ -2270,6 +2270,11 @@ class MuseIrisState:
             and weight.device == local.device
             and weight.is_contiguous()
             and self._lamport_gathers_rmsnorm_mxfp4(local)
+            # The BF16 output matches the separate norm within one ulp, not
+            # bit for bit, so it stays inside the one-shot window it is
+            # tested in; the rest of the slot serves only the bit-exact
+            # quantizing gather.
+            and local.shape[0] * local.shape[1] <= self.reduction.lamport_max_numel
             # Four waves push one word of the shard each and poll whole
             # 16-column runs of the row.
             and local.shape[1] // 2 >= 256

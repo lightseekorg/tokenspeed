@@ -235,6 +235,26 @@ def test_a_pin_that_does_not_reproduce_the_default_keeps_every_default():
     assert "Gemm_Hipblaslt_431442 at (N, K, rows) (8192, 4096, 72)" in lines[0]
 
 
+def test_a_first_call_during_graph_capture_leaves_the_pins_for_the_next_call():
+    # A fresh process, so this call is the first to consult the pins.
+    script = textwrap.dedent("""
+        import json, torch
+        from tokenspeed_kernel.ops.gemm import rocm_blas
+        state = rocm_blas._PinState(rocm_blas._PINS, rocm_blas._PINNED_BUILD)
+        x = torch.randn(8, 8, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            capturing = bool(state.resolve())
+            y = x + 1
+        print(json.dumps({"capturing": capturing, "after": bool(state.resolve())}))
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert report == {"capturing": False, "after": True}
+
+
 def test_another_build_or_enabled_tunableop_keeps_default_gemms(caplog):
     results = torch.cuda.tunable.get_results()
     other_build = rocm_blas._PinState(rocm_blas._PINS, (("PT_VERSION", "0.0.0"),))

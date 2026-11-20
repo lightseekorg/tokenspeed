@@ -152,6 +152,11 @@ class _PinState:
     def resolve(self) -> dict[tuple[int, int], tuple[tuple[int, int, str], ...]]:
         """This device's pins, activating them on the first call; {} if none apply."""
         if self.pins is None:
+            if torch.cuda.is_current_stream_capturing():
+                # Activation compares GEMM outputs on the host, which a
+                # capturing stream does not allow: keep the defaults for this
+                # call and let the next eager call activate the pins.
+                return {}
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             key = device_key(props)
             pins = self.table.get(key, {})
@@ -159,10 +164,6 @@ class _PinState:
                 reason = "its PCI device id is unreadable"
             elif not pins:
                 reason = "no pins are listed for it"
-            elif torch.cuda.is_current_stream_capturing():
-                # The check below compares GEMM outputs on the host, which a
-                # capturing stream does not allow.
-                reason = "first consulted during CUDA graph capture"
             else:
                 reason = self._activate(pins)
             device = f"{props.name} {key}"

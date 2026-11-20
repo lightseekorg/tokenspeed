@@ -310,6 +310,13 @@ def _lamport_gather_rmsnorm_worker(rank, world_size, device):
     width = 4096
     local_width = width // world_size
     weight = torch.linspace(-0.5, 0.5, width, device=device).to(torch.bfloat16)
+    # The BF16 gather stays inside the one-shot window; the rest of the slot
+    # serves only the quantizing gather.
+    past_window = state.reduction.lamport_max_numel // local_width + 1
+    assert not state.can_all_gather_rmsnorm(
+        torch.empty(past_window, local_width, dtype=torch.bfloat16, device=device),
+        weight,
+    )
     for rows in (1, 8, 16, 64):
         gen = torch.Generator(device=device).manual_seed(rows)
         full = torch.randn(rows, width, generator=gen, device=device).to(torch.bfloat16)
