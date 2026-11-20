@@ -445,11 +445,14 @@ def test_copy_page_fields_matches_host_expansion_without_recompiling(
         )
 
 
+@pytest.mark.parametrize("shape", [(4, 8, 16), (3, 7, 9)])
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_store_state_rows_skips_negative_blocks_without_recompiling(
-    device: str,
+    device: str, shape: tuple[int, int, int], transposed: bool, dtype: torch.dtype
 ) -> None:
-    heads, key, value = 4, 8, 16
-    slab = torch.zeros((12, heads, key, value), dtype=torch.bfloat16, device=device)
+    heads, key, value = shape
+    slab = torch.full((12, heads, key, value), -7, dtype=dtype, device=device)
     # Page-interleaved slab view, as the arena hands out.
     strided = slab.as_strided(
         (6, heads, key, value), (2 * heads * key * value, key * value, value, 1)
@@ -457,23 +460,29 @@ def test_store_state_rows_skips_negative_blocks_without_recompiling(
 
     def run(blocks: list[int]) -> None:
         strided.zero_()
-        states = torch.randn(
-            (len(blocks), heads, value, key), dtype=torch.float32, device=device
-        ).transpose(-1, -2)
-        expected = strided.clone()
+        if transposed:
+            states = torch.randn(
+                (len(blocks), heads, value, key), dtype=torch.float32, device=device
+            ).transpose(-1, -2)
+        else:
+            states = torch.randn(
+                (len(blocks), heads, key, value), dtype=torch.float32, device=device
+            )
+        expected = slab.clone()
         for row, block in enumerate(blocks):
             if block >= 0:
-                expected[block] = states[row].to(torch.bfloat16)
+                expected[2 * block] = states[row].to(dtype)
         store_state_rows(
             states, strided, torch.tensor(blocks, dtype=torch.int32, device=device)
         )
-        torch.testing.assert_close(strided, expected, rtol=0, atol=0)
+        torch.testing.assert_close(slab, expected, rtol=0, atol=0)
 
     run([1, -1, 3])
     with assert_no_triton_compile(_store_state_rows_kernel):
         run([5])
         run([2, 4, -1, -1, 1, 0])
         run([-1, -1])
+        run(list(range(6)) + [-1] * 10)
 
     with pytest.raises(ValueError, match="one destination"):
         store_state_rows(
@@ -481,6 +490,24 @@ def test_store_state_rows_skips_negative_blocks_without_recompiling(
             strided,
             torch.zeros(3, dtype=torch.int32, device=device),
         )
+
+
+def test_store_state_rows_large_offsets(device: str) -> None:
+    if torch.cuda.mem_get_info()[0] < 9 * 1024**3:
+        pytest.skip("large-offset test requires 9 GiB free")
+    shape = (2, 7, 9)
+    width = 2 * 7 * 9
+    row_stride = 2**31 + 128
+    backing = torch.empty(row_stride + 2 * width, dtype=torch.float32, device=device)
+    states = backing.as_strided((2, *shape), (row_stride, 63, 9, 1))
+    slab = backing[width:].as_strided((2, *shape), (row_stride, 63, 9, 1))
+    states[1].copy_(torch.arange(width, device=device).reshape(shape))
+    slab.fill_(-7)
+    store_state_rows(
+        states, slab, torch.tensor([-1, 1], dtype=torch.int32, device=device)
+    )
+    torch.testing.assert_close(slab[1], states[1], rtol=0, atol=0)
+    torch.testing.assert_close(slab[0], torch.full_like(slab[0], -7), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 32])
