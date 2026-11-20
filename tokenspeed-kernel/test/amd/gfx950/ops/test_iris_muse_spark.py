@@ -2569,8 +2569,8 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
 
 
 def _int8_block16_round_trip(x):
-    """decode(encode(x)) of the int8-block16 reference (79's encoder /
-    decoder), computed on the CPU and returned on x's device."""
+    """decode(encode(x)) of the int8-block16 reference encoder and
+    decoder, computed on the CPU and returned on x's device."""
     blocks = x.cpu().reshape(-1, 16).float()
     scale = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
     # INT8 codes have no negative zero.
@@ -3558,7 +3558,7 @@ def test_muse_collective_replay(check, backend, world_size):
 
 
 def _int8_block16_payloads(seed):
-    """79's int8_block16_ref payload families [4096, 2048] (BF16): Gaussian,
+    """The int8-block16 reference's payload families [4096, 2048] (BF16): Gaussian,
     Student t (3 dof, from the global generator seeded 0), Gaussian with
     sparse 100x outliers, and exact ties / zeros."""
     torch.manual_seed(0)
@@ -3583,8 +3583,8 @@ def _int8_block16_payloads(seed):
 
 
 def test_int8_block16_encode_matches_the_reference_bit_for_bit():
-    """Codes, scales and the decoded payload equal 79's reference encoder /
-    decoder on its four payload families (its SHA-256 digests of the decoded
+    """Codes, scales and the decoded payload equal the reference encoder and
+    decoder on its four payload families (digests are SHA-256 of the decoded
     BF16, first 16 hex)."""
     import hashlib
 
