@@ -209,11 +209,21 @@ std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler) {
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
     rust::Vec<PeerLookupView> out;
     for (const tokenspeed::PeerLookupRequest& lookup : scheduler.TakePeerLookups()) {
-        out.push_back(PeerLookupView{.lease = ToView(lookup.lease),
+        out.push_back(PeerLookupView{.request_id = rust::String(lookup.request_id),
+                                     .deadline_us = lookup.deadline_us,
+                                     .lease = ToView(lookup.lease),
                                      .holder = rust::String(lookup.holder),
                                      .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                      .tokens = ToRustVec(lookup.tokens),
                                      .max_tokens = lookup.max_tokens});
+    }
+    return out;
+}
+
+rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler) {
+    rust::Vec<PinSampleView> out;
+    for (const auto& sample : scheduler.TakePeerPinSamples()) {
+        out.push_back(PinSampleView{.held_us = sample.held_us, .remaining_us = sample.remaining_us, .expired = sample.expired});
     }
     return out;
 }

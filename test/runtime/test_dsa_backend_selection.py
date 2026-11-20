@@ -61,6 +61,7 @@ def _config(monkeypatch, device, backend_name, **overrides):
     packed_width = overrides.pop("packed_width", 576)
     spec = DSAConfig(
         backend_name=backend_name,
+        paged_backend_cls=overrides.pop("paged_backend_cls", None),
         num_attention_heads=64,
         num_kv_heads=1,
         attn_tp_size=8,
@@ -102,6 +103,23 @@ def test_dsa_name_resolves_to_the_device_implementation(name):
     )
     validate_attention_backend_name(name, flag="--attention-backend")
     assert _get_backend_cls(name, AttentionArch.DSA) is expected
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize("name", [None, "dsa"])
+def test_dsa_storage_accepts_a_selected_numerical_backend(monkeypatch, device, name):
+    class ModelDSABackend(backends.dsa.DSABackend):
+        pass
+
+    config, _ = _config(monkeypatch, device, name, paged_backend_cls=ModelDSABackend)
+    assert config.kvp_size == 8
+    assert _get_backend_cls(name, AttentionArch.DSA, config) is ModelDSABackend
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_dsa_storage_rejects_unregistered_backend_names(monkeypatch, device):
+    with pytest.raises(ValueError, match="kv-parallel-size"):
+        _config(monkeypatch, device, "plugin_dsa_numerics")
 
 
 @pytest.mark.parametrize("name", [None, "dsa"])

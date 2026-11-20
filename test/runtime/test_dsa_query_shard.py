@@ -126,6 +126,7 @@ def _backend(
     backend._prefill_page_table = None
     backend._history_workspace = None
     backend._dense_backend = SimpleNamespace(
+        preallocate_prefill_workspace=lambda pool_options=None: 0,
         init_forward_metadata=lambda *args, **kwargs: None,
         chunked_prefill_metadata=None,
         forward_decode_metadata=None,
@@ -175,8 +176,8 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     )  # two groups: balance 6 + 5, 5 into 6, 5 + 5
     plan = _plan(rank)
     delegate_calls = []
-    backend._dense_backend.init_forward_metadata = (
-        lambda *a, **kw: delegate_calls.append(kw)
+    backend._dense_backend.init_forward_metadata = lambda *a, **kw: (
+        delegate_calls.append(kw)
     )
     _init(backend, plan)
     # The dense delegate sees the whole span and no shard.
@@ -1143,10 +1144,11 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
     target = _history_backend(0)
     staged = []
     linear = SimpleNamespace(
+        preallocate_prefill_workspace=lambda pool_options=None: 0,
         preallocate_verify_workspace=lambda max_bs, width: staged.append(
             (max_bs, width)
         )
-        or 64
+        or 64,
     )
     _prepare_fixed_workspaces(
         server_args=SimpleNamespace(speculative_num_draft_tokens=2),

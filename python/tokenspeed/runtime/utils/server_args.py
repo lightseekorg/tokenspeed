@@ -1368,15 +1368,7 @@ class ServerArgs:
         ):
             _require_choice(flag, value, choices)
         if self.sampling_backend is None:
-            # ``flashinfer`` is the only built-in backend that respects per-request
-            # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
-            # (see ``GreedySamplingBackend.sample``: *"sampling_info is ignored
-            # for single-step (always argmax)"*) — fast for hand-tuned greedy
-            # decoding but silently wrong for any serving deployment where
-            # requests carry sampling params, since the model collapses into
-            # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA and Ascend; users can
-            # still opt into greedy explicitly via ``--sampling-backend greedy``.
+            # Choose the platform sampler that respects request-level parameters.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
@@ -1535,10 +1527,6 @@ class ServerArgs:
             if self.disaggregation_mode != "prefill":
                 raise ValueError(
                     "Peer expert weights currently require a prefill instance"
-                )
-            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
-                raise ValueError(
-                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
                 )
             if self.mapping.requires_forward_coordination:
                 raise ValueError(
@@ -2392,16 +2380,17 @@ class ServerArgs:
         self.moe_cutlass_fused_finalize = False
         # MoE keeps auto or the user's provider restriction. The expert
         # plan checks the batch_invariant feature against actual layer geometry.
-        # Sampling: greedy rows must break exact logit ties canonically, and
-        # sampled rows must draw from a stream the co-batch cannot move.
-        if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
-            raise ValueError(
-                f"--numerics {self.numerics} needs a sampling backend with "
-                "canonical greedy tie-breaking "
-                f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
-                f"{self.sampling_backend} resolves exact ties in reduction order"
-            )
-        self.sampling_stream = "per-request"
+        # The NPU alignment contract compares model logits for the same history.
+        # Serving keeps its configured sampler and random stream.
+        if self.device != "npu":
+            if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
+                raise ValueError(
+                    f"--numerics {self.numerics} needs a sampling backend with "
+                    "canonical greedy tie-breaking "
+                    f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
+                    f"{self.sampling_backend} resolves exact ties in reduction order"
+                )
+            self.sampling_stream = "per-request"
         # Keep the trainer's selection order. The envelope still requires
         # batch-invariant top-k and attention leaves.
         self.dsa_slot_order = "selection"
@@ -2611,8 +2600,7 @@ class ServerArgs:
         # startup prefixes would delete an L3 store's shared namespace.
         if self.disaggregation_mode != "null":
             raise ValueError(
-                "--enable-startup-requests is not supported with "
-                "--disaggregation-mode"
+                "--enable-startup-requests is not supported with --disaggregation-mode"
             )
         if self.kvstore_storage_backend is not None:
             raise ValueError(
