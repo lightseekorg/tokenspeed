@@ -36,7 +36,6 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_verify_conv_update,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
-    _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
     triton_nvidia_kda_fused_paged_verify_split,
 )

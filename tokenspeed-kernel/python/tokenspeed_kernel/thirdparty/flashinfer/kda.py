@@ -253,6 +253,8 @@ def cutedsl_kda_prefill(
         cu_seqlens: Device int64 boundaries [sequences + 1]. Live lengths may
             change on replay and their sum may be less than token capacity;
             input rows beyond the live total must be zero, as in the runtime.
+            Every sequence must be non-empty; unused capacity slots scan one
+            zero-padded token each.
         lower_bound: Negative safe-gate bound, fixed for the model.
 
     Returns:
