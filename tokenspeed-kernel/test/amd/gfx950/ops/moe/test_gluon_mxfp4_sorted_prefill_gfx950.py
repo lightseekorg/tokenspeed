@@ -314,11 +314,14 @@ def test_warmup_covers_every_row_count_in_its_range() -> None:
 
 
 def test_token_counts_reuse_one_compilation_without_warmup() -> None:
-    """Token counts are runtime values of both sorted GEMMs and of the scale
+    """Token counts reuse one compiled kernel per tile configuration.
+
+    Token counts are runtime values of both sorted GEMMs and of the scale
     gather: after one call per tile configuration (64-row blocks at 192-256
     and 513-1280 rows here, 128-row blocks at 257-512), with warm counts that
     are not multiples of 16, counts in every integer-specialization class
-    (multiples of 16 and not) reuse the compiled kernels."""
+    (multiples of 16 and not) reuse the compiled kernels.
+    """
     g = torch.Generator(device="cuda").manual_seed(13)
     w = _experts(
         _codes(g, EXPERTS, 2 * INTER, HIDDEN // 2),
