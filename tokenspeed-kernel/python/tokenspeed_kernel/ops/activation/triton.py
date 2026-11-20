@@ -2016,6 +2016,17 @@ def _mul_rn_f32(left, right):
 
 
 @triton.jit
+def tanh_softcap_value(x, inv_cap, cap):
+    """:func:`tanh_softcap` of FP32 ``x`` in registers, the kernel's steps:
+    ``inv_cap`` and ``cap`` are :func:`tanh_softcap_scalars`."""
+    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
+    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
+    y = _mul_rn_f32(x, inv_cap)
+    y = libdevice.tanh(y)
+    return _mul_rn_f32(y, cap)
+
+
+@triton.jit
 def _tanh_softcap_kernel(
     x_ptr,
     out_ptr,
@@ -2029,11 +2040,7 @@ def _tanh_softcap_kernel(
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < n_cols
     x = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
-    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
-    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
-    y = _mul_rn_f32(x, inv_cap)
-    y = libdevice.tanh(y)
-    y = _mul_rn_f32(y, cap)
+    y = tanh_softcap_value(x, inv_cap, cap)
     tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
 
 

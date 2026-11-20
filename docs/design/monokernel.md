@@ -39,6 +39,29 @@ between a launch and a regular layer. A draft model that takes the switch
 rule as the target: its layers, and its other launches (a context write, a
 draft head), are all packed at startup or startup fails.
 
+A model that runs some layers several times in a forward (a looped core:
+each run is a visit with its own caches) launches every visit or none, and
+each visit has its own launch tag. When a visit's regular forward computes
+an input between its sublayers from state the launch does not hold, the
+visit may run as two launches, its attention part and its MoE part, with
+the regular path's ops computing the part's input before each (a looped
+Inkling2 core's later passes gate the previous pass's message into the MoE
+input, which mixes the attention output). A part's boundary is the
+residual state and the part's output, as between two layers, so no
+pending state crosses a part. The model's kernel README names the parts.
+
+A model whose regular layers already hand over a complete boundary that is
+not a hidden state, such as a residual state of pending terms, may launch a
+fixed subset of its layers in a forward: each launch takes exactly that
+boundary from the layer before it and returns it for the layer after it, so a
+launch never sees half of a regular layer, and the regular layers between two
+launches only see the boundary. Which layers launch is fixed at startup and
+depends on the forward alone, so every rank launches the same layers. The
+model's kernel README names the subset, why the other layers keep the
+regular code, and how the peer copies alternate when a step's count of
+launches is odd (the regular layers' collectives between the last launch of
+a step and the first of the next keep the ranks within one launch).
+
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the recurrent state pages, and the other per-request caches exactly as the
 regular decode path does. Prefill, the regular decode path, and the monokernel
@@ -47,12 +70,19 @@ its k and v) reach later stages through mailboxes, not through the cache.
 A cache write by another CTA in the same launch need not be visible yet (the
 caches need not be coherent between CTAs).
 
-**Same math, not the same bits.** A monokernel follows the regular path's
-numerics: the same activation quantization for each projection, and rounding
-where the regular path's kernels round. Summation orders differ, and so do the
-split boundaries of a split softmax, so results are not bitwise equal. Tests
-compare each stage with a torch reference of TokenSpeed's math, with tight
-tolerances per stage and looser ones per layer.
+**Same math; the same bits where the model promises them.** A monokernel
+follows the regular path's numerics: the same activation quantization for each
+projection, and rounding where the regular path's kernels round. Tests compare
+each stage with a torch reference of TokenSpeed's math, with tight tolerances
+per stage and looser ones per layer. A model's monokernel may go further and
+equal the regular kernels bit for bit: each stage then reproduces the kernel it
+replaces at that kernel's decode launch (its MFMA shapes and K orders, split
+boundaries and partial-sum orders, reduction layouts, transcendental functions
+and FP contraction), and its test compares the two with `torch.equal`. Prefer
+it: speculative decoding then accepts exactly the regular path's tokens, while
+last-bit differences can flip greedy continuations that sit on near ties
+(random-token benchmark prompts do) and move acceptance either way. Inkling2's
+monokernel is bit-identical; Qwen4-Exp's follows the math only.
 
 **One switch, monokernel layer classes.** `--decode-monokernel` is the one
 switch for every model. With it, the model's `get_layer` builds each decoder

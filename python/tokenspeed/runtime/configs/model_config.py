@@ -33,6 +33,7 @@ import yaml
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.inkling2 import Inkling2ModelConfig
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
@@ -104,9 +105,14 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
         "LongcatFlashForCausalLM",
     }
 )
-# Architectures whose config numbers only the cache-owning blocks as layers.
+# Architectures whose attention caches follow the config's cache_layer_types
+# rather than its decoder layers: configs that number only the cache-owning
+# blocks as layers, and looped Inkling2, whose repeated layers own a cache
+# per visit.
 _CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
     {
+        "Inkling2ForConditionalGeneration",
+        "Inkling2LoopForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
@@ -695,6 +701,36 @@ def _derive_num_attention_layers(
     return num_attention_layers
 
 
+def _configure_inkling2_loop(
+    server_args: ServerArgs | None, text_config: PretrainedConfig
+) -> None:
+    """Apply --inkling2-loop-num-passes and --inkling2-loop-share-cache to a
+    serving target's text config."""
+    if server_args is None:
+        return
+    num_passes = server_args.inkling2_loop_num_passes
+    share_cache = server_args.inkling2_loop_share_cache
+    if num_passes is None and not share_cache:
+        return
+    if not isinstance(text_config, Inkling2ModelConfig):
+        raise ValueError(
+            "--inkling2-loop-num-passes and --inkling2-loop-share-cache need an "
+            "inkling2_loop checkpoint"
+        )
+    default = text_config.num_loop_passes
+    # A model-free DUMMY draft reads no hidden states.
+    if (
+        server_args.speculative_algorithm not in (None, "DUMMY")
+        and num_passes is not None
+        and num_passes != default
+    ):
+        raise ValueError(
+            "Inkling2 DSpark drafts read hidden states at fixed layer visits; "
+            f"serve them at the checkpoint's {default} loop passes"
+        )
+    text_config.configure_loop(num_passes=num_passes, share_cache=share_cache)
+
+
 def _apply_constrained_decoding_policy(
     hf_config: PretrainedConfig,
     server_args: ServerArgs | None,
@@ -778,6 +814,8 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if not is_draft_worker:
+            _configure_inkling2_loop(server_args, self.hf_text_config)
         # A registered model states its own family facts; in-tree models
         # without a profile still resolve through the architecture tables.
         # Candidates are exactly the list the model loader walks, so the
@@ -1340,6 +1378,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "Inkling2ForConditionalGeneration",
+        "Inkling2LoopForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "MuseSparkForConditionalGeneration",
