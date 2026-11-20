@@ -3584,24 +3584,23 @@ def _int8_block16_payloads(seed):
 
 def _int8_block16_reference(x):
     """The definition: per 16 elements scale = max|x| / 127 (1e-30 / 127 for an
-    all-zero block), codes = rint(x / scale) clamped to [-127, 127], decode =
-    codes x scale rounded once to BF16. Returns (codes, scales, decoded)."""
+    all-zero block), codes = rint(x / scale) clamped to [-127, 127] as INT8.
+    Returns (codes, scales)."""
     blocks = x.reshape(-1, 16).float()
     scales = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
-    codes = torch.round(blocks / scales).clamp(-127.0, 127.0)
-    decoded = (codes * scales).bfloat16()
-    return codes.to(torch.int8).reshape(-1), scales.reshape(-1), decoded.reshape(-1)
+    codes = torch.round(blocks / scales).clamp(-127.0, 127.0).to(torch.int8)
+    return codes.reshape(-1), scales.reshape(-1)
 
 
 def test_int8_block16_encode_matches_the_reference_bit_for_bit():
-    """Codes, scales and the decoded payload equal the reference encoder and
-    decoder bit for bit on four payload families."""
+    """Codes and scales equal the reference encoder bit for bit on four
+    payload families; with them the decoded payload is determined."""
     from tokenspeed_kernel.ops.communication._iris.payload import (
         encode_int8_block16,
     )
 
     for name, x in _int8_block16_payloads(2026).items():
-        codes, scales, decoded = _int8_block16_reference(x)
+        codes, scales = _int8_block16_reference(x)
         device_codes = torch.empty(x.numel(), dtype=torch.int8, device="cuda")
         device_scales = torch.empty(x.numel() // 16, dtype=torch.float32, device="cuda")
         encode_int8_block16[(-(-x.numel() // 4096),)](
@@ -3611,15 +3610,6 @@ def test_int8_block16_encode_matches_the_reference_bit_for_bit():
         assert torch.equal(
             device_scales.cpu().view(torch.int32), scales.view(torch.int32)
         ), name
-        # Decode on the host, as the reference does: this test is about the
-        # encoder's codes and scales, and the collectives' tests cover the
-        # kernels' own decode.
-        device_decoded = (
-            (device_codes.cpu().float().view(-1, 16) * device_scales.cpu().view(-1, 1))
-            .bfloat16()
-            .reshape(-1)
-        )
-        assert torch.equal(device_decoded.view(torch.int16), decoded.view(torch.int16))
 
 
 def test_int8_block16_encode_indexes_past_2_31_elements():
@@ -3636,7 +3626,7 @@ def test_int8_block16_encode_indexes_past_2_31_elements():
     codes = torch.empty(elements, dtype=torch.int8, device="cuda")
     scales = torch.empty(elements // 16, dtype=torch.float32, device="cuda")
     encode_int8_block16[(-(-elements // 4096),)](x, codes, scales, elements, BLOCK=4096)
-    want_codes, want_scales, _ = _int8_block16_reference(tail)
+    want_codes, want_scales = _int8_block16_reference(tail)
     assert torch.equal(codes[-4096:].cpu(), want_codes)
     assert torch.equal(
         scales[-256:].cpu().view(torch.int32), want_scales.view(torch.int32)
