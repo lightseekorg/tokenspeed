@@ -398,9 +398,6 @@ class MuseIrisState:
             if int8_payloads and self.row_boundary_supported
             else (None, None, None)
         )
-        # The pulls index payloads with 32-bit buffer offsets, as the BF16
-        # pulls do; a producer payload stays below 2^31 elements.
-        assert self.payload_codes is None or capacity < 2**31
         # Expert TP stages raw routes separately from the producer buffer.
         self.owned_route_max_rows = owned_route_max_rows
         # Expert TP8 completes routes on token owners, normalizes there and

@@ -59,6 +59,7 @@ global_server_args_dict: dict = {
     "numerics": ServerArgs.numerics,
     "prefill_collective_payload": ServerArgs.prefill_collective_payload,
     "owned_attention_output": ServerArgs.owned_attention_output,
+    "owned_rows_max_tokens": ServerArgs.owned_rows_max_tokens,
     "speculative_rejection_sample_method": (
         ServerArgs.speculative_rejection_sample_method
     ),
@@ -142,6 +143,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "numerics": server_args.numerics,
             "prefill_collective_payload": server_args.prefill_collective_payload,
             "owned_attention_output": server_args.owned_attention_output,
+            "owned_rows_max_tokens": server_args.owned_rows_max_tokens,
             "speculative_rejection_sample_method": (
                 server_args.speculative_rejection_sample_method
             ),

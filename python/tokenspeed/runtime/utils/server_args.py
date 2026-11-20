@@ -344,6 +344,12 @@ def validate_context_parallel_roles(
         )
 
 
+# Muse Spark's --owned-attention-output choices.
+OWNED_ATTENTION_OUTPUTS = ("reduce-scatter", "all-to-all")
+# Main's owned-row cap; --owned-rows-max-tokens defaults to it.
+OWNED_ROWS_MAX_TOKENS_DEFAULT = 8192
+
+
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
     """Refuse a launch value outside ``flag``'s closed set of ``choices``.
 
@@ -820,13 +826,20 @@ class ServerArgs:
     # element instead of 2, and a numerics change. Decode and verify forwards
     # stay BF16.
     prefill_collective_payload: str = "bf16"
-    # Muse Spark: how owned-row prefill rounds return attention outputs to the
-    # token owners. "reduce-scatter": every rank projects its heads of all rows
-    # and the partial sums are reduce-scattered. "all-to-all": each owner
-    # receives its rows of every rank's heads and projects them through the
-    # whole output projection, gathered on every rank after loading (+1 full
-    # output weight a layer); fewer bytes, a different summation order.
+    # Muse Spark: how owned-row prefill (extend) forwards return attention
+    # outputs to the token owners. "reduce-scatter": every rank projects its
+    # heads of all rows and the partial sums are reduce-scattered.
+    # "all-to-all": each owner receives its rows of every rank's heads and
+    # projects them through the whole output projection, gathered on every
+    # rank after loading (+1 full output weight a layer); fewer bytes, a
+    # different summation order. Refused where Iris owned rows do not run.
     owned_attention_output: str = "reduce-scatter"
+    # Muse Spark: the most token rows a forward takes on the Iris owned-row
+    # layout; larger forwards replicate rows. The default is the layout's
+    # long-standing cap. Above it, forwards of up to this many rows move from
+    # the replicated path to owned rows, whose attention-output and expert sums
+    # use another summation order: a numerics change for those forwards.
+    owned_rows_max_tokens: int = OWNED_ROWS_MAX_TOKENS_DEFAULT
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -2345,6 +2358,22 @@ class ServerArgs:
 
         ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice(
+            "--owned-attention-output",
+            self.owned_attention_output,
+            OWNED_ATTENTION_OUTPUTS,
+        )
+        # The owned-row producer buffer holds this many full 8192-wide BF16
+        # rows and is addressed by 32-bit buffer offsets.
+        if not (
+            OWNED_ROWS_MAX_TOKENS_DEFAULT
+            <= self.owned_rows_max_tokens
+            <= (2**31 - 1) // (8192 * 2)
+        ):
+            raise ValueError(
+                f"--owned-rows-max-tokens must be in [{OWNED_ROWS_MAX_TOKENS_DEFAULT}, "
+                f"{(2**31 - 1) // (8192 * 2)}], got {self.owned_rows_max_tokens}"
+            )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
@@ -5217,11 +5246,22 @@ class ServerArgs:
             "--owned-attention-output",
             type=str,
             default=ServerArgs.owned_attention_output,
-            choices=["reduce-scatter", "all-to-all"],
-            help="Muse Spark: how owned-row prefill rounds return attention "
-            "outputs to the token owners. all-to-all sends each owner its rows "
-            "of every rank's heads and projects them through the whole output "
-            "projection (+1 output weight a layer; a numerics change).",
+            choices=list(OWNED_ATTENTION_OUTPUTS),
+            help="Muse Spark: how owned-row prefill (extend) forwards return "
+            "attention outputs to the token owners. all-to-all sends each owner "
+            "its rows of every rank's heads and projects them through the whole "
+            "output projection (+1 output weight a layer; a numerics change). "
+            "Refused where Iris owned rows do not run.",
+        )
+        parser.add_argument(
+            "--owned-rows-max-tokens",
+            type=int,
+            default=ServerArgs.owned_rows_max_tokens,
+            help="Muse Spark: the most token rows a forward takes on the Iris "
+            "owned-row layout (default 8192). Raising it moves larger forwards "
+            "from the replicated path to owned rows, whose attention-output and "
+            "expert sums use another summation order (a numerics change for "
+            "those forwards); it also sizes the owned-row buffers.",
         )
         parser.add_argument(
             "--prefill-collective-payload",

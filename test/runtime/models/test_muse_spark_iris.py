@@ -853,10 +853,39 @@ def _muse_tp_owned_forward_worker(
         dist.barrier()
 
 
+def _int8_block16_round_trip(x):
+    """decode(encode(x)) of the int8-block16 payload, by its definition."""
+    blocks = x.float().reshape(-1, 16)
+    scale = torch.clamp(blocks.abs().amax(1), min=1e-30) / 127.0
+    codes = torch.round(blocks / scale[:, None]).clamp(-127.0, 127.0)
+    return (codes * scale[:, None]).to(torch.bfloat16).reshape(x.shape)
+
+
+def _muse_owned_rows_default_cap_worker(rank, world_size, device):
+    """At the default --owned-rows-max-tokens (8192) the owned-row buffers are
+    sized as before the flag existed, and 8192 rows take owned rows, 8193 not."""
+    torch.set_grad_enabled(False)
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    assert global_server_args_dict["owned_rows_max_tokens"] == 8192
+    _, state = _prepare_muse_backend(
+        world_size, None, None, expert_tp_size=1, max_num_tokens=24577
+    )
+    assert state.all_reduce.producer.data.numel() == 8192 * 8192
+    assert (
+        state.all_reduce.producer_pull.scratch.numel()
+        == (8192 * 8192 + world_size - 1) // world_size
+    )
+    assert state.can_use_owned_rows(8192) and not state.can_use_owned_rows(8193)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 def _muse_owned_far_rows_worker(rank, world_size, device):
-    """Owned rows at the row cap use the last element of the producer buffer
-    and of pull scratch bit for bit, and row counts up to the cap compile
-    nothing new."""
+    """Owned rows at --owned-rows-max-tokens 24576 use the last element of the
+    producer buffer and of pull scratch bit for bit (reduce-scatter in BF16 and
+    int8-block16, row gathers, both QKVG all-to-alls, the heads all-to-all and
+    the MoE-input gather), and row counts up to the cap compile nothing new."""
     torch.set_grad_enabled(False)
     torch.set_default_dtype(torch.bfloat16)
     from tokenspeed_kernel.ops.communication._iris.all_gather import (
@@ -866,18 +895,22 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
         prepare_muse_communication,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_heads_to_owners,
         iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
     )
     from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
         iris_pull_reduce_scatter,
     )
 
-    from tokenspeed.runtime.models.muse_spark import (
-        MUSE_OWNED_ROWS_MAX_TOKENS,
-        QKVOGateParallelLinear,
-    )
+    from tokenspeed.runtime.models.muse_spark import QKVOGateParallelLinear
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    cap = MUSE_OWNED_ROWS_MAX_TOKENS
+    cap = 24576
+    # The served recipe's cap, with int8-block16 payloads prepared too. This
+    # worker runs in its own spawned process.
+    global_server_args_dict["owned_rows_max_tokens"] = cap
+    global_server_args_dict["prefill_collective_payload"] = "int8-block16"
     with torch.device(device):
         projection = QKVOGateParallelLinear(
             hidden_size=8192,
@@ -948,6 +981,13 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
             total += contribution.float()
         reduced_rows = total.bfloat16()
         del total
+        int8_parts = [_int8_block16_round_trip(c) for c in contributions]
+        total8 = int8_parts[0].float()
+        for part in int8_parts[1:]:
+            total8 += part.float()
+        int8_rows = total8.bfloat16()
+        del total8, int8_parts
+        own_contribution = contributions[rank].clone()
         stream = torch.randn(
             (world_size * local_rows, 8192),
             device=device,
@@ -1001,13 +1041,81 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
         torch.testing.assert_close(
             bits(qkvg), bits(hidden.index_select(1, columns)), atol=0, rtol=0
         )
+        # The fused QKVG all-to-all copies V and the gate unchanged: they equal
+        # the plain all-to-all's V and gate columns bit for bit.
+        projected = projection.project_owned_rows(local_hidden, rows)
+        empty_cache = torch.empty((1, 0), device=device, dtype=torch.float32)
+        positions = torch.arange(rows, device=device, dtype=torch.int64)
+        _, _, fused_v, fused_gate = state.all_to_all_transpose_qkvg_norm_rope(
+            projected, rows, positions, empty_cache, 1e-6, 0.125, payload="bf16"
+        )
+        _, _, plain_v, plain_gate = qkvg.split(
+            tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
+        )
+        torch.testing.assert_close(bits(fused_v), bits(plain_v), atol=0, rtol=0)
+        torch.testing.assert_close(bits(fused_gate), bits(plain_gate), atol=0, rtol=0)
+        # int8-block16 reduce-scatter: the sum of each rank's round-tripped
+        # contribution in rank order, rounded once.
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.copy_(own_contribution)
+        torch.cuda.synchronize()
+        dist.barrier()
+        reduced8 = state.reduce_scatter_owned_rows(branch, payload="int8-block16")
+        expected8 = torch.zeros_like(reduced8)
+        expected8[:valid] = int8_rows[first : first + valid]
+        torch.testing.assert_close(bits(reduced8), bits(expected8), atol=0, rtol=0)
+        # The heads all-to-all: the owner's rows of every rank's heads.
+        heads = (
+            (
+                torch.arange(rows, device=device)[:, None] % 11
+                + torch.arange(8192 // world_size, device=device)[None, :] % 5
+                + rank * 3
+            )
+            / 8
+        ).bfloat16()
+        owned_heads = state.all_to_all_heads_to_owners(heads, rows)
+        everyone = [torch.empty_like(heads) for _ in range(world_size)]
+        dist.all_gather(everyone, heads)
+        expected_heads = torch.zeros_like(owned_heads)
+        expected_heads[:valid] = torch.cat(
+            [peer[first : first + valid] for peer in everyone], dim=1
+        )
+        torch.testing.assert_close(
+            bits(owned_heads), bits(expected_heads), atol=0, rtol=0
+        )
+        # The MoE-input gather: every rank receives all rows, ids and weights.
+        moe_rows = hidden[first : first + local_rows, :4096].contiguous()
+        if moe_rows.shape[0] < local_rows:
+            moe_rows = torch.cat(
+                [moe_rows, moe_rows.new_zeros(local_rows - moe_rows.shape[0], 4096)]
+            )
+        ids = (
+            torch.arange(local_rows * 8, device=device, dtype=torch.int32).view(-1, 8)
+            + first * 8
+        ) % 256
+        weights = ids.float() / 256
+        packet, all_ids, all_weights = state.gather_owned_moe_inputs(
+            moe_rows, ids, weights, rows, valid
+        )
+        torch.testing.assert_close(
+            bits(packet), bits(hidden[:, :4096].contiguous()), atol=0, rtol=0
+        )
+        expected_ids = (
+            torch.arange(rows * 8, device=device, dtype=torch.int32).view(-1, 8) % 256
+        )
+        assert torch.equal(all_ids, expected_ids)
+        assert torch.equal(all_weights, expected_ids.float() / 256)
 
     # Uneven (padded) and full splits at the cap check every element.
     for rows in (cap - 1, cap):
         run(rows)
     # Serving round sizes between 16384 rows and the cap reuse the kernels.
     with assert_no_triton_compile(
-        iris_pull_reduce_scatter, iris_pull_allgather_rows, iris_a2a_transpose_qkvg
+        iris_pull_reduce_scatter,
+        iris_pull_allgather_rows,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+        iris_a2a_heads_to_owners,
     ):
         for rows in (16384, 16385, 20483, cap - 16):
             run(rows)
@@ -1523,6 +1631,9 @@ def _muse_boundary_warmup_worker(rank, world_size, device):
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_owned_far_rows_worker, "nccl", id="owned_far_rows"),
+        pytest.param(
+            _muse_owned_rows_default_cap_worker, "nccl", id="owned_rows_default_cap"
+        ),
         pytest.param(
             _muse_ordinary_all_reduce_worker, "nccl", id="ordinary_all_reduce"
         ),

@@ -999,15 +999,7 @@ class MuseSparkAttention(nn.Module):
         # whole output projection there, instead of reduce-scattering per-rank
         # partials. The whole weight is gathered after loading
         # (prepare_owned_output_weight).
-        self.owned_heads_to_owners = (
-            global_server_args_dict["owned_attention_output"] == "all-to-all"
-        )
-        if self.owned_heads_to_owners and not isinstance(
-            self.o_proj.quant_method, UnquantizedLinearMethod
-        ):
-            raise ValueError(
-                "--owned-attention-output all-to-all needs a BF16 output projection"
-            )
+        self.owned_heads_to_owners = _owned_heads_to_owners(self.o_proj)
         self.owned_output_weight: nn.Parameter | None = None
         self.iris_state: MuseIrisState | None = None
         self.owned_projections: _OwnedRowProjections | None = (
@@ -1286,16 +1278,46 @@ MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
 # NVIDIA owns rows over NCCL from here; below it the split collectives cost more than they save.
 MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
-# Most token rows the owned-row layout serves. Startup sizes three per-rank
-# buffers from min(max forward tokens, this) full 8192-wide BF16 rows: the
-# Iris producer buffer (384 MiB at this cap), its pull scratch holding one
-# rank's share of them (96 MiB at TP4, 48 MiB at TP8), and the prepared
-# gather's local output (384 MiB). 24576 keeps a 24576-token prefill chunk on
-# owned rows; larger forwards take the replicated-row path.
-MUSE_OWNED_ROWS_MAX_TOKENS = 24576
-# Expert TP8 (EP1) owner-side route staging is [rows, 8, 4096] BF16, so its row
-# limit stays at 8192 (512 MiB); larger expert TP8 forwards replicate rows.
+# The most token rows the owned-row layout serves is --owned-rows-max-tokens
+# (8192 by default). Startup sizes three per-rank buffers from min(max forward
+# tokens, it) full 8192-wide BF16 rows: the Iris producer buffer, its pull
+# scratch holding one rank's share of them, and the prepared gather's local
+# output. Larger forwards take the replicated-row path.
+# Expert TP (EP1) owner-side route staging is [rows, 8, 4096] BF16, so its row
+# limit stays at 8192; larger expert-TP forwards replicate rows.
 MUSE_OWNED_ROUTE_MAX_TOKENS = 8192
+
+
+def _owned_heads_to_owners(o_proj: nn.Module) -> bool:
+    """Whether --owned-attention-output all-to-all applies to this output
+    projection; the owner-side projection takes the whole weight in BF16."""
+    if global_server_args_dict["owned_attention_output"] != "all-to-all":
+        return False
+    if not (
+        isinstance(o_proj.quant_method, UnquantizedLinearMethod)
+        and o_proj.weight.dtype == torch.bfloat16
+    ):
+        raise ValueError(
+            "--owned-attention-output all-to-all needs a BF16 output projection"
+        )
+    return True
+
+
+def _heads_to_owners_applies(
+    owned_global_rows: int | None,
+    iris: "MuseIrisState | None",
+    forward_mode: ForwardMode,
+    attention: nn.Module,
+) -> bool:
+    """Whether this forward's attention output takes the heads all-to-all: an
+    owned-row prefill (extend) forward on Iris with the gathered output weight;
+    other forward modes keep the reduce-scatter."""
+    return (
+        owned_global_rows is not None
+        and iris is not None
+        and forward_mode.is_extend()
+        and attention.owned_output_weight is not None
+    )
 
 
 def _collective_payload(forward_mode: ForwardMode) -> str:
@@ -2643,10 +2665,8 @@ class MuseSparkDecoderLayer(nn.Module):
             else None
         )
         if fused is None:
-            heads_to_owners = (
-                owned_global_rows is not None
-                and iris is not None
-                and self.self_attn.owned_output_weight is not None
+            heads_to_owners = _heads_to_owners_applies(
+                owned_global_rows, iris, ctx.forward_mode, self.self_attn
             )
             attention_output, attention_sentinel, attention_ranks = self.self_attn(
                 positions,
@@ -3455,6 +3475,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             layer.mlp.down_columns is not None for layer in self.model.layers
         )
         unprepared = _iris_unprepared(mapping, backend, group)
+        heads_to_owners = any(
+            layer.self_attn.owned_heads_to_owners for layer in self.model.layers
+        )
+        if heads_to_owners and (
+            unprepared is not None or max_num_tokens < MUSE_OWNED_ROWS_MIN_TOKENS
+        ):
+            # The flag would gather every output projection and refuse weight
+            # updates while never running: refuse it instead.
+            raise RuntimeError(
+                "--owned-attention-output all-to-all needs Muse Spark's Iris "
+                f"owned-row prefill, which this server does not run ("
+                f"{unprepared or f'max forward tokens {max_num_tokens} below {MUSE_OWNED_ROWS_MIN_TOKENS}'}); "
+                "serve with --owned-attention-output reduce-scatter"
+            )
         if unprepared is not None:
             if self.model.config.decode_monokernel:
                 # The launches' mailbox scratch lives on the Iris heap that
@@ -3474,7 +3508,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         )
 
         capacity = (
-            min(max_num_tokens, MUSE_OWNED_ROWS_MAX_TOKENS) * self.config.hidden_size
+            min(max_num_tokens, global_server_args_dict["owned_rows_max_tokens"])
+            * self.config.hidden_size
         )
         owned_route_max_rows = (
             min(max_num_tokens, MUSE_OWNED_ROUTE_MAX_TOKENS)
@@ -3511,12 +3546,18 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             producer = state.all_reduce.producer.data
             scratch = state.all_reduce.producer_pull.scratch
             gather_output = state.gather.output
+            payload_bytes = sum(
+                buffer.numel() * buffer.element_size()
+                for buffer in (state.payload_codes, state.payload_scales)
+                if buffer is not None
+            )
             logger.info(
                 f"Muse Iris buffers sized for "
                 f"{producer.numel() // self.config.hidden_size}-token rows; per-rank "
                 f"bytes: producer buffer {producer.numel() * producer.element_size()}, "
                 f"pull scratch {scratch.numel() * scratch.element_size()}, gather "
-                f"output {gather_output.numel() * gather_output.element_size()}"
+                f"output {gather_output.numel() * gather_output.element_size()}, "
+                f"int8-block16 payload {payload_bytes}"
             )
         elif (
             state.all_reduce.producer_direct_max_numel < capacity

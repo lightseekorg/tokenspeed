@@ -2045,5 +2045,94 @@ def test_prefill_collective_payload_applies_to_extend_forwards_only(
         assert module._collective_payload(mode) == expected, mode
 
 
+@pytest.mark.parametrize("flag", ["reduce-scatter", "all-to-all"])
+def test_owned_heads_to_owners_needs_a_bf16_output_projection(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """all-to-all applies only to a BF16, unquantized output projection (the
+    owner projects through the whole gathered weight); reduce-scatter never
+    takes it, whatever the projection."""
+    monkeypatch.setitem(module.global_server_args_dict, "owned_attention_output", flag)
+    projections = {
+        dtype: RowParallelLinear(
+            input_size=64,
+            output_size=64,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=dtype,
+            reduce_results=False,
+            quant_config=None,
+            prefix="model.layers.0.self_attn.o_proj",
+            tp_rank=0,
+            tp_size=1,
+            tp_group=(0,),
+            use_presharded_weights=False,
+            override_kernel_name=None,
+        )
+        for dtype in (torch.bfloat16, torch.float16)
+    }
+    assert module._owned_heads_to_owners(projections[torch.bfloat16]) == (
+        flag == "all-to-all"
+    )
+    if flag == "all-to-all":
+        with pytest.raises(ValueError, match="BF16 output projection"):
+            module._owned_heads_to_owners(projections[torch.float16])
+    else:
+        assert module._owned_heads_to_owners(projections[torch.float16]) is False
+
+
+def test_owned_output_weight_stays_unset_without_the_flag() -> None:
+    attention = _stub(MuseSparkAttention)
+    attention.owned_heads_to_owners = False
+    attention.owned_output_weight = None
+    attention.prepare_owned_output_weight()
+    assert attention.owned_output_weight is None
+
+
+def test_heads_go_to_owners_only_in_owned_prefill_with_the_gathered_weight() -> None:
+    """The decoder layer sends heads to the owners only for an owned-row extend
+    forward on Iris with the gathered weight; decode, mixed and idle forwards,
+    replicated rows and a missing weight keep the reduce-scatter."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    with_weight = SimpleNamespace(owned_output_weight=torch.empty(1))
+    without_weight = SimpleNamespace(owned_output_weight=None)
+    iris = object()
+    for mode in ForwardMode:
+        assert module._heads_to_owners_applies(2048, iris, mode, with_weight) == (
+            mode == ForwardMode.EXTEND
+        )
+    extend = ForwardMode.EXTEND
+    assert not module._heads_to_owners_applies(None, iris, extend, with_weight)
+    assert not module._heads_to_owners_applies(2048, None, extend, with_weight)
+    assert not module._heads_to_owners_applies(2048, iris, extend, without_weight)
+
+
+def test_weight_update_is_refused_while_output_projections_are_gathered() -> None:
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(down_columns=None),
+        self_attn=SimpleNamespace(owned_output_weight=torch.empty(1)),
+    )
+    owner = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    with pytest.raises(RuntimeError, match="owned-attention-output all-to-all"):
+        MuseSparkForConditionalGeneration.begin_weight_update(owner)
+
+
+def test_owned_row_flags_are_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--owned-attention-output"):
+        ServerArgs(model="x", owned_attention_output="all-gather")
+    for tokens in (8191, 2**17):
+        with pytest.raises(ValueError, match="--owned-rows-max-tokens"):
+            ServerArgs(model="x", owned_rows_max_tokens=tokens)
+    assert ServerArgs(model="x").owned_rows_max_tokens == 8192
+    assert (
+        ServerArgs(model="x", owned_rows_max_tokens=24576).owned_rows_max_tokens
+        == 24576
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
