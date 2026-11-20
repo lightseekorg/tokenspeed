@@ -673,6 +673,7 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    enable_ple_hot_cache: bool = False
     # Pack Qwen4-Exp target and draft cache fields into one physical plane.
     qwen4_exp_flat_kv: bool = True
     sampling_backend: str | None = None
@@ -4254,6 +4255,16 @@ class ServerArgs:
             "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
             "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
             "which runs no prefill, reserves no scratch.",
+        )
+        parser.add_argument(
+            "--enable-ple-hot-cache",
+            action="store_true",
+            default=ServerArgs.enable_ple_hot_cache,
+            help="Cache frequently read rows of eligible offloaded Qwen4-Exp PLE "
+            "tables in GPU memory. Disabled by default. "
+            "Requires PLE offloading and a supported table format and CUDA kernel. "
+            "Small lookups and CUDA graphs use regular host gather. "
+            "TOKENSPEED_PLE_HOST_CACHE_SLOTS must be a power of two greater than one.",
         )
         parser.add_argument(
             "--qwen4-exp-flat-kv",

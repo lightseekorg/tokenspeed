@@ -66,9 +66,9 @@ def fp8_quantize_1x128(
     Returns:
         FP8 ``[M, N]`` codes (a row slice of an ``[ceil(M / 4) * 4, N]``
         buffer) and the FP32 dequant scales. On SM10x the scales are a
-        contiguous ``[ceil(N / 128), M]`` tensor; elsewhere they are the flat
-        MN-major buffer with a row stride of ``ceil(M / 4) * 4``, padded to a
-        128-byte size.
+        ``[ceil(N / 128), M]`` view with row stride ``ceil(M / 4) * 4``;
+        elsewhere they are the flat MN-major buffer with that row stride,
+        padded to a 128-byte size.
     """
     if not x.is_cuda or not x.is_contiguous():
         raise ValueError("fp8_quantize_1x128 requires a contiguous CUDA tensor")
@@ -89,8 +89,7 @@ def fp8_quantize_1x128(
         values, scales, x, bool(use_ue8m0)
     )
     if _is_sm100_family(x.device.index):
-        # The SM10x GEMMs take the scales without the 4-row alignment.
-        scales = scales[: groups * m_padded].view(groups, m_padded)[:, :m].contiguous()
+        scales = scales[: groups * m_padded].view(groups, m_padded)[:, :m]
     return values[:m], scales
 
 

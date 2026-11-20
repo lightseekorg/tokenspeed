@@ -972,6 +972,15 @@ class AutoBackend(CommBackend):
     ) -> torch.Tensor:
         return self._projection.gather_mm(tensor, rows, weight, out, workspace)
 
+    def projection_mm_reduce_scatter(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        return self._projection.mm_reduce_scatter(tensor, rows, weight, workspace)
+
     def projection_all_to_all(
         self,
         tensor: torch.Tensor,
