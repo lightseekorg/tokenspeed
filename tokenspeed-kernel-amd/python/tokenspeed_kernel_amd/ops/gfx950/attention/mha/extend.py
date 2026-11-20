@@ -129,20 +129,6 @@ _NUM_XCDS = gl.constexpr(8)
 # picks it by _use_warp_pipeline rather than by query length.
 _EXTEND_TILES = ((64, 2), (128, 4), (256, 8))
 _WARP_PIPELINE_NUM_WARPS = 8
-# Occupancy the 8-wave tile compiles for under full attention with FP8 K/V,
-# in waves a SIMD. Left to the compiler, its registers fit one work-group
-# (two waves a SIMD) on a CU, and little hides its LDS reads and pipeline
-# waits. Four waves a SIMD cap it at 128 VGPRs, so two work-groups share a
-# CU (their K/V rings, 64 KB each, fit in LDS together). The math and its
-# order are unchanged, so outputs stay bit-identical. The sliding-window and
-# 16-bit K/V variants keep the compiler's occupancy: at 128 VGPRs they spill
-# hundreds of bytes a wave.
-# Only a batch of one request takes it. Work-groups of requests with different
-# cached lengths finish at different times and do not move between CUs, so
-# pairs keep sharing a CU beside idle ones, which costs more than the shared
-# CU gains. The cached lengths live on the device, so the launcher cannot
-# tell batches of near-equal requests, which would gain, from unequal ones.
-_WARP_PIPELINE_WAVES_PER_EU = 4
 # Limits of the 8-wave tile (see _use_warp_pipeline): the shortest cached
 # prefix and sliding window, in keys, and the most rounds of work-groups a
 # sliding-window launch may take. Measured on MI355X with 16 query and 2 KV
@@ -214,9 +200,8 @@ def _launch_options(
     """Compile options of an extend launch with num_warps waves a work-group,
     K/V elements of element_size bytes and window_left (-1: full attention):
     the 8-wave tile of a one-request batch (single_request) under full
-    attention with FP8 K/V also takes its occupancy
-    (_WARP_PIPELINE_WAVES_PER_EU). The warm-up compiles both values of
-    single_request, so no launch compiles."""
+    attention with FP8 K/V also takes four waves a SIMD. The warm-up
+    compiles both values of single_request, so no launch compiles."""
     options = dict(num_warps=num_warps, **extern_compile_options())
     if (
         num_warps == _WARP_PIPELINE_NUM_WARPS
@@ -224,7 +209,20 @@ def _launch_options(
         and window_left < 0
         and single_request
     ):
-        options["waves_per_eu"] = _WARP_PIPELINE_WAVES_PER_EU
+        # Left to the compiler, the tile's registers fit one work-group (two
+        # waves a SIMD) on a CU, and little hides its LDS reads and pipeline
+        # waits. Four waves a SIMD cap it at 128 VGPRs, so two work-groups
+        # share a CU (their K/V rings fit in LDS together). The math and its
+        # order are unchanged, so outputs stay bit-identical. The
+        # sliding-window and 16-bit K/V variants keep the compiler's
+        # occupancy: at 128 VGPRs they spill hundreds of bytes a wave.
+        # Only a batch of one request takes it. Work-groups of requests with
+        # different cached lengths finish at different times and do not move
+        # between CUs, so pairs keep sharing a CU beside idle ones, which
+        # costs more than the shared CU gains. The cached lengths live on the
+        # device, so the launcher cannot tell batches of near-equal requests,
+        # which would gain, from unequal ones.
+        options["waves_per_eu"] = 4
     return options
 
 
@@ -1853,8 +1851,8 @@ def _extend(
             # soonest: rounds of the CUs per split of the KV stream, fewer
             # splits on a tie. Where it does, the 4-wave count stands.
             # These rounds count one 8-wave work-group a CU, as at the
-            # compiler's occupancy. A one-request launch compiled at
-            # _WARP_PIPELINE_WAVES_PER_EU fits two, and takes the same split
+            # compiler's occupancy. A one-request launch compiled at four
+            # waves a SIMD fits two, and takes the same split
             # count so that its bits do not depend on the request count.
             eight_wave_groups = grid_num_q_blocks * n_kv_heads
             if eight_wave_groups * num_kv_splits % _GFX950_SM_COUNT != 0:

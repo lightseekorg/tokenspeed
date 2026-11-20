@@ -600,8 +600,8 @@ def fp8_case(queries, prefixes, *, heads, kv_heads):
 )
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_eight_wave_occupancy_keeps_every_bit(queries, prefixes, monkeypatch):
-    """The FP8 full-attention 8-wave tile of one request, at
-    _WARP_PIPELINE_WAVES_PER_EU, gives the same output and LSE bits as at the
+    """The FP8 full-attention 8-wave tile of one request, at four waves a
+    SIMD, gives the same output and LSE bits as at the
     compiler's occupancy, and repeats bit for bit."""
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
@@ -654,15 +654,13 @@ def test_eight_wave_occupancy_selection(
         single_request=single_request,
     )
     assert options["num_warps"] == num_warps
-    assert options.get("waves_per_eu") == (
-        extend._WARP_PIPELINE_WAVES_PER_EU if capped else None
-    )
+    assert options.get("waves_per_eu") == (4 if capped else None)
 
 
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_request_count_keeps_bits_and_compiles_at_warmup():
-    """A one-request FP8 batch runs the 8-wave tile at
-    _WARP_PIPELINE_WAVES_PER_EU, a batch of several requests at the
+    """A one-request FP8 batch runs the 8-wave tile at four waves a
+    SIMD, a batch of several requests at the
     compiler's occupancy. A request gets the same output and LSE bits alone
     as beside a copy of itself, and after the warm-up neither launch
     compiles, unsplit or split."""
