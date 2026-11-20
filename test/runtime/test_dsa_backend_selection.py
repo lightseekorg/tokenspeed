@@ -793,10 +793,12 @@ def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, cas
     "case", ["prims", "kvp1", "verify_unserved", "pinned", "planned", "bf16_cache"]
 )
 def test_kvp_decode_pins_prims_where_it_serves_every_decode(monkeypatch, case):
-    """The head-sharded KVP decode pins the Prims-TS core only where it serves
-    both decode selections (one row per request and the verify rows) on an
-    FP8 cache without a pin or plan of the leaf's own; the probes then ask
-    for it, as the forward does."""
+    """The head-sharded KVP decode pins Prims-TS only where it serves both decodes.
+
+    Those are one row per request and the verify rows, on an FP8 cache
+    without a pin or plan of the leaf's own; the probes then ask for it, as
+    the forward does.
+    """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
         monkeypatch,

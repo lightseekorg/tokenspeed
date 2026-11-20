@@ -741,10 +741,10 @@ class DSABackend(PagedAttentionBackend):
         return False
 
     def _probe_kvp_decode_solution(self) -> str | None:
-        """The solution the head-sharded KVP decode pins: ``flashinfer_prims``
-        where it serves every decode selection the forward makes
-        (``_sparse_leaf_probes``), else the leaf's own pin.
+        """Return the solution the head-sharded KVP decode pins.
 
+        That is ``flashinfer_prims`` where it serves every decode selection
+        the forward makes (``_sparse_leaf_probes``), else the leaf's own pin.
         The Prims-TS core attends the gathered heads unpadded and writes the
         combine's LSE itself, -inf for a row owning no key; the trtllm-gen
         core pads the heads and needs an LSE launch and a mask after it. Only
