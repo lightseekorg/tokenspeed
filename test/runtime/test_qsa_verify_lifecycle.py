@@ -422,6 +422,7 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
     monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.MEGA_MOE)
     world_size = max(attn_tp_size, moe_ep_size)
     config = ModelExecutorConfig(
+        prefill_graph_decoder_capture_sizes=None,
         max_req_pool_size=5,
         output_length=1,
         enforce_eager=False,

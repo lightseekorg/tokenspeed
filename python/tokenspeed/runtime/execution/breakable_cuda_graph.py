@@ -82,8 +82,8 @@ __all__ = [
 ]
 
 
-# A leaf's shape, dtype, device and occurrence among same-shaped tuple leaves.
-HandoffKey = tuple[tuple[int, ...], torch.dtype, torch.device, int]
+# A leaf's shape, stride, dtype, device and occurrence among equal-layout leaves.
+HandoffKey = tuple[tuple[int, ...], tuple[int, ...], torch.dtype, torch.device, int]
 # Trailing shape, dtype, device, and the output's ordinal among a capture's handoffs with them.
 HandoffSlot = tuple[tuple[int, ...], torch.dtype, torch.device, int]
 BreakOutput = torch.Tensor | tuple["BreakOutput", ...] | None
@@ -215,9 +215,9 @@ class BreakableCapture:
             them, so without this a break that runs during the capture reads
             whatever the pool held for the tensors the segment computes, and
             one that indexes with such a tensor can fault. Replays are
-            unaffected. The drafter's extend captures need it: their breaks
-            index with the top-k rows the narrowing gathers and with positions
-            a captured step advances.
+            unaffected. Prefill breaks consume captured projections; drafter
+            extend breaks index with gathered top-k rows and positions a
+            captured step advances.
     """
 
     _active: BreakableCapture | None = None
@@ -251,8 +251,11 @@ class BreakableCapture:
         # Kernel state the segments' launches need zeroed; it lives as long as
         # this capture, which holds the segments.
         self._capture_session: AbstractContextManager[None] | None = None
-        # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
+        # Break-output handoff buffers keyed by output signature; see break_point.
         self._handoff: dict[HandoffKey, torch.Tensor] = {}
+        self._handoff_ranks: dict[
+            tuple[tuple[int, ...], torch.dtype, torch.device], int
+        ] = {}
         self._handoff_storage: dict[HandoffSlot, torch.Tensor] = (
             {} if handoff_storage is None else handoff_storage
         )
@@ -444,10 +447,10 @@ def _record_break(
     are frozen** to their capture-time value -- route per-request quantities
     through ``ctx`` / ``forward_*_metadata`` rather than a bare scalar arg.
 
-    ``resolve_dst(result)`` maps the break's first output to its stable handoff
-    buffer; it is called once (on the capture-time invocation) and the buffer is
-    reused verbatim on every replay, where the (possibly shorter, see
-    :func:`_land_in`) live result is copied into it.
+    ``resolve_dst(result)`` maps the break's output tensors to stable handoff
+    buffers; it is called once (on the capture-time invocation) and the buffers
+    are reused verbatim on every replay, where the (possibly shorter, see
+    :func:`_land_in`) live results are copied into them.
     """
     # Capture-time ambient ctx (the dummy batch's), rebound live at replay; it
     # is kept as is so the identity check below still finds it.
@@ -475,32 +478,67 @@ def _record_break(
         dst = state["dst"]
         _land_in(dst, result)
         if _replay_valid_rows is not None:
-            scrub_padding_tail(_replay_valid_rows, dst)
+            tensors = dst if isinstance(dst, tuple) else (dst,)
+            scrub_padding_tail(_replay_valid_rows, *tensors)
         return dst
 
     return cap.add_eager(replay_fn)
 
 
+def _handoff_key(
+    tensor: torch.Tensor,
+) -> tuple[tuple[int, ...], tuple[int, ...], torch.dtype, torch.device]:
+    shape, stride = tuple(tensor.shape), tensor.stride()
+    extent = 1
+    for step, size in sorted(zip(stride, shape, strict=True)):
+        if size > 1:
+            if step < extent:
+                # Expanded or overlapping outputs need independent elements for
+                # the copy and padding scrub; keep their logical values.
+                contiguous, extent = [], 1
+                for dim in reversed(shape):
+                    contiguous.append(extent)
+                    extent *= max(dim, 1)
+                stride = tuple(reversed(contiguous))
+                break
+            extent += (size - 1) * step
+    return shape, stride, tensor.dtype, tensor.device
+
+
 def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
-    """Leading rows of the shared storage slot for this capture's new handoff ``key``.
+    """A strided view of shared storage for this capture's new handoff ``key``.
 
     The slot is the trailing shape, dtype and device plus how many of this
     capture's handoffs already have them, so one capture's distinct shapes stay
-    in distinct storage. Storage too short for ``key`` is replaced; captures that
-    already hold the old storage keep it alive.
+    in distinct storage. Strides belong to the view, not the storage slot: a
+    smaller bucket can reuse the same address with its own padded scale strides.
+    Storage too short for ``key`` is replaced; captures that already hold the
+    old storage keep it alive.
     """
-    shape, dtype, device, _ = key
+    shape, stride, dtype, device, _ = key
     if not shape:
         return torch.empty(shape, dtype=dtype, device=device)
     trailing = (shape[1:], dtype, device)
-    rank = sum(1 for s, d, v, _ in cap._handoff if s and (s[1:], d, v) == trailing)
+    rank = cap._handoff_ranks.get(trailing, 0)
+    cap._handoff_ranks[trailing] = rank + 1
     slot = (*trailing, rank)
     storage = cap._handoff_storage.get(slot)
-    if storage is None or storage.shape[0] < shape[0]:
-        storage = cap._handoff_storage[slot] = torch.empty(
-            shape, dtype=dtype, device=device
+    # Include the last physical row's padding, which TMA may read beyond the
+    # logical shape. The second bound also covers arbitrary sliced layouts.
+    elements = (
+        max(
+            max(size * step for size, step in zip(shape, stride, strict=True)),
+            1
+            + sum((size - 1) * step for size, step in zip(shape, stride, strict=True)),
         )
-    return storage[: shape[0]]
+        if all(shape)
+        else 0
+    )
+    if storage is None or storage.numel() < elements:
+        storage = cap._handoff_storage[slot] = torch.empty(
+            elements, dtype=dtype, device=device
+        )
+    return storage.as_strided(shape, stride)
 
 
 def break_here(
@@ -545,9 +583,10 @@ def break_point(method: Callable | None = None) -> Callable:
     eager -- or a zero-overhead direct call when not capturing. This is the one
     decorator every model uses to mark a break. Use it bare: ``@break_point``.
 
-    The handoff buffer's shape/dtype/device are **inferred from the method's actual
-    output** at capture time (the break runs during capture regardless), so no
-    output spec is needed -- it works uniformly for breaks whose output matches no
+    The handoff buffers' shapes/strides/dtypes/devices are **inferred from the method's
+    actual output** at capture time (the break runs during capture regardless).
+    The output may be one tensor or a flat tuple of tensors consumed together.
+    No output spec is needed -- it works uniformly for breaks whose output matches no
     input (MLA: ``[tokens, heads*v_head_dim]`` vs ``q``'s ``[tokens, heads*qk_head_dim]``)
     and for one wrapper that returns different shapes per call (e.g. hybrid full-attn
     q-shaped vs GDN z-shaped). Plain tuples may nest tensor and None outputs;
@@ -581,12 +620,13 @@ def break_point(method: Callable | None = None) -> Callable:
 
             def resolve_dst(result: BreakOutput) -> BreakOutput:
                 occurrences: dict[
-                    tuple[tuple[int, ...], torch.dtype, torch.device], int
+                    tuple[tuple[int, ...], tuple[int, ...], torch.dtype, torch.device],
+                    int,
                 ] = {}
 
                 def resolve_leaf(leaf: torch.Tensor) -> torch.Tensor:
                     # Handoff buffer inferred from the capture-time output, shape-keyed.
-                    shape_key = (tuple(leaf.shape), leaf.dtype, leaf.device)
+                    shape_key = _handoff_key(leaf)
                     occurrence = occurrences.get(shape_key, 0)
                     occurrences[shape_key] = occurrence + 1
                     key = (*shape_key, occurrence)
@@ -681,8 +721,8 @@ def _matching_output_leaves(
 def _land_in(dst: BreakOutput, result: BreakOutput) -> None:
     """Copy ``result`` into ``dst`` at a stable address.
 
-    ``dst`` is the (possibly token-padded) handoff buffer the next graph segment
-    reads. ``result`` may cover only the real (unpadded) leading rows -- e.g. a
+    ``dst`` is one handoff buffer, or a tuple of buffers returned together, that
+    the next graph segment reads. ``result`` may cover only the real (unpadded) leading rows -- e.g. a
     varlen attention kernel writes only ``sum(cu_seqlens_q)`` rows -- so we copy
     into the matching leading slice. Padded rows are otherwise left as-is;
     :meth:`BreakableCapture.replay` clears them before the following graph segment

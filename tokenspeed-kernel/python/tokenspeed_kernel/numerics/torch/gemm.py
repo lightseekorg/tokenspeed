@@ -574,11 +574,13 @@ def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
     """Preserve the original batched projection and its BF16 rounding."""
-    if out is None:
-        out = x.new_empty((x.shape[0], weight.shape[0], weight.shape[1]))
-    # Token-major rows flatten as a view; out= rejects inputs that need grad.
+    # Keep each batch's output contiguous. Interleaving the groups through
+    # bmm(out=...) corrupts some ROCm shapes, including five rows and eight groups.
     with torch.no_grad():
-        torch.bmm(x.transpose(0, 1), weight.transpose(1, 2), out=out.transpose(0, 1))
+        result = torch.bmm(x.transpose(0, 1), weight.transpose(1, 2)).transpose(0, 1)
+        if out is None:
+            return result.contiguous()
+        out.copy_(result)
     return out
 
 

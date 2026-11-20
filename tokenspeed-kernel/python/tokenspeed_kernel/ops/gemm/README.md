@@ -388,3 +388,15 @@ The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
 and rejects unsupported scale arguments. Its cached callable uses runtime row
 counts, so changing M does not add specializations. The provider is optional;
 builds without this FlashInfer module retain the existing registered kernels.
+
+## Grouped BF16 output layout
+
+The portable Torch projection computes each group's GEMM into a contiguous
+batch-major result, then copies it to token-major rows. Writing directly into
+an interleaved `bmm(out=...)` view gives incorrect results on ROCm for some row
+counts, including five rows with eight groups. Both allocated and caller-owned
+outputs remain contiguous and flatten without another copy. The intermediate
+has only the operation's lifetime; no persistent workspace is retained.
+
+NVIDIA's registered Torch provider retains the measured direct cuBLAS output
+path. Higher-priority grouped Gluon and FP8 kernels retain their selection.

@@ -184,6 +184,7 @@ def _pool():
 
 def _config():
     return ModelExecutorConfig(
+        prefill_graph_decoder_capture_sizes=None,
         max_req_pool_size=4,
         output_length=1,
         enforce_eager=False,
@@ -265,7 +266,12 @@ def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_emb
             assert owner.can_run(ctx)
             mm_context = MultimodalForwardContext([None], [0], [count], count)
             assert owner.can_run(ctx, mm_context) is not history_embedding
-            actual = owner.replay(ctx, ids, request_token_history=history)
+            actual = owner.replay(
+                ctx,
+                ids,
+                positions=owner.input_buffers.positions_buf[: ctx.input_num_tokens],
+                model_kwargs={"request_token_history": history},
+            )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             torch.testing.assert_close(history_ids, appended, rtol=0, atol=0)
             history_ids.add_(1)
@@ -286,7 +292,12 @@ def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_emb
         expected = model(ctx, ids, ib.positions_buf[:16], request_token_history=history)
         appended = history_ids.clone()
         history_ids.copy_(before)
-        actual = owner.replay(ctx, ids, request_token_history=history)
+        actual = owner.replay(
+            ctx,
+            ids,
+            positions=owner.input_buffers.positions_buf[: ctx.input_num_tokens],
+            model_kwargs={"request_token_history": history},
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(history_ids, appended, rtol=0, atol=0)
     finally:

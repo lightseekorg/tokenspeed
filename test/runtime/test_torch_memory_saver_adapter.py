@@ -568,6 +568,211 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
         )
 
 
+def _check_grouped_projection_storage_on_cuda():
+    from tokenspeed_kernel.numerics.torch.gemm import torch_grouped_bf16_projection
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    with saver.named_region("executor_inputs"):
+        x = torch.full((200, 8, 4096), 0.125, dtype=torch.bfloat16, device="cuda")
+        weight = torch.ones(8, 128, 4096, dtype=x.dtype, device=x.device)
+        out = torch.empty(200, 8, 128, dtype=x.dtype, device=x.device)
+    pointers = [value.data_ptr() for value in (x, weight, out)]
+    for rows in (5, 128, 8, 200):
+        # Lazy vendor workspaces, like startup's other allocations, are managed.
+        with saver.named_region("executor_inputs"):
+            torch_grouped_bf16_projection(x[:rows], weight, out[:rows])
+        for _ in range(3):
+            torch_grouped_bf16_projection(x[:rows], weight, out[:rows])
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                out[:rows].cpu(),
+                torch.full((rows, 8, 128), 512.0, dtype=x.dtype),
+                rtol=0,
+                atol=0,
+            )
+            saver.pause(tag="weights")
+            torch.cuda.empty_cache()
+            ordinary_bytes = sum(
+                segment["total_size"]
+                for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) == (0, 0)
+            )
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            assert [value.data_ptr() for value in (x, weight, out)] == pointers
+            torch.testing.assert_close(
+                out[:rows].cpu(),
+                torch.full((rows, 8, 128), 512.0, dtype=x.dtype),
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_grouped_torch_projection_releases_temporary_storage():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_grouped_projection_storage_on_cuda; _check_grouped_projection_storage_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )
+
+
+def _check_v41_prefill_inputs_on_cuda():
+    from test.runtime.test_deepseek_v41_model import (
+        _config,
+        _mapping,
+        _quant,
+        _Tokenizer,
+    )
+
+    from torch import nn
+
+    from tokenspeed.runtime.execution.prefill_graph_inputs import (
+        copy_prefill_graph_input,
+    )
+    from tokenspeed.runtime.models.deepseek_v41 import (
+        DeepseekV41ForCausalLM,
+        DeepseekV41Model,
+    )
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    # Tiny weights isolate the real V4.1 input/state allocators from checkpoint
+    # loading and expert execution. All retained model storage is managed too.
+    with saver.named_region("executor_inputs"), torch.device("cuda"):
+        config = _config()
+        config.engram_layer_ids = [1, 21]
+        model = DeepseekV41Model(
+            config, _mapping(0, 1, 1), _quant(), "model", False, "gpu", None
+        )
+        model.initialize_engram(_Tokenizer())
+        model.dspark_capture_layers = (0, 20, 39)
+        for layer in model.layers:
+            layer.ffn.gate.bias_vl = nn.Parameter(torch.ones(4))
+        causal = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+        nn.Module.__init__(causal)
+        causal.model = model
+        causal.is_multimodal_active = True
+    retained = []
+    for rows in (128, 384, 256):
+        with saver.named_region("executor_inputs"):
+            inputs = causal.allocate_prefill_graph_inputs(rows)
+            state = model.allocate_decoder_state(rows)
+            positions = torch.arange(2 * rows, dtype=torch.int64, device="cuda")
+        copy_prefill_graph_input(positions[:rows], positions[::2])
+        torch.testing.assert_close(
+            positions[:rows].cpu(), torch.arange(0, 2 * rows, 2), atol=0, rtol=0
+        )
+        inputs["image_mask"][1::3] = True
+        state.image_mask[::2] = True
+        tensors = [
+            *inputs.values(),
+            *[t for t in state._tensors() if t is not None],
+            positions,
+        ]
+        for index, tensor in enumerate(tensors):
+            tensor.fill_(index + 1)
+        inputs["image_mask"][::3] = False
+        state.image_mask[1::2] = False
+        retained.extend((tensor, tensor.data_ptr(), tensor.cpu()) for tensor in tensors)
+        for _ in range(3):
+            torch.cuda.synchronize()
+            saver.pause(tag="weights")
+            torch.cuda.empty_cache()
+            ordinary_bytes = sum(
+                segment["total_size"]
+                for segment in torch.cuda.memory_snapshot()
+                if tuple(segment["segment_pool_id"]) == (0, 0)
+            )
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            for tensor, pointer, expected in retained:
+                assert tensor.data_ptr() == pointer
+                torch.testing.assert_close(tensor.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_v41_prefill_masks_and_decoder_states_survive_repeated_release_resume():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_v41_prefill_inputs_on_cuda; _check_v41_prefill_inputs_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=120,
+        )
+
+
+def _check_v41_vision_rope_on_cuda():
+    from tokenspeed.runtime.models.deepseek_v41_vision import get_vision_cos_sin
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    with saver.named_region("executor_inputs"):
+        marker = torch.arange(8, dtype=torch.float32, device="cuda")
+    pointer, expected_marker = marker.data_ptr(), marker.cpu()
+    for height, width in ((4, 4), (17, 19), (3, 32)):
+        expected = get_vision_cos_sin(height, width, 32, 10000, torch.device("cpu"))
+        for _ in range(3):
+            cos, sin = get_vision_cos_sin(
+                height, width, 32, 10000, torch.device("cuda")
+            )
+            torch.testing.assert_close(cos.cpu(), expected[0], atol=0, rtol=0)
+            torch.testing.assert_close(sin.cpu(), expected[1], atol=0, rtol=0)
+            del cos, sin
+            torch.cuda.synchronize()
+            saver.pause(tag="weights")
+            try:
+                torch.cuda.empty_cache()
+                ordinary_bytes = sum(
+                    segment["total_size"]
+                    for segment in torch.cuda.memory_snapshot()
+                    if tuple(segment["segment_pool_id"]) == (0, 0)
+                )
+                assert ordinary_bytes == 0, ordinary_bytes
+            finally:
+                saver.resume(tag="weights")
+            assert marker.data_ptr() == pointer
+            torch.testing.assert_close(marker.cpu(), expected_marker, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_v41_vision_rope_cache_leaves_no_ordinary_segments_after_release():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_v41_vision_rope_on_cuda; _check_v41_vision_rope_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=120,
+        )
+
+
 @pytest.mark.parametrize("with_draft", [False, True])
 def test_capture_metadata_survives_sleep_for_target_and_draft(
     memory, buffers, with_draft

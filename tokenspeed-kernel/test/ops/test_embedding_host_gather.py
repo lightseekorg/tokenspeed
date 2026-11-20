@@ -101,7 +101,8 @@ def _quantized_rows(table: torch.Tensor, indices: torch.Tensor):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_cuda_mxfp8_row_gather_matches_quantized_dequant(index_dtype):
+@pytest.mark.parametrize("provide_outputs", [False, True])
+def test_cuda_mxfp8_row_gather_matches_quantized_dequant(index_dtype, provide_outputs):
     generator = torch.Generator().manual_seed(0)
     table = _mxfp8_table(40, 256, generator).pin_memory()
     ids = torch.randint(0, 40, (5, 3, 4), generator=generator)
@@ -110,13 +111,50 @@ def test_cuda_mxfp8_row_gather_matches_quantized_dequant(index_dtype):
     ids[1, 1, 0], ids[3, 1, 2] = 1, 2
     # A layer's slice of [tokens, layers, columns] ids: not contiguous.
     indices = ids.to(device="cuda:0", dtype=index_dtype)[:, 1]
-    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    codes = scales = None
+    if provide_outputs:
+        codes = torch.empty(
+            5, 4 * 256, dtype=torch.float8_e4m3fn, device=indices.device
+        )
+        scales = torch.empty(5, 4 * 8, dtype=torch.uint8, device=indices.device)
+    actual_codes, actual_scales = host_gather.mxfp8_row_gather(
+        table, indices, codes, scales
+    )
+    if provide_outputs:
+        assert actual_codes is codes and actual_scales is scales
+    codes, scales = actual_codes, actual_scales
     expected_codes, expected_scales = _quantized_rows(table, indices)
     assert codes.shape == (5, 4 * 256) and codes.dtype == torch.float8_e4m3fn
     assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
     assert torch.equal(scales.cpu(), expected_scales)
     # Most rows are re-scaled, not copied: the same values, new codes.
     assert not torch.equal(scales.cpu(), table[ids[:, 1].clamp(0, 39), 256:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("output", ["codes", "scales"])
+@pytest.mark.parametrize("output_device", ["cpu", "cuda:1"])
+def test_cuda_mxfp8_row_gather_rejects_outputs_on_wrong_device(output, output_device):
+    if output_device == "cuda:1" and torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    table = _mxfp8_table(3, 256, torch.Generator().manual_seed(6)).pin_memory()
+    indices = torch.tensor([[0, 1]], device="cuda:0")
+    codes = torch.empty(
+        1,
+        2 * 256,
+        dtype=torch.float8_e4m3fn,
+        device=output_device if output == "codes" else indices.device,
+    )
+    scales = torch.empty(
+        1,
+        2 * 8,
+        dtype=torch.uint8,
+        device=output_device if output == "scales" else indices.device,
+    )
+    with pytest.raises(
+        ValueError, match="outputs must be on the same device as indices"
+    ):
+        host_gather.mxfp8_row_gather(table, indices, codes, scales)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -179,6 +217,11 @@ def test_cuda_mxfp8_row_gather_sorted_path_reads_rows_past_2gib():
     # region of the same size precedes the table, so an offset that wrapped
     # reads its zeros inside the allocation instead of faulting.
     rows = (1 << 31) // 264 + 2
+    # Include headroom for outputs, sorting and compiler/runtime workspaces.
+    required_bytes = 2 * rows * 264 + (256 << 20)
+    free_bytes, _ = torch.cuda.mem_get_info("cuda:0")
+    if free_bytes < required_bytes:
+        pytest.skip(f"requires {required_bytes / (1 << 30):.2f} GiB of free GPU memory")
     pool = torch.zeros(2 * rows, 264, dtype=torch.uint8, device="cuda:0")
     table = pool[rows:]
     tail = _mxfp8_table(3, 256, torch.Generator().manual_seed(5))

@@ -26,6 +26,9 @@ them as a GEMM's group-32 MXFP8 activation: the codes and canonical scales that
 quantizing the dequantized BF16 rows (1e-4 amax floor) would produce, without
 materializing BF16.
 
+Caller-provided MXFP8 codes and scales must both be on `indices.device`;
+the wrapper rejects mismatched devices before launching a kernel.
+
 Large `mxfp8_row_gather` lookups (at least `_SORT_MIN_ROWS` rows) sort the ids
 first, so neighbouring rows share GPU page walks, and read each distinct row
 once: the first entry of a run of equal ids reads the host and a device-side
