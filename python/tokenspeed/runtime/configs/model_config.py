@@ -708,8 +708,8 @@ def _configure_inkling2_loop(
     serving target's text config."""
     if server_args is None:
         return
-    num_passes = getattr(server_args, "inkling2_loop_num_passes", None)
-    share_cache = getattr(server_args, "inkling2_loop_share_cache", False)
+    num_passes = server_args.inkling2_loop_num_passes
+    share_cache = server_args.inkling2_loop_share_cache
     if num_passes is None and not share_cache:
         return
     if not isinstance(text_config, Inkling2ModelConfig):
