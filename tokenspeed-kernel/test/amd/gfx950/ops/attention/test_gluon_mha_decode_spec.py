@@ -264,10 +264,11 @@ def test_uniform_row_groups_keep_every_bit_at_draft_shapes(running, kv_dtype, wi
 def test_uniform_row_groups_with_an_output_gate_keep_every_bit(kv_dtype, window):
     """A grouped block with an output gate (64-wide heads, the gate's range)
     stores what its one-row requests followed by the separate gated norm
-    give, bit for bit."""
+    give, bit for bit, without launching that op."""
     if not is_cdna4():
         pytest.skip("requires gfx950")
     from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+    from torch.profiler import ProfilerActivity, profile
 
     torch.manual_seed(11)
     running, positions, page, heads, dim = 9, 8, 64, 16, 64
@@ -295,14 +296,19 @@ def test_uniform_row_groups_with_an_output_gate_keep_every_bit(kv_dtype, window)
     expected = weightless_rmsnorm_gated_sigmoid(
         plain.view(rows, heads * dim), gate, heads, dim, 1e-6, False
     )
-    grouped = mha_decode_with_kvcache(
-        **inputs,
-        solution="gluon",
-        block_draft=False,
-        uniform_row_groups=positions,
-        output_gate=gate,
-        output_gate_eps=1e-6,
-    )
+    # A fallback to the separate op would give the same bits; the profile
+    # shows the kernel's own store applied the gate.
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        grouped = mha_decode_with_kvcache(
+            **inputs,
+            solution="gluon",
+            block_draft=False,
+            uniform_row_groups=positions,
+            output_gate=gate,
+            output_gate_eps=1e-6,
+        )
+        torch.cuda.synchronize()
+    assert not any("gated_sigmoid" in event.name for event in prof.events())
     assert torch.equal(
         grouped.view(rows, -1).view(torch.int16), expected.view(torch.int16)
     )

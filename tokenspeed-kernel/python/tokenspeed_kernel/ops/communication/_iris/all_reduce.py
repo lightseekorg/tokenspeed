@@ -2155,14 +2155,14 @@ class ProducerAllReduce:
         The result lives in the caller's storage, never in this state's, so
         later collectives cannot overwrite it and another stream may read it
         once ordered after this call. Payloads within a Lamport window are
-        pushed through its mailboxes and summed in place, at TP4 only inside
-        the push window, whose other payloads are pushed and copied back.
-        Other payloads are copied into the producer buffer and reduced by the generic producer pull,
-        which beat run's two-shot pull at every size measured (129 to 1024
-        rows of 8192 at TP8). Callers must
-        not hold borrowed producer-buffer or pull-scratch views across this
-        call. Every rank must make the same call, on the stream that orders
-        this state's other uses.
+        pushed through its mailboxes and summed in place; at TP4 the two-shot
+        takes only the push window's payloads, and the window's others are
+        pushed and copied back. Other payloads are copied into the producer
+        buffer and reduced by the generic producer pull, which beat run's
+        two-shot pull at every size measured (129 to 1024 rows of 8192 at
+        TP8). Callers must not hold borrowed producer-buffer or pull-scratch
+        views across this call. Every rank must make the same call, on the
+        stream that orders this state's other uses.
         """
         # Uniform across ranks, so a violation fails on every rank alike.
         assert self.can_reduce_ordinary(tensor, rccl_fallback=False)
