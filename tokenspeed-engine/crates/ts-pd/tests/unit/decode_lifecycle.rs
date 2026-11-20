@@ -562,3 +562,174 @@ fn a_full_control_queue_delays_a_registration_instead_of_failing_its_room() {
     }
     assert_eq!(events, [PdEvent::Bootstrapped("queued".to_owned())]);
 }
+
+#[test]
+fn announcements_after_a_revocation_name_the_cache_their_room_registered() {
+    let native = NativeLibrary::new();
+    let (mut peer, _outbox, _mesh, _group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    let (_prefill, received, server) = prefill_node(Some("deferred"));
+    let registered = peer.cache_id();
+    peer.register("r", &bootstrap(server.port(), 5)).unwrap();
+    let announced = |received: &mpsc::Receiver<Vec<bytes::Bytes>>| loop {
+        let frames = received
+            .recv_timeout(Duration::from_secs(3))
+            .expect("an announcement");
+        if wire::is_announce(&frames) {
+            break wire::announce_route(&frames).unwrap();
+        }
+    };
+    assert_eq!(announced(&received), (5, registered.clone()));
+    // A revocation replaces the transfer engine and the cache identity while
+    // the room still waits for its notice.
+    peer.shared.state().revoking = true;
+    let mut revocation = Revocation {
+        shared: peer.shared.clone(),
+        retry_at: Instant::now(),
+        ended: false,
+    };
+    peer.shared.revoke(&mut revocation);
+    drop(revocation);
+    assert_ne!(peer.cache_id(), registered);
+    while received.try_recv().is_ok() {}
+    // Prefill knows only the identity the room's route registered.
+    peer.shared.announce_waiting(0);
+    assert_eq!(announced(&received), (5, registered));
+}
+
+#[test]
+fn revocation_outcomes_are_logged_as_events() {
+    use std::{io::Read, os::unix::net::UnixStream};
+
+    let native = NativeLibrary::new();
+    let cache = [0u8; 64];
+    let (peer, outbox) = DecodePeer::start(DecodeConfig {
+        peer: PeerConfig {
+            library: native.path().to_path_buf(),
+            local_ip: "127.0.0.1".to_owned(),
+            protocol: "rdma".to_owned(),
+            ib_device: String::new(),
+            regions: vec![(cache.as_ptr() as usize, cache.len())],
+            engine_rank: 3,
+            metrics: None,
+        },
+        arena_base: cache.as_ptr() as u64,
+        layout: crate::layout::contract::tests::wire().into_bytes(),
+        tp_size: 1,
+        tp_rank: 0,
+        waiting_timeout: Duration::from_secs(60),
+        heartbeat_interval: Duration::from_secs(60),
+        heartbeat_max_failures: 2,
+    })
+    .unwrap();
+    // Driven on this thread, where the subscriber below listens.
+    let revoke = |peer: &DecodePeer| {
+        peer.shared.state().revoking = true;
+        let mut revocation = Revocation {
+            shared: peer.shared.clone(),
+            retry_at: Instant::now(),
+            ended: false,
+        };
+        peer.shared.revoke(&mut revocation);
+    };
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.try_clone().unwrap())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        revoke(&peer);
+        native.fail_unregistrations();
+        revoke(&peer);
+        let refused = outbox.release_registration().unwrap_err();
+        assert!(refused.contains("kept it registered"), "{refused}");
+    });
+    let mut logs = String::new();
+    reader.read_to_string(&mut logs).unwrap();
+    let line = |event: &str| {
+        logs.lines()
+            .find(|line| line.contains(event))
+            .unwrap_or_else(|| panic!("{event} missing from:\n{logs}"))
+            .to_owned()
+    };
+    assert!(line("event=ts_decode_revocation_fenced").contains("rank=3"));
+    let unfenced = line("event=ts_decode_revocation_unfenced");
+    assert!(
+        unfenced.contains("ERROR") && unfenced.contains("failed to deregister 1"),
+        "{unfenced}"
+    );
+    assert!(line("event=ts_decode_release_refused_unfenced").contains("ERROR"));
+}
+
+#[test]
+fn a_revocation_marks_its_rooms_as_it_ends() {
+    let native = NativeLibrary::new();
+    let (peer, _outbox, _mesh, _group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    // A room whose manifest named the engine about to be replaced.
+    {
+        let mut state = peer.shared.state();
+        let cache_id = state.cache_id.clone();
+        state.tracked.insert(7);
+        state.attached_caches.insert(7, cache_id);
+        state.admissions.insert(7, 0);
+        state.revoking = true;
+    }
+    let mut revocation = Revocation {
+        shared: peer.shared.clone(),
+        retry_at: Instant::now(),
+        ended: false,
+    };
+    peer.shared.revoke(&mut revocation);
+    {
+        let state = peer.shared.state();
+        assert!(state.revoked.contains(&7) && !state.revoking);
+    }
+    // The room retires, through acknowledgments, before the guard drops:
+    // nothing may mark it again.
+    peer.shared.state().clear(7, "prefill:80");
+    drop(revocation);
+    assert!(peer.shared.state().revoked.is_empty());
+}
+
+#[test]
+fn a_registration_interrupted_by_a_revocation_connects_under_the_fresh_cache() {
+    let native = NativeLibrary::new();
+    let (mut peer, _outbox, mut mesh, group) =
+        setup(&native, Duration::from_secs(60), Duration::from_secs(60));
+    // Prefill acknowledges only a cache other than the one registering now,
+    // so the room's first registration waits.
+    let replaced = peer.cache_id();
+    let pending = replaced.clone();
+    let (prefill, _received) = answering_prefill(move |id, cache_id| {
+        if cache_id == pending {
+            Vec::new()
+        } else {
+            acknowledge(id, cache_id)
+        }
+    });
+    let server = bootstrap_to(prefill.port(), None);
+    peer.register("r", &bootstrap(server.port(), 1)).unwrap();
+    until(|| !peer.shared.state().registering.is_empty());
+    // A revocation replaces the transfer engine and cache identity meanwhile.
+    peer.shared.state().revoking = true;
+    let mut revocation = Revocation {
+        shared: peer.shared.clone(),
+        retry_at: Instant::now(),
+        ended: false,
+    };
+    peer.shared.revoke(&mut revocation);
+    drop(revocation);
+    assert_ne!(peer.cache_id(), replaced);
+    // The room gives up the replaced cache's registration and connects again
+    // under the fresh one, instead of waiting until its budget runs out.
+    let deadline = Instant::now() + REGISTRATION_TIMEOUT / 2;
+    let mut events = Vec::new();
+    while !events.contains(&PdEvent::Bootstrapped("r".to_owned())) {
+        assert!(Instant::now() < deadline, "not connected: {events:?}");
+        events.extend(peer.poll(&mut mesh, &group).unwrap());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(events, [PdEvent::Bootstrapped("r".to_owned())]);
+}

@@ -93,7 +93,9 @@ pub struct DecodeConfig {
     /// See `arena_base`.
     pub tp_rank: i64,
     /// Maximum wait in each phase: registration through manifest publication,
-    /// then publication through KV arrival. Failure still waits for write retirement.
+    /// then publication through KV arrival. Failure still waits for write
+    /// retirement; a failed receive still unretired after another such wait
+    /// revokes the transfer engine (`Shared::revoke`).
     pub waiting_timeout: Duration,
     /// How often the Prefill nodes' health is checked.
     pub heartbeat_interval: Duration,
@@ -133,6 +135,10 @@ type ConnectionKey = (String, u64, Vec<i64>);
 
 #[derive(Default)]
 struct Cancellation {
+    /// The cache the room's route registered, which its manifest names
+    /// (else the current one); the cancellation and its acknowledgments name
+    /// it too.
+    cache_id: String,
     acknowledged: BTreeSet<i64>,
     sent: Option<Instant>,
 }
@@ -155,6 +161,9 @@ struct State {
     cached_tokens: HashMap<u64, i64>,
     targets: HashMap<u64, Arc<Vec<Target>>>,
     admissions: HashMap<u64, i32>,
+    /// The cache identity each attached room's route registered: its
+    /// manifest names that cache, and so the transfer engine of that time.
+    attached_caches: HashMap<u64, String>,
     waiting_since: HashMap<u64, Instant>,
     cancellations: HashMap<u64, Cancellation>,
     /// Bootstrap address -> the rooms reading from it.
@@ -171,6 +180,22 @@ struct State {
     notices: HashMap<u64, BTreeSet<i64>>,
     /// Route registrations in progress, by id.
     registering: HashMap<u64, Registering>,
+    /// A revocation is replacing the transfer engine ([`Shared::revoke`]):
+    /// no room connects, and the cache is not released, until it finished.
+    revoking: bool,
+    /// A revocation could not deregister the cache from the engine it
+    /// replaced, whose keys may still reach the cache: it is never released.
+    revocation_unfenced: bool,
+    /// When a failed revocation may be tried again.
+    revocation_not_before: Option<Instant>,
+    /// Rooms whose manifests named a transfer engine that was replaced and
+    /// deregistered: no remote write reaches their pages any more.
+    revoked: HashSet<u64>,
+    /// The engines revocations replaced, kept for the peer's lifetime. Each
+    /// keeps its session (host and RPC port) bound to an engine without the
+    /// cache registered: a revoked writer that resolves its old session
+    /// again cannot reach a later engine that reused the port.
+    revoked_engines: Vec<Arc<ts_mooncake::Engine>>,
 }
 
 impl State {
@@ -312,6 +337,7 @@ impl State {
         self.expected
             .insert(room, route.expected_prefill_ranks.iter().copied().collect());
         self.targets.insert(room, targets);
+        self.attached_caches.insert(room, self.cache_id.clone());
         self.addr_rooms
             .entry(addr.to_owned())
             .or_default()
@@ -324,15 +350,18 @@ impl State {
     }
 
     fn acknowledge_cancellation(&mut self, room: u64, cache_id: &str, rank: i64) {
-        if cache_id != self.cache_id
-            || !self
-                .targets
-                .get(&room)
-                .is_some_and(|targets| targets.iter().any(|target| target.rank == rank))
+        if !self
+            .targets
+            .get(&room)
+            .is_some_and(|targets| targets.iter().any(|target| target.rank == rank))
         {
             return;
         }
-        if let Some(cancellation) = self.cancellations.get_mut(&room) {
+        if let Some(cancellation) = self
+            .cancellations
+            .get_mut(&room)
+            .filter(|cancellation| cancellation.cache_id == cache_id)
+        {
             cancellation.acknowledged.insert(rank);
         }
     }
@@ -344,6 +373,7 @@ impl State {
         // No manifest ever named these pages. The state lock excludes a
         // concurrent admission, which also checks the cancellation marker.
         !self.admissions.contains_key(&room)
+            || self.revoked.contains(&room)
             || self.targets.get(&room).is_some_and(|targets| {
                 targets
                     .iter()
@@ -386,14 +416,55 @@ impl State {
         self.landed.remove(&room);
         self.cached_tokens.remove(&room);
         self.targets.remove(&room);
+        self.attached_caches.remove(&room);
         self.admissions.remove(&room);
         self.waiting_since.remove(&room);
         self.cancellations.remove(&room);
         self.announced.remove(&room);
         self.notices.remove(&room);
+        self.revoked.remove(&room);
         if let Some(rooms) = self.addr_rooms.get_mut(addr) {
             rooms.remove(&room);
         }
+    }
+}
+
+/// A running revocation ([`Shared::revoke`]). [`Shared::revoke`] ends it in
+/// the critical section that marks the rooms it fenced, so no room can retire
+/// in between; dropping one it did not end (no fresh engine, or a panic,
+/// also while unwinding) ends it having fenced nothing.
+struct Revocation {
+    shared: Arc<Shared>,
+    /// When another revocation may start unless this one succeeds.
+    retry_at: Instant,
+    /// Whether [`Revocation::end`] ran.
+    ended: bool,
+}
+
+impl Revocation {
+    /// Clear [`State::revoking`] in `state`, the lock its caller holds;
+    /// `retry_at` is when another revocation may start.
+    fn end(&mut self, state: &mut State, retry_at: Option<Instant>) {
+        state.revoking = false;
+        state.revocation_not_before = retry_at;
+        self.shared.revocation_finished.notify_all();
+        self.ended = true;
+    }
+}
+
+impl Drop for Revocation {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        // Must not panic while unwinding: take the lock even if poisoned.
+        let shared = self.shared.clone();
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let retry_at = self.retry_at;
+        self.end(&mut state, Some(retry_at));
     }
 }
 
@@ -413,6 +484,8 @@ struct Shared {
     registration_replied: Condvar,
     /// The id of the next route registration.
     next_registration_id: AtomicU64,
+    /// Signaled when a revocation finished.
+    revocation_finished: Condvar,
 }
 
 impl Shared {
@@ -446,7 +519,7 @@ impl Shared {
     /// socket is lost with that socket's backlog when its connection fails
     /// (`net::Sockets`). Returns the state lock once every target
     /// acknowledged, `None` if the room stopped waiting for its connection
-    /// or the cache was replaced meanwhile, and an error when a target
+    /// or the cache is being or was replaced meanwhile, and an error when a target
     /// rejected the registration or the targets did not all acknowledge it
     /// within [`REGISTRATION_TIMEOUT`].
     fn register<'a>(
@@ -475,7 +548,7 @@ impl Shared {
         let mut resend_at = Instant::now();
         let mut refused = None;
         let outcome = loop {
-            if !state.awaiting_connection(room) || state.cache_id != cache_id {
+            if !state.awaiting_connection(room) || state.revoking || state.cache_id != cache_id {
                 break Ok(false);
             }
             let registering = &state.registering[&id];
@@ -552,7 +625,18 @@ impl Shared {
         } else {
             state.rooms.update(room, TransferPoll::Failed);
         }
-        let cancellation = state.cancellations.entry(room).or_default();
+        let cache_id = state
+            .attached_caches
+            .get(&room)
+            .unwrap_or(&state.cache_id)
+            .clone();
+        let cancellation = state
+            .cancellations
+            .entry(room)
+            .or_insert_with(|| Cancellation {
+                cache_id,
+                ..Cancellation::default()
+            });
         if cancellation
             .sent
             .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
@@ -561,13 +645,14 @@ impl Shared {
         }
         cancellation.sent = Some(Instant::now());
         let acknowledged = cancellation.acknowledged.len();
+        let frames = wire::cancellation_frames(room, &cancellation.cache_id);
         if let Some(targets) = state.targets.get(&room) {
             for target in targets.iter() {
                 // A full queue is retried on the next cancellation poll.
                 let _ = self.transport.sockets.send_coalesced(
                     &target.host,
                     target.port,
-                    wire::cancellation_frames(room, &state.cache_id),
+                    frames.clone(),
                 );
             }
             let target_count = targets.len();
@@ -624,7 +709,10 @@ impl Shared {
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
         let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let cache_id = {
-            let state = self.state();
+            let state = self
+                .revocation_finished
+                .wait_while(self.state(), |state| state.revoking)
+                .expect("the PD state lock is poisoned");
             if !state.awaiting_connection(room) {
                 return Ok(());
             }
@@ -689,12 +777,21 @@ impl Shared {
         let mut state = self.state();
         // The HTTP lookup may outlive a cancelled request or a cache release.
         // Do not repopulate the new cache's connections with that old work.
-        if !state.awaiting_connection(room) || state.cache_id != cache_id {
+        if !state.awaiting_connection(room) {
             return Ok(());
+        }
+        if state.revoking || state.cache_id != cache_id {
+            // The transfer engine is being or was replaced: connect again,
+            // registering the new cache.
+            drop(state);
+            return self.connect(room, addr);
         }
         if !state.connections.contains_key(&key) {
             state = match self.register(state, room, &targets)? {
                 Some(state) => state,
+                // The transfer engine is being or was replaced: a room still
+                // waiting connects again, registering the new cache.
+                None if self.state().awaiting_connection(room) => return self.connect(room, addr),
                 None => return Ok(()),
             };
             state.connections.insert(key, targets.clone());
@@ -764,12 +861,15 @@ impl Shared {
                 left_out.get_or_insert(room);
                 continue;
             }
+            // The cache the room's route registered: after a revocation the
+            // current one is unknown to Prefill until a room registers it.
+            let cache_id = state.attached_caches.get(&room).unwrap_or(&state.cache_id);
             for target in targets.iter() {
                 let count = sent.entry((target.host.as_str(), target.port)).or_default();
                 match self.transport.sockets.send_coalesced(
                     &target.host,
                     target.port,
-                    wire::announce_frames(room, &state.cache_id),
+                    wire::announce_frames(room, cache_id),
                 ) {
                     Ok(()) => *count += 1,
                     Err(_) => {
@@ -780,6 +880,147 @@ impl Shared {
             }
         }
         left_out.unwrap_or(0)
+    }
+
+    /// The recovery entry for a failed receive whose writers did not all
+    /// acknowledge its cancellation within the receive budget: the Prefill
+    /// rank died or restarted, or a write of its may still be in flight.
+    /// Starts [`Shared::revoke`] off the scheduling loop unless one runs, a
+    /// failed one is cooling down for `retry_after`, or the transport cannot
+    /// fence remote writers (the pages then stay pinned, as logged).
+    fn start_revocation(self: &Arc<Self>, now: Instant, retry_after: Duration) {
+        if !self.transport.deregistration_fences_writes() {
+            return;
+        }
+        {
+            let mut state = self.state();
+            if state.revoking || state.revocation_not_before.is_some_and(|at| now < at) {
+                return;
+            }
+            state.revoking = true;
+        }
+        let mut revocation = Revocation {
+            shared: self.clone(),
+            retry_at: now + retry_after,
+            ended: false,
+        };
+        // A failed spawn drops the revocation, which ends it.
+        let spawned = thread::Builder::new()
+            .name("ts-pd-revoke".to_owned())
+            .spawn(move || revocation.shared.clone().revoke(&mut revocation));
+        if let Err(error) = spawned {
+            tracing::error!(%error, "cannot start revoking unacknowledged KV receives");
+        }
+    }
+
+    /// Fence every remote write into the pages published so far: register
+    /// the cache under a fresh transfer engine and identity, then deregister
+    /// it from the replaced engine, whose keys every published manifest
+    /// named. Every receive attached to the replaced transport fails. Once
+    /// the deregistration succeeded, the rooms whose manifests named the
+    /// replaced engine retire without acknowledgments; if it failed, they
+    /// keep waiting for them. Either way it ends `revocation` as it marks
+    /// them.
+    fn revoke(&self, revocation: &mut Revocation) {
+        let fresh = self.transport.fresh_engine().and_then(|engine| {
+            crate::new_instance_id()
+                .map(|cache_id| (engine, cache_id))
+                .map_err(|error| error.to_string())
+        });
+        let (engine, cache_id) = match fresh {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                tracing::error!(
+                    rank = self.engine_rank,
+                    error,
+                    detail = "no fresh transfer engine: the unacknowledged KV receives stay \
+                              pinned until a later revocation",
+                    "event=ts_decode_revocation_not_started"
+                );
+                return;
+            }
+        };
+        let (replaced, replaced_cache_id, failed) = {
+            let mut state = self.state();
+            let attached: Vec<u64> = state
+                .targets
+                .keys()
+                .copied()
+                .filter(|&room| {
+                    state.tracked.contains(&room)
+                        && !matches!(
+                            state.rooms.get(room),
+                            Some(TransferPoll::Success | TransferPoll::Failed)
+                        )
+                })
+                .collect();
+            for &room in &attached {
+                state.fail(
+                    room,
+                    "KV receive revoked: the transfer engine was replaced to fence a \
+                     Prefill writer that did not acknowledge a cancellation",
+                );
+            }
+            // New registrations name the fresh engine and identity; no
+            // manifest names the replaced engine from here on.
+            let replaced = self.transport.install_engine(engine);
+            let replaced_cache_id = std::mem::replace(&mut state.cache_id, cache_id);
+            state.connections.clear();
+            (replaced, replaced_cache_id, attached.len())
+        };
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..failed {
+                metrics.record_failure();
+            }
+        }
+        let deregistered = self.transport.deregister(&replaced);
+        let replaced_sessions: Vec<String> = replaced
+            .iter()
+            .map(|engine| engine.session_id().to_owned())
+            .collect();
+        let fresh_session = self.transport.session_id();
+        let mut state = self.state();
+        state.revoked_engines.extend(replaced);
+        // The rooms whose manifests named the replaced engine.
+        let named: Vec<u64> = state
+            .admissions
+            .keys()
+            .copied()
+            .filter(|room| state.attached_caches.get(room) == Some(&replaced_cache_id))
+            .collect();
+        match deregistered {
+            Ok(()) => {
+                tracing::warn!(
+                    rank = self.engine_rank,
+                    retired_rooms = ?named,
+                    failed_attached = failed,
+                    ?replaced_sessions,
+                    fresh_session,
+                    "event=ts_decode_revocation_fenced"
+                );
+                // Marked under the lock that computed them: a room that
+                // retires after this is cleared from `revoked` too.
+                state.revoked.extend(named);
+                revocation.end(&mut state, None);
+            }
+            Err(error) => {
+                state.revocation_unfenced = true;
+                tracing::error!(
+                    rank = self.engine_rank,
+                    error,
+                    pinned_rooms = ?named,
+                    failed_attached = failed,
+                    ?replaced_sessions,
+                    fresh_session,
+                    detail = "the replaced engine may still accept writes with its old keys: \
+                              these rooms keep waiting for cancellation acknowledgments and \
+                              this rank never releases its memory",
+                    "event=ts_decode_revocation_unfenced"
+                );
+                let retry_at = revocation.retry_at;
+                revocation.end(&mut state, Some(retry_at));
+            }
+        }
     }
 
     fn watch(&self, interval: Duration, max_failures: u32, stop: &mpsc::Receiver<()>) {
@@ -839,7 +1080,27 @@ impl DecodeOutbox {
     /// A sleep releases the cache: deregister it from the transfer engine,
     /// refused while a tracked request's KV may still land.
     pub fn release_registration(&self) -> Result<(), String> {
-        let mut receiving: Vec<u64> = self.shared.state().tracked.iter().copied().collect();
+        // Held through the release: a revocation installs its engine under it.
+        let state = self.shared.state();
+        if state.revoking {
+            return Err(
+                "cannot release the cache while a revocation replaces its transfer engine"
+                    .to_owned(),
+            );
+        }
+        if state.revocation_unfenced {
+            tracing::error!(
+                rank = self.shared.engine_rank,
+                detail = "a revocation could not deregister the cache from the engine it \
+                          replaced (see event=ts_decode_revocation_unfenced)",
+                "event=ts_decode_release_refused_unfenced"
+            );
+            return Err(
+                "cannot release the cache: a replaced transfer engine kept it registered"
+                    .to_owned(),
+            );
+        }
+        let mut receiving: Vec<u64> = state.tracked.iter().copied().collect();
         if !receiving.is_empty() {
             receiving.sort_unstable();
             return Err(format!(
@@ -920,7 +1181,10 @@ impl DecodeOutbox {
     /// ranks; its KV lands at `request_pool_index`.
     fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
         let mut state = self.shared.state();
-        if !state.tracked.contains(&room) || state.cancellations.contains_key(&room) {
+        if !state.tracked.contains(&room)
+            || state.cancellations.contains_key(&room)
+            || state.rooms.get(room) == Some(TransferPoll::Failed)
+        {
             // The loop ended the request (its transfer failed) after it
             // planned this admission: its pages go back, so no Prefill
             // rank may write them.
@@ -1019,6 +1283,7 @@ impl DecodePeer {
             metrics: config.peer.metrics.clone(),
             registration_replied: Condvar::new(),
             next_registration_id: AtomicU64::new(0),
+            revocation_finished: Condvar::new(),
         });
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -1123,6 +1388,22 @@ impl DecodePeer {
             .collect();
         self.connect
             .retain(|addr, _| state.routes.contains_key(addr) || pending.contains(addr.as_str()));
+    }
+
+    /// Whether a failed receive has waited the whole receive budget for its
+    /// writers to acknowledge the cancellation while its manifest named the
+    /// current transfer engine: only a revocation can retire it now.
+    fn needs_revocation(&self, now: Instant) -> bool {
+        let state = self.shared.state();
+        self.receivers.values().any(|receiver| {
+            receiver
+                .draining
+                .as_ref()
+                .is_some_and(|drain| now - drain.since >= self.waiting_timeout)
+                && !state.cancellation_retired(receiver.room)
+                && state.admissions.contains_key(&receiver.room)
+                && state.attached_caches.get(&receiver.room) == Some(&state.cache_id)
+        })
     }
 
     fn forget(&mut self, rid: &str) {
@@ -1388,6 +1669,9 @@ impl TransferPeer for DecodePeer {
         for rid in ended {
             self.forget(&rid);
         }
+        if self.needs_revocation(now) {
+            Shared::start_revocation(&self.shared, now, self.waiting_timeout);
+        }
         self.reap_connect_workers();
         let stalled = stalled_drains(
             self.order
@@ -1558,7 +1842,13 @@ mod tests {
         );
         state.admissions.insert(1, 3);
         state.apply(StatusMessage::bare(1, TransferPoll::Failed, 0));
-        state.cancellations.insert(1, Cancellation::default());
+        state.cancellations.insert(
+            1,
+            Cancellation {
+                cache_id: "cache".to_owned(),
+                ..Cancellation::default()
+            },
+        );
         assert!(!state.cancellation_retired(1));
         state.acknowledge_cancellation(1, "cache", 0);
         assert!(!state.cancellation_retired(1));
@@ -1596,7 +1886,13 @@ mod tests {
             ]),
         );
         state.admissions.insert(1, 7);
-        state.cancellations.insert(1, Cancellation::default());
+        state.cancellations.insert(
+            1,
+            Cancellation {
+                cache_id: "current".to_owned(),
+                ..Cancellation::default()
+            },
+        );
         state.acknowledge_cancellation(1, "old", 0);
         state.acknowledge_cancellation(1, "current", 9);
         assert!(!state.cancellation_retired(1));
@@ -1610,6 +1906,58 @@ mod tests {
         state.clear(1, "prefill:80");
         state.acknowledge_cancellation(1, "current", 0);
         assert!(state.cancellations.is_empty());
+    }
+
+    #[test]
+    fn a_cancellation_is_acknowledged_for_the_cache_its_route_registered() {
+        let mut state = State {
+            cache_id: "fresh".to_owned(),
+            ..State::default()
+        };
+        connected(&mut state, 1, "prefill:80");
+        state.targets.insert(
+            1,
+            Arc::new(vec![Target {
+                rank: 0,
+                host: "p0".to_owned(),
+                port: 1,
+                is_dummy: false,
+            }]),
+        );
+        state.admissions.insert(1, 3);
+        state.cancellations.insert(
+            1,
+            Cancellation {
+                cache_id: "replaced".to_owned(),
+                ..Cancellation::default()
+            },
+        );
+        state.acknowledge_cancellation(1, "fresh", 0);
+        assert!(!state.cancellation_retired(1));
+        state.acknowledge_cancellation(1, "replaced", 0);
+        assert!(state.cancellation_retired(1));
+    }
+
+    #[test]
+    fn a_revoked_room_retires_without_acknowledgments() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        state.targets.insert(
+            1,
+            Arc::new(vec![Target {
+                rank: 0,
+                host: "p0".to_owned(),
+                port: 1,
+                is_dummy: false,
+            }]),
+        );
+        state.admissions.insert(1, 3);
+        state.cancellations.insert(1, Cancellation::default());
+        assert!(!state.cancellation_retired(1));
+        state.revoked.insert(1);
+        assert!(state.cancellation_retired(1));
+        state.clear(1, "prefill:80");
+        assert!(state.revoked.is_empty());
     }
 
     #[test]
