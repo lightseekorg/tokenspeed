@@ -316,7 +316,7 @@ def projection_mm_to_owners(
 
     Returns:
         This owner's ``[rows, N]`` rows with zero padding rows, borrowed until
-        the workspace's next projection.
+        the next projection.
     """
     if backend is None:
         backend = get_global_backend()

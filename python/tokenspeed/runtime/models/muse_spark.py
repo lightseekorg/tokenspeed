@@ -250,7 +250,7 @@ class _OwnedRowProjections:
     ) -> torch.Tensor:
         """Project all rows through this rank's columns; return its ``[L, world_size * N]`` rows.
 
-        The rows are borrowed until the next post-expert projection.
+        The rows are borrowed until the next owned-row projection.
         """
         return projection_mm_to_owners(
             x, self.local_rows(rows), weight, self.post_expert, None

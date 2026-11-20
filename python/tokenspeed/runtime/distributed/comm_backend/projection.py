@@ -235,7 +235,8 @@ class ProjectionWorkspace:
     Intermediate tensors borrow storage only for the current projection;
     consumers finish on the same stream before another projection reuses it.
     Independent preparations own separate allocations. Final inverse-A2A/RS
-    outputs are caller-owned. Destroy referencing CUDA graphs before close().
+    outputs are caller-owned, but a transpose's owner rows are borrowed until
+    the next projection. Destroy referencing CUDA graphs before close().
     """
 
     def __init__(
@@ -533,6 +534,7 @@ def projection_mm_to_owners(
     """Project all rows through this rank's shard; return owner rows through backend."""
     from tokenspeed_kernel.ops.gemm import mm
 
+    _check_workspace(rows, workspace, backend)
     _check_transpose(inputs, rows, weight, workspace)
     # The exchange's output must not share storage with its input.
     projected = inputs.new_empty((len(workspace.spec.group) * rows, weight.shape[0]))
