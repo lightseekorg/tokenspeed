@@ -19,6 +19,9 @@ first decode hold a request row and KV pages but no execution permit. All
 these requests share one pool; extra rows are not a dedicated transfer pool.
 
 On a D role, the first local decode acquires a move-only permit and keeps it across rounds.
+The wait for that first permit is a time-to-first-token cost: the first-token
+boundary is the first local decode output, so `decode_ready_wait_seconds`
+lies inside TTFT and outside TPOT.
 Permit admission for a newly completed prefill does not displace an
 already streaming request; KV-capacity recovery follows the victim policy below.
 Restoring a Decoding request reserves a permit before issuing the restore;
@@ -106,7 +109,8 @@ matching determines the reusable boundary. Buffers still owned by native I/O
 remain held.
 State groups use the same checkpoint matcher and fixed two-slot layout as
 local hits. Retraction remains an exact image restore, never an L3 re-prefill.
-The D role probes Device history and receives missing data from its peer.
+The D role probes Device and Host history and receives missing data from
+its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
 A first admission with no free request-pool row skips prefix matching; with
@@ -185,17 +189,40 @@ entry both prefill paths call), what each group demands for it in
 
 **Junction cut.** A chunk is never shortened to a page boundary: a prompt
 end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
-costs nothing. The one cut is the *junction* of a hybrid hit: when the KV
-groups' hit `T` reaches past the longest state checkpoint `T_s`
-(`AdmissionResult::junction_tokens`, kept in `CacheProgress::junction_tokens`
-until a chunk passes it), the first chunk after `T_s` ends exactly at `T`, so
-the natural checkpoint it leaves coincides with KV already cached and the next
-prompt sharing that prefix resumes at `T` in every group. The next chunk's
-admission publishes that checkpoint (`PublicationPoint::kStateCheckpoint`):
-the state under the junction's key, but not the KV there, which is cached
-already, so the owner keeps writing its partial block and needs no copy-in
-(`cache-concepts.md`, copy-in). Every other chunk end publishes only its
-completed full pages.
+costs nothing. The one cut is the *junction* of a hit: when the KV reach `T`
+lies past the hit `T_s` (`AdmissionResult::junction_tokens`, kept in
+`CacheProgress::junction_tokens` until a chunk passes it), the first chunk
+after `T_s` ends exactly at `T`, so the natural checkpoint it leaves coincides
+with KV already cached and the next prompt sharing that prefix resumes at `T`
+in every group. With restricted State groups (G > 1) chunk ends stay on the G
+grid, so an on-grid junction publishes only when a chunk end lands on it.
+With a State group, the KV reach is at least the
+prefix-closed groups' coverage, rounded down to the checkpoint grid (a
+restricted State group, `checkpoint_granularity` G > 1, publishes only on
+multiples of G, so a junction off that grid could never be resumed at):
+`T_s` falls short of it where a State checkpoint is missing, and also where a
+sliding window is -- a producer publishes its window only where its chunks
+end, so a prompt that diverges inside another prompt's chunk finds the full
+history cached but no window there. The chunk cut at `T` writes its own
+window and publishes it with the checkpoint, like any chunk end's completed
+pages. Without a State group (a sliding-only model) there is no checkpoint to
+publish, and the D role's probe leaves the State groups out (its prompt
+arrives by transfer): both keep the reach every token-spanned group accepts,
+as before. The next chunk's admission publishes that checkpoint
+(`PublicationPoint::kStateCheckpoint`): the state under the junction's key
+and the windows the chunk wrote under their own page keys, but not the
+full-history KV there, which is cached already, so the owner keeps writing its
+partial block and needs no copy-in (`cache-concepts.md`, copy-in). Every other chunk end publishes only
+its completed full pages.
+
+The trade-off: a junction publishes one checkpoint, and reaching past a
+missing window moves it from the producer's chunk end below the coverage
+(the last boundary with a window, where the cut used to land) up to the
+coverage itself. A later prompt diverging between the two finds neither and
+resumes at the next checkpoint below (for example, a producer chunk end at 8, a
+coverage of 10: a prompt diverging at 9 resumed at 8 before and now at 0).
+The common case it serves is the opposite one: siblings that share the whole
+prefix up to the coverage, which now resume there instead of a chunk earlier.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -390,8 +417,9 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — a `PublicationPoint` other than an ordinary chunk end
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1; the KV there is cached already, so only the state is
-published), and a finish or retraction on every role (`kFinal`: the P's
+junction (§1; the full-history KV there is cached already, so only the state
+and the sliding windows the chunk wrote are published), and a finish or
+retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
 except the dead prompt ends and finishes that the in-forward checkpoint
 skips (below). An ordinary chunk end or decode step publishes nothing for a State
@@ -589,9 +617,11 @@ the KV is the Device's prefix plus a Host suffix, and each State group's
 checkpoint comes from whichever tier holds it, the Device first -- so Device
 KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
 groups reach further than the state (`kv_tokens >
-num_common_tokens`), the difference is the junction: the first chunk ends
-there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. For unrestricted
+num_common_tokens`; with a State group at least the prefix-closed groups'
+coverage on the checkpoint grid), the difference is the junction: the first
+chunk ends there and publishes the checkpoint and the sliding windows the
+cache lacked, so the next prompt that shares the prefix resumes at the KV
+boundary in every group. For unrestricted
 State groups no alignment is imposed on a chunk, and apart from the opt-in
 in-forward checkpoint above no checkpoint is produced inside a forward: a
 chunk's state output is its own natural checkpoint.
@@ -1493,9 +1523,58 @@ tiers together hold distinct content up to about the sum of their capacities,
 less pinned and in-flight blocks, where write-through keeps on the Host a copy
 of what the Device holds.
 
+**Decode allocation** (`SchedulerConfig::decode_allocation_policy`). The
+policy is this role's alone: under either one the D role allocates a
+destination for every request its transfer peer lets in. A config without a
+policy is `early`, as a caller built before the policy existed sends it. A
+request here starts in `Bootstrapping` and becomes a candidate with
+`pd::BootstrappedEvent`; before that it is not probed, so it reports no
+capacity failure and stops no other prompt. Under `early` that event says
+every Decode rank allocated the request's destination, so an admitted prompt
+always has one. Under `deferred` the event only admits, and the destination
+has its own event, `pd::DestinationReadyEvent`
+(`Request::MarkDestinationReady`), which may come in any state: a prompt whose
+final result lands before it waits in `PrefillAwaitingDestination`, with its
+pages and request-pool slot, until the event moves it to `PrefillDone`, whose
+remote decode sends the KV. The policy is read where a final result makes that
+choice and where the prefill plan sets the capacity stop described in the
+following paragraph. A cancellation or a failed transfer (`pd::FailedEvent`)
+ends a waiting prompt as it ends every pinned request: it parks in
+`PdTransferring` until the transfer stopped (`pd::TransferStoppedEvent`). The
+prompts waiting are bounded by the request pool's slots (`max_batch_size`) as
+well as by the pages they hold.
+
+A prompt waiting for its destination holds pages that only the Decode node's
+allocation, or its transfer's failure, gives back. New prompts are admitted
+meanwhile as under `early`: a smaller prompt passes one that does not fit, so
+on a tight pool a larger prompt can wait until the smaller ones behind it stop
+arriving.
+
+The scheduler decides neither when the peer admits a request nor when the
+Decode node may allocate. What keeps the two nodes from waiting for each
+other is the order the transfer peers keep: the Decode node allocates a
+request's destination only after this scheduler admitted the request's last
+chunk, when it holds every page the prompt needs, so no destination is held
+for a prompt this node cannot compute. That includes the prompt's remote
+decode: the last chunk's admission reserved the decode slots it reads, so it
+takes no block. Were it ever not admitted under `deferred`, the scheduler
+logs an error once for that request and leaves the prompt as it is; the
+Decode node's waiting timeout ends it.
+`deferred` requires `--disaggregation-layerwise-interval 0` (no KV streams
+during the forward), attention TP 1, KVP 1, PP 1, no external encoder and a
+model without multimodal input.
+
+The peers' side of that order is in `event-loop.md` (PD): the Decode rank
+announces the room, the prefill peer then sends `pd::BootstrappedEvent`,
+notifies the Decode rank when the plan that carries the request's last chunk
+goes to the device, and sends `pd::DestinationReadyEvent` when the manifests
+arrived; the Decode peer shows its scheduler a request only after that notice.
+
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a
-prompt whose KV is mid-transfer would strand the decode side. Lone-request
+prompt whose KV is mid-transfer would strand the decode side. Under
+`deferred` decode allocation a computed prompt without a destination keeps
+its pages too: it is neither retracted nor computed again. Lone-request
 compaction (§1.4) is gated on the same pin, so past its first admission a
 request here waits as before; the pin counts as a transfer in flight, so the
 stall diagnostic (§2) counts no stall for it either. The no-progress abort
@@ -1519,8 +1598,11 @@ then copy any tail block the index took into its pre-reserved private block.
 
 The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
-pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes the request. On the D role the pin is `RemotePrefilling`:
+pinned until the PD ACK finishes the request: under `early` decode allocation
+the peer's decode may read the pages from the first scheduled chunk (layerwise
+streaming), under `deferred` only from the remote decode on, and a prompt
+waiting for its destination is pinned as well. On the D role the pin is
+`RemotePrefilling`:
 the peer's prefill is writing the destination pages, and `RemotePrefillDone`
 ends it by leaving that state. A fused engine never transfers. Because the pin
 is the state, no event handler can forget to clear it.
@@ -1580,11 +1662,16 @@ claimed by an extend forward, and the capacity model charges no prefill peak
 (§1.4).
 
 **What the D probe may claim.** The remote admission probes this node's own
-Device cache (`PrefixProber::ProbeDecodeDevicePrefix`) so the peer
+Device cache, then its Host (`PrefixProber::ProbeDecodePrefix`), so the peer
 transfers only what is missing. For the token-spanned groups it is the
 ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
-the peer to fill whole; the tail's full blocks below it, when a group's
+the peer to fill whole. The Host continues the Device's history in whole
+pages only, so a Host hit ends on a block boundary of every group: the
+admission loads it below the landing (`load_pairs`), no block is both loaded
+and landed, and the data plane starts the receive behind those loads, since
+the request's first decode runs in a later plan whose layerwise load waits
+name only that plan's loads; the tail's full blocks below it, when a group's
 blocks are smaller than a page, are the hitter's own copies like on every
 role (`pages_to_copy`). The peer fills whole every full-history block up to
 the prompt end, so the landing lists none of them in `pages_to_zero`
@@ -2012,6 +2099,11 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   the tokens its chunk gave up. The incomplete prefill is still admitted
   first, and a resident chunk that fails admission still stops everything
   behind it.
+- On the P role a request is a candidate only after `pd::BootstrappedEvent`,
+  and under `deferred` decode allocation its KV is sent only after
+  `pd::DestinationReadyEvent` (§3.1). A computed prompt waiting for that event
+  is never retracted or computed again. The Decode node must learn of a
+  request only after this role admitted its last chunk.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only

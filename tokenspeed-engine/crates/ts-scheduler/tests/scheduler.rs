@@ -175,6 +175,7 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
         .submit_requests(&[spec("long", (1..=52).collect()), queued])
         .unwrap();
 
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 54);
     for prefix in (0..52).step_by(8) {
         let probe = scheduler.probe_prefill_gate();
         assert!(probe.wants_prefill, "prefix {prefix}");
@@ -184,6 +185,10 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
         assert_eq!(batches[0].request_ids, ["long"]);
         assert_eq!(batches[0].extend_prefix_lens, [prefix]);
         assert_eq!(batches[0].input_lengths, [(52 - prefix).min(8)]);
+        assert_eq!(
+            scheduler.sizes().pending_prefill_tokens,
+            i64::from((52 - prefix - 8).max(0) + 2)
+        );
         assert!(plan.aborts().is_empty());
         scheduler
             .advance(&[event(
@@ -216,6 +221,42 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
 }
 
 #[test]
+fn pending_prefill_tokens_use_the_queued_prompts_observed_cache_hit() {
+    interpreter();
+    let code = NEW_SCHEDULER.replace(
+        "max_scheduled_tokens = 512",
+        "max_scheduled_tokens = 64\ncfg.enable_short_prefill_first = True",
+    );
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+    scheduler
+        .submit_requests(&[spec("seed", (0..32).collect())])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[
+            event(ForwardEventKind::ExtendResult, "seed", vec![42]),
+            event(ForwardEventKind::Finish, "seed", Vec::new()),
+        ])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .submit_requests(&[
+            spec("cold", (1000..1064).collect()),
+            spec("hot", (0..128).collect()),
+        ])
+        .unwrap();
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 192);
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["cold"]);
+    assert_eq!(scheduler.sizes().waiting, 1);
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 96);
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "hot", Vec::new())])
+        .unwrap();
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 0);
+}
+
+#[test]
 fn a_request_runs_from_prefill_to_finish() {
     interpreter();
     let mut scheduler =
@@ -226,11 +267,13 @@ fn a_request_runs_from_prefill_to_finish() {
         .unwrap();
     let sizes = scheduler.sizes();
     assert_eq!((sizes.waiting, sizes.running), (1, 0));
+    assert_eq!(sizes.pending_prefill_tokens, 10);
 
     let plan = scheduler.next_execution_plan(true, false);
     let batches = plan.forward_batches();
     assert_eq!(batches.len(), 1);
     assert_eq!(scheduler.sizes().running, 1);
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 0);
     let prefill = &batches[0];
     assert_eq!(prefill.request_ids, ["r1"]);
     assert_eq!(
@@ -1459,4 +1502,28 @@ fn python_event_lists_keep_their_payload_after_cache_clear() {
         )
         .unwrap();
     });
+}
+
+#[test]
+fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("paused", vec![1, 2, 3])])
+        .unwrap();
+    let mut frozen = tick(1);
+    frozen.tick.as_mut().unwrap().allow_forward = false;
+    scheduler.advance_head(&frozen, &[]).unwrap();
+    // Exceed the scheduler's no-progress threshold while forwards are forbidden.
+    for _ in 0..8192 {
+        let plan = scheduler.next_execution_plan(false, false);
+        assert!(plan.forward_batches().is_empty());
+        assert!(plan.aborts().is_empty());
+        assert_eq!(scheduler.sizes().waiting, 1);
+    }
+    scheduler.advance_head(&tick(2), &[]).unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(plan.aborts().is_empty());
+    assert_eq!(plan.forward_batches()[0].request_ids, ["paused"]);
 }

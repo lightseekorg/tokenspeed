@@ -69,6 +69,7 @@ from tokenspeed.runtime.utils.env import (
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import count_dspark_stages
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 def _fake_pool(*group_specs, **arena_attrs) -> SimpleNamespace:
@@ -798,6 +799,7 @@ class TestDeepseekV4Config:
                 captured["kwargs"] = kwargs
 
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.dp_local_graph = False
         wrapper.attn_backend = FakeBackend()
         wrapper.draft_attn_backend = None
@@ -838,6 +840,7 @@ class TestDeepseekV4Config:
                 captured[self.key]["kwargs"] = kwargs
 
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.dp_local_graph = False
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
@@ -890,10 +893,12 @@ class TestDeepseekV4Config:
                 captured[self.key].append(("refresh", args, kwargs))
 
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.dp_local_graph = False
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.drafter = SimpleNamespace(
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
@@ -949,10 +954,12 @@ class TestDeepseekV4Config:
         state_table = torch.full((1, 1), 2, dtype=torch.int32)
 
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.dp_local_graph = False
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.drafter = SimpleNamespace(
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
@@ -998,6 +1005,7 @@ class TestDeepseekV4Config:
                 captured[self.key].append((args, kwargs))
 
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         wrapper.dp_local_graph = False
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")

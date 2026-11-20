@@ -24,7 +24,7 @@ One program per row, on one warp, loads the row's FP32 logits (eight per lane) a
 the FP32 correction bias, computes ``s = div.rn.f32(1, add.rn.f32(1,
 __nv_expf(-logit)))`` -- Torch's FP32 ``sigmoid_kernel_cuda`` recipe: libdevice
 ``exp`` plus inline PTX ``.rn`` add and div, no FTZ (:data:`RECIPE`; the helpers
-:func:`_sigmoid_rn`, :func:`_add_rn_f32`, :func:`_div_rn_f32`) -- stores ``s`` to
+:func:`_sigmoid_rn`, :func:`add_rn_f32`, :func:`div_rn_f32`) -- stores ``s`` to
 ``scores_ptr`` and adds the bias with one ``add.rn.f32`` (Torch's add). The radix key
 is :func:`_ordered_key_tl`; the jit helpers, constexpr constants, the launch options
 and the admission rule ``grouped_select_rejection`` of
@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops._triton_ptx import add_rn_f32, div_rn_f32, mul_rn_f32
 from tokenspeed_kernel.ops.moe._triton.grouped_select import (
     _EXPERT_CHUNK,
     _GROUP_CHUNK,
@@ -99,8 +100,6 @@ from tokenspeed_kernel.ops.moe._triton.grouped_select import (
     grouped_select_rejection,
 )
 from tokenspeed_kernel.ops.moe._triton.route_epilogue import (
-    _add_rn,
-    _mul_rn,
     route_scale_fp32,
     route_scale_rejection,
 )
@@ -125,35 +124,11 @@ RECIPE = "s = div.rn.f32(1, add.rn.f32(1, __nv_expf(-x))); x = add.rn.f32(s, bia
 
 
 @triton.jit
-def _add_rn_f32(a, b):
-    return tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        "=f,f,f",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _div_rn_f32(a, b):
-    return tl.inline_asm_elementwise(
-        "div.rn.f32 $0, $1, $2;",
-        "=f,f,f",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _sigmoid_rn(t):
     # Torch's FP32 sigmoid_kernel_cuda: 1 / (1 + expf(-t)), IEEE .rn add and div, libdevice
     # expf, no FTZ.
     one = tl.full(t.shape, 1.0, tl.float32)
-    return _div_rn_f32(one, _add_rn_f32(one, libdevice.exp(-t)))
+    return div_rn_f32(one, add_rn_f32(one, libdevice.exp(-t)))
 
 
 # ---------------------------------------------------------------------------------------
@@ -352,7 +327,7 @@ def _router_select_lanepar_kernel(
     s = _sigmoid_rn(logit)
     if not ROUTE:
         tl.store(scores_ptr + row * NUM_EXPERTS + lane, s)
-    x = _add_rn_f32(s, tl.load(bias_ptr + lane))
+    x = add_rn_f32(s, tl.load(bias_ptr + lane))
     # A. radix keys of the choices
     key = _ordered_key_tl(x, KEY_NAN)
     # B. group score: the two largest keys of each group (with multiplicity), one FP32 add
@@ -386,13 +361,13 @@ def _router_select_lanepar_kernel(
             # Shuffle-down offsets 4, 2, 1: pair slot i with slot i + 4, then i + 2,
             # then i + 1 (exact layout moves, one add.rn per pair).
             lo, hi = tl.split(tl.trans(tl.reshape(weights, (2, 4))))
-            quad = _add_rn(lo, hi)
+            quad = add_rn_f32(lo, hi)
             lo, hi = tl.split(tl.trans(tl.reshape(quad, (2, 2))))
-            even, odd = tl.split(_add_rn(lo, hi))
-            denominator = _add_rn(_add_rn(even, odd), 1e-20)
+            even, odd = tl.split(add_rn_f32(lo, hi))
+            denominator = add_rn_f32(add_rn_f32(even, odd), 1e-20)
             weights = tl.div_rn(weights, denominator)
         if SCALE is not None:
-            weights = _mul_rn(weights, SCALE)
+            weights = mul_rn_f32(weights, SCALE)
         tl.store(weights_ptr + row * TOPK + slots, weights)
         tl.store(route_ids_ptr + row * TOPK + slots, ids)
     else:

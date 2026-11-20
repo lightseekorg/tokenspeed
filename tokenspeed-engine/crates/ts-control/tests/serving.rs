@@ -29,6 +29,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, Once, PoisonError,
@@ -60,6 +61,7 @@ use ts_l3::{
     monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
     Namespace, Range, Store, StoreError,
 };
+use ts_metrics::{EngineLabels, EngineMetrics, Exporter, MetricsConfig};
 use ts_pd::{
     BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
     RemotePrefill, TransferPeer, TransferPoll,
@@ -139,8 +141,11 @@ fn new_scheduler(
     role: Role,
     kv_shard_count: usize,
     device_pages: usize,
+    resident_requests: usize,
+    deferred: bool,
 ) -> Scheduler {
     interpreter();
+    let policy = if deferred { "Deferred" } else { "Early" };
     let role = match role {
         Role::Plain => "Fused",
         Role::Prefill => "P",
@@ -190,7 +195,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
-cfg.max_resident_requests = 8
+cfg.max_resident_requests = {resident_requests}
 cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
@@ -198,6 +203,8 @@ cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granula
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
+if cfg.role == ts.SchedulerConfig.Role.P:
+    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.{policy}
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
 {tiers}
@@ -287,6 +294,8 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// Exported gauges checked against the actual dispatch.
+    metrics_dir: Option<PathBuf>,
     /// Every data-plane admission must already have a fresh identity.
     last_admission: u64,
     /// This rank; PD names it as a sender of a request's KV.
@@ -424,6 +433,9 @@ struct WireRoom {
     cancel_pending: bool,
     /// Keep the cancellation acknowledgment pending, as an in-flight write does.
     hold_cancel: bool,
+    /// The decode engine admits the pages once the prefill engine dispatched
+    /// a forward of this room's prompt.
+    preallocated_once_dispatched: bool,
 }
 
 /// A stand-in transfer peer over a [`Wire`]: a transfer advances as soon as
@@ -433,8 +445,12 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Tracked requests: rid, room, bootstrapped, failure reported.
-    tracked: Vec<(String, u64, bool, bool)>,
+    /// Prefill: decode allocation is deferred, so a request is admitted
+    /// at once and its destination's allocation has its own event.
+    deferred: bool,
+    /// Tracked requests: rid, room, bootstrapped, failure reported, and
+    /// (deferred) admitted.
+    tracked: Vec<(String, u64, bool, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -449,7 +465,7 @@ impl TransferPeer for FakePeer {
                 .decode_registered = true;
         }
         self.tracked
-            .push((rid.to_owned(), bootstrap.room, false, false));
+            .push((rid.to_owned(), bootstrap.room, false, false, false));
         Ok(())
     }
 
@@ -467,7 +483,7 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .flat_map(|(_, room, bootstrapped, _)| {
+                .flat_map(|(_, room, bootstrapped, _, _)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
                         || room.cancel_pending
@@ -487,10 +503,11 @@ impl TransferPeer for FakePeer {
                     } else {
                         // The KV left this prefill rank, or arrived from
                         // every one.
-                        let sent = match role {
-                            Role::Prefill => room.sent_by.contains(&rank),
-                            _ => room.sent_by.len() == prefill_ranks,
-                        };
+                        let sent = room.preallocated.is_some()
+                            && match role {
+                                Role::Prefill => room.sent_by.contains(&rank),
+                                _ => room.sent_by.len() == prefill_ranks,
+                            };
                         if sent {
                             TransferPoll::Success
                         } else {
@@ -512,11 +529,16 @@ impl TransferPeer for FakePeer {
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
         let mut agreed = agreed.chunks_exact(2);
+        let deferred = self.deferred && role == Role::Prefill;
         self.tracked
-            .retain_mut(|(rid, room, bootstrapped, failed)| {
+            .retain_mut(|(rid, room, bootstrapped, failed, admitted)| {
                 let state = agreed.next().expect("one state per tracked request");
                 let (poll, retired) = (state[0], state[1]);
                 let room = wire.rooms.entry(*room).or_default();
+                if deferred && !*admitted {
+                    *admitted = true;
+                    events.push(PdEvent::Bootstrapped(rid.clone()));
+                }
                 match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
                     TransferPoll::Failed => {
                         // Failure ends the output before held writes retire.
@@ -534,7 +556,11 @@ impl TransferPeer for FakePeer {
                     }
                     TransferPoll::Bootstrapped if !*bootstrapped => {
                         *bootstrapped = true;
-                        events.push(PdEvent::Bootstrapped(rid.clone()));
+                        events.push(if deferred {
+                            PdEvent::DestinationReady(rid.clone())
+                        } else {
+                            PdEvent::Bootstrapped(rid.clone())
+                        });
                         true
                     }
                     TransferPoll::Success => {
@@ -568,7 +594,7 @@ impl TransferPeer for FakePeer {
     fn abort_room(&mut self, _: &str, _: u64) {}
 
     fn cancel(&mut self, rid: &str) {
-        if let Some((_, room, _, _)) = self.tracked.iter().find(|(id, _, _, _)| id == rid) {
+        if let Some((_, room, ..)) = self.tracked.iter().find(|(id, ..)| id == rid) {
             self.wire
                 .lock()
                 .unwrap()
@@ -681,6 +707,18 @@ impl DataPlane for FakeDevice {
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
         let forward = dispatch.forward;
+        if let Some(directory) = &self.metrics_dir {
+            let gauges = exported_gauges(directory);
+            assert_eq!(
+                gauges["tokenspeed:num_requests_running"],
+                forward.map_or(0, |batch| batch.request_ids.len()) as f64,
+                "RunningBS must count only the dispatched requests"
+            );
+            assert!(
+                gauges["tokenspeed:num_requests_waiting"]
+                    >= gauges["tokenspeed:num_decode_ready_waiting_reqs"]
+            );
+        }
         if let Some(windows) = dispatch.ngram {
             let mut seen = self.ngram.lock().unwrap();
             seen.extend(
@@ -714,6 +752,14 @@ impl DataPlane for FakeDevice {
             .extend(ops.into_iter().map(|op| (self.ack_polls, op)));
         if let Some(wire) = &self.wire {
             let mut wire = wire.lock().unwrap();
+            for rid in forward.iter().flat_map(|batch| &batch.request_ids) {
+                if let Some(room) = self.rooms.get(rid) {
+                    let room = wire.rooms.entry(*room).or_default();
+                    if room.preallocated_once_dispatched {
+                        room.preallocated.get_or_insert(1);
+                    }
+                }
+            }
             if let Some(admitted) = plan.remote_prefill() {
                 for (rid, &slot) in admitted
                     .request_ids
@@ -1256,6 +1302,10 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// A separate metrics directory for each rank.
+    metrics_dir: Option<PathBuf>,
+    /// Resident slots; decode can hold more requests than it forwards.
+    resident_requests: Option<usize>,
     /// The fake device exposes the collective NCCL sleep region.
     nccl_suspendable: bool,
     /// Override the ingress context limit to exercise native capacity errors.
@@ -1264,6 +1314,8 @@ struct Setup {
     device_pages: Option<usize>,
     /// Batch prefill in windows, with pressure checks for fresh admissions.
     prefill_delay: Option<PrefillDelay>,
+    /// PD, prefill: admit without waiting for the decode allocation.
+    deferred_allocation: bool,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1422,6 +1474,8 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let Setup {
         device_pages,
+        metrics_dir,
+        resident_requests,
         pd,
         eplb,
         grammar,
@@ -1429,6 +1483,7 @@ fn run_rank<F: Frontend>(
         epd_receive_enabled,
         startup,
         scheduler: scheduler_handle,
+        deferred_allocation,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1450,6 +1505,7 @@ fn run_rank<F: Frontend>(
             role: pd.role,
             rank,
             wire: pd.wire,
+            deferred: deferred_allocation,
             tracked: Vec::new(),
         }) as Box<dyn TransferPeer + Send>
     });
@@ -1476,6 +1532,8 @@ fn run_rank<F: Frontend>(
         role,
         kv_shard_count,
         device_pages.unwrap_or(513),
+        resident_requests.unwrap_or(8),
+        deferred_allocation,
     )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
@@ -1497,7 +1555,23 @@ fn run_rank<F: Frontend>(
                     awaiting: Vec::new(),
                 }) as Box<dyn EmbeddingReceiver + Send>
             }),
-            metrics: None,
+            metrics: metrics_dir.map(|directory| {
+                let directory = directory.join(rank.to_string());
+                std::fs::create_dir_all(&directory).unwrap();
+                let exporter = Exporter::new(&MetricsConfig {
+                    prometheus_dir: Some(directory),
+                    relay_endpoint: None,
+                })
+                .unwrap();
+                EngineMetrics::new(
+                    &exporter,
+                    &EngineLabels {
+                        model_name: "metrics-test".into(),
+                        app_key: String::new(),
+                        dp_rank: rank as i64,
+                    },
+                )
+            }),
             kv_events: None,
             eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
             grammars: grammar.then(|| {
@@ -1527,6 +1601,10 @@ fn run_rank<F: Frontend>(
 fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
     let (world, _, _) = layout.sizes();
     FakeDevice {
+        metrics_dir: setup
+            .metrics_dir
+            .as_ref()
+            .map(|dir| dir.join(rank.to_string())),
         last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
@@ -2257,6 +2335,8 @@ async fn idle_load_reports_preserve_resident_cache_capacity() {
     let load = snapshots[0].1;
     assert_eq!((load.num_running, load.num_waiting), (0, 0));
     assert_eq!(load.kv_active_pages, 0);
+    assert_eq!(load.num_resident_tokens, Some(0));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert!(load.kv_used_pages > 0, "reclaimable prefixes stay resident");
     assert_eq!(load.kv_total_pages, 512);
 }
@@ -2397,12 +2477,12 @@ async fn dropping_a_stream_aborts_the_request() {
             );
             // Cancellation produces no final output for the dropped stream,
             // but the frontend must still learn that the engine is idle.
-            if engine
-                .client
-                .loads()
-                .iter()
-                .all(|load| load.num_running == 0 && load.num_waiting == 0)
-            {
+            if engine.client.loads().iter().all(|load| {
+                load.num_running == 0
+                    && load.num_waiting == 0
+                    && load.num_resident_tokens == Some(0)
+                    && load.num_waiting_uncached_tokens == Some(0)
+            }) {
                 return;
             }
         }
@@ -3624,6 +3704,429 @@ fn disaggregated(
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefill_under_deferred_allocation_computes_before_its_destination_and_sends_once_granted(
+) {
+    for depth in [0, 1] {
+        let (prefill, decode, _wire) = start_pd_pair(
+            depth,
+            Layout::Single,
+            Tiers::DeviceOnly,
+            Setup {
+                deferred_allocation: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let request = disaggregated("r", 9, 40, 4);
+        let (prefilled, decoded) = tokio::join!(run(&prefill.client, request.clone()), async {
+            // The prefill engine computes the prompt before the decode
+            // engine even knows the request.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, rids, _)| rids.iter().any(|rid| rid == "r"))
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("depth {depth}: the prompt was not computed"));
+            run(&decode.client, request).await
+        });
+        assert_eq!(tokens(&prefilled), [1000], "depth {depth}");
+        assert_eq!(
+            prefilled.last().unwrap().finish_reason.as_deref(),
+            Some("length")
+        );
+        assert_eq!(tokens(&decoded), [1000, 1001, 1002, 1003], "depth {depth}");
+        assert_eq!(prefill.released().len(), 1, "depth {depth}");
+    }
+}
+
+/// A prefill engine under deferred allocation, alone, one script batch per
+/// round; no decode engine allocates any destination. Returns its rank and
+/// the wire.
+fn run_prefill_under_deferred_allocation(
+    depth: usize,
+    script: Script,
+) -> (ScriptedRank, Arc<Mutex<Wire>>) {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    let mut ranks = run_scripted(
+        Layout::Single,
+        depth,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Prefill,
+                wire: wire.clone(),
+            }),
+            deferred_allocation: true,
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    (ranks.remove(0), wire)
+}
+
+#[test]
+fn a_prefill_under_deferred_allocation_keeps_its_kv_until_the_destination_is_allocated() {
+    for depth in [0, 1] {
+        let mut script = vec![Vec::new(); 20];
+        script[0].push(EngineRequest::Add(Box::new(disaggregated("r", 9, 40, 4))));
+        let (rank, wire) = run_prefill_under_deferred_allocation(depth, script);
+        // One forward computed the prompt; for the rounds after it landed
+        // the prompt kept its pages and sent nothing.
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.forwards, 1, "depth {depth}");
+        assert!(rank.released.is_empty(), "depth {depth}");
+        let wire = wire.lock().unwrap();
+        assert!(
+            wire.rooms[&9].preallocated.is_none() && wire.rooms[&9].sent.is_none(),
+            "depth {depth}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_prefill_under_deferred_allocation_is_released_without_its_destination() {
+    // The abort comes with the submission, so the transfer fails while the
+    // prompt's forward is still out at depth 1, or four rounds later, once
+    // the computed prompt waits for its destination. Either way the retired
+    // transfer's failure releases the request, and nothing is sent, to the
+    // decode engine or to the client, which tore down its stream.
+    for depth in [0, 1] {
+        for abort_round in [0, 4] {
+            let mut script = vec![Vec::new(); 12];
+            script[0].push(EngineRequest::Add(Box::new(disaggregated(
+                "doomed", 11, 40, 4,
+            ))));
+            script[abort_round].push(EngineRequest::Abort(vec!["doomed".to_owned()]));
+            let (rank, wire) = run_prefill_under_deferred_allocation(depth, script);
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(
+                rank.released
+                    .iter()
+                    .map(|(rid, _)| rid.as_str())
+                    .collect::<Vec<_>>(),
+                ["doomed"],
+                "depth {depth}, abort round {abort_round}"
+            );
+            assert!(
+                rank.outputs.iter().all(|output| output.rid != "doomed"),
+                "depth {depth}, abort round {abort_round}"
+            );
+            let wire = wire.lock().unwrap();
+            assert!(
+                wire.rooms[&11].fails && wire.rooms[&11].sent.is_none(),
+                "depth {depth}, abort round {abort_round}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_prefill_under_deferred_allocation_whose_transfer_fails_ends_with_an_abort() {
+    // The prompt is computed and waits for its destination, then its
+    // transfer fails: a bootstrap timeout, a decode node gone. Its output
+    // waited for the transfer, even when its one token ended it, and its
+    // client gets the abort a prompt failing before it is computed gets.
+    for depth in [0, 1] {
+        for max_new_tokens in [1, 4] {
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let prefill = start_ranks_with(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role: Role::Prefill,
+                        wire: wire.clone(),
+                    }),
+                    deferred_allocation: true,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let mut stream = prefill
+                .client
+                .generate(disaggregated("r", 9, 40, max_new_tokens))
+                .await
+                .unwrap();
+            let case = format!("depth {depth}, max_new_tokens {max_new_tokens}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), stream.next())
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert!(
+                prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, rids, _)| rids.iter().any(|rid| rid == "r")),
+                "{case}"
+            );
+            wire.lock().unwrap().rooms.entry(9).or_default().fails = true;
+            let chunks = collect(stream).await;
+            let last = chunks.last().unwrap();
+            assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{case}");
+            let details = &last.finish_details.as_ref().unwrap().0;
+            assert!(
+                details.iter().any(|(k, v)| k == "message"
+                    && *v == Value::from("PD/EPD remote transfer failed or timed out")),
+                "{case}: {details:?}"
+            );
+            prefill.settle().await;
+            assert_eq!(prefill.released().len(), 1, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
+    // The decode engine allocates the destination once the prompt's only
+    // forward is dispatched. At depth 1 the round polls the grant while that
+    // forward is out, so the prompt never waits for it; at depth 0 the result
+    // lands first. Either way the KV goes out once its result landed.
+    for depth in [0, 1] {
+        let wire = Arc::new(Mutex::new(Wire {
+            prefill_ranks: 1,
+            ..Wire::default()
+        }));
+        wire.lock()
+            .unwrap()
+            .rooms
+            .entry(9)
+            .or_default()
+            .preallocated_once_dispatched = true;
+        let mut script = vec![Vec::new(); 20];
+        script[0].push(EngineRequest::Add(Box::new(disaggregated("r", 9, 40, 4))));
+        let rank = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup {
+                pd: Some(Pd {
+                    role: Role::Prefill,
+                    wire: wire.clone(),
+                }),
+                deferred_allocation: true,
+                ..Setup::default()
+            },
+            vec![script],
+            no_reaction,
+        )
+        .remove(0);
+        assert_eq!(rank.outcome, Ok(()), "depth {depth}");
+        assert_eq!(rank.forwards, 1, "depth {depth}");
+        assert_eq!(
+            wire.lock().unwrap().rooms[&9].sent,
+            Some(1000),
+            "depth {depth}"
+        );
+        let outputs: Vec<_> = rank
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "r")
+            .collect();
+        assert_eq!(
+            outputs
+                .iter()
+                .flat_map(|output| output.output_ids.clone())
+                .collect::<Vec<_>>(),
+            [1000],
+            "depth {depth}"
+        );
+        assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
+        assert_eq!(rank.released.len(), 1, "depth {depth}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_pause_freezes_a_prefill_under_deferred_allocation_on_either_side_of_its_grant() {
+    // Frozen, the engine computes nothing and polls no transfer. A prompt
+    // whose destination is allocated before it arrives is not computed until
+    // the resume; a computed prompt whose destination is allocated during
+    // the freeze sends nothing until then. Both complete afterwards.
+    for depth in [0, 1] {
+        for granted_first in [true, false] {
+            let case = format!("depth {depth}, granted first {granted_first}");
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let prefill = start_ranks_with(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role: Role::Prefill,
+                        wire: wire.clone(),
+                    }),
+                    deferred_allocation: true,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let forwards = || {
+                prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, rids, _)| rids.iter().any(|rid| rid == "r"))
+                    .count()
+            };
+            let request = disaggregated("r", 9, 40, 4);
+            let mut stream = if granted_first {
+                wire.lock()
+                    .unwrap()
+                    .rooms
+                    .entry(9)
+                    .or_default()
+                    .preallocated = Some(1);
+                assert_eq!(
+                    control(&prefill, pause("keep")).await,
+                    [("PauseSchedulerReqOutput", true)],
+                    "{case}"
+                );
+                prefill.client.generate(request).await.unwrap()
+            } else {
+                let mut stream = prefill.client.generate(request).await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), stream.next())
+                        .await
+                        .is_err(),
+                    "{case}"
+                );
+                assert_eq!(forwards(), 1, "{case}");
+                assert_eq!(
+                    control(&prefill, pause("keep")).await,
+                    [("PauseSchedulerReqOutput", true)],
+                    "{case}"
+                );
+                wire.lock()
+                    .unwrap()
+                    .rooms
+                    .entry(9)
+                    .or_default()
+                    .preallocated = Some(1);
+                stream
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), stream.next())
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(forwards(), usize::from(!granted_first), "{case}");
+            assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "{case}");
+            assert_eq!(
+                control(&prefill, resume()).await,
+                [("ResumeSchedulerReqOutput", true)],
+                "{case}"
+            );
+            let chunks = collect(stream).await;
+            assert_eq!(tokens(&chunks), [1000], "{case}");
+            assert_eq!(
+                chunks.last().unwrap().finish_reason.as_deref(),
+                Some("length"),
+                "{case}"
+            );
+            assert_eq!(forwards(), 1, "{case}");
+            assert_eq!(wire.lock().unwrap().rooms[&9].sent, Some(1000), "{case}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_pause_drains_a_computed_prefill_under_deferred_allocation_once_its_destination_comes(
+) {
+    // The scheduler holds a computed prompt until its transfer starts, so a
+    // wait pause answers only after the decode engine allocated its
+    // destination and its KV went out.
+    for depth in [0, 1] {
+        let wire = Arc::new(Mutex::new(Wire {
+            prefill_ranks: 1,
+            ..Wire::default()
+        }));
+        let prefill = start_ranks_with(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup {
+                pd: Some(Pd {
+                    role: Role::Prefill,
+                    wire: wire.clone(),
+                }),
+                deferred_allocation: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let mut stream = prefill
+            .client
+            .generate(disaggregated("r", 9, 40, 4))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "depth {depth}"
+        );
+        let mut pausing = std::pin::pin!(prefill.client.control(pause("wait")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut pausing)
+                .await
+                .is_err(),
+            "depth {depth}: the pause answered with the prompt waiting"
+        );
+        assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "depth {depth}");
+        wire.lock()
+            .unwrap()
+            .rooms
+            .entry(9)
+            .or_default()
+            .preallocated = Some(1);
+        let replies = tokio::time::timeout(Duration::from_secs(10), pausing)
+            .await
+            .unwrap_or_else(|_| panic!("depth {depth}: the pause never answered"))
+            .unwrap();
+        assert_eq!(
+            outcome(replies),
+            [("PauseSchedulerReqOutput", true)],
+            "depth {depth}"
+        );
+        assert_eq!(
+            wire.lock().unwrap().rooms[&9].sent,
+            Some(1000),
+            "depth {depth}"
+        );
+        let chunks = collect(stream).await;
+        assert_eq!(tokens(&chunks), [1000], "depth {depth}");
+        assert_eq!(
+            control(&prefill, resume()).await,
+            [("ResumeSchedulerReqOutput", true)],
+            "depth {depth}"
+        );
+    }
+}
+
 #[test]
 fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
     for layout in [Layout::Single, Layout::Tp(2)] {
@@ -4798,6 +5301,9 @@ async fn an_abort_pause_aborts_what_runs_and_a_keep_pause_freezes_it() {
         before += 1;
     }
     assert!(before < 30, "the request kept running while frozen");
+    let load = engine.client.loads()[0];
+    assert_eq!(load.num_resident_tokens, Some(3 + before));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert_eq!(
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", true)]
@@ -5840,4 +6346,214 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         "no round of the {} before the device's was kept",
         device_round - opened
     );
+}
+
+/// Read the real Prometheus files without involving a server or GPU.
+fn exported_gauges(directory: &Path) -> HashMap<String, f64> {
+    Python::attach(|py| {
+        let globals = PyDict::new(py);
+        globals
+            .set_item("directory", directory.to_str().unwrap())
+            .unwrap();
+        py.run(c"import glob, json\nfrom prometheus_client.mmap_dict import MmapedDict\nvalues = {json.loads(key)[1]: value for path in glob.glob(directory + '/gauge_*.db') for key, value, *_ in MmapedDict.read_all_values_from_file(path)}", Some(&globals), None).unwrap();
+        globals
+            .get_item("values")
+            .unwrap()
+            .unwrap()
+            .extract()
+            .unwrap()
+    })
+}
+
+#[test]
+fn scheduler_metrics_follow_dispatched_forwards_and_return_to_zero() {
+    interpreter();
+    for role in [Role::Plain, Role::Prefill, Role::Decode] {
+        for depth in [0, 1] {
+            let directory = std::env::temp_dir().join(format!(
+                "ts-control-metrics-{}-{role:?}-{depth}",
+                std::process::id()
+            ));
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                rooms: (0..12)
+                    .map(|room| {
+                        (
+                            room,
+                            WireRoom {
+                                decode_registered: true,
+                                preallocated: (role == Role::Prefill).then_some(room as i32 + 1),
+                                sent: (role == Role::Decode).then_some(1000),
+                                sent_by: if role == Role::Decode {
+                                    vec![0]
+                                } else {
+                                    Vec::new()
+                                },
+                                ..WireRoom::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            }));
+            let mut script = vec![Vec::new(); 80];
+            for row in 0..12 {
+                let rid = format!("metrics-{row}");
+                let request = if role == Role::Plain {
+                    request(&rid, 80, budget(4))
+                } else {
+                    disaggregated(&rid, row, 80, 4)
+                };
+                script[0].push(EngineRequest::Add(Box::new(request)));
+            }
+            let ranks = run_scripted(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    metrics_dir: Some(directory.clone()),
+                    resident_requests: Some(if role == Role::Decode { 12 } else { 8 }),
+                    pd: (role != Role::Plain).then_some(Pd { role, wire }),
+                    ..Setup::default()
+                },
+                vec![script],
+                no_reaction,
+            );
+            assert_eq!(ranks[0].outcome, Ok(()));
+            assert_eq!(ranks[0].released.len(), 12);
+            assert!(ranks[0].forwards > 0);
+            let gauges = exported_gauges(&directory.join("0"));
+            for name in [
+                "num_requests_running",
+                "num_requests_waiting",
+                "num_requests_inflight",
+            ] {
+                assert_eq!(
+                    gauges[&format!("tokenspeed:{name}")],
+                    0.0,
+                    "{role:?}/{depth}/{name}"
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
+
+#[test]
+fn scheduler_metrics_count_ready_decode_requests_waiting_for_a_permit() {
+    interpreter();
+    let directory = std::env::temp_dir().join(format!("ts-metrics-ready-{}", std::process::id()));
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        rooms: (0..12)
+            .map(|room| {
+                (
+                    room,
+                    WireRoom {
+                        sent: Some(1000),
+                        sent_by: vec![0],
+                        ..WireRoom::default()
+                    },
+                )
+            })
+            .collect(),
+    }));
+    let mut script = vec![Vec::new(); 20];
+    script[0] = (0..12)
+        .map(|row| {
+            EngineRequest::Add(Box::new(disaggregated(
+                &format!("ready-{row}"),
+                row,
+                80,
+                100,
+            )))
+        })
+        .collect();
+    let ranks = run_scripted(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(directory.clone()),
+            resident_requests: Some(12),
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire,
+            }),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert_eq!(ranks[0].outcome, Ok(()));
+    let gauges = exported_gauges(&directory.join("0"));
+    assert_eq!(gauges["tokenspeed:num_requests_running"], 8.0);
+    assert_eq!(gauges["tokenspeed:num_decode_ready_waiting_reqs"], 4.0);
+    assert_eq!(gauges["tokenspeed:num_requests_waiting"], 4.0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn scheduler_metrics_keep_paused_queues_current_without_a_forward() {
+    interpreter();
+    let directory = std::env::temp_dir().join(format!("ts-metrics-paused-{}", std::process::id()));
+    let mut script = vec![Vec::new(); 6];
+    script[0].push(EngineRequest::Add(Box::new(request(
+        "running",
+        16,
+        budget(100),
+    ))));
+    script[1].push(EngineRequest::Control(Box::new(pause("keep"))));
+    script[2].push(EngineRequest::Add(Box::new(request(
+        "paused",
+        16,
+        budget(100),
+    ))));
+    let ranks = run_scripted(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(directory.clone()),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert_eq!(ranks[0].outcome, Ok(()));
+    let gauges = exported_gauges(&directory.join("0"));
+    assert_eq!(gauges["tokenspeed:num_requests_running"], 0.0);
+    assert_eq!(gauges["tokenspeed:num_requests_waiting"], 1.0);
+    assert_eq!(gauges["tokenspeed:num_requests_inflight"], 2.0);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn scheduler_metrics_exclude_dp_idle_padding() {
+    interpreter();
+    let directory = std::env::temp_dir().join(format!("ts-metrics-dp-{}", std::process::id()));
+    let mut active = vec![Vec::new(); 20];
+    active[0].push(EngineRequest::Add(Box::new(request(
+        "active",
+        16,
+        budget(4),
+    ))));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            metrics_dir: Some(directory.clone()),
+            ..Setup::default()
+        },
+        vec![active, vec![Vec::new(); 20]],
+        no_reaction,
+    );
+    assert!(ranks[1].idle_forwards > 0);
+    assert_eq!(ranks[1].forwards, 0);
+    for (rank, outcome) in ranks.iter().enumerate() {
+        assert_eq!(outcome.outcome, Ok(()));
+        let gauges = exported_gauges(&directory.join(rank.to_string()));
+        assert_eq!(gauges["tokenspeed:num_requests_running"], 0.0);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }

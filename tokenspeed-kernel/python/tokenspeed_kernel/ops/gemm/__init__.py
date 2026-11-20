@@ -520,6 +520,7 @@ def plan_dense_gemm(
     dtype: torch.dtype,
     batch_size: int | None,
     batch_invariant: bool,
+    solution: str | None = None,
 ) -> KernelPlan:
     """Plan dense MM/BMM from model geometry, without allocating example tokens.
 
@@ -538,7 +539,7 @@ def plan_dense_gemm(
         features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         static_traits=traits,
         variable_traits=frozenset({"m"}),
-        solution=None,
+        solution=solution,
         declared_traits=frozenset(),
         ignore_layout=False,
     )
@@ -729,7 +730,7 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_bf16_gemm(A, B, out)
-        # Decode rows on small weights take one pinned TGV tile on SM100/103
+        # Decode rows on small weights take one pinned TGV tile on SM100/103/107
         # under PDL (README "Decode GEMMs on small weights"). Like the joint
         # path, only before serving: CUDA graphs captured at startup keep the
         # tile, and eager calls while serving keep cuBLASLt. Registering the
@@ -4430,7 +4431,7 @@ def fp32_router_gemv_execute(
         or not x.is_contiguous()
     ):
         raise ValueError(
-            "router input must be contiguous FP32 " f"[rows, {typed_plan.hidden_size}]"
+            f"router input must be contiguous FP32 [rows, {typed_plan.hidden_size}]"
         )
     return typed_plan.kernel(
         x,

@@ -132,6 +132,8 @@ struct PeerHit {
 struct AdmissionResources {
     TokenContainer* token_container;
     std::int32_t prefix_granularity;
+    // Last admission probe's hit, for load reporting only; never reused by admission.
+    std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
     // The request has asked its peer holder once (or has none to ask), and
@@ -260,6 +262,9 @@ struct PrefillDone : RestoreMarker {
 
     ForwardResources resources;
     TokenContainer::Window window{};
+    // Deferred decode allocation: the error about this prompt's remote
+    // decode not being admitted was logged.
+    bool remote_decode_failure_logged{false};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
