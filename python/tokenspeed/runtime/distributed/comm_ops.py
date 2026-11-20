@@ -238,6 +238,35 @@ def projection_all_gather(
     return backend.projection_all_gather(tensor, rows, quantize, workspace)
 
 
+def projection_gather_mm(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Gather every owner's rows and project them through this rank's weight shard.
+
+    Args:
+        tensor: This owner's ``[local_rows, K]`` rows, ``local_rows <= rows``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N / TP, K]`` output shard.
+        out: Caller-owned ``[TP * rows, N / TP]`` destination; owner ``p``'s
+            rows land at ``[p * rows, (p + 1) * rows)``, with zero rows for its
+            padding.
+        workspace: A collectively prepared ``gather`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        out.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_gather_mm(tensor, rows, weight, out, workspace)
+
+
 def projection_all_to_all(
     tensor: torch.Tensor,
     rows: int,

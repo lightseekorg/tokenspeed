@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     reserve_flashinfer_trtllm_dsa_buffers,
     trtllm_sparse_mla_query_heads,
 )
+from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
@@ -80,8 +81,10 @@ from tokenspeed.runtime.layers.attention.dcp.cache import (
     plan_history_gather,
 )
 from tokenspeed.runtime.layers.attention.dcp.comm import (
+    ValueProjection,
     combine_attention_partials,
     combine_attention_records,
+    combine_project_attention_partials,
     gather_query_heads,
     gather_query_heads_padded,
     gather_query_heads_rank_major,
@@ -124,6 +127,20 @@ _OWNED_INDEX_COLUMN_ALIGN = 16
 # Sparse prefills of at least this many rows attend every head on a row shard;
 # on GB300 at TP8 the exchanges cost less than the core saves above ~3k rows.
 _ROW_SHARD_MIN_ROWS = 4096
+
+
+def _projected(
+    latent: torch.Tensor, heads: int, projection: ValueProjection | None
+) -> torch.Tensor:
+    """``latent`` rows, or their projection through ``projection`` when given."""
+    if projection is None:
+        return latent
+    return mla_project_value(
+        latent.view(latent.shape[0], heads, -1),
+        projection.weight,
+        gate=projection.gate,
+        out=projection.out,
+    )
 
 
 def _priority_band(name: str) -> str:
@@ -1969,6 +1986,7 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor | None = None,
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
+        value_projection: ValueProjection | None = None,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -1982,9 +2000,13 @@ class DSABackend(PagedAttentionBackend):
                 topk_lens=topk_lens,
                 topk_owned=topk_owned,
                 gathered_query=gathered_query,
+                value_projection=value_projection,
             )
-        if topk_owned or gathered_query is not None:
-            raise ValueError("an owned decode top-k needs its slots")
+        if topk_owned or gathered_query is not None or value_projection is not None:
+            raise ValueError(
+                "topk_owned, gathered_query, and value_projection need the "
+                "sparse decode's top-k slots"
+            )
         if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
@@ -2510,10 +2532,15 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor | None,
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
+        value_projection: ValueProjection | None = None,
     ) -> torch.Tensor:
         """Sparse decode over ``topk_indices``: the whole selection as
         scheduler slots, or with ``topk_owned`` (a sharded cache only) this
         rank's share of it as local cache slots, ``topk_lens`` counting them.
+
+        With ``value_projection`` the decode returns ``value_projection.out``,
+        the latent projected through it; a head-sharded KVP combine applies it
+        as it merges (``combine_project_attention_partials``).
 
         ``gathered_query`` is every rank's ``q`` as the owned top-k's score
         gather landed it, uint8 ``[ranks, rows, bytes]``: the rider
@@ -2660,7 +2687,9 @@ class DSABackend(PagedAttentionBackend):
                     q_len_per_req=q_len_per_req,
                     gathered_query=gathered_query,
                 )
-                return out.reshape(-1, heads * layer.v_head_dim)
+                return _projected(
+                    out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
+                )
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
@@ -2686,6 +2715,14 @@ class DSABackend(PagedAttentionBackend):
         )
         if use_dcp:
             local_output, local_lse = out
+            if value_projection is not None and not keep_all_heads:
+                return combine_project_attention_partials(
+                    local_output,
+                    local_lse,
+                    group=self.kvp_group,
+                    rank=self.kvp_rank,
+                    projection=value_projection,
+                )
             out = combine_attention_partials(
                 local_output,
                 local_lse,
@@ -2696,7 +2733,9 @@ class DSABackend(PagedAttentionBackend):
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )
-        return out.reshape(-1, heads * layer.v_head_dim)
+        return _projected(
+            out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
+        )
 
     def _forward_dcp_records_decode(
         self,
