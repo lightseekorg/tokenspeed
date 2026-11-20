@@ -54,14 +54,14 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import AbstractContextManager
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import Pipe
 from multiprocessing.connection import Connection
 
 import msgspec
 import torch
-import torch.distributed as dist
 from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
@@ -82,7 +82,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.engine import zmq_wire
+from tokenspeed.runtime.engine import memory_protocol, zmq_wire
 from tokenspeed.runtime.engine.gc_hooks import (
     FULL_COLLECTION_INTERVAL,
     GcHooks,
@@ -343,6 +343,8 @@ def start_rust_host(
                 "notset": "trace",
             }.get(level, level),
         )
+        # Older hosts ignore the device hint and accept the same command line.
+        host_env["TS_HOST_DEVICE"] = server_args.device
         popen = subprocess.Popen(
             [
                 (
@@ -695,6 +697,8 @@ class HostDataPlane:
         attn_tp_cpu_group,
         epd_publisher,
         starting: bool,
+        *,
+        replica_memory_transitions: bool,
     ) -> None:
         self._device = handle
         # The engine serves its own startup requests (``HostConfig``'s
@@ -705,6 +709,7 @@ class HostDataPlane:
         self._profiler = profiler
         # Tag -> MemoryRegion (``memory_occupation.memory_regions``).
         self._regions = regions
+        self._replica_memory_transitions = replica_memory_transitions
         # Per request: what every forward it runs in needs, fixed at
         # admission.
         self._requests: dict[str, _AdmittedRequest] = {}
@@ -1046,15 +1051,30 @@ class HostDataPlane:
         )
         return bool(ok), str(message)
 
+    def check_memory_transition(
+        self, tags: list[str], release: bool
+    ) -> tuple[bool, str]:
+        """Check an ordered request before any rank changes its memory mappings."""
+        return self._device.check_memory_transition(tags, release=release)
+
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
-        for tag in tags:
-            self._regions[tag].release()
+        self._transition_memory(tags, release=True)
 
     def resume_memory(self, tags: list[str]) -> None:
         """Restore memory regions, in order."""
-        for tag in tags:
-            self._regions[tag].resume()
+        self._transition_memory(tags, release=False)
+
+    def _transition_memory(self, tags: list[str], *, release: bool) -> None:
+        completion = (
+            self._device.complete_memory_transition()
+            if self._replica_memory_transitions
+            else nullcontext()
+        )
+        with completion:
+            for tag in tags:
+                region = self._regions[tag]
+                (region.release if release else region.resume)()
 
     def set_grammar_entries(self, entries: list[tuple[str, int]]) -> None:
         """The host's matcher entries, before serving starts."""
@@ -1271,9 +1291,12 @@ class HostBootstrap:
         host_spans,
         metrics_relay_endpoint: str | None,
         peer_outbox,
+        *,
+        replica_memory_transitions: bool = False,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
+        self._replica_memory_transitions = replica_memory_transitions
         mapping = server_args.mapping
         gpu_id = mapping.gpu_id
         self._gpu_id = gpu_id
@@ -1489,8 +1512,14 @@ class HostBootstrap:
             )
             regions = memory_regions(
                 device.handle,
-                TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver),
-                nccl_suspendable=nccl_suspend_supported(),
+                TorchMemorySaverAdapter.create(
+                    enable=server_args.enable_memory_saver, device=server_args.device
+                ),
+                graph_tag="acl_graph" if server_args.device == "npu" else "cuda_graph",
+                nccl_suspendable=(
+                    server_args.device != "npu" and nccl_suspend_supported()
+                ),
+                synchronize_kv_before_registration=server_args.device == "npu",
             )
             # EPD: a multimodal prefill node's first stage receives image
             # embeddings from encode nodes; None for every other rank.
@@ -1710,21 +1739,18 @@ class HostBootstrap:
                 epd_publisher=(
                     epd_receive.publisher if epd_receive is not None else None
                 ),
+                replica_memory_transitions=replica_memory_transitions,
                 starting=server_args.enable_startup_requests,
             )
             self._device = device.handle
 
     def collective_addresses(self, port: int) -> list[str]:
-        """Every rank's collective address, in rank order, given this rank's
-        port; a collective of the whole world, through the rendezvous the
-        data plane already has."""
-        gathered: list = [None] * self._world_cpu_group.size()
-        dist.all_gather_object(
-            gathered,
+        """Agree on the memory protocol and exchange the rank mesh addresses."""
+        return memory_protocol.gather_collective_addresses(
+            self._world_cpu_group,
             join_host_port(self._collective_host, port),
-            group=self._world_cpu_group,
+            replica_memory_transitions=self._replica_memory_transitions,
         )
-        return gathered
 
     def report_ready(self) -> None:
         """Tell the launcher the rank is serving, once the frontend
@@ -1794,35 +1820,52 @@ class HostBootstrap:
             self._memory_sampler.stop()
             self._memory_sampler = None
         self._device.shutdown_cache()
+        if self._server_args.device == "npu":
+            # The native host skips Python atexit; close HCCL groups while
+            # CANN is still live. Each group's shutdown waits for its streams.
+            pg_manager.shutdown()
 
 
-def bootstrap(
-    control_fd: int,
+def prepare_bootstrap(
+    control_fd: int, *, validate_memory_protocol: bool
+) -> tuple[bool, Callable[..., HostBootstrap | EncodeBootstrap]]:
+    """Read the launch pipe once so the host can select a protocol before building the rank."""
+    connection = Connection(control_fd)
+    launch_args = connection.recv()
+    server_args, _, _ = launch_args
+    requires_v3 = (
+        server_args.enable_memory_saver
+        and server_args.disaggregation_mode != "encode"
+        and TorchMemorySaverAdapter.adapter_class(
+            enable=True, device=server_args.device
+        ).supports_replica_memory_transitions
+    )
+    minimum_protocol = (
+        memory_protocol.WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
+        if requires_v3
+        else memory_protocol.WEIGHT_UPDATE_PROTOCOL
+    )
+    enabled = validate_memory_protocol and requires_v3
+    return enabled, functools.partial(
+        _build_rank, connection, launch_args, minimum_protocol, enabled
+    )
+
+
+def _build_rank(
+    connection,
+    launch_args,
+    minimum_protocol: int,
+    replica_memory_transitions: bool,
     pd_outbox,
-    weight_update_commit_protocol: int = 0,
-    host_spans=None,
+    protocol: int,
+    host_spans,
     peer_outbox=None,
 ) -> HostBootstrap | EncodeBootstrap:
-    """Build this host's rank from the arguments the launcher sends on
-    ``control_fd``; with PD, its transfer peer reaches the host through
-    ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
-    host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
-    the host's span recording, which a profile merges into its trace
-    (``engine/profiler.py``); an older host binary passes none. With peer
-    prefix sharing, ``peer_outbox`` is where the data plane tells the host a
-    plan's landings may be read (``cache/peer.py``); an older host binary
-    passes none."""
-    connection = Connection(control_fd)
-    server_args, port_args, metrics_relay_endpoint = connection.recv()
-    # Reject an older host binary before constructing a model or process
-    # group. Protocol 1 publishes the replica-wide decision that makes locally
-    # loaded weights usable; protocol 2 also agrees the load prerequisites
-    # before any rank starts loading. A binary without protocol 1 calls
-    # bootstrap with two arguments.
-    if server_args.enable_memory_saver and weight_update_commit_protocol < 2:
+    server_args, port_args, metrics_relay_endpoint = launch_args
+    if server_args.enable_memory_saver and protocol < minimum_protocol:
         raise RuntimeError(
-            "Memory saver requires a ts-host binary with weight-update commit "
-            "protocol 2; rebuild tokenspeed-engine together with this runtime"
+            f"Memory saver requires ts-host protocol {minimum_protocol}; "
+            "rebuild tokenspeed-engine together with this runtime"
         )
     if server_args.peer_prefix_port is not None and peer_outbox is None:
         raise RuntimeError(
@@ -1839,7 +1882,23 @@ def bootstrap(
         host_spans,
         metrics_relay_endpoint,
         peer_outbox,
+        replica_memory_transitions=replica_memory_transitions,
     )
+
+
+def bootstrap(
+    control_fd: int,
+    pd_outbox,
+    weight_update_commit_protocol: int = 0,
+    host_spans=None,
+    peer_outbox=None,
+) -> HostBootstrap | EncodeBootstrap:
+    """Build the rank for hosts that call the original bootstrap entry point.
+
+    The host may pass span recording and the outbox for peer prefix sharing.
+    """
+    _, start = prepare_bootstrap(control_fd, validate_memory_protocol=False)
+    return start(pd_outbox, weight_update_commit_protocol, host_spans, peer_outbox)
 
 
 def notify_launcher_of_failure() -> None:

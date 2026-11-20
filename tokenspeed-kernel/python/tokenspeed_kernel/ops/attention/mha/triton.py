@@ -269,9 +269,29 @@ if current_platform().is_npu:
         priority=Priority.PERFORMANT,
         traits={
             **_NPU_OPTIONS,
-            "q_len": frozenset({1}),
+            "q_len": frozenset({1, 2, 3, 4, 5}),
             "page_size": frozenset({64, 128}),
         },
     )
     def torch_npu_mha_decode_with_kvcache(**kwargs):
         return _mha_decode_with_kvcache(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        name="triton_ascend_mha_decode_with_kvcache",
+        solution="triton",
+        capability=_NPU_CAPABILITY,
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
+        ),
+        priority=Priority.PORTABLE,
+        traits={
+            **_NPU_OPTIONS,
+            "q_len": frozenset({1, 2, 3, 4, 5}),
+            "page_size": frozenset({64, 128}),
+            "window_sink": frozenset({False}),
+        },
+    )
+    def triton_ascend_mha_decode_with_kvcache(**kwargs):
+        return _triton_mha_decode_with_kvcache_impl(**kwargs)

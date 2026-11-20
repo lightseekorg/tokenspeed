@@ -70,7 +70,16 @@ def test_remap_restores_constants_but_only_complete_update_restores_usability():
     model = TinyModel()
     address = model.weight.data_ptr()
     state = WeightMemoryState(policy="discard", models=[model])
+    with pytest.raises(RuntimeError, match="Release KV"):
+        state.check_memory_transition(["weights", "kv_cache"], release=True)
+    state.check_memory_transition(["kv_cache", "weights"], release=True)
+    assert not state.kv_released
+    state.require_usable()
     discard(model, state)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["weights", "kv_cache"], release=False)
+    state.check_memory_transition(["weights"], release=False)
+    assert not state.resident and state.kv_released
     with pytest.raises(RuntimeError, match="unavailable"):
         state.require_usable()
     state.resume(lambda: None)
@@ -84,8 +93,12 @@ def test_remap_restores_constants_but_only_complete_update_restores_usability():
         model.weight.copy_(torch.arange(4.0) + 10)
     state.finish_update(success=True)
     with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["kv_cache"], release=False)
+    with pytest.raises(RuntimeError, match="unavailable"):
         state.before_kv_resume()
     state.commit_update(True)
+    state.check_memory_transition(["kv_cache"], release=False)
+    assert state.kv_released
     state.before_kv_resume()
     state.mark_kv_resumed()
     state.require_usable()
@@ -213,7 +226,12 @@ def test_cpu_backup_preserves_legacy_kv_before_weight_resume_order():
     state = WeightMemoryState(policy="cpu_backup", models=[model])
     assert state.preserved == []
     saved = model.weight.detach().clone()
+    state.check_memory_transition(["weights"], release=True)
+    state.mark_kv_released()
     state.release(lambda: None)
+    state.check_memory_transition(["weights", "kv_cache"], release=False)
+    state.check_memory_transition(["kv_cache"], release=False)
+    assert not state.resident and state.kv_released
     state.before_kv_resume()
     state.mark_kv_resumed()
     state.resume(lambda: None)

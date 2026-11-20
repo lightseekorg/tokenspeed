@@ -50,8 +50,13 @@ from tokenspeed.runtime.distributed.process_group_manager import (  # noqa: E402
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
+    UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
+)
+from tokenspeed.runtime.execution import model_runner as runner_module  # noqa: E402
+from tokenspeed.runtime.execution.ascend_memory_saver_device import (  # noqa: E402
+    AscendMemorySaverDeviceHandle,
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
@@ -168,6 +173,7 @@ class _FakeSdk(ModuleType):
         self.updater_configs: list = []
         self.updates: list = []
         self.fail_with: Exception | None = None
+        self.result: object | None = None
 
         class EngineType:
             members = {"FLUENT_LLM": "fluent-llm"}
@@ -200,7 +206,7 @@ class _FakeSdk(ModuleType):
                     model.load_weights([("a", torch.ones(1))])
                     model.load_weights([("b", torch.ones(1))])
                 sdk.updates.append((models, version))
-                return {"version": version}
+                return {"version": version} if sdk.result is None else sdk.result
 
         def make_model_updater(config, *, weight_store):
             sdk.updater_configs.append((config, weight_store))
@@ -314,6 +320,7 @@ def _runner(server_args, global_rank=3, is_draft_worker=False):
 
 def _model_update_args(**overrides):
     args = dict(
+        enable_memory_saver=False,
         model_update_config=json.dumps(_CONFIG),
         model_update_sdk_module="fake_model_updater",
         model_update_engine_type="fluent_llm",
@@ -323,12 +330,16 @@ def _model_update_args(**overrides):
     return SimpleNamespace(**args)
 
 
+@pytest.mark.parametrize("backend", ["cuda", "npu"])
 def test_runner_uses_the_global_rank_as_reader_rank_and_wraps_a_session(
-    sdk, monkeypatch
+    sdk, monkeypatch, backend
 ):
     monkeypatch.setattr(torch.cuda, "empty_cache", mock.Mock())
     monkeypatch.setattr(torch.cuda, "synchronize", mock.Mock())
     runner = _runner(_model_update_args(), global_rank=3)
+    runner.device = backend
+    if backend == "npu":
+        monkeypatch.setattr(torch, "get_device_module", lambda _: torch.cuda)
 
     class _Model:
         def __init__(self):
@@ -364,6 +375,20 @@ def test_runner_turns_an_sdk_error_into_a_failed_result(sdk, monkeypatch):
     )
     # The SDK's staging buffers are released on the failure path too.
     torch.cuda.empty_cache.assert_called_once_with()
+
+
+def test_gpu_sdk_cleanup_failure_still_propagates(sdk, monkeypatch):
+    runner = _runner(_model_update_args())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+
+    def fail_cleanup():
+        raise RuntimeError("cache cleanup failed")
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", fail_cleanup)
+    with pytest.raises(RuntimeError, match="cache cleanup failed"):
+        runner.update_weights_from_mooncake(
+            4, [_TinyDiscardModel()], require_complete=False
+        )
 
 
 def test_runner_without_model_update_config_fails_the_request():
@@ -473,15 +498,18 @@ class _TinyDiscardModel(BaseCausalLM):
             self.total.copy_(self.a + self.b)
 
 
-def _discard_device(monkeypatch):
+def _discard_device(monkeypatch, *, backend):
     # Only transport/device operations are replaced. The handle, runner,
     # updater adapter, session, model and validity state are the real classes.
     monkeypatch.setattr(torch.cuda, "empty_cache", mock.Mock())
     monkeypatch.setattr(torch.cuda, "synchronize", mock.Mock())
     model = _TinyDiscardModel()
     state = WeightMemoryState(policy="discard", models=[model])
-    runner = _runner(_model_update_args())
+    runner = _runner(_model_update_args(enable_memory_saver=True))
     runner.model = model
+    runner.device = backend
+    if backend == "npu":
+        monkeypatch.setattr(torch, "get_device_module", lambda _: torch.cuda)
     executor = _executor(draft_policy="retain", with_draft=False)
     executor.model_runner = runner
     return DeviceHandle(executor, weight_memory=state), state, model
@@ -500,8 +528,35 @@ def _lose_weight_pages(state, model):
     state.release(lose_pages)
 
 
-def test_discarded_device_waits_for_global_commit_before_kv_wake(sdk, monkeypatch):
-    handle, state, model = _discard_device(monkeypatch)
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+@pytest.mark.parametrize(
+    "request_type", [UpdateWeightFromDiskReqInput, UpdateWeightsFromMooncakeReqInput]
+)
+def test_ascend_saver_requires_cache_flush_before_weight_update(policy, request_type):
+    model = _TinyDiscardModel()
+    state = WeightMemoryState(policy=policy, models=[model])
+    state.mark_kv_released()
+    executor = _executor(draft_policy="retain", with_draft=False)
+    handle = AscendMemorySaverDeviceHandle(executor, weight_memory=state)
+    fields = {"model_path": "/checkpoint-b"}
+    if request_type is UpdateWeightsFromMooncakeReqInput:
+        fields = {"version": 2, "weight_version": None}
+
+    ok, message = handle.update_weights(request_type(flush_cache=False, **fields))
+
+    assert not ok and "require flush_cache=true" in message
+    assert state.valid and not state.updating and not state.failed
+    assert state.kv_released
+
+
+@pytest.mark.parametrize(
+    "backend,result", [("cuda", None), ("cuda", False), ("npu", False)]
+)
+def test_discarded_device_waits_for_global_commit_before_kv_wake(
+    sdk, monkeypatch, backend, result
+):
+    sdk.result = result
+    handle, state, model = _discard_device(monkeypatch, backend=backend)
     address = model.a.data_ptr()
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
@@ -522,6 +577,8 @@ def test_discarded_device_waits_for_global_commit_before_kv_wake(sdk, monkeypatc
     handle.before_kv_resume()
     state.require_usable()
     assert sdk.updates[0][1] == 11
+    if result is False:
+        assert message == "applied model version 11: False"
 
 
 @pytest.mark.parametrize("fail_load", [False, True])
@@ -545,7 +602,7 @@ def test_snapshot_update_obeys_the_discard_commit_boundary(sdk, monkeypatch, fai
     monkeypatch.setattr(
         sdk, "make_model_updater", lambda config, *, weight_store: SnapshotUpdater()
     )
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     address = model.a.data_ptr()
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
@@ -573,7 +630,7 @@ def test_snapshot_update_obeys_the_discard_commit_boundary(sdk, monkeypatch, fai
 def test_discarded_device_poisoned_by_local_or_remote_update_failure(
     sdk, monkeypatch, remote_failure
 ):
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
     if not remote_failure:
@@ -597,7 +654,7 @@ def test_discarded_device_poisoned_by_local_or_remote_update_failure(
 def test_discarded_device_rejects_update_before_kv_release_or_weight_remap(
     sdk, monkeypatch, unmapped
 ):
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     if unmapped:
         _lose_weight_pages(state, model)
     # The control plane's admission check refuses without touching anything.
@@ -629,7 +686,7 @@ def test_discarded_device_rejects_update_before_kv_release_or_weight_remap(
 
 
 def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
     success, message = handle.update_weights(
@@ -650,6 +707,119 @@ def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
     assert model.total.item() == 2
 
 
+@pytest.mark.parametrize("policy", ["retain", "refresh"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_ascend_mooncake_stream_reaches_npu_with_shared_draft(
+    sdk, monkeypatch, policy, fail
+):
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Ascend NPU required")
+
+    class Draft(_TinyDiscardModel):
+        def required_weight_update_names(self):
+            return {"a"}
+
+    target = _TinyDiscardModel().to("npu")
+    draft = Draft().to("npu")
+    draft.b = target.b
+    addresses = (target.a.data_ptr(), draft.a.data_ptr(), draft.b.data_ptr())
+
+    class Updater:
+        def update_weights(self, models, *, version, snapshot=None):
+            if snapshot != {"version": version}:
+                raise ValueError("wrong snapshot")
+            models[0].load_weights([("a", torch.full((1,), 10.0))])
+            if not fail or policy == "refresh":
+                models[0].load_weights([("b", torch.full((1,), 20.0, device="npu"))])
+            if len(models) > 1 and not fail:
+                models[1].load_weights([("a", torch.full((1,), 30.0))])
+            return "loaded"
+
+    monkeypatch.setattr(
+        sdk, "make_model_updater", lambda config, *, weight_store: Updater()
+    )
+    runner = _runner(
+        _model_update_args(enable_memory_saver=True, model_update_draft_weights=policy)
+    )
+    runner.device = "npu"
+    runner.model = target
+    executor = _executor(draft_policy=policy, with_draft=True)
+    executor.device = "npu:0"
+    executor.model_runner = runner
+    executor.draft_model_runner.model = draft
+    models = [target, draft] if policy == "refresh" else [target]
+    state = WeightMemoryState(policy="discard", models=models)
+    state.mark_kv_released()
+    handle = AscendMemorySaverDeviceHandle(executor, weight_memory=state)
+    if policy == "refresh":
+        ok, reason = handle.check_weight_update(
+            UpdateWeightFromDiskReqInput(model_path=".")
+        )
+        assert not ok and "target and refresh draft together" in reason
+    request = _mooncake_req(11)
+    request.snapshot = {"version": 11}
+    success, message = handle.update_weights(request)
+    assert success is not fail, message
+    with pytest.raises(RuntimeError, match="restart" if fail else "unavailable"):
+        handle.before_kv_resume()
+    handle.commit_weight_update(success)
+    if fail:
+        assert "missing checkpoint weights" in message
+        assert target.total.item() == 9  # Neither model ran its post-load hook.
+        with pytest.raises(RuntimeError, match="restart"):
+            handle.before_kv_resume()
+    else:
+        handle.before_kv_resume()
+        assert (target.a.item(), target.b.item(), target.total.item()) == (10, 20, 30)
+        assert draft.a.item() == (30 if policy == "refresh" else 4)
+        assert draft.b.item() == 20
+        assert addresses == (
+            target.a.data_ptr(),
+            draft.a.data_ptr(),
+            draft.b.data_ptr(),
+        )
+
+
+def test_ascend_backup_sdk_accepts_partial_updates_without_a_discard_contract(
+    sdk, monkeypatch
+):
+    class BackupModel(_TinyDiscardModel):
+        supports_weight_discard = False
+
+        def required_weight_update_names(self):
+            raise NotImplementedError("No complete replacement contract")
+
+    class Updater:
+        def update_weights(self, models, *, version):
+            models[0].load_weights([("a", torch.full((1,), 20.0))])
+            return "partial"
+
+    monkeypatch.setattr(
+        sdk, "make_model_updater", lambda config, *, weight_store: Updater()
+    )
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda _: SimpleNamespace(synchronize=lambda _: None, empty_cache=lambda: None),
+    )
+    model = BackupModel()
+    before_b = model.b.detach().clone()
+    state = WeightMemoryState(policy="cpu_backup", models=[model])
+    runner = _runner(_model_update_args(enable_memory_saver=True))
+    runner.device = "npu"
+    runner.model = model
+    executor = _executor(draft_policy="retain", with_draft=False)
+    executor.model_runner = runner
+    handle = AscendMemorySaverDeviceHandle(executor, weight_memory=state)
+    ok, message = handle.update_weights(_mooncake_req(12))
+    assert ok, message
+    handle.commit_weight_update(True)
+    state.require_usable()
+    assert model.a.item() == 20
+    torch.testing.assert_close(model.b, before_b)
+    assert model.total.item() == 20 + before_b.item()
+
+
 def test_device_without_memory_saver_admits_every_weight_load():
     handle = DeviceHandle(_executor(draft_policy="retain", with_draft=False))
     assert handle.check_weight_update(_mooncake_req(3)) == (
@@ -660,53 +830,118 @@ def test_device_without_memory_saver_admits_every_weight_load():
         handle.check_weight_update(object())
 
 
+def _bootstrap_args(*, device: str, memory_saver: bool, role: str) -> ServerArgs:
+    args = ServerArgs(
+        model="x",
+        device=device,
+        enable_memory_saver=memory_saver,
+        weight_memory_policy="cpu_backup" if memory_saver else None,
+        disaggregation_mode=role,
+        disable_prefill_graph=device == "npu",
+        disable_pdl=device == "npu",
+    )
+    args.mapping.rank = 0
+    return args
+
+
+@pytest.mark.parametrize("checked_startup", [False, True])
 @pytest.mark.parametrize(
-    "memory_saver,protocol,peer_prefix_port,has_peer_outbox,rejected",
+    "device,role,memory_saver,protocol,required",
     [
-        (True, None, None, False, True),
-        (False, None, None, False, False),
-        (True, 1, None, False, True),
-        (True, 2, None, False, False),
-        (False, 2, 7100, False, True),
-        (False, 2, 7100, True, False),
+        ("cuda", "null", True, None, 2),
+        ("cuda", "null", True, 1, 2),
+        ("cuda", "null", True, 2, None),
+        ("cuda", "prefill", True, 3, None),
+        ("npu", "null", True, None, 3),
+        ("npu", "null", True, 1, 3),
+        ("npu", "null", True, 2, 3),
+        ("npu", "null", True, 3, None),
+        ("npu", "prefill", True, 3, None),
+        ("npu", "decode", True, 3, None),
+        ("npu", "null", False, None, None),
+        ("npu", "encode", False, 2, None),
+        ("npu", "encode", True, 2, None),
     ],
 )
-def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
-    monkeypatch,
-    memory_saver,
-    protocol,
-    peer_prefix_port,
-    has_peer_outbox,
-    rejected,
+def test_host_protocol_and_capability_agree_before_device_build(
+    monkeypatch, checked_startup, device, role, memory_saver, protocol, required
+):
+    from tokenspeed.runtime.engine import rust_host
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    expected = checked_startup and memory_saver and device == "npu" and role != "encode"
+    assert TorchMemorySaverAdapter.adapter_class(
+        memory_saver, device=device
+    ).supports_replica_memory_transitions is (device == "npu" and memory_saver)
+    built = object()
+    build = mock.Mock(return_value=built)
+    monkeypatch.setattr(
+        rust_host, "EncodeBootstrap" if role == "encode" else "HostBootstrap", build
+    )
+    receiver, sender = Pipe(duplex=True)
+    with receiver, sender:
+        sender.send(
+            (
+                _bootstrap_args(device=device, memory_saver=memory_saver, role=role),
+                None,
+                None,
+            )
+        )
+        fd = os.dup(receiver.fileno())
+        if checked_startup:
+            capability, start = rust_host.prepare_bootstrap(
+                fd, validate_memory_protocol=True
+            )
+            assert capability is expected
+            build.assert_not_called()
+            invoke = lambda: start(None, protocol if protocol is not None else 0, None)
+        else:
+            arguments = (fd, None) if protocol is None else (fd, None, protocol)
+            invoke = lambda: rust_host.bootstrap(*arguments)
+        if required is not None:
+            with pytest.raises(RuntimeError, match=f"protocol {required}"):
+                invoke()
+            build.assert_not_called()
+        else:
+            assert invoke() is built
+            if role != "encode":
+                assert build.call_args.kwargs["replica_memory_transitions"] is expected
+
+
+@pytest.mark.parametrize("checked_startup", [False, True])
+@pytest.mark.parametrize("has_peer_outbox", [False, True])
+def test_host_bootstrap_requires_peer_outbox_for_peer_prefix_sharing(
+    monkeypatch, checked_startup, has_peer_outbox
 ):
     from tokenspeed.runtime.engine import rust_host
 
     built = object()
     build = mock.Mock(return_value=built)
     monkeypatch.setattr(rust_host, "HostBootstrap", build)
-    receiver, sender = Pipe(duplex=False)
-    try:
-        args = ServerArgs(
-            model="model-x",
-            enable_memory_saver=memory_saver,
-            weight_memory_policy="cpu_backup" if memory_saver else None,
-            peer_prefix_port=peer_prefix_port,
-        )
+    args = ServerArgs(model="x", device="cuda", peer_prefix_port=7100)
+    peer_outbox = object() if has_peer_outbox else None
+    receiver, sender = Pipe(duplex=True)
+    with receiver, sender:
         sender.send((args, None, None))
-        call_args = (os.dup(receiver.fileno()), None)
-        if protocol is not None:
-            call_args += (protocol,)
-        bootstrap_kwargs = {"peer_outbox": object()} if has_peer_outbox else {}
-        if rejected:
-            with pytest.raises(RuntimeError, match="rebuild tokenspeed-engine"):
-                rust_host.bootstrap(*call_args, **bootstrap_kwargs)
+        fd = os.dup(receiver.fileno())
+        if checked_startup:
+            capability, start = rust_host.prepare_bootstrap(
+                fd, validate_memory_protocol=True
+            )
+            assert not capability
             build.assert_not_called()
+            invoke = lambda: start(None, 2, None, peer_outbox=peer_outbox)
         else:
-            assert rust_host.bootstrap(*call_args, **bootstrap_kwargs) is built
-            build.assert_called_once()
-    finally:
-        receiver.close()
-        sender.close()
+            invoke = lambda: rust_host.bootstrap(fd, None, 2, peer_outbox=peer_outbox)
+        if has_peer_outbox:
+            assert invoke() is built
+            assert build.call_args.args[-1] is peer_outbox
+        else:
+            with pytest.raises(RuntimeError, match="--peer-prefix-port requires"):
+                invoke()
+            build.assert_not_called()
 
 
 @pytest.fixture(autouse=True)

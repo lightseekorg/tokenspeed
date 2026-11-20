@@ -229,5 +229,17 @@ class ProcessGroupManager:
                     self._dedicated_groups[key] = process_group
         return self._dedicated_groups[key]
 
+    def shutdown(self) -> None:
+        """Destroy the distributed world and drop the manager's cached groups.
+
+        Call after worker threads finish, while the device runtime can still
+        tear down its communicators.
+        """
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        self._process_groups.clear()
+        self._dedicated_groups.clear()
+        self._emulated_rank_groups = None
+
 
 process_group_manager = ProcessGroupManager()

@@ -83,6 +83,7 @@ logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
 _is_cuda_graph_phase = False
+_is_acl_graph_forward = False
 
 
 def get_is_capture_mode() -> bool:
@@ -91,6 +92,11 @@ def get_is_capture_mode() -> bool:
 
 def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
+
+
+def is_acl_graph_forward() -> bool:
+    """Whether this forward is recording or warming up an ACL decode graph."""
+    return _is_acl_graph_forward
 
 
 @contextmanager
@@ -411,10 +417,9 @@ class ForwardStepRunner:
         self.disable_padding = config.disable_cuda_graph_padding
         self.device = config.device
         self.device_module = torch.get_device_module(self.device)
-        # Decode graphs capture into the memory saver's ``cuda_graph`` region
-        # so a sleep release can free their pool (a no-op adapter otherwise).
+        # The memory saver can release the decode graph's private pool.
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=self.device
         )
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
@@ -781,6 +786,18 @@ class ForwardStepRunner:
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
+    def _snapshot_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+        """Record target and draft tensor identities for a graph variant and batch.
+
+        ACL replay refreshes the views present at capture entry. Later draft
+        steps can publish narrower views over the same write-slot storage.
+        CUDA and ROCm take the snapshot after capture has finished.
+        """
+        snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
+        if self.draft_attn_backend is not None:
+            snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
+        self._metadata_snapshots[graph_key] = snapshots
+
     def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
         """Assert the refresh rebound the tensors the captured graph reads."""
         snapshots = self._metadata_snapshots.get(graph_key)
@@ -957,7 +974,14 @@ class ForwardStepRunner:
             self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
-            return self._capture_forward(bs, ctx, sampling_info)
+            # Only this graph's capture and warmups need the graph-safe draft kernel.
+            global _is_acl_graph_forward
+            previous = _is_acl_graph_forward
+            _is_acl_graph_forward = self.device == "npu"
+            try:
+                return self._capture_forward(bs, ctx, sampling_info)
+            finally:
+                _is_acl_graph_forward = previous
 
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
@@ -996,12 +1020,25 @@ class ForwardStepRunner:
         # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs, query_tokens=query_tokens)
 
+        if self._graph_debug and self.device == "npu":
+            self._snapshot_graph_metadata((variant, bs))
+
         self.deepep_adapter.capture()
 
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        if self.device == "npu":
+        if self.device == "npu" and self.config.enable_memory_saver:
+            graph_capture = self.memory_saver_adapter.npu_graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                tag="acl_graph",
+                policy=self.config.acl_graph_memory_policy,
+                pool_scope="decode",
+                auto_dispatch_capture=True,
+            )
+        elif self.device == "npu":
             graph_capture = self.device_module.graph(
                 graph,
                 pool=global_graph_memory_pool,
@@ -1044,14 +1081,8 @@ class ForwardStepRunner:
 
         global_graph_memory_pool = graph.pool()
 
-        if self._graph_debug:
-            # The slots bound by the last _init_capture_metadata are exactly
-            # what the graph recorded; snapshot their tensor identities so
-            # every replay can assert the refresh still writes them.
-            snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
-            if self.draft_attn_backend is not None:
-                snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
-            self._metadata_snapshots[(variant, bs)] = snapshots
+        if self._graph_debug and self.device != "npu":
+            self._snapshot_graph_metadata((variant, bs))
 
         if self.drafter is not None:
             self.drafter.set_decode_graph_query_extent(None)
@@ -1331,6 +1362,37 @@ class ForwardStepRunner:
         max_num_tokens = max(ctx.global_num_tokens)
         return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
 
+    def _update_npu_graph(self, graph, seq_lens: torch.Tensor) -> None:
+        """Update host task arguments after metadata refresh and before replay.
+
+        Captured FIA tasks start with the query width as their placeholder KV
+        length. Replay supplies one KV length per captured row. Native target
+        MHA uses its published lengths, including the verify floor for short
+        live requests and padding. Other backends receive the padded input
+        lengths in ``seq_lens``.
+        """
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
+            CacheGroupRouter,
+        )
+
+        if type(self.attn_backend) is CacheGroupRouter:
+            leaves = self.attn_backend.child_backends()
+            if leaves and all(type(leaf) is MHAAttnBackend for leaf in leaves):
+                # All native MHA groups use the same target verify width.
+                seq_lens = leaves[0].forward_decode_metadata.seq_lens
+
+        # The tasks read their device inputs when replay reaches them, after
+        # their in-graph producers.
+        with torch.inference_mode():
+            graph.update(
+                cpu_update_input=[
+                    {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                ]
+            )
+
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
@@ -1574,13 +1636,7 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                # Update callbacks write the inference tensors created at capture.
-                with torch.inference_mode():
-                    graph.update(
-                        cpu_update_input=[
-                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                        ]
-                    )
+                self._update_npu_graph(graph, seq_lens)
             query_tokens = (
                 self._decode_query_tokens or padded_bs * self.max_tokens_per_req
             )
