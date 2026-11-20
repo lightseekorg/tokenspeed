@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import cached_property
 
 import torch
 from tokenspeed_kernel._optional import has_optional_package
@@ -211,6 +212,23 @@ class KdaRetainedHistory:
             for x in (self.key, self.decay, self.length, self.live_state_indices)
         ):
             raise ValueError("retained history fields must be on the same device")
+
+    @cached_property
+    def packed_record_width(self) -> int | None:
+        """Return the common FP32 row width if every head can use a 16-byte bulk copy."""
+        width = self.correction.shape[-1]
+        for field in (self.correction, self.key, self.decay):
+            page_stride, head_stride, record_stride, channel_stride = field.stride()
+            if (
+                field.shape[-1] != width
+                or record_stride != width
+                or channel_stride != 1
+                or page_stride % 4
+                or head_stride % 4
+                or field.data_ptr() % 16
+            ):
+                return None
+        return width
 
 
 # Retained commit descriptor ABI: UINT64 [layers, 9].

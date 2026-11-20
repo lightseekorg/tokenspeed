@@ -44,18 +44,16 @@ The CuTe fused kernels require unit-stride request vectors and correction
 channels. Other strides use split producers and the stride-aware retained
 verify core.
 
-CuTe initializes each FP32 shared-memory state tile directly from the selected
-base and accepted history. In the one-token fused kernel each block checks the
-live page's accepted length before loading the state tile. For an empty
-history or 3–16 accepted records, an asynchronous bulk copy loads the FP32
-base into shared memory. The latter path prepares U, K, and decay while the
-copy runs. The kernel loads and converts BF16 bases element by element.
-For 3–16 accepted records, each block stages U and weights K by the decay of
-later records. Warp MMA sums the corrections with
-three TF32 products and FP32 accumulation. The block adds the base scaled by
-all accepted decays. For one or two accepted records, each thread loads
-the keys and decays once and reuses them across all of its value rows.
-The scalar replay applies the records in order.
+The one-token fused kernel projects the accepted history onto the current
+query and key. For 1–16 accepted records, it scales the query and key by
+the cumulative decay before multiplying them by the dense base. It adds
+each retained U vector weighted by its key's two dot products. The block stages
+the accepted U, K and decay rows in shared memory while it computes the gate.
+When the rows for each head are contiguous and 16-byte aligned, it issues one
+bulk copy per field alongside the checkpoint copy. Threads load strided views
+using their tensor strides. One warp computes both dot products for a retained
+record. Empty histories need only the base products.
+Longer histories replay in record order into a private FP32 state tile.
 The native tiled consolidation kernel runs only for source copies and capacity
 boundaries; convolution and accepted-length publication use the common
 retained commit ABI.

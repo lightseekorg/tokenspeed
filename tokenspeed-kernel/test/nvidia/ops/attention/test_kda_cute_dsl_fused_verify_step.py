@@ -259,9 +259,18 @@ def test_retained_prefix_append_preserves_base_and_publishes_on_commit(
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_fused_step_matches_split_with_mixed_retained_lengths(state_dtype):
+@pytest.mark.parametrize("record_layout", ["interleaved", "packed", "unaligned"])
+def test_fused_step_matches_split_with_mixed_retained_lengths(
+    state_dtype, record_layout
+):
     x = _inputs(13, seed=147)
-    x["state_pool"] = x["state_pool"].to(state_dtype)
+    state = x["state_pool"].to(state_dtype)
+    if state_dtype == torch.bfloat16:
+        # Four extra BF16 values alternate aligned and 8-byte-offset head tiles.
+        # Verify both copy paths against the same split reference.
+        padded = state.new_empty((*state.shape[:2], DIM * DIM + 4))
+        state = padded[..., : DIM * DIM].view_as(state).copy_(state)
+    x["state_pool"] = state
     x["state_indices"].copy_(
         torch.tensor([1, 0, -1, *range(2, 12)], device="cuda", dtype=torch.int32)
     )
@@ -276,6 +285,21 @@ def test_fused_step_matches_split_with_mixed_retained_lengths(state_dtype):
         reference,
         history=dataclasses.replace(reference.history, live_state_indices=live),
     )
+    if record_layout != "interleaved":
+        history = records.history
+        key = history.key.contiguous()
+        if record_layout == "unaligned":
+            # A contiguous K view can still start four bytes into its storage.
+            key = key.new_empty(key.numel() + 1)[1:].view_as(key)
+        records = dataclasses.replace(
+            records,
+            history=dataclasses.replace(
+                history,
+                correction=history.correction.contiguous(),
+                key=key,
+                decay=history.decay.contiguous(),
+            ),
+        )
     history = records.history
     history.length[1:12, 0] = torch.tensor(
         [0, 1, 2, 3, 8, 9, 15, 16, 17, 32, 8], device="cuda"
