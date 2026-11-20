@@ -258,6 +258,14 @@ Host/operation capacity. A healthy operation that merely exceeds the budget
 also selects this conservative private generation; the timeout is not evidence
 of a broken transport.
 
+Old native PUTs keep their write workers as well as their source references.
+When they occupy all configured write workers, new PUT attempts fail safely
+before native submission instead of accumulating a stale write queue. Independent
+QUERY/GET work is not disabled merely by that old write lane's age; writes resume
+when a worker is available. Retained Host blocks, total operation credits and
+backend health still bound useful work, so this does not guarantee reads under
+exhausted shared capacity or unlimited recovery without restart.
+
 **Historical unsafe memory.** `tokenspeed:l3_io_quarantined=1` remains set after
 such recovery because a clear supplies no missing retirement proof. It guards
 shutdown: `close()` still refuses deregistration of that old allocation and
@@ -278,6 +286,20 @@ synchronous administrative RPC is outside both preparation and healthy-drain
 timeouts. Recovery generations are agreed only within the engine's
 replica/attention-DP group; independent Prefill services may temporarily stop
 sharing until a new immutable weight version selects their common prefix.
+
+**Weight namespace publication failure.** After all ranks report a successful
+model load, shared-version metadata is prepared without publication. The ranks
+inspect the target prefix, agree any required fresh generation, and validate
+their local executor plans before committing namespace metadata on the gated
+path. An entropy or preparation failure keeps every rank's previous namespace
+metadata for that publication attempt; it does not revert an earlier successful
+clear. Check the failed update reply and namespace observations before retrying.
+The model load may already have written parameter bytes, and a negative
+`commit_weight_update` marks them unusable rather than restoring old parameters.
+Use a complete supported reload or the existing restart procedure; do not resume
+serving merely because the namespace still reports its previous version. A
+retry must still satisfy the normal flush/version checks, including ABA isolation
+when old access to its target remains unproven.
 
 Never treat an empty queue, a soft timeout, successful clear or a zero
 current-blocking gauge as proof that old native I/O retired. A retaining clear

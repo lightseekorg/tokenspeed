@@ -502,6 +502,16 @@ health with a new health epoch, so old failures cannot close the new generation.
 A new unproven result in the current generation again blocks new I/O until clear.
 The aggregate unsafe-I/O metric and shutdown proof remain conservative.
 
+An old running PUT still occupies its write worker. If old-generation native
+PUTs occupy every configured write worker, a new PUT completes as a safely
+retired failure before native submission instead of queueing behind that old
+lane. Its queue age therefore cannot close pressure admission for independent
+new-generation QUERY/GET work. With a free write worker, new PUTs can still run;
+as old workers return, normal write admission resumes. This is neither native
+cancellation nor extra worker capacity. Old source references and total
+Host/operation credits remain charged, so exhausted shared resources can still
+limit reads and writes.
+
 Storage exposes separate ownership and progress observations. Physical pending
 includes every ticket and continues governing strict clear and resource budgets.
 Current pending also includes the active generation's terminal quarantine, so
@@ -519,6 +529,26 @@ Later healthy clears can delete the safe active namespace and clear its indexes
 while keeping old references, without rotating into yet another private scope.
 
 Weight metadata advances only after every rank successfully loads the weights.
+Namespace publication has a separate prepare/commit boundary after that load
+agreement. Controls first checks the candidate identity without publishing it;
+the executor inspects the prospective target prefix before entering it. If any
+owner needs ABA isolation, the ranks obtain and broadcast the fresh generation
+before changing a namespace. Each owner then prepares an owned, validated
+version/generation plan. Only after every preparation succeeds does the exclusive
+control gate commit executor, Controls and peer metadata, with no new I/O
+submitted between preparation and commit. A rank whose requested version is
+unchanged still participates in every agreement and applies a globally selected
+isolation generation.
+
+An entropy or namespace-preparation failure leaves that publication attempt's
+previous version/generation/prefix unchanged on every rank. Old native I/O and
+its retirement proofs are never rolled back. A preceding cache clear may already
+have invalidated local indexes or rotated their clear scope; publication failure
+does not undo that clear. The model load may also already have changed parameter
+bytes. `commit_weight_update(false)` marks the loaded model unusable; it is not a
+parameter rollback or permission to serve using a mixture of weights. Recovery
+or retry must follow the existing complete-weight reload/restart contract.
+
 An actual change to another immutable weight version restores its standard
 shared weight namespace across independent engines. Reapplying the same version
 keeps the clear-generation suffix. Returning A -> B -> A while old A access is

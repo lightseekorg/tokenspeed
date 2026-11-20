@@ -2203,54 +2203,80 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         op: &ControlRequest,
         message: String,
     ) -> Result<(bool, String), LoopError> {
-        let version = self.controls.commit_shared_weight_version(op);
-        let local = match &version {
+        // Model loading is already agreed, but no namespace metadata becomes
+        // visible until entropy and every local namespace plan are ready.
+        let controls = self.controls.prepare_shared_weight_version(op);
+        let isolation = match &controls {
             Err(refusal) => Err(refusal.clone()),
-            Ok(Some(version)) => match &self.l3 {
-                Some(l3) => l3
+            Ok(prepared) => match (prepared.changed_version(), &self.l3) {
+                (Some(version), Some(l3)) => l3
                     .executor
-                    .set_weight_version(version)
+                    .weight_version_needs_isolation(version)
                     .map_err(|error| error.to_string()),
-                None => Ok(()),
+                _ => Ok(false),
             },
-            Ok(None) => Ok(()),
         };
-        if !self.converge(local.is_ok())? {
+        if !self.converge(isolation.is_ok())? {
             return Ok((
                 false,
-                local.err().unwrap_or_else(|| {
-                    "weight namespace publication failed on another rank".to_owned()
+                isolation.err().unwrap_or_else(|| {
+                    "weight namespace preparation failed on another rank".to_owned()
                 }),
             ));
         }
         // A -> B -> A must not re-enter a prefix touched by retained old A I/O.
         // Unchanged-version ranks participate too; local change is not a gate
         // for collective membership.
-        let changed = matches!(&version, Ok(Some(_)));
-        let needs_isolation = changed
-            && self
-                .l3
-                .as_ref()
-                .is_some_and(|l3| l3.executor.current_namespace_needs_isolation());
-        if !self.converge(!needs_isolation)? {
+        let generation = if !self.converge(!isolation.expect("namespace inspection agreed"))? {
             let Some(generation) = self.fresh_cache_generation()? else {
                 return Ok((
                     false,
                     "could not isolate the weight namespace from old I/O".to_owned(),
                 ));
             };
-            let local = match &self.l3 {
-                Some(l3) => l3.executor.begin_cache_generation(&generation),
-                None => Ok(()),
-            };
-            if !self.converge(local.is_ok())? {
-                return Ok((
-                    false,
-                    "could not isolate the weight namespace from old I/O".to_owned(),
-                ));
+            Some(generation)
+        } else {
+            None
+        };
+        let controls = controls.expect("control metadata preparation agreed");
+        // Allocate the peer's identity before publication too. An unchanged
+        // member still applies an agreed nonce if another owner needs it.
+        let peer_version = controls.changed_version().map(str::to_owned);
+        let storage = match &self.l3 {
+            Some(l3) if peer_version.is_some() || generation.is_some() => {
+                let version = controls
+                    .target_version()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| l3.executor.weight_version());
+                l3.executor
+                    .prepare_weight_version(&version, generation.as_deref())
+                    .map(Some)
+                    .map_err(|error| error.to_string())
             }
+            _ => Ok(None),
+        };
+        if !self.converge(storage.is_ok())? {
+            return Ok((
+                false,
+                storage.err().unwrap_or_else(|| {
+                    "weight namespace preparation failed on another rank".to_owned()
+                }),
+            ));
         }
-        if let Ok(Some(version)) = version {
+        // The exclusive control gate has submitted no new I/O or namespace
+        // changes since preparation. Publication now moves checked values;
+        // there are no backend/entropy calls or expected failures between the
+        // executor, Controls and Peer updates.
+        if let Some(prepared) = storage.expect("storage namespace preparation agreed") {
+            self.l3
+                .as_ref()
+                .expect("a storage plan has its executor")
+                .executor
+                .commit_prepared_weight_version(prepared);
+        }
+        self.controls
+            .commit_prepared_shared_weight_version(controls);
+        if let Some(version) = peer_version {
             if let Some(peer) = &mut self.peer {
                 peer.set_weight_version(&version);
             }

@@ -146,6 +146,7 @@ fn new_scheduler(
     resident_requests: usize,
     deferred: bool,
     host_blocks: usize,
+    l3_default_pressure: bool,
 ) -> Scheduler {
     interpreter();
     let policy = if deferred { "Deferred" } else { "Early" };
@@ -187,10 +188,10 @@ fn new_scheduler(
              cfg.enable_l3_storage = True\n\
              cfg.storage_config = ts.StorageConfig(\n\
                  8, 8, storage_host_credits, 64, 1024, 1, 10**9, 10**9,\n\
-                 ts.StoragePressure(64, 2**40, 10**9),\n\
-                 ts.StoragePressure(32, 2**39, 5 * 10**8))"
+                 storage_pressure_high, storage_pressure_low)"
         }
     };
+    let l3_default_pressure = if l3_default_pressure { "True" } else { "False" };
     let code = format!(
         r#"
 import tokenspeed_scheduler as ts
@@ -211,6 +212,12 @@ if cfg.role == ts.SchedulerConfig.Role.P:
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
 storage_host_credits = min(64, {host_blocks} // {kv_shard_count})
+if {l3_default_pressure}:
+    storage_pressure_high = ts.StoragePressure(8, 256 * 1024 * 1024, 500_000)
+    storage_pressure_low = ts.StoragePressure(4, 128 * 1024 * 1024, 250_000)
+else:
+    storage_pressure_high = ts.StoragePressure(64, 2**40, 10**9)
+    storage_pressure_low = ts.StoragePressure(32, 2**39, 5 * 10**8)
 {tiers}
 if cfg.num_host_pages > 1:
     cfg.num_host_pages = {host_blocks} // {kv_shard_count} + 1
@@ -345,6 +352,8 @@ struct FakeDevice {
     weight_commits: Arc<Mutex<Vec<bool>>>,
     /// Inject a local loading failure while other ranks succeed.
     fail_weight_update: bool,
+    /// A test-only device callback after the stand-in loader executes.
+    weight_update_hook: Option<fn(&ControlRequest)>,
     /// The rank's load prerequisites refuse (weights released, KV still
     /// resident); a test clears it before retrying.
     weight_load_refused: Arc<AtomicBool>,
@@ -908,6 +917,9 @@ impl DataPlane for FakeDevice {
             _ => None,
         };
         self.weight_load_versions.lock().unwrap().push(version);
+        if let Some(hook) = self.weight_update_hook {
+            hook(op);
+        }
         Ok((!self.fail_weight_update, "applied".to_owned()))
     }
 
@@ -1599,6 +1611,8 @@ struct Setup {
     l3_stores: Vec<Arc<StorageProbe>>,
     /// L3: bound the Host cache for eviction-driven cold reads.
     l3_host_blocks: Option<usize>,
+    /// L3: exercise production queue/age watermarks instead of broad test limits.
+    l3_default_pressure: bool,
     /// L3: budget for healthy native work before clear isolates its buffers.
     l3_clear_cache_drain_timeout: Option<Duration>,
     /// L3: optional owner-specific budgets for agreement coverage.
@@ -1610,6 +1624,8 @@ struct Setup {
     held_cache_acks: bool,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
+    /// A test-only callback for real host failures after the device load.
+    weight_update_hook: Option<fn(&ControlRequest)>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
     /// The requests each engine serves itself before its frontend attaches,
@@ -1800,6 +1816,7 @@ fn run_rank<F: Frontend>(
         resident_requests.unwrap_or(8),
         deferred_allocation,
         setup.l3_host_blocks.unwrap_or(1024),
+        setup.l3_default_pressure,
     )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
@@ -1896,6 +1913,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
         ep_rank: rank,
         fail_weight_update: setup.weight_update_failure_rank == Some(rank),
+        weight_update_hook: setup.weight_update_hook,
         weight_load_refused: Arc::new(AtomicBool::new(
             setup
                 .weight_load_refused
@@ -6197,6 +6215,326 @@ async fn an_idle_loop_consumes_late_storage_retirement_without_new_ingress() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_old_blocked_write_worker_does_not_close_new_generation_read_pressure() {
+    let gate = Gate::closed();
+    let store = Arc::new(StorageProbe {
+        put_gate: Some(gate.clone()),
+        ..StorageProbe::default()
+    });
+    let handle = Arc::new(Mutex::new(None));
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::L3,
+        Setup {
+            device_pages: Some(33),
+            l3_host_blocks: Some(32),
+            l3_default_pressure: true,
+            l3_store: Some(store.clone()),
+            l3_clear_cache_drain_timeout: Some(Duration::ZERO),
+            scheduler: Some(handle.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _release = ReleaseStoreGate(gate.clone());
+    let old_ids: Vec<i32> = (1..=65).collect();
+    run(
+        &engine.client,
+        routed_prompt("old-blocked-writer", &old_ids, None),
+    )
+    .await;
+    wait_for_store_put(&store).await;
+    flush_until_idle(&engine).await;
+    let namespace = agreed_namespace(
+        &publication_on_every_rank(&engine, "blocked-writer-new-generation", &old_ids).await,
+        "v1",
+    );
+    let queries_before = store.queries.lock().unwrap().len();
+    let target_ids: Vec<i32> = (1001..=1065).collect();
+    let target = run(
+        &engine.client,
+        routed_prompt("new-backup-with-no-write-worker", &target_ids, None),
+    )
+    .await;
+    assert_eq!(tokens(&target), [1000, 1001, 1002, 1003]);
+    assert_eq!(target.last().unwrap().cached_tokens, 0);
+    let target_keys: HashSet<String> = store.queries.lock().unwrap()[queries_before..]
+        .iter()
+        .flat_map(|(keys, _)| keys.iter())
+        .filter(|key| key.starts_with(&namespace))
+        .cloned()
+        .collect();
+    assert!(!target_keys.is_empty());
+    // A separate writer can publish the same immutable objects while this
+    // engine's only native write worker remains held by the old generation.
+    // Seed the exact keys requested by the real scheduler, through Store API.
+    let keys: Vec<String> = target_keys.iter().cloned().collect();
+    let mut payload = vec![0x5a_u8; keys.len() * 8];
+    let ranges: Vec<Range> = (0..keys.len())
+        .map(|key| Range {
+            offset: key * 8,
+            size: 8,
+        })
+        .collect();
+    let seeded = store
+        .memory
+        .batch_put_from(
+            &keys,
+            HostBuffer {
+                base: payload.as_mut_ptr() as usize,
+                len: payload.len(),
+            },
+            &ranges,
+        )
+        .unwrap();
+    assert!(seeded.retired && seeded.success.iter().all(|success| *success));
+    // The production age high watermark is 500ms. A new backup must reject
+    // as retired, rather than sit behind the old worker and close read gates.
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let scheduler = handle.lock().unwrap().clone().unwrap();
+    let stats = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(scheduler) = scheduler.try_lock() {
+                let stats = scheduler.storage_stats();
+                if stats.operations == stats.retained_operations {
+                    break stats;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("new backups remained queued behind an old native write");
+    assert!(stats.retained_operations > 0);
+    assert!(stats.retained_host_blocks > 0);
+    assert!(!stats.pressure_gate_closed);
+    assert!(store.put_results.lock().unwrap().is_empty());
+    let native_queries_before = engine.storage_queries();
+    evict_and_restore_from_l3(
+        &engine,
+        std::slice::from_ref(&store),
+        &target_ids,
+        None,
+        &[0],
+        &namespace,
+        &target_keys,
+    )
+    .await;
+    assert!(engine.storage_queries() > native_queries_before);
+    assert_eq!(store.puts.lock().unwrap().len(), 1);
+    assert!(store.put_results.lock().unwrap().is_empty());
+    gate.open();
+    drop(engine);
+    assert!(store.closed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn failed_nonce_preparation_keeps_weight_namespace_metadata_on_the_previous_version() {
+    const CHILD: &str = "TS_TEST_NONCE_PREPARATION_EMFILE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "failed_nonce_preparation_keeps_weight_namespace_metadata_on_the_previous_version",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "isolated nonce failure test timed out:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated nonce failure test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // RLIMIT_NOFILE is process-wide, so only this exact isolated test may
+    // lower it. Existing sockets stay live; opening the nonce file fails.
+    interpreter();
+    static ARM_EMFILE: AtomicBool = AtomicBool::new(false);
+    fn fail_nonce_after_return_a_load(op: &ControlRequest) {
+        let ControlRequest::UpdateWeightFromDisk(request) = op else {
+            return;
+        };
+        if request.weight_version.as_deref() != Some("v1")
+            || !ARM_EMFILE.swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        Python::attach(|py| {
+            // Imported before changing the limit; importing cannot itself
+            // become the filesystem failure this test intends to observe.
+            let resource = py.import("resource").unwrap();
+            let nofile = resource.getattr("RLIMIT_NOFILE").unwrap();
+            let (_, hard): (i64, i64) = resource
+                .call_method1("getrlimit", (&nofile,))
+                .unwrap()
+                .extract()
+                .unwrap();
+            resource
+                .call_method1("setrlimit", (&nofile, (0_i64, hard)))
+                .unwrap();
+        });
+    }
+    struct RestoreNoFile {
+        limits: (i64, i64),
+        restored: bool,
+    }
+    impl RestoreNoFile {
+        fn restore(&mut self) {
+            Python::attach(|py| {
+                let resource = py.import("resource").unwrap();
+                let nofile = resource.getattr("RLIMIT_NOFILE").unwrap();
+                resource
+                    .call_method1("setrlimit", (nofile, self.limits))
+                    .unwrap();
+            });
+            self.restored = true;
+        }
+    }
+    impl Drop for RestoreNoFile {
+        fn drop(&mut self) {
+            if !self.restored {
+                Python::attach(|py| {
+                    if let Ok(resource) = py.import("resource") {
+                        if let Ok(nofile) = resource.getattr("RLIMIT_NOFILE") {
+                            let _ = resource.call_method1("setrlimit", (nofile, self.limits));
+                        }
+                    }
+                });
+            }
+        }
+    }
+    let limits = Python::attach(|py| {
+        let resource = py.import("resource").unwrap();
+        let nofile = resource.getattr("RLIMIT_NOFILE").unwrap();
+        resource
+            .call_method1("getrlimit", (nofile,))
+            .unwrap()
+            .extract()
+            .unwrap()
+    });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let store = Arc::new(StorageProbe {
+                failed_put_retirement: Mutex::new(Some(false)),
+                ..StorageProbe::default()
+            });
+            let engine = start_ranks_with(
+                Layout::Single,
+                1,
+                Tiers::L3,
+                Setup {
+                    l3_store: Some(store.clone()),
+                    weight_update_hook: Some(fail_nonce_after_return_a_load),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let ids: Vec<i32> = (1..=65).collect();
+            run(
+                &engine.client,
+                routed_prompt("unsafe-a-before-nonce-failure", &ids, None),
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !store.put_results.lock().unwrap().contains(&false) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the old A PUT did not report unknown retirement");
+            flush_until_idle(&engine).await;
+            *store.failed_put_retirement.lock().unwrap() = None;
+            let load = |version: &str, flush_cache: bool| {
+                ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    model_path: format!("/checkpoint-{version}"),
+                    load_format: None,
+                    weight_version: Some(version.to_owned()),
+                    flush_cache,
+                })
+            };
+            assert_eq!(
+                control(&engine, load("v2", true)).await,
+                [("UpdateWeightFromDiskReqOutput", true)]
+            );
+            let previous = ts_l3::keys::key_prefix("serving", "v2", "");
+            let mut restore = RestoreNoFile {
+                limits,
+                restored: false,
+            };
+            ARM_EMFILE.store(true, Ordering::SeqCst);
+            let failed =
+                tokio::time::timeout(Duration::from_secs(2), control(&engine, load("v1", true)))
+                    .await;
+            // Restore before inspecting results or sending any subsequent
+            // request, including when an assertion or reply timeout fails.
+            restore.restore();
+            assert!(!ARM_EMFILE.load(Ordering::SeqCst));
+            assert_eq!(
+                failed.expect("nonce preparation did not return a bounded failure"),
+                [("UpdateWeightFromDiskReqOutput", false)]
+            );
+            assert_weight_commits(&engine, &[true, false]).await;
+            for output in publication_on_every_rank(&engine, "after-failed-nonce", &ids).await {
+                assert_eq!(output.storage_namespace, previous);
+            }
+            assert_eq!(
+                control(&engine, load("v1", false)).await,
+                [("UpdateWeightFromDiskReqOutput", false)]
+            );
+            assert_weight_commits(&engine, &[true, false]).await;
+            assert_eq!(
+                control(&engine, load("v1", true)).await,
+                [("UpdateWeightFromDiskReqOutput", true)]
+            );
+            assert_weight_commits(&engine, &[true, false, true]).await;
+            let outputs = publication_on_every_rank(&engine, "after-retried-nonce", &ids).await;
+            let actual = agreed_namespace(&outputs, "v1");
+            assert_ne!(actual, ts_l3::keys::key_prefix("serving", "v1", ""));
+            assert_eq!(
+                *engine.ranks[0].weight_load_versions.lock().unwrap(),
+                [
+                    Some("v2".to_owned()),
+                    Some("v1".to_owned()),
+                    Some("v1".to_owned())
+                ]
+            );
+            drop(engine);
+            assert!(!store.closed.load(Ordering::SeqCst));
+        });
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn startup_phases_clear_with_a_budget_while_an_old_put_is_still_running() {
     const IN_FLIGHT_DEPTH: usize = 1;
     for layout in [Layout::Single, Layout::Tp(2)] {
@@ -7161,6 +7499,7 @@ async fn a_non_storage_flush_refusal_keeps_an_existing_backup_attached() {
 async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_generation() {
     for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
         let late = Gate::closed();
+        let scheduler_handle = Arc::new(Mutex::new(None));
         let remote = Arc::new(MemoryStore::new());
         let stores = vec![
             Arc::new(StorageProbe {
@@ -7182,6 +7521,7 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
                 device_pages: Some(33),
                 l3_host_blocks: Some(32),
                 l3_stores: stores.clone(),
+                scheduler: Some(scheduler_handle.clone()),
                 ..Setup::default()
             },
         )
@@ -7194,7 +7534,8 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         }
         let _release = Release(late.clone());
         let old_ids: Vec<i32> = (1..=65).collect();
-        let target_ids: Vec<i32> = (1001..=1065).collect();
+        let warm_new_ids: Vec<i32> = (1001..=1065).collect();
+        let target_ids: Vec<i32> = (2001..=2065).collect();
         assert_eq!(
             tokens(&run(&engine.client, routed_prompt("old-weights", &old_ids, None)).await),
             [1000, 1001, 1002, 1003]
@@ -7266,21 +7607,51 @@ async fn a_single_unsafe_owner_preserves_host_holds_and_restores_l3_in_a_new_gen
         let switched = publication_on_every_rank(&engine, "after-switch", &old_ids).await;
         let namespace = agreed_namespace(&switched, "v2");
         assert!(switched.iter().all(|output| output.status != "published"));
-        let put_offsets: Vec<usize> = stores
-            .iter()
-            .map(|store| store.puts.lock().unwrap().len())
-            .collect();
         let fresh = run(
             &engine.client,
-            routed_prompt("new-weights", &target_ids, None),
+            routed_prompt("new-weights-while-old-write-is-held", &warm_new_ids, None),
         )
         .await;
         assert_eq!(tokens(&fresh), [1000, 1001, 1002, 1003]);
         assert_eq!(fresh.last().unwrap().cached_tokens, 0);
+        for output in publication_on_every_rank(&engine, "blocked-new-backup", &warm_new_ids).await
+        {
+            assert_ne!(output.status, "published");
+        }
 
         // The healthy worker is still in the old native call. Once released,
-        // that call must keep its old keys and then service new-generation PUTs.
+        // its late result keeps the old keys. Best-effort backups rejected
+        // while that worker was full are not replayed automatically.
         late.open();
+        let scheduler = scheduler_handle.lock().unwrap().clone().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(scheduler) = scheduler.try_lock() {
+                    let stats = scheduler.storage_stats();
+                    // Every owner's native result has reached agreement:
+                    // the old mixed-retirement ticket is now quarantined.
+                    if stats.quarantined > 0 && stats.operations == stats.retained_operations {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the old native PUT completion did not reach the scheduler");
+        let put_offsets: Vec<usize> = stores
+            .iter()
+            .map(|store| store.puts.lock().unwrap().len())
+            .collect();
+        // A distinct prefill after actual worker retirement is a new backup
+        // opportunity. It must publish normally on every owner.
+        let fresh = run(
+            &engine.client,
+            routed_prompt("new-weights-after-old-write-retired", &target_ids, None),
+        )
+        .await;
+        assert_eq!(tokens(&fresh), [1000, 1001, 1002, 1003]);
+        assert_eq!(fresh.last().unwrap().cached_tokens, 0);
         wait_for_publication(&engine, &target_ids, &[0, 1], &namespace).await;
         assert!(remote
             .keys()
