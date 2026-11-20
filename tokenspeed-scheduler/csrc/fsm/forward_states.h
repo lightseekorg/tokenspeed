@@ -262,6 +262,9 @@ struct PrefillDone : RestoreMarker {
 
     ForwardResources resources;
     TokenContainer::Window window{};
+    // Deferred decode allocation: the error about this prompt's remote
+    // decode not being admitted was logged.
+    bool remote_decode_failure_logged{false};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};

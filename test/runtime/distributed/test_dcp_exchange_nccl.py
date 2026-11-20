@@ -781,6 +781,8 @@ def _decode_records_leaf(dsa, group, rank, requests, records_core):
     # (test_dcp_decode_records_core_on_the_real_k31_selection), or its
     # verdict where another core decodes.
     leaf._dcp_decode_records_core = records_core
+    # The leaf's own decode selection, as where Prims-TS does not serve.
+    leaf._kvp_decode_solution = None
     leaf._owned_decode_topk = True
     leaf._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(

@@ -274,6 +274,7 @@ fn room_end_metrics(name: &str, cancel_decode: Option<bool>) {
         Duration::from_secs(120),
         None,
         0,
+        "early",
         Some(metrics),
     );
     let (mut mesh, group) = single_rank();
@@ -352,6 +353,7 @@ fn replica_end_metrics(cause: &str) {
                         timeout,
                         None,
                         0,
+                        "early",
                         Some(metrics),
                     );
                     pair.prefill.register("r", &pair.bootstrap).unwrap();

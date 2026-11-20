@@ -1218,8 +1218,11 @@ impl KvTransferMetrics {
             .observe(&[&self.labels[0], &self.labels[1]], seconds);
     }
 
-    /// A transfer that timed out in `stage` (`bootstrapping` on the prefill
-    /// node, `waiting_for_input` on the decode node).
+    /// A transfer that timed out in `stage`: on the prefill node
+    /// `bootstrapping`, or before a node under deferred allocation admitted
+    /// the request `waiting_for_announcement` (of its decode node); on the
+    /// decode node `waiting_for_admission` before its manifest went out, then
+    /// `waiting_for_input`.
     pub fn record_timeout(&self, stage: &str) {
         self.timeouts
             .inc(&[&self.labels[0], &self.labels[1], stage], 1.0);

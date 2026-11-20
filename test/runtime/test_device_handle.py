@@ -898,8 +898,8 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
             submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
                 trace.append(("store", [op.request_pool_index for op in ops]))
             ),
-            submit_load_backs=lambda ops, *, prerequisite_stream: (
-                trace.append("load_backs")
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
             ),
         ),
     )

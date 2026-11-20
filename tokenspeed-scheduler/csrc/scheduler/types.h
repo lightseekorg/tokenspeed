@@ -135,6 +135,18 @@ struct SchedulerConfig {
     // (transfer pins, destination layouts, transfer_policy validation) keys
     // on the role directly.
     Role role{Role::kFused};
+    // What the Decode destination gates on the P role; refused elsewhere
+    // (Validate), and absent there it is kEarly. Under either policy a prompt
+    // is admitted once pd::BootstrappedEvent arrived.
+    //   kEarly     that event also says every Decode rank allocated the
+    //              destination, so a prompt computes with its destination
+    //              allocated.
+    //   kDeferred  the destination has its own event,
+    //              pd::DestinationReadyEvent. A prompt computed before it
+    //              waits in PrefillAwaitingDestination, and its KV is sent
+    //              once it arrived.
+    enum class DecodeAllocationPolicy : std::uint8_t { kEarly, kDeferred };
+    std::optional<DecodeAllocationPolicy> decode_allocation_policy;
 
     bool disable_prefix_cache{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.
@@ -200,9 +212,11 @@ struct SchedulerConfig {
     // that fit whole, so they run complete in the same forward: the chunk
     // ends on an earlier page and gives up fewer than this plus one page
     // (docs/design/scheduler.md §1.1). A chunk yields only while such prompts
-    // wait, and only what they take. 0 (the default) is off; at most half of
-    // max_scheduled_tokens, so a long prompt keeps about half of every round
-    // or more.
+    // wait, and only what they take. 0 (the default) is off: no chunk gives
+    // way; at most half of max_scheduled_tokens, so a long prompt keeps about
+    // half of every round or more. The budget a P-role chunk leaves on its
+    // own goes to bootstrapped prompts that fit whole in it whatever this
+    // value (§1.1).
     std::int32_t prefill_chunk_yield_tokens{0};
 
     // The single validation entry point for a scheduler configuration: every
