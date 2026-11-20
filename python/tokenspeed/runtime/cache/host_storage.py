@@ -206,6 +206,7 @@ class HostCacheStorage:
         *,
         group_specs: Sequence[CacheGroupSpec],
         num_host_lcm_blocks: int,
+        host_register_threads: int | None,
     ):
         """
         Args:
@@ -213,6 +214,7 @@ class HostCacheStorage:
             group_specs: The scheduler's group specs, which size the shared
                 parent (``compute_host_lcm_block_bytes``).
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
+            host_register_threads: Startup-only registration override, or None.
         """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -225,12 +227,10 @@ class HostCacheStorage:
         ) = _compute_host_layout(layout, group_specs=group_specs)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
-        import torch
+        from tokenspeed.runtime.cache.host_allocation import allocate_host_buffer
 
-        self.host_buffer = torch.empty(
-            self.host_buffer_bytes,
-            dtype=torch.uint8,
-            pin_memory=True,
+        self.host_buffer = allocate_host_buffer(
+            self.host_buffer_bytes, register_threads=host_register_threads
         )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:

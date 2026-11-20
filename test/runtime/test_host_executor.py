@@ -104,6 +104,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
+    platform = ModuleType("tokenspeed_kernel.platform")
+    platform.current_platform = Mock(return_value=SimpleNamespace(is_nvidia=False))
     ownership = ModuleType("tokenspeed.runtime.cache.transfer.ownership")
     ownership.BlockOwnerTranslation = Mock
     lanes = ModuleType("tokenspeed.runtime.cache.transfer.lanes")
@@ -113,8 +115,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.check_host_memory = Mock()
     lanes.host_memory_share = Mock(return_value=(10**12, "host (psutil)"))
     lanes.largest_pinned_fit = Mock(
-        side_effect=lambda room_bytes, *, block_bytes: (
-            max(room_bytes, 0) // block_bytes * block_bytes
+        side_effect=lambda room_bytes, *, block_bytes, padding_bytes=0: (
+            max(room_bytes - padding_bytes, 0) // block_bytes * block_bytes
         )
     )
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
@@ -162,6 +164,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     runtime_utils.get_colorful_logger = Mock(return_value=Mock())
     runtime_utils.get_device_module = Mock(return_value=Mock())
     fake_modules = {
+        "tokenspeed_kernel.platform": platform,
         "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
         "tokenspeed_engine.scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
@@ -1135,6 +1138,7 @@ class TestGroupAwareWireTest:
 
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
+            "tokenspeed_kernel.platform",
             "tokenspeed_kernel.ops.kvcache.host_transfer",
             "tokenspeed_engine.scheduler",
             "tokenspeed.runtime.cache.l2.layerwise_load",

@@ -500,6 +500,13 @@ Trainer-side contract:
 
 ## Scheduler and memory
 
+On NVIDIA CUDA, Host L2 startup allocation uses eight parallel page-touch
+threads and `cudaHostRegister`, with a 4 KiB-aligned buffer. No startup flag or
+global pinned-allocator override is needed. Original PyTorch allocator settings
+are restored on success or failure before snapshot and later allocations.
+Other platforms keep their existing allocation policy. This does not bind CPUs
+or memory to NUMA nodes.
+
 | Parameter | Purpose |
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |

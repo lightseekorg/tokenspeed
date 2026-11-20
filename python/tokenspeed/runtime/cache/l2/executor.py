@@ -61,7 +61,9 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
     transfer_cache_blocks,
     wait_layer_ready,
 )
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.cache.host_allocation import HOST_BUFFER_ALIGNMENT_BYTES
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
     compute_host_group_packing,
@@ -279,6 +281,11 @@ class HostCacheExecutor:
         share_bytes, share_source = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
+        # CUDA host registration is an allocator setting, not a dispatched kernel.
+        host_register_threads = 8 if l2_tier and current_platform().is_nvidia else None
+        alignment_padding = (
+            HOST_BUFFER_ALIGNMENT_BYTES - 1 if host_register_threads is not None else 0
+        )
         # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
@@ -287,7 +294,9 @@ class HostCacheExecutor:
         # it is also a barrier: no rank pins before every rank read its share.
         fitting_l2_blocks = _min_over_ranks(
             largest_pinned_fit(
-                share_bytes - pool_pinned_bytes, block_bytes=host_lcm_block_bytes
+                share_bytes - pool_pinned_bytes,
+                block_bytes=host_lcm_block_bytes,
+                padding_bytes=alignment_padding,
             )
             // host_lcm_block_bytes,
             world_cpu_group,
@@ -340,7 +349,8 @@ class HostCacheExecutor:
         )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
-        l2_pinned_bytes = pinned_host_bytes(l2_bytes)
+        l2_allocation_bytes = l2_bytes + alignment_padding
+        l2_pinned_bytes = pinned_host_bytes(l2_allocation_bytes)
         check_host_memory(
             l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
@@ -362,6 +372,7 @@ class HostCacheExecutor:
                 self.layout,
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=host_lcm_blocks,
+                host_register_threads=host_register_threads,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -386,6 +397,7 @@ class HostCacheExecutor:
                 self.layout,
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
+                host_register_threads=None,
             )
             self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
                 self.layout,
