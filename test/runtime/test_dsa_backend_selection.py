@@ -790,14 +790,15 @@ def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, cas
 
 
 @pytest.mark.parametrize(
-    "case", ["prims", "kvp1", "verify_unserved", "pinned", "planned", "bf16_cache"]
+    "case",
+    ["prims", "kvp1", "verify_unserved", "pinned", "planned", "bf16_cache", "pdl_off"],
 )
 def test_kvp_decode_pins_prims_where_it_serves_every_decode(monkeypatch, case):
     """The head-sharded KVP decode pins Prims-TS only where it serves both decodes.
 
-    Those are one row per request and the verify rows, on an FP8 cache
-    without a pin or plan of the leaf's own; the probes then ask for it, as
-    the forward does.
+    Those are one row per request and the verify rows, on an FP8 cache with
+    PDL on and without a pin or plan of the leaf's own; the probes then ask
+    for it, as the forward does.
     """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
@@ -817,6 +818,7 @@ def test_kvp_decode_pins_prims_where_it_serves_every_decode(monkeypatch, case):
         return SimpleNamespace(name=f"fake_{mode}")
 
     monkeypatch.setattr(dsa, "select_kernel", select)
+    monkeypatch.setattr(dsa, "pdl_enabled", lambda: case != "pdl_off")
     backend.configure_runtime(
         block_granularity=128,
         virtual_block_count=17,
@@ -895,6 +897,8 @@ def test_dcp_records_core_on_the_real_k31_selection(monkeypatch, solution):
     for name, value in values.items():
         setattr(backend, name, value)
     monkeypatch.setattr(dsa, "_LOGGED_SPARSE_LEAVES", set())
+    # PDL on, as GPUs default to; the Prims-TS core launches only with it.
+    monkeypatch.setattr(dsa, "pdl_enabled", lambda: True)
     backend.configure_runtime(
         block_granularity=128, virtual_block_count=17, shard_count=8
     )

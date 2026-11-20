@@ -45,7 +45,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -748,8 +748,9 @@ class DSABackend(PagedAttentionBackend):
         The Prims-TS core attends the gathered heads unpadded and writes the
         combine's LSE itself, -inf for a row owning no key; the trtllm-gen
         core pads the heads and needs an LSE launch and a mask after it. Only
-        without a pin or plan of the leaf's own, on an FP8 cache. Boot
-        configuration only, so every rank of the group agrees.
+        without a pin or plan of the leaf's own, on an FP8 cache, and with PDL
+        on, as the Prims-TS core launches only with it. Boot configuration
+        only, so every rank of the group agrees.
         """
         if (
             len(self.kvp_group) <= 1
@@ -757,6 +758,7 @@ class DSABackend(PagedAttentionBackend):
             or self.decode_kernel_plan is not None
             or self.data_type != torch.float8_e4m3fn
             or current_platform().is_npu
+            or not pdl_enabled()
         ):
             return self.kernel_solution
         decodes = [
