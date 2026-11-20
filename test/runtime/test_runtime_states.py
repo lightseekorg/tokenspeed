@@ -227,6 +227,7 @@ def _scheduled_batch():
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
         storage_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,

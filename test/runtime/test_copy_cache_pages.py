@@ -287,6 +287,7 @@ class TestFinishTailHitCopyCudaTest:
                 host_write_policy="write_through",
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
+                max_consecutive_prefill_rounds=0,
                 storage_config=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
@@ -508,6 +509,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 host_write_policy="write_back",
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
+                max_consecutive_prefill_rounds=0,
                 cache_groups=pool_to_cache_groups(pool),
             )
             scheduler = ts.Scheduler(scheduler_config)
