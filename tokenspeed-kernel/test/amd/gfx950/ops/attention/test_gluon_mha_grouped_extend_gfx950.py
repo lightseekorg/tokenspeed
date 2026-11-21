@@ -923,3 +923,122 @@ def test_extend_reads_pages_past_int32_range(queries, prefixes, window, head_dim
     actual = far_case.invoke("gluon", return_lse=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _one_request(case: PagedCase, request: int) -> PagedCase:
+    """The same request launched alone: its own grid, block count and order."""
+    start = int(case.cu_q[request])
+    rows = case.queries[request]
+    length = int(case.lengths[request])
+    return dataclasses.replace(
+        case,
+        q=case.q[start : start + rows],
+        table=case.table[request : request + 1],
+        lengths=case.lengths[request : request + 1],
+        cu_q=torch.tensor([0, rows], device="cuda", dtype=torch.int32),
+        cu_kv=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+        queries=[rows],
+        max_q=rows,
+        max_k=length,
+    )
+
+
+# Batched and alone launches here pick the same tile and KV split count (a
+# split count is part of the numerics, so cases keep it at one): under full
+# attention every request has at least 4096 rows over a prefix of at least
+# 8192 keys (8-wave tile, the grid fills the machine unsplit); under the
+# window every launch takes the 8-wave tile's 1-4 rounds of work-groups.
+_PLACEMENT_CASES = {
+    -1: [
+        # A rectangular launch whose blocks x KV heads leave a remainder on
+        # 8 XCDs (129 blocks a request), alone and batched.
+        pytest.param([4112] * 3, [9000 + 5] * 3, id="rect-tail"),
+        pytest.param([4096] * 2, [12000 + 3] * 2, id="rect"),
+        pytest.param([4100, 6000, 4500], [9000 + 7, 12000, 8500 + 1], id="ragged"),
+    ],
+    2047: [
+        pytest.param([2100] * 2, [9000 + 5] * 2, id="rect"),
+        pytest.param([2100, 2300], [9000 + 7, 3000 + 1], id="ragged"),
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "window,queries,prefixes",
+    [
+        pytest.param(window, *case.values, id=f"w{window}-{case.id}")
+        for window, cases in _PLACEMENT_CASES.items()
+        for case in cases
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.usefixtures("require_gfx950")
+def test_work_group_placement_keeps_every_bit(window, queries, prefixes, dtype):
+    """Where a (query block, KV head) runs and in which order is placement
+    only: a batched launch writes exactly the bytes of each request launched
+    alone, whose grids, remap tails and orders all differ."""
+    case = make_case(
+        queries,
+        prefixes,
+        heads=32,
+        kv_heads=4,
+        window=window,
+        causal=True,
+        sinks=False,
+        head_dim=64,
+    )
+    if dtype == torch.bfloat16:
+        # Every block runs once: a skipped or repeated block misses the oracle.
+        assert_reference(case)
+    else:
+        case = dataclasses.replace(
+            case, q=case.q.to(dtype), k=case.k.to(dtype), v=case.v.to(dtype)
+        )
+    alone_cases = [_one_request(case, request) for request in range(len(queries))]
+    for single in alone_cases:
+        assert uses_warp_pipeline(single) == uses_warp_pipeline(case)
+    batched = case.invoke("gluon", return_lse=False)
+    alone = torch.cat(
+        [single.invoke("gluon", return_lse=False) for single in alone_cases]
+    )
+    assert torch.equal(batched.view(torch.int16), alone.view(torch.int16))
+
+
+@pytest.mark.usefixtures("require_gfx950")
+def test_work_group_placement_does_not_recompile():
+    """The remap reads the grid at run time: once the launcher's warmup has
+    compiled every variant for these heads, batch shapes that change the block
+    count, the remap tail and the grid layout compile nothing new."""
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+    from utils import assert_no_triton_compile
+
+    def run(queries, prefix):
+        case = make_case(
+            queries,
+            [prefix] * len(queries),
+            heads=32,
+            kv_heads=4,
+            window=-1,
+            causal=True,
+            sinks=False,
+            head_dim=64,
+        )
+        # The page table's row stride is compiled in, as the served table's
+        # fixed width is: pad every batch's table to one width.
+        table = torch.full(
+            (len(queries), 256), 1 << 30, device="cuda", dtype=torch.int32
+        )
+        table[:, : case.table.shape[1]] = case.table
+        dataclasses.replace(case, table=table).invoke("gluon", return_lse=False)
+
+    with kernel_warmup(enabled=True):
+        run([100], 300)
+    with assert_no_triton_compile(
+        extend.gluon_mha_extend_gfx950,
+        extend.gluon_mha_extend_split_gfx950,
+        extend.gluon_mha_extend_reduce_gfx950,
+    ):
+        for queries in ([1056], [1040] * 2, [1040] * 3, [640, 1500], [900, 33, 1200]):
+            for prefix in (300, 9000):
+                run(queries, prefix)
