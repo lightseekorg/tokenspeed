@@ -77,6 +77,10 @@ share one launch with independent per-row top-k programs. Both
 topologies keep the same global token cutoffs for Lamport, push, pull, and
 owned-row paths. Owned rows use ceil(global rows / world size), with padded
 rows masked; QKVG exchange derives each rank's head widths from the group size.
+The attention output returns to the token owners either as per-rank partial
+projections reduce-scattered by row, or, with `all_to_all_heads_to_owners`, as
+each rank's heads of the owner's rows, which the owner projects through the
+whole output weight.
 With expert TP8 (EP1), batches whose routes outgrow the Lamport two-shot
 all-reduce (44 rows) and stay below the owned-row cutoff reduce-scatter each
 token's raw routes onto its owner through the owned-row route staging,

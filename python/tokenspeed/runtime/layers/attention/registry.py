@@ -339,6 +339,7 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
     "Inkling2ForConditionalGeneration",
+    "Inkling2LoopForConditionalGeneration",
 }
 
 _DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
@@ -1097,7 +1098,7 @@ def _create_target_components(
             backend,
             text_config,
             config,
-            num_layers=text_config.num_hidden_layers,
+            num_layers=text_config.num_conv_layers,
             is_draft=False,
             enable_layerwise_cache_ready=(
                 server_args.disaggregation_mode == "prefill"

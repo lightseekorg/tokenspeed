@@ -78,6 +78,35 @@ def _deployment_facts():
 
 
 class TestStorageKeyTest:
+    @pytest.mark.parametrize(
+        ("for_peer", "numerics", "compatible"),
+        [(True, "auto", True), (True, "rl-bitwise", False), (False, "auto", False)],
+    )
+    def test_expert_placement_for_peer_and_persistent_kv(
+        self, for_peer, numerics, compatible
+    ):
+        facts = _deployment_facts()
+
+        def identity(ep, **overrides):
+            return storage_deployment_id(
+                **{
+                    **facts,
+                    "for_peer": for_peer,
+                    "kv_producer": {"numerics": numerics, "moe_ep_size": ep},
+                    **overrides,
+                }
+            )
+
+        assert (identity(16) == identity(32)) is compatible
+        for change in (
+            {"attn_tp_size": 2},
+            {"cache_signature": "other-layout"},
+            {"group_shard_counts": (2,)},
+            {"revision": "other-weights"},
+            {"cache_quantization": "other-quantization"},
+        ):
+            assert identity(16) != identity(32, **change)
+
     def test_cp_group_layouts_do_not_share_replica_keys(self):
         facts = _deployment_facts()
         facts.update(

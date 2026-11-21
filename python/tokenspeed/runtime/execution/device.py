@@ -1816,9 +1816,11 @@ def build_device_side(
         if current_platform().is_amd:
             # Kernels warmed above read the probe's small KV arena. On AMD,
             # Triton keys a compilation on whether each tensor's storage fits
-            # in 2 GB (buffer ops address it with 32-bit offsets), so those
-            # variants do not serve the full-size arena: without this, each
-            # one compiles on its first live batch instead, mid-serve. Other
+            # in 2 GB (buffer ops address it with 32-bit offsets), so a kernel
+            # that specializes the arena's pointers does not serve the
+            # full-size arena: without this, it compiles on its first live
+            # batch instead, mid-serve. Kernels that do not specialize the
+            # arena's pointers compile once and are not affected. Other
             # platforms' kernels do not key on the arena's size and skip the
             # second warm-up. Warm again on the final pools with the tactics
             # tuned above; tuning now would allocate workspaces outside the
@@ -1886,12 +1888,38 @@ def build_device_side(
             process_group_manager as pg_manager,
         )
 
+        cpu_group = (
+            pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+            if server_args.mapping.world_size > 1
+            else None
+        )
+        if server_args.kvstore_release_checkpoint_cache:
+            from tokenspeed.runtime.cache.l2.executor import (
+                release_checkpoint_file_cache,
+            )
+            from tokenspeed.runtime.cache.l3.factory import model_checkpoint_id
+
+            configs = (
+                [model_config]
+                if draft_model_config is None
+                else [model_config, draft_model_config]
+            )
+            if server_args.peer_prefix_port is not None:
+                # Compute the mandatory identity while the loaded shards are still cached.
+                for config in configs:
+                    model_checkpoint_id(server_args, config)
+            release_checkpoint_file_cache(
+                [config.model_path for config in configs],
+                node_leader=(global_rank % server_args.mapping.nprocs_per_node == 0),
+                cpu_group=cpu_group,
+            )
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
             draft_pool=views.draft_token_to_kv_pool,
             l2_tier=server_args.enable_kvstore,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            host_headroom_bytes=server_args.kvstore_host_headroom_gib * 1024**3,
             snapshot_pool=snapshot_pool,
             slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
@@ -1900,11 +1928,7 @@ def build_device_side(
             kvp_rank=server_args.mapping.attn.kvp_rank,
             nprocs_per_node=server_args.mapping.nprocs_per_node,
             cache_observation_capacity=cache_observation_capacity,
-            world_cpu_group=(
-                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
-                if server_args.mapping.world_size > 1
-                else None
-            ),
+            world_cpu_group=cpu_group,
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.
@@ -1950,6 +1974,7 @@ def build_device_side(
     peer_geometry = None
     if peer_outbox is not None:
         from tokenspeed.runtime.cache.peer import build_peer_geometry
+        from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
         if host_cache is None:
             raise ValueError(
@@ -1968,6 +1993,7 @@ def build_device_side(
             },
             device_regions=arena.registration_regions(),
             host_storage=host_cache.storage,
+            host_region_planner=get_peer_host_region_planner(server_args.device),
         )
 
     kv_transfer = kv_transfer_builder(

@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
     iris_pull_allgather_moe_inputs,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+    iris_a2a_heads_to_owners,
     iris_a2a_transpose_qkvg,
     iris_fused_a2a_transpose_qkvg_norm_rope,
 )
@@ -400,9 +401,6 @@ class MuseIrisState:
             if int8_payloads and self.row_boundary_supported
             else (None, None, None)
         )
-        # The pulls index payloads with 32-bit buffer offsets, as the BF16
-        # pulls do; a producer payload stays below 2^31 elements.
-        assert self.payload_codes is None or capacity < 2**31
         # Expert TP stages raw routes separately from the producer buffer.
         self.owned_route_max_rows = owned_route_max_rows
         # Expert TP8 completes routes on token owners, normalizes there and
@@ -665,6 +663,61 @@ class MuseIrisState:
             NUM_WARPS=4,
             INT8_BLOCK16=int8_block16,
             num_warps=4,
+            WAIT_VMEM=self._arch.wait_vmem,
+        )
+        return output
+
+    def all_to_all_heads_to_owners(
+        self, heads: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """Turn this rank's attention heads of all rows into owned rows of all heads.
+
+        heads is BF16 [rows, 8192 / world_size], this rank's gated attention
+        output. Returns [ceil(rows / world_size), 8192] for this rank's token
+        rows, rank r's heads at columns r * 8192 / world_size, zero padding
+        rows: the input of the full output projection on the token owner.
+        The heads pass through the producer prefix, which the exchange's exit
+        frees for the next producer.
+        """
+        if not self.can_use_owned_rows(rows):
+            raise ValueError(
+                f"all_to_all_heads_to_owners: {rows} rows are outside the owned-row "
+                f"layout this state was prepared for"
+            )
+        width = _MUSE_BOUNDARY_WIDTH // self.world_size
+        if heads.shape != (rows, width) or heads.dtype != torch.bfloat16:
+            raise ValueError(
+                f"all_to_all_heads_to_owners: heads must be BF16 [{rows}, {width}], "
+                f"got {heads.dtype} {tuple(heads.shape)}"
+            )
+        assert heads.device == self.all_reduce.device
+        source = self.all_reduce.producer.data[: rows * width].view(rows, width)
+        source.copy_(heads)
+        local_rows = triton.cdiv(rows, self.world_size)
+        output = torch.empty(
+            (local_rows, _MUSE_BOUNDARY_WIDTH),
+            dtype=heads.dtype,
+            device=self.all_reduce.device,
+        )
+        valid = max(
+            0, min(local_rows, rows - self.all_reduce.rank_in_group * local_rows)
+        )
+        # The exchange leaves padding rows unwritten; zeros keep their
+        # projection finite.
+        output[valid:].zero_()
+        # One wave covers 64 lanes x 8 BF16 of a row.
+        num_warps = width // 512
+        iris_a2a_heads_to_owners[(_MUSE_ROW_GATHER_PROGRAMS,)](
+            source,
+            output,
+            self.row_gather_flags,
+            self.all_reduce.peers.addresses[: self.world_size],
+            rows,
+            RANK=self.all_reduce.rank_in_group,
+            WIDTH=width,
+            FLAG_ROWS=_MUSE_ROW_GATHER_PROGRAMS,
+            NUM_WARPS=num_warps,
+            num_warps=num_warps,
             WAIT_VMEM=self._arch.wait_vmem,
         )
         return output
@@ -2663,6 +2716,16 @@ def prepare_muse_communication(
         capacity = all_reduce.producer_direct_max_numel
     else:
         capacity = producer_direct_max_numel
+    # The owned-row and pull kernels index the producer buffer, its pull
+    # scratch (one rank's share of it) and the gather output (its size)
+    # through AMD buffer instructions: int32 element offsets that become
+    # 32-bit byte offsets from each buffer's base. Buffers below 2**31 bytes
+    # keep both in range.
+    if capacity * torch.bfloat16.itemsize > 2**31 - 1:
+        raise ValueError(
+            f"Muse producer capacity of {capacity} BF16 elements exceeds the "
+            f"{2**31 - 1} bytes 32-bit buffer offsets address"
+        )
     size = MuseIrisState.heap_bytes(
         capacity,
         world_size=group.size(),

@@ -816,7 +816,8 @@ express.
 `init_forward_metadata_capture_cuda_graph` has a base default — run the
 idle-refresh arm (`actual_bs=0`, `for_graph_replay=True`) over the same
 persistent buffers replay refreshes — at both tiers: `AttentionBackend`
-(runner-facing; the router's version idle-fills its table stacks, republishes
+(runner-facing; the router's version runs the refresh's idle stack fill, the
+same `fill_decode` kernel replay launches, republishes
 the decode write-location views, then runs each leaf's capture hook) and
 `PagedAttentionBackend` (kernel-facing leaves). That default IS the capture
 for every backend except a closed list of sanctioned overrides, each tied to
