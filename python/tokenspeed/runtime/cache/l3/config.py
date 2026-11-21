@@ -54,6 +54,17 @@ class StorageRuntimeConfig:
     def from_extra_config(
         cls, raw: str | None, *, host_blocks: int, prefix_granularity: int
     ) -> StorageRuntimeConfig:
+        """The L3 settings ``--kvstore-storage-backend-extra-config`` tunes.
+
+        Args:
+            raw: The extra config's JSON, or None.
+            host_blocks: The Host pool's blocks in its densest group: its
+                parents, the null block excluded, times the largest packing
+                (``SchedulerConfig::HostBlockCapacity``). Host credits count
+                blocks in any group, since a hybrid model's GET holds every KV
+                page under the State checkpoint it restores.
+            prefix_granularity: Tokens per prefix page.
+        """
         from tokenspeed_engine.scheduler import StorageConfig, StoragePressure
 
         knobs = parse_extra_config(raw).get("async", {})
@@ -127,7 +138,7 @@ class StorageRuntimeConfig:
             if values[name] > 2**31 - 1:
                 raise ValueError(f"L3 {name} exceeds the scheduler's int32 limit")
         if values["max_host_blocks"] > host_blocks:
-            raise ValueError("L3 max_host_blocks exceeds usable Host parents")
+            raise ValueError("L3 max_host_blocks exceeds the Host pool's blocks")
         if values["min_prefetch_tokens"] > values["max_prefetch_tokens"]:
             raise ValueError("L3 minimum prefetch must fit the maximum")
         return cls(

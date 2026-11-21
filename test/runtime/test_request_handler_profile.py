@@ -199,7 +199,15 @@ class TestHostSpans:
 
             with ThreadPoolExecutor(max_workers=1) as worker:
                 control = worker.submit(control_round).result(timeout=10)
-            host_spans.threads += [(forward, "ts-forward"), (control, "ts-host")]
+            # A Disk operation on a lane row, which no thread owns.
+            lane = profiler_mod._LANE_TID_BASE + 3
+            now_ns = time.time_ns()
+            host_spans.spans.append(("Disk read op 7", "host", lane, now_ns, now_ns))
+            host_spans.threads += [
+                (forward, "ts-forward"),
+                (control, "ts-host"),
+                (lane, "Disk read 3"),
+            ]
             assert handler.stop_profile().success
         assert not host_spans.recording
 
@@ -231,6 +239,9 @@ class TestHostSpans:
         # Torch names only the threads it saw: the control thread's lane is
         # named after the host's thread.
         assert (control, f"thread {control} (ts-host)") in thread_names
+        # A lane row goes by its name alone.
+        assert (lane, "Disk read 3") in thread_names
+        assert only("Disk read op 7")["tid"] == lane
 
     def test_a_trace_the_merge_fails_on_is_written_without_the_host_spans(
         self, tmp_path

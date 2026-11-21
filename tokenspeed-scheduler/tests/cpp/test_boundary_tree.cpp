@@ -38,7 +38,8 @@ namespace tokenspeed::test {
 namespace {
 
 using Node = BoundaryTree::Node;
-using CheckpointBoundaryCounts = std::array<std::int32_t, 2>;  // checkpoint_boundaries_in_subtree by CacheTier
+using CheckpointBoundaryCounts =
+    std::array<std::int32_t, kNumCacheTiers>;  // checkpoint_boundaries_in_subtree by CacheTier
 
 constexpr std::int32_t kP = 4;
 constexpr BoundaryTree::EntryKind kDeviceKv{.tier = CacheTier::kDevice, .state = false, .closed = true};
@@ -57,6 +58,7 @@ BoundaryTree::Config TreeConfig(std::int32_t closed_blocks_per_page, bool queue_
         .num_state_groups = 1,
         .has_prefix_closed_groups = true,
         .has_host_tier = true,
+        .has_disk_tier = false,
         .queue_dead_candidates = queue_dead_candidates,
     };
 }

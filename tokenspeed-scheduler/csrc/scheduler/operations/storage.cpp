@@ -135,8 +135,9 @@ void Scheduler::handleEvent(const cache::StorageTick& event) {
     for (const auto& request : requests_) {
         const auto* prefetch = request->GetIf<fsm::Prefetching>();
         const auto* admission = request->AdmissionResourcesPtr();
-        if ((prefetch != nullptr && storage_now_us_ >= prefetch->deadline_us) ||
-            (admission != nullptr && admission->storage_hold &&
+        // A peer landing into Host keeps the peer clock (handleEvent(PeerTick)).
+        if ((prefetch != nullptr && ownsStorageLease(prefetch->lease) && storage_now_us_ >= prefetch->deadline_us) ||
+            (admission != nullptr && admission->storage_hold && ownsStorageLease(admission->storage_hold->lease) &&
              storage_now_us_ >= admission->storage_hold->deadline_us)) {
             expireStorage(*request);
         }
@@ -152,8 +153,13 @@ void Scheduler::handleEvent(const cache::StorageDetach& event) {
     if (auto* request = findRequest(event.request_id)) releaseStorage(*request);
 }
 
+bool Scheduler::ownsStorageLease(const StorageLease& lease) const {
+    return (storage_transfers_ && lease.IssuedBy(*storage_transfers_)) ||
+           (disk_transfers_ && lease.IssuedBy(*disk_transfers_));
+}
+
 void Scheduler::releaseStorage(Request& request) {
-    if (!storage_transfers_) return;
+    if (!storage_transfers_ && !disk_transfers_ && !peer_host_landings_) return;
     // The request gives L3 up and keeps its place: the lease on the operation
     // it waits for, or on its Ready data, dies with the wait.
     if (request.Is<fsm::Prefetching>()) {
@@ -169,6 +175,7 @@ void Scheduler::prepareStorage(Request& request) {
     if (!storage_transfers_) return;
     const auto& limits = storage_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
+        if (!state->lease.IssuedBy(*storage_transfers_)) return;
         const std::uint64_t operation = state->lease.OperationId();
         if (storage_transfers_->Completed(operation) && !storage_transfers_->IsQuery(operation)) {
             const auto deadline =

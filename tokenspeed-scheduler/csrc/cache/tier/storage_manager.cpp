@@ -196,7 +196,7 @@ StorageLease::~StorageLease() {
 }
 
 void StorageLease::reset() noexcept {
-    if (StorageTransferManager* manager = std::exchange(manager_, nullptr)) {
+    if (StorageLeaseIssuer* manager = std::exchange(manager_, nullptr)) {
         manager->detach(std::exchange(operation_id_, 0));
     }
 }

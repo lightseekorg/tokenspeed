@@ -143,7 +143,9 @@ def _muse_boundary_norms(device):
     return post_norm, pre_norm
 
 
-def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
+def _prepare_muse_backend(
+    world_size, projection, moe, *, expert_tp_size, max_num_tokens=8192
+):
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
         initialize_comm_backend,
@@ -193,9 +195,10 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             owned_projections=None,
         ),
     )
-    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+    prepare = MuseSparkForConditionalGeneration.prepare_communication_runtime
+    assert prepare(owner, max_num_tokens)
     state = owner.model.iris_state
-    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+    assert prepare(owner, max_num_tokens)
     assert owner.model.iris_state is state
     assert projection.iris_state is state and moe.iris_state is state
     assert backend.get_prepared_all_gather(group, torch.bfloat16) is state.gather
@@ -897,6 +900,258 @@ def _muse_fp8_decode_routing_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _int8_block16_round_trip(x):
+    """decode(encode(x)) of the int8-block16 payload, by its definition."""
+    blocks = x.float().reshape(-1, 16)
+    amax = torch.clamp(blocks.abs().amax(1), min=1e-30)
+    # The encoder divides by 127 correctly rounded. On the GPU torch divides
+    # a tensor by a Python scalar as a multiply by its reciprocal, which
+    # differs in the last bit for some blocks, so the scales divide on the
+    # host (as the encoder test's reference does).
+    scale = (amax.cpu() / 127.0).to(x.device)
+    # INT8 codes have no negative zero.
+    codes = torch.round(blocks / scale[:, None]).clamp(-127.0, 127.0).to(torch.int8)
+    return (codes.float() * scale[:, None]).to(torch.bfloat16).reshape(x.shape)
+
+
+def _muse_owned_rows_default_cap_worker(rank, world_size, device):
+    """At the default prefill chunk size the owned-row buffers hold 8192 rows
+    whatever the largest forward, and 8192 rows take owned rows, 8193 not."""
+    torch.set_grad_enabled(False)
+    _, state = _prepare_muse_backend(
+        world_size, None, None, expert_tp_size=1, max_num_tokens=24577
+    )
+    assert state.all_reduce.producer.data.numel() == 8192 * 8192
+    assert (
+        state.all_reduce.producer_pull.scratch.numel()
+        == (8192 * 8192 + world_size - 1) // world_size
+    )
+    assert state.can_use_owned_rows(8192) and not state.can_use_owned_rows(8193)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def _muse_owned_far_rows_worker(rank, world_size, device):
+    """Owned rows at a 24576-token prefill chunk use the last element of the
+    producer buffer and of pull scratch bit for bit (reduce-scatter in BF16 and
+    int8-block16, row gathers, both QKVG exchanges and the MoE-input gather),
+    and row counts up to the cap compile nothing new."""
+    torch.set_grad_enabled(False)
+    torch.set_default_dtype(torch.bfloat16)
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_pull_allgather_rows,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+
+    from tokenspeed.runtime.models.muse_spark import QKVOGateParallelLinear
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    cap = 24576
+    # A 24576-token prefill chunk, with int8-block16 payloads prepared too.
+    # This worker runs in its own spawned process.
+    global_server_args_dict["chunked_prefill_size"] = cap
+    global_server_args_dict["prefill_collective_payload"] = "int8-block16"
+    with torch.device(device):
+        projection = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="model.layers.1.self_attn.qkv_proj",
+            tp_rank=rank,
+            tp_size=world_size,
+            tp_group=tuple(range(world_size)),
+            replicate_for_owned_rows=True,
+        )
+    # Forwards past the cap must not grow the buffers past it.
+    _, state = _prepare_muse_backend(
+        world_size, projection, None, expert_tp_size=1, max_num_tokens=cap + 1
+    )
+    producer = state.all_reduce.producer.data
+    scratch = state.all_reduce.producer_pull.scratch
+    assert producer.numel() == cap * 8192
+    assert scratch.numel() == (cap * 8192 + world_size - 1) // world_size
+    assert state.can_use_owned_rows(cap) and not state.can_use_owned_rows(cap + 1)
+    with pytest.raises(ValueError, match="32-bit buffer offsets"):
+        prepare_muse_communication(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=0,
+            producer_direct_max_numel=2**30,
+            enable_lamport=False,
+            owned_route_max_rows=0,
+            intermediate_gather_max_rows=0,
+            all_reduce=None,
+            int8_payloads=False,
+            device=device,
+        )
+    # One-hot rows make the owned QKVG projection exact.
+    columns = []
+    for index, (name, width) in enumerate(
+        (("q", 8192), ("k", 1024), ("v", 1024), ("g", 8192))
+    ):
+        weight = torch.zeros(width, 8192, device=device)
+        sources = (torch.arange(width, device=device) * 13 + index * 17) % 8192
+        weight[torch.arange(width, device=device), sources] = 1
+        projection.weight_loader(projection.weight, weight, name)
+        shard = width // world_size
+        columns.append(sources[rank * shard : (rank + 1) * shard])
+    columns = torch.cat(columns)
+
+    def bits(tensor):
+        return tensor.view(torch.int16)
+
+    def run(rows):
+        local_rows = (rows + world_size - 1) // world_size
+        first = rank * local_rows
+        valid = max(0, min(local_rows, rows - first))
+        contributions = [
+            torch.randn(
+                (rows, 8192),
+                device=device,
+                dtype=torch.float32,
+                generator=torch.Generator(device=device).manual_seed(rows * 8 + peer),
+            ).bfloat16()
+            for peer in range(world_size)
+        ]
+        # The reduce-scatter adds rank 0's partial first, then ranks 1, 2, ...
+        total = contributions[0].float()
+        for contribution in contributions[1:]:
+            total += contribution.float()
+        reduced_rows = total.bfloat16()
+        del total
+        int8_parts = [_int8_block16_round_trip(c) for c in contributions]
+        total8 = int8_parts[0].float()
+        for part in int8_parts[1:]:
+            total8 += part.float()
+        int8_rows = total8.bfloat16()
+        del total8, int8_parts
+        own_contribution = contributions[rank].clone()
+        stream = torch.randn(
+            (world_size * local_rows, 8192),
+            device=device,
+            dtype=torch.float32,
+            generator=torch.Generator(device=device).manual_seed(rows * 8 + 7),
+        )
+        hidden = (
+            (
+                torch.arange(rows, device=device)[:, None] % 13
+                + torch.arange(8192, device=device)[None, :] % 7
+            )
+            / 16
+        ).bfloat16()
+        local_hidden = torch.full((local_rows, 8192), float("nan"), device=device)
+        local_hidden[:valid].copy_(hidden[first : first + valid])
+
+        scratch.fill_(float("nan"))
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.copy_(contributions[rank])
+        del contributions
+        torch.cuda.synchronize()
+        dist.barrier()
+        reduced = state.reduce_scatter_owned_rows(branch, payload="bf16")
+        reduced_copy = reduced.clone()
+        gathered = state.all_gather_owned_rows(reduced, rows, True)
+        tap = state.all_gather_owned_stream_bf16(
+            stream[first : first + local_rows].contiguous(), rows
+        )
+        projected = projection.project_owned_rows(local_hidden, rows)
+        qkvg = state.all_to_all_transpose_qkvg(projected, rows, payload="bf16")
+        torch.cuda.synchronize()
+        if rows == cap:
+            # The reduce-scatter reads every rank's producer buffer up to its
+            # last element and, at an even split, fills pull scratch.
+            end = producer.data_ptr() + producer.numel() * producer.element_size()
+            assert branch.data_ptr() + branch.numel() * 2 == end
+            if cap % world_size == 0:
+                assert reduced.data_ptr() == scratch.data_ptr()
+                assert reduced.numel() == scratch.numel()
+        expected = torch.zeros_like(reduced_copy)
+        expected[:valid] = reduced_rows[first : first + valid]
+        torch.testing.assert_close(bits(reduced_copy), bits(expected), atol=0, rtol=0)
+        # The far rows explicitly, for a readable failure.
+        torch.testing.assert_close(
+            bits(gathered[-8:]), bits(reduced_rows[-8:]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(bits(gathered), bits(reduced_rows), atol=0, rtol=0)
+        torch.testing.assert_close(
+            bits(tap), bits(stream[:rows].bfloat16()), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            bits(qkvg), bits(hidden.index_select(1, columns)), atol=0, rtol=0
+        )
+        # The fused QKVG exchange copies V and the gate unchanged: they equal
+        # the plain exchange's V and gate columns bit for bit.
+        projected = projection.project_owned_rows(local_hidden, rows)
+        empty_cache = torch.empty((1, 0), device=device, dtype=torch.float32)
+        positions = torch.arange(rows, device=device, dtype=torch.int64)
+        _, _, fused_v, fused_gate = state.all_to_all_transpose_qkvg_norm_rope(
+            projected, rows, positions, empty_cache, 1e-6, 0.125, payload="bf16"
+        )
+        _, _, plain_v, plain_gate = qkvg.split(
+            tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
+        )
+        torch.testing.assert_close(bits(fused_v), bits(plain_v), atol=0, rtol=0)
+        torch.testing.assert_close(bits(fused_gate), bits(plain_gate), atol=0, rtol=0)
+        # int8-block16 reduce-scatter: the sum of each rank's round-tripped
+        # contribution in rank order, rounded once.
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.copy_(own_contribution)
+        torch.cuda.synchronize()
+        dist.barrier()
+        reduced8 = state.reduce_scatter_owned_rows(branch, payload="int8-block16")
+        expected8 = torch.zeros_like(reduced8)
+        expected8[:valid] = int8_rows[first : first + valid]
+        torch.testing.assert_close(bits(reduced8), bits(expected8), atol=0, rtol=0)
+        # The MoE-input gather: every rank receives all rows, ids and weights.
+        moe_rows = hidden[first : first + local_rows, :4096].contiguous()
+        if moe_rows.shape[0] < local_rows:
+            moe_rows = torch.cat(
+                [moe_rows, moe_rows.new_zeros(local_rows - moe_rows.shape[0], 4096)]
+            )
+        ids = (
+            torch.arange(local_rows * 8, device=device, dtype=torch.int32).view(-1, 8)
+            + first * 8
+        ) % 256
+        weights = ids.float() / 256
+        packet, all_ids, all_weights = state.gather_owned_moe_inputs(
+            moe_rows, ids, weights, rows, valid
+        )
+        torch.testing.assert_close(
+            bits(packet), bits(hidden[:, :4096].contiguous()), atol=0, rtol=0
+        )
+        expected_ids = (
+            torch.arange(rows * 8, device=device, dtype=torch.int32).view(-1, 8) % 256
+        )
+        assert torch.equal(all_ids, expected_ids)
+        assert torch.equal(all_weights, expected_ids.float() / 256)
+
+    # Uneven (padded) and full splits at the cap check every element.
+    for rows in (cap - 1, cap):
+        run(rows)
+    # Serving round sizes between 16384 rows and the cap reuse the kernels.
+    with assert_no_triton_compile(
+        iris_pull_reduce_scatter,
+        iris_pull_allgather_rows,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    ):
+        for rows in (16384, 16385, 20483, cap - 16):
+            run(rows)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 def _muse_owned_routed_wt_worker(rank, world_size, device):
     torch.set_grad_enabled(False)
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -1408,6 +1663,10 @@ def _muse_boundary_warmup_worker(rank, world_size, device):
         pytest.param(_muse_boundary_warmup_worker, "nccl", id="boundary_warmup"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
+        pytest.param(_muse_owned_far_rows_worker, "nccl", id="owned_far_rows"),
+        pytest.param(
+            _muse_owned_rows_default_cap_worker, "nccl", id="owned_rows_default_cap"
+        ),
         pytest.param(
             _muse_ordinary_all_reduce_worker, "nccl", id="ordinary_all_reduce"
         ),

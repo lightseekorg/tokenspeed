@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
@@ -2494,6 +2495,46 @@ def test_prefill_collective_payload_applies_to_extend_forwards_only(
     for mode in ForwardMode:
         expected = flag if mode == ForwardMode.EXTEND else "bf16"
         assert module._collective_payload(mode) == expected, mode
+
+
+@pytest.mark.parametrize(
+    "chunk,numerics,expected",
+    [
+        (None, "auto", 8192),
+        (-1, "auto", 8192),
+        (4096, "auto", 8192),
+        (8192, "auto", 8192),
+        (24576, "auto", 24576),
+        (24576, "rl-bitwise", 8192),
+        (24577, "auto", 24576),
+        (32768, "auto", 24576),
+    ],
+)
+def test_owned_rows_follow_the_prefill_chunk_size(
+    monkeypatch: pytest.MonkeyPatch, chunk, numerics: str, expected: int
+) -> None:
+    """The owned-row layout serves the configured prefill chunk, at least
+    8192 and at most 24576 rows; --numerics rl-bitwise keeps 8192."""
+    monkeypatch.setitem(module.global_server_args_dict, "chunked_prefill_size", chunk)
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", numerics)
+    assert module._owned_rows_max_tokens() == expected
+
+
+def test_prefill_collective_payload_is_refused_for_other_checkpoints(tmp_path) -> None:
+    """--prefill-collective-payload applies to Muse Spark only: off its
+    default, another architecture's checkpoint is refused."""
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["LlamaForCausalLM"]})
+    )
+    args = ServerArgs(model="x")
+    args.model = str(tmp_path)
+    args.prefill_collective_payload = "int8-block16"
+    with pytest.raises(ValueError, match="applies to Muse Spark"):
+        args.resolve_model_defaults()
+    args.prefill_collective_payload = "bf16"
+    args.resolve_model_defaults()
 
 
 def test_prefill_collective_payload_choices_match_the_iris_state() -> None:

@@ -157,7 +157,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     MultimodalForwardContext,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.common import make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -166,6 +166,8 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
 
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
+
+logger = get_colorful_logger(__name__)
 
 
 logger = logging.getLogger(__name__)
@@ -1524,6 +1526,34 @@ MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
 # NVIDIA owns rows over NCCL from here; below it the split collectives cost more than they save.
 MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
+# The owned-row layout serves forwards up to the prefill chunk the server is
+# configured for (--chunked-prefill-size), and at least 8192 rows. Startup
+# sizes three per-rank buffers from min(max forward tokens, that) full
+# 8192-wide BF16 rows: the Iris producer buffer, its pull scratch holding one
+# rank's share of them, and the prepared gather's local output. Larger
+# forwards take the replicated-row path, whose attention-output and expert
+# sums add the ranks in another order.
+MUSE_OWNED_ROWS_MAX_TOKENS = 8192
+# The largest chunk the layout follows: the size its outputs were checked
+# at against the replicated path. It is well inside the producer buffer's
+# 32-bit offset range (131071 rows).
+MUSE_OWNED_ROWS_LIMIT_TOKENS = 24576
+# Expert TP (EP1) owner-side route staging is [rows, 8, 4096] BF16, so its row
+# limit stays at 8192; larger expert-TP forwards replicate rows.
+MUSE_OWNED_ROUTE_MAX_TOKENS = 8192
+
+
+def _owned_rows_max_tokens() -> int:
+    """The most token rows a forward takes on the owned-row layout.
+
+    Chunks above 8192 tokens stay on owned rows instead of replicated rows,
+    which changes the order their sums are taken in; --numerics rl-bitwise
+    keeps 8192, and the layout follows the chunk size up to 24576 rows.
+    """
+    chunk = global_server_args_dict["chunked_prefill_size"]
+    if global_server_args_dict["numerics"] in BITWISE_ENVELOPES or chunk is None:
+        return MUSE_OWNED_ROWS_MAX_TOKENS
+    return min(max(chunk, MUSE_OWNED_ROWS_MAX_TOKENS), MUSE_OWNED_ROWS_LIMIT_TOKENS)
 
 
 def _payload_refusal(cause: str) -> str:
@@ -3899,9 +3929,11 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             prepare_muse_communication,
         )
 
-        capacity = min(max_num_tokens, 8192) * self.config.hidden_size
+        capacity = (
+            min(max_num_tokens, _owned_rows_max_tokens()) * self.config.hidden_size
+        )
         owned_route_max_rows = (
-            min(max_num_tokens, 8192)
+            min(max_num_tokens, MUSE_OWNED_ROUTE_MAX_TOKENS)
             if mapping.moe.tp_size > 1
             and mapping.moe.ep_size == 1
             and self.config.moe_hidden_size == 4096
@@ -3932,6 +3964,22 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             # MLP and projection reductions when it runs at attention TP, and
             # a draft model's (DFlash2) per-layer reductions.
             backend.iris.install_ordinary_all_reduce(group, state.reduction)
+            producer = state.all_reduce.producer.data
+            scratch = state.all_reduce.producer_pull.scratch
+            gather_output = state.gather.output
+            payload_bytes = sum(
+                buffer.numel() * buffer.element_size()
+                for buffer in (state.payload_codes, state.payload_scales)
+                if buffer is not None
+            )
+            logger.info(
+                f"Muse Iris owned-row limit "
+                f"{producer.numel() // self.config.hidden_size} token rows; per-rank "
+                f"bytes: producer buffer {producer.numel() * producer.element_size()}, "
+                f"pull scratch {scratch.numel() * scratch.element_size()}, gather "
+                f"output {gather_output.numel() * gather_output.element_size()}, "
+                f"int8-block16 payload {payload_bytes}"
+            )
         elif (
             state.all_reduce.producer_direct_max_numel < capacity
             or state.owned_route_max_rows < owned_route_max_rows
