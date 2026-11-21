@@ -2061,6 +2061,8 @@ def test_prefill_collective_payload_applies_to_extend_forwards_only(
 
 def test_prefill_collective_payload_choices_match_the_iris_state() -> None:
     """ServerArgs validates the flag; the Iris state takes the same names."""
+    if not current_platform().is_cdna4:
+        pytest.skip("the Iris state is importable on AMD CDNA4 only")
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MUSE_PAYLOADS
 
     from tokenspeed.runtime.utils.server_args import PREFILL_COLLECTIVE_PAYLOADS
