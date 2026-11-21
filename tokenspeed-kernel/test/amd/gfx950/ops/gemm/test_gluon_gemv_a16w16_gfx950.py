@@ -49,9 +49,15 @@ from tokenspeed_kernel.ops.layernorm.triton import (  # noqa: E402
     rmsnorm_fused_parallel,
 )
 from tokenspeed_kernel_amd._triton import triton  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (  # noqa: E402
+    supports_gluon_rowcta_bf16_gemv_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
     _HALF_TILE_MAX_M,
+    _MFMA_MAX_BLOCK_N,
+    _MFMA_NARROW_MAX_M,
     _PREFERRED_BUCKETS,
+    _config,
     gluon_gated_norm_gemv_a16w16_gfx950,
     gluon_gemv_a16w16_gfx950,
     gluon_rmsnorm_gemv_a16w16_gfx950,
@@ -195,6 +201,28 @@ def test_half_tiles_match_one_program_per_cu_bitwise(m, n, k):
     )
 
 
+# Outputs wider than _MFMA_MAX_BLOCK_N columns a CU (MLP gate-up, GDN in_proj
+# and attention QKV of Qwen3.8-27B) split into several programs a CU.
+@pytest.mark.parametrize("n,k", [(34816, 5120), (14336, 5120), (8200, 1040)])
+@pytest.mark.parametrize("m", [2, 4, 5, 16])
+def test_wide_outputs_take_narrow_programs(m, n, k):
+    cus = torch.cuda.get_device_properties(0).multi_processor_count
+    if triton.cdiv(n, cus) <= _MFMA_MAX_BLOCK_N:
+        pytest.skip(f"{n} outputs are not wider than {_MFMA_MAX_BLOCK_N} a CU")
+    rows, _, block_n, _, _, num_warps = _config(m, n, k, cus)
+    narrow = m <= _MFMA_NARROW_MAX_M
+    assert rows == block_n == (16 if narrow else _MFMA_MAX_BLOCK_N)
+    assert num_warps == (8 if narrow else 4)
+    torch.manual_seed(n + k + m)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    launch_gluon_gemv_a16w16_gfx950(x, w, out)
+    torch.testing.assert_close(
+        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
+    )
+
+
 def test_gemv_compiles_once_per_row_bucket():
     n, k = 2560, 3072
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
@@ -227,7 +255,8 @@ _BUCKET_ROWS = {1: range(1, 2), 4: range(2, 5), 16: range(5, 17)}
 def test_selection_takes_the_gemv_on_every_listed_bucket():
     # A listed entry the GEMV cannot serve (say a K that is not a multiple of
     # 16) or a bucket other than 1, 4 or 16 would never be selected, silently
-    # keeping the slower default.
+    # keeping the slower default. Row counts with a measured row-CTA tile
+    # keep that tile.
     for (n, k), buckets in _PREFERRED_BUCKETS.items():
         for bucket in buckets:
             assert bucket in _BUCKET_ROWS, ((n, k), bucket)
@@ -235,7 +264,10 @@ def test_selection_takes_the_gemv_on_every_listed_bucket():
                 selected = _select_mv(
                     m, n, k, True, torch.bfloat16, torch.bfloat16, False
                 )
-                assert selected is registered_gemv, (m, n, k)
+                rowcta = m > 1 and supports_gluon_rowcta_bf16_gemv_gfx950(m, n, k)
+                assert (selected is registered_gemv) is not rowcta, (m, n, k)
+                if rowcta:
+                    assert selected.__name__ == "gluon_rowcta_bf16_gemv_gfx950"
 
 
 @pytest.mark.parametrize("m", [1, 4, 16])

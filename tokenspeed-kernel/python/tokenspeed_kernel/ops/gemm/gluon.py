@@ -659,6 +659,10 @@ if platform.is_amd:
         return _grouped_decode_impl(x, weight, counters=counters, quantize=True)
 
     def _gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        # A row-CTA tile measured for this power-of-two row bucket is finer
+        # than the GEMV's 2-4 and 5-16 buckets and keeps those rows.
+        if m > 1 and _supports_rowcta_bf16_gemv(m, n, k):
+            return False
         return _supports_gemv_a16w16(m, n, k) and _prefers_gemv_a16w16(m, n, k)
 
     # Ranked above the decode GEMM: the GEMV's measured buckets are the

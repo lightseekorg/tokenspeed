@@ -270,15 +270,19 @@ decode batches, `1 <= M <= 16`, with one program per CU.
   `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny GEMM at one
   row, the decode GEMM or hipBLASLt above) in cold-cache standalone sweeps.
   Direct calls take any supported shape.
-- One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
-  runtime arguments.
+- Two rows of a shape with a measured row-CTA tile (`_ROWS_CONFIGS`) keep
+  that tile.
+- One binary per (shape, M bucket): M = 1, and M = 2-16 (M = 2-4 and 5-16
+  for outputs wider than 32 columns a CU). `M` and `N` are runtime arguments.
 
 #### Algorithm
 
 A program computes `rows = cdiv(N, CUs)` consecutive outputs over full K for
 every row of `x`, padded to a power-of-2 block of `BLOCK_N` rows. Results do
 not depend on `rows`: each output's summation order is fixed by the
-constexprs alone.
+constexprs alone. At M >= 2, outputs wider than 32 columns a CU split into
+several programs a CU: 16 columns over eight waves at M = 2-4, 32 columns
+above; one 64-256 column tile a CU ran up to 5x slower than hipBLASLt there.
 
 - M = 1 (FMA tile): waves split the rows; a lane loads 16 bytes of every
   512-element K chunk, so one load instruction reads 1 KB of a row. Lanes keep
