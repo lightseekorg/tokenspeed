@@ -777,10 +777,10 @@ Notes:
 - The NVIDIA command below captures each prefill bucket for 1 and for up to
   64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
   several requests also runs its KDA layers inside the graph instead of at
-  eager breaks. On 2 GB300 nodes, this cut the time-to-first-token of 2 to 64
-  concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
-  GPU and 2 to 3 more minutes of startup.
-- The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
+  eager breaks. On 2 GB300 nodes with the MLA preview draft, this cut the
+  time-to-first-token of 2 to 64 concurrent short prompts by 40% to 55%, for
+  about 0.7 GB less KV cache per GPU and 2 to 3 more minutes of startup.
+- The earlier MLA preview draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes up to 7 tokens per step: its checkpoint sets 7 drafts with
   `--speculative-num-draft-tokens 8` by default, and explicit widths draft
   fewer (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`).
@@ -807,8 +807,8 @@ Notes:
 
 Install `flash-linear-attention` for the KDA layers, as for
 [Kimi K3](#kimi-k3), then serve with the DSpark draft on 8 Blackwell GPUs.
-This launch was validated on 2 GB300 nodes with 4 GPUs each. On such nodes,
-start each one with the command below plus
+For a deployment on 2 nodes with 4 GPUs each, start each node with the command
+below plus
 `--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
 `<rank>` is the node's rank (`0` on the first node, `1` on the second) and
 `<first-node>:<port>` is the first node's address and a free port on it. Drop
@@ -826,9 +826,9 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --max-num-seqs 64 \
   --prefill-graph-capture-batch-sizes 1 64 \
   --speculative-algorithm DSPARK \
-  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark \
   --speculative-num-draft-tokens 8 \
-  --drafter-attention-backend tokenspeed_mla \
+  --drafter-attention-backend mha \
   --host 0.0.0.0 \
   --port 8000
 ```
