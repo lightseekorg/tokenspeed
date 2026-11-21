@@ -68,6 +68,8 @@ class DiskTierTuning:
             prefetch.
         wait_timeout_ms: How long a request waits for its prefetch.
         ready_timeout_ms: How long a finished prefetch is held for it.
+        push_ring_mb: With peer sharing, the staging ring a peer push reads
+            Disk blocks into, in MB, rounded up to whole blocks.
     """
 
     queue_depth: int = 32
@@ -81,6 +83,7 @@ class DiskTierTuning:
     min_prefetch_tokens: int = 256
     wait_timeout_ms: int = 10000
     ready_timeout_ms: int = 5000
+    push_ring_mb: int = 512
 
     @classmethod
     def from_json(cls, text: str | None) -> DiskTierTuning:
@@ -104,6 +107,8 @@ class DiskTierTuning:
             raise ValueError("host_blocks_fraction must be in (0, 1]")
         if not 0 < tuning.write_host_blocks_fraction <= 1:
             raise ValueError("write_host_blocks_fraction must be in (0, 1]")
+        if tuning.push_ring_mb <= 0:
+            raise ValueError("push_ring_mb must be positive")
         return tuning
 
 
@@ -161,6 +166,8 @@ class DiskSettings:
         owner_rank: This rank among a sharded group's owners.
         tp_rank: This rank's attention-TP rank.
         max_operations: The scheduler's Disk operation credits.
+        push_ring_bytes: With peer sharing, the staging ring peer pushes
+            read Disk blocks into; 0 without.
     """
 
     file: str
@@ -179,6 +186,7 @@ class DiskSettings:
     owner_rank: int
     tp_rank: int
     max_operations: int
+    push_ring_bytes: int
 
 
 def disk_file_path(server_args, *, global_rank: int) -> str:
@@ -243,4 +251,10 @@ def disk_settings(
         owner_rank=int(ownership.rank),
         tp_rank=int(server_args.mapping.attn.tp_rank),
         max_operations=tuning.max_operations,
+        # A holder pushes its Disk pages to peers through the ring.
+        push_ring_bytes=(
+            tuning.push_ring_mb * 1_000_000
+            if server_args.peer_prefix_port is not None
+            else 0
+        ),
     )

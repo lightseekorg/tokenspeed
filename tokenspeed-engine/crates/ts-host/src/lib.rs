@@ -171,6 +171,7 @@ fn disk_settings(settings: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::dis
         host_layout: layout(settings.getattr("num_host_lcm_blocks")?.extract()?)?,
         disk_layout: layout(settings.getattr("num_disk_lcm_blocks")?.extract()?)?,
         max_operations: settings.getattr("max_operations")?.extract()?,
+        push_ring_bytes: settings.getattr("push_ring_bytes")?.extract()?,
     }))
 }
 
@@ -958,6 +959,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 &ranks.replica,
                 scheduler.clone(),
                 peer_outbox.get(),
+                disk.as_ref(),
             )
         })
         .transpose()

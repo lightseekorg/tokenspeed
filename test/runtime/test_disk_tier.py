@@ -82,6 +82,7 @@ def _disk_args(**overrides) -> ServerArgs:
     args.kvstore_storage_backend = None
     args.pipeline_parallel_size = 1
     args.port = 30000
+    args.peer_prefix_port = None
     args.mapping = Mapping(rank=1, world_size=2, attn_tp_size=2, attn_dp_size=1)
     for name, value in overrides.items():
         setattr(args, name, value)
@@ -244,6 +245,15 @@ def test_settings_lay_the_file_out_as_the_host_pool(monkeypatch):
         500_000_000,
     )
     assert (settings.queue_depth, settings.write_queue_depth) == (16, 2)
+    assert settings.push_ring_bytes == 0, "no peer pushes without peer sharing"
+    with_peers = disk_settings(
+        _disk_args(disk_tier_size_gb=(10 * parent + 1) / 1e9, peer_prefix_port=7100),
+        tuning=DiskTierTuning(push_ring_mb=64),
+        host_storage=storage,
+        ownership=ownership,
+        global_rank=3,
+    )
+    assert with_peers.push_ring_bytes == 64_000_000
 
     with pytest.raises(ValueError, match="holds no"):
         disk_settings(

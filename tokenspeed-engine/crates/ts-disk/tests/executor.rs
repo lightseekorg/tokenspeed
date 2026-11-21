@@ -279,7 +279,7 @@ fn a_cancelled_write_issues_nothing_more() {
 fn closing_cancels_queued_jobs_and_refuses_new_ones() {
     let scratch = ScratchFile::new("closing");
     let memory = Memory::map(4 * ALIGNMENT).unwrap();
-    let mut executor = start(
+    let executor = start(
         &scratch,
         &memory,
         ExecutorConfig {

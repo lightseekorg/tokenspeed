@@ -29,6 +29,8 @@
 
 use ts_scheduler::{PeerPageView, PeerTier};
 
+use crate::peer::push::{PushItem, PushSpan};
+
 /// One Device field of a cache group: page `p` sits at `address + p *
 /// page_stride` and holds `bytes` (a replicated group's scheduler block id is
 /// its page).
@@ -76,8 +78,12 @@ pub struct RankGeometry {
     pub session: String,
     /// Every Device field, in the order the rank lists them.
     pub device: Vec<DeviceField>,
-    /// The Host pool; absent without one.
+    /// The Host pool; absent without one. A Disk tier packs its blocks the
+    /// same way (`docs/rfcs/0006-disk-tier.md`).
     pub host: Option<HostPool>,
+    /// The rank's push endpoint (`push::PushEndpoint`): where a reader asks
+    /// it to push its Disk pages, and where its own pushes are answered.
+    pub push: Option<String>,
 }
 
 /// A page or geometry a read cannot place.
@@ -207,6 +213,60 @@ impl RankGeometry {
     }
 }
 
+/// The pushes that land `pages` whose holder pages are on its Disk tier:
+/// per page, every field of the page's group, at its offset in the holder's
+/// packed block (a Disk block packs like a Host block), to the reader's tier.
+pub fn push_items(
+    holder: &RankGeometry,
+    reader: &RankGeometry,
+    pages: &[(PeerPageView, PeerPageView)],
+) -> Result<Vec<PushItem>, GeometryError> {
+    let pool = holder.host.as_ref().ok_or(GeometryError::NoHost)?;
+    let mut items = Vec::with_capacity(pages.len());
+    for (source, destination) in pages {
+        if destination.group_id != source.group_id
+            || source.tier != PeerTier::Disk
+            || destination.tier == PeerTier::Disk
+        {
+            return Err(GeometryError::Tier);
+        }
+        let group = source.group_id;
+        if source.block_id <= 0 || destination.block_id <= 0 {
+            return Err(GeometryError::Block {
+                group,
+                block: source.block_id.min(destination.block_id),
+            });
+        }
+        let host = pool
+            .groups
+            .get(group as usize)
+            .ok_or(GeometryError::Block {
+                group,
+                block: source.block_id,
+            })?;
+        let mut spans = Vec::new();
+        for field in holder.device.iter().filter(|field| field.group_id == group) {
+            let offset = host
+                .field_offsets
+                .iter()
+                .find(|(id, _)| *id == field.field_id)
+                .map(|(_, offset)| *offset)
+                .ok_or_else(|| GeometryError::Field(field.field_id.clone()))?;
+            spans.push(PushSpan {
+                offset,
+                address: reader.field_address(destination, field)?,
+                length: field.bytes,
+            });
+        }
+        items.push(PushItem {
+            group,
+            block: source.block_id,
+            spans,
+        });
+    }
+    Ok(items)
+}
+
 /// The copies that land `pages` -- each a holder page and the reader's
 /// destination for the same group and slot -- every field of the page's
 /// group, from the holder's tier to the reader's (its Device or its Host
@@ -281,6 +341,7 @@ mod tests {
                 },
             ],
             host,
+            push: None,
         }
     }
 

@@ -52,10 +52,10 @@ namespace tokenspeed {
 
 // What a cache mutation reports to its observer (KV cache events): a key
 // stored in or removed from the Device index (kStored, kRemoved), or a change
-// of a boundary's Host entries (kHostResidency, keyed by its content hash
-// alone). The boundary of a Host change may be one no Device publication ever
-// described: a Host block an L3 read brought in.
-enum class CacheMutation { kStored, kRemoved, kHostResidency };
+// of a boundary's Host or Disk entries (kLowerTierResidency, keyed by its
+// content hash alone). The boundary of such a change may be one no Device
+// publication ever described: a Host block an L3 read brought in.
+enum class CacheMutation { kStored, kRemoved, kLowerTierResidency };
 using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
 
 // The first block (page offset) of a tail a group needs: 0 for a group that

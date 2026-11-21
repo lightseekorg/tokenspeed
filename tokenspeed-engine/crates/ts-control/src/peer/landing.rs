@@ -35,6 +35,9 @@ pub struct Timeouts {
     /// read the transfer engine gave up on may still have writes queued at
     /// the NIC.
     pub quarantine_us: i64,
+    /// How long a holder may take to push its Disk pages
+    /// (`docs/rfcs/0006-disk-tier.md`); it posts no write past it.
+    pub push_us: i64,
 }
 
 /// Where a landing stands.
@@ -304,6 +307,7 @@ mod tests {
     const TIMEOUTS: Timeouts = Timeouts {
         answer_us: 100,
         quarantine_us: 1000,
+        push_us: 500,
     };
 
     fn page(slot: i32) -> PeerPageView {

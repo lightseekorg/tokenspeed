@@ -283,7 +283,12 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
     _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
     _assert(tail_tokens >= 0 && tail_tokens < store_.PrefixGranularity(), "a tail lies strictly inside a prefix page");
     const BoundaryTree::Node* node = store_.Boundaries().Find(boundary.content_hash);
-    if (node == nullptr) return {.device_publishable = false, .host_publishable = false, .retains_descriptor = false};
+    if (node == nullptr) {
+        return {.device_publishable = false,
+                .host_publishable = false,
+                .disk_publishable = false,
+                .retains_descriptor = false};
+    }
     const bool retains_descriptor = node->Entries(BoundaryTree::kDevice) > 0 || node->OnHost() || node->OnDisk();
     // A continuous history group represents locality without requiring the
     // auxiliary sliding windows or sparse checkpoints at every ancestor.
@@ -297,14 +302,20 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
         }
         const std::int32_t on_device = node->ClosedEntries(BoundaryTree::kDevice);
         const std::int32_t on_host = node->ClosedEntries(BoundaryTree::kHost);
-        _assert(on_device <= expected && on_host <= expected, "a boundary's history entries lie among its keys");
+        const std::int32_t on_disk = node->ClosedEntries(BoundaryTree::kDisk);
+        _assert(on_device <= expected && on_host <= expected && on_disk <= expected,
+                "a boundary's history entries lie among its keys");
         return {.device_publishable = on_device == expected,
                 .host_publishable = on_host == expected,
+                .disk_publishable = on_disk == expected,
                 .retains_descriptor = retains_descriptor};
     }
     // No continuous history means no ordinary prefix-residency events.
     // Scheduler configuration rejects enabling this event stream in that case.
-    return {.device_publishable = false, .host_publishable = false, .retains_descriptor = retains_descriptor};
+    return {.device_publishable = false,
+            .host_publishable = false,
+            .disk_publishable = false,
+            .retains_descriptor = retains_descriptor};
 }
 
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
@@ -485,6 +496,28 @@ CacheCoordinator::PrefixExport CacheCoordinator::ExportPrefix(PrefixProbe&& prob
         };
         export_tier(device_blocks, CacheTier::kDevice, 0);
         export_tier(host_blocks, CacheTier::kHost, static_cast<std::int32_t>(device_blocks.size()));
+    }
+    return out;
+}
+
+CacheCoordinator::PrefixExport CacheCoordinator::ExportListing(const PrefixProber::PrefixListing& listing) {
+    PrefixExport out{.num_tokens = listing.num_tokens};
+    if (out.num_tokens == 0) {
+        return out;
+    }
+    out.access_epoch = history_.IssueAccessEpoch();
+    for (const PrefixProber::ListedPage& page : listing.pages) {
+        const BlockPool* pool = page.tier == CacheTier::kDevice ? &store_.DevicePool()
+                                : page.tier == CacheTier::kHost ? store_.HostPool()
+                                                                : store_.DiskPool();
+        FatalCheck(pool != nullptr, "a listed page's tier has a pool");
+        PrefixCacheIndex& index = store_.Groups()[page.key.group_id].Index();
+        CacheBlockRef block = index.Find(*pool, page.key);
+        FatalCheck(static_cast<bool>(block), "a listed page is still indexed when it is exported");
+        index.TouchExisting(*pool, std::span{&page.key, 1}, std::span{&block, 1}, out.access_epoch,
+                            SessionForAccess(out.access_epoch));
+        out.blocks.push_back(
+            ExportedBlock{.key = page.key, .slot = page.slot, .tier = page.tier, .block = std::move(block)});
     }
     return out;
 }

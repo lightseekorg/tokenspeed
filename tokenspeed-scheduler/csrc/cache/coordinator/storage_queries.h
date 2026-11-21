@@ -85,6 +85,13 @@ public:
     // (warm Host hits counted). Empty when no boundary fits.
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
+    // Peer sharing with a Disk tier (docs/rfcs/0006-disk-tier.md): what a
+    // holder lists when `disk_hits`, keys its Disk holds, extend its local
+    // hit -- the longest boundary the Device, the Host and the Disk resume
+    // together under the Host-suffix rule, each page from the fastest tier
+    // holding it, at the slots PrefixProber::ListPrefix uses. Reads only;
+    // num_tokens is 0 when the Disk adds nothing to the Device's hit.
+    PrefixProber::PrefixListing ListWithDisk(const PromptPrefix& prompt, std::span<const CacheKey> disk_hits) const;
 
 private:
     // The complete dependency set selected by a matcher, with each key's

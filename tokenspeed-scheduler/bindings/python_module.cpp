@@ -92,10 +92,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::module_ kv_event = m.def_submodule("KVEvent");
     // The memory an event concerns, as vLLM's events name it: None for the
-    // GPU cache, "CPU_PINNED" for the pinned Host cache.
+    // GPU cache, "CPU_PINNED" for the pinned Host cache, "DISK" for the Disk
+    // tier.
     const auto medium_name = [](tokenspeed::KvEventMedium medium) -> nb::object {
-        if (medium == tokenspeed::KvEventMedium::kDevice) return nb::none();
-        return nb::str("CPU_PINNED");
+        switch (medium) {
+            case tokenspeed::KvEventMedium::kDevice:
+                return nb::none();
+            case tokenspeed::KvEventMedium::kHost:
+                return nb::str("CPU_PINNED");
+            case tokenspeed::KvEventMedium::kDisk:
+                return nb::str("DISK");
+        }
+        return nb::none();
     };
     nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockStoredEvent&) { return "BlockStored"; })

@@ -34,6 +34,7 @@ use ts_control::peer::{
     geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
     landing::Timeouts,
     net::{Inbound, PeerNet},
+    push::{PagePusher, PushItem},
     read::Arena,
     wire::Request,
     Peer, PeerListener, PeerSettings,
@@ -149,6 +150,7 @@ fn geometry(base: u64) -> RankGeometry {
             bytes: PAGE_BYTES,
         }],
         host: None,
+        push: None,
     }
 }
 
@@ -169,6 +171,15 @@ fn geometry_with_host(base: u64, host_base: u64) -> RankGeometry {
     }
 }
 
+/// A replica whose holders never push: none of them has a Disk tier.
+struct NoPushes;
+
+impl PagePusher for NoPushes {
+    fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+        Err("no holder pushes".into())
+    }
+}
+
 fn settings(name: &str, weight_version: &str) -> PeerSettings {
     PeerSettings {
         name: name.to_owned(),
@@ -178,6 +189,7 @@ fn settings(name: &str, weight_version: &str) -> PeerSettings {
         timeouts: Timeouts {
             answer_us: 1_000_000,
             quarantine_us: 10_000,
+            push_us: 1_000_000,
         },
         record_lifetime: Duration::from_secs(5),
     }
@@ -251,6 +263,7 @@ impl Replica {
             Some(listener),
             scheduler.clone(),
             Arc::new(arena.clone()),
+            Arc::new(NoPushes),
         )
         .unwrap();
         Self {

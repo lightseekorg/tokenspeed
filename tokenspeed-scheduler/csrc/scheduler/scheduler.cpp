@@ -129,7 +129,7 @@ Scheduler::Scheduler(SchedulerConfig config)
             const CacheKey boundary = eventKey(key);
             // A Host block can arrive for a boundary no publication here ever
             // described (an L3 read): without its tokens there is no event.
-            if (mutation == CacheMutation::kHostResidency && !kv_event_boundaries_.contains(boundary)) {
+            if (mutation == CacheMutation::kLowerTierResidency && !kv_event_boundaries_.contains(boundary)) {
                 return;
             }
             markKvEventBoundaryForReconcile(boundary);
@@ -200,9 +200,10 @@ KvEventBatch Scheduler::DrainKvEventBatch() {
                                      ? static_cast<std::int32_t>(descriptor_tokens)
                                      : 0;
         const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
-        const std::array<bool, kNumKvEventMedia> publishable{status.device_publishable, status.host_publishable};
+        const std::array<bool, kNumKvEventMedia> publishable{status.device_publishable, status.host_publishable,
+                                                             status.disk_publishable};
         if (publishable != event_boundary.published) {
-            const bool anywhere = status.device_publishable || status.host_publishable;
+            const bool anywhere = status.device_publishable || status.host_publishable || status.disk_publishable;
             mutations.push_back({.block_hash = event_boundary.stored->block_hash,
                                  .stored = anywhere ? event_boundary.stored : KvEventDescriptorRef{},
                                  .resident = publishable});

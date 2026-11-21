@@ -79,6 +79,32 @@ PromptPrefix PromptUpTo(const cache::PeerLookup& lookup, std::int32_t num_tokens
                   std::span{lookup.tokens}.first(static_cast<std::size_t>(num_tokens)), num_tokens);
 }
 
+// What a holder lists for `prompt`: its Device and Host hit, or, when its
+// Disk tier extends that, the Disk-extended listing, whose Disk pages the
+// holder pushes (docs/rfcs/0006-disk-tier.md).
+PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+    PrefixProber::PrefixListing listing =
+        coordinator.Prober().ListPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
+    if (coordinator.Disk().HasPool()) {
+        PrefixProber::PrefixListing with_disk =
+            coordinator.Storage().ListWithDisk(prompt, coordinator.Disk().PrefixHits(prompt));
+        if (with_disk.num_tokens > listing.num_tokens) return with_disk;
+    }
+    return listing;
+}
+
+// The listing's blocks, held and refreshed (CacheCoordinator::ExportPrefix).
+CacheCoordinator::PrefixExport ExportPeerPrefix(CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+    if (coordinator.Disk().HasPool()) {
+        const PrefixProber::PrefixListing listing = ListPeerPrefix(coordinator, prompt);
+        if (std::ranges::any_of(listing.pages,
+                                [](const PrefixProber::ListedPage& page) { return page.tier == CacheTier::kDisk; })) {
+            return coordinator.ExportListing(listing);
+        }
+    }
+    return coordinator.ExportPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
+}
+
 std::vector<PeerPage> Pages(const PrefixProber::PrefixListing& listing) {
     std::vector<PeerPage> pages;
     pages.reserve(listing.pages.size());
@@ -98,8 +124,8 @@ PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const 
                      lookup.lease.id);
         return answer;
     }
-    const PrefixProber::PrefixListing listing = coordinator.Prober().ListPrefix(
-        coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
+    const PrefixProber::PrefixListing listing =
+        ListPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens));
     answer.num_tokens = listing.num_tokens;
     answer.pages = Pages(listing);
     return answer;
@@ -110,8 +136,8 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
     if (!WellFormed(lookup, coordinator.PrefixGranularity()) || num_tokens <= 0 || num_tokens > lookup.max_tokens) {
         return false;
     }
-    const PrefixProber::PrefixListing listing = coordinator.Prober().ListPrefix(
-        coordinator.Prober().ProbePromptPrefix(PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity())));
+    const PrefixProber::PrefixListing listing =
+        ListPeerPrefix(coordinator, PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity()));
     return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
 }
 
@@ -127,8 +153,8 @@ void PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerLookup&
         static_cast<std::int64_t>(leases_.size()) >= max_leases_) {
         return;
     }
-    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(
-        coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
+    CacheCoordinator::PrefixExport exported =
+        ExportPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens));
     if (exported.num_tokens == 0) {
         return;
     }
@@ -155,9 +181,9 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
         return;
     }
     const auto pages = static_cast<std::size_t>(pin.num_tokens / coordinator.PrefixGranularity());
-    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(coordinator.Prober().ProbePromptPrefix(
-        Prompt(std::span{lease.prefix_hashes}.first(pages),
-               std::span{lease.tokens}.first(static_cast<std::size_t>(pin.num_tokens)), pin.num_tokens)));
+    CacheCoordinator::PrefixExport exported = ExportPeerPrefix(
+        coordinator, Prompt(std::span{lease.prefix_hashes}.first(pages),
+                            std::span{lease.tokens}.first(static_cast<std::size_t>(pin.num_tokens)), pin.num_tokens));
     // The pin holds what its answer named, or nothing: the blocks it just
     // acquired go back with the lease.
     std::vector<PeerPage> acquired;

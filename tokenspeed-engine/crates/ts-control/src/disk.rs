@@ -39,7 +39,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use ts_disk::{Direction, DiskFile, Executor, ExecutorConfig, Io, Job, ALIGNMENT};
+use ts_disk::{Direction, DiskFile, Executor, ExecutorConfig, Io, Job, Memory, ALIGNMENT};
 use ts_l3::{HostBuffer, HostLayout};
 use ts_metrics::{DiskExecutorStats, DiskSchedulerStats};
 use ts_scheduler::{
@@ -65,6 +65,10 @@ pub struct DiskSettings {
     pub disk_layout: HostLayout,
     /// The scheduler's operation credits (`DiskConfig::max_operations`).
     pub max_operations: usize,
+    /// With peer sharing, the bytes of the staging ring this rank's pushes
+    /// read Disk blocks into (`peer::push`); 0 without. Rounded up to whole
+    /// slots of the largest block.
+    pub push_ring_bytes: usize,
 }
 
 /// A Disk tier that cannot start, or an operation it cannot run.
@@ -194,7 +198,9 @@ impl Agreement {
 
 /// This rank's Disk tier: the executor and the replica's agreement.
 pub struct DiskTier {
-    executor: Executor,
+    /// Shared with the rank's peer pushes, which read into `ring`.
+    executor: Arc<Executor>,
+    ring: Option<Arc<Memory>>,
     host: HostBuffer,
     host_layout: HostLayout,
     disk_layout: HostLayout,
@@ -247,7 +253,17 @@ impl DiskTier {
             )));
         }
         let file = DiskFile::create(&settings.file, settings.file_bytes)?;
-        let executor = Executor::start(file, &[(host.base, host.len)], settings.executor)?;
+        let ring = (settings.push_ring_bytes > 0)
+            .then(|| {
+                let slot = push_slot_bytes(&settings.host_layout);
+                Memory::map(settings.push_ring_bytes.div_ceil(slot) * slot)
+            })
+            .transpose()
+            .map_err(|error| DiskError::Settings(format!("the push staging ring: {error}")))?
+            .map(Arc::new);
+        let mut regions = vec![(host.base, host.len)];
+        regions.extend(ring.iter().map(|ring| (ring.address(), ring.size())));
+        let executor = Arc::new(Executor::start(file, &regions, settings.executor)?);
         tracing::info!(
             file = %settings.file.display(),
             bytes = settings.file_bytes,
@@ -256,6 +272,7 @@ impl DiskTier {
         );
         Ok(Self {
             executor,
+            ring,
             host,
             host_layout: settings.host_layout.clone(),
             disk_layout: settings.disk_layout.clone(),
@@ -372,10 +389,35 @@ impl DiskTier {
         due
     }
 
+    /// What this rank's peer pushes read from: the executor, the file's
+    /// layout, the staging ring and its slot size. None without a ring.
+    pub fn push_source(&self) -> Option<(Arc<Executor>, HostLayout, Arc<Memory>, usize)> {
+        self.ring.as_ref().map(|ring| {
+            (
+                self.executor.clone(),
+                self.disk_layout.clone(),
+                ring.clone(),
+                push_slot_bytes(&self.host_layout),
+            )
+        })
+    }
+
     /// Cancel what is queued and wait for what runs to retire.
     pub fn close(&mut self, timeout: Duration) -> Result<(), ts_disk::executor::CloseError> {
         self.executor.close(timeout)
     }
+}
+
+/// A push staging slot: the largest block, already a multiple of the
+/// direct-I/O alignment (`DiskTier::start` checks).
+fn push_slot_bytes(layout: &HostLayout) -> usize {
+    layout
+        .groups
+        .iter()
+        .map(|group| group.block_bytes)
+        .max()
+        .unwrap_or(ALIGNMENT)
+        .max(ALIGNMENT)
 }
 
 /// The scheduler's Disk observations, as metrics.

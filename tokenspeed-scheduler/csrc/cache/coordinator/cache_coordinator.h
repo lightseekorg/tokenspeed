@@ -198,6 +198,10 @@ public:
         std::uint64_t access_epoch{0};
     };
     PrefixExport ExportPrefix(PrefixProbe&& probe);
+    // The pages of a listing that names a holder's Disk pages too
+    // (StorageQueries::ListWithDisk), held and refreshed as ExportPrefix
+    // holds and refreshes a probe's: each from the tier the listing names.
+    PrefixExport ExportListing(const PrefixProber::PrefixListing& listing);
     // After a peer read in full the prefix an export dated `access_epoch`,
     // whose entries are `keys`: demotes its leaf chain as DemoteEntries does.
     // From the deepest boundary toward the root, a boundary joins the chain
@@ -514,6 +518,7 @@ public:
     struct BoundaryEventStatus {
         bool device_publishable;
         bool host_publishable;
+        bool disk_publishable;
         bool retains_descriptor;
     };
     // Routing requires every continuous-history group on the medium (the

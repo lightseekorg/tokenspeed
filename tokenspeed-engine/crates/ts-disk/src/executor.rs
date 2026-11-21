@@ -29,6 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use parking_lot::Mutex;
+
 use crate::{
     dispatch::{self, Chunk, Limits, Shared},
     file::{DiskFile, ALIGNMENT},
@@ -276,6 +278,13 @@ pub struct Executor {
     pieces: Pieces,
     file_size: u64,
     max_io_bytes: usize,
+    /// The threads and their exit notices; `close` takes them once. The
+    /// executor is shared (a Disk tier and its peer pushes submit to it), so
+    /// closing takes `&self`.
+    lifecycle: Mutex<Lifecycle>,
+}
+
+struct Lifecycle {
     threads: Vec<thread::JoinHandle<()>>,
     exited: mpsc::Receiver<()>,
     closed: bool,
@@ -324,14 +333,16 @@ impl Executor {
         };
         let shared = Arc::new(Shared::new(limits, eventfd));
         let (exit_tx, exited) = mpsc::channel();
-        let mut executor = Self {
+        let executor = Self {
             shared: shared.clone(),
             pieces: pieces.clone(),
             file_size: file.size(),
             max_io_bytes: config.max_io_bytes,
-            threads: Vec::new(),
-            exited,
-            closed: false,
+            lifecycle: Mutex::new(Lifecycle {
+                threads: Vec::new(),
+                exited,
+                closed: false,
+            }),
         };
         // From here on, a failed start closes what already runs.
         let spawn = |name: String, body: Box<dyn FnOnce() + Send>| {
@@ -349,7 +360,7 @@ impl Executor {
                 let ring = uring::Ring::new(&file, &pieces, config.queue_depth)
                     .map_err(StartError::Ring)?;
                 let (shared, file) = (shared.clone(), file.clone());
-                executor.threads.push(spawn(
+                executor.lifecycle.lock().threads.push(spawn(
                     "ts-disk-uring".to_owned(),
                     Box::new(move || {
                         ring.run(&shared);
@@ -361,7 +372,7 @@ impl Executor {
             Backend::Psync => {
                 for index in 0..config.queue_depth {
                     let (shared, file) = (shared.clone(), file.clone());
-                    executor.threads.push(spawn(
+                    executor.lifecycle.lock().threads.push(spawn(
                         format!("ts-disk-io-{index}"),
                         Box::new(move || psync::run(&shared, &file)),
                     )?);
@@ -370,7 +381,7 @@ impl Executor {
         }
         let rate = config.write_bytes_per_second;
         let max_io_bytes = config.max_io_bytes;
-        executor.threads.push(spawn(
+        executor.lifecycle.lock().threads.push(spawn(
             "ts-disk-pacer".to_owned(),
             Box::new(move || dispatch::pace(&shared, rate, max_io_bytes)),
         )?);
@@ -447,25 +458,26 @@ impl Executor {
     /// Cancel what is queued, wait up to `timeout` for what is in flight to
     /// retire, and stop the threads. On failure the threads are left
     /// running and the memory must stay mapped.
-    pub fn close(&mut self, timeout: Duration) -> Result<(), CloseError> {
-        if self.closed {
+    pub fn close(&self, timeout: Duration) -> Result<(), CloseError> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.closed {
             return Ok(());
         }
         let finished = self.shared.queues.lock().close();
         self.shared.wake();
         dispatch::report(finished);
         let deadline = Instant::now() + timeout;
-        self.closed = true;
-        for _ in 0..self.threads.len() {
+        lifecycle.closed = true;
+        for _ in 0..lifecycle.threads.len() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if self.exited.recv_timeout(remaining).is_err() {
+            if lifecycle.exited.recv_timeout(remaining).is_err() {
                 // Leave the threads: they hold the file and finish when the
                 // kernel retires their requests.
-                self.threads.clear();
+                lifecycle.threads.clear();
                 return Err(CloseError);
             }
         }
-        for thread in self.threads.drain(..) {
+        for thread in lifecycle.threads.drain(..) {
             let _ = thread.join();
         }
         Ok(())

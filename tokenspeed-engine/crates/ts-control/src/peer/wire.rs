@@ -221,6 +221,9 @@ fn write_geometry(out: &mut Writer, geometry: &RankGeometry) {
         out.u64(field.page_stride);
         out.u64(field.bytes);
     }
+    out.option(geometry.push.as_ref(), |out, endpoint| {
+        out.bytes(endpoint.as_bytes())
+    });
     out.option(geometry.host.as_ref(), |out, pool| {
         out.u64(pool.address);
         out.count(pool.groups.len());
@@ -250,6 +253,7 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
             bytes: reader.u64()?,
         });
     }
+    let push = reader.option(read_str)?;
     let host = reader.option(|reader| {
         let address = reader.u64()?;
         let count = reader.count()?;
@@ -276,6 +280,7 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
         session,
         device,
         host,
+        push,
     })
 }
 
@@ -551,6 +556,7 @@ mod tests {
                     field_offsets: vec![("layer.3.k".into(), 0)],
                 }],
             }),
+            push: Some("10.0.0.2:7300".into()),
         };
         for reply in [
             Reply::Layout {
@@ -559,6 +565,7 @@ mod tests {
                     geometry.clone(),
                     RankGeometry {
                         host: None,
+                        push: None,
                         ..geometry.clone()
                     },
                 ],

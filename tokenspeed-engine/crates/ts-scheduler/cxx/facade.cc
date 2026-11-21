@@ -476,7 +476,8 @@ std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const 
     auto batch = std::make_unique<tokenspeed::KvEventBatch>();
     for (const auto& event : events) {
         const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
-        const auto medium = event.host ? tokenspeed::KvEventMedium::kHost : tokenspeed::KvEventMedium::kDevice;
+        if (event.medium >= tokenspeed::kNumKvEventMedia) throw std::invalid_argument("an unknown KV event medium");
+        const auto medium = static_cast<tokenspeed::KvEventMedium>(event.medium);
         if (event.stored) {
             batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
                          {event.token_ids.data(), event.token_ids.size()}, event.block_size, medium);

@@ -177,16 +177,19 @@ holds Disk entries like the others. RFC 0004's argument that answers hold
 until the next head applies unchanged: Disk entries are placed, evicted and
 published only in plans.
 
-Every rank runs a push endpoint, named in its layout beside its transfer
-engine session; the layout also carries the Disk group layout (the Host
-one). A PUSH names the lease, the holder's incarnation, the Disk block ids and
-the reader's destinations. The holder rank reads each block with io_uring
-into a fixed staging ring registered with the transfer engine
-(FREE → SSD_READING → RDMA_WRITING → FREE) and writes it to the reader with the
-transfer engine as soon as the read completes, so reads and network
-transfers overlap. A block larger than a ring slot moves in slot-sized
-chunks. A full ring applies backpressure. Neither the holder's scheduler nor
-its forward thread takes part.
+Every rank runs a push endpoint (`peer::push`), named in its layout beside its
+transfer engine session; the layout's Host group layout is also the Disk's.
+A reader member asks the holder member of its own index to PUSH the Disk
+pages of its shard: the Disk block ids, and for each block its fields' offsets
+in the block and their destinations in the reader's memory, within a budget.
+The holder rank reads each block with its Disk executor into a slot of a
+staging ring registered with that executor and with the transfer engine
+(FREE → SSD_READING → RDMA_WRITING → FREE) and writes the block's fields to
+the reader with the transfer engine as soon as the read completes, so reads
+and network transfers overlap. A slot holds the largest block; a full ring
+applies backpressure. The member reports its part of the landing once its
+reads and the push both ended. Neither the holder's scheduler nor its forward
+thread takes part.
 
 **Reader and landing tier.** `--peer-prefix-landing-tier` selects where a peer
 prefix lands, with no default:
@@ -207,16 +210,19 @@ and the holder's vouching at release.
 
 **Write fence.** A push makes the holder a remote writer into the reader's
 memory, so a landing the reader gave up must not take late writes into pages
-it reuses. The reader follows PD's fence (`event-loop.md`, PD receive
-revocation): it sends CANCEL on the PUSH's ordered channel, and the holder
-acknowledges once every write of the job retired or none was posted; the
-holder posts no write past the job's deadline. Without an acknowledgment
-within the budget the reader revokes the transfer engine's registration,
-after which the NIC rejects late writes. Only RDMA revokes; elsewhere the
-pages stay held.
+it reuses. The holder posts no write past the push's budget. A reader that
+stops waiting at the budget sends CANCEL on the PUSH's channel, and the holder
+acknowledges once every write of the job retired, or at once when none runs;
+only then, or after a bounded wait for that, does the member report its part
+failed, and the landing's pages are then held for the read quarantine, which
+outlasts the transfer engine's own timeout, as for a failed read (RFC 0004,
+Faults). The transfer engine's registration is not revoked: late writes are
+bounded by the holder's budget and the engine's timeout, as late reads
+already are.
 
-**Capability.** A holder advertises its push endpoint; a reader says in its
-lookup whether it accepts Disk pages. Without both, no Disk page is listed.
+**Capability.** A holder with a Disk tier serves pushes from its endpoint and
+lists Disk pages; one without lists only its Device and Host. Every reader of
+a build that lists Disk pages accepts them.
 
 ### Roles
 

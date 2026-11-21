@@ -37,6 +37,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/tier/disk_manager.h"
+#include "cache/tier/peer_exports.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 
@@ -419,6 +420,64 @@ TEST(DiskTierTest, AStateCheckpointIsCleanedWithItsHistoryAndPrefetchedWithIt) {
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
 }
 
+// A holder lists, for a peer, each page from the fastest tier holding it;
+// its Disk pages are pushed (docs/rfcs/0006-disk-tier.md, Peer sharing).
+TEST(DiskTierTest, APeerListingNamesEachPageFromTheFastestTierHoldingIt) {
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16);
+    const Prompt prompt(4, 1);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    const DiskOperation write = cache.Clean(keys);
+    cache.disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    cache.EvictFromHost(std::span{keys}.last(2));
+
+    const cache::PeerLookup lookup{.lease = {.reader = "reader", .id = 1},
+                                   .prefix_hashes = prompt.hashes,
+                                   .tokens = prompt.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    EXPECT_EQ(answer.num_tokens, 16) << "the Disk extends the Host's two pages";
+    ASSERT_EQ(answer.pages.size(), 4u);
+    for (std::int32_t slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(answer.pages[static_cast<std::size_t>(slot)].slot, slot);
+        EXPECT_EQ(answer.pages[static_cast<std::size_t>(slot)].tier, slot < 2 ? CacheTier::kHost : CacheTier::kDisk);
+    }
+    EXPECT_EQ(answer.pages[2].block_id, write.disk_blocks[2]) << "a Disk page names its Disk block";
+    EXPECT_TRUE(PeerExports::Matches(cache.coordinator, lookup, answer.num_tokens, answer.pages));
+
+    // The hard pin holds the Disk blocks too, until the release.
+    PeerExports exports{PeerConfig{.name = "holder",
+                                   .incarnation = 1,
+                                   .max_leases = 4,
+                                   .soft_pin_us = 100,
+                                   .hard_pin_us = 1000,
+                                   .lookup_timeout_us = 100,
+                                   .min_fetch_tokens = 1,
+                                   .landing_tier = PeerLandingTier::kDevice,
+                                   .max_host_landing_blocks = 0,
+                                   .host_ready_timeout_us = 0}};
+    exports.Lookup(cache.coordinator, lookup, /*now_us=*/0);
+    exports.Pin(cache.coordinator,
+                cache::PeerPin{.lease = lookup.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                /*now_us=*/1);
+    EXPECT_TRUE(exports.Held(lookup.lease));
+    EXPECT_EQ(cache.coordinator.Disk().NumPinnedDiskCachedBlocks(), 2);
+    exports.Release(cache.coordinator, cache::PeerRelease{.lease = lookup.lease, .demote = false}, /*now_us=*/2);
+    EXPECT_EQ(cache.coordinator.Disk().NumPinnedDiskCachedBlocks(), 0);
+}
+
+TEST(DiskTierTest, APeerListingWithoutADiskGainIsTheDeviceAndHostOne) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16);
+    const Prompt prompt(3, 1);
+    cache.OnHostOnly(prompt);
+    const cache::PeerLookup lookup{.lease = {.reader = "reader", .id = 1},
+                                   .prefix_hashes = prompt.hashes,
+                                   .tokens = prompt.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    EXPECT_EQ(answer.num_tokens, 12);
+    EXPECT_TRUE(std::ranges::none_of(answer.pages, [](const PeerPage& page) { return page.tier == CacheTier::kDisk; }));
+}
+
 TEST(DiskTierTest, AClearDropsTheDiskTierWithTheOthers) {
     DiskTierCache cache(FullAndState(), /*disk_parents=*/16);
     const Prompt prompt(2, 1);
@@ -599,6 +658,30 @@ TEST_F(DiskTierSchedulerTest, APrefetchPastItsDeadlineAdmitsFromTheLocalHit) {
     EXPECT_TRUE(scheduler_->StoragePending()) << "the read keeps its blocks until it retires";
     AckDisk(reads[0], /*success=*/true);
     EXPECT_FALSE(scheduler_->StoragePending());
+}
+
+// Routers credit Disk hits too: a cleaned boundary is out on the Disk stream.
+class DiskTierKvEventsTest : public DiskTierSchedulerTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig config = DiskTierSchedulerTest::MakeConfig();
+        config.enable_kv_cache_events = true;
+        return config;
+    }
+};
+
+TEST_F(DiskTierKvEventsTest, ACleanedBoundaryIsOutOnTheDiskStream) {
+    Tick(1);
+    SeedOnHost();
+    scheduler_->DrainKvEvents();
+    const std::vector<DiskOperation> writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes[0], /*success=*/true);
+    const std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    EXPECT_TRUE(std::ranges::any_of(events, [](const KvCacheEvent& event) {
+        const auto* stored = std::get_if<KvBlockStoredEvent>(&event);
+        return stored != nullptr && stored->medium == KvEventMedium::kDisk;
+    })) << "the cleaned page is out on the Disk stream";
 }
 
 TEST_F(DiskTierSchedulerTest, ACacheClearDrainsTheDiskOperationsInFlight) {

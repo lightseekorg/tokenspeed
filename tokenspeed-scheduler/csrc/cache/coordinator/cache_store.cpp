@@ -485,11 +485,11 @@ std::vector<CacheKey> CacheStore::ExpandPrefixKeys(std::span<const std::string> 
 void CacheStore::SetMutationSink(CacheMutationSink sink) {
     mutation_sink_ = std::move(sink);
     if (!mutation_sink_) {
-        boundary_tree_.SetHostEntriesObserver(nullptr);
+        boundary_tree_.SetLowerTierEntriesObserver(nullptr);
         return;
     }
-    boundary_tree_.SetHostEntriesObserver([this](const ContentHash& hash) {
-        mutation_sink_(CacheKey{.content_hash = hash}, CacheMutation::kHostResidency);
+    boundary_tree_.SetLowerTierEntriesObserver([this](const ContentHash& hash) {
+        mutation_sink_(CacheKey{.content_hash = hash}, CacheMutation::kLowerTierResidency);
     });
 }
 

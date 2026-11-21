@@ -520,8 +520,9 @@ mod ffi {
         token_ids: Vec<i32>,
         /// Stored: tokens per block.
         block_size: i32,
-        /// The event concerns the Host cache; else the Device.
-        host: bool,
+        /// The memory the event concerns, as a `KvEventMedium` value: 0 the
+        /// Device, 1 the Host cache, 2 the Disk tier.
+        medium: u8,
     }
 
     /// A peer lease's name: its reader and the reader's own counter
@@ -1275,6 +1276,8 @@ pub enum KvEventMedium {
     Device,
     /// The pinned Host cache (Host L2).
     Host,
+    /// The Disk tier (`docs/rfcs/0006-disk-tier.md`).
+    Disk,
 }
 impl KvEventBatch {
     /// Copy independent event rows into an owned batch, preserving wire fields.
@@ -1327,10 +1330,10 @@ impl KvEventBatch {
             parent_block_hash: parents[i],
             token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
             block_size: block_sizes[i],
-            medium: if media[i] == 0 {
-                KvEventMedium::Device
-            } else {
-                KvEventMedium::Host
+            medium: match media[i] {
+                0 => KvEventMedium::Device,
+                1 => KvEventMedium::Host,
+                _ => KvEventMedium::Disk,
             },
         })
     }

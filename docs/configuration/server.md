@@ -2064,11 +2064,15 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `min_prefetch_tokens` | 256 | The fewest tokens past the local hit worth a read. |
 | `wait_timeout_ms` | 10000 | How long a prompt waits for its read before it runs from the local hit. |
 | `ready_timeout_ms` | 5000 | How long a finished read is held for its prompt. |
+| `push_ring_mb` | 512 | With `--peer-prefix-port`, the staging memory a peer push reads Disk blocks into, rounded up to whole blocks. |
 
 The Disk tier needs `--kvstore-write-policy write_back` and prefix caching,
 and is refused with `--kvstore-storage-backend` and
 `--pipeline-parallel-size > 1`. With it, every Host block is padded to a
-multiple of 4096 bytes so each one moves in one direct I/O. A cache flush or
+multiple of 4096 bytes so each one moves in one direct I/O. With peer prefix
+sharing, a replica serves the prefixes its Disk tier holds too: it pushes
+them into the reader's landing, reading each block into a staging ring and
+writing it over RDMA as soon as it is read. A cache flush or
 weight update waits up to 30 s for the Disk operations in flight to finish,
 and fails if one does not.
 

@@ -186,6 +186,7 @@ impl Replica {
             host_layout: host_layout.clone(),
             disk_layout: layout(DISK_BLOCKS),
             max_operations: 4,
+            push_ring_bytes: 0,
         })
         .unwrap();
         Self {

@@ -75,6 +75,7 @@ from tokenspeed.runtime.cache.disk import (
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
+    PUSH_TIMEOUT_S,
     QUARANTINE_S,
     RECORD_LIFETIME_S,
     PeerSharingSettings,
@@ -1257,9 +1258,11 @@ def _peer_sharing_settings(
         weight_version=str(server_args.weight_version),
         answer_timeout_s=server_args.peer_prefix_answer_timeout_ms / 1000,
         quarantine_s=QUARANTINE_S,
+        push_timeout_s=PUSH_TIMEOUT_S,
         record_lifetime_s=RECORD_LIFETIME_S,
         library=mooncake_library(),
         local_ip=local_ip,
+        push_host=host,
         protocol=mooncake_protocol(),
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
