@@ -73,6 +73,11 @@ def is_cdna5() -> bool:
     return platform is not None and platform.is_cdna5
 
 
+def is_rdna4() -> bool:
+    platform = detected_platform()
+    return platform is not None and platform.is_rdna4
+
+
 def kernel_supported(name: str) -> bool:
     """Whether the registered kernel ``name`` can run on the detected device."""
     platform = detected_platform()
