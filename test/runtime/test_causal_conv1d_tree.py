@@ -312,6 +312,45 @@ def test_decode_update_compiles_once_across_batch_sizes():
     assert compiles.call_count == 0
 
 
+def test_decode_update_compiles_once_across_pool_sizes():
+    """The conv-state pool is sized from free memory at server start; it must not key a new binary."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
+        _causal_conv1d_update_kernel,
+    )
+
+    torch.manual_seed(0)
+    dim, width, bs = 64, 4, 8
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(bs, dim, device="cuda", dtype=torch.bfloat16)
+    rows = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
+
+    def run(pool):
+        conv_state = torch.zeros(
+            pool, dim, width - 1, device="cuda", dtype=torch.bfloat16
+        )
+        return causal_conv1d_update(
+            x.clone(),
+            conv_state,
+            weight,
+            None,
+            activation="silu",
+            conv_state_indices=rows,
+            parent_indices=None,
+        )
+
+    expected = run(2822)
+    with patch.object(
+        _causal_conv1d_update_kernel,
+        "_do_compile",
+        wraps=_causal_conv1d_update_kernel._do_compile,
+    ) as compiles:
+        for pool in (2912, 33, 4096):
+            assert torch.equal(run(pool), expected)
+    assert compiles.call_count == 0
+
+
 @pytest.mark.parametrize("width", [1, 3, 4, 16])
 @pytest.mark.parametrize("batch", [1, 7, 300])
 def test_chain_update_writes_the_split_payload(batch, width):
