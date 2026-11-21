@@ -124,6 +124,8 @@ def _resolve_grid(
 _EXTEND_BLOCK_N = 64
 # gfx950 deals workgroup i of a launch (in dispatch order) to XCD i % 8.
 _NUM_XCDS = gl.constexpr(8)
+# The K / V caches' alignment in bytes: the direct-to-LDS page copy needs it.
+_CACHE_ALIGN_BYTES = gl.constexpr(16)
 # (BLOCK_M, NUM_WARPS) of the query tiles, smallest first. The 8-wave tile
 # runs the warp-pipelined page loop (_stream_kv_warp_pipelined); the launcher
 # picks it by _use_warp_pipeline rather than by query length.
@@ -541,8 +543,17 @@ class ExtendProgram:
         # offset within the page, which stays the same for every page.
         page_elems: gl.constexpr = cfg.PAGE_SIZE * cfg.N_KV_HEADS * cfg.HEAD_DIM
         elem_bytes: gl.constexpr = cache_ptr.dtype.element_ty.primitive_bitwidth // 8
+        # The arena pointer is not specialized (it would key the binary on
+        # the arena's size), so its _CACHE_ALIGN_BYTES alignment, which the direct-to-LDS
+        # copy needs (buffer_load_to_local has no lowering without it), is
+        # stated here: the launcher checks the arena's base, and a page is a
+        # whole number of 16-byte rows (HEAD_DIM is 64 or 128, see
+        # ExtendConfig).
         page = buffer.make_buffer_descriptor(
-            cache_ptr + physical_page.to(gl.int64) * page_elems,
+            gl.multiple_of(
+                cache_ptr + physical_page.to(gl.int64) * page_elems,
+                _CACHE_ALIGN_BYTES,
+            ),
             page_elems * elem_bytes,
         )
         buffer.load_to_shared(
@@ -1262,9 +1273,16 @@ def _remap_extend_program(
     return pid_q, pid_batch, kv_head
 
 
+_PER_CALL_ARGS = ("num_seqs", "k_cache_ptr", "v_cache_ptr")
+
+
 # The request count follows the batch. Without do_not_specialize, Triton would
-# compile separate binaries for a count of 1 and for multiples of 16.
-@gluon.jit(do_not_specialize=("num_seqs",))
+# compile separate binaries for a count of 1 and for multiples of 16. The KV
+# arena pointers are not specialized either: Triton keys a binary on whether a
+# tensor's storage fits in 2 GB, and the arena is sized after startup's warm-up
+# (a small probe arena, then the full one). Pages are addressed from an int64
+# page base, so one binary serves both.
+@gluon.jit(do_not_specialize=_PER_CALL_ARGS)
 def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -1401,7 +1419,7 @@ def gluon_mha_extend_gfx950(
     program.store_lse(l_i, m_i)
 
 
-@gluon.jit(do_not_specialize=("num_seqs",))
+@gluon.jit(do_not_specialize=_PER_CALL_ARGS)
 def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -1796,6 +1814,14 @@ def _extend(
             "gluon_mha_extend_gfx950 needs contiguous [pages, page_size, kv_heads, "
             f"head_dim] K / V caches; got strides {k_cache.stride()} / "
             f"{v_cache.stride()} for shape {tuple(k_cache.shape)}"
+        )
+    align = _CACHE_ALIGN_BYTES.value
+    if k_cache.data_ptr() % align or v_cache.data_ptr() % align:
+        # The kernels state the caches' alignment, which the direct-to-LDS
+        # page copy needs: it has no lowering for an unaligned arena.
+        raise ValueError(
+            f"gluon_mha_extend_gfx950 needs {align}-byte aligned K / V caches; got "
+            f"{k_cache.data_ptr():#x} / {v_cache.data_ptr():#x}"
         )
     head_dim = q.shape[2]
     n_heads = q.shape[1]

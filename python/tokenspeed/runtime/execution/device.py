@@ -1803,9 +1803,11 @@ def build_device_side(
         if current_platform().is_amd:
             # Kernels warmed above read the probe's small KV arena. On AMD,
             # Triton keys a compilation on whether each tensor's storage fits
-            # in 2 GB (buffer ops address it with 32-bit offsets), so those
-            # variants do not serve the full-size arena: without this, each
-            # one compiles on its first live batch instead, mid-serve. Other
+            # in 2 GB (buffer ops address it with 32-bit offsets), so a kernel
+            # that specializes the arena's pointers does not serve the
+            # full-size arena: without this, it compiles on its first live
+            # batch instead, mid-serve. Kernels that do not specialize the
+            # arena's pointers compile once and are not affected. Other
             # platforms' kernels do not key on the arena's size and skip the
             # second warm-up. Warm again on the final pools with the tactics
             # tuned above; tuning now would allocate workspaces outside the

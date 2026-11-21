@@ -26,6 +26,7 @@ from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 import torch
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
@@ -640,3 +641,43 @@ class FakeTimer:
             first_replay_time_ms=3.0,
             measurement_time_ms=4.0,
         )
+
+
+# A KV arena small enough for startup's probe and one past 2 GiB, for the tests
+# that one compiled binary serves both (Triton keys a binary on whether a
+# tensor's storage fits in 2 GB on AMD).
+ARENA_TOKENS, ARENA_HQ, ARENA_HKV, ARENA_DIM = 24, 8, 2, 128
+# Rows of the small arena; the large one holds more than 2 GiB of BF16 rows.
+ARENA_SMALL_SLOTS = 64
+ARENA_LARGE_SLOTS = 2**31 // (ARENA_HKV * ARENA_DIM * 2) + ARENA_SMALL_SLOTS
+# Only AMD keys a binary on the 2 GiB bound; elsewhere both arenas share one
+# binary anyway, so the > 4 GiB of caches these tests allocate would check
+# nothing.
+needs_amd_arena_key = pytest.mark.skipif(
+    not is_amd(), reason="only AMD keys a binary on a tensor's 2 GiB bound"
+)
+
+
+def skip_without_arena_memory() -> None:
+    """Skip a test whose two past-2-GiB caches do not fit in free memory."""
+    needed = 2 * ARENA_LARGE_SLOTS * ARENA_HKV * ARENA_DIM * 2 + 2**30
+    if torch.cuda.mem_get_info()[0] < needed:
+        pytest.skip(f"the past-2-GiB arena needs {needed / 2**30:.1f} GiB free")
+
+
+def arena_caches(slots: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 K / V caches of ``slots`` rows, the small or the past-2-GiB arena."""
+    shape = (slots, ARENA_HKV, ARENA_DIM)
+    return (
+        torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
+        torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
+    )
+
+
+def arena_slots(first: int) -> torch.Tensor:
+    """ARENA_TOKENS distinct slots from ``first``, the same for every caller."""
+    g = torch.Generator(device="cuda").manual_seed(7)
+    return (
+        first
+        + torch.randperm(ARENA_SMALL_SLOTS, device="cuda", generator=g)[:ARENA_TOKENS]
+    )
