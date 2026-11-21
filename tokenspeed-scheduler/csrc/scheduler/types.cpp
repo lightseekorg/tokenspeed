@@ -128,7 +128,7 @@ void SchedulerConfig::Validate() const {
     // The default leaves the yield unbounded, as before the bound existed.
     if (prefill_chunk_yield_tokens > 0 && prefill_chunk_yield_max_rounds <= 0) {
         throw std::invalid_argument(
-            "Scheduler: prefill_chunk_yield_max_rounds must be positive when prefill_chunk_yield_tokens is");
+            "Scheduler: prefill_chunk_yield_max_rounds must be positive when prefill_chunk_yield_tokens is positive");
     }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
