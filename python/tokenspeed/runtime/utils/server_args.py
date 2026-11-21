@@ -641,7 +641,6 @@ class ServerArgs:
     # its name is host:port. None takes this host's detected address.
     peer_prefix_host: str | None = None
     peer_prefix_answer_timeout_ms: int = 50
-    peer_prefix_host_region_mib: int | None = None
     peer_prefix_min_fetch_tokens: int = 256
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
@@ -2683,11 +2682,6 @@ class ServerArgs:
             )
         if self.peer_prefix_answer_timeout_ms <= 0:
             raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
-        if (
-            self.peer_prefix_host_region_mib is not None
-            and self.peer_prefix_host_region_mib <= 0
-        ):
-            raise ValueError("--peer-prefix-host-region-mib must be positive")
         if self.peer_prefix_min_fetch_tokens <= 0:
             raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
 
@@ -3707,12 +3701,6 @@ class ServerArgs:
             default=ServerArgs.peer_prefix_answer_timeout_ms,
             help="How long a request waits for the peer holder's answer to each "
             "step (lookup, pin, release) before it computes the prefix itself.",
-        )
-        parser.add_argument(
-            "--peer-prefix-host-region-mib",
-            type=int,
-            default=ServerArgs.peer_prefix_host_region_mib,
-            help="Target peer Host registration size in MiB for the device plugin.",
         )
         parser.add_argument(
             "--peer-prefix-min-fetch-tokens",

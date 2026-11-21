@@ -161,18 +161,13 @@ def peer_host_regions(
     length: int,
     parent_bytes: int,
     planner: PeerHostRegionPlanner | None,
-    target_bytes: int | None,
 ) -> tuple[tuple[int, int], ...]:
     """Map the planner's lengths onto the pool, checking coverage and READ boundaries."""
     if planner is None:
-        if target_bytes is not None:
-            raise ValueError(
-                "A peer Host region target requires a registered device planner"
-            )
         return ((address, length),)
     regions = []
     offset = 0
-    for size in planner(length, parent_bytes, target_bytes):
+    for size in planner(length, parent_bytes):
         if type(size) is not int or size <= 0 or size > length - offset:
             raise ValueError("Invalid peer Host region length")
         regions.append((address + offset, size))
@@ -192,7 +187,6 @@ def build_peer_geometry(
     device_regions: Sequence[tuple[int, int]],
     host_storage: HostCacheStorage,
     host_region_planner: PeerHostRegionPlanner | None = None,
-    host_region_bytes: int | None = None,
 ) -> PeerGeometry:
     """This rank's geometry: the fields the Host tier stores (the target's
     and the draft's), at their Device addresses and their offsets in the
@@ -208,7 +202,6 @@ def build_peer_geometry(
             (``CacheArena.registration_regions``).
         host_storage: The Host pool.
         host_region_planner: Optional device plugin supplying consecutive region sizes.
-        host_region_bytes: Optional target size passed to the planner.
 
     Returns:
         The geometry, registering the Device ranges and the Host pool.
@@ -253,7 +246,6 @@ def build_peer_geometry(
         host_bytes,
         host_storage.host_lcm_block_bytes,
         host_region_planner,
-        host_region_bytes,
     )
     return PeerGeometry(
         device=tuple(device),

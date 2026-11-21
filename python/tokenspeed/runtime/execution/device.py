@@ -1972,11 +1972,6 @@ def build_device_side(
             device_regions=arena.registration_regions(),
             host_storage=host_cache.storage,
             host_region_planner=get_peer_host_region_planner(server_args.device),
-            host_region_bytes=(
-                server_args.peer_prefix_host_region_mib << 20
-                if server_args.peer_prefix_host_region_mib is not None
-                else None
-            ),
         )
 
     kv_transfer = kv_transfer_builder(

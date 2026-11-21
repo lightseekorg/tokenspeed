@@ -194,9 +194,9 @@ def record_external(kind: str, name: str, undo) -> None:
         _active.undo.append(undo)
 
 
-# The planner returns consecutive region lengths for a compact Host pool. All
-# sizes are in bytes: pool length, compact parent stride and optional target.
-PeerHostRegionPlanner = Callable[[int, int, int | None], tuple[int, ...]]
+# A planner maps the pool length and compact parent stride to consecutive region
+# lengths. All sizes are in bytes.
+PeerHostRegionPlanner = Callable[[int, int], tuple[int, ...]]
 _PEER_HOST_REGION_PLANNERS: dict[str, PeerHostRegionPlanner] = {}
 
 

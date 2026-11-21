@@ -58,19 +58,17 @@ NUM_LCM_BLOCKS = 6
 
 
 def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():
-    assert peer_host_regions(100, 42, 6, None, None) == ((100, 42),)
-    assert peer_host_regions(100, 42, 6, lambda *_: (24, 18), 24) == (
+    assert peer_host_regions(100, 42, 6, None) == ((100, 42),)
+    assert peer_host_regions(100, 42, 6, lambda length, parent: (24, 18)) == (
         (100, 24),
         (124, 18),
     )
-    with pytest.raises(ValueError, match="registered device planner"):
-        peer_host_regions(100, 42, 6, None, 24)
 
 
 @pytest.mark.parametrize("lengths", [(12,), (18, 25), (17, 25), (0, 42), (-6, 48)])
 def test_invalid_peer_host_registration_plans_are_refused(lengths):
     with pytest.raises(ValueError, match="(region|regions)"):
-        peer_host_regions(100, 42, 6, lambda *_: lengths, None)
+        peer_host_regions(100, 42, 6, lambda *_: lengths)
 
 
 def test_release_only_loaded_checkpoint_file_pages(tmp_path, monkeypatch):
@@ -264,7 +262,6 @@ def test_every_attention_dp_rank_needs_a_valid_port():
     [
         {"peer_prefix_answer_timeout_ms": 0},
         {"peer_prefix_min_fetch_tokens": 0},
-        {"peer_prefix_host_region_mib": 0},
     ],
 )
 def test_peer_limits_must_be_positive(overrides):
