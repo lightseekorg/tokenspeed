@@ -101,11 +101,13 @@ def _paged_tree_problem(
     rows=None,
     seen_width=None,
     kv_dtype=torch.bfloat16,
+    kv_scales=(1.0, 1.0),
 ):
     """A paged HND cache holding each request's prefix + ``n``-key tree window,
     plus the reference. ``rows=None`` is verify (a row per node, ancestor
     masks); otherwise ``rows`` lane rows per request with random window masks.
-    K/V hold values exact in ``kv_dtype``, so the reference sees what it stores."""
+    K/V hold values exact in ``kv_dtype``, so the reference sees what it stores
+    (times ``kv_scales``, a scaled cache's dequantization)."""
     r = n if rows is None else rows
     words = (n + 63) // 64
 
@@ -148,8 +150,8 @@ def _paged_tree_problem(
                 )
             _store_row_bits(mask, b * r + i, words, bits)
         group = hq // hkv
-        kk = keys.float().repeat_interleave(group, 1)
-        vv = vals.float().repeat_interleave(group, 1)
+        kk = keys.float().repeat_interleave(group, 1) * kv_scales[0]
+        vv = vals.float().repeat_interleave(group, 1) * kv_scales[1]
         qq = q[b * r : (b + 1) * r].float()
         s = torch.einsum("nhd,xhd->hnx", qq, kk) * scale
         vis = torch.ones(r, plen + n, dtype=torch.bool)
@@ -277,7 +279,9 @@ def _check_tree_window(
     poison=None,
     kv_dtype=torch.bfloat16,
     causal_prefix=True,
+    fp8_kv_scales=None,
 ):
+    kv_scales = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
     q, _, _, mask, k_cache, v_cache, tables, ref, scale = _paged_tree_problem(
         bs,
         n,
@@ -290,6 +294,7 @@ def _check_tree_window(
         rows,
         None if poison is None else rows,
         kv_dtype,
+        kv_scales,
     )
     r = n if rows is None else rows
     if poison is not None:
@@ -303,8 +308,17 @@ def _check_tree_window(
                     v_cache[tables[b, pos // page], :, pos % page] = poison
     k_rows = k_cache.permute(0, 2, 1, 3).reshape(-1, hkv, d)
     v_rows = v_cache.permute(0, 2, 1, 3).reshape(-1, hkv, d)
+    # The prefix partial is in true K/V units: the stored rows times the scales.
     prefix_out, prefix_lse = _causal_prefix_partial(
-        q, k_rows, v_rows, tables, prefix_lens, r, page, scale, causal=causal_prefix
+        q,
+        k_rows.float() * kv_scales[0],
+        v_rows.float() * kv_scales[1],
+        tables,
+        prefix_lens,
+        r,
+        page,
+        scale,
+        causal=causal_prefix,
     )
     layout = _last_dim_strided if strided else (lambda t: t)
     out = tree_window_attention(
@@ -321,8 +335,10 @@ def _check_tree_window(
         causal_prefix=causal_prefix,
         page_size=page,
         sm_scale=scale,
+        fp8_kv_scales=fp8_kv_scales,
     )
-    torch.testing.assert_close(out.float().cpu(), ref, atol=2e-2, rtol=2e-2)
+    tol = 2e-2 * max(1.0, kv_scales[1])
+    torch.testing.assert_close(out.float().cpu(), ref, atol=tol, rtol=tol)
 
 
 @pytest.mark.parametrize("rows,n", [(None, 16), (None, 64), (4, 12), (8, 32)])
@@ -341,6 +357,38 @@ def test_tree_window_attention_fp8_kv(rows, n, require):
         gen,
         rows=rows,
         kv_dtype=torch.float8_e4m3fn,
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_scales",
+    [(0.5, 2.0), (2.0, 0.5), (0.0371, 1.73)],
+    ids=["k0.5-v2", "k2-v0.5", "k0.0371-v1.73"],
+)
+@pytest.mark.parametrize(
+    "rows,n,causal_prefix",
+    [(None, 16, True), (None, 64, True), (8, 32, True), (4, 12, False)],
+)
+def test_tree_window_attention_scaled_fp8_kv(
+    rows, n, causal_prefix, kv_scales, require
+):
+    """An FP8 E4M3 cache at per-tensor scales: the K scale joins the logits,
+    the V scale the window's P.V, merged with a partial in true units."""
+    require("attention", "tree_window", "triton", torch.float8_e4m3fn, "k_cache")
+    gen = torch.Generator().manual_seed(n * 10 + (rows or 0))
+    _check_tree_window(
+        3,
+        n,
+        [5, 70, 131],
+        32,
+        8,
+        128,
+        32,
+        gen,
+        rows=rows,
+        kv_dtype=torch.float8_e4m3fn,
+        causal_prefix=causal_prefix,
+        fp8_kv_scales=kv_scales,
     )
 
 

@@ -46,6 +46,7 @@ def _fwd_kernel(
     sink_ptr,
     page_table,
     sm_scale,
+    o_scale,
     kv_group_num,
     stride_qbs,
     stride_qh,
@@ -213,7 +214,8 @@ def _fwd_kernel(
                     other=0.0,
                 )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            # K/V may be stored narrower than q (fp8 KV cache); upcast in registers.
+            qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 if HAS_KV_CACHE:
                     offs_kpe = (
@@ -238,7 +240,7 @@ def _fwd_kernel(
                         mask=mask_n[None, :],
                         other=0.0,
                     )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -276,8 +278,8 @@ def _fwd_kernel(
                     mask=mask_n[:, None] & mask_dv[None, :],
                     other=0.0,
                 )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            p = p.to(q.dtype)
+            acc = acc * re_scale[:, None] + tl.dot(p, v.to(q.dtype))
 
             e_max = n_e_max
 
@@ -285,7 +287,8 @@ def _fwd_kernel(
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
 
-    safe_deno = tl.where(deno > 0.0, deno, 1.0)
+    # o_scale is a scaled FP8 cache's V scale.
+    safe_deno = tl.where(deno > 0.0, deno, 1.0) / o_scale
 
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -336,6 +339,7 @@ def prefill_attention_fwd(
     page_size=1,
     has_kv_cache=False,
     lse_extend=None,
+    o_scale=1.0,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -429,6 +433,7 @@ def prefill_attention_fwd(
         sinks,
         page_table_arg,
         sm_scale,
+        o_scale,
         kv_group_num,
         q_extend.stride(0),
         q_extend.stride(1),
@@ -538,10 +543,15 @@ def _triton_mha_extend_with_kvcache_impl(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    # Every key is a cache row (no extend K/V): a scaled cache's k joins the
+    # logit scale, its v the output's.
+    k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
+    softmax_scale *= k_descale
     k = torch.empty(
         (0, k_cache.shape[2], k_cache.shape[3]),
         dtype=k_cache.dtype,
@@ -580,6 +590,7 @@ def _triton_mha_extend_with_kvcache_impl(
         page_size=k_cache.shape[1],
         has_kv_cache=True,
         lse_extend=lse,
+        o_scale=v_descale,
     )
     if return_lse:
         return out, lse

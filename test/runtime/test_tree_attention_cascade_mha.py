@@ -21,7 +21,8 @@
 """Draft-tree attention on the portable MHA leaf (the ROCm default;
 docs/design/tree-speculation.md): the Triton causal prefix extend plus
 ``tree_window_attention``, reached through the verify and lane dispatch,
-against an fp32 reference."""
+against an fp32 reference, over a bf16 or an FP8 E4M3 cache at unit or
+per-tensor K/V scales."""
 
 import os
 import sys
@@ -32,10 +33,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales  # noqa: E402
 
 from tokenspeed.runtime.execution.drafter.eagle_harness.lanes import (  # noqa: E402
     Eagle4TreeLanes,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.layers.attention.backends.paged.mha import (  # noqa: E402
     MHAAttnBackend,
 )
@@ -52,9 +55,35 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 PAGE = 64
 HQ, HKV = 16, 4
+DECODE = ForwardMode.DECODE
 
 
-def _backend(num_draft_tokens: int, max_bs: int, is_draft: bool, dim: int):
+FP8 = torch.float8_e4m3fn
+# (cache dtype, per-tensor K/V scales the FP8 cache was written with).
+KV_DTYPES = pytest.mark.parametrize(
+    "kv_dtype,kv_scales",
+    [
+        (torch.bfloat16, None),
+        (FP8, None),
+        (FP8, (0.5, 2.0)),
+        (FP8, (0.0371, 1.73)),
+    ],
+    ids=["bf16_kv", "fp8_kv", "fp8_kv_k0.5_v2", "fp8_kv_k0.0371_v1.73"],
+)
+
+
+def _tol(kv_scales):
+    """The output scales with V, and so does its error."""
+    return 2e-2 * (1.0 if kv_scales is None else max(1.0, kv_scales[1]))
+
+
+def _backend(
+    num_draft_tokens: int,
+    max_bs: int,
+    is_draft: bool,
+    dim: int,
+    kv_dtype: torch.dtype = torch.bfloat16,
+):
     spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=HQ,
@@ -65,7 +94,7 @@ def _backend(num_draft_tokens: int, max_bs: int, is_draft: bool, dim: int):
     cfg = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype=kv_dtype,
         kernel_page_size=PAGE,
         context_len=2048,
         max_bs=max_bs,
@@ -81,7 +110,7 @@ def _backend(num_draft_tokens: int, max_bs: int, is_draft: bool, dim: int):
     return backend
 
 
-def _layer(dim: int, sliding_window_size: int = -1):
+def _layer(dim: int, sliding_window_size: int = -1, kv_scales=None):
     return SimpleNamespace(
         layer_id=0,
         tp_q_head_num=HQ,
@@ -92,21 +121,36 @@ def _layer(dim: int, sliding_window_size: int = -1):
         scaling=dim**-0.5,
         logit_cap=0.0,
         sliding_window_size=sliding_window_size,
+        fp8_kv_scales=None if kv_scales is None else FP8TensorScales(*kv_scales),
     )
 
 
-def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_left=-1):
+def _problem(
+    seq_lens,
+    rows,
+    window,
+    max_pages,
+    gen,
+    dim,
+    poison=None,
+    window_left=-1,
+    kv_dtype=torch.bfloat16,
+    kv_scales=None,
+):
     """Paged K/V rows for every request's keys, queries, window masks, and the
     fp32 reference: row r sees the prefix and window key j when bit j % 64 of
     its mask word j // 64 is set. With ``window_left`` the row decodes at the
-    prefix end and sees only the last ``window_left + 1`` prefix keys."""
+    prefix end and sees only the last ``window_left + 1`` prefix keys. The
+    reference reads the K/V rows as stored (an FP8 cache dequantized), times
+    ``kv_scales`` when given."""
+    ks, vs = (1.0, 1.0) if kv_scales is None else kv_scales
     bs = len(seq_lens)
     pages = (max(seq_lens) + PAGE - 1) // PAGE
     table = torch.zeros(bs, max_pages, dtype=torch.int32)
     table[:, :pages] = (torch.randperm(bs * pages, generator=gen) + 1).view(bs, pages)
     rows_shape = ((bs * pages + 1) * PAGE, HKV, dim)
-    k_rows = torch.randn(rows_shape, generator=gen).bfloat16()
-    v_rows = torch.randn(rows_shape, generator=gen).bfloat16()
+    k_rows = torch.randn(rows_shape, generator=gen).to(kv_dtype)
+    v_rows = torch.randn(rows_shape, generator=gen).to(kv_dtype)
     q = torch.randn(bs * rows, HQ, dim, generator=gen).bfloat16()
     words = (window + 63) // 64
     if words == 1:
@@ -133,8 +177,8 @@ def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_le
     for b, length in enumerate(seq_lens):
         pos = torch.arange(length)
         slots = (table[b, pos // PAGE].long() * PAGE + pos % PAGE).tolist()
-        kk = k_rows[slots].float().repeat_interleave(HQ // HKV, 1)
-        vv = v_rows[slots].float().repeat_interleave(HQ // HKV, 1)
+        kk = k_rows[slots].float().repeat_interleave(HQ // HKV, 1) * ks
+        vv = v_rows[slots].float().repeat_interleave(HQ // HKV, 1) * vs
         prefix = length - window
         first = 0 if window_left < 0 else prefix - 1 - window_left
         for i in range(rows):
@@ -169,16 +213,24 @@ def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_le
     return table.cuda(), q.cuda(), bits.cuda(), pool, ref
 
 
+@KV_DTYPES
 @pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("nodes", [4, 16, 64])
-def test_tree_verify_matches_reference(nodes, dim):
+def test_tree_verify_matches_reference(nodes, dim, kv_dtype, kv_scales):
     gen = torch.Generator().manual_seed(nodes + dim)
     # Long and short committed prefixes, including ones shorter than the window.
     committed = [700, 1, nodes - 2, 130]
     seq_lens = [c + nodes for c in committed]
-    backend = _backend(nodes, max_bs=8, is_draft=False, dim=dim)
+    backend = _backend(nodes, max_bs=8, is_draft=False, dim=dim, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, nodes, nodes, backend.max_num_pages, gen, dim
+        seq_lens,
+        nodes,
+        nodes,
+        backend.max_num_pages,
+        gen,
+        dim,
+        kv_dtype=kv_dtype,
+        kv_scales=kv_scales,
     )
     mask = torch.zeros(8 * nodes, dtype=torch.int64, device="cuda")
     mask[: len(seq_lens) * nodes] = bits
@@ -189,23 +241,36 @@ def test_tree_verify_matches_reference(nodes, dim):
     backend.refresh_decode_metadata(
         bs, bs, torch.tensor(seq_lens, dtype=torch.int32, device="cuda"), table
     )
-    out = backend.forward_decode(q, None, None, _layer(dim), None, pool, bs)
+    # The decode query stays in the model dtype under a bound tree.
+    layer = _layer(dim, kv_scales=kv_scales)
+    assert backend.query_dtype(layer, DECODE, torch.bfloat16) == torch.bfloat16
+    out = backend.forward_decode(q, None, None, layer, None, pool, bs)
+    tol = _tol(kv_scales)
     torch.testing.assert_close(
-        out.view(-1, HQ, dim).float().cpu(), ref, atol=2e-2, rtol=2e-2
+        out.view(-1, HQ, dim).float().cpu(), ref, atol=tol, rtol=tol
     )
 
 
+@KV_DTYPES
 @pytest.mark.parametrize("poison", [None, float("nan")])
 @pytest.mark.parametrize("topk,steps", [(2, 7), (4, 4), (8, 5)])
-def test_tree_lanes_match_reference(topk, steps, poison):
+def test_tree_lanes_match_reference(topk, steps, poison, kv_dtype, kv_scales):
     dim = 128
     gen = torch.Generator().manual_seed(topk * 10 + steps)
     window = (steps - 1) * topk
     frontier = [700, 1, 3, 130]
     seq_lens = [f + window for f in frontier]
-    backend = _backend(window, max_bs=8, is_draft=True, dim=dim)
+    backend = _backend(window, max_bs=8, is_draft=True, dim=dim, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, topk, window, backend.max_num_pages, gen, dim, poison
+        seq_lens,
+        topk,
+        window,
+        backend.max_num_pages,
+        gen,
+        dim,
+        poison,
+        kv_dtype=kv_dtype,
+        kv_scales=kv_scales,
     )
     lanes = TreeDraftInputs(topk, steps, 8, torch.device("cuda"))
     backend.bind_tree_draft(lanes)
@@ -216,17 +281,21 @@ def test_tree_lanes_match_reference(topk, steps, poison):
         bs, bs, torch.tensor(frontier, dtype=torch.int32, device="cuda"), table
     )
     lanes.active = True
-    out = backend.forward_decode(q, None, None, _layer(dim), None, pool, bs)
+    out = backend.forward_decode(
+        q, None, None, _layer(dim, kv_scales=kv_scales), None, pool, bs
+    )
     lanes.active = False
+    tol = _tol(kv_scales)
     torch.testing.assert_close(
-        out.view(-1, HQ, dim).float().cpu(), ref, atol=2e-2, rtol=2e-2
+        out.view(-1, HQ, dim).float().cpu(), ref, atol=tol, rtol=tol
     )
 
 
 # 80 slots: two mask words per row, the second partly used.
+@KV_DTYPES
 @pytest.mark.parametrize("topk,steps", [(4, 5), (8, 11)])
 @pytest.mark.parametrize("window_left", [-1, 40])
-def test_eagle4_lanes_match_reference(window_left, topk, steps):
+def test_eagle4_lanes_match_reference(window_left, topk, steps, kv_dtype, kv_scales):
     """EAGLE-4 lanes: a sliding-window draft layer decodes each lane row's
     prefix alone (per-row tables), then its window ancestors; windows past 64
     slots read the ancestors from the next mask word."""
@@ -236,9 +305,18 @@ def test_eagle4_lanes_match_reference(window_left, topk, steps):
     # Prefixes past, at, and inside the sliding window.
     frontier = [700, 41, 3, 130]
     seq_lens = [f + window for f in frontier]
-    backend = _backend(window, max_bs=8, is_draft=True, dim=dim)
+    backend = _backend(window, max_bs=8, is_draft=True, dim=dim, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, topk, window, backend.max_num_pages, gen, dim, None, window_left
+        seq_lens,
+        topk,
+        window,
+        backend.max_num_pages,
+        gen,
+        dim,
+        None,
+        window_left,
+        kv_dtype=kv_dtype,
+        kv_scales=kv_scales,
     )
     lanes = Eagle4TreeLanes(
         topk, steps, 8, torch.device("cuda"), slides=window_left >= 0
@@ -253,11 +331,12 @@ def test_eagle4_lanes_match_reference(window_left, topk, steps):
     )
     lanes.active = True
     out = backend.forward_decode(
-        q, None, None, _layer(dim, window_left), None, pool, bs
+        q, None, None, _layer(dim, window_left, kv_scales), None, pool, bs
     )
     lanes.active = False
+    tol = _tol(kv_scales)
     torch.testing.assert_close(
-        out.view(-1, HQ, dim).float().cpu(), ref, atol=2e-2, rtol=2e-2
+        out.view(-1, HQ, dim).float().cpu(), ref, atol=tol, rtol=tol
     )
 
 
@@ -390,8 +469,19 @@ def test_tree_verify_refuses_a_sliding_window_layer():
         backend.forward_decode(q, None, None, _layer(dim, 16), None, pool, bs)
 
 
-def test_tree_support_blocks_an_fp8_cache():
-    """The window kernel reads the cache unscaled, so a scaled FP8 cache has no tree path."""
+@pytest.mark.parametrize(
+    "kv_dtype,mxfp8,supported",
+    [
+        (torch.bfloat16, False, True),
+        (FP8, False, True),
+        (torch.float8_e5m2, False, False),
+        (FP8, True, False),
+    ],
+    ids=["bf16", "fp8_e4m3", "fp8_e5m2", "mxfp8"],
+)
+def test_tree_support_by_cache_dtype(kv_dtype, mxfp8, supported):
+    """The cascade's Triton kernels widen an E4M3 cache (per-tensor scales
+    included); E5M2 and MXFP8 caches have no tree path."""
     spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=HQ,
@@ -402,17 +492,18 @@ def test_tree_support_blocks_an_fp8_cache():
     cfg = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_dtype=kv_dtype,
         kernel_page_size=PAGE,
         context_len=2048,
         max_bs=8,
         max_resident_requests=8,
         kv_cache_quant_method="none",
+        kv_cache_mxfp8=mxfp8,
         speculative_num_steps=3,
         speculative_num_draft_tokens=4,
         is_draft=False,
         components=(spec,),
     )
     support = MHAAttnBackend(cfg, spec, kernel_page_size=PAGE).tree_support()
-    assert support.verify_blocker is not None and support.draft_blocker is not None
-    assert _backend(4, 8, False, 128).tree_support().verify_blocker is None
+    assert (support.verify_blocker is None) == supported
+    assert (support.draft_blocker is None) == supported
