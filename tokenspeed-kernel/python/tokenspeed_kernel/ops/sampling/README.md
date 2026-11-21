@@ -21,6 +21,17 @@ The same synchronization is required for eager execution and graph replay.
 delayed global histogram atomics. It checks bucket counts, stable Top-K results
 and Top-P counter integrity for uniform and K+1 boundary inputs in both modes.
 
+The bucket counts also hold only while every radix pass reads the same input.
+With PDL, a kernel may start before the preceding kernel's stores are visible,
+and the softmax kernels signal launch completion while other threads of the
+block are still storing probabilities. Every kernel of the pipeline therefore
+calls `cudaGridDependencySynchronize()` before it touches global memory. A
+pass that histograms a row softmax is still writing counts values the later
+passes no longer see, which exceeds the output capacity in the same way as an
+undercount. `test/nvidia/ops/test_sampling_topk_pdl.py` runs the pipeline behind
+a producer that signals launch completion before it stores the probabilities,
+and checks the renormalized rows and the Top-P input pointers in both modes.
+
 ## Packed probability sampling (`packed_verify.py`)
 
 `sample_probs` draws from already filtered and normalized FP32 rows.
