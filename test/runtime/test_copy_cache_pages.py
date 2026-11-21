@@ -296,6 +296,8 @@ class TestFinishTailHitCopyCudaTest:
                         attn_kind=ts.AttnKind.Full,
                     )
                 ],
+                num_disk_pages=0,
+                disk_config=None,
             )
         )
 
@@ -471,6 +473,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             kvp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
         # A model executor without a model (none is loaded here): the fields
         # its page copy and page zeroing read, and no drafter for the handle
@@ -509,6 +512,8 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 prefill_decode_interval=0,
                 prefill_decode_min_interval=0,
                 cache_groups=pool_to_cache_groups(pool),
+                num_disk_pages=0,
+                disk_config=None,
             )
             scheduler = ts.Scheduler(scheduler_config)
 
@@ -792,6 +797,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             kvp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
         # A model executor without a model, as above; the plans here copy and
         # zero no page.
@@ -1008,6 +1014,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             kvp_rank=0,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
         # A model executor without a model, as above.
         model_executor = ModelExecutor.__new__(ModelExecutor)

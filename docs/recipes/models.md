@@ -279,6 +279,51 @@ ts serve thinkingmachines/Inkling-2-Small \
     --speculative-algorithm DSPARK
 ```
 
+### Inkling 2 Mini
+
+Inkling 2 Mini, `thinkingmachines/Inkling-2-Mini`, is a looped Inkling 2: 24
+layers of width 2304, NVFP4 experts in layers 0-19, MXFP8 experts in layers
+20-23, everything else BF16. Its core, layers 6-17, runs three times per token.
+The checkpoint declares the architecture
+`Inkling2LoopForConditionalGeneration`. As with Inkling 2 Small, the DSpark
+draft ships in the same directory and `ts serve` selects the `inkling2`
+reasoning parser. The checkpoint sets no draft width, so DSpark proposes three
+tokens per round.
+
+On AMD, the command is Inkling 2 Small's with three changes:
+
+- `--decode-monokernel`: decode steps of 1, 2, 4 or 8 requests run each layer
+  in persistent gfx950 kernels, with the same output as without the flag.
+- `--max-model-len 262120`: the context Inkling 2 Mini is validated at. The
+  checkpoint covers 1,048,576 positions, 24 fewer with the draft.
+- `--cudagraph-capture-sizes 1 2 4 8 16 32 64`: decode graphs for up to 64
+  requests. Graph capture at the default sizes, up to 80, does not finish on
+  Inkling 2 Mini yet.
+
+```bash
+ts serve thinkingmachines/Inkling-2-Mini \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 262120 --sampling-backend triton \
+    --attention-backend triton --drafter-attention-backend triton \
+    --mm-attention-backend triton_attn \
+    --speculative-algorithm DSPARK --decode-monokernel \
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64
+```
+
+Each pass of the core keeps its own KV and convolution caches. Two options
+change the loop:
+
+- `--inkling2-loop-num-passes N`: run the core N times instead of three. With a
+  DSpark draft only the checkpoint's count is accepted, and with
+  `--decode-monokernel` at most 4.
+- `--inkling2-loop-share-cache`: the passes of a core layer share its KV cache,
+  so the cache does not grow with the pass count. Each pass keeps its own
+  convolution state.
+
+Layerwise PD cache transfer and sequence-parallel prefill are not supported
+for looped checkpoints: a PD prefill server must pass
+`--disaggregation-layerwise-interval 0`.
+
 ## MiniMax M3
 
 MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
@@ -732,10 +777,10 @@ Notes:
 - The NVIDIA command below captures each prefill bucket for 1 and for up to
   64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
   several requests also runs its KDA layers inside the graph instead of at
-  eager breaks. On 2 GB300 nodes, this cut the time-to-first-token of 2 to 64
-  concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
-  GPU and 2 to 3 more minutes of startup.
-- The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
+  eager breaks. On 2 GB300 nodes with the MLA preview draft, this cut the
+  time-to-first-token of 2 to 64 concurrent short prompts by 40% to 55%, for
+  about 0.7 GB less KV cache per GPU and 2 to 3 more minutes of startup.
+- The earlier MLA preview draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes up to 7 tokens per step: its checkpoint sets 7 drafts with
   `--speculative-num-draft-tokens 8` by default, and explicit widths draft
   fewer (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`).
@@ -762,8 +807,8 @@ Notes:
 
 Install `flash-linear-attention` for the KDA layers, as for
 [Kimi K3](#kimi-k3), then serve with the DSpark draft on 8 Blackwell GPUs.
-This launch was validated on 2 GB300 nodes with 4 GPUs each. On such nodes,
-start each one with the command below plus
+For a deployment on 2 nodes with 4 GPUs each, start each node with the command
+below plus
 `--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
 `<rank>` is the node's rank (`0` on the first node, `1` on the second) and
 `<first-node>:<port>` is the first node's address and a free port on it. Drop
@@ -781,49 +826,66 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --max-num-seqs 64 \
   --prefill-graph-capture-batch-sizes 1 64 \
   --speculative-algorithm DSPARK \
-  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark \
   --speculative-num-draft-tokens 8 \
-  --drafter-attention-backend tokenspeed_mla \
+  --drafter-attention-backend mha \
   --host 0.0.0.0 \
   --port 8000
 ```
 
 ### AMD
 
-On 8x MI350X/MI355X (gfx950), serve at TP8 with Kimi-K3's EAGLE-3.1 draft
-(`lightseekorg/kimi-k3-eagle3.1-mla`), which accepts slightly more tokens per
-step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
-22% larger than K3's, so at the default `--gpu-memory-utilization`, 15 requests
-of 50K input and 500 output tokens run at once.
+On 8x MI350X/MI355X (gfx950), serve at TP8 with KV parallelism 8 and the
+released Kimi-K3.1 DSpark draft. CI's Kimi-K3.1 AMD accuracy and performance
+jobs serve this same command, and `test/ci_system/test_eval_configs.py` fails
+if the two drift apart.
 
 ```bash
 GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
-  --max-model-len 65536 \
+  --max-model-len 131072 \
   --kv-cache-dtype fp8 \
+  --dsa-index-k-format mxfp4 \
   --tensor-parallel-size 8 \
   --mm-encoder-tp-mode data \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla \
-  --drafter-attention-backend gluon \
-  --max-num-seqs 64 \
-  --disable-kvstore \
-  --enable-startup-requests \
+  --kv-parallel-size 8 \
+  --decode-context-parallel-size 8 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark \
+  --speculative-num-steps 5 \
+  --drafter-attention-backend mha \
   --prefill-graph-max-tokens 3072 \
   --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072 \
+  --disable-kvstore \
+  --enable-startup-requests \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-- The rest comes from the defaults and the draft's config: a 3-step EAGLE3
-  chain (a 4-token verify window), the draft's capture layers
-  (2, 46, 90) and BF16 weights, TP8 without expert parallelism, automatic MoE
-  selection, an 8192-token prefill budget, and CUDA graph capture sizes up to
-  `--max-num-seqs`.
-- `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
-  kernels and fails fast where none is registered; leaving it unset lets the
-  `mla` backend select the kernels.
+- The rest comes from the defaults: TP8 without expert parallelism, automatic
+  MoE selection, the `dsa` attention backend, an 8192-token prefill budget,
+  `--gpu-memory-utilization 0.95`, prefix caching, and CUDA graph capture sizes
+  up to the speculative `--max-num-seqs` default.
+- `--max-model-len 131072` caps requests at 128K tokens. Raise it for longer
+  prompts; at the checkpoint's full 1M context the speculative verify padding
+  runs past the RoPE tables, and the server warns at startup.
+- `--mm-encoder-tp-mode data`: the vision encoder's 12 heads don't split 8
+  ways, so each GPU keeps a copy of the encoder and encodes whole images.
+- `--kv-parallel-size 8 --decode-context-parallel-size 8`: each GPU stores one
+  eighth of every request's full-attention pages, and decode attends each GPU's
+  share of the selected keys. See
+  [KV parallelism](../serving/parallelism.md#kv-parallelism).
+- `--dsa-index-k-format mxfp4` stores the indexer keys as MXFP4 (68 bytes per
+  token per layer instead of FP8's 132) and scores them against MXFP4 queries.
+- `--speculative-num-steps 5` drafts 5 tokens per step (a 6-token verify
+  window) instead of the draft checkpoint's 7, which suits many concurrent
+  requests better than a single one. A step count equal to the default of 3
+  doesn't override the checkpoint; pass `--speculative-num-draft-tokens 4`
+  with it.
+- `--drafter-attention-backend mha` runs the released draft's sliding-window
+  GQA layers, causally within the block and under KVP (see the draft notes
+  above).
 - Prefill CUDA graphs replay under KV parallelism too, with the DSA attention
   and the KV history gather at eager breaks. `--prefill-graph-max-tokens 3072`
   captures only chunks of up to 3072 new tokens; longer chunks run faster eager.
@@ -836,14 +898,8 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
 - `--enable-startup-requests` has the engine serve a few requests of its own
   before it reports ready, so eager prefill and the request bookkeeping are
   compiled before the first client request instead of during it.
-- Optionally, add `--kv-parallel-size 8 --decode-context-parallel-size 8` for
-  long contexts or many concurrent requests. Each GPU then stores one eighth of
-  every request's full-attention pages, so about 55 requests of 50K input and
-  500 output tokens run at once, and decode attends each GPU's share of the
-  selected keys. See
-  [KV parallelism](../serving/parallelism.md#kv-parallelism).
-  With KV parallelism, also add `--enable-mixed-batch`: decode rows then ride
-  in a prefill chunk's forward instead of waiting for it.
+- `--disable-kvstore` turns off the host-memory KV tier; prefix caching on the
+  GPU stays on.
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2

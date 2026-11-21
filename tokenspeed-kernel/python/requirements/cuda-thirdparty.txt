@@ -8,7 +8,6 @@ tokenspeed-fa3==3.0.0.post20260810
 tokenspeed-fa4==4.0.0.post20260923
 tokenspeed-quack==0.6.4.post20260923
 tokenspeed-flashkda==0.0.1.post20260901
-tokenspeed-cutedsl-kda==0.1.0.post20260923
 # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
 # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
 # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.

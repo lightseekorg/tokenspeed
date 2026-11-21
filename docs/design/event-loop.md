@@ -478,7 +478,10 @@ data-plane calls and their waits for the GIL on the control thread, and each
 operation on the forward thread. The profiler merges them into the trace it
 exports, on their threads' lanes, so a forward thread's operation encloses
 the Python it ran; the C++ scheduler's spans are under the `scheduler`
-category, the rest under `host`. The recording follows the torch profiler's window and
+category, the rest under `host`. Work that overlaps on one thread, as Disk
+operations in flight and peer landings do, records on lane rows instead
+(`profile::Lanes`): each piece holds the lowest free row of its family until
+it ends. The recording follows the torch profiler's window and
 costs one atomic load per span outside it; it keeps only the spans that began
 inside the window, so an operation open as a by-stage profile switches stages
 stays out of the next stage's trace. A trace the merge fails on is written
@@ -858,6 +861,26 @@ until deployment restart. Discard requires both the model and its resolved
 quantization configuration to opt in; quantized post-load derivation must
 rebuild codes and scales in place from the complete new checkpoint, never
 reuse discarded values or mark remapped storage usable on its own.
+
+An L3 full-clear separates logical invalidation from native memory lifetime.
+After the non-storage preflight, healthy I/O is given
+`async.clear_cache_drain_timeout_ms` (default 500 ms) through ordinary rounds;
+the pending flush replies and weight-operation head are preserved while no new
+forward/storage plan starts. Polling, completion agreement and control queries
+continue. The budget does not bound the normal synchronous remote purge.
+An unsafe active namespace skips that healthy wait; a timeout or unsafe scope
+selects retaining clear on every rank. Old tickets detach and keep their exact
+Host addresses, while local indexes clear and new L3 work uses a fresh agreed
+generation. This path performs no remote purge and proves no native retirement.
+A slow healthy timeout still selects this private scope; it does not restore
+cross-Prefill sharing with independent services outside the rank agreement.
+
+Retained memory alone does not keep the serving loop busy. Request/Device-copy
+readiness and progress-pending storage determine frontend idle waiting and
+stall diagnostics; every round still polls and agrees old completions. Metrics
+keep historical `l3_io_quarantined` separate from active-namespace
+`l3_io_blocked`, backend health and capacity pressure. The historical flag guards
+shutdown deregistration; it is not a reason to reject all new-generation I/O.
 The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
@@ -872,11 +895,16 @@ all-to-all EP, broadcasting the committed placement), which the profile's
 is a frontend operation on the first queue that starts the same internal
 sequence. The loop refuses a memory release while a rebalance is in progress
 and, once drained, the release waits while chunk steps still write the
-weights. A cache clear MIN-reduces the scheduler's non-mutating
-`can_clear_cache` across the replica and then across attention DP — DP
-replicas share Mooncake objects — then MIN-reduces an error-returning L3
-namespace deletion, before any rank mutates Device/Host. The frontend
-combines every engine's reply. Independent TokenSpeed jobs that share a tenant are not
+weights. A cache clear agrees its selected non-mutating preflight across the
+replica and attention DP. Without storage it retains ordinary
+`can_clear_cache` semantics. With healthy storage, preparation checks normal
+indexed Device pins and indexed Host owners after accounting for the storage
+references that draining can release. Exact physical-block reference counts,
+active parents and occupied-slot coverage are required when local invalidation
+must retain old storage references, not for every ordinary clear. The strict
+path agrees remote namespace deletion before local mutation; retaining recovery
+instead agrees isolation and performs no remote deletion. The frontend combines
+every engine's reply. Independent TokenSpeed jobs that share a tenant are not
 in those groups.
 
 **The expert rebalance** (`eplb`, `--enable-eplb`). The controller counts the

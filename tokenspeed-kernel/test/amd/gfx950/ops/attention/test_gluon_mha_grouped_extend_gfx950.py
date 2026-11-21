@@ -129,6 +129,44 @@ def test_warp_pipeline_selection(max_q, prefix, total_q, window, expected):
     )
 
 
+@pytest.mark.parametrize(
+    "max_q,prefix,total_q,window,expected",
+    [
+        # FP8 K/V takes the 8-wave tile under the same bounds as 16-bit K/V,
+        # at any query row count past the 64-row tile.
+        (8192, 65536, 8192, -1, True),
+        (150, 100000, 150, -1, True),
+        (384, 512000, 384, -1, True),
+        (64, 100000, 64, -1, False),
+        (4096, 512, 8192, -1, False),
+        (4096, 65536, 4 * 4096, 2047, True),
+        (512, 65536, 512, 2047, False),
+    ],
+)
+def test_fp8_warp_pipeline_selection(max_q, prefix, total_q, window, expected):
+    if not is_amd():
+        pytest.importorskip(
+            "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
+        )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        _use_warp_pipeline,
+    )
+
+    assert (
+        _use_warp_pipeline(
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_q + prefix,
+            total_q=total_q,
+            group_size=8,
+            n_kv_heads=2,
+            head_dim=64,
+            element_size=1,
+            window_left=window,
+        )
+        == expected
+    )
+
+
 @dataclass
 class PagedCase:
     q: torch.Tensor
@@ -465,6 +503,273 @@ def test_warp_pipeline(queries, prefixes, heads, kv_heads, window, sinks):
     torch.testing.assert_close(first_lse, second_lse, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "queries,prefixes,window,sinks",
+    [
+        # A cached-prefill chunk of 8192 rows over a short and a long prefix:
+        # unsplit, as serving's chunks.
+        pytest.param([8192], [8192], -1, False, id="chunk-8k-prefix"),
+        pytest.param([8192], [100000], -1, False, id="chunk-100k-prefix"),
+        # A short extend over a long prefix splits the KV stream: whole splits
+        # sit above some rows' diagonal, the rows with no visible key. At 384
+        # rows the 4-wave split count would leave a partial 8-wave round, so
+        # the launch takes another split count.
+        pytest.param([150], [100000 + 5], -1, False, id="split"),
+        pytest.param([384], [100000 + 5], -1, False, id="split-whole-rounds"),
+        # 2560 rows: more splits than the 4-wave launch, over two rounds.
+        pytest.param([2560], [100000 + 5], -1, False, id="split-more-than-four-wave"),
+        pytest.param([65, 900], [9000, 700 * 64 + 5], -1, True, id="ragged-sinks"),
+        pytest.param([4096], [5000 + 13], 2047, False, id="window"),
+    ],
+)
+@pytest.mark.usefixtures("require_gfx950")
+def test_fp8_warp_pipeline_as_accurate_as_four_wave(
+    queries, prefixes, window, sinks, monkeypatch
+):
+    """FP8 K/V on the 8-wave tile is as close to the FP32 oracle as the 4-wave
+    tile, in output and LSE, and repeats bit for bit."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    case = make_case(
+        queries,
+        prefixes,
+        heads=16,
+        kv_heads=2,
+        window=window,
+        causal=True,
+        sinks=sinks,
+        head_dim=64,
+    )
+    case = dataclasses.replace(
+        case,
+        q=case.q.to(torch.float8_e4m3fn),
+        k=case.k.to(torch.float8_e4m3fn),
+        v=case.v.to(torch.float8_e4m3fn),
+    )
+    assert uses_warp_pipeline(case)
+    expected, expected_lse = reference(case)
+    eight, eight_lse = case.invoke("gluon", return_lse=True)
+    again, again_lse = case.invoke("gluon", return_lse=True)
+    # The 4-wave tile is the launcher's choice whenever the 8-wave tile is not.
+    monkeypatch.setattr(extend, "_use_warp_pipeline", lambda **kwargs: False)
+    four, four_lse = case.invoke("gluon", return_lse=True)
+    torch.testing.assert_close(eight, again, rtol=0, atol=0)
+    torch.testing.assert_close(eight_lse, again_lse, rtol=0, atol=0)
+    # Both tiles round FP8 probabilities the same way up to the order of FP32
+    # sums, so the 8-wave error stays at the 4-wave tile's: within a tenth of
+    # it, plus a few FP32 ulps of LSE.
+    for actual, baseline, oracle, slack in (
+        (eight.float(), four.float(), expected, 0.0),
+        (eight_lse, four_lse, expected_lse, 1e-5),
+    ):
+        error = (actual - oracle).abs()
+        baseline_error = (baseline - oracle).abs()
+        assert error.max() <= 1.1 * baseline_error.max() + slack
+        assert error.mean() <= 1.1 * baseline_error.mean() + slack
+
+
+def fp8_case(queries, prefixes, *, heads, kv_heads):
+    """A full-attention, causal, head-dim-64 case with FP8 Q / K / V."""
+    case = make_case(
+        queries,
+        prefixes,
+        heads=heads,
+        kv_heads=kv_heads,
+        window=-1,
+        causal=True,
+        sinks=False,
+        head_dim=64,
+    )
+    return dataclasses.replace(
+        case,
+        q=case.q.to(torch.float8_e4m3fn),
+        k=case.k.to(torch.float8_e4m3fn),
+        v=case.v.to(torch.float8_e4m3fn),
+    )
+
+
+@pytest.mark.parametrize(
+    "queries,prefixes",
+    [
+        # A served long-prefix chunk of one request (Muse Spark TP4: 32
+        # query, 4 KV heads) at 156k cached keys.
+        pytest.param([2500], [156000], id="long-prefix-chunk"),
+        # A short extend over a long prefix takes the split-K kernel.
+        pytest.param([150], [131072 + 5], id="split"),
+    ],
+)
+@pytest.mark.usefixtures("require_gfx950")
+def test_fp8_eight_wave_occupancy_keeps_every_bit(queries, prefixes, monkeypatch):
+    """The FP8 full-attention 8-wave tile of one request, at four waves a
+    SIMD, gives the same output and LSE bits as at the
+    compiler's occupancy, and repeats bit for bit."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    case = fp8_case(queries, prefixes, heads=32, kv_heads=4)
+    assert uses_warp_pipeline(case)
+    capped, capped_lse = case.invoke("gluon", return_lse=True)
+    again, again_lse = case.invoke("gluon", return_lse=True)
+    launch_options = extend._launch_options
+
+    def compiler_occupancy(*args, **kwargs):
+        options = launch_options(*args, **kwargs)
+        options.pop("waves_per_eu")
+        return options
+
+    # The launch as it compiled before the occupancy cap.
+    monkeypatch.setattr(extend, "_launch_options", compiler_occupancy)
+    base, base_lse = case.invoke("gluon", return_lse=True)
+    torch.testing.assert_close(capped, again, rtol=0, atol=0)
+    torch.testing.assert_close(capped_lse, again_lse, rtol=0, atol=0)
+    torch.testing.assert_close(capped, base, rtol=0, atol=0)
+    torch.testing.assert_close(capped_lse, base_lse, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "num_warps,element_size,window,single_request,capped",
+    [
+        # Only the FP8 full-attention 8-wave tile of a one-request batch
+        # takes the occupancy cap.
+        (8, 1, -1, True, True),
+        (8, 1, -1, False, False),
+        (8, 1, 2047, True, False),
+        (8, 2, -1, True, False),
+        (4, 1, -1, True, False),
+        (2, 1, -1, True, False),
+    ],
+)
+def test_eight_wave_occupancy_selection(
+    num_warps, element_size, window, single_request, capped
+):
+    if not is_amd():
+        pytest.importorskip(
+            "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
+        )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    options = extend._launch_options(
+        num_warps,
+        element_size=element_size,
+        window_left=window,
+        single_request=single_request,
+    )
+    assert options["num_warps"] == num_warps
+    assert options.get("waves_per_eu") == (4 if capped else None)
+
+
+@pytest.mark.usefixtures("require_gfx950")
+def test_fp8_request_count_keeps_bits_and_compiles_at_warmup():
+    """A one-request FP8 batch runs the 8-wave tile at four waves a
+    SIMD, a batch of several requests at the
+    compiler's occupancy. A request gets the same output and LSE bits alone
+    as beside a copy of itself, and after the warm-up neither launch
+    compiles, unsplit or split."""
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_reduce_gfx950,
+        gluon_mha_extend_split_gfx950,
+    )
+    from utils import assert_no_triton_compile
+
+    # 4096 rows over a 9000-key prefix fill the CUs unsplit, alone and
+    # doubled; 150 rows over 20000 keys split the KV stream.
+    for queries, prefix, unsplit in ((4096, 9000, True), (150, 20000, False)):
+        two = fp8_case([queries, queries], [prefix, prefix], heads=16, kv_heads=2)
+        # The second request repeats the first: same queries, same pages.
+        two.q[queries:] = two.q[:queries]
+        two.table[1] = two.table[0]
+        one = fp8_case([queries], [prefix], heads=16, kv_heads=2)
+        one = dataclasses.replace(
+            one, q=two.q[:queries], k=two.k, v=two.v, table=two.table[:1]
+        )
+        assert uses_warp_pipeline(one) and uses_warp_pipeline(two)
+        with kernel_warmup(enabled=True):
+            one.invoke("gluon", return_lse=True)
+        with assert_no_triton_compile(
+            gluon_mha_extend_gfx950,
+            gluon_mha_extend_split_gfx950,
+            gluon_mha_extend_reduce_gfx950,
+        ):
+            single, single_lse = one.invoke("gluon", return_lse=True)
+            double, double_lse = two.invoke("gluon", return_lse=True)
+        torch.testing.assert_close(double[:queries], double[queries:], rtol=0, atol=0)
+        if unsplit:
+            # The same sums in the same order at either occupancy.
+            torch.testing.assert_close(single, double[:queries], rtol=0, atol=0)
+            torch.testing.assert_close(single_lse, double_lse[:queries], rtol=0, atol=0)
+        expected, expected_lse = reference(one)
+        torch.testing.assert_close(single.float(), expected, rtol=8e-2, atol=8e-2)
+        torch.testing.assert_close(single_lse, expected_lse, rtol=0, atol=2e-4)
+
+
+@pytest.mark.parametrize(
+    "heads,kv_heads,queries,prefix",
+    [
+        # Muse Spark TP4 (32 query, 4 KV heads): 16 query blocks a head, so
+        # each head runs on two XCDs; 2 KV heads take four each.
+        pytest.param(32, 4, 4096, 20000, id="tp4"),
+        pytest.param(16, 2, 4096, 9000, id="tp8"),
+    ],
+)
+@pytest.mark.usefixtures("require_gfx950")
+def test_xcd_head_order_keeps_every_bit(heads, kv_heads, queries, prefix):
+    """The unsplit kernel places each KV head's workgroups on their own XCDs.
+    Every workgroup still computes one (query block, head), so a request's
+    output equals the oracle and repeats bit for bit beside another request."""
+    two = fp8_case([queries, queries], [prefix, prefix], heads=heads, kv_heads=kv_heads)
+    two.q[queries:] = two.q[:queries]
+    two.table[1] = two.table[0]
+    one = fp8_case([queries], [prefix], heads=heads, kv_heads=kv_heads)
+    one = dataclasses.replace(
+        one, q=two.q[:queries], k=two.k, v=two.v, table=two.table[:1]
+    )
+    single, single_lse = one.invoke("gluon", return_lse=True)
+    double, double_lse = two.invoke("gluon", return_lse=True)
+    torch.testing.assert_close(single, double[:queries], rtol=0, atol=0)
+    torch.testing.assert_close(single, double[queries:], rtol=0, atol=0)
+    torch.testing.assert_close(single_lse, double_lse[:queries], rtol=0, atol=0)
+    expected, expected_lse = reference(one)
+    torch.testing.assert_close(single.float(), expected, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(single_lse, expected_lse, rtol=0, atol=2e-4)
+
+
+@pytest.mark.usefixtures("require_gfx950")
+def test_extend_rejects_head_slices_of_the_cache():
+    # The kernels read K / V pages as contiguous [pages, 64, kv_heads, dim];
+    # a head slice of a larger cache has other strides and must not be read
+    # as that layout.
+    case = make_case(
+        [256],
+        [1000],
+        heads=32,
+        kv_heads=4,
+        window=-1,
+        causal=True,
+        sinks=False,
+        head_dim=64,
+    )
+    sliced = dataclasses.replace(
+        case, q=case.q[:, :16], k=case.k[:, :, :2], v=case.v[:, :, :2]
+    )
+    with pytest.raises(ValueError, match="contiguous"):
+        sliced.invoke("gluon", return_lse=False)
+
+
+@pytest.mark.usefixtures("require_gfx950")
+def test_fp8_eight_wave_reads_pages_past_int32_range():
+    # The FP8 8-wave tile computes each KV page base in 64-bit too: pages past
+    # 2**31 elements read exactly what the same pages read in a small pool.
+    case = fp8_case([256], [20000], heads=32, kv_heads=4)
+    assert uses_warp_pipeline(case)
+    expected = case.invoke("gluon", return_lse=False)
+    (k_far, v_far), far_table = move_pages_past_int32((case.k, case.v), case.table)
+    far_case = dataclasses.replace(case, k=k_far, v=v_far, table=far_table)
+    actual = far_case.invoke("gluon", return_lse=False)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def assert_graph_replay_follows_metadata(case: PagedCase, updates):
     """Capture case once, then for each (queries, lengths) rewrite the
     metadata in place and check the replay against eager and the oracle,
@@ -618,3 +923,122 @@ def test_extend_reads_pages_past_int32_range(queries, prefixes, window, head_dim
     actual = far_case.invoke("gluon", return_lse=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _one_request(case: PagedCase, request: int) -> PagedCase:
+    """The same request launched alone: its own grid, block count and order."""
+    start = int(case.cu_q[request])
+    rows = case.queries[request]
+    length = int(case.lengths[request])
+    return dataclasses.replace(
+        case,
+        q=case.q[start : start + rows],
+        table=case.table[request : request + 1],
+        lengths=case.lengths[request : request + 1],
+        cu_q=torch.tensor([0, rows], device="cuda", dtype=torch.int32),
+        cu_kv=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+        queries=[rows],
+        max_q=rows,
+        max_k=length,
+    )
+
+
+# Batched and alone launches here pick the same tile and KV split count (a
+# split count is part of the numerics, so cases keep it at one): under full
+# attention every request has at least 4096 rows over a prefix of at least
+# 8192 keys (8-wave tile, the grid fills the machine unsplit); under the
+# window every launch takes the 8-wave tile's 1-4 rounds of work-groups.
+_PLACEMENT_CASES = {
+    -1: [
+        # A rectangular launch whose blocks x KV heads leave a remainder on
+        # 8 XCDs (129 blocks a request), alone and batched.
+        pytest.param([4112] * 3, [9000 + 5] * 3, id="rect-tail"),
+        pytest.param([4096] * 2, [12000 + 3] * 2, id="rect"),
+        pytest.param([4100, 6000, 4500], [9000 + 7, 12000, 8500 + 1], id="ragged"),
+    ],
+    2047: [
+        pytest.param([2100] * 2, [9000 + 5] * 2, id="rect"),
+        pytest.param([2100, 2300], [9000 + 7, 3000 + 1], id="ragged"),
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "window,queries,prefixes",
+    [
+        pytest.param(window, *case.values, id=f"w{window}-{case.id}")
+        for window, cases in _PLACEMENT_CASES.items()
+        for case in cases
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.usefixtures("require_gfx950")
+def test_work_group_placement_keeps_every_bit(window, queries, prefixes, dtype):
+    """Where a (query block, KV head) runs and in which order is placement
+    only: a batched launch writes exactly the bytes of each request launched
+    alone, whose grids, remap tails and orders all differ."""
+    case = make_case(
+        queries,
+        prefixes,
+        heads=32,
+        kv_heads=4,
+        window=window,
+        causal=True,
+        sinks=False,
+        head_dim=64,
+    )
+    if dtype == torch.bfloat16:
+        # Every block runs once: a skipped or repeated block misses the oracle.
+        assert_reference(case)
+    else:
+        case = dataclasses.replace(
+            case, q=case.q.to(dtype), k=case.k.to(dtype), v=case.v.to(dtype)
+        )
+    alone_cases = [_one_request(case, request) for request in range(len(queries))]
+    for single in alone_cases:
+        assert uses_warp_pipeline(single) == uses_warp_pipeline(case)
+    batched = case.invoke("gluon", return_lse=False)
+    alone = torch.cat(
+        [single.invoke("gluon", return_lse=False) for single in alone_cases]
+    )
+    assert torch.equal(batched.view(torch.int16), alone.view(torch.int16))
+
+
+@pytest.mark.usefixtures("require_gfx950")
+def test_work_group_placement_does_not_recompile():
+    """The remap reads the grid at run time: once the launcher's warmup has
+    compiled every variant for these heads, batch shapes that change the block
+    count, the remap tail and the grid layout compile nothing new."""
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+    from utils import assert_no_triton_compile
+
+    def run(queries, prefix):
+        case = make_case(
+            queries,
+            [prefix] * len(queries),
+            heads=32,
+            kv_heads=4,
+            window=-1,
+            causal=True,
+            sinks=False,
+            head_dim=64,
+        )
+        # The page table's row stride is compiled in, as the served table's
+        # fixed width is: pad every batch's table to one width.
+        table = torch.full(
+            (len(queries), 256), 1 << 30, device="cuda", dtype=torch.int32
+        )
+        table[:, : case.table.shape[1]] = case.table
+        dataclasses.replace(case, table=table).invoke("gluon", return_lse=False)
+
+    with kernel_warmup(enabled=True):
+        run([100], 300)
+    with assert_no_triton_compile(
+        extend.gluon_mha_extend_gfx950,
+        extend.gluon_mha_extend_split_gfx950,
+        extend.gluon_mha_extend_reduce_gfx950,
+    ):
+        for queries in ([1056], [1040] * 2, [1040] * 3, [640, 1500], [900, 33, 1200]):
+            for prefix in (300, 9000):
+                run(queries, prefix)

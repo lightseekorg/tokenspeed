@@ -579,7 +579,13 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
     output, sentinel = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
+        hidden,
+        router_input,
+        hidden.shape[0],
+        hidden.shape[0],
+        None,
+        project=True,
+        payload="bf16",
     )
     assert sentinel is None
 
@@ -1186,7 +1192,7 @@ def test_owned_attention_stores_prepared_rows_once(
     attention.owned_projections = None
 
     attention.iris_state = SimpleNamespace(
-        all_to_all_transpose_qkvg_norm_rope=lambda *args: (
+        all_to_all_transpose_qkvg_norm_rope=lambda *args, payload: (
             prepared_q,
             prepared_k,
             prepared_v,
@@ -1461,6 +1467,7 @@ def test_experts_combined_prepares_routing_once_per_token_count(
             tokens,
             prepared,
             False,
+            payload="bf16",
         )
 
     combine(2, None)
@@ -1513,6 +1520,27 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
     )
 
     with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+
+
+def test_int8_payload_without_iris_fails_startup_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prefill-collective-payload int8-block16 encodes only Iris owned-row
+    collectives: a server whose Iris cannot be prepared refuses it at startup
+    instead of serving with the flag inert."""
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", "int8-block16"
+    )
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[],
+            config=SimpleNamespace(decode_monokernel=False),
+            owned_projections=None,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
         MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
@@ -1773,6 +1801,7 @@ def _gathered_mxfp4_workspace_worker(
             enable_lamport=enable_lamport,
             owned_route_max_rows=0,
             intermediate_gather_max_rows=0,
+            int8_payloads=False,
             all_reduce=None,
             group=dist.group.WORLD,
             rank_in_group=rank,
@@ -2012,6 +2041,44 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
+
+
+@pytest.mark.parametrize("flag", ["bf16", "int8-block16"])
+def test_prefill_collective_payload_applies_to_extend_forwards_only(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """--prefill-collective-payload selects the owned-row collectives'
+    encoding of extend forwards; every other forward mode stays BF16."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    monkeypatch.setitem(
+        module.global_server_args_dict, "prefill_collective_payload", flag
+    )
+    for mode in ForwardMode:
+        expected = flag if mode == ForwardMode.EXTEND else "bf16"
+        assert module._collective_payload(mode) == expected, mode
+
+
+def test_prefill_collective_payload_choices_match_the_iris_state() -> None:
+    """ServerArgs validates the flag; the Iris state takes the same names."""
+    if not current_platform().is_cdna4:
+        pytest.skip("the Iris state is importable on AMD CDNA4 only")
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MUSE_PAYLOADS
+
+    from tokenspeed.runtime.utils.server_args import PREFILL_COLLECTIVE_PAYLOADS
+
+    assert tuple(PREFILL_COLLECTIVE_PAYLOADS) == tuple(MUSE_PAYLOADS)
+
+
+def test_prefill_collective_payload_is_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--prefill-collective-payload"):
+        ServerArgs(model="x", prefill_collective_payload="fp8")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
+        )
 
 
 if __name__ == "__main__":

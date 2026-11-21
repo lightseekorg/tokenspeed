@@ -116,6 +116,33 @@ def _communication_worker(rank, world_size, port, check, backend, error_dict):
             dist.destroy_process_group()
 
 
+def _muse_boundary_norms(device):
+    """A Muse layer's post-attention norm (no weight) and pre-feedforward norm,
+    with the model's zero-centered gain, on device in BF16."""
+    from tokenspeed.runtime.models.muse_spark import (
+        ZERO_CENTERED_GAIN_OFFSET,
+        MuseSparkRMSNorm,
+    )
+
+    post_norm = MuseSparkRMSNorm(
+        hidden_size=8192,
+        eps=1e-6,
+        has_weight=False,
+        weight_offset=ZERO_CENTERED_GAIN_OFFSET,
+    )
+    pre_norm = MuseSparkRMSNorm(
+        hidden_size=8192,
+        eps=1e-6,
+        has_weight=True,
+        weight_offset=ZERO_CENTERED_GAIN_OFFSET,
+    ).to(device=device, dtype=torch.bfloat16)
+    # Equal on every rank, without moving the caller's random stream.
+    generator = torch.Generator(device=device).manual_seed(7)
+    with torch.no_grad():
+        pre_norm.weight.copy_(torch.randn(8192, device=device, generator=generator) / 8)
+    return post_norm, pre_norm
+
+
 def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
@@ -135,10 +162,16 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             post_expert_proj=None,
             down_columns=None,
         )
+    # Preparation warms the attention boundary with the first layer's norms.
+    post_norm, pre_norm = _muse_boundary_norms(
+        torch.device("cuda", torch.cuda.current_device())
+    )
     layer = SimpleNamespace(
         iris_state=None,
         self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
         mlp=moe,
+        post_attention_layernorm=post_norm,
+        pre_feedforward_layernorm=pre_norm,
     )
     owner = SimpleNamespace(
         mapping=SimpleNamespace(
@@ -275,7 +308,9 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         fused = reference = None
         if full.shape[0] >= MUSE_OWNED_QKVG_MIN_TOKENS:
             projected = projection.project_owned_rows(local, full.shape[0])
-            output = state.all_to_all_transpose_qkvg(projected, full.shape[0])
+            output = state.all_to_all_transpose_qkvg(
+                projected, full.shape[0], payload="bf16"
+            )
             table = rope if full.shape[0] < 4096 else nope
             q, k, v, gate = output.split(
                 tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
@@ -301,13 +336,19 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             if rank == full.shape[0] % world_size:
                 torch.cuda._sleep(20000)
             fused = state.all_to_all_transpose_qkvg_norm_rope(
-                projected, full.shape[0], positions, table, eps, q_scale
+                projected,
+                full.shape[0],
+                positions,
+                table,
+                eps,
+                q_scale,
+                payload="bf16",
             )
         else:
             normalized = state.all_gather_owned_rows(local, full.shape[0], True)
             output, _ = projection(normalized)
         # O's next producer can overwrite every old QKVG source address.
-        reduced = state.reduce_scatter_owned_rows(poison)
+        reduced = state.reduce_scatter_owned_rows(poison, payload="bf16")
         gathered = state.all_gather_owned_rows(reduced, full.shape[0], True)
         return output, gathered, previous, fused, reference
 
@@ -489,6 +530,7 @@ def _muse_tp_routes_worker(rank, world_size, device):
                 tokens,
                 weights,
                 owned_rows=owned,
+                payload="bf16",
             )
 
         if scattered:
@@ -676,12 +718,14 @@ def _muse_tp_owned_forward_worker(
             full = torch.randn(rows, 8192, device=device)
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
-            expected_rows, _, _ = moe(
-                full, full.float(), rows, rows, None, project=True
+            expected_rows, _ = moe(
+                full, full.float(), rows, rows, None, project=True, payload="bf16"
             )
             expected_rows = expected_rows.clone()
             expected = expected_rows[first : first + valid]
-            actual, _, _ = moe(local, local.float(), rows, rows, rows, project=True)
+            actual, _ = moe(
+                local, local.float(), rows, rows, rows, project=True, payload="bf16"
+            )
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
             state.all_reduce.producer.data.fill_(torch.nan)
@@ -698,7 +742,9 @@ def _muse_tp_owned_forward_worker(
                     assert (
                         moe._route_and_quantize_inputs(rows_in, router_in) is not None
                     )
-                    decode, _, _ = moe(rows_in, router_in, small, small, None, True)
+                    decode, _ = moe(
+                        rows_in, router_in, small, small, None, True, payload="bf16"
+                    )
                     torch.testing.assert_close(
                         decode, expected_rows[:small], atol=2**-7, rtol=2**-7
                     )
@@ -734,7 +780,15 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
     moe.post_expert_norm.weight = torch.nn.Parameter(norm)
-    group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    # Prepare int8-block16 payloads too; each call names its payload. Restored
+    # once the state is prepared (it reads the flag only there).
+    global_server_args_dict["prefill_collective_payload"] = "int8-block16"
+    try:
+        group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    finally:
+        global_server_args_dict["prefill_collective_payload"] = "bf16"
 
     def inputs(rows):
         torch.manual_seed(rows + rank * 17)
@@ -766,7 +820,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         case["packet"].fill_((rank + 1) * (step + 1) / 8)
         case["attention"].fill_((rank + 1) * (step + 1) / 16)
 
-    def reference(routes, mapping, rows, weights):
+    def reference(routes, mapping, rows, weights, payload):
         norm = moe.post_expert_norm
         if mapping is None:
             combined = routed_input_scale_rmsnorm_sum(
@@ -795,14 +849,16 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 output,
                 None,
             )
-        return state.reduce_scatter_owned_rows(output).clone()
+        return state.reduce_scatter_owned_rows(output, payload=payload).clone()
 
     def run(case):
         rows = case["rows"]
-        expected = reference(case["routes"], case["mapping"], rows, case["weights"])
+        expected = reference(
+            case["routes"], case["mapping"], rows, case["weights"], "bf16"
+        )
         producer = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
         producer.copy_(case["attention"])
-        state.reduce_scatter_owned_rows(producer)
+        state.reduce_scatter_owned_rows(producer, payload="bf16")
         local_rows = (rows + world_size - 1) // world_size
         valid = max(0, min(local_rows, rows - rank * local_rows))
         packet, _, _ = state.gather_owned_moe_inputs(
@@ -811,7 +867,12 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         if rank == rows % world_size:
             torch.cuda._sleep(20000)
         actual = moe._reduce_expert_routes(
-            case["routes"], case["mapping"], rows, case["weights"], owned_rows=True
+            case["routes"],
+            case["mapping"],
+            rows,
+            case["weights"],
+            owned_rows=True,
+            payload="bf16",
         ).clone()
         upper = state.acquire_owned_post_expert_output(rows, 8192)
         upper[:, :4096].copy_(actual)
@@ -880,13 +941,40 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     )
     # The unmapped BF16 layer retains the portable producer and release path.
     dense = cases[1]["original"].view(193, 8, 4096)
-    expected = reference(dense, None, 193, cases[1]["weights"])
+    expected = reference(dense, None, 193, cases[1]["weights"], "bf16")
     actual = moe._reduce_expert_routes(
-        dense, None, 193, cases[1]["weights"], owned_rows=True
+        dense, None, 193, cases[1]["weights"], owned_rows=True, payload="bf16"
     )
     torch.testing.assert_close(
         actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
     )
+    # int8-block16: the routed sum writes the payload codes and scales itself;
+    # the owners' rows must equal the separate sum, encode and pull.
+    for case in cases:
+        for step in range(3):
+            update(case, step)
+            expected = reference(
+                case["routes"],
+                case["mapping"],
+                case["rows"],
+                case["weights"],
+                "int8-block16",
+            )
+            actual = moe._reduce_expert_routes(
+                case["routes"],
+                case["mapping"],
+                case["rows"],
+                case["weights"],
+                owned_rows=True,
+                payload="int8-block16",
+            )
+            torch.testing.assert_close(
+                actual.view(torch.int16),
+                expected.view(torch.int16),
+                rtol=0,
+                atol=0,
+                msg=lambda m: f"int8-block16 rows {case['rows']} step {step}: {m}",
+            )
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -976,7 +1064,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
     # A reduce-scatter result lives in pull scratch; reducing it in place
     # through the pull would overwrite it, so the policy declines it.
     full, _ = operands(192)
-    owned = state.reduce_scatter_owned_rows(full)
+    owned = state.reduce_scatter_owned_rows(full, payload="bf16")
     # Refill the view with small integers so the reduction stays exact.
     values, expected = operands(owned.shape[0])
     owned.copy_(values)
@@ -1093,9 +1181,85 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _muse_boundary_warmup_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_lamport_allreduce_muse_attntail,
+    )
+    from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
+        triton_post_norm_residual_pre_norm,
+    )
+
+    # Startup preparation alone must compile the attention boundary's Lamport
+    # push for every row count it serves: rows pick its peer order, staggered
+    # from 5 rows, so batches on both sides of that bound reuse the warmup.
+    _, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
+    post_norm, pre_norm = _muse_boundary_norms(device)
+    torch.manual_seed(11)
+    beta = torch.sigmoid(torch.randn(8192, device=device))
+    alpha = torch.sqrt(1 - beta.square())
+    row_counts = (1, 4, 5, 8, state.boundary_max_rows)
+    bases = [torch.randn(rows, 8192, device=device) for rows in row_counts]
+    streams = [torch.randn_like(base) for base in bases]
+
+    def contribution(base, peer):
+        return (base + (peer + 1) / 8).bfloat16()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    outputs = []
+    with assert_no_triton_compile(iris_fused_lamport_allreduce_muse_attntail):
+        for base, stream in zip(bases, streams):
+            branch = state.all_reduce.acquire_outputs((tuple(base.shape),))[0]
+            branch.copy_(contribution(base, rank))
+            assert state.can_all_reduce_symmetric_boundary(
+                branch, stream, post_norm.weight, alpha, beta, pre_norm.weight
+            )
+            outputs.append(
+                state.all_reduce_symmetric_boundary(
+                    branch,
+                    stream,
+                    post_norm.weight,
+                    alpha,
+                    beta,
+                    pre_norm.weight,
+                    post_norm.eps,
+                    post_norm.weight_offset,
+                    pre_norm.eps,
+                    pre_norm.weight_offset,
+                )
+            )
+    for base, stream, actual in zip(bases, streams, outputs):
+        reduced = sum(contribution(base, peer).float() for peer in range(world_size))
+        expected = triton_post_norm_residual_pre_norm(
+            stream,
+            reduced.bfloat16(),
+            post_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            alpha,
+            beta,
+            pre_norm.weight,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+            False,
+            None,
+            1,
+        )
+        for got, reference in zip(actual, expected):
+            torch.testing.assert_close(
+                got,
+                reference,
+                atol=1e-5 if got.dtype == torch.float32 else 0.015625,
+                rtol=2e-5 if got.dtype == torch.float32 else 0.008,
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 @pytest.mark.parametrize(
     "check,backend",
     [
+        pytest.param(_muse_boundary_warmup_worker, "nccl", id="boundary_warmup"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(

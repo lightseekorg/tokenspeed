@@ -207,7 +207,10 @@ it on gfx950 and transposes the router weight once to `[N, K]`.
   row's logits depend only on the M bucket, and repeat calls are bitwise
   stable.
 - One binary per (shape, multiplier, M bucket): power-of-two buckets up to 16,
-  then one per split-K config. `M` is a runtime argument.
+  then one per split-K config. `M` is a runtime argument. With
+  `warm_variants` (the registered op passes it during kernel warmup), the
+  launcher compiles every bucket's binary for its shape without launching,
+  so a batch in a bucket startup never ran does not compile while serving.
 
 #### Algorithm
 
@@ -242,6 +245,8 @@ the router's split-K GEMM and an independent BF16 decode GEMM
 - `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
   16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
   rows and differ from the GEMV's in the last bits at 1-8 rows.
+- One binary per decode GEMM M bucket; `warm_variants` compiles each of them
+  at startup, as for the router GEMV.
 
 #### Algorithm
 
@@ -1646,8 +1651,8 @@ the partials by LSE.
 Each workgroup owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
-With head dim 64 and 16-bit K/V, 256-row tiles on eight waves (below) take
-over when each workgroup streams many cached keys: under full attention a
+With head dim 64 and 16-bit or FP8 K/V, 256-row tiles on eight waves (below)
+take over when each workgroup streams many cached keys: under full attention a
 cached prefix (`max_seqlen_k - max_seqlen_q`) of at least 8192 keys; under a
 window of at least 2047 keys a prefix of at least the window and one to four
 workgroups per CU over the launch. `max_seqlen_k` should be the longest
@@ -1673,11 +1678,25 @@ V and copy K; PV MFMAs with the next page's row maxima). The two waves on a
 SIMD run one cluster apart, and the copy clusters raise their priority with
 `s_setprio`, so one wave's MFMAs and softmax overlap the other's LDS reads and
 copies. K and V pass through 4-slot LDS rings, K four pages ahead and V two.
-The running maximum moves only when a page raises it by more than 8 (base 2),
-so most pages skip the accumulator rescale, and a wave whose 32 rows all kept
-their maximum skips it with one scalar branch. A wave uses about 196 VGPRs, so
-one 8-wave workgroup runs per CU; the split count therefore counts each as
-two 4-wave workgroups.
+With 16-bit K/V the running maximum moves only when a page raises it by more
+than 8 (base 2), so most pages skip the accumulator rescale. With FP8 K/V the
+maximum moves on every page that raises it, as in the 4-wave loop, because FP8
+P is quantized against it. Either way a wave whose 32 rows all kept their
+maximum skips the rescale with one scalar branch. A wave uses about 196 VGPRs,
+so one 8-wave workgroup runs per CU and the split count counts each as two
+4-wave workgroups. With FP8 K/V under full attention, a one-request launch
+compiles at four waves per SIMD (128 VGPRs), so two workgroups share a CU.
+The FP8 split count starts from the 4-wave grid's, since split boundaries
+change FP8 bits; where the 8-wave grid would leave a partial round of the CUs
+it takes the count, up to twice that, that finishes soonest.
+
+The unsplit kernel places its workgroups by KV head when the head count
+divides the eight XCDs: workgroup `i` lands on XCD `i % 8`, each head gets its own
+`8 / heads` XCDs, and a head's blocks alternate over them, so the workgroups
+sharing an XCD's L2 stream one head's pages. Workgroups left over when the
+launch is not a multiple of eight take each head's last blocks. Blocks then run
+last to first, so the shortest work ends the launch. Every (query block, KV
+head) pair still runs once, so placement does not change the output.
 
 ### gfx950 MLA extend
 
@@ -2266,6 +2285,36 @@ column-first workgroup order distributes concurrent updates across the output.
 This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
 of order-dependent BF16 rounding. Stage 2 clears the destination on each call
 and graph replay. Larger token counts retain the FP32 reduction path.
+
+### Wide E2M1 prefill tiles
+
+A grouped configuration whose `wide_tiles` is set (in the gfx950 MXFP4
+`fused/tuning.py` table: 4096 x 4096 experts, 32 or 64 of 256 local, from 192 rows)
+runs
+E2M1 package prefill on 64-row sort blocks and both GEMMs on their wide tiles.
+Other shapes keep the general tiles. So does that shape under expert tensor
+parallelism, whose sorted gate/up holds every expert locally (no table row
+yet: the wide tiles are unmeasured there).
+
+The gate/up GEMM's wide tile is 64 rows by 256 interleaved gate/up weight rows
+(128 outputs) on four waves, each wave owning 64 weight rows for all 64 rows,
+so it reads the activation tile from shared memory once per K tile.
+Activations are copied two K tiles ahead through three shared-memory slots,
+and weights and scales load one K tile ahead. The epilogue splits gate from up
+in registers and quantizes the 64 x 128 output in one pass. A 128-row sort
+block is two such tiles with the block's expert. Every output element sees the
+same MFMAs in the same K order as the general tile, so the bits are the same.
+
+The down GEMM's wide tile serves reduce mode: 64 rows by 256 columns on four
+waves through the same K loop as the gate/up tile (256-wide K tiles,
+activations two ahead). Each element accumulates the same 128-wide MFMA steps
+in the same order as the general 128-wide K tile, then rounds once to BF16;
+the 64 x 256 tile is redistributed once and each route's row stored as one
+contiguous span. Both tiles take row, route and token counts at run time, and
+address an expert's weights and the sorted intermediate past 2^31 bytes in
+64-bit offsets. Measured on MI355X (one EP4 rank, served EP facade) they are
+faster than the general tiles from 3k to 24k rows; the table row spans 192
+rows up to the stage-1 launcher's 2^31-byte activation bound.
 
 ### gfx950 BF16 expert routes
 

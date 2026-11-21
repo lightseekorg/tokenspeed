@@ -38,7 +38,7 @@ fn fixture_batch() -> Vec<KvEventView> {
             parent_block_hash: 7,
             token_ids: (1..=8).collect(),
             block_size: 4,
-            host: false,
+            medium: 0,
         },
         KvEventView {
             stored: true,
@@ -47,7 +47,7 @@ fn fixture_batch() -> Vec<KvEventView> {
             parent_block_hash: 0,
             token_ids: vec![9, 10, 11, 12],
             block_size: 4,
-            host: false,
+            medium: 0,
         },
         KvEventView {
             stored: false,
@@ -56,7 +56,7 @@ fn fixture_batch() -> Vec<KvEventView> {
             parent_block_hash: 0,
             token_ids: Vec::new(),
             block_size: 0,
-            host: false,
+            medium: 0,
         },
         KvEventView {
             stored: true,
@@ -65,7 +65,7 @@ fn fixture_batch() -> Vec<KvEventView> {
             parent_block_hash: 11,
             token_ids: vec![5, 6, 7, 8],
             block_size: 4,
-            host: true,
+            medium: 1,
         },
         KvEventView {
             stored: false,
@@ -74,7 +74,7 @@ fn fixture_batch() -> Vec<KvEventView> {
             parent_block_hash: 0,
             token_ids: Vec::new(),
             block_size: 0,
-            host: true,
+            medium: 1,
         },
     ]
 }

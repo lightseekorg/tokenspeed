@@ -38,6 +38,11 @@ Typed holders carry each optional step: `HeadNorm` or `RelativeHeadNorm`
 In the runtime, a layer states its steps once: `PagedAttention(...,
 rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 `PagedAttention.forward` runs a GQA layer's prologue before core attention.
+After core attention, `PagedAttention.attend(..., rmsnorm_output_gate=(gate,
+eps))` returns `weightless_rmsnorm_gated_sigmoid` of the output. A decode whose
+backend `gates_decode_output` applies it in the kernel store that writes the
+output; every other forward runs the separate op after. Both give the same
+bits, so the choice is a parameter of the one path.
 When a projection or collective has already applied the same head-step numerics,
 `PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
 Relative attention (Inkling 2) takes per-call head steps, so its layer states

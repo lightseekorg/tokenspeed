@@ -47,12 +47,14 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed_kernel.ops.sampling import vocab_shard_topk  # noqa: E402
 from tokenspeed_kernel.ops.sampling.triton.topk_topp import (  # noqa: E402
+    _top_k_top_p_candidates_stage1_kernel,
     _top_k_top_p_gumbel_stage2_kernel,
 )
 from tokenspeed_kernel.ops.sampling.triton.vocab_topk import (  # noqa: E402
     _vocab_shard_topk_kernel,
     _vocab_topk_merge_kernel,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 
 from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
     get_apply_vocab_mask_func,
@@ -429,3 +431,64 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
                     tree=None,
                 )
                 assert bool(((accept_length >= 1) & (accept_length <= N)).all())
+
+
+@requires_cuda
+def test_warm_verify_compiles_the_eager_full_logit_routes() -> None:
+    """After a verify in the startup warm-up, eager sample and verify on whole
+    logit rows compile nothing at either candidate count.
+
+    The warm decode and graph capture verify at 128 candidates; an eager step
+    whose top_k all fit in 64 selects 64, and the first token after a prefill
+    is a one-row sample. A vocabulary used by no other test keeps the
+    compiles this test checks its own.
+    """
+    vocab = 7001
+    backend = TritonSamplingBackend(
+        dataclasses.replace(
+            _config(),
+            vocab_size=vocab,
+            tp_group=None,
+            enable_speculative_sampling=False,
+        )
+    )
+    logits = (
+        torch.randn(BS * N, vocab, generator=torch.Generator().manual_seed(43)) * 3
+    ).to("cuda", torch.float32)
+    candidates = torch.zeros((BS, N), dtype=torch.int32, device="cuda")
+    req_pool_indices = _prepare(
+        backend, [128, 128, 128], [1.0, 1.0, 1.0], N, "w", admission_start=1
+    )
+    info = _info(req_pool_indices, None, None)
+    info.vocab_size = vocab
+    with kernel_warmup(enabled=True):
+        backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits), info, candidates, tree=None
+        )
+    kernels = (_top_k_top_p_candidates_stage1_kernel, _top_k_top_p_gumbel_stage2_kernel)
+    with _kernel_test_utils().assert_no_triton_compile(*kernels):
+        for step, top_k in enumerate(([5, 64, 1], [100, 3, 128])):
+            rid = f"f{step}r"
+            # Fresh admissions each step, clear of the warm-up requests.
+            start = 1 + BS * (step + 1)
+            req_pool_indices = _prepare(
+                backend, top_k, [1.0, 1.0, 1.0], 1, rid, admission_start=start
+            )
+            info = _info(req_pool_indices, None, None)
+            info.vocab_size = vocab
+            sampled, _ = backend.sample(
+                LogitsProcessorOutput(next_token_logits=logits[:BS]), info
+            )
+            assert bool(((sampled >= 0) & (sampled < vocab)).all())
+            req_pool_indices = _prepare(
+                backend, top_k, [1.0, 1.0, 1.0], N, rid, admission_start=start
+            )
+            info = _info(req_pool_indices, None, None)
+            info.vocab_size = vocab
+            _, accept_length = backend.verify(
+                LogitsProcessorOutput(next_token_logits=logits),
+                info,
+                candidates,
+                tree=None,
+            )
+            assert bool(((accept_length >= 1) & (accept_length <= N)).all())

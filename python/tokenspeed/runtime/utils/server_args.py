@@ -344,6 +344,11 @@ def validate_context_parallel_roles(
         )
 
 
+# Muse Spark's --prefill-collective-payload choices (the Iris state's
+# MUSE_PAYLOADS; a test checks they match).
+PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
+
+
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
     """Refuse a launch value outside ``flag``'s closed set of ``choices``.
 
@@ -635,6 +640,18 @@ class ServerArgs:
     peer_prefix_host: str | None = None
     peer_prefix_answer_timeout_ms: int = 50
     peer_prefix_min_fetch_tokens: int = 256
+    # Where a peer prefix lands: "device" (the request's admitted Device
+    # pages) or "host" (Host blocks before its admission). Required with
+    # peer sharing; no default.
+    peer_prefix_landing_tier: str | None = None
+    # The Disk tier: the node's local SSD below Host L2
+    # (docs/rfcs/0006-disk-tier.md). One directory per drive; None turns it
+    # off. The I/O backend and the write budget have no default.
+    disk_tier_paths: list[str] | None = None
+    disk_tier_size_gb: float = 0.0
+    disk_tier_io: str | None = None
+    disk_tier_write_mbps: int | None = None
+    disk_tier_config: str | None = None
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -812,6 +829,14 @@ class ServerArgs:
     # switches below (resolve_numerics). Each folded switch can still be set
     # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Muse Spark: the payload encoding of the owned-row prefill collectives
+    # (the QKVG all-to-all and the attention and expert reduce-scatters) in
+    # extend forwards. "bf16" transfers the rows as produced. "int8-block16"
+    # transfers INT8 codes with an FP32 scale per 16 elements, decoded to BF16
+    # by the receiver before the collective's arithmetic: 1.25 bytes an
+    # element instead of 2, and a numerics change. Decode and verify forwards
+    # stay BF16.
+    prefill_collective_payload: str = "bf16"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1132,6 +1157,15 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if (
+            self.prefill_collective_payload != "bf16"
+            and architectures is not None
+            and "MuseSparkForConditionalGeneration" not in architectures
+        ):
+            raise ValueError(
+                "--prefill-collective-payload applies to Muse Spark's owned-row "
+                f"prefill only; this checkpoint is {architectures}"
+            )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
@@ -2330,6 +2364,18 @@ class ServerArgs:
 
         ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice(
+            "--prefill-collective-payload",
+            self.prefill_collective_payload,
+            PREFILL_COLLECTIVE_PAYLOADS,
+        )
+        if self.numerics == "rl-bitwise" and self.prefill_collective_payload != "bf16":
+            # The envelope promises the trainer's bits; the INT8 payload rounds
+            # every prefill collective's inputs.
+            raise ValueError(
+                "--prefill-collective-payload int8-block16 changes prefill "
+                "numerics; --numerics rl-bitwise needs bf16"
+            )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
@@ -2613,7 +2659,16 @@ class ServerArgs:
         """``--peer-prefix-port`` and its settings: what peer prefix sharing
         runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
         if self.peer_prefix_port is None:
+            if self.peer_prefix_landing_tier is not None:
+                raise ValueError(
+                    "--peer-prefix-landing-tier requires --peer-prefix-port"
+                )
             return
+        _require_choice(
+            "--peer-prefix-landing-tier",
+            self.peer_prefix_landing_tier,
+            ("device", "host"),
+        )
         unsupported = [
             setting
             for setting, refused in (
@@ -2649,8 +2704,56 @@ class ServerArgs:
         if self.peer_prefix_min_fetch_tokens <= 0:
             raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
 
+    def validate_disk_tier_options(self):
+        """``--disk-tier-paths`` and its settings: what the Disk tier runs
+        with (``docs/rfcs/0006-disk-tier.md``)."""
+        if self.disk_tier_paths is None:
+            for flag, value in (
+                ("--disk-tier-io", self.disk_tier_io),
+                ("--disk-tier-write-mbps", self.disk_tier_write_mbps),
+                ("--disk-tier-config", self.disk_tier_config),
+            ):
+                if value is not None:
+                    raise ValueError(f"{flag} requires --disk-tier-paths")
+            return
+        unsupported = [
+            setting
+            for setting, refused in (
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                (
+                    "--kvstore-write-policy other than write_back",
+                    self.kvstore_write_policy != "write_back",
+                ),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--disk-tier-paths is not supported with " + ", ".join(unsupported)
+            )
+        if not self.disk_tier_paths:
+            raise ValueError("--disk-tier-paths needs at least one directory")
+        if self.disk_tier_size_gb <= 0:
+            raise ValueError("--disk-tier-size-gb must be positive")
+        _require_choice("--disk-tier-io", self.disk_tier_io, ("io_uring", "psync"))
+        if self.disk_tier_write_mbps is None or self.disk_tier_write_mbps <= 0:
+            raise ValueError("--disk-tier-write-mbps must be a positive budget")
+        from tokenspeed.runtime.cache.disk import DiskTierTuning
+
+        DiskTierTuning.from_json(self.disk_tier_config)
+
     def validate_cache_options(self):
         self.validate_peer_prefix_options()
+        self.validate_disk_tier_options()
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -3662,6 +3765,62 @@ class ServerArgs:
             help="The fewest tokens past the local prefix hit worth reading from "
             "a peer holder; a shorter peer hit is computed instead.",
         )
+        parser.add_argument(
+            "--peer-prefix-landing-tier",
+            type=str,
+            choices=["device", "host"],
+            default=ServerArgs.peer_prefix_landing_tier,
+            help="Where a peer prefix lands: 'device' reads it into the Device "
+            "pages the request's admission allocates, which wait out the "
+            "transfer; 'host' reads it into Host blocks before the admission, "
+            "which then takes it as a Host hit at the cost of Host capacity and "
+            "one host-to-device copy. Required with --peer-prefix-port.",
+        )
+        parser.add_argument(
+            "--disk-tier-paths",
+            type=str,
+            nargs="+",
+            default=ServerArgs.disk_tier_paths,
+            help="Cache prefixes on the node's local SSD below Host L2: one "
+            "directory per drive, on a file system that supports O_DIRECT "
+            "(XFS or ext4, not tmpfs); each rank keeps one file in one of them. "
+            "Host L2 writes its entries back to the file in the background and "
+            "a request whose prefix only the file holds reads it into Host "
+            "before its admission. The file's contents never outlive the "
+            "process. Needs --kvstore-write-policy write_back and prefix "
+            "caching; refused with --kvstore-storage-backend and "
+            "--pipeline-parallel-size > 1. See docs/rfcs/0006-disk-tier.md.",
+        )
+        parser.add_argument(
+            "--disk-tier-size-gb",
+            type=float,
+            default=ServerArgs.disk_tier_size_gb,
+            help="The Disk tier's size per rank, in gigabytes.",
+        )
+        parser.add_argument(
+            "--disk-tier-io",
+            type=str,
+            choices=["io_uring", "psync"],
+            default=ServerArgs.disk_tier_io,
+            help="How the Disk tier reaches its file: 'io_uring' (needs a "
+            "kernel and seccomp policy that allow it) or 'psync', a pool of "
+            "threads calling pread/pwrite. Required with --disk-tier-paths.",
+        )
+        parser.add_argument(
+            "--disk-tier-write-mbps",
+            type=int,
+            default=ServerArgs.disk_tier_write_mbps,
+            help="The bytes per second, in MB, each rank may write to its Disk "
+            "tier file: the SSD's endurance budget. Required with "
+            "--disk-tier-paths.",
+        )
+        parser.add_argument(
+            "--disk-tier-config",
+            type=str,
+            default=ServerArgs.disk_tier_config,
+            help="JSON object of Disk tier tuning settings; see "
+            "docs/configuration/server.md for the keys and their defaults.",
+        )
         # Retraction snapshot pool
         parser.add_argument(
             "--retraction-snapshot-host-gb",
@@ -4205,7 +4364,7 @@ class ServerArgs:
             "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
             "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
-            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). 'cudnn' uses FlashInfer's "
+            "FlashInfer CuTe DSL KDA prefill kernel on SM100/SM103. 'cudnn' uses FlashInfer's "
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(
@@ -5197,6 +5356,16 @@ class ServerArgs:
             "with a row's offset in the buffer, so neither is "
             "batch-invariant. Gathers keep the multicast kernels. Turns off "
             "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--prefill-collective-payload",
+            type=str,
+            default=ServerArgs.prefill_collective_payload,
+            choices=list(PREFILL_COLLECTIVE_PAYLOADS),
+            help="Muse Spark: the payload encoding of the owned-row prefill "
+            "collectives in extend forwards. int8-block16 sends INT8 codes with "
+            "an FP32 scale per 16 elements (a numerics change); decode stays "
+            "BF16.",
         )
         parser.add_argument(
             "--numerics",

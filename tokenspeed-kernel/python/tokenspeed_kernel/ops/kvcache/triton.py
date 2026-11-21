@@ -931,7 +931,6 @@ def copy_state_rows_compact(
 
 
 @triton.jit(
-    do_not_specialize=["num_rows", "state_width"],
     **(
         {"do_not_specialize_on_alignment": ["blocks"]}
         if current_platform().is_npu
@@ -942,26 +941,23 @@ def _store_state_rows_kernel(
     states,
     slab,
     blocks,
-    num_rows,
-    state_width,
-    state_dim_2,
-    state_dim_3,
+    state_width: tl.constexpr,
+    state_dim_2: tl.constexpr,
+    state_dim_3: tl.constexpr,
     state_stride_0,
-    state_stride_1,
-    state_stride_2,
-    state_stride_3,
+    state_stride_1: tl.constexpr,
+    state_stride_2: tl.constexpr,
+    state_stride_3: tl.constexpr,
     slab_stride_0,
-    slab_stride_1,
-    slab_stride_2,
-    slab_stride_3,
+    slab_stride_1: tl.constexpr,
+    slab_stride_2: tl.constexpr,
+    slab_stride_3: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
-    row = offsets // state_width
-    feature = offsets % state_width
-    live = row < num_rows
-    destination = tl.load(blocks + row, mask=live, other=-1).to(tl.int64)
-    live = live & (destination >= 0)
+    row = tl.program_id(0).to(tl.int64)
+    feature = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    destination = tl.load(blocks + row).to(tl.int64)
+    live = (feature < state_width) & (destination >= 0)
     # int64 element offsets: a slab block id times its stride, or a late row of
     # a wide state, exceeds int32 on large pools.
     dim_1_index = feature // (state_dim_2 * state_dim_3)
@@ -1019,12 +1015,11 @@ def store_state_rows(
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
     state_width = states[0].numel()
-    block = 256
-    _store_state_rows_kernel[(triton.cdiv(blocks.numel() * state_width, block),)](
+    block = 512
+    _store_state_rows_kernel[(blocks.numel(), triton.cdiv(state_width, block))](
         states,
         slab,
         blocks,
-        blocks.numel(),
         state_width,
         states.shape[2],
         states.shape[3],

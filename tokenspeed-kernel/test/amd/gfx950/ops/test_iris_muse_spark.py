@@ -192,7 +192,13 @@ def _logical_cdna4_scales(
     rows: int,
     cols: int,
 ) -> torch.Tensor:
-    """Read the logical values from a padded CDNA4 scale allocation."""
+    """Read the logical values from a padded CDNA4 scale allocation.
+
+    Allocations are panel-major (one ``cols * 32``-byte panel per 32 rows) and
+    may be returned as the transposed ``[cols * 32, panels]`` view, so offsets
+    index storage order, not the view's logical order: a padded last panel's
+    unwritten bytes would otherwise be read as real rows.
+    """
     logical_m = torch.arange(rows, device=scales.device)[:, None]
     logical_k = torch.arange(cols, device=scales.device)[None, :]
     m_in_block = logical_m % 32
@@ -203,7 +209,11 @@ def _logical_cdna4_scales(
     k_lo = logical_k % 4
     swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
     offsets = swizzled_k + (logical_m // 32) * (cols * 32)
-    return scales.view(torch.uint8).flatten()[offsets]
+    storage = scales.view(torch.uint8)
+    if storage.dim() == 2 and storage.stride(0) == 1 and storage.shape[1] > 1:
+        storage = storage.t()
+    assert storage.is_contiguous(), (tuple(scales.shape), scales.stride())
+    return storage.reshape(-1)[offsets]
 
 
 def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
@@ -300,6 +310,13 @@ def _lamport_gather_rmsnorm_worker(rank, world_size, device):
     width = 4096
     local_width = width // world_size
     weight = torch.linspace(-0.5, 0.5, width, device=device).to(torch.bfloat16)
+    # The BF16 gather stays inside the one-shot window; the rest of the slot
+    # serves only the quantizing gather.
+    past_window = state.reduction.lamport_max_numel // local_width + 1
+    assert not state.can_all_gather_rmsnorm(
+        torch.empty(past_window, local_width, dtype=torch.bfloat16, device=device),
+        weight,
+    )
     for rows in (1, 8, 16, 64):
         gen = torch.Generator(device=device).manual_seed(rows)
         full = torch.randn(rows, width, generator=gen, device=device).to(torch.bfloat16)
@@ -358,6 +375,7 @@ def _muse_state(rank, device, max_rows, enable_lamport):
         enable_lamport=enable_lamport,
         owned_route_max_rows=0,
         intermediate_gather_max_rows=0,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -719,7 +737,7 @@ def _muse_owned_packet_worker(rank, world_size, device):
 
     def one(item):
         rows, _, valid_rows, local, ids, weights, branch = item
-        reduced = state.reduce_scatter_owned_rows(branch)
+        reduced = state.reduce_scatter_owned_rows(branch, payload="bf16")
         retained = state.all_gather_owned_rows(reduced, rows, True)
         quantized = rmsnorm_mxfp4_quant(local, norm_weight, 1e-8, 1.0)
         # Pull peers may still read scratch when this rank starts packet packing.
@@ -742,7 +760,7 @@ def _muse_owned_packet_worker(rank, world_size, device):
         )
         generic_snapshot = generic_output.clone()
         # The next scatter overwrites packet staging before outputs are checked.
-        state.reduce_scatter_owned_rows(branch)
+        state.reduce_scatter_owned_rows(branch, payload="bf16")
         return retained, packed_result, bf16_result, generic_snapshot
 
     for item in inputs:
@@ -1618,14 +1636,17 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
             RANK=rank,
             WORLD_SIZE=world_size,
             total_elements=raw_input.numel(),
-            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            MAX_ELEMENTS=state.reduction.lamport_capacity,
             NUM_STAGES=3,
             PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
         )
 
     # 128 rows exceed the pull variant's 84 ready flags; Lamport needs none.
-    for rows in (1, 3, 16, 128):
+    # 129 and 172 rows end in a padded 32-row scale panel; 160 ends exactly
+    # on a panel boundary. 173 and 320 rows lie past the one-shot window, in
+    # the rest of the slot.
+    for rows in (1, 3, 16, 128, 129, 160, 172, 173, 320):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, width),))[0]
             local = published[:, rank * local_width : (rank + 1) * local_width]
@@ -1712,7 +1733,9 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
     width, local_width, experts, topk, scale = 4096, 4096 // world_size, 256, 8, 2.5
     weight = (torch.randn(width, device=device) * 0.1).bfloat16()
     bias = torch.randn(experts, device=device) * 0.01
-    for rows in (2, 8, 16):
+    # 17 rows are past the router's shared launch; 173 and 320 past the
+    # one-shot window.
+    for rows in (2, 8, 16, 17, 173, 320):
         local = torch.empty((rows, local_width), dtype=torch.bfloat16, device=device)
         logits = torch.empty((rows, experts), dtype=torch.float32, device=device)
         generator = torch.Generator(device=device)
@@ -1773,7 +1796,7 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
     # The row count is a runtime argument: rows of an already compiled
     # specialization class reuse its binary.
     with assert_no_triton_compile(iris_fused_lamport_allgather_rmsnorm_mxfp4_topk):
-        for rows in (3, 5, 12):
+        for rows in (3, 5, 12, 200, 319):
             local = torch.zeros(
                 (rows, local_width), dtype=torch.bfloat16, device=device
             )
@@ -1819,7 +1842,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             RANK=rank,
             WORLD_SIZE=world_size,
             total_elements=value.numel(),
-            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            MAX_ELEMENTS=state.reduction.lamport_capacity,
             NUM_STAGES=3,
             PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
@@ -2323,7 +2346,7 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
     def two_shot_programs(count):
         """Programs of the generic reduction's two-shot launch, or zero."""
         selected = (
-            reduction.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            reduction.lamport_two_shot_min_numel
             <= count
             <= reduction.lamport_two_shot_max_numel
             and count % two_shot_tile == 0
@@ -2567,20 +2590,123 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
             assert bool((region.view(torch.int32) == -(2**31)).all())
 
 
+def _int8_block16_round_trip(x):
+    """decode(encode(x)) of the int8-block16 reference encoder and
+    decoder, computed on the CPU and returned on x's device."""
+    blocks = x.cpu().reshape(-1, 16).float()
+    scale = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
+    # INT8 codes have no negative zero.
+    codes = torch.round(blocks / scale).clamp(-127.0, 127.0).to(torch.int8)
+    return (codes.float() * scale).to(torch.bfloat16).reshape(x.shape).to(x.device)
+
+
+def _muse_int8_block16_payload_worker(rank, world_size, device):
+    """Each owned-row prefill collective with int8-block16 payloads equals the
+    BF16 collective of the reference round trip of the same payload, bit for
+    bit, and row counts stay runtime values."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    )
+    from tokenspeed_kernel.ops.communication._iris.payload import (
+        encode_int8_block16,
+    )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+    from utils import assert_no_triton_compile
+
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        # Holds 4099 rows; at 8 ranks the pull scratch (1/8) holds 513 owned rows.
+        producer_direct_max_numel=4104 * 8192,
+        enable_lamport=False,
+        owned_route_max_rows=0,
+        intermediate_gather_max_rows=0,
+        int8_payloads=True,
+        all_reduce=None,
+        device=device,
+    )
+    generator = torch.Generator(device=device).manual_seed(100 + rank)
+
+    def payload(rows, width):
+        # Rows of very different magnitudes, and all-zero blocks.
+        x = torch.randn(rows, width, device=device, generator=generator)
+        x *= torch.logspace(-3, 3, rows, device=device)[:, None]
+        x[::7, :16] = 0
+        return x.bfloat16()
+
+    def check(rows):
+        for width in (8192, 4096):
+            x = payload(rows, width)
+            got = state.reduce_scatter_owned_rows(x, payload="int8-block16").clone()
+            want = state.reduce_scatter_owned_rows(
+                _int8_block16_round_trip(x), payload="bf16"
+            )
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+                "reduce-scatter",
+                rows,
+                width,
+                int((got.view(torch.int16) != want.view(torch.int16)).sum()),
+            )
+        source = state.acquire_owned_qkvg_output(rows)
+        x = payload(source.shape[0], 18432)
+        source.copy_(x)
+        got = state.all_to_all_transpose_qkvg(source, rows, payload="int8-block16")
+        source.copy_(_int8_block16_round_trip(x))
+        want = state.all_to_all_transpose_qkvg(source, rows, payload="bf16")
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+            "all-to-all",
+            rows,
+            int((got.view(torch.int16) != want.view(torch.int16)).sum()),
+        )
+        positions = torch.arange(rows, device=device)
+        cache = torch.randn(rows, 64, device=device, generator=generator)
+        source.copy_(x)
+        got = state.all_to_all_transpose_qkvg_norm_rope(
+            source, rows, positions, cache, 1e-6, 0.125, payload="int8-block16"
+        )
+        source.copy_(_int8_block16_round_trip(x))
+        want = state.all_to_all_transpose_qkvg_norm_rope(
+            source, rows, positions, cache, 1e-6, 0.125, payload="bf16"
+        )
+        for part, actual, expected in zip("qkvg", got, want):
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), (
+                "fused all-to-all",
+                part,
+                rows,
+                int((actual.view(torch.int16) != expected.view(torch.int16)).sum()),
+            )
+
+    # Owned rows from the smallest owned-row round, with ragged last owners.
+    check(193)
+    with assert_no_triton_compile(
+        encode_int8_block16,
+        iris_pull_reduce_scatter,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    ):
+        for rows in (2051, 4099):
+            check(rows)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 def _muse_lamport_payload_worker(rank, world_size, device):
     """Distinct per-rank data through each Lamport protocol, grid, and stage."""
     state = _muse_state(rank, device, 128, True)
     reduction = state.reduction
-    two_shot = world_size == 8
-    if two_shot:
-        assert reduction.lamport_two_shot_max_numel == 128 * 8192
-    else:
-        assert reduction.lamport_two_shot_epochs is None
+    assert reduction.lamport_two_shot_max_numel == 128 * 8192
     # (elements, in place, protocol). One-shot: one and eight tiles, one route
     # token, and a two-shot-sized payload of partial two-shot tiles. TP8
     # two-shot: the smallest payload, route tokens 2..32 including the largest
-    # one-shot payload, and the full capacity. TP4 has no two-shot; its larger
-    # payloads use push.
+    # one-shot payload, and the full capacity. TP4 keeps the one-shot over its
+    # whole window, so its two-shot starts above the largest one-shot payload.
     cases = (
         (512, False, "one"),
         (8 * 512, False, "one"),
@@ -2596,9 +2722,9 @@ def _muse_lamport_payload_worker(rank, world_size, device):
         (524288, True, "two"),
         (1048576, False, "two"),
     )
-    if not two_shot:
+    if world_size == 4:
         cases = tuple(
-            (count, in_place, "one" if count <= 43 * 4096 else "push")
+            (count, in_place, "one" if count <= 43 * 4096 else "two")
             for count, in_place, _ in cases
         )
     generator = torch.Generator().manual_seed(4096 + world_size)
@@ -2645,20 +2771,19 @@ def _muse_lamport_payload_worker(rank, world_size, device):
     # Each Lamport call advances the stage of exactly the programs it launched.
     for (count, _, protocol), value, output in zip(cases, inputs, outputs, strict=True):
         one_shot = reduction.lamport_epochs.clone()
-        two = two_shot and reduction.lamport_two_shot_epochs.clone()
+        two = reduction.lamport_two_shot_epochs.clone()
         value.copy_(payloads[0][rank, :1].expand(count))
         reduction.run(value, output, count)
         advanced = (reduction.lamport_epochs != one_shot).sum().item()
         assert advanced == (count // 512 if protocol == "one" else 0)
-        if two_shot:
-            advanced = (reduction.lamport_two_shot_epochs != two).sum().item()
-            assert advanced == (count // 1024 if protocol == "two" else 0)
+        # One two-shot program reduces a 128-element tile of every shard.
+        advanced = (reduction.lamport_two_shot_epochs != two).sum().item()
+        assert advanced == (count // (world_size * 128) if protocol == "two" else 0)
     load(1)
     check(run(), 1)
     # Start the capture from the last stage so replays wrap the rotation.
     reduction.lamport_epochs.fill_(2)
-    if two_shot:
-        reduction.lamport_two_shot_epochs.fill_(2)
+    reduction.lamport_two_shot_epochs.fill_(2)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
@@ -2672,6 +2797,48 @@ def _muse_lamport_payload_worker(rank, world_size, device):
         graph.replay()
         torch.cuda.synchronize()
         check(results, scale)
+    dist.barrier()
+
+
+def _muse_lamport_two_shot_order_worker(rank, world_size, device):
+    """The Lamport two-shot adds in the order of the path it replaced.
+
+    At TP4 it took over the push two-shot's payloads (above the one-shot
+    window), so it must add FP32 (r0 + r1) + (r2 + r3) as the push does; at
+    TP8 it adds in rank order, as the one-shot does. Inexact sums (BF16 values
+    with widely spread exponents) tell the orders apart, which the exact
+    payloads above cannot.
+    """
+    state = _muse_state(rank, device, 128, True)
+    reduction = state.reduction
+    # Served all-reduce rows above the TP4 one-shot window (22 x 8192 elements
+    # and up) to the two-shot capacity.
+    counts = (22 * 8192, 50 * 8192, 64 * 8192, 128 * 8192)
+    generator = torch.Generator().manual_seed(77 + world_size)
+    for count in counts:
+        # Exponents spread over 2**-24..1, so the FP32 sum of the four terms
+        # is often inexact and its order shows after the BF16 rounding.
+        scale = torch.exp2(
+            -torch.randint(0, 25, (world_size, count), generator=generator).float()
+        )
+        values = (
+            torch.randn((world_size, count), generator=generator) * scale
+        ).bfloat16()
+        value = values[rank].to(device)
+        output = torch.empty_like(value)
+        two = reduction.lamport_two_shot_epochs.clone()
+        actual = reduction.run(value, output, count)[:count].clone()
+        assert (reduction.lamport_two_shot_epochs != two).any(), count
+        terms = values.float()
+        if world_size == 4:
+            reduced = (terms[0] + terms[1]) + (terms[2] + terms[3])
+        else:
+            reduced = terms[0]
+            for peer in range(1, world_size):
+                reduced = reduced + terms[peer]
+        torch.testing.assert_close(
+            actual, reduced.bfloat16().to(device), atol=0, rtol=0
+        )
     dist.barrier()
 
 
@@ -2710,6 +2877,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -2768,7 +2936,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
             RANK=rank,
             WORLD_SIZE=world_size,
             total_elements=raw_input.numel(),
-            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            MAX_ELEMENTS=state.reduction.lamport_capacity,
             NUM_STAGES=3,
             PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
@@ -2906,6 +3074,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -3003,7 +3172,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
                 RANK=rank,
                 WORLD_SIZE=world_size,
                 total_elements=one_shot_input.numel(),
-                MAX_ELEMENTS=state.reduction.lamport_max_numel,
+                MAX_ELEMENTS=state.reduction.lamport_capacity,
                 NUM_STAGES=3,
                 PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
                 num_warps=1,
@@ -3088,6 +3257,7 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=2049,
         intermediate_gather_max_rows=capacity,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -3114,7 +3284,14 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
             deterministic_order=True,
         )
         routes = MXFP4SortedRoutes(
-            sorted_ids, sorted_weights, expert_ids, valid, block, rows, 8
+            sorted_ids,
+            sorted_weights,
+            expert_ids,
+            valid,
+            block,
+            rows,
+            8,
+            wide_tiles=False,
         )
         return routes, weights
 
@@ -3297,7 +3474,7 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
         rows, stream, branch = item
         # A reduce-scatter result occupies pull scratch first, as attention
         # output does.
-        reduced = state.reduce_scatter_owned_rows(branch)
+        reduced = state.reduce_scatter_owned_rows(branch, payload="bf16")
         retained = state.all_gather_owned_rows(reduced, rows, True)
         if rank == rows % world_size:
             torch.cuda._sleep(20000)
@@ -3376,6 +3553,12 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
             id="sliding_attention_tail_epoch_wrap",
         ),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
+        pytest.param(
+            _muse_int8_block16_payload_worker, "nccl", id="int8_block16_payloads"
+        ),
+        pytest.param(
+            _muse_lamport_two_shot_order_worker, "nccl", id="lamport_two_shot_order"
+        ),
         pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
         pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
         pytest.param(_muse_tp_column_routes_worker, "nccl", id="tp_column_routes"),
@@ -3394,3 +3577,99 @@ def test_muse_collective_replay(check, backend, world_size):
         (world_size, _get_open_port(), check, backend),
         world_size,
     )
+
+
+def _int8_block16_payloads(seed):
+    """Payload families [4096, 2048] (BF16), all from one generator: Gaussian,
+    Student t with 3 degrees of freedom (a Gaussian over the root of a scaled
+    chi-square), Gaussian with sparse 100x outliers, and exact ties / zeros."""
+    generator = torch.Generator().manual_seed(seed)
+    gauss = torch.randn(4096, 2048, generator=generator)
+    chi2 = (torch.randn(3, 4096, 2048, generator=generator) ** 2).sum(0)
+    t3 = torch.randn(4096, 2048, generator=generator) / torch.sqrt(chi2 / 3)
+    outliers = gauss.clone()
+    outliers[torch.rand(4096, 2048, generator=generator) < 1e-3] *= 100.0
+    ties = torch.zeros(64, 2048)
+    ties[:, 0::16] = 127.0
+    ties[:, 1::16] = 2.5
+    ties[:, 2::16] = -3.5
+    return {
+        name: x.bfloat16()
+        for name, x in (
+            ("gaussian", gauss),
+            ("student-t3", t3),
+            ("gauss+outliers", outliers),
+            ("ties/zeros", ties),
+        )
+    }
+
+
+def _int8_block16_reference(x):
+    """The definition: per 16 elements scale = max|x| / 127 (1e-30 / 127 for an
+    all-zero block), codes = rint(x / scale) clamped to [-127, 127] as INT8.
+    Returns (codes, scales)."""
+    blocks = x.reshape(-1, 16).float()
+    scales = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
+    codes = torch.round(blocks / scales).clamp(-127.0, 127.0).to(torch.int8)
+    return codes.reshape(-1), scales.reshape(-1)
+
+
+def test_int8_block16_encode_matches_the_reference_bit_for_bit():
+    """Codes and scales equal the reference encoder bit for bit on four
+    payload families; with them the decoded payload is determined."""
+    from tokenspeed_kernel.ops.communication._iris.payload import (
+        encode_int8_block16,
+    )
+
+    for name, x in _int8_block16_payloads(2026).items():
+        codes, scales = _int8_block16_reference(x)
+        device_codes = torch.empty(x.numel(), dtype=torch.int8, device="cuda")
+        device_scales = torch.empty(x.numel() // 16, dtype=torch.float32, device="cuda")
+        encode_int8_block16[(-(-x.numel() // 4096),)](
+            x.cuda(), device_codes, device_scales, x.numel(), BLOCK=4096
+        )
+        assert torch.equal(device_codes.cpu(), codes), name
+        assert torch.equal(
+            device_scales.cpu().view(torch.int32), scales.view(torch.int32)
+        ), name
+
+
+def test_int8_block16_encode_indexes_past_2_31_elements():
+    """The encode's program bases are 64-bit: the far end of a payload past
+    2^31 elements encodes to the reference's codes and scales.
+
+    The Iris state refuses a producer this large, so serving never reaches
+    it; the test guards the kernel's own offset arithmetic, which must not
+    depend on that refusal.
+    """
+    from tokenspeed_kernel.ops.communication._iris.payload import (
+        encode_int8_block16,
+    )
+
+    elements = 2**31 + 4096
+    x = torch.zeros(elements, dtype=torch.bfloat16, device="cuda")
+    tail = torch.randn(4096, generator=torch.Generator().manual_seed(31)).bfloat16()
+    x[-4096:] = tail.cuda()
+    codes = torch.empty(elements, dtype=torch.int8, device="cuda")
+    scales = torch.empty(elements // 16, dtype=torch.float32, device="cuda")
+    encode_int8_block16[(-(-elements // 4096),)](x, codes, scales, elements, BLOCK=4096)
+    want_codes, want_scales = _int8_block16_reference(tail)
+    assert torch.equal(codes[-4096:].cpu(), want_codes)
+    assert torch.equal(
+        scales[-256:].cpu().view(torch.int32), want_scales.view(torch.int32)
+    )
+    assert bool((want_codes != 0).any())
+
+
+def test_int8_block16_payload_choice_is_checked():
+    """An owned-row collective names its payload: an unknown name raises, and
+    int8-block16 raises when its buffers were not prepared."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
+
+    state = MuseIrisState.__new__(MuseIrisState)
+    state.payload_codes = None
+    assert state._int8_block16("bf16") is False
+    with pytest.raises(ValueError, match="unknown collective payload"):
+        state._int8_block16("fp8")
+    with pytest.raises(RuntimeError, match="not prepared"):
+        state._int8_block16("int8-block16")

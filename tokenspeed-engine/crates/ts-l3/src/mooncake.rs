@@ -21,7 +21,11 @@
 //! The Mooncake store as an L3 store: zero-copy gets and puts against the
 //! registered Host pool, as SGLang's HiCache and vLLM's connector use it.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use ts_mooncake::store::{regex_escape, Store as Client, StoreLibrary, StoreSetup};
 
@@ -37,11 +41,72 @@ const OBJECT_ALREADY_EXISTS: i32 = -705;
 /// `NO_AVAILABLE_HANDLE`: the master's allocation rejection, before any
 /// source transfer.
 const NO_AVAILABLE_HANDLE: i32 = -200;
+/// Ownership rejection at End after the audited default Host transfers finish.
+const ILLEGAL_CLIENT: i32 = -601;
 
 /// A store client with the Host pool registered.
 pub struct MooncakeStore {
     client: Client,
     host: HostBuffer,
+    in_flight_puts: InFlightPuts,
+}
+
+/// One Store client is shared by several workers. Keep its concurrent writes
+/// to the same complete object key from reusing that client's write ownership.
+#[derive(Default)]
+struct InFlightPuts {
+    keys: Mutex<HashSet<String>>,
+}
+
+struct PutClaim<'a> {
+    registry: &'a InFlightPuts,
+    entries: Vec<(usize, String)>,
+    release_on_drop: bool,
+}
+
+impl InFlightPuts {
+    fn claim<'a>(&'a self, keys: &[String], candidates: &[usize]) -> PutClaim<'a> {
+        let mut claimed = self.keys.lock().expect("Mooncake in-flight PUT lock");
+        let entries = candidates
+            .iter()
+            .filter(|&&index| claimed.insert(keys[index].clone()))
+            .map(|&index| (index, keys[index].clone()))
+            .collect();
+        PutClaim {
+            registry: self,
+            entries,
+            release_on_drop: true,
+        }
+    }
+}
+
+impl PutClaim<'_> {
+    fn native_started(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    fn native_finished(&mut self, retired: bool) {
+        // The default Host result contract below is the only retirement
+        // evidence. A lost/timed-out End may still act on this client's key;
+        // waiting longer cannot make it safe to release that key's claim.
+        self.release_on_drop = retired;
+    }
+}
+
+impl Drop for PutClaim<'_> {
+    fn drop(&mut self) {
+        if !self.release_on_drop {
+            // The executor retains this batch's Host references and operation
+            // credits too, so these keys remain bounded by the same admission
+            // budgets. Do not permit another write while old I/O is unknown.
+            return;
+        }
+        // A guard can drop during unwinding; another panic would abort.
+        let mut claimed = self.registry.keys.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, key) in &self.entries {
+            claimed.remove(key);
+        }
+    }
 }
 
 impl MooncakeStore {
@@ -62,7 +127,11 @@ impl MooncakeStore {
             segment = setup.global_segment_size,
             "Mooncake Store L3 ready"
         );
-        Ok(Self { client, host })
+        Ok(Self {
+            client,
+            host,
+            in_flight_puts: InFlightPuts::default(),
+        })
     }
 
     fn addresses(host: HostBuffer, ranges: &[Range]) -> (Vec<usize>, Vec<usize>) {
@@ -102,11 +171,18 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
     }
 }
 
-/// A PUT's outcome: the objects that already `exist` succeed without a
-/// write, and each `missing` key takes its write's result. An existing
-/// object (another writer's) is a success; an allocation rejection retires
-/// as a failure the scheduler offers again; other errors do not prove that
-/// the source bytes are no longer read.
+/// Keep the SDK's accepted/existing PUT acknowledgment as a historical hint,
+/// not a promise that another writer's object is readable yet. Actual restore
+/// still needs full-length GET success independently of that acknowledgment.
+/// The audited default Host C ABI uses the reliable memory policy: End follows
+/// successful allocated transfers, and a failed transfer is not hidden by a
+/// later Revoke rejection. ILLEGAL_CLIENT therefore retires sources without
+/// proving publication. This does not generalize to flexible memory/NoF or
+/// custom backend policies; see docs/design/async-l3-cache.md for source links.
+/// The SDK is dynamically loaded; this adapter performs no runtime policy or
+/// capability validation. These retirement assumptions depend on the selected
+/// library preserving the audited default Host ABI's behavior and must not be
+/// generalized to arbitrary SDK builds.
 fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
     let mut success = exists;
     for (&index, &result) in missing.iter().zip(results) {
@@ -115,9 +191,15 @@ fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResul
     IoResult {
         object_failures: vec![false; success.len()],
         success,
-        retired: results
-            .iter()
-            .all(|&result| [0, OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE].contains(&result)),
+        retired: results.iter().all(|&result| {
+            [
+                0,
+                OBJECT_ALREADY_EXISTS,
+                NO_AVAILABLE_HANDLE,
+                ILLEGAL_CLIENT,
+            ]
+            .contains(&result)
+        }),
     }
 }
 
@@ -128,8 +210,8 @@ fn namespace_pattern(prefix: &str) -> String {
 
 impl Store for MooncakeStore {
     fn failures_retire(&self) -> bool {
-        // A failed SDK call does not prove that RDMA stopped using the Host
-        // bytes.
+        // A top-level SDK error supplies no per-key status vector and does not
+        // prove that native access to the Host bytes stopped.
         false
     }
 
@@ -192,18 +274,23 @@ impl Store for MooncakeStore {
                 });
             }
         };
-        let missing: Vec<usize> = (0..keys.len()).filter(|&i| !exists[i]).collect();
+        let candidates: Vec<usize> = (0..keys.len()).filter(|&i| !exists[i]).collect();
+        let mut claim = self.in_flight_puts.claim(keys, &candidates);
+        let missing: Vec<usize> = claim.entries.iter().map(|(index, _)| *index).collect();
         if missing.is_empty() {
             return Ok(put_outcome(exists, &missing, &[]));
         }
         let put_keys: Vec<String> = missing.iter().map(|&i| keys[i].clone()).collect();
         let put_ranges: Vec<Range> = missing.iter().map(|&i| ranges[i]).collect();
         let (addrs, sizes) = Self::addresses(host, &put_ranges);
+        claim.native_started();
         let results = self
             .client
             .batch_put_from(&put_keys, &addrs, &sizes)
             .map_err(failed)?;
-        Ok(put_outcome(exists, &missing, &results))
+        let result = put_outcome(exists, &missing, &results);
+        claim.native_finished(result.retired);
+        Ok(result)
     }
 
     fn remove_by_prefix(&self, prefix: &str) -> bool {
@@ -236,16 +323,121 @@ impl Store for MooncakeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+
+    const RPC_FAIL: i32 = -900;
+    const RPC_TIMEOUT: i32 = -901;
+
+    #[test]
+    fn put_claims_filter_only_overlapping_objects_and_release_before_submission() {
+        let registry = InFlightPuts::default();
+        let keys = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "a".to_owned(),
+        ];
+        let first = registry.claim(&keys, &[0, 1, 3]);
+        assert_eq!(first.entries, [(0, "a".to_owned()), (1, "b".to_owned())]);
+        let second = registry.claim(&keys, &[1, 2]);
+        assert_eq!(second.entries, [(2, "c".to_owned())]);
+        drop(first); // No native call occurred, including an early local error.
+        let next = registry.claim(&keys, &[0, 1, 2]);
+        assert_eq!(next.entries, [(0, "a".to_owned()), (1, "b".to_owned())]);
+        drop(next);
+        drop(second);
+        assert!(registry.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_host_put_results_release_only_safely_retired_claims() {
+        for (result, retired) in [
+            (0, true),
+            (OBJECT_ALREADY_EXISTS, true),
+            (NO_AVAILABLE_HANDLE, true),
+            (ILLEGAL_CLIENT, true),
+            (-800, false),
+            (-1, false),
+        ] {
+            let registry = InFlightPuts::default();
+            let keys = vec!["a".to_owned()];
+            let mut claim = registry.claim(&keys, &[0]);
+            claim.native_started();
+            let outcome = put_outcome(vec![false], &[0], &[result]);
+            assert_eq!(outcome.retired, retired);
+            claim.native_finished(outcome.retired);
+            drop(claim);
+            let next = registry.claim(&keys, &[0]);
+            assert_eq!(next.entries.is_empty(), !retired);
+        }
+    }
+
+    #[test]
+    fn an_unknown_end_rpc_retains_both_the_put_claim_and_source_ownership() {
+        for result in [RPC_FAIL, RPC_TIMEOUT] {
+            let registry = InFlightPuts::default();
+            let keys = vec!["a".to_owned()];
+            let mut claim = registry.claim(&keys, &[0]);
+            claim.native_started();
+            let outcome = put_outcome(vec![false], &[0], &[result]);
+            assert_eq!(outcome.success, [false]);
+            assert!(!outcome.retired);
+            claim.native_finished(outcome.retired);
+            drop(claim);
+            assert!(registry.claim(&keys, &[0]).entries.is_empty());
+            let next_namespace = vec!["v2/a".to_owned()];
+            assert_eq!(registry.claim(&next_namespace, &[0]).entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_native_call_without_a_result_does_not_release_its_claim() {
+        let registry = InFlightPuts::default();
+        let keys = vec!["a".to_owned()];
+        {
+            let mut claim = registry.claim(&keys, &[0]);
+            claim.native_started();
+            // A failed SDK call returns through `?` without a status vector.
+        }
+        assert!(registry.claim(&keys, &[0]).entries.is_empty());
+    }
+
+    #[test]
+    fn concurrent_workers_claim_one_shared_key_without_serializing_other_keys() {
+        let registry = Arc::new(InFlightPuts::default());
+        let barrier = Arc::new(Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let keys = vec!["shared".to_owned(), format!("private-{worker}")];
+                    barrier.wait();
+                    let claim = registry.claim(&keys, &[0, 1]);
+                    let shared = claim.entries.iter().any(|(index, _)| *index == 0);
+                    assert!(claim.entries.iter().any(|(index, _)| *index == 1));
+                    barrier.wait(); // Every claim stays live until all workers saw it.
+                    shared
+                })
+            })
+            .collect();
+        let shared_writers = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(shared_writers, 1);
+        assert!(registry.keys.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn existing_objects_are_not_rewritten_and_rejections_retire() {
         // `existing` is stored; `saved` writes; `pressure` meets a full
         // store, a failure the scheduler offers again.
-        let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
+        let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
         assert_eq!(outcome.success, [true, true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false, false, false]);
-        // Another writer's concurrent create is a success.
+        // Another writer's accepted create keeps the SDK's best-effort ACK.
         let outcome = put_outcome(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]);
         assert_eq!(outcome.success, [true]);
         assert!(outcome.retired);
@@ -254,10 +446,89 @@ mod tests {
     #[test]
     fn a_failed_put_does_not_retire() {
         for error in [-1, -800] {
-            let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, error]);
+            let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, error]);
             assert_eq!(outcome.success, [true, true, false]);
             assert!(!outcome.retired);
         }
+    }
+
+    #[test]
+    fn zero_and_duplicate_results_keep_the_existing_sdk_ack_semantics() {
+        for result in [0, OBJECT_ALREADY_EXISTS] {
+            let outcome = put_outcome(vec![false], &[0], &[result]);
+            assert_eq!(outcome.success, [true]);
+            assert!(outcome.retired);
+            assert_eq!(outcome.object_failures, [false]);
+        }
+    }
+
+    #[test]
+    fn a_put_ack_does_not_retire_another_keys_unknown_io() {
+        for unknown in [-800, RPC_FAIL, RPC_TIMEOUT, -1] {
+            let outcome = put_outcome(vec![false, false], &[0, 1], &[0, unknown]);
+            assert_eq!(outcome.success, [true, false]);
+            assert!(!outcome.retired);
+            assert_eq!(outcome.object_failures, [false, false]);
+        }
+    }
+
+    #[test]
+    fn a_put_ack_does_not_override_a_later_get_miss_or_short_read() {
+        for status in [0, OBJECT_ALREADY_EXISTS] {
+            let ack = put_outcome(vec![false], &[0], &[status]);
+            assert_eq!(ack.success, [true]);
+            assert!(ack.retired);
+            for result in [OBJECT_NOT_FOUND, 4] {
+                let read = get_outcome(&[result], &[8]);
+                assert_eq!(read.success, [false]);
+                assert!(read.retired);
+                assert_eq!(read.object_failures, [true]);
+            }
+        }
+    }
+
+    #[test]
+    fn an_owner_rejection_retires_default_host_sources_without_publication() {
+        let outcome = put_outcome(vec![true, true], &[0, 1], &[0, ILLEGAL_CLIENT]);
+        assert_eq!(outcome.success, [true, false]);
+        assert!(outcome.retired);
+        assert_eq!(outcome.object_failures, [false, false]);
+    }
+
+    #[test]
+    fn an_owner_rejection_does_not_hide_another_keys_unknown_transfer() {
+        for unknown in [-800, RPC_FAIL, RPC_TIMEOUT, -1] {
+            for results in [[ILLEGAL_CLIENT, unknown], [unknown, ILLEGAL_CLIENT]] {
+                let registry = InFlightPuts::default();
+                let keys = vec!["a".to_owned(), "b".to_owned()];
+                let mut claim = registry.claim(&keys, &[0, 1]);
+                claim.native_started();
+                let outcome = put_outcome(vec![false, false], &[0, 1], &results);
+                assert_eq!(outcome.success, [false, false]);
+                assert!(!outcome.retired);
+                assert_eq!(outcome.object_failures, [false, false]);
+                claim.native_finished(outcome.retired);
+                drop(claim);
+                assert!(registry.claim(&keys, &[0, 1]).entries.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn default_host_statuses_keep_sdk_acks_separate_from_source_retirement() {
+        let outcome = put_outcome(
+            vec![false; 4],
+            &[0, 1, 2, 3],
+            &[
+                ILLEGAL_CLIENT,
+                0,
+                OBJECT_ALREADY_EXISTS,
+                NO_AVAILABLE_HANDLE,
+            ],
+        );
+        assert_eq!(outcome.success, [false, true, true, false]);
+        assert!(outcome.retired);
+        assert_eq!(outcome.object_failures, [false; 4]);
     }
 
     #[test]
