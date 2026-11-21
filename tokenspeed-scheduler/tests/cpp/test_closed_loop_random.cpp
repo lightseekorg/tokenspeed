@@ -72,6 +72,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -94,6 +95,9 @@ namespace {
 
 constexpr std::int32_t kP = 8;
 constexpr std::int32_t kRounds = 300;
+
+// The shard counts a closed loop runs at.
+constexpr std::array<std::int32_t, 4> kKvShards{1, 2, 4, 8};
 
 // What a run changes in its seed's draws. The defaults change nothing: every
 // draw is still made, so a seed keeps its random stream.
@@ -138,6 +142,8 @@ struct LoopKnobs {
     // P role only: SchedulerConfig::drop_short_prompt_end_checkpoints, with
     // the in-forward checkpoints on whatever in_forward says.
     bool drop_short_prompt_ends{false};
+    // A shard count in place of the drawn one.
+    std::optional<std::int32_t> kv_shards;
 };
 
 struct ClosedLoop {
@@ -307,7 +313,7 @@ struct ClosedLoop {
         // Restricted State groups require in-forward checkpoints.
         const bool in_forward = knobs.in_forward.value_or(Rand(0, 2) == 0) || knobs.state_grain > 1;
         const std::int32_t host_pages = std::vector<std::int32_t>{9, 17, 33}[Rand(0, 3)];
-        kv_shards = std::vector<std::int32_t>{1, 2, 4, 8}[Rand(0, 4)];
+        kv_shards = knobs.kv_shards.value_or(kKvShards[Rand(0, 4)]);
         const std::int32_t device_pages = std::vector<std::int32_t>{24, 40, 64}[Rand(0, 3)] * knobs.device_pages_factor;
         // A parent holds at least one history block per shard.
         const std::int32_t packing = std::max(4, kv_shards);
@@ -914,14 +920,24 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     EXPECT_GT(waiting_grants, 0u);
 }
 
-// 16 seeds, each driving two schedulers as the ranks of one replica. Seeds 16
-// to 31 draw write-back at every shard count.
+// 16 seeds, each driving two schedulers as the ranks of one replica. The
+// seeds pin each (write policy, shard count) cell twice, so the coverage
+// asserted below does not rest on how a seed's draws land.
 TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
+    // Two seeds per cell.
+    constexpr unsigned kSeedBase = 16;
+    constexpr unsigned kSeeds = 16;
     // Per write policy and shard count: the eviction write-backs and the
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
-    for (unsigned seed = 16; seed < 32; ++seed) {
-        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true, LoopKnobs{});
+    for (unsigned seed = kSeedBase; seed < kSeedBase + kSeeds; ++seed) {
+        // Pin the cell: write-back for the first half of the seeds and
+        // write-through for the rest, the four shard counts in turn. The draws
+        // still run, so a seed's other configuration keeps its stream.
+        const std::size_t cell_index = seed - kSeedBase;
+        const LoopKnobs knobs{.write_back = cell_index < kSeeds / 2,
+                              .kv_shards = kKvShards[cell_index % kKvShards.size()]};
+        ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/true, knobs);
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
                                           << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards);
         try {
@@ -939,8 +955,10 @@ TEST(ClosedLoopRandomTest, MirroredPrefillSchedulersPlanAlike) {
         write_backs += stats.eviction_stores.ops;
         loads += stats.prefix_loads.ops;
     }
-    // Write-back evicted, wrote back and loaded back at every shard count.
-    for (const std::int32_t shards : {1, 2, 4, 8}) {
+    // Write-back evicted, wrote back and loaded back at every shard count, and
+    // every cell ran.
+    EXPECT_EQ(exercised.size(), kSeeds / 2);
+    for (const std::int32_t shards : kKvShards) {
         const auto& [write_backs, loads] = exercised[{true, shards}];
         EXPECT_GT(write_backs, 0u) << "shards " << shards;
         EXPECT_GT(loads, 0u) << "shards " << shards;
