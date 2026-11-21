@@ -1646,8 +1646,8 @@ the partials by LSE.
 Each workgroup owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
-With head dim 64 and 16-bit K/V, 256-row tiles on eight waves (below) take
-over when each workgroup streams many cached keys: under full attention a
+With head dim 64 and 16-bit or FP8 K/V, 256-row tiles on eight waves (below)
+take over when each workgroup streams many cached keys: under full attention a
 cached prefix (`max_seqlen_k - max_seqlen_q`) of at least 8192 keys; under a
 window of at least 2047 keys a prefix of at least the window and one to four
 workgroups per CU over the launch. `max_seqlen_k` should be the longest
@@ -1673,11 +1673,17 @@ V and copy K; PV MFMAs with the next page's row maxima). The two waves on a
 SIMD run one cluster apart, and the copy clusters raise their priority with
 `s_setprio`, so one wave's MFMAs and softmax overlap the other's LDS reads and
 copies. K and V pass through 4-slot LDS rings, K four pages ahead and V two.
-The running maximum moves only when a page raises it by more than 8 (base 2),
-so most pages skip the accumulator rescale, and a wave whose 32 rows all kept
-their maximum skips it with one scalar branch. A wave uses about 196 VGPRs, so
-one 8-wave workgroup runs per CU; the split count therefore counts each as
-two 4-wave workgroups.
+With 16-bit K/V the running maximum moves only when a page raises it by more
+than 8 (base 2), so most pages skip the accumulator rescale. With FP8 K/V the
+maximum moves on every page that raises it, as in the 4-wave loop, because FP8
+P is quantized against it. Either way a wave whose 32 rows all kept their
+maximum skips the rescale with one scalar branch. A wave uses about 196 VGPRs,
+so one 8-wave workgroup runs per CU and the split count counts each as two
+4-wave workgroups. With FP8 K/V under full attention, a one-request launch
+compiles at four waves per SIMD (128 VGPRs), so two workgroups share a CU.
+The FP8 split count starts from the 4-wave grid's, since split boundaries
+change FP8 bits; where the 8-wave grid would leave a partial round of the CUs
+it takes the count, up to twice that, that finishes soonest.
 
 ### gfx950 MLA extend
 
