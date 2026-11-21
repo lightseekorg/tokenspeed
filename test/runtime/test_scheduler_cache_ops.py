@@ -232,6 +232,7 @@ def _config(**overrides):
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
         storage_config=None,
         num_disk_pages=0,
         disk_config=None,

@@ -363,6 +363,12 @@ admitted ahead of it), less a hit's replay window, and finishes U uncached
 tokens within `1 + ceil((U - B) / R)` such rounds. A final chunk never gives
 way. A resident chunk whose admission fails still blocks everything behind
 it, and the chunk that gave way is admitted first again next round. With
+`prefill_chunk_yield_max_rounds` Y (unbounded by default), a prompt gives way
+in at most Y of its rounds: a round counts when its chunk was cut shorter for
+the carry or a carried prompt ran beside it. After Y such rounds its chunks
+end where they would without the option, and only the budget they leave is
+filled; so at most Y of the rounds the bound above counts advance by less
+than a whole budget for the carry. With
 N = 0 (the default) no chunk gives way: it ends where it would without the
 option, and only the budget it leaves is filled. The fused role does
 neither: there, retraction picks the largest incomplete prefill first, and a
@@ -1802,6 +1808,24 @@ chunk the engine runs before its last one, its own included. A round that `M`
 holds back counts toward `N` like the interval's own. With `M >= N` the
 interval owes nothing `M` does not; `M` alone bounds nothing. The P and D
 roles refuse it as well.
+
+**Bounded suspension** (`max_consecutive_prefill_rounds` `K`, requires the
+interval): the suspension above lets a queue of overdue prompts run its
+chunks back to back for as long as the queue lasts, with every decode stalled
+throughout. With `K`, an overdue prompt suspends the interval only until `K`
+prefill rounds have run back to back; the round that reaches `K` owes the
+decodes the whole interval again, and no overdue prompt suspends that one.
+In exchange the held-back count restarts whenever a round runs one of the
+prompt's chunks, so the `N`-round bound applies to each chunk rather than to
+the prompt in total: a prompt in `c` chunks waits up to about `c` intervals.
+A run counts only rounds that hold a decode back: a round with nothing ready
+to decode ends the run (prefill while nothing decodes stalls nothing and is
+not limited), and in mixed mode so does every round that decodes beside its
+prefill: there the cap is never reached, and what `K` changes is the restart
+alone, so each chunk of an overdue prompt waits the interval. The counters follow the plans and the candidates, identical on every
+rank, like the interval's. With both `K` and the minimum interval `M`, a
+round owes decodes when `M` has rounds left or when the interval does and no
+overdue prompt may suspend it.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is

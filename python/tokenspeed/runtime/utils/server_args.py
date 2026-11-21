@@ -478,6 +478,9 @@ class ServerArgs:
     prefill_decode_interval: int = 0
     # The same, owed even while an overdue prompt suspends the interval.
     prefill_decode_min_interval: int = 0
+    # The most back-to-back prefill rounds an overdue prompt may suspend the
+    # interval for; 0 keeps the unbounded suspension.
+    max_consecutive_prefill_rounds: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -3154,6 +3157,13 @@ class ServerArgs:
                 "a prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.max_consecutive_prefill_rounds < 0:
+            raise ValueError("--max-consecutive-prefill-rounds must be non-negative")
+        if self.max_consecutive_prefill_rounds and not self.prefill_decode_interval:
+            raise ValueError(
+                "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
+                "it bounds how long an overdue prompt suspends the interval"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -3588,6 +3598,17 @@ class ServerArgs:
             "for a prompt it has held back in full. A long prompt's chunks "
             "then alternate with decode rounds instead of stalling the decodes "
             "back to back. Aggregated serving only. 0 (the default) is off.",
+        )
+        parser.add_argument(
+            "--max-consecutive-prefill-rounds",
+            type=int,
+            default=ServerArgs.max_consecutive_prefill_rounds,
+            help="With --prefill-decode-interval: the most back-to-back prefill "
+            "rounds that hold a decode back while an overdue prompt suspends "
+            "the interval; the round that reaches it owes the decodes the whole "
+            "interval again, and a prompt's held-back count restarts whenever "
+            "one of its chunks runs. 0 (the default) keeps the unbounded "
+            "suspension.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
