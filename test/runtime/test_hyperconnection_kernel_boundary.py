@@ -65,6 +65,7 @@ def test_kernel_boundary_is_gpu_only() -> None:
             2,
             projection_rows=4,
             weights_independent=False,
+            activation_quantization="none",
         )
     with pytest.raises(ValueError, match="requires GPU tensors"):
         gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
@@ -800,6 +801,7 @@ def test_prefill_weight_reload_preserves_graph(dtype):
             projection_rows=324,
             weights_independent=True,
             override="triton_hyperconnection_mix",
+            activation_quantization="none",
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(result, expected, rtol=0.005, atol=0.002)

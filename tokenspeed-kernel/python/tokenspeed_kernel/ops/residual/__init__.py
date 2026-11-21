@@ -27,7 +27,12 @@ from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 
 # ===-----------------------------------------------------------------------===#
 # Kimi K3 Attention Residual
@@ -365,9 +370,13 @@ def select_gated_residual_mix_kernel(
     lowrank: int,
     *,
     weights_independent: bool,
+    activation_quantization: str,
     override: str | None,
     solution: str | None,
     packed_up_weight: _torch.Tensor | None = None,
+    projection_weight_scale: _torch.Tensor | None = None,
+    up_weight_scale: _torch.Tensor | None = None,
+    normalized_scale: _torch.Tensor | None = None,
 ):
     """Select the ``gated_residual_mix`` kernel for validated 2-D inputs.
 
@@ -380,6 +389,12 @@ def select_gated_residual_mix_kernel(
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
         weights_independent: Whether both weights stay unchanged within forward.
+        activation_quantization: Explicit "none" or "fp8" activation arithmetic.
+        projection_weight_scale: FP32 tensor or output-channel scales for FP8
+            down/inject weights; omitted for unquantized weights.
+        up_weight_scale: Corresponding scales for FP8 Up weights.
+        normalized_scale: Tensor or row scale for prequantized E4M3 input;
+            omitted for 16-bit input.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
@@ -393,7 +408,12 @@ def select_gated_residual_mix_kernel(
     )
 
     rows = int(flat.shape[0])
-    grid_supported = supports_fused_hc(flat.device)
+    # The 16-bit fused path queries clusters here. Prequantized FP8 measures
+    # its compiled CTA capacity before the cooperative launch.
+    grid_supported = (
+        projection_weight.dtype != _torch.float8_e4m3fn
+        and supports_fused_hc(flat.device)
+    )
 
     traits = {
         "prefill_up_mix": (
@@ -423,10 +443,46 @@ def select_gated_residual_mix_kernel(
         ),
         "deterministic": _torch.are_deterministic_algorithms_enabled(),
     }
+    projection_format = dense_tensor_format(projection_weight.dtype)
+    up_format = dense_tensor_format(up_weight.dtype)
+    if projection_weight.dtype == _torch.float8_e4m3fn:
+        if projection_weight_scale is None or up_weight_scale is None:
+            raise ValueError("FP8 mixer requires both weight scales")
+        projection_format = tensor_format(
+            "scaled-fp8",
+            projection_weight.dtype,
+            scale=ScaleFormat(
+                storage_dtype=_torch.float32,
+                granularity=(
+                    "tensor" if projection_weight_scale.numel() == 1 else "channel"
+                ),
+            ),
+        )
+        up_format = tensor_format(
+            "scaled-fp8",
+            up_weight.dtype,
+            scale=ScaleFormat(
+                storage_dtype=_torch.float32,
+                granularity="tensor" if up_weight_scale.numel() == 1 else "channel",
+            ),
+        )
+    normalized_format = dense_tensor_format(flat.dtype)
+    if flat.dtype == _torch.float8_e4m3fn:
+        if normalized_scale is None:
+            raise ValueError("prequantized FP8 input requires normalized_scale")
+        normalized_format = tensor_format(
+            "scaled-fp8",
+            flat.dtype,
+            scale=ScaleFormat(
+                storage_dtype=_torch.float32,
+                granularity="tensor" if normalized_scale.numel() == 1 else "token",
+            ),
+        )
+    traits["activation_quantization"] = activation_quantization
     signature = format_signature(
-        normalized=dense_tensor_format(flat.dtype),
-        projection_weight=dense_tensor_format(projection_weight.dtype),
-        up_weight=dense_tensor_format(up_weight.dtype),
+        normalized=normalized_format,
+        projection_weight=projection_format,
+        up_weight=up_format,
     )
     kernel = select_kernel(
         "residual",
@@ -449,10 +505,15 @@ def gated_residual_mix(
     *,
     projection_rows: int,
     weights_independent: bool,
+    activation_quantization: str,
     projection_scale: float = 1.0,
     override: str | None = None,
     solution: str | None = None,
     packed_up_weight: _torch.Tensor | None = None,
+    projection_weight_scale: _torch.Tensor | None = None,
+    up_weight_scale: _torch.Tensor | None = None,
+    normalized_scale: _torch.Tensor | None = None,
+    output_dtype: _torch.dtype | None = None,
 ) -> tuple[_torch.Tensor, _torch.Tensor | None]:
     """Mix normalized hyperconnection branches and optionally form inject logits.
 
@@ -468,8 +529,11 @@ def gated_residual_mix(
             ``[stored_rows, hc_count * hidden_size]``. ``stored_rows`` is
             ``projection_rows`` or, for BF16/FP16, rounded up to eight rows
             by :func:`pad_gated_residual_projection_weight` during loading.
+            E4M3 FP8 weights require projection_weight_scale; they may retain
+            the same storage padding, which never contributes inject logits.
         up_weight: Mix-up weight shaped
-            ``[hc_count * hidden_size, lowrank]``.
+            ``[hc_count * hidden_size, lowrank]``. E4M3 FP8 weights require
+            up_weight_scale and preserve their 8-bit global storage.
         packed_up_weight: Optional output of prepare_gated_residual_up_weight
             for the current up_weight contents. Kernels without packed-weight
             support use up_weight; this does not force an implementation.
@@ -483,6 +547,23 @@ def gated_residual_mix(
             unchanged within forward, permitting weight TMA before the activation
             producer completes. Pass False when a preceding PDL kernel may write
             either weight.
+        activation_quantization: Explicitly "none" for 16-bit activations, or
+            "fp8" for dynamic per-token E4M3 input and post-SiLU quantization.
+            FP8 activation quantization requires E4M3 weights. The original
+            16-bit normalized input is retained for the gated residual sum.
+            Already-quantized E4M3 inputs instead require normalized_scale and
+            output_dtype, use codes directly, and mix with codes times scale.
+        projection_weight_scale: FP32 dequantization scale for E4M3 down/inject
+            weights, one per stored output row or one broadcast value.
+            Required for FP8 weights; omitted for unquantized weights.
+        up_weight_scale: FP32 scale for E4M3 Up weights, one per output row or
+            one broadcast value. Scales multiply the FP8 codes. Scale contents
+            follow the same readiness and update contract as their weights.
+        normalized_scale: FP32 scale for prequantized E4M3 normalized input,
+            one value or one per flattened row. Omitted for 16-bit inputs.
+        output_dtype: Required BF16 or FP16 output dtype for prequantized input;
+            also selects post-SiLU rounding before internal FP8 quantization.
+            Omitted for 16-bit inputs, whose dtype determines the outputs.
         projection_scale: Scale applied to down and inject projection results.
             It is ``1`` when an exact power-of-two scale was folded into the
             checkpoint weight and ``1 / hc_count`` otherwise.
@@ -490,13 +571,16 @@ def gated_residual_mix(
         solution: Optional registered solution name.
 
     Returns:
-        A pair containing the mixed tensor shaped ``[..., hidden_size]`` and
+        A pair in the normalized-input dtype, or explicit output_dtype for
+        prequantized input, containing the mixed tensor shaped ``[..., hidden_size]`` and
         optional inject logits shaped ``[..., hc_count]``.
     """
     if hc_count <= 1 or hidden_size <= 0 or lowrank <= 0:
         raise ValueError("hc_count must exceed one and all dimensions must be positive")
     if not math.isfinite(projection_scale) or projection_scale <= 0:
         raise ValueError("projection_scale must be finite and positive")
+    if activation_quantization not in ("none", "fp8"):
+        raise ValueError("activation_quantization must be none or fp8")
 
     wide = hc_count * hidden_size
     flat = _flatten_rows(normalized, wide, "normalized")
@@ -511,7 +595,12 @@ def gated_residual_mix(
             f"projection_rows is {projection_rows}; expected {lowrank} "
             f"or {lowrank + hc_count}"
         )
-    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    alignment = (
+        8
+        if projection_weight.dtype
+        in (_torch.bfloat16, _torch.float16, _torch.float8_e4m3fn)
+        else 1
+    )
     padded_rows = (projection_rows + alignment - 1) // alignment * alignment
     if projection_weight.shape[0] not in (projection_rows, padded_rows):
         raise ValueError(
@@ -522,8 +611,64 @@ def gated_residual_mix(
         raise ValueError(
             f"up_weight must have shape {(wide, lowrank)}, got {tuple(up_weight.shape)}"
         )
-    _same_tensor_contract(flat, projection_weight, "projection_weight")
-    _same_tensor_contract(flat, up_weight, "up_weight")
+    fp8_weights = projection_weight.dtype == up_weight.dtype == _torch.float8_e4m3fn
+    prequantized_input = flat.dtype == _torch.float8_e4m3fn
+    if prequantized_input:
+        if not fp8_weights or activation_quantization != "fp8":
+            raise ValueError(
+                "prequantized FP8 input requires FP8 weights and fp8 arithmetic"
+            )
+        if output_dtype not in (_torch.bfloat16, _torch.float16):
+            raise ValueError(
+                "prequantized FP8 input requires BF16 or FP16 output_dtype"
+            )
+        if (
+            normalized_scale is None
+            or normalized_scale.dtype != _torch.float32
+            or normalized_scale.device != flat.device
+            or not normalized_scale.is_contiguous()
+            or normalized_scale.numel() not in (1, flat.shape[0])
+        ):
+            raise ValueError(
+                "FP8 normalized input requires a colocated contiguous FP32 tensor or row scale"
+            )
+    elif normalized_scale is not None or output_dtype is not None:
+        raise ValueError(
+            "normalized_scale and output_dtype apply only to prequantized FP8 input"
+        )
+    if fp8_weights:
+        if flat.dtype not in (_torch.bfloat16, _torch.float16, _torch.float8_e4m3fn):
+            raise ValueError("FP8 mixer requires BF16, FP16 or E4M3 normalized input")
+        if packed_up_weight is not None:
+            raise ValueError("FP8 mixer consumes canonical, unpacked FP8 weights")
+        for name, weight, scale in (
+            ("projection_weight", projection_weight, projection_weight_scale),
+            ("up_weight", up_weight, up_weight_scale),
+        ):
+            if (
+                scale is None
+                or scale.dtype != _torch.float32
+                or scale.device != flat.device
+                or weight.device != flat.device
+                or not scale.is_contiguous()
+                or scale.shape
+                not in ((1,), (1, 1), (weight.shape[0],), (weight.shape[0], 1))
+            ):
+                raise ValueError(
+                    f"{name} requires a colocated contiguous FP32 tensor or channel scale"
+                )
+        if any(
+            not t.is_contiguous() or t.data_ptr() % 16
+            for t in (flat, projection_weight, up_weight)
+        ):
+            raise ValueError("FP8 mixer requires contiguous 16-byte-aligned operands")
+    else:
+        _same_tensor_contract(flat, projection_weight, "projection_weight")
+        _same_tensor_contract(flat, up_weight, "up_weight")
+        if activation_quantization != "none":
+            raise ValueError("FP8 activation quantization requires FP8 weights")
+        if projection_weight_scale is not None or up_weight_scale is not None:
+            raise ValueError("weight scales require FP8 weights")
     if packed_up_weight is not None:
         _same_tensor_contract(flat, packed_up_weight, "packed_up_weight")
         if (
@@ -540,15 +685,18 @@ def gated_residual_mix(
     has_inject = projection_rows != lowrank
     leading_shape = normalized.shape[:-1]
     if rows == 0:
-        mixed = normalized.new_empty((*leading_shape, hidden_size))
+        result_dtype = output_dtype if prequantized_input else normalized.dtype
+        mixed = normalized.new_empty((*leading_shape, hidden_size), dtype=result_dtype)
         inject = (
-            normalized.new_empty((*leading_shape, hc_count)) if has_inject else None
+            normalized.new_empty((*leading_shape, hc_count), dtype=result_dtype)
+            if has_inject
+            else None
         )
         return mixed, inject
 
     from tokenspeed_kernel.ops.tuning import is_warming_up
 
-    if is_warming_up():
+    if is_warming_up() and not fp8_weights:
         from tokenspeed_kernel.ops.residual.cute_fused import warmup
 
         warmup(
@@ -572,7 +720,11 @@ def gated_residual_mix(
         hidden_size,
         lowrank,
         weights_independent=weights_independent,
+        activation_quantization=activation_quantization,
         packed_up_weight=packed_up_weight,
+        projection_weight_scale=projection_weight_scale,
+        up_weight_scale=up_weight_scale,
+        normalized_scale=normalized_scale,
         override=override,
         solution=solution,
     )
@@ -586,6 +738,18 @@ def gated_residual_mix(
         kernel_name=kernel.name,
         **traits,
     ):
+        quantized_arguments = (
+            {
+                "projection_weight_scale": projection_weight_scale,
+                "up_weight_scale": up_weight_scale,
+                "activation_quantization": activation_quantization,
+            }
+            if fp8_weights
+            else {}
+        )
+        if prequantized_input:
+            quantized_arguments["normalized_scale"] = normalized_scale
+            quantized_arguments["output_dtype"] = output_dtype
         mixed, inject = kernel(
             flat,
             projection_weight,
@@ -597,6 +761,7 @@ def gated_residual_mix(
             projection_scale,
             weights_independent,
             packed_up_weight=packed_up_weight,
+            **quantized_arguments,
         )
     mixed = mixed.reshape(*leading_shape, hidden_size)
     if inject is not None:
@@ -1221,6 +1386,8 @@ import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual.cute_dsl_fp8  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual.cute_dsl_fp8_fused  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.torch  # noqa: E402,F401
