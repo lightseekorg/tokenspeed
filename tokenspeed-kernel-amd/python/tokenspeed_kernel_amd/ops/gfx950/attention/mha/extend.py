@@ -1212,6 +1212,56 @@ def _stream_kv(
     return m_i, l_i, acc
 
 
+@gluon.jit
+def _remap_extend_program(
+    pid_q, pid_batch, kv_head, RAGGED: gl.constexpr, N_KV_HEADS: gl.constexpr
+):
+    """Place each (query block, KV head) work-group on its head's XCDs, longest
+    blocks first.
+
+    Work-groups are dispatched in launch order ``linear = block + blocks *
+    head`` (a rectangular launch's block is ``batch * blocks_per_req +
+    pid_q``) and land on XCD ``linear % _NUM_XCDS``. Each KV head gets its own
+    ``_NUM_XCDS / N_KV_HEADS`` XCDs, so the work-groups sharing an XCD's L2
+    stream the same head's pages; a head's blocks alternate over its XCDs
+    (causal blocks grow with their position, and contiguous runs would load
+    one XCD with the late ones). When ``_NUM_XCDS`` does not divide the
+    launch, the last ``blocks * heads % _NUM_XCDS`` work-groups take each
+    head's last blocks, so every (block, head) still runs exactly once; those
+    few work-groups are not placed by head.
+    Blocks are then taken last to first: under causal full attention a
+    request's last blocks see the most keys, and the last request's go first,
+    so the shortest work ends the launch. Each work-group computes the same
+    (block, head) wherever it runs, so the output bits do not change.
+    """
+    per_head: gl.constexpr = _NUM_XCDS // N_KV_HEADS
+    blocks_per_req = gl.num_programs(0)
+    if RAGGED:
+        blocks = blocks_per_req
+    else:
+        blocks = blocks_per_req * gl.num_programs(1)
+    linear = pid_q + blocks_per_req * pid_batch + blocks * kv_head
+    total = blocks * N_KV_HEADS
+    full = total - total % _NUM_XCDS
+    if linear < full:
+        xcd = linear % _NUM_XCDS
+        kv_head = xcd // per_head
+        block = (linear // _NUM_XCDS) * per_head + xcd % per_head
+    else:
+        # The tail holds tail / heads blocks of every head; head-minor so
+        # only the head count (a constant) divides.
+        tail = linear - full
+        kv_head = tail % N_KV_HEADS
+        block = blocks - (total - full) // N_KV_HEADS + tail // N_KV_HEADS
+    block = blocks - 1 - block
+    if RAGGED:
+        pid_q = block
+    else:
+        pid_q = block % blocks_per_req
+        pid_batch = block // blocks_per_req
+    return pid_q, pid_batch, kv_head
+
+
 # The request count follows the batch. Without do_not_specialize, Triton would
 # compile separate binaries for a count of 1 and for multiples of 16.
 @gluon.jit(do_not_specialize=("num_seqs",))
@@ -1271,30 +1321,21 @@ def gluon_mha_extend_gfx950(
         kv_head = gl.program_id(1)
     else:
         kv_head = gl.program_id(2)
+    pid_batch = 0 if RAGGED else gl.program_id(1)
     if _NUM_XCDS % N_KV_HEADS == 0:
-        # Give each KV head its own _NUM_XCDS / N_KV_HEADS XCDs, so the
-        # workgroups sharing an XCD's L2 stream the same head's pages (in
-        # dispatch order every head lands on every XCD). A head's query blocks
-        # alternate over its XCDs rather than taking contiguous runs
-        # (_remap_xcd): causal blocks grow with their position, and runs would
-        # load one XCD with the late ones. Each workgroup still computes one
-        # (query block, head): the same work and bits on another XCD. The
-        # launch must be (query blocks, heads): ragged, or one request.
-        blocks = gl.num_programs(0)
-        single = RAGGED or gl.num_programs(1) == 1
-        if single and (blocks * N_KV_HEADS) % _NUM_XCDS == 0:
-            per_head: gl.constexpr = _NUM_XCDS // N_KV_HEADS
-            linear = pid_q + blocks * kv_head
-            xcd = linear % _NUM_XCDS
-            kv_head = xcd // per_head
-            pid_q = (linear // _NUM_XCDS) * per_head + xcd % per_head
+        # Each KV head on its own XCDs, longest query blocks first, for every
+        # launch shape (_remap_extend_program); the same (block, head) work and
+        # bits on another XCD.
+        pid_q, pid_batch, kv_head = _remap_extend_program(
+            pid_q, pid_batch, kv_head, RAGGED, N_KV_HEADS
+        )
     batch, q_pos_base = _resolve_grid(
         cu_seqlens_q_ptr,
         num_seqs,
         RAGGED,
         cfg.BLOCK_Q,
         pid_q,
-        gl.program_id(1),
+        pid_batch,
     )
     program = ExtendProgram.create(
         cfg,
