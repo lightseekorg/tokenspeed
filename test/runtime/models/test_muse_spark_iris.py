@@ -858,9 +858,15 @@ def _muse_tp_owned_forward_worker(
 def _int8_block16_round_trip(x):
     """decode(encode(x)) of the int8-block16 payload, by its definition."""
     blocks = x.float().reshape(-1, 16)
-    scale = torch.clamp(blocks.abs().amax(1), min=1e-30) / 127.0
-    codes = torch.round(blocks / scale[:, None]).clamp(-127.0, 127.0)
-    return (codes * scale[:, None]).to(torch.bfloat16).reshape(x.shape)
+    amax = torch.clamp(blocks.abs().amax(1), min=1e-30)
+    # The encoder divides by 127 correctly rounded. On the GPU torch divides
+    # a tensor by a Python scalar as a multiply by its reciprocal, which
+    # differs in the last bit for some blocks, so the scales divide on the
+    # host (as the encoder test's reference does).
+    scale = (amax.cpu() / 127.0).to(x.device)
+    # INT8 codes have no negative zero.
+    codes = torch.round(blocks / scale[:, None]).clamp(-127.0, 127.0).to(torch.int8)
+    return (codes.float() * scale[:, None]).to(torch.bfloat16).reshape(x.shape)
 
 
 def _muse_owned_rows_default_cap_worker(rank, world_size, device):
