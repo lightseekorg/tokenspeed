@@ -90,9 +90,9 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     can_acquire_all_reduce_outputs,
     prepare_projection_collectives,
-    projection_all_to_all,
     projection_gather_mm,
     projection_mm_reduce_scatter,
+    projection_mm_to_owners,
     reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -253,16 +253,13 @@ class _OwnedRowProjections:
     def matmul_to_owners(
         self, x: torch.Tensor, rows: int, weight: torch.Tensor
     ) -> torch.Tensor:
-        """Project all rows through this rank's columns; return its ``[L, world_size * N]`` rows."""
-        local_rows = self.local_rows(rows)
-        local = x.new_empty((self.world_size * local_rows, weight.shape[0]))
-        mm(x, weight, out=local[:rows])
-        local[rows:].zero_()
-        out = x.new_empty((local_rows, self.world_size * weight.shape[0]))
-        projection_all_to_all(
-            local, local_rows, True, False, out, self.post_expert, None
+        """Project all rows through this rank's columns; return its ``[L, world_size * N]`` rows.
+
+        The rows are borrowed until the next owned-row projection.
+        """
+        return projection_mm_to_owners(
+            x, self.local_rows(rows), weight, self.post_expert, None
         )
-        return out
 
     def gather_rows(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
         """Gather every rank's ``[L, width]`` rows into ``[rows, width]``."""
@@ -283,7 +280,7 @@ def _prepare_owned_projections(
         ("gather", layer.self_attn.qkv_proj.weight),
         ("scatter", layer.self_attn.o_proj.weight),
         ("gather", layer.mlp.pre_expert_proj.weight),
-        ("column", layer.mlp.post_expert_proj.weight),
+        ("transpose", layer.mlp.post_expert_proj.weight),
     )
     specs = [
         ProjectionSpec(
