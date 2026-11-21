@@ -1979,7 +1979,7 @@ harmless.
 
 **Optional ownership observations.** `Scheduler::SetCacheEventSink` installs a
 shared, nonblocking observer before the first submission. The scheduler owns
-its reference until all requests, transfer tickets and slot allocators have
+its reference until all requests, transfer tickets, and slot allocators have
 been destroyed; shutdown needs no explicit unregister. The control plane
 supplies its existing immutable `RequestSpec::admission_id`;
 zero is refused when observing. The sink adds no queue, GPU work, fences, or
@@ -2016,7 +2016,7 @@ existing copy and slot-state import fence.
 Prefix loads use the same observer and transfer counter. `OnPrefixLoadScheduled`
 records `PrefixLoadTelemetry` after the first admission has acquired its real
 slot, for both ordinary and peer-assisted admissions. The immutable operation
-and batch retain that RID, admission, slot generation and operation generation
+and batch retain that RID, admission, slot generation, and operation generation
 through cancellation and RID reuse. A late physical-copy completion cannot
 establish that the admission is still live. `kCacheEventProtocolVersion` in the
 native sink header lets the host discover this metadata contract before model

@@ -41,7 +41,7 @@ an output stream can remain stalled.
 when explicitly enabled. Native callbacks report immutable ownership metadata;
 the ordinary ACK poll is followed by a drain of completed CPU copy metadata.
 Neither sideband feeds the scheduler or establishes replica-wide completion.
-The protocol makes rank scope, operation/admission joins and diagnostic loss
+The protocol makes rank scope, operation/admission joins, and diagnostic loss
 explicit; incomplete or lossy traces cannot qualify recovery.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)

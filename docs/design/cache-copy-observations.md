@@ -5,7 +5,7 @@ metadata describes an admission and a scheduled operation. The Python executor
 adds local physical-copy counts to the operation's existing completion ACK;
 it does not infer completion from prefix-hit counters or timestamps.
 
-The scheduler adapter freezes request/admission identity, operation generation
+The scheduler adapter freezes request/admission identity, operation generation,
 and slot/frontier metadata into immutable transfer objects before submission.
 Opt-in `record_observations=True` requires those native fields. In particular,
 observed restore identity comes from the captured native admission, not a later
@@ -25,7 +25,7 @@ The immutable observations travel on the same `_Ack` as the operation. A prefix
 load's final copy event and a restore's event after both Host tiers and slot-state
 imports are the only completion witnesses. `CompletionQueue.pop_ready()` releases
 the ACK and its observations together. No extra device synchronization, stream,
-allocation, request-ID map or completion callback is added. Copy/import failures
+allocation, request-ID map, or completion callback is added. Copy/import failures
 queue no successful observation. Shutdown drops pending payloads and undrained
 observations. A physical copy may finish after its request was cancelled; its ACK
 must still release held resources. That physical completion does not claim the
@@ -40,10 +40,10 @@ ACKs. Request identities are never truncated into ambiguous join keys. The host
 must propagate loss rather than certify incomplete evidence.
 
 Python reads no instance label; the host supplies and validates the explicit
-public instance option. The control-plane owner adds engine, role, scheduler-replica and physical-rank
+public instance option. The control-plane owner adds engine, role, scheduler-replica, and physical-rank
 context, owns bounded nonblocking export, and distinguishes a local copy from
 replica-wide ACK agreement. Scheduled and completed records join by operation
-kind, wrap generation and operation ID within that context, then match the frozen
+kind, wrap generation, and operation ID within that context, then match the frozen
 request/admission identity. Admission cancellation and actual client-visible
 progress remain native owner facts. A restore's accepted-token frontier is not
 client-delivery proof, and a slot allocation is not itself proof of a GPU write.

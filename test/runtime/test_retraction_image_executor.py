@@ -360,7 +360,7 @@ def _build(
 def test_native_image_plan_preserves_transfer_rows_and_restore_identity(
     record_observations,
 ):
-    """Only copy completion is supplied: plans, bindings and adaptation are real."""
+    """Only copy completion is supplied: plans, bindings, and adaptation are real."""
     from tokenspeed_engine import scheduler as ts
 
     cfg = ts.SchedulerConfig()
@@ -465,8 +465,8 @@ def test_native_image_plan_preserves_transfer_rows_and_restore_identity(
     assert {
         (t.group_id, t.source_page) for tier, t in rows if tier == HostTier.L2
     } <= stored_l2_rows
-    assert restored.telemetry == (
-        RestoreTelemetry(
+    if record_observations:
+        expected_telemetry = RestoreTelemetry(
             admission_id=17,
             op_generation=0,
             previous_slot=original_slot,
@@ -478,9 +478,9 @@ def test_native_image_plan_preserves_transfer_rows_and_restore_identity(
             computed_tokens=5,
             prompt_tokens=4,
         )
-        if record_observations
-        else None
-    )
+    else:
+        expected_telemetry = None
+    assert restored.telemetry == expected_telemetry
     assert all(not batch.request_ids for batch in plan.forward)
     done = ts.Cache.RestoreDoneEvent()
     done.op_id = restored.op_id

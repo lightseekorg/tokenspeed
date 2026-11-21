@@ -228,9 +228,9 @@ class MemoryRegions:
 
 @pytest.fixture
 def executor_factory(monkeypatch):
-    # Discovery, streams, copy kernels and slot-state device owners are the only
+    # Discovery, streams, copy kernels, and slot-state device owners are the only
     # unavailable boundaries. Ownership translation, collection, ACK polling,
-    # completion queue and telemetry accounting execute their real code.
+    # completion queue, and telemetry accounting execute their real code.
     from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 
     monkeypatch.setattr(
@@ -358,15 +358,14 @@ def executor_factory(monkeypatch):
 
 
 def restore(op_id=9, admission=17, *, empty=False):
-    transfers = (
-        ()
-        if empty
-        else (
+    if empty:
+        transfers = ()
+    else:
+        transfers = (
             CacheTransfer(0, 1, 5, "key", 0),
             CacheTransfer(0, 2, 6, "key", 0),
             CacheTransfer(1, 2, 3, "", 0),
         )
-    )
     tiers = () if empty else (HostTier.L2, HostTier.L2, HostTier.SNAPSHOT_POOL)
     return RestoreOp(
         op_id, "request-a", admission, 2, 1, transfers, tiers, telemetry(admission)

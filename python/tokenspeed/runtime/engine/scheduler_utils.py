@@ -634,7 +634,7 @@ def restore_ops_from_wire(
     return ops
 
 
-def prefix_load_ops_from_wire(op) -> list[PrefixLoadOp]:
+def prefix_load_ops_from_wire(op: Cache.LoadBackOp) -> list[PrefixLoadOp]:
     """Freeze observed prefix-load identity with its actual operation rows."""
     count = _check_batch_rows(
         op,

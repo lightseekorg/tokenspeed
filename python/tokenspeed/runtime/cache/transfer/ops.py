@@ -139,7 +139,7 @@ class PrefixLoadOp:
     Attributes:
         op_id: The scheduler's ticket; the ACK carries it back.
         request_id: The request loading its prefix.
-        telemetry: Frozen scheduler admission, operation and slot identity.
+        telemetry: Frozen scheduler admission, operation, and slot identity.
         transfers: Host L2 block to Device block rows, before local-owner translation.
     """
 

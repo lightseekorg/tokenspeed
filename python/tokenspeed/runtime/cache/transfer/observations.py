@@ -21,7 +21,7 @@
 """Bounded CPU observations attached to the same lifetime as cache-copy ACKs.
 
 These records describe completed local physical copies, not request success or
-replica-wide completion. Export, request cancellation and admission ownership
+replica-wide completion. Export, request cancellation, and admission ownership
 remain control-plane responsibilities.
 """
 
