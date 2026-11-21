@@ -41,8 +41,11 @@ names. No model or deployment identifiers are inferred for the instance label.
 Each record is one `[cache-event] ` marker followed by a JSON object. Records
 use the existing host nonblocking logger's bounded queue, independently of the
 ordinary tracing level filter. Serialization is bounded to 8192 bytes per
-record, and request IDs to 256 UTF-8 bytes. The Python completed queue holds at
-most 4096 observations. Identity is never truncated.
+record, and request IDs to 256 UTF-8 bytes. The Python completed queue and the
+host's CPU publication handoff each hold at most 4096 observations. Concurrent
+producers never wait for each other: they try to enqueue, and one active
+publisher assigns sequences and writes to the existing logger in queue order.
+The handoff adds no exporter thread. Identity is never truncated.
 
 Every record carries `protocol`, `instance_id`, `role`, `dp_rank`,
 `physical_rank`, `scope`, `record_sequence`, and `log_dropped_lines`.
@@ -89,14 +92,20 @@ slot to another admission likewise establishes ownership, not a GPU overwrite.
 
 `trace_started` begins each physical rank's stream at sequence zero.
 `trace_finished` follows the final context owner's release, including native
-slot teardown, and carries `lost_observations` and `evidence_valid`.
+slot teardown, and carries `lost_observations` and `evidence_valid`. On normal
+host shutdown, the Python log guard reacquires the GIL after serving releases
+its owners, draining deferred bootstrap/scheduler decrefs before the native log
+guard flushes. It does not finalize Python or collect frozen cycles. A retained
+native owner leaves the trace incomplete; process exit alone never synthesizes
+a terminal record.
 
 Consumers must require both endpoints, contiguous unique sequences through the
 terminal record, zero loss counters, and valid operation/admission joins.
 `observation_loss` records identify rejected native identities, invalid Python
-payloads, oversized records, completed-queue overflow, or log-queue overflow,
-with `dropped_count` and `evidence_valid=false`. Every record carries the logger's cumulative
-`log_dropped_lines`, including ordinary log lines lost from its shared queue;
+payloads, oversized records, completed/publication-queue overflow, or log-queue
+overflow, with `dropped_count` and `evidence_valid=false`. Every record carries
+the logger's cumulative `log_dropped_lines`, including ordinary log lines lost
+from its shared queue;
 any such loss conservatively invalidates the trace.
 
 A loss record or terminal summary can itself be lost when the output is full.

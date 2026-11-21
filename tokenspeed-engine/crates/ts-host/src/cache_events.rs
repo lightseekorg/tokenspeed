@@ -27,7 +27,7 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, OnceLock,
+        mpsc, Arc, Mutex, OnceLock, TryLockError,
     },
 };
 
@@ -46,6 +46,7 @@ use ts_scheduler::{
 const MAX_INSTANCE_BYTES: usize = 128;
 const MAX_RECORD_BYTES: usize = 8192;
 const MAX_COMPLETIONS: usize = 4096;
+const MAX_PENDING_RECORDS: usize = 4096;
 
 #[derive(Clone)]
 pub(crate) struct Settings {
@@ -112,10 +113,20 @@ struct Context {
     dp_rank: i64,
     physical_rank: usize,
     writer: NonBlocking,
-    next_sequence: AtomicU64,
+    pending: mpsc::SyncSender<Value>,
+    publication: Mutex<Publication>,
+    pending_losses: AtomicU64,
     lost_observations: AtomicU64,
     reported_log_losses: AtomicUsize,
     native_losses: OnceLock<CacheObservationLosses>,
+}
+
+/// One publisher assigns sequences and enqueues complete lines in that order.
+/// Producers only try-send/try-lock: a concurrent native destructor must not
+/// wait on another callback, Python, or output I/O.
+struct Publication {
+    pending: mpsc::Receiver<Value>,
+    next_sequence: u64,
 }
 
 impl CacheEvents {
@@ -138,13 +149,19 @@ impl CacheEvents {
         if dp_rank < 0 {
             return Err("cache observations require a nonnegative DP rank".to_owned());
         }
+        let (pending, records) = mpsc::sync_channel(MAX_PENDING_RECORDS);
         let context = Self(Arc::new(Context {
             instance: settings.instance,
             role,
             dp_rank,
             physical_rank,
             writer,
-            next_sequence: AtomicU64::new(0),
+            pending,
+            publication: Mutex::new(Publication {
+                pending: records,
+                next_sequence: 0,
+            }),
+            pending_losses: AtomicU64::new(0),
             lost_observations: AtomicU64::new(0),
             reported_log_losses: AtomicUsize::new(0),
             native_losses: OnceLock::new(),
@@ -241,6 +258,16 @@ impl Context {
     }
 
     fn report_losses(&self) {
+        self.publish_pending();
+        let pending_losses = self.pending_losses.swap(0, Ordering::Relaxed);
+        if pending_losses > 0 {
+            // Counted at rejection even if this loss record is itself dropped.
+            self.emit(json!({
+                "event": "observation_loss", "scope": "physical_rank",
+                "reason": "publication_queue_overflow", "dropped_count": pending_losses,
+                "evidence_valid": false,
+            }));
+        }
         if let Some(losses) = self.native_losses.get() {
             let lost = losses.take();
             if lost > 0 {
@@ -254,13 +281,39 @@ impl Context {
         }
     }
 
-    fn emit(&self, mut record: Value) {
+    fn emit(&self, record: Value) {
+        if self.pending.try_send(record).is_err() {
+            self.lost_observations.fetch_add(1, Ordering::Relaxed);
+            self.pending_losses.fetch_add(1, Ordering::Relaxed);
+        }
+        self.publish_pending();
+    }
+
+    fn publish_pending(&self) {
+        let mut publication = match self.publication.try_lock() {
+            Ok(publication) => publication,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        // Bound each callback's work even if other producers keep arriving.
+        // A poll or the last owner's Drop drains any records left behind.
+        for _ in 0..MAX_PENDING_RECORDS {
+            let Ok(record) = publication.pending.try_recv() else {
+                break;
+            };
+            let sequence = publication.next_sequence;
+            publication.next_sequence += 1;
+            self.write_record(record, sequence);
+        }
+    }
+
+    fn write_record(&self, mut record: Value, sequence: u64) {
         record["protocol"] = protocol().into();
         record["instance_id"] = self.instance.as_str().into();
         record["role"] = self.role.into();
         record["dp_rank"] = self.dp_rank.into();
         record["physical_rank"] = self.physical_rank.into();
-        record["record_sequence"] = self.next_sequence.fetch_add(1, Ordering::Relaxed).into();
+        record["record_sequence"] = sequence.into();
         record["log_dropped_lines"] = self.writer.error_counter().dropped_lines().into();
         let mut buffer = RecordBuffer(Vec::with_capacity(MAX_RECORD_BYTES));
         // Only fixed scalar fields and bounded identity strings enter this

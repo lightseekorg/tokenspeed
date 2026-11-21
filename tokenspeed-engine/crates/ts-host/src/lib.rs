@@ -1037,6 +1037,9 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
         let log_guard = logging::init(args.enable_async_logging);
         let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Outside serve: reacquiring the GIL here drains its deferred
+            // bootstrap/scheduler decrefs, so their last ownership callbacks
+            // can finish the cache trace before the native log guard flushes.
             let _python_logs = logging::PythonLogGuard;
             serve(&args, launcher)
         }));

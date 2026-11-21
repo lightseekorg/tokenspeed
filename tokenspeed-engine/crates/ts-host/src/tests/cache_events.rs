@@ -102,9 +102,9 @@ fn install(scheduler: &mut Scheduler, writer: NonBlocking) -> CacheEvents {
 fn teardown(scheduler: Scheduler, context: CacheEvents) {
     drop(context);
     drop(scheduler);
-    Python::attach(|py| {
-        py.import("gc").unwrap().call_method0("collect").unwrap();
-    });
+    // Match the host's PythonLogGuard: reacquire the GIL to release deferred
+    // native owners; do not rely on an explicit collection or finalization.
+    Python::attach(|_| {});
 }
 
 #[test]
@@ -458,4 +458,75 @@ fn rejected_native_identity_is_explicit_loss_through_scheduler_teardown() {
     assert!(!records
         .iter()
         .any(|v| v["event"] == "slot_assigned" || v["event"] == "slot_released"));
+}
+
+#[path = "cache_events_shutdown.rs"]
+mod shutdown;
+
+#[test]
+fn concurrent_producers_keep_sequence_in_queue_arrival_order() {
+    let mut scheduler = scheduler();
+    let (writer, guard, capture) = writer();
+    let context = install(&mut scheduler, writer);
+    let start = Arc::new(std::sync::Barrier::new(8));
+    std::thread::scope(|scope| {
+        for producer in 0..8 {
+            let context = &context;
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                for index in 0..128 {
+                    context.0.emit(
+                        json!({"event": "concurrent_probe", "producer": producer, "index": index}),
+                    );
+                }
+            });
+        }
+    });
+    teardown(scheduler, context);
+    drop(guard);
+    let records = records(&capture);
+    assert_eq!(records.len(), 1026);
+    for (sequence, record) in records.iter().enumerate() {
+        assert_eq!(
+            record["record_sequence"], sequence,
+            "sequence diverged at queue position {sequence}"
+        );
+    }
+    assert_eq!(records.last().unwrap()["evidence_valid"], true);
+}
+
+#[test]
+fn a_contended_publication_handoff_is_bounded_and_reports_overflow() {
+    let mut scheduler = scheduler();
+    let (writer, guard, capture) = writer();
+    let context = install(&mut scheduler, writer);
+    // Pause a real publisher while other observations arrive. This must not
+    // make an emitter wait, including a native destructor on another thread.
+    let publisher = context.0.publication.lock().unwrap();
+    for index in 0..MAX_PENDING_RECORDS + 3 {
+        context
+            .0
+            .emit(json!({"event": "queued_probe", "index": index}));
+    }
+    drop(publisher);
+    teardown(scheduler, context);
+    drop(guard);
+    let records = records(&capture);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["event"] == "queued_probe")
+            .count(),
+        MAX_PENDING_RECORDS
+    );
+    let loss = records
+        .iter()
+        .find(|r| r["event"] == "observation_loss")
+        .unwrap();
+    assert_eq!(loss["reason"], "publication_queue_overflow");
+    assert_eq!(loss["dropped_count"], 3);
+    assert_eq!(records.last().unwrap()["event"], "trace_finished");
+    assert_eq!(records.last().unwrap()["lost_observations"], 3);
+    assert_eq!(records.last().unwrap()["evidence_valid"], false);
 }
