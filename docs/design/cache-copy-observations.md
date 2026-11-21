@@ -50,3 +50,20 @@ client-delivery proof, and a slot allocation is not itself proof of a GPU write.
 
 See [the event-loop boundary](event-loop.md) and
 [the scheduler's restore ownership](scheduler.md#4-suspend-and-resume).
+
+## Bounding debug injection
+
+`--debug-force-retraction-max-per-request N` optionally limits successfully
+imaged **forced** retractions per admission. Omission (`None`) keeps the legacy
+unlimited behavior. A supplied value must be an integer in `[1, INT32_MAX]` and
+requires a nonzero forcing interval and a retracting role with a snapshot pool.
+Explicit zero is invalid; it is never treated as omission. Both positive decode
+and negative mid-prefill intervals use the same bound.
+
+Waits and refused/failed image attempts do not consume the bound. Reusing an
+external request ID creates a new admission with a fresh counter. Ordinary
+capacity-triggered recovery neither consumes nor consults the forced budget,
+so a final scored tail must still be checked after the last actual restore.
+Stopping debug injection is not itself proof of completed copies or output
+progress. Python passes the exact optional value to the native scheduler; the
+native request owns the counter and scheduling policy.

@@ -131,6 +131,7 @@ def make_config(
     prefill_decode_min_interval: int,
     decode_allocation_policy: str | None = None,
     debug_force_retraction_interval: int = 0,
+    debug_force_retraction_max_per_request: int | None = None,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
@@ -203,6 +204,9 @@ def make_config(
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
             without capacity pressure. A test knob, never set in serving.
+        debug_force_retraction_max_per_request: Optional positive bound on
+            successfully imaged forced retractions per admission. None preserves
+            unlimited forcing; capacity recovery does not consult this bound.
         enable_kv_cache_events: Publish KV cache events.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
@@ -292,6 +296,7 @@ def make_config(
     cfg.host_group_packing = list(host_group_packing)
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
+    cfg.debug_force_retraction_max_per_request = debug_force_retraction_max_per_request
     cfg.storage_config = storage_config
     cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events

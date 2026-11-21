@@ -317,3 +317,13 @@ def test_cache_plan_keeps_storage_cancel_before_the_next_query():
     ]
     assert prepared.storage[0].op_id == original.op_id
     assert prepared.storage[1].op_id > original.op_id
+
+
+@pytest.mark.parametrize("cap", [None, 0, 1, 64, 2**31 - 1])
+def test_make_config_preserves_optional_forced_cap_exactly(cap):
+    # Validation belongs to ServerArgs/native scheduler. This adapter must not
+    # turn the invalid explicit zero into the valid unlimited None value.
+    config = _config(
+        debug_force_retraction_interval=3, debug_force_retraction_max_per_request=cap
+    )
+    assert config.debug_force_retraction_max_per_request == cap
