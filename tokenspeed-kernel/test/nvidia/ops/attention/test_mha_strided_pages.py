@@ -263,3 +263,99 @@ def test_paged_writes_reuse_compilation_across_token_counts():
             write(count)
     torch.testing.assert_close(key[1, :31], k[:31], atol=0, rtol=0)
     torch.testing.assert_close(value[1, :31], v[:31], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("solution", ["flashinfer", "triton"])
+def test_decode_reads_k_and_v_on_separate_padded_planes(graph, solution):
+    # K and V pages padded to one shared stride inside different planes, as when a
+    # group's fields ride in planes sized for another group: 16 KV heads of 64,
+    # 8 causal query rows, a 2047-token window, pages up to the end of the pool.
+    pages, page_rows, kv_heads, heads, dim, rows, window_left = (
+        40,
+        128,
+        16,
+        96,
+        64,
+        8,
+        2047,
+    )
+    page_stride = 141_312
+    shape = (pages, page_rows, kv_heads, dim)
+    strides = (page_stride, kv_heads * dim, dim, 1)
+    planes = [
+        torch.full((pages, page_stride), 1e4, dtype=torch.bfloat16, device="cuda")
+        for _ in range(2)
+    ]
+    key, value = (plane.as_strided(shape, strides) for plane in planes)
+    # 23 pages hold 2,900 tokens; the rest of the row repeats page 0, which stays garbage.
+    used = torch.tensor(
+        [
+            39,
+            3,
+            38,
+            7,
+            21,
+            1,
+            30,
+            12,
+            5,
+            36,
+            2,
+            17,
+            9,
+            25,
+            33,
+            4,
+            28,
+            14,
+            6,
+            37,
+            19,
+            11,
+            8,
+        ],
+        device="cuda",
+    )
+    key[used] = torch.randn(len(used), *shape[1:], dtype=torch.bfloat16, device="cuda")
+    value[used] = torch.randn_like(key[used])
+    table = torch.zeros(1, 32, dtype=torch.int32, device="cuda")
+    table[0, : len(used)] = used
+    length = 2900
+    lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    q = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+    call = lambda: mha_decode_with_kvcache(
+        q=q,
+        k_cache=key,
+        v_cache=value,
+        page_table=table,
+        cache_seqlens=lengths,
+        max_seqlen_k=4096,
+        max_seqlen_q=rows,
+        window_left=window_left,
+        window_sink=0,
+        return_lse=False,
+        solution=solution,
+        block_draft=False,
+    )
+
+    def change_decode_rows():
+        lengths.sub_(5)
+        q.mul_(0.5)
+
+    output = _run(call, graph, change_decode_rows)
+    length = int(lengths[0].item())
+    group = heads // kv_heads
+    keys = key[used].flatten(0, 1).float().repeat_interleave(group, dim=1)
+    values = value[used].flatten(0, 1).float().repeat_interleave(group, dim=1)
+    expected = []
+    for row in range(rows):
+        end = length - rows + row + 1
+        begin = max(end - window_left - 1, 0)
+        scores = torch.einsum("hd,thd->ht", q[row].float(), keys[begin:end]) / 8
+        expected.append(
+            torch.einsum("ht,thd->hd", scores.softmax(-1), values[begin:end])
+        )
+    torch.testing.assert_close(
+        output.float(), torch.stack(expected), atol=2e-2, rtol=2e-2
+    )

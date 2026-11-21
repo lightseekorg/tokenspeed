@@ -289,7 +289,14 @@ if platform.is_amd:
             dtype=torch.int32,
             device=x.device,
         )
-        return _fp32_router_gemv_impl(x, weight, multiplier, tile_counters, enable_pdl)
+        return _fp32_router_gemv_impl(
+            x,
+            weight,
+            multiplier,
+            tile_counters,
+            enable_pdl,
+            warm_variants=is_warming_up(),
+        )
 
     def _supports_router_gemv_mm_problem(m: int, n: int, k: int) -> bool:
         # Any router shape the traits admit tiles the router half; the decode
@@ -350,6 +357,7 @@ if platform.is_amd:
             mm_b,
             mm_out,
             counters[router_counters:],
+            warm_variants=is_warming_up(),
         )
 
     try:
