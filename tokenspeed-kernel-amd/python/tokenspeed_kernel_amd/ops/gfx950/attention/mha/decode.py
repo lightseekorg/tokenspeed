@@ -656,7 +656,11 @@ class AttentionProgram:
         before streaming the keys, so the gate is in registers by the store."""
         cfg = self.cfg
         offs_m = gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, output_gate_layout(cfg.NUM_WARPS))
+            0,
+            cfg.BLOCK_M,
+            layout=gl.SliceLayout(
+                1, output_gate_layout(cfg.NUM_WARPS, cfg.NUM_Q_HEADS, cfg.HEAD_DIM)
+            ),
         )
         return load_output_gate(
             gate_ptr,
@@ -664,6 +668,7 @@ class AttentionProgram:
             self.row_tokens(offs_m),
             self.row_heads(offs_m),
             self.row_valid(offs_m),
+            cfg.NUM_Q_HEADS,
             cfg.HEAD_DIM,
             cfg.NUM_WARPS,
         )
@@ -876,13 +881,43 @@ class AttentionProgram:
 # ===-----------------------------------------------------------------------===#
 
 
+@gluon.constexpr_function
+def _gate_values_per_lane(NUM_Q_HEADS, HEAD_DIM):
+    """Values of a head each lane holds in the Triton
+    ``weightless_rmsnorm_gated_sigmoid`` kernel, whose per-head sum of squares
+    the gated store must reproduce.
+
+    That kernel runs 4 warps of 64 lanes over one ``[next_power_of_2(heads),
+    head_dim]`` BF16 tile per token, and Triton's default layout spreads the
+    tile evenly over the lanes, at most one 16-byte vector (8 BF16 values) a
+    lane: 2 values at 8 heads, 4 at 16, 8 from 32 up.
+    """
+    separate_op_lanes = 4 * 64  # its num_warps times the gfx950 wave size
+    vector_values = 8  # 16 bytes of BF16
+    per_lane = triton.next_power_of_2(NUM_Q_HEADS) * HEAD_DIM // separate_op_lanes
+    if per_lane > vector_values:
+        return vector_values
+    if per_lane < 1:
+        return 1
+    return per_lane
+
+
 @gluon.jit
-def output_gate_layout(NUM_WARPS: gl.constexpr):
+def output_gate_layout(
+    NUM_WARPS: gl.constexpr, NUM_Q_HEADS: gl.constexpr, HEAD_DIM: gl.constexpr
+):
     """The layout ``store_rmsnorm_gated`` normalizes heads in: that of the
-    Triton ``weightless_rmsnorm_gated_sigmoid`` kernel over ``[heads, 64]``
-    (8 values a lane, 8 lanes a head), so a head's sum of squares reduces in
-    the same order."""
-    return gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
+    Triton ``weightless_rmsnorm_gated_sigmoid`` kernel over ``[heads,
+    HEAD_DIM]`` at this head count (``_gate_values_per_lane`` values a lane,
+    the rest of a head across lanes), so a head's sum of squares reduces in
+    the same order. A fixed split matches that kernel only at the head counts
+    that give it the same split."""
+    PER_LANE: gl.constexpr = _gate_values_per_lane(NUM_Q_HEADS, HEAD_DIM)
+    HEAD_LANES: gl.constexpr = HEAD_DIM // PER_LANE
+    # A wave's 64 lanes: HEAD_LANES across a head, the rest across heads.
+    return gl.BlockedLayout(
+        [1, PER_LANE], [64 // HEAD_LANES, HEAD_LANES], [NUM_WARPS, 1], [1, 0]
+    )
 
 
 @gluon.jit
@@ -892,12 +927,13 @@ def load_output_gate(
     tokens,
     q_heads,
     valid,
+    NUM_Q_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
     """The BF16 gate rows ``gate_ptr[token * gate_stride + head * HEAD_DIM]``
     of (token, head) rows, in ``output_gate_layout``."""
-    layout: gl.constexpr = output_gate_layout(NUM_WARPS)
+    layout: gl.constexpr = output_gate_layout(NUM_WARPS, NUM_Q_HEADS, HEAD_DIM)
     rows: gl.constexpr = gl.SliceLayout(1, layout)
     tokens = gl.convert_layout(tokens, rows).to(gl.int64)
     q_heads = gl.convert_layout(q_heads, rows)
@@ -935,7 +971,7 @@ def store_rmsnorm_gated(
     ``weightless_rmsnorm_gated_sigmoid`` on it: same layout
     (``output_gate_layout``), same arithmetic, ``tl.sigmoid`` written out.
     """
-    layout: gl.constexpr = output_gate_layout(NUM_WARPS)
+    layout: gl.constexpr = output_gate_layout(NUM_WARPS, NUM_Q_HEADS, HEAD_DIM)
     rows: gl.constexpr = gl.SliceLayout(1, layout)
     values = gl.convert_layout(output.to(out_ptr.dtype.element_ty), layout)
     values = values.to(gl.float32)
@@ -970,11 +1006,10 @@ def _store_head_rmsnorm_gated(
     """``store_rmsnorm_gated`` for one (query token, head) of a one-wave
     program: ``output`` is its ``[HEAD_DIM]`` row, ``gate`` its
     ``_load_head_output_gate``."""
-    one: gl.constexpr = gl.SliceLayout(1, output_gate_layout(1))
+    layout: gl.constexpr = output_gate_layout(1, NUM_Q_HEADS, HEAD_DIM)
+    one: gl.constexpr = gl.SliceLayout(1, layout)
     store_rmsnorm_gated(
-        gl.expand_dims(
-            gl.convert_layout(output, gl.SliceLayout(0, output_gate_layout(1))), 0
-        ),
+        gl.expand_dims(gl.convert_layout(output, gl.SliceLayout(0, layout)), 0),
         gate,
         gl.full([1], q_index, gl.int32, one),
         gl.full([1], q_head, gl.int32, one),
@@ -989,16 +1024,22 @@ def _store_head_rmsnorm_gated(
 
 @gluon.jit
 def _load_head_output_gate(
-    gate_ptr, gate_stride, q_index, q_head, HEAD_DIM: gl.constexpr
+    gate_ptr,
+    gate_stride,
+    q_index,
+    q_head,
+    NUM_Q_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
 ):
     """``load_output_gate`` of one (query token, head), ``[1, HEAD_DIM]``."""
-    one: gl.constexpr = gl.SliceLayout(1, output_gate_layout(1))
+    one: gl.constexpr = gl.SliceLayout(1, output_gate_layout(1, NUM_Q_HEADS, HEAD_DIM))
     return load_output_gate(
         gate_ptr,
         gate_stride,
         gl.full([1], q_index, gl.int32, one),
         gl.full([1], q_head, gl.int32, one),
         gl.full([1], True, gl.int1, one),
+        NUM_Q_HEADS,
         HEAD_DIM,
         1,
     )
@@ -1447,7 +1488,7 @@ def gluon_mha_decode_reduce_gfx950(
     if HAS_GATE:
         # Issued first, so the gate arrives while the partials merge.
         gate = _load_head_output_gate(
-            gate_ptr, gate_stride, q_index, q_head, cfg.HEAD_DIM
+            gate_ptr, gate_stride, q_index, q_head, cfg.NUM_Q_HEADS, cfg.HEAD_DIM
         )
 
     # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2.
@@ -2522,7 +2563,7 @@ def gluon_mha_decode_balanced_reduce_gfx950(
     if HAS_GATE:
         # Issued first, so the gate arrives while the partials merge.
         gate = _load_head_output_gate(
-            gate_ptr, gate_stride, q_index, q_head, cfg.HEAD_DIM
+            gate_ptr, gate_stride, q_index, q_head, cfg.NUM_Q_HEADS, cfg.HEAD_DIM
         )
     # The decode's row block and row of this (query token, head): rows run
     # over query positions, then over the KV head's query heads.
