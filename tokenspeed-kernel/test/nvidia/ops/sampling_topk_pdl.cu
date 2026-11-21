@@ -100,7 +100,8 @@ int run(bool graph_mode, unsigned long long delay_cycles) {
     auto launch = [&] {
         // Stale contents the pipeline must not observe.
         check_cuda(cudaMemsetAsync(probs.data, 0, size_t(batch) * vocab * sizeof(float), stream));
-        early_signal_producer<<<1024, 256, 0, stream>>>(probs.data, fresh.data,
+        // A small grid: the sleeping producer must leave the SMs free for the pipeline.
+        early_signal_producer<<<64, 256, 0, stream>>>(probs.data, fresh.data,
             size_t(batch) * vocab, delay_cycles);
         fused_topk_topp::invokeFusedTopKTopP(probs.data, ks.data, ps.data, out.data,
             workspace.data, batch, vocab, stream, side_stream, /*enablePdl=*/true,
