@@ -39,3 +39,13 @@ Unsupported channel spans raise an error.
 
 Under PDL, the `inkling_ring_sconv` decode kernel triggers its dependents before its own wait.
 It loads its request metadata and pre-chunk ring taps before that wait; it follows projections and collectives, which all wait first.
+
+## Prefill convolution writing q, k and v
+
+`causal_conv1d_qkv_fn` is `causal_conv1d_fn` for a packed `[q | k | v]` channel layout.
+It writes the output to contiguous `[tokens, key_dim]`, `[tokens, key_dim]` and `[tokens, value_dim]` rows instead of packed rows.
+The values are the ones the packed output followed by the GDN q/k/v split pass would hold, bit for bit, and the conv state update is the same.
+Both widths must be multiples of `PREFILL_QKV_CHANNEL_MULTIPLE`.
+On NVIDIA from Hopper on, the CuTe DSL kernel serves it: the same tile and arithmetic as the packed CuTe DSL kernel, with each thread's four channels stored to the q, k or v row that holds them.
+Other GPUs use the Triton kernel.
+GDN prefill uses it, in place of the convolution and the split pass, on every platform but Hopper; there the split also zeroes the rows past the live tokens.
