@@ -86,7 +86,7 @@ def device_loading_context(
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
-        if p.device.type == "cpu":
+        if p.device.type == "cpu" and not getattr(p, "ple_shared_storage", False):
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         # Parameters already on target device are not touched

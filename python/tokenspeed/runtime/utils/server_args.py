@@ -905,6 +905,7 @@ class ServerArgs:
     # scratch is allocated before graph capture, so larger forwards fall
     # back to the generic all-to-all instead of growing it at runtime.
     head_tp_exchange_max_rows: int = 256
+    ple_table_layout: str = "global_sharded"
     lm_head_tp_size: int | None = None
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
@@ -5204,6 +5205,14 @@ class ServerArgs:
             "o_proj rows). The symmetric-memory scratch is allocated before "
             "graph capture; larger forwards fall back to the generic all-to-all. "
             "Only used with --attn-head-tp-size > 1.",
+        )
+        parser.add_argument(
+            "--ple-table-layout",
+            choices=["global_sharded", "attn_tp_sharded", "shared", "peer_sharded"],
+            default=ServerArgs.ple_table_layout,
+            help="PLE vocabulary layout: global_sharded splits across stage ranks; "
+            "attn_tp_sharded splits within attention TP; shared maps one full host table "
+            "per node; peer_sharded directly reads mapped host shards on one node.",
         )
         parser.add_argument(
             "--lm-head-tp-size",
