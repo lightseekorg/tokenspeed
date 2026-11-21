@@ -66,6 +66,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/coordinator/session_registry.cpp
     csrc/cache/coordinator/cache_store.cpp
     csrc/cache/coordinator/cache_evictor.cpp
+    csrc/cache/coordinator/cache_eviction_diagnostic.cpp
     csrc/cache/coordinator/admission_history.cpp
     csrc/cache/coordinator/host_cache.cpp
     csrc/cache/coordinator/disk_cache.cpp
@@ -164,6 +165,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_swa_sink.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
+        tests/cpp/test_cache_eviction_diagnostic.cpp
         tests/cpp/test_checkpoint_retention.cpp
         tests/cpp/test_checkpoint_demotion.cpp
         tests/cpp/test_peer_exports.cpp
