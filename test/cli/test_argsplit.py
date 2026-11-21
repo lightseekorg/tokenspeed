@@ -129,6 +129,7 @@ def test_multi_value_capture_sizes_route_to_engine():
         "--prefill-graph-capture-sizes",
         "--prefill-graph-capture-token-sizes",
         "--prefill-graph-capture-batch-sizes",
+        "--prefill-graph-decoder-capture-token-sizes",
     ):
         r = _split([flag, "288", "320", "--dp-sampling"])
         assert r.engine == [flag, "288", "320", "--dp-sampling"]

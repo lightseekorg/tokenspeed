@@ -57,6 +57,9 @@ class TestPrefillCaptureArgsTest:
                 "1024",
                 "2048",
                 "4096",
+                "--prefill-graph-decoder-capture-token-sizes",
+                "256",
+                "96",
                 "--prefill-graph-capture-batch-sizes",
                 "2",
                 "1",
@@ -67,6 +70,7 @@ class TestPrefillCaptureArgsTest:
             assert (vars(direct)) == (vars(routed))
             assert not (hasattr(direct, "prefill_graph_capture_token_sizes"))
             assert (direct.prefill_graph_capture_sizes) == ([1024, 2048, 4096])
+            assert direct.prefill_graph_decoder_capture_token_sizes == [256, 96]
             config = SimpleNamespace(**vars(direct))
             config.prefill_graph_max_tokens = config.chunked_prefill_size = 4096
             config.context_len = 4096
@@ -121,6 +125,7 @@ class TestPrefillCaptureArgsTest:
     def test_defaults_and_help_keep_token_and_request_units_separate(self):
         args = self.parser.parse_args(["--model", "test"])
         assert (args.prefill_graph_capture_sizes) is None
+        assert args.prefill_graph_decoder_capture_token_sizes is None
         assert (args.prefill_graph_capture_batch_sizes) is None
         help_text = " ".join(self.parser.format_help().split())
         assert ("Total input-token capacities per forward") in (help_text)
@@ -746,6 +751,7 @@ class TestDummyGroupTablesTest:
         )
         pg.dp_size = 1
         pg.drafter = drafter
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg.input_buffers = InputBuffers(
             max_bs=16,
             max_num_tokens=4096,
@@ -1153,16 +1159,49 @@ class TestNarrowingPrefillGraphTest:
         self.torch = torch
         self.mod = prefill_graph
 
-    def test_decoder_row_buckets_clip_the_token_ladder_to_the_row_cap(self):
+    def test_window_ladder_covers_short_tails_and_coarsens_for_large_batches(self):
         buckets = self.mod.get_decoder_row_buckets
-        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        # 128 rows per request x 32 requests caps the decoder at 4096 rows.
-        assert (buckets(ladder, 128, 32)) == (ladder[:-1])
-        # A cap between rungs becomes the top rung itself.
-        assert (buckets(ladder, 128, 3)) == ([16, 32, 64, 128, 256, 384])
-        # The token ladder bounds the cap: narrowing never adds rows.
-        assert (buckets([16, 48], 128, 32)) == ([16, 48])
-        assert (buckets([], 128, 32)) == ([])
+        assert buckets(128, default_max=4096, capacity=8192, capture_sizes=None) == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            *range(128, 2048, 128),
+            *range(2048, 4097, 256),
+        ]
+        assert buckets(128, default_max=1024, capacity=300, capture_sizes=[]) == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            300,
+        ]
+        assert buckets(128, default_max=48, capacity=128, capture_sizes=None) == [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            48,
+        ]
+
+    def test_decoder_override_uses_exact_sizes_within_the_real_batch_budget(self):
+        buckets = self.mod.get_decoder_row_buckets
+        assert buckets(
+            128, default_max=64, capacity=256, capture_sizes=[96, 16, 96]
+        ) == [16, 96]
+        for invalid in ([0], [-1], [257], [1.5], [True]):
+            with pytest.raises(ValueError, match="decoder-capture-token-sizes"):
+                buckets(128, default_max=64, capacity=256, capture_sizes=invalid)
 
     def _model(self, rows, calls):
         torch = self.torch
@@ -1209,7 +1248,7 @@ class TestNarrowingPrefillGraphTest:
             (SimpleNamespace(embed_tokens=object())), (self.mod.NarrowingPrefillModel)
         )
         for inner, expected_buckets in (
-            (model, [64, 256, 384]),
+            (model, [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]),
             (SimpleNamespace(embed_tokens=object()), []),
         ):
             inner.embed_tokens = object()
@@ -1224,6 +1263,9 @@ class TestNarrowingPrefillGraphTest:
                 disable_prefill_graph=False,
                 data_parallel_size=1,
                 max_num_seqs=3,
+                context_len=512,
+                chunked_prefill_size=1024,
+                prefill_graph_decoder_capture_token_sizes=None,
             )
             with (
                 mock.patch.object(
@@ -1244,9 +1286,7 @@ class TestNarrowingPrefillGraphTest:
             assert (graph.decoder_buckets) == (expected_buckets)
 
     def test_narrowing_model_stays_eager_under_attention_dp(self):
-        """The narrowed row count is rank-local, so decoder buckets (and the
-        collective shapes their graphs bake) could differ across DP ranks:
-        the split graph is off under DP; an ordinary model keeps its graph."""
+        """Models without fixed-capacity stage support retain eager DP."""
         from unittest import mock
 
         model, _ = self._model(128, [])
@@ -1290,13 +1330,17 @@ class TestNarrowingPrefillGraphTest:
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
         pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg._narrowing = model
+        pg._dp_stage_live_counts = None
         pg.decoder_buckets = decoder_buckets
         pg.dp_size = 1
+        pg.disable = False
+        pg._captured_hidden_mode = self.mod.CaptureHiddenMode.NULL
         pg._engaged_logged = set()
         pg.config = SimpleNamespace(world_size=1)
         pg.attn_backend = SimpleNamespace(
             step_counter=None,
             prepare_prefill_metadata=lambda *args, **kwargs: False,
+            prefill_graph_scope=contextlib.nullcontext,
         )
         pg._encoders = {
             256: self.mod.CapturedEncoder(
@@ -1342,7 +1386,11 @@ class TestNarrowingPrefillGraphTest:
         model, State = self._model(100, calls)
         pg = self._bare(model, State, [64, 192], calls)
         ctx = self._ctx(200)
-        hidden, aux = pg._replay_narrowed(256, ctx, 200, noted_waits_done=False)
+        encoder, decoder = pg.select_buckets(ctx)
+        assert (encoder, decoder) == (256, 192)
+        hidden, aux = pg._replay_narrowed(
+            encoder, ctx, 200, decoder_bucket=decoder, noted_waits_done=False
+        )
         assert (calls) == (
             [
                 # The encoder replays over the padded bucket with the real
@@ -1361,27 +1409,27 @@ class TestNarrowingPrefillGraphTest:
         assert (hidden.shape) == ((100, 2))
         assert (aux) is None
         assert (ctx.input_num_tokens) == (200), "the pin is restored"
-        assert pg._has_bucket(256) and not pg._has_bucket(64)
 
-    def test_rows_above_the_decoder_ladder_run_the_decoder_eager(self):
+    @pytest.mark.parametrize("rows", [0, 200])
+    def test_empty_or_uncovered_local_decoder_runs_eager(self, rows):
         calls = []
-        model, State = self._model(300, calls)
+        model, State = self._model(rows, calls)
         pg = self._bare(model, State, [64, 192], calls)
-        assert (pg._decoder_bucket(300)) is None
-        assert (pg._decoder_bucket(64)) == (64)
-        assert (pg._decoder_bucket(65)) == (192)
+        ctx = self._ctx(256)
+        encoder, decoder = pg.select_buckets(ctx)
+        assert (encoder, decoder) == (256, None)
         hidden, _ = pg._replay_narrowed(
-            256, self._ctx(256), 256, noted_waits_done=False
+            encoder, ctx, 256, decoder_bucket=decoder, noted_waits_done=False
         )
         assert (calls) == (
             [
                 ("encoder", 256),
                 ("narrow", 256, 256),
-                ("decoder eager", 300, 256),
-                ("finish", 300, 256),
+                ("decoder eager", rows, 256),
+                ("finish", rows, 256),
             ]
         )
-        assert (hidden.shape) == ((300, 2))
+        assert hidden.shape == (rows, 2)
 
     def test_narrowing_disagreeing_with_the_metadata_is_fatal(self):
         calls = []
@@ -1389,7 +1437,71 @@ class TestNarrowingPrefillGraphTest:
         model.decoder_rows = lambda ctx: 99
         pg = self._bare(model, State, [192], calls)
         with pytest.raises((RuntimeError), match=("narrowing yielded 100 rows")):
-            pg._replay_narrowed(256, self._ctx(200), 200, noted_waits_done=False)
+            pg._replay_narrowed(
+                256, self._ctx(200), 200, decoder_bucket=192, noted_waits_done=False
+            )
+
+    def _dp_graph(self):
+        model, state = self._model(0, [])
+        graph = self._bare(model, state, [64, 128], [])
+        graph.dp_size = 4
+        graph.disable = False
+        graph.capture_buckets = [256]
+        graph._dp_stage_live_counts = self.torch.ones(2, dtype=self.torch.int32)
+        graph.config = SimpleNamespace(
+            world_size=4, spec_algo="DSPARK", spec_num_tokens=6
+        )
+        return graph
+
+    def test_stage_filter_restores_eager_routing_after_failure(self):
+        graph = self._dp_graph()
+        counts = graph._dp_stage_live_counts
+        with pytest.raises(RuntimeError, match="replay failed"):
+            with graph._stage_rows(6, 128):
+                assert counts.tolist() == [6, 128]
+                raise RuntimeError("replay failed")
+        assert counts.tolist() == [1, 1]
+        with pytest.raises(ValueError, match="exceed"):
+            with graph._stage_rows(129, 128):
+                pass
+
+    def test_dp_stages_refresh_the_same_filter_seen_by_real_captured_kernels(self):
+        torch = self.torch
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA graph replay")
+        graph = self._dp_graph()
+        counts = torch.ones(2, dtype=torch.int32, device="cuda")
+        graph._dp_stage_live_counts = counts
+        encoder = self.mod.BreakableCapture()
+        decoder = self.mod.BreakableCapture()
+        with encoder:
+            encoder_seen = counts.clone()
+        with decoder:
+            decoder_seen = counts.expand(128, 2).clone()
+        ctx = self._ctx(200)
+        ctx.global_num_tokens = [200, 6, 0, 64]
+        ctx.global_bs = [1, 1, 0, 1]
+        ctx.global_num_decodes = [0, 1, 0, 0]
+        ctx.all_decode_or_idle = False
+        for live_rows in (100, 0, 6, 128):
+            model, State = self._model(live_rows, [])
+            graph._narrowing = model
+            # This rank can have fewer rows than either agreed capacity.
+            graph._encoders[256] = self.mod.CapturedEncoder(encoder, State(256))
+            graph._decoders[128] = self.mod.CapturedDecoder(
+                decoder, State(128), self.mod.CapturedForward(decoder_seen, [])
+            )
+            hidden, _ = graph._replay_narrowed(
+                256, ctx, 200, decoder_bucket=128, noted_waits_done=False
+            )
+            assert encoder_seen.tolist() == [200, 256]
+            assert decoder_seen[0].tolist() == (
+                [1, 1] if live_rows == 128 else [live_rows, 128]
+            )
+            assert hidden.shape == (live_rows, 2)
+            assert counts.tolist() == [1, 1]
+            assert ctx.input_num_tokens == 200
+            assert ctx.global_num_tokens == [200, 6, 0, 64]
 
 
 class TestTrtllmPrefillGraphSeamsTest:

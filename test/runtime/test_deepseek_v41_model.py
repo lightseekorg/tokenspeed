@@ -828,7 +828,18 @@ def test_model_constructor_accepts_supported_parallel_layouts(
     config.hidden_size = 256
     config.engram_layer_ids = []
     with torch.device("meta"):
-        DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu", None)
+        model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu", None)
+    if backend.is_mega_moe():
+        # Isolate the meta-device count pair from other tests' CUDA graphs.
+        monkeypatch.setattr(v41.deep_gemm, "_live_requests", None)
+        counts = v41.deep_gemm.mega_moe_live_requests(model.embed_tokens.weight.device)
+        native_kernel = "deep_gemm_mxfp4_mega_moe_apply"
+        for layer in model.layers:
+            layer.ffn.experts.plan["apply_kernel_name"] = native_kernel
+        assert model.dp_prefill_graph_live_counts() is counts
+        last_plan = model.layers[-1].ffn.experts.plan
+        last_plan["apply_kernel_name"] = "trtllm_nvfp4_mega_moe_apply"
+    assert model.dp_prefill_graph_live_counts() is None
 
 
 def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
@@ -1607,10 +1618,13 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
     pre = torch.rand(tokens, 4, device="cuda")
     args = (layer, residual, pre, positions, None, ctx)
     native = v41.try_mhc_shifted_post_pre_norm
+    captured_native = False
 
     def shifted(*args):
+        nonlocal captured_native
         result = native(*args)
         assert result is not None
+        captured_native |= torch.cuda.is_current_stream_capturing()
         return result
 
     calls = Mock(side_effect=shifted)
@@ -1665,7 +1679,7 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
         )
 
         monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", shifted)
-        cap = BreakableCapture()
+        cap = BreakableCapture(run_segments_while_capturing=True)
         with active_forward(ctx):
             cap.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(cap.stream):
@@ -1675,8 +1689,8 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
             scopes.clear()
             with cap:
                 captured = _complete_layer(*args)
-            # Attention cannot fork across the eager break, and the FFN fork
-            # is also kept out of captured segments: MegaMHC is never captured.
+            # Attention stays at its eager break; its consumer captures the native join.
+            assert captured_native
             assert scopes == [False, False]
             for _ in range(3):
                 residual.normal_()
@@ -3737,6 +3751,30 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             torch.testing.assert_close(
                 logits.argmax(-1), reference.argmax(-1), rtol=0, atol=0
             )
+
+    # An idle peer replays both common buckets after a populated round. Its
+    # empty metadata must prevent every attention break from writing live KV.
+    before_idle = arena.clone()
+    empty = ids_buf[:0]
+    backend.refresh_decode_metadata(
+        0,
+        0,
+        empty,
+        empty,
+        forward_mode=ForwardMode.IDLE,
+        block_tables={gid: table[:0] for gid, table in tables.items()},
+        for_graph_replay=True,
+    )
+    idle = context(0, 0, [], 0)
+    idle.forward_mode = ForwardMode.IDLE
+    assert model.decoder_rows(idle) == 0
+    with active_forward(idle), backend.prefill_graph_scope():
+        encoder_capture.replay(valid_rows=0)
+        narrowed = model.narrowing_forward(encoder_state, idle)
+        assert narrowed.rows == 0
+        narrowed.land_into(statics)
+        decoder_capture.replay(valid_rows=0)
+    assert torch.equal(arena, before_idle)
 
 
 def _assert_decode_graph_matches_eager(adapter, backend, tables, device, steps):

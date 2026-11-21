@@ -149,9 +149,7 @@ def test_shifted_mhc_quantize_fp8_matches_group32_reference(tokens, hidden):
 @pytest.mark.parametrize("tokens", [33, 512, 8192])
 def test_shifted_mhc_refresh_on_two_streams(tokens):
     args = _inputs(tokens, 5120, 20)
-    # A fresh stream needs its own native barrier initialization. CUDA graph
-    # replay is unsupported: split barriers can read the previous replay's
-    # partials.
+    # A fresh stream needs its own native barrier initialization.
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     for stream in streams:
         stream.wait_stream(torch.cuda.current_stream())
@@ -164,6 +162,35 @@ def test_shifted_mhc_refresh_on_two_streams(tokens):
                 for got, ref in zip(actual, _reference(args), strict=True):
                     torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
         stream.synchronize()
+
+
+@pytest.mark.parametrize("quantize_fp8", [False, True], ids=["bf16", "fp8"])
+def test_shifted_mhc_consecutive_graph_replays(quantize_fp8):
+    args = _inputs(33, 5120, 20)
+    join = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8
+        if quantize_fp8
+        else try_mhc_shifted_post_pre_norm
+    )
+    residual = args["residual"]
+    inputs = (residual.clone(), -residual)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Compute both references during stream warmup. Interleaved eager
+        # MegaMHC calls would overwrite the barrier state we want to exercise.
+        expected = [join(**{**args, "residual": value}) for value in inputs]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = join(**args)
+        assert outputs is not None
+        for i in range(32):
+            residual.copy_(inputs[i % 2])
+            graph.replay()
+            for actual, ref in zip(outputs, expected[i % 2], strict=True):
+                if actual.dtype == torch.float8_e4m3fn:
+                    actual, ref = actual.view(torch.uint8), ref.view(torch.uint8)
+                torch.testing.assert_close(actual, ref, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

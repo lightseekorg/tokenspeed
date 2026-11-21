@@ -1429,7 +1429,7 @@ def probe_arena_floor(
     rather than inlined so a test can assert the number instead of the source.
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
-    request per that many rows of a bucket no wider than the token ladder's,
+    request per decoder window of a bucket within the forward's token budget,
     and never more than ``max_num_seqs``. A chain drafter records its extend
     rounds' decode steps, and a block drafter its block draft, at every request
     count up to ``EXTEND_DECODE_MAX_REQUESTS``, and never more than
