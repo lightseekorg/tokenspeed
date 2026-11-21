@@ -1670,10 +1670,46 @@ pub struct DiskExecutorStats {
     pub failed_jobs: f64,
 }
 
+/// Each Disk executor job's time on this rank, with the L3 metrics' labels.
+/// The executor's threads observe it as each job reports.
+pub struct DiskJobMetrics {
+    labels: [String; 5],
+    seconds: Metric,
+}
+
+impl DiskJobMetrics {
+    /// One job of a Disk operation: its `direction` (`read` or `write`),
+    /// whether it succeeded, how long it `queued` before its first request
+    /// went to the kernel (None if none did) and its whole time.
+    pub fn observe(
+        &self,
+        direction: &str,
+        succeeded: bool,
+        queued: Option<std::time::Duration>,
+        elapsed: std::time::Duration,
+    ) {
+        let outcome = if succeeded { "success" } else { "failure" };
+        let labels = |stage| -> Vec<&str> {
+            self.labels
+                .iter()
+                .map(String::as_str)
+                .chain([direction, stage, outcome])
+                .collect()
+        };
+        if let Some(queued) = queued {
+            self.seconds
+                .observe(&labels("queued"), queued.as_secs_f64());
+        }
+        self.seconds
+            .observe(&labels("total"), elapsed.as_secs_f64());
+    }
+}
+
 /// The Disk tier's metrics (`docs/rfcs/0006-disk-tier.md`), with the L3
 /// metrics' labels.
 pub struct DiskMetrics {
     labels: [String; 5],
+    jobs: Arc<DiskJobMetrics>,
     resources: Metric,
     blocks: Metric,
     expirations: Metric,
@@ -1690,14 +1726,29 @@ impl DiskMetrics {
         let with = |extra: &[&'static str]| -> Vec<&'static str> {
             L3_LABELS.iter().chain(extra).copied().collect()
         };
+        let label_values = [
+            labels.model_name.clone(),
+            labels.app_key.clone(),
+            labels.dp_rank.to_string(),
+            labels.tp_rank.to_string(),
+            labels.engine_role.clone(),
+        ];
         Self {
-            labels: [
-                labels.model_name.clone(),
-                labels.app_key.clone(),
-                labels.dp_rank.to_string(),
-                labels.tp_rank.to_string(),
-                labels.engine_role.clone(),
-            ],
+            jobs: Arc::new(DiskJobMetrics {
+                labels: label_values.clone(),
+                seconds: Metric::histogram(
+                    exporter,
+                    "tokenspeed:disk_job_seconds",
+                    "Time of this rank's Disk executor jobs, by direction: queued until the \
+                     first request reached the kernel, and total until the job reported.",
+                    &with(&["direction", "stage", "outcome"]),
+                    &[
+                        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+                        1., 2.5, 5., 10.,
+                    ],
+                ),
+            }),
+            labels: label_values,
             resources: Metric::gauge(
                 exporter,
                 "tokenspeed:disk_scheduler_resources",
@@ -1745,6 +1796,11 @@ impl DiskMetrics {
             .map(String::as_str)
             .chain(extra.iter().copied())
             .collect()
+    }
+
+    /// The job histogram, which the Disk tier's executor callbacks observe.
+    pub fn jobs(&self) -> Arc<DiskJobMetrics> {
+        Arc::clone(&self.jobs)
     }
 
     /// Export a cumulative counter's growth since its last export.

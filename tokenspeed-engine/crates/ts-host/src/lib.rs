@@ -927,10 +927,16 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     // The L3 tier's executor connects its store before serving starts.
     let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
     // The Disk tier's file is allocated before serving starts.
+    let disk_metrics = config.metrics.disk_metrics(exporter.as_ref());
     let disk = config
         .disk
         .as_ref()
-        .map(ts_control::disk::DiskTier::start)
+        .map(|settings| {
+            ts_control::disk::DiskTier::start(
+                settings,
+                disk_metrics.as_ref().map(DiskMetrics::jobs),
+            )
+        })
         .transpose()?;
     let grammars = config
         .grammar
@@ -995,7 +1001,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
-            disk_metrics: config.metrics.disk_metrics(exporter.as_ref()),
+            disk_metrics,
             disk,
             peer,
         },

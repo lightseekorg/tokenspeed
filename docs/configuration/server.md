@@ -2090,6 +2090,12 @@ across TP ranks.
 | `tokenspeed:disk_io_bytes_total` | `direction` | Bytes this rank moved to and from its file. |
 | `tokenspeed:disk_io_queued_bytes` | `state` | `queued_read`, `queued_write` (including what waits for the write budget) and `inflight` bytes. |
 | `tokenspeed:disk_io_failed_jobs_total` | | Executor jobs that failed on this rank. |
+| `tokenspeed:disk_job_seconds` | `direction`, `stage`, `outcome` | Each Disk operation's executor job on this rank: `queued` until its first request reached the kernel (behind reads, other jobs and the write budget), and `total` until it reported. |
+
+A `/start_profile` trace shows each Disk operation on a `Disk read` or
+`Disk write` row from submission to report, with its `queued` part; a
+holder's pushes on `Peer push` rows, with each block's RDMA write; and a
+reader's landings on `Peer landing` rows, phase by phase.
 
 ### Block verification (experimental)
 

@@ -169,25 +169,28 @@ impl Replica {
         let file = ScratchFile::new(&format!("{backend:?}"));
         let host = Memory::map(HOST_BLOCKS * BLOCK_BYTES).unwrap();
         let host_layout = layout(HOST_BLOCKS);
-        let disk = DiskTier::start(&DiskSettings {
-            file: file.0.clone(),
-            file_bytes: (DISK_BLOCKS * BLOCK_BYTES) as u64,
-            executor: ExecutorConfig {
-                backend,
-                queue_depth: 4,
-                write_queue_depth: 2,
-                max_io_bytes: 1 << 20,
-                write_bytes_per_second: 1 << 30,
+        let disk = DiskTier::start(
+            &DiskSettings {
+                file: file.0.clone(),
+                file_bytes: (DISK_BLOCKS * BLOCK_BYTES) as u64,
+                executor: ExecutorConfig {
+                    backend,
+                    queue_depth: 4,
+                    write_queue_depth: 2,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+                host: HostBuffer {
+                    base: host.address(),
+                    len: host.size(),
+                },
+                host_layout: host_layout.clone(),
+                disk_layout: layout(DISK_BLOCKS),
+                max_operations: 4,
+                push_ring_bytes: 0,
             },
-            host: HostBuffer {
-                base: host.address(),
-                len: host.size(),
-            },
-            host_layout: host_layout.clone(),
-            disk_layout: layout(DISK_BLOCKS),
-            max_operations: 4,
-            push_ring_bytes: 0,
-        })
+            None,
+        )
         .unwrap();
         Self {
             scheduler: scheduler(),

@@ -29,6 +29,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use ts_metrics::{
@@ -488,6 +489,20 @@ fn disk_samples_export_counter_growth_once_and_current_gauges() {
     scheduler.written_blocks = 44.0;
     scheduler.operations = 0.0;
     metrics.record(&scheduler, &io);
+    // Executor threads observe jobs as they report: a read that queued
+    // 2 ms of its 30 ms, and a write cancelled before it was issued.
+    let jobs = metrics.jobs();
+    std::thread::spawn(move || {
+        jobs.observe(
+            "read",
+            true,
+            Some(Duration::from_millis(2)),
+            Duration::from_millis(30),
+        );
+        jobs.observe("write", false, None, Duration::from_millis(1));
+    })
+    .join()
+    .unwrap();
     drop(metrics);
     let Some(rendered) = render(&directory) else {
         return;
@@ -555,6 +570,35 @@ fn disk_samples_export_counter_growth_once_and_current_gauges() {
         let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
         assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
     }
+    let job_sample = |name: &str, labels: &[&str]| -> Option<f64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("tokenspeed:disk_job_seconds_{name}{{"))
+                    && labels.iter().all(|label| line.contains(label))
+            })
+            .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+    };
+    let (read, write) = ("direction=\"read\"", "direction=\"write\"");
+    let (queued, total) = ("stage=\"queued\"", "stage=\"total\"");
+    assert_eq!(
+        job_sample("bucket", &[read, queued, "le=\"0.0025\""]),
+        Some(1.0)
+    );
+    assert_eq!(
+        job_sample("bucket", &[read, total, "le=\"0.025\""]),
+        Some(0.0)
+    );
+    assert_eq!(
+        job_sample("count", &[read, total, "outcome=\"success\""]),
+        Some(1.0)
+    );
+    assert_eq!(
+        job_sample("count", &[write, total, "outcome=\"failure\""]),
+        Some(1.0)
+    );
+    // A job that issued nothing has no queued sample.
+    assert_eq!(job_sample("count", &[write, queued]), None);
     std::fs::remove_dir_all(&directory).unwrap();
 }
 

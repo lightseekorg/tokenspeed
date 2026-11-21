@@ -34,17 +34,17 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::executor::{Direction, IoError, Pressure, Stats};
+use crate::executor::{Direction, IoError, JobReport, Pressure, Stats};
 
-/// What a job runs once it ended: its outcome.
-pub(crate) type Done = Box<dyn FnOnce(Result<(), IoError>) + Send>;
+/// What a job runs once it ended: its report.
+pub(crate) type Done = Box<dyn FnOnce(JobReport) + Send>;
 
 /// Jobs that ended under the lock, reported after it is released.
-pub(crate) type Finished = Vec<(Done, Result<(), IoError>)>;
+pub(crate) type Finished = Vec<(Done, JobReport)>;
 
 pub(crate) fn report(finished: Finished) {
-    for (done, outcome) in finished {
-        done(outcome);
+    for (done, report) in finished {
+        done(report);
     }
 }
 
@@ -64,6 +64,8 @@ struct JobEntry {
     direction: Direction,
     bytes: u64,
     submitted_at: Instant,
+    /// When its first chunk went to the kernel.
+    issued_at: Option<Instant>,
     queued: usize,
     inflight: usize,
     error: Option<IoError>,
@@ -132,6 +134,7 @@ impl Queues {
                 direction,
                 bytes,
                 submitted_at: now,
+                issued_at: None,
                 queued,
                 inflight: 0,
                 error: None,
@@ -160,6 +163,7 @@ impl Queues {
         let entry = self.jobs.get_mut(&chunk.job).expect("a queued chunk's job");
         entry.queued -= 1;
         entry.inflight += 1;
+        entry.issued_at.get_or_insert_with(Instant::now);
         Some(chunk)
     }
 
@@ -168,7 +172,7 @@ impl Queues {
         &mut self,
         chunk: Chunk,
         result: Result<(), IoError>,
-    ) -> Option<(Done, Result<(), IoError>)> {
+    ) -> Option<(Done, JobReport)> {
         match chunk.direction {
             Direction::Read => self.inflight_reads -= 1,
             Direction::Write => self.inflight_writes -= 1,
@@ -191,7 +195,7 @@ impl Queues {
     }
 
     /// Stop issuing `job`'s chunks; returns it if nothing of it is in flight.
-    pub(crate) fn cancel(&mut self, job: u64) -> Option<(Done, Result<(), IoError>)> {
+    pub(crate) fn cancel(&mut self, job: u64) -> Option<(Done, JobReport)> {
         let entry = self.jobs.get_mut(&job)?;
         entry.cancelled = true;
         if entry.queued > 0 {
@@ -268,7 +272,7 @@ impl Queues {
         }
     }
 
-    fn end_if_retired(&mut self, job: u64) -> Option<(Done, Result<(), IoError>)> {
+    fn end_if_retired(&mut self, job: u64) -> Option<(Done, JobReport)> {
         let entry = self.jobs.get(&job)?;
         if entry.queued > 0 || entry.inflight > 0 {
             return None;
@@ -289,7 +293,14 @@ impl Queues {
             Err(IoError::Cancelled) => self.stats.cancelled_jobs += 1,
             Err(_) => self.stats.failed_jobs += 1,
         }
-        Some((entry.done.take().expect("a job reports once"), outcome))
+        let report = JobReport {
+            outcome,
+            queued: entry
+                .issued_at
+                .map(|issued| issued.duration_since(entry.submitted_at)),
+            elapsed: entry.submitted_at.elapsed(),
+        };
+        Some((entry.done.take().expect("a job reports once"), report))
     }
 }
 
@@ -414,7 +425,10 @@ mod tests {
     fn recorder() -> (Done, Outcomes) {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        (Box::new(move |outcome| sink.lock().push(outcome)), seen)
+        (
+            Box::new(move |report: JobReport| sink.lock().push(report.outcome)),
+            seen,
+        )
     }
 
     const LIMITS: Limits = Limits {
@@ -462,10 +476,10 @@ mod tests {
         assert!(queues.finish(first, Err(IoError::Os(libc::EIO))).is_none());
         // The third chunk is no longer issued: the job failed.
         assert_eq!(queues.next(LIMITS), None);
-        let (done, outcome) = queues
+        let (done, report) = queues
             .finish(second, Err(IoError::Os(libc::ENOSPC)))
             .unwrap();
-        done(outcome);
+        done(report);
         assert_eq!(*seen.lock(), vec![Err(IoError::Os(libc::EIO))]);
         assert_eq!(queues.stats().failed_jobs, 1);
     }
@@ -483,8 +497,9 @@ mod tests {
         let issued = queues.next(LIMITS).unwrap();
         assert!(queues.cancel(job).is_none());
         assert!(queues.drained());
-        let (_, outcome) = queues.finish(issued, Ok(())).unwrap();
-        assert_eq!(outcome, Err(IoError::Cancelled));
+        let (_, report) = queues.finish(issued, Ok(())).unwrap();
+        assert_eq!(report.outcome, Err(IoError::Cancelled));
+        assert!(report.queued.is_some_and(|queued| queued <= report.elapsed));
     }
 
     #[test]
@@ -499,7 +514,9 @@ mod tests {
         );
         let finished = queues.close();
         assert_eq!(finished.len(), 1);
-        assert_eq!(finished[0].1, Err(IoError::Cancelled));
+        assert_eq!(finished[0].1.outcome, Err(IoError::Cancelled));
+        // Nothing of it reached the kernel.
+        assert_eq!(finished[0].1.queued, None);
         assert!(queues.closing() && queues.drained());
     }
 

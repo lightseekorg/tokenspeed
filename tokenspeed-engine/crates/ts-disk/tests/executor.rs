@@ -29,8 +29,8 @@ use std::{
 };
 
 use ts_disk::{
-    Backend, Direction, DiskFile, Executor, ExecutorConfig, Io, IoError, Job, Memory, SubmitError,
-    ALIGNMENT,
+    Backend, Direction, DiskFile, Executor, ExecutorConfig, Io, IoError, Job, JobReport, Memory,
+    SubmitError, ALIGNMENT,
 };
 
 const FILE_BYTES: u64 = 1 << 20;
@@ -72,7 +72,9 @@ fn start(scratch: &ScratchFile, memory: &Memory, config: ExecutorConfig) -> Exec
 fn run(executor: &Executor, job: Job) -> Result<(), IoError> {
     let (tx, rx) = mpsc::channel();
     executor
-        .submit(job, move |outcome| tx.send(outcome).unwrap())
+        .submit(job, move |report: JobReport| {
+            tx.send(report.outcome).unwrap()
+        })
         .expect("a valid job");
     rx.recv_timeout(Duration::from_secs(30))
         .expect("the job reports")
@@ -246,7 +248,7 @@ fn a_cancelled_write_issues_nothing_more() {
                     len: 3 * ALIGNMENT,
                 }],
             },
-            move |outcome| tx.send(outcome).unwrap(),
+            move |report: JobReport| tx.send(report.outcome).unwrap(),
         )
         .unwrap();
     executor.cancel(job);
@@ -276,6 +278,53 @@ fn a_cancelled_write_issues_nothing_more() {
 }
 
 #[test]
+fn a_write_held_by_the_budget_reports_the_wait_as_queued() {
+    let scratch = ScratchFile::new("budget-wait");
+    let memory = Memory::map(2 * ALIGNMENT).unwrap();
+    // The budget passes one page at once, then one every 1/16 s.
+    let executor = start(
+        &scratch,
+        &memory,
+        ExecutorConfig {
+            max_io_bytes: ALIGNMENT,
+            write_bytes_per_second: 16 * ALIGNMENT as u64,
+            ..config(Backend::Psync)
+        },
+    );
+    let (tx, rx) = mpsc::channel();
+    for page in 0..2 {
+        let tx = tx.clone();
+        executor
+            .submit(
+                Job {
+                    direction: Direction::Write,
+                    ios: vec![Io {
+                        file_offset: (page * ALIGNMENT) as u64,
+                        address: memory.address() + page * ALIGNMENT,
+                        len: ALIGNMENT,
+                    }],
+                },
+                move |report: JobReport| tx.send(report).unwrap(),
+            )
+            .unwrap();
+    }
+    let reports: Vec<JobReport> = (0..2)
+        .map(|_| rx.recv_timeout(Duration::from_secs(30)).unwrap())
+        .collect();
+    assert!(reports.iter().all(|report| report.outcome.is_ok()));
+    for report in &reports {
+        let queued = report.queued.expect("an issued job");
+        assert!(queued <= report.elapsed);
+    }
+    let waited = reports
+        .iter()
+        .filter_map(|report| report.queued)
+        .max()
+        .unwrap();
+    assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
+}
+
+#[test]
 fn closing_cancels_queued_jobs_and_refuses_new_ones() {
     let scratch = ScratchFile::new("closing");
     let memory = Memory::map(4 * ALIGNMENT).unwrap();
@@ -299,7 +348,7 @@ fn closing_cancels_queued_jobs_and_refuses_new_ones() {
                     len: 4 * ALIGNMENT,
                 }],
             },
-            move |outcome| tx.send(outcome).unwrap(),
+            move |report: JobReport| tx.send(report.outcome).unwrap(),
         )
         .unwrap();
     executor.close(Duration::from_secs(30)).unwrap();

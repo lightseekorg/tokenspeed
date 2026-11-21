@@ -81,6 +81,19 @@ pub struct Job {
     pub ios: Vec<Io>,
 }
 
+/// How a job ended, and how long it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobReport {
+    /// Whether every range moved.
+    pub outcome: Result<(), IoError>,
+    /// From the submission until its first request went to the kernel:
+    /// the time it waited behind other jobs, reads before writes, and the
+    /// write budget. None if no request of it was issued.
+    pub queued: Option<Duration>,
+    /// From the submission until the report.
+    pub elapsed: Duration,
+}
+
 /// A submitted job, to cancel it by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JobId(pub(crate) u64);
@@ -388,12 +401,12 @@ impl Executor {
         Ok(executor)
     }
 
-    /// Queue `job`; `done` runs once with its outcome, after every request
+    /// Queue `job`; `done` runs once with its report, after every request
     /// it issued retired, on an executor thread, so it must be quick.
     pub fn submit(
         &self,
         job: Job,
-        done: impl FnOnce(Result<(), IoError>) + Send + 'static,
+        done: impl FnOnce(JobReport) + Send + 'static,
     ) -> Result<JobId, SubmitError> {
         if job.ios.is_empty() {
             return Err(SubmitError::Empty);

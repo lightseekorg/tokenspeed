@@ -46,9 +46,10 @@ use std::{
 
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
-use ts_disk::{Direction, Executor, Io, Job, Memory};
+use ts_disk::{Direction, Executor, Io, Job, JobReport, Memory};
 use ts_l3::HostLayout;
 use ts_pd::{NetError, Sockets};
+use ts_scheduler::profile::{self, Lanes};
 
 use crate::{
     codec::{Reader, Writer},
@@ -332,6 +333,10 @@ impl Holder {
     /// the reader, unless the budget passes, the reader cancels or an I/O
     /// fails. Returns whether every block landed.
     fn run(&self, session: &str, budget: Duration, items: &[PushItem], job: &Running) -> bool {
+        // On a profile timeline: the push, and each block's write inside it.
+        static PUSHES: Lanes = Lanes::new("Peer push");
+        let lane = PUSHES.hold();
+        let begin_ns = profile::now_ns();
         let deadline = Instant::now() + budget;
         let ring = self.source.ring.address();
         let (done, completions) = mpsc::channel::<(usize, usize, bool)>();
@@ -369,8 +374,8 @@ impl Holder {
                             len: range.size,
                         }],
                     },
-                    move |outcome| {
-                        let _ = done.send((index, slot, outcome.is_ok()));
+                    move |report: JobReport| {
+                        let _ = done.send((index, slot, report.outcome.is_ok()));
                     },
                 );
                 if submitted.is_err() {
@@ -401,14 +406,38 @@ impl Holder {
                     lengths: items[index].spans.iter().map(|span| span.length).collect(),
                     host_bytes: 0,
                 };
+                let write_ns = profile::now_ns();
                 if let Err(error) = self.source.writer.write(session, &spans) {
                     tracing::warn!(%error, "peer push write failed");
                     ok = false;
                 }
+                if let Some(lane) = &lane {
+                    lane.record(profile::HOST, "write".into(), write_ns, profile::now_ns());
+                }
             }
             self.slots.give_back(slot);
         }
-        ok && next == items.len() && !job.cancelled.load(Ordering::Relaxed)
+        let landed = ok && next == items.len() && !job.cancelled.load(Ordering::Relaxed);
+        if let Some(lane) = &lane {
+            let bytes: u64 = items
+                .iter()
+                .flat_map(|item| &item.spans)
+                .map(|span| span.length)
+                .sum();
+            let outcome = if landed { "landed" } else { "stopped" };
+            lane.record(
+                profile::HOST,
+                format!(
+                    "Peer push to {session}: {} blocks, {:.1} MiB, {outcome}",
+                    items.len(),
+                    bytes as f64 / (1 << 20) as f64
+                )
+                .into(),
+                begin_ns,
+                profile::now_ns(),
+            );
+        }
+        landed
     }
 }
 

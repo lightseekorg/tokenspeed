@@ -259,25 +259,28 @@ impl Replica {
                 .unwrap_or_else(std::env::temp_dir);
             let file = ScratchFile(dir.join(format!("ts-peer-disk-{}", std::process::id())));
             let host = Memory::map(HOST_BLOCKS * BLOCK_BYTES).unwrap();
-            let tier = DiskTier::start(&DiskSettings {
-                file: file.0.clone(),
-                file_bytes: (DISK_BLOCKS * BLOCK_BYTES) as u64,
-                executor: ExecutorConfig {
-                    backend: Backend::Psync,
-                    queue_depth: 4,
-                    write_queue_depth: 2,
-                    max_io_bytes: 1 << 20,
-                    write_bytes_per_second: 1 << 30,
+            let tier = DiskTier::start(
+                &DiskSettings {
+                    file: file.0.clone(),
+                    file_bytes: (DISK_BLOCKS * BLOCK_BYTES) as u64,
+                    executor: ExecutorConfig {
+                        backend: Backend::Psync,
+                        queue_depth: 4,
+                        write_queue_depth: 2,
+                        max_io_bytes: 1 << 20,
+                        write_bytes_per_second: 1 << 30,
+                    },
+                    host: HostBuffer {
+                        base: host.address(),
+                        len: host.size(),
+                    },
+                    host_layout: layout(HOST_BLOCKS),
+                    disk_layout: layout(DISK_BLOCKS),
+                    max_operations: 4,
+                    push_ring_bytes: 2 * BLOCK_BYTES,
                 },
-                host: HostBuffer {
-                    base: host.address(),
-                    len: host.size(),
-                },
-                host_layout: layout(HOST_BLOCKS),
-                disk_layout: layout(DISK_BLOCKS),
-                max_operations: 4,
-                push_ring_bytes: 2 * BLOCK_BYTES,
-            })
+                None,
+            )
             .unwrap();
             let (executor, disk_layout, ring, slot_bytes) = tier.push_source().unwrap();
             push.serve(PushSource {

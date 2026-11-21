@@ -48,8 +48,8 @@ mod psync;
 mod uring;
 
 pub use executor::{
-    Backend, Direction, Executor, ExecutorConfig, Io, IoError, Job, JobId, Pressure, StartError,
-    Stats, SubmitError,
+    Backend, Direction, Executor, ExecutorConfig, Io, IoError, Job, JobId, JobReport, Pressure,
+    StartError, Stats, SubmitError,
 };
 pub use file::{DiskFile, FileError, ALIGNMENT};
 pub use memory::Memory;

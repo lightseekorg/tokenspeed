@@ -39,10 +39,13 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use ts_disk::{Direction, DiskFile, Executor, ExecutorConfig, Io, Job, Memory, ALIGNMENT};
+use ts_disk::{
+    Direction, DiskFile, Executor, ExecutorConfig, Io, Job, JobReport, Memory, ALIGNMENT,
+};
 use ts_l3::{HostBuffer, HostLayout};
-use ts_metrics::{DiskExecutorStats, DiskSchedulerStats};
+use ts_metrics::{DiskExecutorStats, DiskJobMetrics, DiskSchedulerStats};
 use ts_scheduler::{
+    profile::{self, Lanes},
     DiskDoneView, DiskOpKind, DiskStatsView, ExecutionPlan, StorageRound, StorageTickView,
 };
 
@@ -207,6 +210,8 @@ pub struct DiskTier {
     /// Operations this rank finished since its last report; executor
     /// threads append to it.
     finished: Arc<Mutex<Vec<(u64, bool)>>>,
+    /// Observes each operation's job, on a rank that reports metrics.
+    job_metrics: Option<Arc<DiskJobMetrics>>,
     agreement: Agreement,
     clock: Instant,
     /// When the metrics were last sampled, and whether Disk work was pending.
@@ -214,8 +219,12 @@ pub struct DiskTier {
 }
 
 impl DiskTier {
-    /// Open the file and start the executor over the Host pool.
-    pub fn start(settings: &DiskSettings) -> Result<Self, DiskError> {
+    /// Open the file and start the executor over the Host pool;
+    /// `job_metrics` observes each operation's job.
+    pub fn start(
+        settings: &DiskSettings,
+        job_metrics: Option<Arc<DiskJobMetrics>>,
+    ) -> Result<Self, DiskError> {
         let alignment = ALIGNMENT;
         let host = settings.host;
         let aligned = |value: usize| value % alignment == 0;
@@ -277,6 +286,7 @@ impl DiskTier {
             host_layout: settings.host_layout.clone(),
             disk_layout: settings.disk_layout.clone(),
             finished: Arc::new(Mutex::new(Vec::new())),
+            job_metrics,
             agreement: Agreement {
                 max_operations: settings.max_operations,
                 reports: BTreeMap::new(),
@@ -289,6 +299,10 @@ impl DiskTier {
     /// Start `plan`'s Disk operations on this rank; none waits for I/O.
     /// Returns whether the plan had any.
     pub fn submit(&self, plan: &ExecutionPlan) -> Result<bool, DiskError> {
+        // On a profile timeline: each operation from submission to report,
+        // with the wait before its first request reached the kernel.
+        static READS: Lanes = Lanes::new("Disk read");
+        static WRITES: Lanes = Lanes::new("Disk write");
         let ops = plan.disk_ops();
         for op in &ops {
             if op.group_ids.len() != op.host_blocks.len()
@@ -321,18 +335,50 @@ impl DiskTier {
                 self.finished.lock().push((op_id, true));
                 continue;
             }
-            let direction = match op.kind {
-                DiskOpKind::Read => Direction::Read,
-                DiskOpKind::Write => Direction::Write,
+            let (direction, name, lanes) = match op.kind {
+                DiskOpKind::Read => (Direction::Read, "read", &READS),
+                DiskOpKind::Write => (Direction::Write, "write", &WRITES),
                 _ => return Err(DiskError::Operation("its kind")),
             };
+            let lane = lanes.hold();
+            let begin_ns = profile::now_ns();
+            let rows = ios.len();
+            let bytes: usize = ios.iter().map(|io| io.len).sum();
             let finished = self.finished.clone();
+            let job_metrics = self.job_metrics.clone();
             self.executor
-                .submit(Job { direction, ios }, move |outcome| {
-                    if let Err(error) = &outcome {
+                .submit(Job { direction, ios }, move |report: JobReport| {
+                    let succeeded = report.outcome.is_ok();
+                    if let Err(error) = &report.outcome {
                         tracing::warn!(op_id, %error, "Disk operation failed");
                     }
-                    finished.lock().push((op_id, outcome.is_ok()));
+                    if let Some(metrics) = &job_metrics {
+                        metrics.observe(name, succeeded, report.queued, report.elapsed);
+                    }
+                    if let Some(lane) = lane {
+                        let end_ns = profile::now_ns();
+                        if let Some(queued) = report.queued {
+                            let queued_ns = i64::try_from(queued.as_nanos()).unwrap_or(i64::MAX);
+                            lane.record(
+                                profile::HOST,
+                                "queued".into(),
+                                begin_ns,
+                                begin_ns.saturating_add(queued_ns).min(end_ns),
+                            );
+                        }
+                        let outcome = if succeeded { "" } else { ", failed" };
+                        lane.record(
+                            profile::HOST,
+                            format!(
+                                "Disk {name} op {op_id}: {rows} blocks, {:.1} MiB{outcome}",
+                                bytes as f64 / (1 << 20) as f64
+                            )
+                            .into(),
+                            begin_ns,
+                            end_ns,
+                        );
+                    }
+                    finished.lock().push((op_id, succeeded));
                 })?;
         }
         Ok(!ops.is_empty())

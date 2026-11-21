@@ -32,7 +32,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ts_disk::{Backend, Direction, DiskFile, Executor, ExecutorConfig, Io, Job, Memory, ALIGNMENT};
+use ts_disk::{
+    Backend, Direction, DiskFile, Executor, ExecutorConfig, Io, Job, JobReport, Memory, ALIGNMENT,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -85,8 +87,8 @@ fn main() {
                         len: block,
                     }],
                 },
-                move |outcome| {
-                    let _ = tx.send((slot, started, outcome.is_ok()));
+                move |report: JobReport| {
+                    let _ = tx.send((slot, started, report.outcome.is_ok()));
                 },
             )
             .expect("a valid job");

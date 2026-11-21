@@ -24,7 +24,12 @@
 //! release's answer. The members step it alike; the first member sends what
 //! a step asks for, and each member reads its own shard.
 
-use ts_scheduler::{PeerAnswerView, PeerFetchView, PeerLeaseView};
+use std::sync::Arc;
+
+use ts_scheduler::{
+    profile::{self, Lane, Lanes},
+    PeerAnswerView, PeerFetchView, PeerLeaseView,
+};
 
 /// How long each wait may last, in the agreed peer clock's microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,11 +76,29 @@ pub enum Action {
     },
 }
 
+/// A landing's row on a profile timeline: each phase, then the whole.
+#[derive(Clone)]
+struct Timeline {
+    lane: Arc<Lane>,
+    started_ns: i64,
+    phase_ns: i64,
+}
+
+impl std::fmt::Debug for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timeline")
+            .field("started_ns", &self.started_ns)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One landing.
 #[derive(Debug, Clone)]
 pub struct Landing {
     fetch: PeerFetchView,
     metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    /// None unless a profile records.
+    timeline: Option<Timeline>,
     started_us: i64,
     failure: Option<&'static str>,
     phase_us: i64,
@@ -97,6 +120,7 @@ impl Landing {
         now_us: i64,
         timeouts: Timeouts,
     ) -> (Self, Action) {
+        static LANDINGS: Lanes = Lanes::new("Peer landing");
         let (phase, action) = if layout_known {
             (Phase::Pin, Action::SendPin)
         } else {
@@ -106,6 +130,14 @@ impl Landing {
             Self {
                 fetch,
                 metrics: None,
+                timeline: LANDINGS.hold().map(|lane| {
+                    let now_ns = profile::now_ns();
+                    Timeline {
+                        lane: Arc::new(lane),
+                        started_ns: now_ns,
+                        phase_ns: now_ns,
+                    }
+                }),
                 started_us: now_us,
                 failure: None,
                 phase_us: now_us,
@@ -135,6 +167,25 @@ impl Landing {
             Phase::Quarantine { .. } => "quarantine",
             Phase::Done(_) => return,
         };
+        if let Some(timeline) = &mut self.timeline {
+            let now_ns = profile::now_ns();
+            let lane = &timeline.lane;
+            lane.record(profile::HOST, stage.into(), timeline.phase_ns, now_ns);
+            if let Phase::Done(end) = next {
+                let fetch = &self.fetch;
+                lane.record(
+                    profile::HOST,
+                    format!(
+                        "Peer landing {}: tokens {}..{end} of {} from {}",
+                        fetch.request_id, fetch.begin_tokens, fetch.end_tokens, fetch.holder
+                    )
+                    .into(),
+                    timeline.started_ns,
+                    now_ns,
+                );
+            }
+            timeline.phase_ns = now_ns;
+        }
         if let Some(metrics) = &self.metrics {
             if outcome != "ok" && self.failure.is_none() {
                 self.failure = Some(stage);
