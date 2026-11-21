@@ -85,6 +85,8 @@ __all__ = [
     "index_query_rope_quant",
     "selected_attention",
     "selected_attention_fp8",
+    "allocate_fp8_output",
+    "scatter_attention_output_fp8",
     "prepare_fused_decode_weights",
     "selected_attention_rope",
     "new_attention_schedule",
@@ -404,6 +406,41 @@ def prepare_fused_decode_weights(
     )
 
 
+def allocate_fp8_output(
+    device: torch.device, groups: int, rows: int, *, zeroed: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate E4M3 codes [rows, groups, 4096] and packed int32 UE8M0 scales.
+
+    Each group holds eight 512-wide query heads. Scales have shape [rows, groups, 32]
+    with row stride one and physical capacity rounded up to a multiple of four rows.
+    Padding is always zero. Set zeroed=True for sparse writes. With zeroed=False
+    the caller fills every logical row before projection.
+    """
+    aligned = (rows + 3) // 4 * 4
+    allocate = torch.zeros if zeroed else torch.empty
+    codes = allocate((rows, groups, 4096), dtype=torch.float8_e4m3fn, device=device)
+    storage = allocate((groups, 32, aligned), dtype=torch.int32, device=device)
+    if not zeroed and rows < aligned:
+        storage[..., rows:].zero_()
+    return codes, storage.permute(2, 0, 1)[:rows]
+
+
+def scatter_attention_output_fp8(
+    out: tuple[torch.Tensor, torch.Tensor],
+    rows: slice | torch.Tensor,
+    result: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy compact codes/scales into out at a slice, row indices or a Boolean mask.
+
+    Each selected row occurs once. The result matches the selected rows in
+    shape, order, device and dtypes. Return out with those rows updated.
+    """
+    # Float8 index_put is unavailable on some targets; bytes preserve the codes.
+    out[0].view(torch.uint8)[rows] = result[0].view(torch.uint8)
+    out[1][rows] = result[1]
+    return out
+
+
 def selected_attention_fp8(
     q: torch.Tensor,
     swa_cache: torch.Tensor | None,
@@ -419,6 +456,8 @@ def selected_attention_fp8(
     num_groups: int,
     prefill_kv: torch.Tensor | None,
     prefill_indices: torch.Tensor | None,
+    *,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Q RoPE, selected attention and inverse RoPE with FP8 output.
 
@@ -428,8 +467,13 @@ def selected_attention_fp8(
     Returns E4M3 [T,groups,H/groups*512] and packed UE8M0 int32 scales for
     ``grouped_fp8_projection`` with the prepared output weight. Both prepared
     projections must be used together; this layout is not the ordinary output.
+
+    When supplying out, pass writable codes/scales in allocate_fp8_output
+    layout on q.device, with one row per query and num_groups groups. A matching
+    row slice of a larger allocation can receive the copy. Omitting out returns
+    the kernel's tensors directly.
     """
-    return _kernel("selected_attention_fp8", q)(
+    result = _kernel("selected_attention_fp8", q)(
         q,
         swa_cache,
         swa_slots,
@@ -445,6 +489,9 @@ def selected_attention_fp8(
         prefill_kv,
         prefill_indices,
     )
+    if out is not None:
+        return scatter_attention_output_fp8(out, slice(None), result)
+    return result
 
 
 def selected_attention(

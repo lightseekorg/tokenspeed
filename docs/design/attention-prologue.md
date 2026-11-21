@@ -478,7 +478,7 @@ decode graph capture. A forward never creates a process group; an idle DP
 rank still participates in startup. The backend retains its shared workspace
 across layers, while the process-group manager retains the communicator.
 
-### V4.1 fused decode attention
+### V4.1 fused attention
 
 On supported Blackwell configurations, V4.1 decode keeps a separate prepared
 copy of the query and grouped output projection weights. The query projection
@@ -490,16 +490,20 @@ DSpark decode uses the same contract over its BF16 window workspace.
 
 The native epilogue requires eight query heads per output group. Unsupported
 head or projection geometry and distributed partial attention retain the regular
-path. Pure prefill uses the same prepared weights and the same fused call, one
-per workspace batch; a mixed batch keeps the regular path, since its extend and
-decode halves must agree on the output format, and so does prefill under the
-operator's query context parallelism, whose head exchange cannot merge grouped
-FP8 rows. Prefill under a model query shard also keeps the regular path: the
-backend receives the shard's query rows while the caller rotates Q from its own
-source rows, so the fused Q RoPE would use other positions. Prepared copies are
+path. Prefill uses one fused call per workspace batch. Mixed prefill and
+decode copy FlashMLA's results into disjoint rows of one buffer. Its allocator
+sets the FP8 layout and each caller supplies one destination row per query.
+The output projection reads the entire batch or graph bucket.
+Skipped prefill rows stay zero. Slices retain the parent stride of the packed
+scales. Operator QCP exchanges BF16 heads, and model query shards rotate Q
+at their source positions. Both use the regular path. Prepared copies are
 nonpersistent buffers, refreshed in place from the canonical checkpoint after
 weight updates so captured graphs retain their addresses. Cache ownership,
 selection and write ordering are unchanged.
+
+In a breakable prefill graph, eager attention fills a bucket-sized FP8 buffer
+and clears its padding, or the entire buffer on an idle rank. The next segment
+replays `wo_a` and `wo_b`. The CED narrowing layer runs eagerly between stages.
 
 Attention-front FP8 projection warmup visits every layer and deduplicates by
 device and weight shape. The initial window-only layers have no indexer, and
