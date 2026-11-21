@@ -437,6 +437,14 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
     }
 }
 
+void Scheduler::SetCacheEventSink(std::shared_ptr<CacheEventSink> sink) {
+    if (submitted_requests_) {
+        throw std::logic_error("install the cache event sink before submitting requests");
+    }
+    req_pool_allocator_.SetEventSink(sink.get());
+    cache_event_sink_ = std::move(sink);
+}
+
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     ProfileSpan profile_span{"Scheduler::SubmitRequests"};
     std::unordered_set<std::string> request_ids;
@@ -445,6 +453,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     pending_requests.reserve(request_specs.size());
     const std::int32_t max_token_limit = CapacityModel::MaxRequestTokenLimit(config_);
     for (const RequestSpec& spec : request_specs) {
+        if (cache_event_sink_ && spec.admission_id == 0) {
+            throw std::invalid_argument("cache events require the control plane admission identity");
+        }
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
         }
@@ -493,6 +504,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         }
     }
 
+    submitted_requests_ = submitted_requests_ || !pending_requests.empty();
     requests_.reserve(requests_.size() + pending_requests.size());
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
         const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;

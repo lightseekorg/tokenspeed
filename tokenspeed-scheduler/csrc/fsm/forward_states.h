@@ -312,6 +312,11 @@ using ResumeShape = std::variant<ResumePrefilling, ResumePrefillDone, ResumeDeco
 // where it was (a decoding victim decodes, a mid-prefill victim runs its next
 // chunk). Nothing is recomputed and nothing is rebased.
 struct Retracted {
+    // Frozen before the old RAII slot is released, not reconstructed at restore.
+    std::int32_t previous_slot{-1};
+    std::uint64_t previous_slot_generation{0};
+    std::int32_t committed_tokens{0};
+    std::int32_t computed_tokens{0};
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
     CacheProgress cache_progress;

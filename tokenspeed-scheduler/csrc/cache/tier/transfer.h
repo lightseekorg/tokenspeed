@@ -130,15 +130,28 @@ struct WriteBackBatch {
     bool operator==(const WriteBackBatch&) const = default;
 };
 
+struct PrefixLoadTelemetry {
+    std::uint64_t admission_id{0};
+    std::uint64_t op_generation{0};
+    std::int32_t request_pool_index{-1};
+    std::uint64_t slot_generation{0};
+
+    bool operator==(const PrefixLoadTelemetry&) const = default;
+};
+
 struct LoadBackOperation {
     std::uint32_t op_id{0};
     std::vector<CacheTransfer> transfers;  // HOST→DEVICE.
+    std::string request_id;
+    PrefixLoadTelemetry telemetry;
 };
 
 // Host L2 -> Device. Every source is a published Host entry: nothing a load
 // touches can miss, so the op is acknowledged by its copy alone.
 struct LoadBackBatch {
     std::vector<std::uint32_t> op_ids;
+    std::vector<std::string> request_ids;
+    std::vector<PrefixLoadTelemetry> telemetry;
     std::vector<std::vector<std::uint32_t>> group_ids;
     std::vector<std::vector<std::int32_t>> src_pages;
     std::vector<std::vector<std::int32_t>> dst_pages;
@@ -148,6 +161,8 @@ struct LoadBackBatch {
     explicit LoadBackBatch(const std::vector<LoadBackOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const auto& op : ops) {
+            request_ids.push_back(op.request_id);
+            telemetry.push_back(op.telemetry);
             _assert(!op.transfers.empty(), "load-back op carries no transfers");
             std::vector<std::uint32_t> operation_groups;
             std::vector<std::int32_t> operation_sources;
@@ -195,6 +210,23 @@ struct SnapshotStoreOperation {
     std::vector<CacheTransfer> transfers;
 };
 
+// Immutable scheduler context for the operation. committed_tokens includes
+// the complete prompt and accepted outputs, not client delivery or CP state.
+struct RestoreTelemetry {
+    std::uint64_t admission_id{0};
+    std::uint64_t op_generation{0};
+    std::int32_t previous_slot{-1};
+    std::uint64_t previous_slot_generation{0};
+    std::uint64_t slot_generation{0};
+    std::uint64_t slot_previous_admission_id{0};
+    std::uint64_t restore_sequence{0};
+    std::int32_t committed_tokens{0};
+    std::int32_t computed_tokens{0};
+    std::int32_t prompt_tokens{0};
+
+    bool operator==(const RestoreTelemetry&) const = default;
+};
+
 // The way back, Host -> DEVICE in one op: every imaged slot that was not
 // claimed from the Device prefix index, each row naming its source tier, plus
 // the slot-state blob imported into the new request_pool_index. An L2 row
@@ -211,6 +243,7 @@ struct SnapshotRestoreOperation {
     std::int32_t snapshot_slot{-1};
     std::vector<CacheTransfer> transfers;
     std::vector<HostTier> source_tier;  // parallel to transfers
+    RestoreTelemetry telemetry;
 };
 
 namespace internal_transfer {
@@ -265,6 +298,7 @@ struct SnapshotStoreBatch {
 };
 
 struct SnapshotRestoreBatch {
+    std::vector<RestoreTelemetry> telemetry;
     std::vector<std::uint32_t> op_ids;
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
@@ -280,6 +314,7 @@ struct SnapshotRestoreBatch {
     explicit SnapshotRestoreBatch(const std::vector<SnapshotRestoreOperation>& ops) {
         std::unordered_set<CacheTransfer, CacheTransferHash> seen;
         for (const SnapshotRestoreOperation& op : ops) {
+            telemetry.push_back(op.telemetry);
             _assert(op.request_pool_index >= 0 && op.snapshot_slot >= 0,
                     "snapshot restore op must name the new request slot and its blob slot");
             _assert(op.source_tier.size() == op.transfers.size(), "every restore row names its source tier");

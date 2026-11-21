@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "integration_test_helper.h"
+#include "cache_event_test_sink.h"
 #include "unit_test_helper.h"
 
 namespace tokenspeed::test {
@@ -497,6 +498,48 @@ TEST_P(PeerSchedulerTest, AHolderPinsLoadedDevicePagesOnlyAfterTheirLoadAcknowle
 // A local hit that ends inside a page (a tail) ends inside a block, which a
 // landing would fill as well as the hit's copy: the landing starts at the
 // page boundary below instead.
+TEST(PeerLoadOwnershipTest, HostPrefixLoadUsesTheAllocatedLandingSlot) {
+    Scheduler holder{PeerConfigFor("holder")};
+    auto reader_config = PeerConfigFor("reader");
+    reader_config.max_batch_size = 1;
+    reader_config.max_resident_requests = 1;
+    Scheduler reader{reader_config};
+    auto sink = std::make_shared<RecordingCacheEventSink>();
+    reader.SetCacheEventSink(sink);
+    const auto tokens = MakeAlignedTokens(8, kP);
+    for (Scheduler* scheduler : {&holder, &reader}) {
+        const auto computed =
+            scheduler == &holder ? tokens : std::vector<std::int32_t>(tokens.begin(), tokens.begin() + 2 * kP);
+        scheduler->SubmitRequests(
+            {RequestSpec{.request_id = "warm", .admission_id = 11, .tokens = computed, .max_new_tokens = 1}});
+        Plan(*scheduler);
+        Send(*scheduler, forward::ExtendResult{.request_id = "warm", .tokens = {7}});
+        Send(*scheduler, forward::Finish{.request_id = "warm"});
+        const auto finish = Plan(*scheduler);
+        for (const auto id : CacheOpIds<WriteBackBatch>(finish)) Send(*scheduler, cache::WriteBackDone{.op_id = id});
+    }
+    ASSERT_TRUE(reader.ClearL1Cache());
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "r", .admission_id = 22, .peer_holder = "holder", .tokens = tokens}});
+    Plan(reader);
+    HolderServicer servicer{holder};
+    for (const auto& lookup : reader.TakePeerLookups()) {
+        const auto answer = servicer.Lookup(lookup);
+        Send(reader, cache::PeerLookupAnswered{.lease = answer.lease, .num_tokens = answer.num_tokens});
+    }
+    const auto plan = Plan(reader);
+    ASSERT_EQ(plan.peer_fetches.size(), 1u);
+    ASSERT_EQ(sink->prefix_loads.size(), 1u);
+    const auto& load = sink->prefix_loads.front();
+    EXPECT_EQ(load.request_id, "r");
+    EXPECT_EQ(load.telemetry.admission_id, 22u);
+    EXPECT_EQ(load.telemetry.request_pool_index, sink->slots.back().slot);
+    EXPECT_EQ(load.telemetry.slot_generation, sink->slots.back().generation);
+    EXPECT_EQ(load.telemetry.slot_generation, 2u);
+    EXPECT_EQ(load.telemetry.op_generation, 0u);
+    EXPECT_FALSE(load.transfers.empty());
+}
+
 TEST(PeerLandingAlignmentTest, ALocalTailHitLandsFromThePageBoundaryBelow) {
     Scheduler holder{PeerConfigFor("holder")};
     Scheduler reader{PeerConfigFor("reader")};

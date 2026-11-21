@@ -1964,6 +1964,46 @@ with the ticket when the request is gone. Neither can be re-granted to another
 request while a copy still writes it. A late ACK for a dropped image is
 harmless.
 
+**Optional ownership observations.** `Scheduler::SetCacheEventSink` installs a
+shared, nonblocking observer before the first submission. The scheduler owns
+its reference until all requests, transfer tickets and slot allocators have
+been destroyed; shutdown needs no explicit unregister. The control plane
+supplies its existing immutable `RequestSpec::admission_id`;
+zero is refused when observing. The sink adds no queue, GPU work, fences, or
+scheduling decisions. Its caller owns bounded delivery and engine/rank labels;
+a dropped observation cannot be used as evidence of a complete recovery.
+
+Request-slot allocations have a slot-local generation. `ReqPoolIndex` carries
+it through moves, including the restore ticket's handoff at ACK. Binding an
+admission emits `OnSlotAssigned`; dropping the owning handle emits
+`OnSlotReleased`, including when cancellation has left it with a transfer.
+The allocator retains only a generation and the last admission ID per slot.
+An assignment to a different admission proves an ownership handoff; it does
+not by itself prove that a GPU forward wrote the row.
+
+`OnRestoreScheduled` observes the operation after the request enters
+`Restoring`. Its `RestoreTelemetry` travels with the operation and the batch:
+old/new slot generations, previous destination owner, admission ID, per-request
+restore sequence, and the transfer counter's generation across 32-bit wire-ID
+rollover. Joins include engine instance, role, rank, operation kind, generation,
+and ID; request and admission identities must agree. The retraction freezes
+`committed_tokens` (the complete submitted prompt plus scheduler-accepted
+outputs) separately from `computed_tokens` (the cache frontier). A mid-prefill
+image can have computed fewer tokens than the full prompt; a decoding image
+has not computed its last accepted token. Neither is a CP snapshot position,
+client delivery count, or stop-trimmed output count. The scheduled callback
+claims no copy completion or local rows/bytes: those belong to the executor's
+existing copy and slot-state import fence.
+
+Prefix loads use the same observer and transfer counter. `OnPrefixLoadScheduled`
+records `PrefixLoadTelemetry` after the first admission has acquired its real
+slot, for both ordinary and peer-assisted admissions. The immutable operation
+and batch retain that RID, admission, slot generation and operation generation
+through cancellation and RID reuse. A late physical-copy completion cannot
+establish that the admission is still live. `kCacheEventProtocolVersion` in the
+native sink header lets the host discover this metadata contract before model
+startup; version 1 covers prefix/restore attribution and slot ownership.
+
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the

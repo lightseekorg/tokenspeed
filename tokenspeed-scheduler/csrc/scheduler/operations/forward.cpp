@@ -1035,6 +1035,19 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(decode_slot)};
 }
 
+LoadBackOperation Scheduler::startPrefixLoad(Request& request, std::vector<BlockTransfer> load_pairs) {
+    LoadBackOperation operation = tier_transfers_.StartPrefixLoad(std::move(load_pairs));
+    const ReqPoolIndex& slot = request.ForwardResourcesRef().req_pool_index;
+    operation.request_id = request.Id();
+    operation.telemetry.admission_id = request.AdmissionId();
+    operation.telemetry.request_pool_index = slot.slot_;
+    operation.telemetry.slot_generation = slot.generation();
+    if (cache_event_sink_) {
+        cache_event_sink_->OnPrefixLoadScheduled(operation);
+    }
+    return operation;
+}
+
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                         std::vector<LoadBackOperation>& load_back_operations) {
     // The event consumes the Submitted state and with it any L3 Ready hold:
@@ -1043,7 +1056,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (!load_pairs.empty()) {
-        load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
+        load_back_operations.push_back(startPrefixLoad(*request, std::move(load_pairs)));
     }
     return operation;
 }
@@ -1792,13 +1805,25 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     // The restore op owns the request-pool row it imports the blob into until
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.
+    ReqPoolIndex restore_slot = req_pool_allocator_.Allocate();
+    restore_slot.BindOwner(request->Id(), request->AdmissionId());
     SnapshotRestoreOperation op = tier_transfers_.StartSnapshotRestore(
-        request->Id(), req_pool_allocator_.Allocate(), std::move(decode_slot), retracted->blob_slot,
+        request->Id(), std::move(restore_slot), std::move(decode_slot), retracted->blob_slot,
         std::move(result->load_pairs), std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
+    op.telemetry.admission_id = request->AdmissionId();
+    op.telemetry.previous_slot = retracted->previous_slot;
+    op.telemetry.previous_slot_generation = retracted->previous_slot_generation;
+    op.telemetry.restore_sequence = request->NextRestoreSequence();
+    op.telemetry.committed_tokens = retracted->committed_tokens;
+    op.telemetry.computed_tokens = retracted->computed_tokens;
+    op.telemetry.prompt_tokens = request->PrefillSize();
     const std::uint32_t restore_op = op.op_id;
-    build.snapshot_restores.push_back(std::move(op));
     request->Apply(
         fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), std::move(result->copy_in_blocks), restore_op});
+    if (cache_event_sink_) {
+        cache_event_sink_->OnRestoreScheduled(op);
+    }
+    build.snapshot_restores.push_back(std::move(op));
     build.scheduled.insert(request);
     spdlog::info("[Scheduler] restore: request {} ({} tokens) copies its image back", request->Id(),
                  request->TokenSize());
