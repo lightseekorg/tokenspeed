@@ -33,6 +33,7 @@ PRODUCER_DELAY_CYCLES = 100_000_000
 
 @pytest.fixture(scope="module")
 def topk_pdl_binary(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    """Compiles the native regression and returns the path of its binary."""
     nvcc = shutil.which("nvcc")
     if nvcc is None:
         pytest.skip("CUDA compiler is required for the native PDL regression")

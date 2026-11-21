@@ -33,10 +33,12 @@
 
 using TopPCounter = air_top_p::Counter<float>;
 
+// Throws on a CUDA error.
 void CheckCuda(cudaError_t error) {
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
+// Owns a device allocation of `count` elements of T.
 template <typename T>
 class DeviceBuffer {
 public:
@@ -44,6 +46,8 @@ public:
     ~DeviceBuffer() { cudaFree(data_); }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&&) = delete;
+    DeviceBuffer& operator=(DeviceBuffer&&) = delete;
     T* data() const { return data_; }
 
 private:
@@ -65,6 +69,8 @@ __global__ void EarlySignalProducer(float* probs, const float* fresh, size_t cou
     }
 }
 
+// Runs the pipeline behind the producer four times, eagerly or as a replayed
+// graph. Returns 0 when every row and every Top-P input pointer is correct.
 int Run(bool graph_mode, uint64_t delay_cycles) {
     constexpr int batch = 8;
     constexpr int vocab = 131072;
