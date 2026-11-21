@@ -177,8 +177,12 @@ void SchedulerConfig::Validate() const {
         if (disable_prefix_cache) {
             throw std::invalid_argument("Scheduler: a Disk tier needs prefix caching");
         }
-        if (disk_config->max_host_blocks > host_allocator.NumUsableBlocks()) {
-            throw std::invalid_argument("Scheduler: Disk tier Host credits must not exceed usable Host parents");
+        const std::int64_t densest_packing =
+            host_group_packing.empty() ? 1 : *std::ranges::max_element(host_group_packing);
+        if (disk_config->max_host_blocks > std::int64_t{host_allocator.NumUsableBlocks()} * densest_packing) {
+            throw std::invalid_argument(
+                "Scheduler: Disk tier Host credits must not exceed the usable Host parents times the densest "
+                "Host packing");
         }
     }
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {

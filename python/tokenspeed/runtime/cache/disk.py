@@ -60,7 +60,7 @@ class DiskTierTuning:
         max_operations: Disk operations in flight, reads and writes.
         max_blocks_per_operation: Blocks one operation moves.
         host_blocks_fraction: The share of Host L2 blocks Disk operations
-            may hold at once.
+            may hold at once, counted in the densest group's blocks.
         write_host_blocks_fraction: Of those, the share cleaning writes may
             hold.
         max_queued_cleanings: Host entries waiting to be cleaned.
@@ -112,17 +112,20 @@ def num_disk_lcm_blocks(server_args, host_lcm_block_bytes: int) -> int:
     return int(server_args.disk_tier_size_gb * 1e9) // host_lcm_block_bytes
 
 
-def disk_scheduler_config(tuning: DiskTierTuning, *, num_host_lcm_blocks: int):
+def disk_scheduler_config(tuning: DiskTierTuning, *, num_host_blocks: int):
     """The scheduler's ``DiskConfig``.
 
     Args:
         tuning: ``--disk-tier-config``.
-        num_host_lcm_blocks: Host parents, the null block excluded; the
-            Host shares are taken of them.
+        num_host_blocks: The Host pool's blocks in its densest group: its
+            parents, the null block excluded, times that group's packing
+            (``SchedulerConfig::host_group_packing``). A hybrid model's
+            prefetch must hold every KV page under the State checkpoint it
+            reaches, so the shares are of blocks, not parents.
     """
     from tokenspeed_engine.scheduler import DiskConfig
 
-    max_host_blocks = max(1, int(num_host_lcm_blocks * tuning.host_blocks_fraction))
+    max_host_blocks = max(1, int(num_host_blocks * tuning.host_blocks_fraction))
     return DiskConfig(
         max_operations=tuning.max_operations,
         max_blocks_per_operation=tuning.max_blocks_per_operation,

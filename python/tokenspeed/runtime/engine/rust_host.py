@@ -1422,7 +1422,9 @@ class HostBootstrap:
                     global_rank=global_rank,
                 )
                 disk_config = disk_scheduler_config(
-                    disk_tuning, num_host_lcm_blocks=disk.num_host_lcm_blocks
+                    disk_tuning,
+                    num_host_blocks=disk.num_host_lcm_blocks
+                    * max(device.specs.host_group_packing),
                 )
                 # The executor addresses the Host pool by pointer as well.
                 _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)

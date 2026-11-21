@@ -151,12 +151,12 @@ def test_tuning_refuses_values_the_executor_cannot_run(text, refused):
 def test_the_scheduler_limits_take_their_shares_of_the_host_pool():
     config = disk_scheduler_config(
         DiskTierTuning(host_blocks_fraction=0.25, write_host_blocks_fraction=0.5),
-        num_host_lcm_blocks=100,
+        num_host_blocks=100,
     )
     assert (config.max_host_blocks, config.max_write_host_blocks) == (25, 12)
     assert (config.wait_timeout_us, config.ready_timeout_us) == (10_000_000, 5_000_000)
     # A tiny pool still lends one block to each.
-    config = disk_scheduler_config(DiskTierTuning(), num_host_lcm_blocks=2)
+    config = disk_scheduler_config(DiskTierTuning(), num_host_blocks=2)
     assert (config.max_host_blocks, config.max_write_host_blocks) == (1, 1)
 
 
@@ -275,7 +275,7 @@ def _disk_scheduler():
             storage_config=None,
             num_disk_pages=33,
             disk_config=disk_scheduler_config(
-                DiskTierTuning(min_prefetch_tokens=1), num_host_lcm_blocks=64
+                DiskTierTuning(min_prefetch_tokens=1), num_host_blocks=64
             ),
             host_write_policy="write_back",
             prefill_decode_interval=0,

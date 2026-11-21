@@ -35,8 +35,11 @@ struct DiskConfig {
     std::int32_t max_operations;
     // Blocks one operation moves.
     std::int32_t max_blocks_per_operation;
-    // Host blocks Disk operations hold at once: a prefetch's destinations, a
-    // cleaning write's sources. Each can keep one Host parent from recycling.
+    // Host blocks Disk operations hold at once, in any group: a prefetch's
+    // destinations, a cleaning write's sources. At most the Host's parents
+    // times its densest packing: a prefetch reaches a hybrid model's next
+    // State checkpoint only if every KV page under it fits, and a held block
+    // can keep its parent from recycling, so this is a share of the pool.
     std::int32_t max_host_blocks;
     // Of those, at most this many for cleaning writes, so a slow drive leaves
     // prefetches room.

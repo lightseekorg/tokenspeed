@@ -643,6 +643,13 @@ TEST(DiskTierConfigTest, ADiskTierNeedsHostWriteBackAndItsLimits) {
     EXPECT_THROW(config.Validate(), std::invalid_argument) << "write-through Host";
     config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
     EXPECT_NO_THROW(config.Validate());
+    // Credits count blocks: up to the eight usable parents times the packing.
+    config.host_group_packing = {3};
+    config.disk_config->max_host_blocks = 24;
+    EXPECT_NO_THROW(config.Validate());
+    config.disk_config->max_host_blocks = 25;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "more credits than Host blocks";
+    config.disk_config->max_host_blocks = 1;
     config.disk_allocator.total_pages = 1;
     EXPECT_THROW(config.Validate(), std::invalid_argument) << "disk_config without a Disk tier";
 }
