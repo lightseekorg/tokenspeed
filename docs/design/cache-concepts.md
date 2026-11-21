@@ -772,6 +772,11 @@ unschedulable until the ACK. Three ACK kinds ride the one cache poll
 (`ts-control`'s `cache_ops`) replica-intersects them alike; a readmission
 needs both store ACKs.
 
+`test/runtime/test_retraction_image_executor.py` drives native snapshot/restore
+plans through the Python adapter with observations enabled and disabled. It
+checks image-row provenance, frozen restore frontiers and slot identity, and
+that the adapted restore ACK resumes the request on its restored block tables.
+
 **Slot-state image.** Device state keyed by `req_pool_index` that lives in no
 cache group must travel with the pages or the continuation is not exact: the
 next step's inputs and the verifier's recorded draft distributions
