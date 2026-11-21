@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
@@ -337,6 +338,64 @@ def warm_specialization_classes(run, key, sweep, pool) -> None:
         if key(value) in needed:
             needed.discard(key(value))
             run(value)
+
+
+# Block maxima for MXFP4 scale tests, all exact in BF16. Most are below 4, where
+# the scale exponent ``floor(log2(amax)) - 2`` is negative; 0.0 is an all-zero
+# block.
+_MXFP4_SCALE_LADDER = (
+    2.0**-20,
+    2.0**-3,
+    0.5,
+    0.75,
+    1.0,
+    3.0,
+    3.5,
+    4.0,
+    100.0,
+    2.0**10,
+    0.0,
+)
+
+
+def mxfp4_scale_byte(amax: float) -> int:
+    """E8M0 scale byte the MXFP4 quantizers store for a block maximum.
+
+    The quantizers round ``amax`` up to the next power of two when its
+    significand is at least 1.75, then store
+    ``clamp(floor(log2(amax)) - 2, -127, 127) + 127``. An all-zero block has
+    ``log2(0) = -inf``, which clamps to -127 and gives byte 0.
+    """
+    if amax == 0.0:
+        return 0
+    significand, exponent = math.frexp(amax)  # amax = significand * 2**exponent
+    log2_amax = exponent - 1 + (1 if significand >= 0.875 else 0)
+    return min(max(log2_amax - 2, -127), 127) + 127
+
+
+def make_mxfp4_scale_ladder(
+    rows: int, blocks: int, *, device: str = "cuda"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build BF16 rows whose 32-value blocks have known maxima.
+
+    Block ``(row, block)`` takes maximum ``ladder[(row + block) % len(ladder)]``,
+    so every maximum appears in every row and block column once ``rows`` and
+    ``blocks`` reach the ladder length together. The other values in a block
+    are that maximum times 0, +-0.5 or 0.25.
+
+    Returns:
+        ``(x, scale)``: ``x`` is ``[rows, blocks * 32]`` BF16 on ``device``;
+        ``scale`` is the expected ``[rows, blocks]`` uint8 scale bytes on the
+        CPU, in row-major (linear) layout.
+    """
+    ladder = torch.tensor(_MXFP4_SCALE_LADDER, dtype=torch.float32)
+    index = (torch.arange(rows)[:, None] + torch.arange(blocks)[None, :]) % len(ladder)
+    pattern = torch.tensor([1.0, -1.0, 0.5, -0.5, 0.25, 0.0, 0.5, -0.25]).repeat(4)
+    x = (ladder[index][:, :, None] * pattern).reshape(rows, blocks * 32)
+    scale = torch.tensor(
+        [mxfp4_scale_byte(amax) for amax in _MXFP4_SCALE_LADDER], dtype=torch.uint8
+    )[index]
+    return x.to(device=device, dtype=torch.bfloat16), scale
 
 
 def make_mxfp4_moe_weights(
