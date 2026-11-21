@@ -103,6 +103,8 @@ pub fn offset_endpoint_port(endpoint: &str, dp_rank: i64) -> Result<String, KvEv
 
 /// The medium of a Host event, as vLLM's events name the pinned Host cache.
 const MEDIUM_HOST: &str = "CPU_PINNED";
+/// The medium of a Disk tier event, as routers name local disk.
+const MEDIUM_DISK: &str = "DISK";
 
 /// One round's events as the publisher's payload (`KVEventBatch`): the
 /// time, the events and this rank's attention-DP rank.
@@ -117,6 +119,7 @@ pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<
         let medium = |encoder: &mut ts_wire::msgpack::Encoder| match event.medium {
             KvEventMedium::Device => encoder.nil(),
             KvEventMedium::Host => encoder.str(MEDIUM_HOST),
+            KvEventMedium::Disk => encoder.str(MEDIUM_DISK),
         };
         if event.stored {
             encoder.array_len(7);
@@ -386,6 +389,28 @@ mod tests {
     }
 
     #[test]
+    fn each_medium_encodes_as_routers_name_it() {
+        use ts_scheduler::KvEventView;
+        let removal = |medium| {
+            let batch = KvEventBatch::from_events(&[KvEventView {
+                stored: false,
+                block_hashes: vec![7],
+                has_parent: false,
+                parent_block_hash: 0,
+                token_ids: Vec::new(),
+                block_size: 0,
+                medium,
+            }]);
+            encode_batch(1.0, &batch, 0)
+        };
+        let contains =
+            |bytes: &[u8], text: &[u8]| bytes.windows(text.len()).any(|window| window == text);
+        assert!(!contains(&removal(0), b"CPU_PINNED") && !contains(&removal(0), b"DISK"));
+        assert!(contains(&removal(1), MEDIUM_HOST.as_bytes()));
+        assert!(contains(&removal(2), MEDIUM_DISK.as_bytes()));
+    }
+
+    #[test]
     fn a_full_queue_blocks_until_capacity_returns_and_preserves_owned_batches() {
         use std::sync::mpsc::TryRecvError;
         use ts_scheduler::KvEventView;
@@ -397,7 +422,7 @@ mod tests {
                 parent_block_hash: 0,
                 token_ids: Vec::new(),
                 block_size: 0,
-                host: false,
+                medium: 0,
             }])
         };
         let (queue, mut receiver) = tokio::sync::mpsc::channel(1);

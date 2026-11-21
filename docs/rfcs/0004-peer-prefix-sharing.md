@@ -439,7 +439,10 @@ holder's clock, from PIN application until actual release or expiry.
 transport service on each rank. Sum `tokenspeed:peer_outstanding_read_bytes`
 over reader ranks for bytes queued or executing against a holder; count distinct
 reader replicas with a positive sum to obtain concurrency at scrape time.
-Use `tokenspeed:peer_read_bytes_total` for successful physical payload.
+Use `tokenspeed:peer_read_bytes_total` for successful physical payload;
+`tokenspeed:peer_read_source_bytes_total` splits it, and the Disk pages a holder
+pushed with it ([RFC 0006](0006-disk-tier.md)), by the holder's `source_tier`:
+`device`, `host` or `disk`.
 Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
 A reader process that dies before terminal observation cannot report a completed
 sample; frontend failures and holder expiry remain independently observable.

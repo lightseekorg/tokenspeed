@@ -31,6 +31,7 @@ import torch
 from tokenspeed_engine.scheduler import (
     Cache,
     CacheGroupConfig,
+    DiskConfig,
     SchedulerConfig,
     StorageConfig,
 )
@@ -123,6 +124,8 @@ def make_config(
     host_group_packing: Sequence[int],
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
+    num_disk_pages: int,
+    disk_config: DiskConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
     prefill_decode_min_interval: int,
@@ -175,6 +178,10 @@ def make_config(
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
+        num_disk_pages: The Disk tier's LCM blocks including the null page;
+            0 without the tier (``docs/rfcs/0006-disk-tier.md``).
+        disk_config: The Disk tier's limits (``cache/disk.py``), present
+            exactly with the tier.
         host_write_policy: ``--kvstore-write-policy``: ``"write_through"``
             streams published entries to Host (at chunk ends, the prompt end
             and finish); ``"write_back"`` writes back what an admission or a
@@ -291,6 +298,10 @@ def make_config(
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.storage_config = storage_config
     cfg.enable_l3_storage = enable_l3_storage
+    if (disk_config is not None) != (num_disk_pages > 1):
+        raise ValueError("disk_config is required exactly with a Disk tier")
+    cfg.num_disk_pages = num_disk_pages
+    cfg.disk_config = disk_config
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     cfg.role = scheduler_role(role)
@@ -620,7 +631,8 @@ class CacheOperations(NamedTuple):
         Cache.StorageQueryOp
         | Cache.StorageGetOp
         | Cache.StoragePutOp
-        | Cache.StorageCancelOp,
+        | Cache.StorageCancelOp
+        | Cache.DiskOp,
         ...,
     ]
 
@@ -631,9 +643,10 @@ def cache_ops_from_plan(
     """Read and validate every cache op once before any owner submits work.
 
     L2 wire batches pass through; snapshot/restore batches become per-request
-    operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
-    tuple: the engine host's L3 executor runs them. Unknown kinds fail the
-    whole conversion without partial submission.
+    operations. Host-only QUERY/GET/PUT/Cancel descriptors and Disk
+    operations go to the storage tuple: the engine host's L3 and Disk
+    executors run them. Unknown kinds fail the whole conversion without
+    partial submission.
 
     ``request_admission`` resolves each snapshot/restore request while the
     plan is adapted. The resulting op holds the identity, never a late lookup
@@ -659,6 +672,7 @@ def cache_ops_from_plan(
                 Cache.StorageGetOp,
                 Cache.StoragePutOp,
                 Cache.StorageCancelOp,
+                Cache.DiskOp,
             ),
         ):
             storage.append(op)

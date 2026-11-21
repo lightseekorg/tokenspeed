@@ -61,6 +61,15 @@ HARD_PIN_S = 30.0
 QUARANTINE_S = 5.0
 # A holder forgets a lease's record this long after its last request.
 RECORD_LIFETIME_S = HARD_PIN_S + 30.0
+# How long a holder may take to push its Disk pages into a reader's landing
+# (docs/rfcs/0006-disk-tier.md); it posts no write past it, and a reader
+# that stops waiting cancels the push first.
+PUSH_TIMEOUT_S = 10.0
+# Host landings: the share of the Host pool's blocks (in its densest group)
+# landings hold at once, and how long a landed prefix is held for its
+# request's admission.
+HOST_LANDING_BLOCKS_FRACTION = 0.5
+HOST_READY_S = 5.0
 
 
 def peer_incarnation() -> int:
@@ -84,6 +93,8 @@ def peer_scheduler_config(
     incarnation: int,
     answer_timeout_ms: int,
     min_fetch_tokens: int,
+    landing_tier: str,
+    num_host_blocks: int,
 ) -> PeerConfig:
     """The scheduler's peer sharing limits.
 
@@ -94,12 +105,21 @@ def peer_scheduler_config(
             before the request is admitted without it.
         min_fetch_tokens: The fewest tokens worth reading from a peer past
             the local hit.
+        landing_tier: ``--peer-prefix-landing-tier``: ``"device"`` lands a
+            prefix into the Device pages the request's admission allocates,
+            ``"host"`` into Host blocks before its admission.
+        num_host_blocks: The Host pool's blocks in its densest group (its
+            parents, the null block excluded, times that group's packing);
+            Host landings hold a share of them.
 
     Returns:
         The ``SchedulerConfig.peer_config`` value.
     """
-    from tokenspeed_engine.scheduler import PeerConfig
+    from tokenspeed_engine.scheduler import PeerConfig, PeerLandingTier
 
+    host = landing_tier == "host"
+    if not host and landing_tier != "device":
+        raise ValueError(f"unknown peer landing tier {landing_tier!r}")
     return PeerConfig(
         name=name,
         incarnation=incarnation,
@@ -108,6 +128,11 @@ def peer_scheduler_config(
         hard_pin_us=int(HARD_PIN_S * 1e6),
         lookup_timeout_us=answer_timeout_ms * 1000,
         min_fetch_tokens=min_fetch_tokens,
+        landing_tier=PeerLandingTier.Host if host else PeerLandingTier.Device,
+        max_host_landing_blocks=(
+            max(1, int(num_host_blocks * HOST_LANDING_BLOCKS_FRACTION)) if host else 0
+        ),
+        host_ready_timeout_us=int(HOST_READY_S * 1e6) if host else 0,
     )
 
 
@@ -241,9 +266,12 @@ class PeerSharingSettings:
             flushed weight update moves it.
         answer_timeout_s: How long a landing waits for each answer.
         quarantine_s: How long a failed landing's blocks stay unused.
+        push_timeout_s: How long a holder may take to push its Disk pages.
         record_lifetime_s: How long a holder keeps a lease's record.
         library: The transfer engine library.
         local_ip: The address the transfer engine starts on.
+        push_host: The host other replicas reach this rank's push endpoint
+            at (``peer::push``).
         protocol: The transfer engine's transport.
         ib_device: The RDMA devices, comma-separated; empty for all.
         geometry: This rank's geometry.
@@ -257,9 +285,11 @@ class PeerSharingSettings:
     weight_version: str
     answer_timeout_s: float
     quarantine_s: float
+    push_timeout_s: float
     record_lifetime_s: float
     library: str
     local_ip: str
+    push_host: str
     protocol: str
     ib_device: str
     geometry: PeerGeometry

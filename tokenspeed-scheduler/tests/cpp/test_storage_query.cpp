@@ -24,6 +24,7 @@
 #include <array>
 #include <cstdint>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -84,13 +85,25 @@ std::vector<std::int32_t> Packing(std::span<const CacheGroupSpec> specs) {
 
 class QueryCache {
 public:
-    QueryCache(std::int32_t grain, std::vector<CacheGroupSpec> specs, std::int32_t parents)
+    // `host_credits`: the Host blocks storage operations may hold; the parents
+    // by default.
+    QueryCache(std::int32_t grain, std::vector<CacheGroupSpec> specs, std::int32_t parents,
+               std::optional<std::int32_t> host_credits = std::nullopt)
         : device{parents, Packing(specs)},
           host{parents, Packing(specs)},
-          coordinator{MakeCoordinator(specs, grain, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
+          coordinator{MakeCoordinator(specs, grain, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
+                                      /*write_back_evictions=*/false,
                                       /*checkpoint_retention_requests=*/0)},
-          storage{coordinator,
-                  StorageConfig{8, 256, parents, 256, 8192, 1, 1000, 1000, {8, 1048576, 1000}, {4, 524288, 500}}} {}
+          storage{coordinator, StorageConfig{8,
+                                             256,
+                                             host_credits.value_or(parents),
+                                             256,
+                                             8192,
+                                             1,
+                                             1000,
+                                             1000,
+                                             {8, 1048576, 1000},
+                                             {4, 524288, 500}}} {}
 
     void Warm(std::span<const CacheKey> keys) {
         for (const auto& key : keys) {
@@ -142,6 +155,31 @@ TEST_P(StorageQueryHighestTest, RestoresTheHighestCheckpointWithinTheActualKeyBu
 }
 
 INSTANTIATE_TEST_SUITE_P(KeyBudgets, StorageQueryHighestTest, ::testing::Values(40u, 256u));
+
+// A hybrid prompt's one checkpoint sits at its end, so its GET holds every KV
+// page under it: with four KV pages packed per Host parent, more blocks than
+// the Host has parents. Credits counted in parents could never restore it.
+TEST(StorageQueryTest, AHybridGetHoldsMoreBlocksThanTheHostHasParents) {
+    // Twelve parents: the 32 KV blocks fill eight, the checkpoint takes one.
+    constexpr std::int32_t kParents = 12;
+    const auto specs = FullAndStates(128, 32, 1);
+    QueryPrompt prompt(1024, 128);
+    const auto prefix = prompt.Prefix(1024, false);
+    // The store holds the prompt with the one checkpoint at its end.
+    const auto stored = [&](const QueryCache& cache) {
+        const StorageQuery boundary = cache.coordinator.Storage().SharedPrefixKeys(prefix, 256);
+        EXPECT_EQ(boundary.max_tokens, 1024);
+        EXPECT_EQ(boundary.keys.size(), 33u) << "32 KV blocks and the checkpoint";
+        return boundary.keys;
+    };
+    {
+        QueryCache parents_only(128, specs, kParents);
+        EXPECT_FALSE(parents_only.storage.StartRead(prefix, stored(parents_only))) << "33 blocks exceed 12 credits";
+    }
+    QueryCache blocks(128, specs, kParents, /*host_credits=*/kParents * 4);
+    EXPECT_EQ(blocks.Restore(prefix, stored(blocks)).size(), 33u);
+    EXPECT_EQ(blocks.coordinator.Prober().ProbePromptPrefix(prefix).host.num_common_tokens, 1024);
+}
 
 TEST(SharedPrefixPublicationTest, DependenciesIncludeLocalFullHistoryStateAndWindow) {
     auto specs = FullAndStates(4, 2, 2);

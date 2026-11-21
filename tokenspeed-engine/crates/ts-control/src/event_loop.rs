@@ -60,7 +60,7 @@ use std::{
 
 use parking_lot::{lock_api::ArcMutexGuard, Mutex, RawMutex};
 use ts_collective::{Group, Mesh, Reduce};
-use ts_metrics::{EngineMetrics, L3Metrics};
+use ts_metrics::{DiskMetrics, EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     profile, CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent,
@@ -76,6 +76,7 @@ use crate::{
     cache_ops::{CacheOpError, CacheOps},
     codec::{Reader, Writer},
     control::{self, ControlConfig, Controls, Drain, Effect},
+    disk::{DiskError, DiskTier},
     eplb::{self, InternalOp, SlotMoves},
     grammar::{self as grammar_cache, GrammarKey, Grammars, InvalidGrammar, Lookup},
     ingress::{self, Admission, Admitted, IngressLimits},
@@ -195,6 +196,13 @@ const RELOAD_GATE_CODE: i64 = 7;
 
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
+
+/// Without L3, how long a cache clear waits for the Host and Disk writes
+/// still in flight -- the Disk tier's operations, peer landings into Host --
+/// to retire. Each takes milliseconds; one still in flight past this fails
+/// the clear, since none is retained across one
+/// (`Scheduler::CanClearCacheRetainingStorage`).
+const LOCAL_CLEAR_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A failure of a data-plane operation; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
@@ -444,6 +452,10 @@ pub enum LoopError {
     /// The L3 executor refused what a plan or a control operation asked.
     #[error(transparent)]
     StorageExecutor(#[from] ts_l3::ExecutorError),
+    /// The Disk tier refused a plan's operation, or its replica could not
+    /// agree on its reports.
+    #[error(transparent)]
+    Disk(#[from] DiskError),
     /// The replica could not agree on its peer sharing reports.
     #[error(transparent)]
     Peer(#[from] PeerError),
@@ -553,6 +565,12 @@ pub struct Subsystems {
     /// on the executors' reports every round, and flushes delete the tier's
     /// namespace. `None` without the tier.
     pub l3: Option<ts_l3::Executor>,
+    /// With the Disk tier (`docs/rfcs/0006-disk-tier.md`), this rank's
+    /// executor and file: the replica agrees on what the executors finished
+    /// every round. `None` without the tier, which excludes L3.
+    pub disk: Option<DiskTier>,
+    /// The Disk tier's metrics, on a rank that reports them.
+    pub disk_metrics: Option<DiskMetrics>,
     /// With peer prefix sharing, this rank's part of it: started over the
     /// loop's scheduler, which its endpoint serves between rounds. `None`
     /// without.
@@ -580,6 +598,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The L3 tier: this rank's executor and the replica's agreement.
     l3: Option<Tier>,
     l3_metrics: Option<L3Metrics>,
+    /// The Disk tier: this rank's executor and the replica's agreement.
+    disk: Option<DiskTier>,
+    disk_metrics: Option<DiskMetrics>,
     peer: Option<Peer>,
     /// The peer clock the replica agreed on this round.
     peer_now_us: i64,
@@ -635,9 +656,9 @@ struct Relayed {
     stop: bool,
     /// Its frontend messages.
     messages: Vec<EngineRequest>,
-    /// With L3, every member's storage report, in member order; empty
-    /// without.
-    l3_reports: Vec<Vec<u8>>,
+    /// With L3 or the Disk tier, every member's storage report, in member
+    /// order; empty without.
+    storage_reports: Vec<Vec<u8>>,
     /// With peer sharing, every member's peer report, in member order;
     /// empty without.
     peer_reports: Vec<Vec<u8>>,
@@ -669,6 +690,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .then(|| HistoryRows::new(config.request_token_history_lookback)),
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
+            disk: subsystems.disk,
+            disk_metrics: subsystems.disk_metrics,
             peer: subsystems.peer,
             peer_now_us: 0,
             scheduler: scheduler.lock_arc(),
@@ -840,14 +863,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Nothing reaches a rank whose frontend is gone: it stops as on a
         // stop request, so every rank stops after this round.
         let stop_requested = stop_requested || self.frontend.closed();
-        let l3_report = self.l3.as_ref().map(Tier::report);
+        let storage_report = self
+            .l3
+            .as_ref()
+            .map(Tier::report)
+            .or_else(|| self.disk.as_ref().map(DiskTier::report));
         let peer_report = self.peer.as_mut().map(Peer::report);
         let Relayed {
             mut stop,
             messages,
-            l3_reports,
+            storage_reports,
             peer_reports,
-        } = self.relay(stop_requested, received, l3_report, peer_report)?;
+        } = self.relay(stop_requested, received, storage_report, peer_report)?;
         let mut busy = !messages.is_empty();
         // First at the head: the holder's changes since the last round, as
         // its replica agreed on them, then the landings' progress.
@@ -872,7 +899,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
 
         // The storage tick and the cache-op acknowledgments advance at the
         // head of the round, so this round's plan sees them.
-        let storage = self.storage_round(&l3_reports, forward_allowed)?;
+        let storage = self.storage_round(&storage_reports, forward_allowed)?;
         let ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
@@ -907,6 +934,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .next_execution_plan(false, self.config.prefill_delay.is_some());
             if let Some(l3) = &self.l3 {
                 busy |= l3.submit(&plan)?;
+            }
+            if let Some(disk) = &self.disk {
+                busy |= disk.submit(&plan)?;
             }
             let cache_ops = plan.cache_ops();
             self.cache_ops.dispatched(&cache_ops);
@@ -967,6 +997,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // A storage operation's outcome is an acknowledgment too.
         busy |= !ready.is_empty()
             || !storage.done.is_empty()
+            || !storage.disk_done.is_empty()
             || !events.is_empty()
             || !outputs.is_empty()
             || !released.is_empty();
@@ -1047,9 +1078,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // The storage operations start on the L3 executor at once, apart
         // from the device work.
-        let storage_work = match &self.l3 {
-            Some(l3) => l3.submit(&plan)?,
-            None => false,
+        let storage_work = match (&self.l3, &self.disk) {
+            (Some(l3), _) => l3.submit(&plan)?,
+            (None, Some(disk)) => disk.submit(&plan)?,
+            (None, None) => false,
         };
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
@@ -1299,19 +1331,23 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
     }
 
-    /// The round's storage input to the scheduler. With L3, the replica's
-    /// agreement on the members' reports, every round. Without, the forward
-    /// permission when a freeze starts or ends: the tick is the scheduler's
-    /// only input that carries it, and its clock, which times only storage
-    /// deadlines, stays 0.
+    /// The round's storage input to the scheduler. With L3 or the Disk
+    /// tier, the replica's agreement on the members' reports, every round.
+    /// Without, the forward permission when a freeze starts or ends: the
+    /// tick is the scheduler's only input that carries it, and its clock,
+    /// which times only storage deadlines, stays 0.
     fn storage_round(
         &mut self,
-        l3_reports: &[Vec<u8>],
+        storage_reports: &[Vec<u8>],
         allowed: bool,
     ) -> Result<StorageRound, LoopError> {
         if let Some(l3) = self.l3.as_mut() {
             let _span = profile::span("Tier::agree");
-            return Ok(l3.agree(l3_reports, allowed, allowed)?);
+            return Ok(l3.agree(storage_reports, allowed, allowed)?);
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            let _span = profile::span("DiskTier::agree");
+            return Ok(disk.agree(storage_reports, allowed, allowed)?);
         }
         if allowed == self.forward_allowed {
             return Ok(StorageRound::default());
@@ -1758,10 +1794,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// Sample L3 metrics once a second while stable, plus each transition
-    /// between progress-pending and idle. Observations never feed the agreement
-    /// or the scheduler.
+    /// Sample L3 or Disk metrics once a second while stable, plus each
+    /// transition between progress-pending and idle. Observations never feed
+    /// the agreement or the scheduler.
     fn record_storage_metrics(&mut self) -> Result<(), LoopError> {
+        if let (Some(disk), Some(metrics)) = (self.disk.as_mut(), self.disk_metrics.as_mut()) {
+            if disk.metrics_due(self.scheduler.storage_progress_pending()) {
+                metrics.record(
+                    &crate::disk::scheduler_stats(self.scheduler.disk_stats()),
+                    &disk.executor_stats(),
+                );
+            }
+            return Ok(());
+        }
         let (Some(l3), Some(metrics)) = (self.l3.as_mut(), self.l3_metrics.as_mut()) else {
             return Ok(());
         };
@@ -2050,9 +2095,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let pending = self.scheduler.storage_current_pending();
         if !self.converge(!pending)? {
-            let budget = self.l3.as_ref().map_or(Duration::ZERO, |l3| {
-                l3.executor.config().clear_cache_drain_timeout
-            });
+            let budget = match &self.l3 {
+                Some(l3) => l3.executor.config().clear_cache_drain_timeout,
+                None => LOCAL_CLEAR_DRAIN_TIMEOUT,
+            };
             let expired = self.cache_clear_started.expect("clear started").elapsed() >= budget;
             if !self.converge(!expired)? {
                 return self.clear_cache_retaining_storage().map(Some);
@@ -2678,13 +2724,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// The round's frontend messages, from the replica's first member, and
-    /// its stop request; with L3, every member's storage report, which this
-    /// rank's `l3_report` joins.
+    /// its stop request; with L3 or the Disk tier, every member's storage
+    /// report, which this rank's `storage_report` joins.
     fn relay(
         &mut self,
         stop_requested: bool,
         received: Vec<EngineRequest>,
-        l3_report: Option<Vec<u8>>,
+        storage_report: Option<Vec<u8>>,
         peer_report: Option<Vec<u8>>,
     ) -> Result<Relayed, LoopError> {
         let replica = &self.ranks.replica;
@@ -2692,7 +2738,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(Relayed {
                 stop: stop_requested,
                 messages: received,
-                l3_reports: l3_report.into_iter().collect(),
+                storage_reports: storage_report.into_iter().collect(),
                 peer_reports: peer_report.into_iter().collect(),
             });
         }
@@ -2705,9 +2751,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         // Every member's reports ride the relay: one exchange a round for
         // all of them, in the same order on every member.
-        let (has_l3, has_peer) = (l3_report.is_some(), peer_report.is_some());
-        let reports: Vec<Vec<u8>> = l3_report.into_iter().chain(peer_report).collect();
-        let (mut l3_reports, mut peer_reports) = (Vec::new(), Vec::new());
+        let (has_storage, has_peer) = (storage_report.is_some(), peer_report.is_some());
+        let reports: Vec<Vec<u8>> = storage_report.into_iter().chain(peer_report).collect();
+        let (mut storage_reports, mut peer_reports) = (Vec::new(), Vec::new());
         let relayed = if reports.is_empty() {
             self.ranks.mesh.broadcast(replica, 0, payload)?
         } else {
@@ -2725,8 +2771,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     relayed = relay.to_vec();
                 }
                 let mut parts = parts.into_iter();
-                if has_l3 {
-                    l3_reports.extend(parts.next().map(<[u8]>::to_vec));
+                if has_storage {
+                    storage_reports.extend(parts.next().map(<[u8]>::to_vec));
                 }
                 if has_peer {
                     peer_reports.extend(parts.next().map(<[u8]>::to_vec));
@@ -2742,7 +2788,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(Relayed {
             stop,
             messages,
-            l3_reports,
+            storage_reports,
             peer_reports,
         })
     }

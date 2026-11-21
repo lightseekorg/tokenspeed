@@ -41,6 +41,7 @@
 #include "cache/coordinator/admission_types.h"
 #include "cache/coordinator/cache_evictor.h"
 #include "cache/coordinator/cache_store.h"
+#include "cache/coordinator/disk_cache.h"
 #include "cache/coordinator/host_cache.h"
 #include "cache/coordinator/prefix_prober.h"
 #include "cache/coordinator/storage_queries.h"
@@ -79,22 +80,25 @@ public:
     // write_back_evictions whether an admission or a restore evicts Device
     // cache by segments, the evictions of those and of a lone-request
     // compaction are recorded for the plan's write-back drain
-    // (TakeEvictedSegments), dead prefix entries are collected on both tiers,
+    // (TakeEvictedSegments), dead prefix entries are collected on every tier,
     // and a retraction image's Host leg takes room by whole segments first
     // (the Host write-back policy; it needs a Host pool and excludes
     // streaming). The snapshot pool holds retracted requests' private KV
     // images (Snapshot / Restore); nullptr means the engine never retracts.
+    // The Disk pool is the local SSD tier below Host
+    // (docs/rfcs/0006-disk-tier.md); it needs the Host write-back policy, and
+    // nullptr means no Disk tier.
     // checkpoint_retention_requests and checkpoint_retention_leaf_distance are
     // SchedulerConfig's: a State checkpoint more than the leaf distance from a
     // leaf ranks, under pressure, as if last used that many new requests ago
     // (0 requests ranks every entry by its own use).
-    // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host,
+    // enable_l3_storage, host_pool, disk_pool, snapshot_pool, stream_device_cache_to_host,
     // write_back_evictions and checkpoint_retention_requests have no defaults:
     // a shorter call would convert a pool pointer to bool and silently disable
     // a tier instead of failing to compile. A leaf distance of 0 ranks only
     // the newest checkpoint on a branch as a leaf.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
+                     bool enable_l3_storage, BlockPool* host_pool, BlockPool* disk_pool, BlockPool* snapshot_pool,
                      bool stream_device_cache_to_host, bool write_back_evictions,
                      std::int64_t checkpoint_retention_requests, std::int32_t checkpoint_retention_leaf_distance = 0);
     // Index entries and recorded write-backs point at the store's boundary
@@ -194,6 +198,10 @@ public:
         std::uint64_t access_epoch{0};
     };
     PrefixExport ExportPrefix(PrefixProbe&& probe);
+    // The pages of a listing that names a holder's Disk pages too
+    // (StorageQueries::ListWithDisk), held and refreshed as ExportPrefix
+    // holds and refreshes a probe's: each from the tier the listing names.
+    PrefixExport ExportListing(const PrefixProber::PrefixListing& listing);
     // After a peer read in full the prefix an export dated `access_epoch`,
     // whose entries are `keys`: demotes its leaf chain as DemoteEntries does.
     // From the deepest boundary toward the root, a boundary joins the chain
@@ -338,6 +346,8 @@ public:
     const AdmissionHistory& History() const { return history_; }
     HostCache& Host() { return host_; }
     const HostCache& Host() const { return host_; }
+    DiskCache& Disk() { return disk_; }
+    const DiskCache& Disk() const { return disk_; }
     // Whether Device eviction writes back by segments (the Host write-back
     // policy).
     bool WritesBackEvictions() const { return write_back_evictions_; }
@@ -410,13 +420,13 @@ public:
     // Requires a successful retaining-storage preflight on the control thread.
     // Removes cache indexes; external refs keep their physical slots occupied.
     void ClearCacheRetainingStorage();
-    // Evicts, on both tiers, the prefix entries no probe can resume from any
+    // Evicts, on every tier, the prefix entries no probe can resume from any
     // more (write_back_evictions only; nothing is queued otherwise). A node no
     // eviction write-back is bringing to the Host is dead when no checkpoint
-    // boundary is left in its subtree on either tier (with State groups), when
+    // boundary is left in its subtree on any tier (with State groups), when
     // it is a tail no probe enumerates (its hint is gone), or when it is a gap
     // a prefix-closed group cannot cross: no prefix-closed group holds it on
-    // either tier, whatever State entries or children it keeps. The boundary
+    // any tier, whatever State entries or children it keeps. The boundary
     // tree queues candidates as holders leave it (the node a removal stops at
     // once no checkpoint boundary is left under it, a gap); a tail the cap
     // left behind and a boundary a settlement did not publish are queued too.
@@ -508,6 +518,7 @@ public:
     struct BoundaryEventStatus {
         bool device_publishable;
         bool host_publishable;
+        bool disk_publishable;
         bool retains_descriptor;
     };
     // Routing requires every continuous-history group on the medium (the
@@ -630,6 +641,8 @@ private:
     AdmissionHistory history_;
     // Host L2: allocation and placement, publication, write-back settlement.
     HostCache host_{store_, evictor_, history_, write_back_evictions_};
+    // The local SSD tier below Host: placement, publication, a prompt's hits.
+    DiskCache disk_{store_, evictor_, history_, prober_};
     // What L3 storage is asked for a prompt's prefix, and the Host blocks a
     // read lands in.
     StorageQueries storage_;
@@ -646,7 +659,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool, BlockPool* disk_pool,
                                  BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
                                  std::int64_t checkpoint_retention_requests,
                                  std::int32_t checkpoint_retention_leaf_distance = 0);

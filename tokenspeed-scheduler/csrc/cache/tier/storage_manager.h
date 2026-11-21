@@ -37,7 +37,7 @@ namespace tokenspeed {
 // on the scheduler thread. Runtime workers receive only immutable descriptors.
 // A query or GET is started for a request and returned as its StorageLease;
 // backups (PUT) belong to no request and retire on their own.
-class StorageTransferManager {
+class StorageTransferManager : public StorageLeaseIssuer {
 public:
     StorageTransferManager(CacheCoordinator& coordinator, StorageConfig config);
     const StorageConfig& Config() const { return config_; }
@@ -103,8 +103,6 @@ public:
     std::vector<StorageOperation> TakeCommands();
 
 private:
-    friend class StorageLease;
-
     struct Ticket {
         StorageKind kind;
         std::vector<CacheKey> keys;
@@ -124,7 +122,7 @@ private:
     };
     std::uint64_t nextId();
     // What dropping the operation's lease does.
-    void detach(std::uint64_t id) noexcept;
+    void detach(std::uint64_t id) noexcept override;
     void rememberNegative(const CacheKey& key);
     void rememberPublished(const CacheKey& key);
     void clearMetadata();

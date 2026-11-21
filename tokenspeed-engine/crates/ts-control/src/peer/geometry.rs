@@ -24,11 +24,12 @@
 //!
 //! A reader and its holder share the namespace, so their fields agree; only
 //! the addresses differ. A read copies, per page, every field of the page's
-//! group from the holder's tier to the reader's Device field.
+//! group from the holder's tier to the reader's (its Device field, or its
+//! packed Host block).
 
-use std::collections::HashMap;
+use ts_scheduler::{PeerPageView, PeerTier};
 
-use ts_scheduler::PeerPageView;
+use crate::peer::push::{PushItem, PushSpan};
 
 /// One Device field of a cache group: page `p` sits at `address + p *
 /// page_stride` and holds `bytes` (a replicated group's scheduler block id is
@@ -77,8 +78,12 @@ pub struct RankGeometry {
     pub session: String,
     /// Every Device field, in the order the rank lists them.
     pub device: Vec<DeviceField>,
-    /// The Host pool; absent without one.
+    /// The Host pool; absent without one. A Disk tier packs its blocks the
+    /// same way (`docs/rfcs/0006-disk-tier.md`).
     pub host: Option<HostPool>,
+    /// The rank's push endpoint (`push::PushEndpoint`): where a reader asks
+    /// it to push its Disk pages, and where its own pushes are answered.
+    pub push: Option<String>,
 }
 
 /// A page or geometry a read cannot place.
@@ -92,15 +97,16 @@ pub enum GeometryError {
         /// The block.
         block: i32,
     },
-    /// The holder named a Host block, and has no Host pool.
-    #[error("the holder named a Host block and has no Host pool")]
+    /// A Host block on a rank without a Host pool.
+    #[error("a Host block on a rank without a Host pool")]
     NoHost,
     /// The two ranks' fields disagree.
     #[error("field {0} is not on both ranks")]
     Field(String),
-    /// A destination is not on the reader's Device.
-    #[error("a landing destination must be a Device block")]
-    Destination,
+    /// A page whose tier a read cannot reach: a holder's Disk page (pushed,
+    /// never read), or a reader's destination outside its Device and Host.
+    #[error("a peer read neither reads a Disk page nor lands outside Device and Host")]
+    Tier,
     /// An address computation overflowed.
     #[error("a peer read address overflows")]
     Overflow,
@@ -162,25 +168,67 @@ impl HostPool {
             .checked_add(offset)
             .ok_or(GeometryError::Overflow)
     }
+
+    /// The address of `field` within `group`'s packed `block`.
+    fn field_address(&self, group: u32, block: i32, field: &str) -> Result<u64, GeometryError> {
+        let offset = self
+            .groups
+            .get(group as usize)
+            .and_then(|host| host.field_offsets.iter().find(|(id, _)| id == field))
+            .map(|(_, offset)| *offset)
+            .ok_or_else(|| GeometryError::Field(field.to_owned()))?;
+        self.block_address(group, block)?
+            .checked_add(offset)
+            .ok_or(GeometryError::Overflow)
+    }
 }
 
-/// The copies that land `pages` -- each a holder page and the reader's
-/// destination for the same group and slot -- every field of the page's
-/// group, from the holder's tier to the reader's Device field.
-pub fn read_spans(
+impl RankGeometry {
+    /// Where `field` of `page` lives on this rank: its Device page, or its
+    /// packed Host block.
+    fn field_address(
+        &self,
+        page: &PeerPageView,
+        field: &DeviceField,
+    ) -> Result<u64, GeometryError> {
+        match page.tier {
+            PeerTier::Device => {
+                let device = self
+                    .device
+                    .iter()
+                    .find(|own| own.group_id == page.group_id && own.field_id == field.field_id)
+                    .ok_or_else(|| GeometryError::Field(field.field_id.clone()))?;
+                if device.bytes != field.bytes {
+                    return Err(GeometryError::Field(field.field_id.clone()));
+                }
+                page_address(device.address, i64::from(page.block_id), device.page_stride)
+            }
+            PeerTier::Host => self
+                .host
+                .as_ref()
+                .ok_or(GeometryError::NoHost)?
+                .field_address(page.group_id, page.block_id, &field.field_id),
+            _ => Err(GeometryError::Tier),
+        }
+    }
+}
+
+/// The pushes that land `pages` whose holder pages are on its Disk tier:
+/// per page, every field of the page's group, at its offset in the holder's
+/// packed block (a Disk block packs like a Host block), to the reader's tier.
+pub fn push_items(
     holder: &RankGeometry,
     reader: &RankGeometry,
     pages: &[(PeerPageView, PeerPageView)],
-) -> Result<Spans, GeometryError> {
-    let destinations: HashMap<(u32, &str), &DeviceField> = reader
-        .device
-        .iter()
-        .map(|field| ((field.group_id, field.field_id.as_str()), field))
-        .collect();
-    let mut spans = Spans::default();
+) -> Result<Vec<PushItem>, GeometryError> {
+    let pool = holder.host.as_ref().ok_or(GeometryError::NoHost)?;
+    let mut items = Vec::with_capacity(pages.len());
     for (source, destination) in pages {
-        if destination.host || destination.group_id != source.group_id {
-            return Err(GeometryError::Destination);
+        if destination.group_id != source.group_id
+            || source.tier != PeerTier::Disk
+            || destination.tier == PeerTier::Disk
+        {
+            return Err(GeometryError::Tier);
         }
         let group = source.group_id;
         if source.block_id <= 0 || destination.block_id <= 0 {
@@ -189,38 +237,66 @@ pub fn read_spans(
                 block: source.block_id.min(destination.block_id),
             });
         }
-        let host_block = if source.host {
-            let pool = holder.host.as_ref().ok_or(GeometryError::NoHost)?;
-            Some((pool, pool.block_address(group, source.block_id)?))
-        } else {
-            None
-        };
+        let host = pool
+            .groups
+            .get(group as usize)
+            .ok_or(GeometryError::Block {
+                group,
+                block: source.block_id,
+            })?;
+        let mut spans = Vec::new();
         for field in holder.device.iter().filter(|field| field.group_id == group) {
-            let landing = destinations
-                .get(&(group, field.field_id.as_str()))
+            let offset = host
+                .field_offsets
+                .iter()
+                .find(|(id, _)| *id == field.field_id)
+                .map(|(_, offset)| *offset)
                 .ok_or_else(|| GeometryError::Field(field.field_id.clone()))?;
-            if landing.bytes != field.bytes {
-                return Err(GeometryError::Field(field.field_id.clone()));
-            }
-            let from = match host_block {
-                None => page_address(field.address, i64::from(source.block_id), field.page_stride)?,
-                Some((pool, block)) => {
-                    let offset = pool.groups[group as usize]
-                        .field_offsets
-                        .iter()
-                        .find(|(id, _)| *id == field.field_id)
-                        .map(|(_, offset)| *offset)
-                        .ok_or_else(|| GeometryError::Field(field.field_id.clone()))?;
-                    block.checked_add(offset).ok_or(GeometryError::Overflow)?
-                }
-            };
-            spans.sources.push(from);
-            spans.destinations.push(page_address(
-                landing.address,
-                i64::from(destination.block_id),
-                landing.page_stride,
-            )?);
-            if source.host {
+            spans.push(PushSpan {
+                offset,
+                address: reader.field_address(destination, field)?,
+                length: field.bytes,
+            });
+        }
+        items.push(PushItem {
+            group,
+            block: source.block_id,
+            spans,
+        });
+    }
+    Ok(items)
+}
+
+/// The copies that land `pages` -- each a holder page and the reader's
+/// destination for the same group and slot -- every field of the page's
+/// group, from the holder's tier to the reader's (its Device or its Host
+/// pool). A holder's Disk page is pushed, never read (`push`).
+pub fn read_spans(
+    holder: &RankGeometry,
+    reader: &RankGeometry,
+    pages: &[(PeerPageView, PeerPageView)],
+) -> Result<Spans, GeometryError> {
+    let mut spans = Spans::default();
+    for (source, destination) in pages {
+        if destination.group_id != source.group_id
+            || source.tier == PeerTier::Disk
+            || destination.tier == PeerTier::Disk
+        {
+            return Err(GeometryError::Tier);
+        }
+        let group = source.group_id;
+        if source.block_id <= 0 || destination.block_id <= 0 {
+            return Err(GeometryError::Block {
+                group,
+                block: source.block_id.min(destination.block_id),
+            });
+        }
+        for field in holder.device.iter().filter(|field| field.group_id == group) {
+            spans.sources.push(holder.field_address(source, field)?);
+            spans
+                .destinations
+                .push(reader.field_address(destination, field)?);
+            if source.tier == PeerTier::Host {
                 spans.host_bytes += field.bytes;
             }
             spans.lengths.push(field.bytes);
@@ -233,11 +309,14 @@ pub fn read_spans(
 mod tests {
     use super::*;
 
-    fn page(group: u32, slot: i32, host: bool, block: i32) -> PeerPageView {
+    const DEVICE: PeerTier = PeerTier::Device;
+    const HOST: PeerTier = PeerTier::Host;
+
+    fn page(group: u32, slot: i32, tier: PeerTier, block: i32) -> PeerPageView {
         PeerPageView {
             group_id: group,
             slot,
-            host,
+            tier,
             block_id: block,
         }
     }
@@ -262,6 +341,7 @@ mod tests {
                 },
             ],
             host,
+            push: None,
         }
     }
 
@@ -284,7 +364,7 @@ mod tests {
         let spans = read_spans(
             &holder,
             &reader,
-            &[(page(0, 0, false, 7), page(0, 0, false, 3))],
+            &[(page(0, 0, DEVICE, 7), page(0, 0, DEVICE, 3))],
         )
         .unwrap();
         assert_eq!(spans.sources, vec![1_000_700, 1_010_700]);
@@ -301,7 +381,7 @@ mod tests {
         let spans = read_spans(
             &holder,
             &reader,
-            &[(page(0, 1, true, 5), page(0, 1, false, 4))],
+            &[(page(0, 1, HOST, 5), page(0, 1, DEVICE, 4))],
         )
         .unwrap();
         assert_eq!(spans.sources, vec![5_000_400, 5_000_440]);
@@ -312,12 +392,38 @@ mod tests {
             &holder,
             &reader,
             &[
-                (page(0, 1, true, 5), page(0, 1, false, 4)),
-                (page(0, 0, false, 7), page(0, 0, false, 3)),
+                (page(0, 1, HOST, 5), page(0, 1, DEVICE, 4)),
+                (page(0, 0, DEVICE, 7), page(0, 0, DEVICE, 3)),
             ],
         )
         .unwrap();
         assert_eq!((mixed.total_bytes(), mixed.host_bytes), (200, 100));
+    }
+
+    #[test]
+    fn a_page_lands_into_the_readers_host_block() {
+        let holder = geometry(1_000_000, Some(host_pool(5_000_000)));
+        let reader = geometry(2_000_000, Some(host_pool(6_000_000)));
+        // Reader block 4 is the first block of the second parent.
+        let spans = read_spans(
+            &holder,
+            &reader,
+            &[
+                (page(0, 0, DEVICE, 7), page(0, 0, HOST, 4)),
+                (page(0, 1, HOST, 5), page(0, 1, HOST, 2)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            spans.sources,
+            vec![1_000_700, 1_010_700, 5_000_400, 5_000_440]
+        );
+        assert_eq!(
+            spans.destinations,
+            vec![6_000_300, 6_000_340, 6_000_100, 6_000_140]
+        );
+        assert_eq!(spans.lengths, vec![40, 60, 40, 60]);
+        assert_eq!(spans.host_bytes, 100);
     }
 
     #[test]
@@ -328,7 +434,7 @@ mod tests {
             read_spans(
                 &holder,
                 &reader,
-                &[(page(0, 0, true, 5), page(0, 0, false, 4))]
+                &[(page(0, 0, HOST, 5), page(0, 0, DEVICE, 4))]
             ),
             Err(GeometryError::NoHost)
         );
@@ -336,15 +442,24 @@ mod tests {
             read_spans(
                 &holder,
                 &reader,
-                &[(page(0, 0, false, 5), page(0, 0, true, 4))]
+                &[(page(0, 0, DEVICE, 5), page(0, 0, HOST, 4))]
             ),
-            Err(GeometryError::Destination)
+            Err(GeometryError::NoHost)
+        );
+        assert_eq!(
+            read_spans(
+                &holder,
+                &reader,
+                &[(page(0, 0, PeerTier::Disk, 5), page(0, 0, DEVICE, 4))]
+            ),
+            Err(GeometryError::Tier),
+            "a Disk page is pushed, never read"
         );
         assert!(matches!(
             read_spans(
                 &holder,
                 &reader,
-                &[(page(0, 0, false, 0), page(0, 0, false, 4))]
+                &[(page(0, 0, DEVICE, 0), page(0, 0, DEVICE, 4))]
             ),
             Err(GeometryError::Block { .. })
         ));
@@ -354,7 +469,7 @@ mod tests {
             read_spans(
                 &holder,
                 &narrower,
-                &[(page(0, 0, false, 5), page(0, 0, false, 4))]
+                &[(page(0, 0, DEVICE, 5), page(0, 0, DEVICE, 4))]
             ),
             Err(GeometryError::Field("layer.0.v".into()))
         );
@@ -369,7 +484,7 @@ mod tests {
             read_spans(
                 &far,
                 &reader,
-                &[(page(0, 0, false, 2), page(0, 0, false, 4))]
+                &[(page(0, 0, DEVICE, 2), page(0, 0, DEVICE, 4))]
             ),
             Err(GeometryError::Overflow)
         );

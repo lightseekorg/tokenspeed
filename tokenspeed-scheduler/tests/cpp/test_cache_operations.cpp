@@ -154,10 +154,10 @@ TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
         .block_granularity = 2,
         .shard_count = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
     std::vector<CacheBlockRef> device = device_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
     std::vector<CacheBlockRef> same_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
@@ -190,10 +190,10 @@ TEST(CacheOperationTest, ALoadExportsEachTiersBlockIdWithItsOwnPacking) {
         .block_granularity = 2,
         .shard_count = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                                                   /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager manager{coordinator};
     const std::array<std::int32_t, 8> buckets{0, 1, 0, 1, 0, 1, 0, 1};
     const auto device = device_pool.AcquireBlocksInBuckets(0, std::span{buckets}.first(6));
@@ -344,7 +344,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
@@ -387,7 +387,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
@@ -438,7 +438,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
@@ -495,7 +495,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
@@ -539,7 +539,7 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
         },
     };
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
@@ -606,7 +606,7 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
@@ -659,11 +659,12 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
-                                                   /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
+                        /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
@@ -750,9 +751,10 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
         BlockPool pool(2, {1});
         BlockPool host_pool(2, {1});
         const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kState, .block_granularity = 0}};
-        auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
-                                           /*snapshot_pool=*/nullptr, true, /*write_back_evictions=*/false,
-                                           /*checkpoint_retention_requests=*/0);
+        auto coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
+                            /*snapshot_pool=*/nullptr, true, /*write_back_evictions=*/false,
+                            /*checkpoint_retention_requests=*/0);
         TierTransferManager transfers(coordinator);
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = ContentHash{hashes[0]}};
@@ -786,7 +788,7 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
     BlockPool pool(1, {1});
     BlockPool host_pool(1, {1});
     const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kState, .block_granularity = 0}};
-    auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool,
+    auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
                                        /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false,
                                        /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
@@ -867,7 +869,7 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
-                                                   /*enable_l3_storage=*/false, &host_pool,
+                                                   /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false,
                                                    /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
@@ -907,7 +909,7 @@ TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+        specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<CacheKey> keys = coordinator.Store().ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
@@ -943,7 +945,7 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+        specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool, /*disk_pool=*/nullptr,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const CacheKey key_h0{.group_id = 0, .content_hash = ContentHash{"h0"}};
@@ -978,7 +980,7 @@ protected:
     BlockPool host{4, {1}};
     std::array<CacheGroupSpec, 1> specs{
         {CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}}};
-    CacheCoordinator coordinator{MakeCoordinator(specs, 2, device, true, &host, nullptr, true,
+    CacheCoordinator coordinator{MakeCoordinator(specs, 2, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
                                                  /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0)};
     StorageTransferManager storage{coordinator,
                                    StorageConfig{4, 16, 4, 3, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
@@ -999,7 +1001,7 @@ protected:
                        .block_granularity = 2,
                        .shard_count = 2},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
-    CacheCoordinator coordinator{MakeCoordinator(specs, 4, device, true, &host, nullptr, true,
+    CacheCoordinator coordinator{MakeCoordinator(specs, 4, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
                                                  /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0)};
     StorageTransferManager storage{coordinator,
                                    StorageConfig{4, 64, 32, 16, 64, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
@@ -1554,7 +1556,8 @@ TEST(CacheOperationTest, ShardedL3PartialReadUsesOrdinaryOwnerPreservingAdmissio
                            .shard_count = shards},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         };
-        auto coordinator = MakeCoordinator(specs, 4, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
+        auto coordinator = MakeCoordinator(specs, 4, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
+                                           /*write_back_evictions=*/false,
                                            /*checkpoint_retention_requests=*/0);
         StorageTransferManager storage{
             coordinator, StorageConfig{4, 32, 16, 16, 32, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
@@ -1609,7 +1612,8 @@ TEST(CacheOperationTest, ShardedL3ReservationRespectsBucketPressureAndExistingHo
     BlockPool host{1, {4}};
     const std::array specs{CacheGroupSpec{
         .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2, .shard_count = 4}};
-    auto coordinator = MakeCoordinator(specs, 2, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
+    auto coordinator = MakeCoordinator(specs, 2, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
+                                       /*write_back_evictions=*/false,
                                        /*checkpoint_retention_requests=*/0);
     const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
     auto pinned = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{2});
@@ -1642,7 +1646,8 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
     BlockPool host{2, {1}};
     std::array specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
+    auto coordinator = MakeCoordinator(specs, 2, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
+                                       /*write_back_evictions=*/false,
                                        /*checkpoint_retention_requests=*/0);
     const CacheKey later{.group_id = 0, .content_hash = ContentHash{"h1"}};
     const CacheKey unrelated{.group_id = 0, .content_hash = ContentHash{"other"}};
@@ -2006,7 +2011,8 @@ TEST(CacheOperationTest, RetainingClearKeepsMixedPackingIoLocationsIdenticalAcro
                            .shard_count = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
         };
-        CacheCoordinator coordinator{MakeCoordinator(specs, 4, device, true, &host, nullptr, true,
+        CacheCoordinator coordinator{MakeCoordinator(specs, 4, device, true, &host, /*disk_pool=*/nullptr, nullptr,
+                                                     true,
                                                      /*write_back_evictions=*/false,
                                                      /*checkpoint_retention_requests=*/0)};
         StorageTransferManager storage{

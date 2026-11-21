@@ -23,7 +23,12 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_engine.scheduler import PeerConfig, SchedulerConfig, StorageConfig
+from tokenspeed_engine.scheduler import (
+    DiskConfig,
+    PeerConfig,
+    SchedulerConfig,
+    StorageConfig,
+)
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -253,6 +258,8 @@ def scheduler_config_from_args(
     specs,
     *,
     storage_config: StorageConfig | None,
+    num_disk_pages: int,
+    disk_config: DiskConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
     max_resident_requests: int,
@@ -270,6 +277,10 @@ def scheduler_config_from_args(
             geometry, the cache groups and the Host tiers' page counts.
         storage_config: Shared storage scheduling limits, or None
             when no storage backend is configured.
+        num_disk_pages: The Disk tier's LCM blocks including the null page,
+            0 without the tier.
+        disk_config: The Disk tier's limits (``cache/disk.py``), or None
+            without the tier.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
         max_resident_requests: Rank-local resident request slots.
@@ -311,6 +322,8 @@ def scheduler_config_from_args(
         host_group_packing=specs.host_group_packing,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
+        num_disk_pages=num_disk_pages,
+        disk_config=disk_config,
         host_write_policy=server_args.kvstore_write_policy,
         decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
