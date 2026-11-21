@@ -713,6 +713,7 @@ impl DataPlane for FakeDevice {
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
         for request in requests {
             assert!(request.state.admission > self.last_admission);
+            assert_eq!(request.spec.admission_id, request.state.admission);
             self.last_admission = request.state.admission;
             self.generated.insert(request.rid.clone(), 0);
             if let Some(bootstrap) = &request.bootstrap {

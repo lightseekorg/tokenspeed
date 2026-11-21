@@ -61,6 +61,9 @@ Every record carries `protocol`, `instance_id`, `role`, `dp_rank`,
 Operation joins use `(instance_id, role, dp_rank, physical_rank, kind,
 op_generation, op_id)` and must also match `request_id`, `admission_id`, `slot`,
 and `slot_generation`. Operation IDs may wrap; generation and kind are required.
+The output processor allocates the admission identity before the data plane
+learns the request. The same identity travels in the native request specification
+and remains attached to its slot and cache operations throughout recovery.
 The scheduler is replicated: mirrored scheduler records from different physical
 ranks are not separate logical operations. One rank's copy completion is not
 replica-wide completion. The existing ACK intersection remains authoritative.

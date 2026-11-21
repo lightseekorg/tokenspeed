@@ -3293,6 +3293,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         tracing::debug!(admitted = admissions.len(), "requests admitted");
         for admission in &mut admissions {
             self.outputs.assign_admission(&mut admission.state);
+            admission.spec.admission_id = admission.state.admission;
         }
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;

@@ -256,6 +256,7 @@ fn event(kind: ForwardEventKind, request_id: &str, tokens: Vec<i32>) -> ForwardE
 
 fn spec(request_id: &str, tokens: Vec<i32>, holder: &str) -> RequestSpec {
     RequestSpec {
+        admission_id: 0,
         request_id: request_id.to_owned(),
         session_id: String::new(),
         cache_group_id: String::new(),
