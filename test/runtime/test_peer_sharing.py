@@ -38,6 +38,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from tokenspeed.runtime.cache.host_storage import HostCacheStorage  # noqa: E402
 from tokenspeed.runtime.cache.peer import (  # noqa: E402
     build_peer_geometry,
+    peer_host_regions,
     peer_incarnation,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
@@ -54,6 +55,43 @@ from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 NUM_LCM_BLOCKS = 6
+
+
+def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():
+    assert peer_host_regions(100, 42, 6, None, None) == ((100, 42),)
+    assert peer_host_regions(100, 42, 6, lambda *_: (24, 18), 24) == (
+        (100, 24),
+        (124, 18),
+    )
+    with pytest.raises(ValueError, match="registered device planner"):
+        peer_host_regions(100, 42, 6, None, 24)
+
+
+@pytest.mark.parametrize("lengths", [(12,), (18, 25), (17, 25), (0, 42), (-6, 48)])
+def test_invalid_peer_host_registration_plans_are_refused(lengths):
+    with pytest.raises(ValueError, match="(region|regions)"):
+        peer_host_regions(100, 42, 6, lambda *_: lengths, None)
+
+
+def test_release_only_loaded_checkpoint_file_pages(tmp_path, monkeypatch):
+    from tokenspeed.runtime.cache.l2.executor import release_checkpoint_file_cache
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"weights")
+    (tmp_path / "config.json").write_text("{}")
+    advised = []
+    monkeypatch.setattr(
+        os,
+        "posix_fadvise",
+        lambda fd, start, length, advice: advised.append(
+            (os.fstat(fd).st_ino, start, length, advice)
+        ),
+    )
+    release_checkpoint_file_cache([str(tmp_path)], node_leader=False, cpu_group=None)
+    assert not advised
+    release_checkpoint_file_cache([str(tmp_path)] * 2, node_leader=True, cpu_group=None)
+    assert advised == [(shard.stat().st_ino, 0, 0, os.POSIX_FADV_DONTNEED)]
+    assert shard.read_bytes() == b"weights"
 
 
 def _spec(group_id: str, attn_kind: str) -> CacheGroupSpec:
@@ -223,7 +261,11 @@ def test_every_attention_dp_rank_needs_a_valid_port():
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"peer_prefix_answer_timeout_ms": 0}, {"peer_prefix_min_fetch_tokens": 0}],
+    [
+        {"peer_prefix_answer_timeout_ms": 0},
+        {"peer_prefix_min_fetch_tokens": 0},
+        {"peer_prefix_host_region_mib": 0},
+    ],
 )
 def test_peer_limits_must_be_positive(overrides):
     with pytest.raises(ValueError, match="must be positive"):

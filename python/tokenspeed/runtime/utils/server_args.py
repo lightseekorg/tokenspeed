@@ -625,6 +625,8 @@ class ServerArgs:
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
+    kvstore_host_headroom_gib: int = 10
+    kvstore_release_checkpoint_cache: bool = False
     kvstore_io_backend: str = "kernel"
     # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
     kvstore_write_policy: str = "write_through"
@@ -639,6 +641,7 @@ class ServerArgs:
     # its name is host:port. None takes this host's detected address.
     peer_prefix_host: str | None = None
     peer_prefix_answer_timeout_ms: int = 50
+    peer_prefix_host_region_mib: int | None = None
     peer_prefix_min_fetch_tokens: int = 256
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
@@ -2680,6 +2683,11 @@ class ServerArgs:
             )
         if self.peer_prefix_answer_timeout_ms <= 0:
             raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
+        if (
+            self.peer_prefix_host_region_mib is not None
+            and self.peer_prefix_host_region_mib <= 0
+        ):
+            raise ValueError("--peer-prefix-host-region-mib must be positive")
         if self.peer_prefix_min_fetch_tokens <= 0:
             raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
 
@@ -3619,6 +3627,17 @@ class ServerArgs:
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
         parser.add_argument(
+            "--kvstore-release-checkpoint-cache",
+            action="store_true",
+            help="Advise Linux to evict local safetensors checkpoint pages after loading, before pinning the Host cache.",
+        )
+        parser.add_argument(
+            "--kvstore-host-headroom-gib",
+            type=int,
+            default=ServerArgs.kvstore_host_headroom_gib,
+            help="GiB of available Host memory per local rank to reserve outside the pinned cache and retraction pools.",
+        )
+        parser.add_argument(
             "--kvstore-write-policy",
             type=str,
             choices=["write_through", "write_back"],
@@ -3688,6 +3707,12 @@ class ServerArgs:
             default=ServerArgs.peer_prefix_answer_timeout_ms,
             help="How long a request waits for the peer holder's answer to each "
             "step (lookup, pin, release) before it computes the prefix itself.",
+        )
+        parser.add_argument(
+            "--peer-prefix-host-region-mib",
+            type=int,
+            default=ServerArgs.peer_prefix_host_region_mib,
+            help="Target peer Host registration size in MiB for the device plugin.",
         )
         parser.add_argument(
             "--peer-prefix-min-fetch-tokens",

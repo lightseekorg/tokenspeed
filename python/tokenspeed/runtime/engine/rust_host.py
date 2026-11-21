@@ -1223,6 +1223,7 @@ def _peer_sharing_settings(
         draft_model_config,
         host_cache=host_cache,
         world_cpu_group=world_group,
+        for_peer=True,
     )
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:

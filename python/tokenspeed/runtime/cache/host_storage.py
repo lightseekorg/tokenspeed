@@ -232,6 +232,11 @@ class HostCacheStorage:
             dtype=torch.uint8,
             pin_memory=True,
         )
+        if self.host_buffer.data_ptr() == 0 or not self.host_buffer.is_pinned():
+            raise RuntimeError(
+                f"Failed to allocate {self.host_buffer_bytes} pinned CPU bytes "
+                f"for Host cache (address={self.host_buffer.data_ptr()})"
+            )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
         """Return the packed byte offset for one non-null CacheBlock."""

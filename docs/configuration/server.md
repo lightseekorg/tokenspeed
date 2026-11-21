@@ -1804,8 +1804,20 @@ ratios and the derived retraction snapshot pool) pin that much more Host
 memory; the gigabyte sizes keep their byte budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
-equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Available means the smaller of the host's free memory and
+equal share of the Host memory its node has available, less
+`--kvstore-host-headroom-gib` per rank (10 GiB by default).
+For Linux hosts where a loaded safetensors checkpoint occupies the page cache,
+`--kvstore-release-checkpoint-cache` lets each node advise the kernel to
+release that checkpoint's clean file pages before allocating pinned storage.
+Peer workers compute the checkpoint identity before releasing the pages.
+
+Device plugins can register a peer Host region planner. The runtime verifies
+that its regions cover the pool and only split between compact parents, so a
+field READ stays within one registration. On torch_npu builds
+that expose the effective allocator settings, setting
+`PYTORCH_NPU_ALLOC_CONF=pinned_max_round_threshold_mb:1024,pin_memory_expandable_segments:False`
+lets large pools use their requested byte size for the pinned budget.
+Available means the smaller of the host's free memory and
 what the process's memory cgroup still allows (its limit, `memory.max` or
 `memory.high` on cgroup v2, less its usage with page cache counted as free;
 the tightest limit over its cgroup and the ones above it, found through
@@ -2013,6 +2025,7 @@ request computes the prefix itself.
 | `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
 | `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
 | `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
+| `--peer-prefix-host-region-mib` | unset | Target Host registration size in MiB for the device plugin. With no target, a registered planner chooses its default. Without a planner the pool is registered as one region. |
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
 
 Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
