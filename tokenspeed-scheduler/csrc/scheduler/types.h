@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 #include "cache/tier/disk.h"
@@ -141,6 +142,13 @@ struct SchedulerConfig {
     // Fused role only: decode rounds every local prefill round owes even
     // while an overdue prompt suspends the interval (§3.3). 0 is off.
     std::int32_t prefill_decode_min_interval{0};
+    // With prefill_decode_interval: the most prefill rounds that may run back
+    // to back while an overdue prompt suspends the interval; the round that
+    // reaches it owes the decodes the whole interval again, overdue prompts
+    // or not, and every prompt's held-back count restarts when one of its
+    // chunks runs (docs/design/scheduler.md §3.3). 0 keeps the unbounded
+    // suspension.
+    std::int32_t max_consecutive_prefill_rounds{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after
@@ -236,6 +244,12 @@ struct SchedulerConfig {
     // own goes to bootstrapped prompts that fit whole in it whatever this
     // value (§1.1).
     std::int32_t prefill_chunk_yield_tokens{0};
+    // P role: the most rounds in which one prompt's chunk gives way
+    // (prefill_chunk_yield_tokens); afterwards its chunks are cut only as
+    // they would be without the yield (docs/design/scheduler.md §1.1).
+    // Positive when prefill_chunk_yield_tokens is; the default leaves it
+    // unbounded.
+    std::int32_t prefill_chunk_yield_max_rounds{std::numeric_limits<std::int32_t>::max()};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

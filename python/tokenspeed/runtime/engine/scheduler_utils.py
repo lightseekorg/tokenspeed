@@ -129,6 +129,7 @@ def make_config(
     host_write_policy: str,
     prefill_decode_interval: int,
     prefill_decode_min_interval: int,
+    max_consecutive_prefill_rounds: int,
     decode_allocation_policy: str | None = None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
@@ -197,6 +198,12 @@ def make_config(
             decode rounds owed after each round that schedules a prefill
             chunk, unless no decode can run, even while an overdue prompt
             suspends the interval; 0 is off. Fused role only.
+        max_consecutive_prefill_rounds: ``--max-consecutive-prefill-rounds``:
+            with the interval, the most back-to-back prefill rounds that
+            hold a decode back while an overdue prompt suspends it; the round
+            that reaches it owes the decodes the whole interval again, and a
+            prompt's held-back count restarts whenever one of its chunks
+            runs. 0 keeps the unbounded suspension. Fused role only.
         decode_allocation_policy:
             ``--disaggregation-decode-allocation-policy``, a prefill-role
             setting and None on every other role: ``"early"``, which None is
@@ -345,6 +352,9 @@ def make_config(
     if prefill_decode_min_interval:
         # Set only when on, for the same reason.
         cfg.prefill_decode_min_interval = prefill_decode_min_interval
+    if max_consecutive_prefill_rounds:
+        # Set only when on, for the same reason.
+        cfg.max_consecutive_prefill_rounds = max_consecutive_prefill_rounds
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True
