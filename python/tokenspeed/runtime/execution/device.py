@@ -1646,14 +1646,16 @@ def build_device_side(
         if server_args.mapping.attn.has_kvp:
             # A fused decode value tail for the attentions that project as they merge.
             value_heads = set()
+            # The DSA attentions' owned decode top-k gathers float words.
+            float_words = False
             for runner in (target, draft):
                 if runner is None:
                     continue
                 for module in runner.model.modules():
-                    if (
-                        isinstance(module, GlmDsaSparseAttentionMixin)
-                        and module.owned_decode_value_weight() is not None
-                    ):
+                    if not isinstance(module, GlmDsaSparseAttentionMixin):
+                        continue
+                    float_words = True
+                    if module.owned_decode_value_weight() is not None:
                         value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
                 tuple(server_args.mapping.attn.kvp_group),
@@ -1664,6 +1666,7 @@ def build_device_side(
                 ),
                 value_heads=value_heads.pop() if len(value_heads) == 1 else None,
                 decode_rows=max_batch_size * decode_input_tokens,
+                float_words=float_words,
             )
         # Large startup batches can select RCCL while a later prefix hit selects
         # Iris. Prepare that small-batch route before the serving sync guard.
