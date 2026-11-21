@@ -1907,6 +1907,29 @@ TEST_F(PrefillChunkYieldSuite, ALongPromptStillFinishesUnderAStreamOfShortPrompt
     EXPECT_EQ(rounds, 12);
 }
 
+// A round whose chunk ends where it would without the yield, and beside which
+// no carried prompt runs, does not count toward
+// prefill_chunk_yield_max_rounds. The resident chunk at 32 ends at its
+// junction (40) however much budget it keeps, and follow_up, carried, is not
+// admitted beside it in this 35-page pool. With a bound of one the long prompt
+// therefore still gives way to s3 in the next round.
+TEST_F(PrefillChunkYieldSuite, ARoundThatGaveNothingDoesNotCountTowardTheBound) {
+    hybrid_ = true;
+    pages_ = 35;
+    max_rounds_ = 1;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(40, 5000);
+    const std::vector<std::int32_t> other = MakeTokens(12, 6000);
+    Publish("other", other);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(60, 8000)));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 0, 32, 100}}));
+    SubmitPrompt("follow_up", Extending(other, MakeTokens(4, 7000)));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 32, 40, 100}}));
+    SubmitPrompt("s3", MakeTokens(6, 4000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s3", 0, 6, 6}, {"holder", 40, 64, 100}}));
+}
+
 // Two ranks' schedulers given the same events build the same plans.
 TEST_F(PrefillChunkYieldSuite, MirroredSchedulersPlanAlike) {
     std::vector<std::unique_ptr<Scheduler>> ranks;
