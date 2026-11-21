@@ -170,9 +170,7 @@ def _prepare_muse_backend(
     )
     layer = SimpleNamespace(
         iris_state=None,
-        self_attn=SimpleNamespace(
-            iris_state=None, qkv_proj=projection, owned_heads_to_owners=False
-        ),
+        self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
         mlp=moe,
         post_attention_layernorm=post_norm,
         pre_feedforward_layernorm=pre_norm,
@@ -218,7 +216,6 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         gqa_prologue,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
-        iris_a2a_heads_to_owners,
         iris_a2a_transpose_qkvg,
         iris_fused_a2a_transpose_qkvg_norm_rope,
     )
@@ -300,42 +297,18 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             None,
             torch.arange(rows, device=device, dtype=torch.int64),
         )
-        # This rank's attention heads of every row, distinct per rank.
-        heads = (
-            (
-                torch.arange(rows, device=device)[:, None] % 11
-                + torch.arange(8192 // world_size, device=device)[None, :] % 5
-                + rank * 3
-            )
-            / 8
-        ).bfloat16()
-        return full, local, poison, positions, cache, heads
-
-    def check_owned_heads(heads, owned_heads):
-        """The owner's rows of every rank's heads match an all-gather."""
-        rows = heads.shape[0]
-        everyone = [torch.empty_like(heads) for _ in range(world_size)]
-        dist.all_gather(everyone, heads)
-        first = rank * owned_heads.shape[0]
-        valid = max(0, min(owned_heads.shape[0], rows - first))
-        expected = torch.zeros_like(owned_heads)
-        expected[:valid] = torch.cat(
-            [peer[first : first + valid] for peer in everyone], dim=1
-        )
-        torch.testing.assert_close(
-            owned_heads.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
-        )
+        return full, local, poison, positions, cache
 
     inputs = [make_inputs(rows) for rows in (2047, 2048, 8191)]
 
     def run(item):
-        full, local, poison, positions, cache, heads = item
+        full, local, poison, positions, cache = item
         generic = state.all_reduce.acquire_outputs(
             ((state.reduction.push_max_numel + 8192,),)
         )[0]
         generic.fill_(rank + 1)
         previous = state.reduce_outputs((generic,))[0]
-        fused = reference = owned_heads = None
+        fused = reference = None
         if full.shape[0] >= MUSE_OWNED_QKVG_MIN_TOKENS:
             projected = projection.project_owned_rows(local, full.shape[0])
             output = state.all_to_all_transpose_qkvg(
@@ -374,16 +347,13 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
                 q_scale,
                 payload="bf16",
             )
-            if rank == (full.shape[0] + 1) % world_size:
-                torch.cuda._sleep(20000)
-            owned_heads = state.all_to_all_heads_to_owners(heads, full.shape[0])
         else:
             normalized = state.all_gather_owned_rows(local, full.shape[0], True)
             output, _ = projection(normalized)
         # O's next producer can overwrite every old QKVG source address.
         reduced = state.reduce_scatter_owned_rows(poison, payload="bf16")
         gathered = state.all_gather_owned_rows(reduced, full.shape[0], True)
-        return output, gathered, previous, fused, reference, owned_heads
+        return output, gathered, previous, fused, reference
 
     def sequence():
         return [run(item) for item in inputs]
@@ -402,8 +372,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             projection.weight_loader(projection.weight, weight, name)
         assert projection.weight.data_ptr() == parameter_pointer
         assert projection._local_weight().data_ptr() == local_pointer
-        for full, local, _, positions, _, heads in inputs:
-            heads.add_(1 / 8)
+        for full, local, _, positions, _ in inputs:
             positions.add_(97).remainder_(16384)
             full.add_(1 / 16)
             first = rank * local.shape[0]
@@ -412,16 +381,9 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         if rank == replay:
             torch.cuda._sleep(10000)
         graph.replay()
-        for (full, *_, heads), (
-            output,
-            gathered,
-            previous,
-            fused,
-            reference,
-            owned_heads,
-        ) in zip(inputs, outputs):
-            if owned_heads is not None:
-                check_owned_heads(heads, owned_heads)
+        for (full, *_), (output, gathered, previous, fused, reference) in zip(
+            inputs, outputs
+        ):
             if fused is not None:
                 for actual, expected in zip(fused, reference):
                     assert actual.is_contiguous() and bool(torch.isfinite(actual).all())
@@ -453,78 +415,15 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             rtol=0,
             atol=0,
         )
-    # The largest owned-row round the producer holds: its last rows sit at
-    # the far end of the heads all-to-all's source and output.
-    capacity = state.all_reduce.producer_direct_max_numel // 8192
-    while not state.can_use_owned_rows(capacity):
-        capacity -= 1
     with assert_no_triton_compile(
-        iris_a2a_heads_to_owners,
-        iris_a2a_transpose_qkvg,
-        iris_fused_a2a_transpose_qkvg_norm_rope,
+        iris_a2a_transpose_qkvg, iris_fused_a2a_transpose_qkvg_norm_rope
     ):
         for rows in (2051, 8190):
-            item = make_inputs(rows)
-            output, _, _, fused, reference, owned_heads = run(item)
+            output, _, _, fused, reference = run(make_inputs(rows))
             for actual, expected in zip(fused, reference):
                 torch.testing.assert_close(
                     actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
                 )
-            check_owned_heads(item[-1], owned_heads)
-        heads = make_inputs(capacity)[-1]
-        check_owned_heads(heads, state.all_to_all_heads_to_owners(heads, capacity))
-
-    # The token owners' whole output projection equals the per-rank partials
-    # reduce-scattered to them. Sparse +-1 weights over small integer heads
-    # keep every sum exact, so the column order is checked bit for bit.
-    from tokenspeed.runtime.layers.linear import RowParallelLinear
-    from tokenspeed.runtime.models.muse_spark import MuseSparkAttention
-
-    attention = MuseSparkAttention.__new__(MuseSparkAttention)
-    torch.nn.Module.__init__(attention)
-    with torch.device(device):
-        attention.o_proj = RowParallelLinear(
-            input_size=8192,
-            output_size=8192,
-            bias=False,
-            input_is_parallel=True,
-            skip_bias_add=False,
-            params_dtype=None,
-            reduce_results=False,
-            quant_config=None,
-            prefix="model.layers.1.self_attn.o_proj",
-            tp_rank=rank,
-            tp_size=world_size,
-            tp_group=tuple(range(world_size)),
-            use_presharded_weights=False,
-            override_kernel_name=None,
-        )
-    attention.owned_heads_to_owners = True
-    attention.owned_output_weight = None
-    attention.iris_state = state
-    weight = torch.zeros(8192, 8192, device=device)
-    outputs = torch.arange(8192, device=device)
-    for term in range(4):
-        weight[outputs, (outputs * 13 + term * 2053) % 8192] = (-1) ** term
-    attention.o_proj.weight_loader(attention.o_proj.weight, weight)
-    attention.prepare_owned_output_weight()
-    for rows in (2047, 4100):
-        heads = (
-            (torch.arange(rows, device=device)[:, None] * 7 + rank)
-            + torch.arange(8192 // world_size, device=device)[None, :]
-        ) % 5 - 2
-        heads = heads.bfloat16()
-        partial = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
-        torch.mm(heads, attention.o_proj.weight.T, out=partial)
-        expected = state.reduce_scatter_owned_rows(partial, payload="bf16").clone()
-        actual = attention.project_owned_heads(heads, rows)
-        valid = max(0, min(actual.shape[0], rows - rank * actual.shape[0]))
-        torch.testing.assert_close(
-            actual[:valid].view(torch.int16),
-            expected[:valid].view(torch.int16),
-            rtol=0,
-            atol=0,
-        )
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -889,8 +788,8 @@ def _muse_owned_rows_default_cap_worker(rank, world_size, device):
 def _muse_owned_far_rows_worker(rank, world_size, device):
     """Owned rows at a 24576-token prefill chunk use the last element of the
     producer buffer and of pull scratch bit for bit (reduce-scatter in BF16 and
-    int8-block16, row gathers, both QKVG all-to-alls, the heads all-to-all and
-    the MoE-input gather), and row counts up to the cap compile nothing new."""
+    int8-block16, row gathers, both QKVG exchanges and the MoE-input gather),
+    and row counts up to the cap compile nothing new."""
     torch.set_grad_enabled(False)
     torch.set_default_dtype(torch.bfloat16)
     from tokenspeed_kernel.ops.communication._iris.all_gather import (
@@ -900,7 +799,6 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
         prepare_muse_communication,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
-        iris_a2a_heads_to_owners,
         iris_a2a_transpose_qkvg,
         iris_fused_a2a_transpose_qkvg_norm_rope,
     )
@@ -1046,8 +944,8 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
         torch.testing.assert_close(
             bits(qkvg), bits(hidden.index_select(1, columns)), atol=0, rtol=0
         )
-        # The fused QKVG all-to-all copies V and the gate unchanged: they equal
-        # the plain all-to-all's V and gate columns bit for bit.
+        # The fused QKVG exchange copies V and the gate unchanged: they equal
+        # the plain exchange's V and gate columns bit for bit.
         projected = projection.project_owned_rows(local_hidden, rows)
         empty_cache = torch.empty((1, 0), device=device, dtype=torch.float32)
         positions = torch.arange(rows, device=device, dtype=torch.int64)
@@ -1069,25 +967,6 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
         expected8 = torch.zeros_like(reduced8)
         expected8[:valid] = int8_rows[first : first + valid]
         torch.testing.assert_close(bits(reduced8), bits(expected8), atol=0, rtol=0)
-        # The heads all-to-all: the owner's rows of every rank's heads.
-        heads = (
-            (
-                torch.arange(rows, device=device)[:, None] % 11
-                + torch.arange(8192 // world_size, device=device)[None, :] % 5
-                + rank * 3
-            )
-            / 8
-        ).bfloat16()
-        owned_heads = state.all_to_all_heads_to_owners(heads, rows)
-        everyone = [torch.empty_like(heads) for _ in range(world_size)]
-        dist.all_gather(everyone, heads)
-        expected_heads = torch.zeros_like(owned_heads)
-        expected_heads[:valid] = torch.cat(
-            [peer[first : first + valid] for peer in everyone], dim=1
-        )
-        torch.testing.assert_close(
-            bits(owned_heads), bits(expected_heads), atol=0, rtol=0
-        )
         # The MoE-input gather: every rank receives all rows, ids and weights.
         moe_rows = hidden[first : first + local_rows, :4096].contiguous()
         if moe_rows.shape[0] < local_rows:
@@ -1120,7 +999,6 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
         iris_pull_allgather_rows,
         iris_a2a_transpose_qkvg,
         iris_fused_a2a_transpose_qkvg_norm_rope,
-        iris_a2a_heads_to_owners,
     ):
         for rows in (16384, 16385, 20483, cap - 16):
             run(rows)

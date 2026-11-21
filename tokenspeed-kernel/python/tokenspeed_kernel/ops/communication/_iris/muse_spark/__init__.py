@@ -50,7 +50,6 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
     iris_pull_allgather_moe_inputs,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
-    iris_a2a_heads_to_owners,
     iris_a2a_transpose_qkvg,
     iris_fused_a2a_transpose_qkvg_norm_rope,
 )
@@ -663,52 +662,6 @@ class MuseIrisState:
             NUM_WARPS=4,
             INT8_BLOCK16=int8_block16,
             num_warps=4,
-            WAIT_VMEM=self._arch.wait_vmem,
-        )
-        return output
-
-    def all_to_all_heads_to_owners(
-        self, heads: torch.Tensor, rows: int
-    ) -> torch.Tensor:
-        """Turn this rank's attention heads of all rows into owned rows of all heads.
-
-        heads is BF16 [rows, 8192 / world_size], this rank's gated attention
-        output. Returns [ceil(rows / world_size), 8192] for this rank's token
-        rows, rank r's heads at columns r * 8192 / world_size, zero padding
-        rows: the input of the full output projection on the token owner.
-        The heads pass through the producer prefix, which the exchange's exit
-        frees for the next producer.
-        """
-        assert self.can_use_owned_rows(rows)
-        width = _MUSE_BOUNDARY_WIDTH // self.world_size
-        assert heads.shape == (rows, width) and heads.dtype == torch.bfloat16
-        assert heads.device == self.all_reduce.device
-        source = self.all_reduce.producer.data[: rows * width].view(rows, width)
-        source.copy_(heads)
-        local_rows = triton.cdiv(rows, self.world_size)
-        output = torch.empty(
-            (local_rows, _MUSE_BOUNDARY_WIDTH),
-            dtype=heads.dtype,
-            device=self.all_reduce.device,
-        )
-        valid = max(
-            0, min(local_rows, rows - self.all_reduce.rank_in_group * local_rows)
-        )
-        # The exchange leaves padding rows unwritten; zeros keep their
-        # projection finite.
-        output[valid:].zero_()
-        # One wave covers 64 lanes x 8 BF16 of a row.
-        num_warps = width // 512
-        iris_a2a_heads_to_owners[(_MUSE_ROW_GATHER_PROGRAMS,)](
-            source,
-            output,
-            self.row_gather_flags,
-            self.all_reduce.peers.addresses[: self.world_size],
-            rows,
-            RANK=self.all_reduce.rank_in_group,
-            FLAG_ROWS=_MUSE_ROW_GATHER_PROGRAMS,
-            NUM_WARPS=num_warps,
-            num_warps=num_warps,
             WAIT_VMEM=self._arch.wait_vmem,
         )
         return output

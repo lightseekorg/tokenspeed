@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import socket
@@ -1119,7 +1118,7 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
     )
     monkeypatch.setattr(module, "pdl_enabled", lambda: False)
     positions, ctx = torch.arange(3), SimpleNamespace()
-    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None, True)
+    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None)
     q, k, v, positions_arg, ctx_arg = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, rows[:, :q_end])
@@ -1129,16 +1128,13 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
 
 
 @requires_gpu
-@pytest.mark.parametrize("project", [False, True])
 @pytest.mark.parametrize("with_rope", [False, True])
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_owned_attention_stores_prepared_rows_once(
-    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int, project: bool
+    monkeypatch: pytest.MonkeyPatch, with_rope: bool, world_size: int
 ) -> None:
     """Prepared receiver outputs pass through the real prologue's cache store,
-    preserving prefix slots and reaching attention without another head norm.
-    Without ``project`` the gated heads come back for the token owners'
-    output projection."""
+    preserving prefix slots and reaching attention without another head norm."""
     from tokenspeed_kernel.ops.attention.prologue import HeadKVCache
 
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -1192,11 +1188,7 @@ def test_owned_attention_stores_prepared_rows_once(
         project_owned_rows=lambda value, global_rows: value,
         tp_group=tuple(range(world_size)),
     )
-    attention._project = (
-        (lambda value: (value, None, 1))
-        if project
-        else (lambda value: pytest.fail("heads for the owners were projected"))
-    )
+    attention._project = lambda value: (value, None, 1)
     attention.owned_projections = None
 
     attention.iris_state = SimpleNamespace(
@@ -1241,7 +1233,7 @@ def test_owned_attention_stores_prepared_rows_once(
             dtype=torch.bfloat16, kv_write_target=write_target
         ),
     )
-    output, sentinel, ranks = attention(positions, local, ctx, rows, project)
+    output, sentinel, ranks = attention(positions, local, ctx, rows)
     assert sentinel is None and ranks == 1
     assert torch.equal(output, prepared_q)
     assert len(write_targets) == 1
@@ -1500,12 +1492,7 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
         model=SimpleNamespace(
-            layers=[
-                SimpleNamespace(
-                    mlp=mlp,
-                    self_attn=SimpleNamespace(owned_heads_to_owners=False),
-                )
-            ],
+            layers=[SimpleNamespace(mlp=mlp)],
             config=SimpleNamespace(decode_monokernel=False),
             owned_projections=None,
         ),
@@ -1533,52 +1520,6 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
     )
 
     with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
-        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
-
-
-@pytest.mark.parametrize(
-    "flag,value",
-    [
-        ("prefill_collective_payload", "int8-block16"),
-        ("owned_attention_output", "all-to-all"),
-    ],
-)
-def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
-    tmp_path, flag: str, value
-) -> None:
-    """The owned-row prefill flags apply to Muse Spark only: off their
-    defaults, another architecture's checkpoint is refused."""
-    from tokenspeed.runtime.utils.server_args import ServerArgs
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"architectures": ["LlamaForCausalLM"]})
-    )
-    args = ServerArgs(model="x")
-    args.model = str(tmp_path)
-    setattr(args, flag, value)
-    with pytest.raises(ValueError, match="apply to Muse Spark"):
-        args.resolve_model_defaults()
-    setattr(args, flag, ServerArgs.__dataclass_fields__[flag].default)
-    args.resolve_model_defaults()
-
-
-def test_heads_all_to_all_without_iris_fails_startup_with_the_cause() -> None:
-    """--owned-attention-output all-to-all runs only on Iris owned rows: a
-    server whose Iris cannot be prepared refuses it at startup instead of
-    gathering output weights it would never use."""
-    layer = SimpleNamespace(
-        self_attn=SimpleNamespace(owned_heads_to_owners=True),
-        mlp=SimpleNamespace(down_columns=None),
-    )
-    owner = SimpleNamespace(
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
-        model=SimpleNamespace(
-            layers=[layer],
-            config=SimpleNamespace(decode_monokernel=False),
-            owned_projections=None,
-        ),
-    )
-    with pytest.raises(RuntimeError, match="needs Muse Spark's Iris owned-row prefill"):
         MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
@@ -2116,91 +2057,6 @@ def test_prefill_collective_payload_applies_to_extend_forwards_only(
     for mode in ForwardMode:
         expected = flag if mode == ForwardMode.EXTEND else "bf16"
         assert module._collective_payload(mode) == expected, mode
-
-
-@pytest.mark.parametrize("flag", ["reduce-scatter", "all-to-all"])
-def test_owned_heads_to_owners_needs_a_bf16_output_projection(
-    monkeypatch: pytest.MonkeyPatch, flag: str
-) -> None:
-    """all-to-all applies only to a BF16, unquantized output projection (the
-    owner projects through the whole gathered weight); reduce-scatter never
-    takes it, whatever the projection."""
-    monkeypatch.setitem(module.global_server_args_dict, "owned_attention_output", flag)
-    projections = {
-        dtype: RowParallelLinear(
-            input_size=64,
-            output_size=64,
-            bias=False,
-            input_is_parallel=True,
-            skip_bias_add=False,
-            params_dtype=dtype,
-            reduce_results=False,
-            quant_config=None,
-            prefix="model.layers.0.self_attn.o_proj",
-            tp_rank=0,
-            tp_size=1,
-            tp_group=(0,),
-            use_presharded_weights=False,
-            override_kernel_name=None,
-        )
-        for dtype in (torch.bfloat16, torch.float16)
-    }
-    assert module._owned_heads_to_owners(projections[torch.bfloat16]) == (
-        flag == "all-to-all"
-    )
-    if flag == "all-to-all":
-        with pytest.raises(ValueError, match="BF16 output projection"):
-            module._owned_heads_to_owners(projections[torch.float16])
-    else:
-        assert module._owned_heads_to_owners(projections[torch.float16]) is False
-
-
-def test_owned_output_weight_stays_unset_without_the_flag() -> None:
-    attention = _stub(MuseSparkAttention)
-    attention.owned_heads_to_owners = False
-    attention.owned_output_weight = None
-    attention.prepare_owned_output_weight()
-    assert attention.owned_output_weight is None
-
-
-def test_heads_go_to_owners_only_in_owned_prefill_with_the_gathered_weight() -> None:
-    """The decoder layer sends heads to the owners only for an owned-row extend
-    forward on Iris with the gathered weight; decode, mixed and idle forwards,
-    replicated rows and a missing weight keep the reduce-scatter."""
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
-    with_weight = SimpleNamespace(owned_output_weight=torch.empty(1))
-    without_weight = SimpleNamespace(owned_output_weight=None)
-    iris = object()
-    for mode in ForwardMode:
-        assert module._heads_to_owners_applies(2048, iris, mode, with_weight) == (
-            mode == ForwardMode.EXTEND
-        )
-    extend = ForwardMode.EXTEND
-    assert not module._heads_to_owners_applies(None, iris, extend, with_weight)
-    assert not module._heads_to_owners_applies(2048, None, extend, with_weight)
-    assert not module._heads_to_owners_applies(2048, iris, extend, without_weight)
-
-
-def test_weight_update_is_refused_while_output_projections_are_gathered() -> None:
-    layer = SimpleNamespace(
-        mlp=SimpleNamespace(down_columns=None),
-        self_attn=SimpleNamespace(owned_output_weight=torch.empty(1)),
-    )
-    owner = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
-    with pytest.raises(RuntimeError, match="owned-attention-output all-to-all"):
-        MuseSparkForConditionalGeneration.begin_weight_update(owner)
-
-
-def test_owned_row_flags_are_validated_in_server_args() -> None:
-    from tokenspeed.runtime.utils.server_args import ServerArgs
-
-    with pytest.raises(ValueError, match="--owned-attention-output"):
-        ServerArgs(model="x", owned_attention_output="all-gather")
-    with pytest.raises(ValueError, match="rl-bitwise"):
-        ServerArgs(
-            model="x", owned_attention_output="all-to-all", numerics="rl-bitwise"
-        )
 
 
 @pytest.mark.parametrize(
