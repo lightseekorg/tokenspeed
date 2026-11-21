@@ -570,11 +570,15 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // A first chunk that cannot finish its prompt gives way to the whole
     // prompts carried behind it (prefill_chunk_yield_tokens); unchanged
     // without them.
+    const auto local_chunk = [&](std::int32_t budget) {
+        budget = static_cast<std::int32_t>(
+            std::min<std::int64_t>(budget, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
+        return PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, budget, junction_tokens);
+    };
+    const std::int32_t unyielded_budget = remaining;
     if (source == fsm::PrefillSource::kLocal) {
-        const std::int32_t yielding =
+        remaining =
             YieldingChunkBudget(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining, yield_tokens);
-        feedback.chunk_gave_way = yielding < remaining;
-        remaining = yielding;
     }
     remaining = static_cast<std::int32_t>(
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
@@ -584,6 +588,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                          ? landing_end - hit_tokens
                                          : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
                                                               unscheduled, remaining, junction_tokens);
+    // The chunk gave way only if it ends before the one the whole budget
+    // allowed: a junction or the KV limit may end both at the same place.
+    if (source == fsm::PrefillSource::kLocal && remaining < unyielded_budget) {
+        feedback.chunk_gave_way = tokens_this_round < local_chunk(unyielded_budget);
+    }
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -816,22 +825,31 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     // As for a first chunk: a chunk that cannot finish gives way to the
     // whole prompts carried behind it.
+    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
+    const std::int32_t state_checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
+    // The chunk a budget gives: cut at the KV limit, a junction, and toward
+    // an in-forward State checkpoint. 0 when no chunk fits.
+    const auto chunk = [&](std::int32_t budget) {
+        budget = static_cast<std::int32_t>(
+            std::min<std::int64_t>(budget, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
+        const std::int32_t tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
+                                                       budget, cache_progress.junction_tokens);
+        return tokens == 0
+                   ? 0
+                   : chunkTowardInForwardCheckpoint(state_checkpoint, first_pos, tokens, cache_progress.junction_tokens,
+                                                    config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
+    };
     const std::int32_t yielding =
         YieldingChunkBudget(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining, yield_tokens);
-    feedback.chunk_gave_way = yielding < remaining;
-    remaining = yielding;
-    remaining = static_cast<std::int32_t>(
-        std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
-    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
-    std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                     remaining, cache_progress.junction_tokens);
+    std::int32_t prefill_tokens = chunk(yielding);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
-    const std::int32_t state_checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
-    prefill_tokens =
-        chunkTowardInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, cache_progress.junction_tokens,
-                                       config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
+    // As for a first chunk: it gave way only if it ends before the chunk the
+    // whole budget allowed.
+    if (yielding < remaining) {
+        feedback.chunk_gave_way = prefill_tokens < chunk(remaining);
+    }
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, coordinator_.PrefixGranularity());
     // The chunk that ended at the junction publishes its natural checkpoint
