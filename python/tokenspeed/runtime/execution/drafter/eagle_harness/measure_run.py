@@ -303,7 +303,8 @@ def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) ->
     config_dir = os.path.join(args.run_dir, "config")
     os.makedirs(config_dir, exist_ok=True)
     with open(os.path.join(config_dir, "measure_config.json"), "w") as f:
-        json.dump({"batch_size": batch_size}, f)
+        # tp_size: the server refuses the cost data at another TP size.
+        json.dump({"batch_size": batch_size, "tp_size": args.tp_size}, f)
     engine.generate(
         [
             generate_request(

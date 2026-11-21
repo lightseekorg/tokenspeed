@@ -70,6 +70,7 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
     chain_table_width,
     check_chain_cost_domain,
+    check_cost_tp_size,
     first_rank_value,
 )
 from tokenspeed.runtime.execution.drafter.eagle_harness.cost import load_cost_data
@@ -414,6 +415,10 @@ class EagleHarness(Eagle4):
                 device=self.device,
             )
         cost_dir = f"{harness.data_path}/cost"
+        first_rank_value(
+            lambda: check_cost_tp_size(harness.data_path, mapping.attn.tp_size),
+            file_group,
+        )
         cost_data = first_rank_value(lambda: load_cost_data(cost_dir), file_group)
         if harness.compute_intensity == "chain_intensity":
             check_chain_cost_domain(

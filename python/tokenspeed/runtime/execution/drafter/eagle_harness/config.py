@@ -140,6 +140,29 @@ def check_chain_cost_domain(
         )
 
 
+def check_cost_tp_size(data_path: str, tp_size: int) -> None:
+    """Refuse cost data measured at another tensor-parallel size: a round's
+    draft and verify times depend on it (the TP2 tables of a dense 27B target
+    run 5-40% below its TP1 ones), so a server would price its rounds with
+    another topology's costs without notice. ``measure_run`` stamps
+    ``tp_size`` into ``<data path>/config/measure_config.json``; data without
+    the stamp predates it and passes.
+
+    Raises:
+        ValueError: The cost data was measured at another TP size.
+    """
+    path = os.path.join(data_path, "config", "measure_config.json")
+    if not os.path.exists(path):
+        return
+    measured = load_run_config(path).get("tp_size")
+    if measured is not None and int(measured) != tp_size:
+        raise ValueError(
+            f"EAGLE-Harness cost data {data_path} was measured at TP {measured}, "
+            f"but this server runs TP {tp_size}: re-run measure_run with "
+            f"--tp-size {tp_size}"
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class EagleHarnessConfig:
     """``--speculative-exec-mode``, ``--speculative-data-path``,
