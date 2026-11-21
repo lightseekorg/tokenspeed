@@ -664,13 +664,20 @@ class ModelExecutor:
         self._pp_wire_logged = False
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+        prefill_graph_tokens = (
+            config.prefill_graph_max_tokens
+            if not config.disable_prefill_graph and not config.enforce_eager
+            else 0
+        )
 
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         with self.memory_saver_adapter.named_region("executor_inputs"):
             self.input_buffers = InputBuffers(
                 max_bs=max_bs,
                 max_num_tokens=max(
-                    config.chunked_prefill_size, max_bs * config.output_length
+                    config.chunked_prefill_size,
+                    max_bs * config.output_length,
+                    prefill_graph_tokens,
                 ),
                 state_write_padding_pool_index=config.max_req_pool_size,
                 device=self.device,
@@ -1247,7 +1254,9 @@ class ModelExecutor:
             )
             if self.config.chunked_prefill_size > 0:
                 num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
-        set_autotune_max_num_tokens(num_tokens)
+        # Capture can pad above the scheduler's live prefill budget. Keep the
+        # tactic mapper wide enough for those rows even when discovery is smaller.
+        set_autotune_max_num_tokens(num_tokens if decode_only else ib.max_num_tokens)
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)

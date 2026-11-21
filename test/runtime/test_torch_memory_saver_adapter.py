@@ -346,6 +346,7 @@ def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
 def _check_managed_metadata_on_cuda():
     """Check managed allocations, retained views and zero ordinary bytes on CUDA."""
     from tokenspeed.runtime.execution.forward_step import prepare_capture_metadata
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
         build_managed_cache_metadata,
     )
@@ -414,7 +415,22 @@ def _check_managed_metadata_on_cuda():
         )
     rows.publish((5,))
     counts = rows.source_token_counts
-    retained = [(table, address, expected), (counts, counts.data_ptr(), counts.cpu())]
+    with saver.named_region("executor_inputs"):
+        inputs = InputBuffers(
+            max_bs=4,
+            max_num_tokens=2080,
+            state_write_padding_pool_index=5,
+            device="cuda",
+        )
+    inputs.fill_dummy_decode_buffers(batch_size=4, total_tokens=2080)
+    retained = [
+        (table, address, expected),
+        (counts, counts.data_ptr(), counts.cpu()),
+    ]
+    retained.extend(
+        (tensor, tensor.data_ptr(), tensor.cpu())
+        for tensor in (inputs.input_ids_buf, inputs.positions_buf)
+    )
     for count, host_tables in ((1, False), (257, True), (3, False)):
         arrays = np.ones((count, 2), dtype=np.int32)
         spans = np.tile(np.array([0, 2], dtype=np.int32), (count, 1))
