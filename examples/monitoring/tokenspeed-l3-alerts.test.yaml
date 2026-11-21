@@ -1,0 +1,289 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Run with: promtool test rules examples/monitoring/tokenspeed-l3-alerts.test.yaml
+rule_files:
+- tokenspeed-l3-alerts.yaml
+evaluation_interval: 1m
+tests:
+- name: old operations and active degraded backend
+  interval: 1m
+  input_series:
+  - series: tokenspeed:l3_backend_state{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: 1x20
+  - series: tokenspeed:l3_io_quarantined{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",resource="pressure_gate_closed"}
+    values: 1x20
+  - series: tokenspeed:l3_io_events_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",event="rejected"}
+    values: 0+60x20
+  - series: tokenspeed:l3_pressure_bypasses_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: 0+60x20
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="queued"}
+    values: 31x20
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="completed"}
+    values: 31x20
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts:
+    - exp_labels:
+        job: tokenspeed
+        instance: engine-a
+        model_name: m
+        dp_rank: '0'
+        engine_role: 'null'
+        tp_rank: '0'
+        kind: get
+        state: queued
+        severity: warning
+      exp_annotations:
+        summary: L3 get jobs older than 30s are queued on TP rank 0.
+        description: Ages count from submission. A running job this old is native I/O that
+          has not returned; it keeps its Host references and operation credit even after its
+          request was cancelled. Check the store's latency and transport; requests past wait_timeout_ms
+          already recompute.
+  - eval_time: 12m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts:
+    - exp_labels:
+        job: tokenspeed
+        instance: engine-a
+        model_name: m
+        dp_rank: '0'
+        engine_role: 'null'
+        tp_rank: '0'
+        kind: get
+        state: completed
+        severity: warning
+      exp_annotations:
+        summary: Completed L3 get facts wait to be polled on TP rank 0.
+        description: Completed jobs stay charged until the engine's event loop polls them.
+          Age includes queue and backend time, so a newly completed slow call is also old.
+          Check completed-job counts and event-loop progress before diagnosing a polling backlog.
+  - eval_time: 12m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts:
+    - exp_labels:
+        job: tokenspeed
+        instance: engine-a
+        model_name: m
+        dp_rank: '0'
+        engine_role: 'null'
+        tp_rank: '0'
+        severity: warning
+      exp_annotations:
+        summary: The L3 store has been refusing jobs on TP rank 0 for 10 minutes.
+        description: The backend failed and its recovery probes keep failing; jobs are rejected
+          without a store call and requests recompute. This recovers on its own once a probe
+          succeeds. Check the store's master and providers.
+  - eval_time: 12m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts:
+    - exp_labels:
+        job: tokenspeed
+        instance: engine-a
+        model_name: m
+        dp_rank: '0'
+        engine_role: 'null'
+        severity: warning
+      exp_annotations:
+        summary: L3 admission has been closed by queue pressure under traffic on DP rank 0.
+        description: New requests skip L3 preparation and backups are dropped. Compare tokenspeed:l3_io_operations
+          and tokenspeed:l3_io_oldest_operation_age_seconds with the queue watermarks.
+- name: quarantine suppresses backend alert and collapses mirrored TP reports
+  interval: 1m
+  input_series:
+  - series: tokenspeed:l3_backend_state{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: 1x20
+  - series: tokenspeed:l3_io_quarantined{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: 1x20
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",resource="pressure_gate_closed"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_events_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",event="rejected"}
+    values: 0+60x20
+  - series: tokenspeed:l3_pressure_bypasses_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_quarantined{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="1"}
+    values: 1x20
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",resource="quarantined"}
+    values: 2x20
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="1",resource="quarantined"}
+    values: 2x20
+  alert_rule_test:
+  - eval_time: 0m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts: []
+  - eval_time: 0m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts: []
+  - eval_time: 0m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts: []
+  - eval_time: 0m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts: []
+  - eval_time: 0m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts:
+    - exp_labels:
+        job: tokenspeed
+        instance: engine-a
+        model_name: m
+        dp_rank: '0'
+        engine_role: 'null'
+        severity: critical
+      exp_annotations:
+        summary: L3 native I/O retirement is unproven on DP rank 0; restart required.
+        description: New L3 I/O stays disabled and the quarantined Host blocks stay held until
+          the process restarts. Serving continues on L1/L2 and recomputation. Find the rank
+          with tokenspeed:l3_io_quarantined, then plan a restart.
+  - eval_time: 12m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts: []
+- name: idle open backend and pressure do not alert without rejected traffic
+  interval: 1m
+  input_series:
+  - series: tokenspeed:l3_backend_state{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: 1x20
+  - series: tokenspeed:l3_io_quarantined{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",resource="pressure_gate_closed"}
+    values: 1x20
+  - series: tokenspeed:l3_io_events_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",event="rejected"}
+    values: '0x20'
+  - series: tokenspeed:l3_pressure_bypasses_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts: []
+- name: drained healthy queues remain quiet
+  interval: 1m
+  input_series:
+  - series: tokenspeed:l3_backend_state{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_quarantined{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",resource="pressure_gate_closed"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_events_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",event="rejected"}
+    values: '0x20'
+  - series: tokenspeed:l3_pressure_bypasses_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="queued"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="running"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="completed"}
+    values: '0x20'
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts: []
+- name: operation age at threshold remains quiet
+  interval: 1m
+  input_series:
+  - series: tokenspeed:l3_backend_state{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_quarantined{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_scheduler_resources{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",resource="pressure_gate_closed"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_events_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",event="rejected"}
+    values: '0x20'
+  - series: tokenspeed:l3_pressure_bypasses_total{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0"}
+    values: '0x20'
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="queued"}
+    values: 30x20
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="running"}
+    values: 30x20
+  - series: tokenspeed:l3_io_oldest_operation_age_seconds{job="tokenspeed",instance="engine-a",model_name="m",app_key="",dp_rank="0",engine_role="null",tp_rank="0",kind="get",state="completed"}
+    values: 30x20
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: TokenSpeedL3OperationStuck
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3CompletionsUndelivered
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3Quarantined
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3BackendUnavailable
+    exp_alerts: []
+  - eval_time: 12m
+    alertname: TokenSpeedL3PressureGateClosed
+    exp_alerts: []
