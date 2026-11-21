@@ -3636,7 +3636,12 @@ def test_int8_block16_encode_matches_the_reference_bit_for_bit():
 
 def test_int8_block16_encode_indexes_past_2_31_elements():
     """The encode's program bases are 64-bit: the far end of a payload past
-    2^31 elements encodes to the reference's codes and scales."""
+    2^31 elements encodes to the reference's codes and scales.
+
+    The Iris state refuses a producer this large, so serving never reaches
+    it; the test guards the kernel's own offset arithmetic, which must not
+    depend on that refusal.
+    """
     from tokenspeed_kernel.ops.communication._iris.payload import (
         encode_int8_block16,
     )
