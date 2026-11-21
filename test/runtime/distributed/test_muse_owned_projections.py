@@ -20,8 +20,9 @@
 
 """Muse Spark's owned-row projections on real process groups.
 
-Stalled workers leave rank/PID/phase logs and a five-minute Python stack dump
-under .ci-artifacts for the existing failure upload. The suite timeout is unchanged.
+Workers record rank/PID/phase logs and Python stack snapshots every five minutes.
+Failures retain these under .ci-artifacts for the existing upload. The suite
+timeout is unchanged.
 
 Usage:
     python -m pytest test/runtime/distributed/test_muse_owned_projections.py -v

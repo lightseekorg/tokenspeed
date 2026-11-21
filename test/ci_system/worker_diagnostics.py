@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Rank-attributed stacks that survive a test runner killing stalled workers."""
+"""Periodic rank-attributed stacks that survive a test runner killing workers."""
 
 import faulthandler
 import os
@@ -31,11 +31,12 @@ from pathlib import Path
 def worker_diagnostics(
     directory: Path, rank: int, *, dump_after_seconds: float
 ) -> Iterator[Callable[[str], None]]:
-    """Record phases and one delayed stack dump without terminating the worker.
+    """Record phases and dump stacks every interval without terminating the worker.
 
     Use only in a dedicated worker process: faulthandler owns one process-wide
     timer. The caller retains the directory on failure for artifact collection.
     Phase labels mark host progress, not completion of asynchronous GPU work.
+    Snapshots are periodic; they do not identify whether a worker is stalled.
     """
     with (directory / f"rank-{rank}.log").open("w") as output:
         print(f"rank={rank} pid={os.getpid()}", file=output, flush=True)
@@ -44,7 +45,7 @@ def worker_diagnostics(
             print(f"phase={name}", file=output, flush=True)
 
         faulthandler.dump_traceback_later(
-            dump_after_seconds, repeat=False, file=output, exit=False
+            dump_after_seconds, repeat=True, file=output, exit=False
         )
         try:
             yield phase

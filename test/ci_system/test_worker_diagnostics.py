@@ -41,9 +41,11 @@ def start_worker(tmp_path, mode):
         "    phase('cpu_fixture')\n"
         "    if sys.argv[2] == 'stall': wait_for_release()\n"
         "    phase('complete')\n"
-        # If the timer was not cancelled on context exit, this is long enough
-        # for the failure to appear in the saved file before the child exits.
-        "if sys.argv[2] == 'success': time.sleep(1.2)\n"
+        # Reopening reuses the descriptor faulthandler captured. Without
+        # cancellation, the timer appends here instead of hitting a closed fd.
+        "if sys.argv[2] == 'success':\n"
+        "    with (Path(sys.argv[1]) / 'rank-1.log').open('a'):\n"
+        "        time.sleep(1.2)\n"
     )
     return subprocess.Popen(
         [sys.executable, str(script), str(tmp_path), mode],
@@ -66,7 +68,7 @@ def test_completed_worker_cancels_the_diagnostic_timer(tmp_path):
 
 
 @pytest.mark.parametrize("terminate", [False, True])
-def test_stalled_worker_dump_is_attributed_nonfatal_and_survives_kill(
+def test_periodic_worker_dumps_are_attributed_nonfatal_and_survive_kill(
     tmp_path, terminate
 ):
     process = start_worker(tmp_path, "stall")
@@ -75,11 +77,14 @@ def test_stalled_worker_dump_is_attributed_nonfatal_and_survives_kill(
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             output = path.read_text() if path.exists() else ""
-            if "Timeout (" in output and "in wait_for_release" in output:
+            if (
+                output.count("Timeout (") >= 2
+                and output.count("in wait_for_release") >= 2
+            ):
                 break
             time.sleep(0.02)
         else:
-            pytest.fail("The stalled CPU worker did not write its stack")
+            pytest.fail("The stalled CPU worker did not write repeated stacks")
         assert f"rank=1 pid={process.pid}\nphase=cpu_fixture\n" in output
         assert process.poll() is None  # The diagnostic did not end the worker.
         if terminate:
