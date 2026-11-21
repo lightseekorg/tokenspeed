@@ -244,6 +244,10 @@ def _routes_experts(hf_config) -> bool:
 
 _T = TypeVar("_T")
 
+# The sampling backends that verify a sampled draft tree by tree rejection
+# sampling (TreeRejectionSampler) against their own target p'.
+TREE_REJECTION_SAMPLING_BACKENDS = ("flashinfer", "triton")
+
 
 def first_rank_value(load: Callable[[], _T], group: dist.ProcessGroup | None) -> _T:
     """``load()`` run by the first rank of ``group`` alone, its value (or the
@@ -317,12 +321,12 @@ def validate_server_args(server_args: ServerArgs) -> None:
             "drop --enable-speculative-sampling"
         )
     if server_args.enable_speculative_sampling and (
-        server_args.sampling_backend != "flashinfer"
+        server_args.sampling_backend not in TREE_REJECTION_SAMPLING_BACKENDS
     ):
         raise ValueError(
             "EAGLE-Harness verifies sampled drafts by tree rejection sampling, "
-            "which only --sampling-backend flashinfer has; got "
-            f"{server_args.sampling_backend}"
+            f"which only --sampling-backend {' or '.join(TREE_REJECTION_SAMPLING_BACKENDS)} "
+            f"has; got {server_args.sampling_backend}"
         )
     topk = server_args.speculative_eagle_topk
     if topk not in (1, 2, 4, 8):

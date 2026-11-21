@@ -53,7 +53,7 @@ def test_default_is_off_and_the_flags_travel_by_config_not_global_dict():
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE3", "MTP", "DSPARK"])
-@pytest.mark.parametrize("backend", ["flashinfer", "flashinfer_full"])
+@pytest.mark.parametrize("backend", ["flashinfer", "flashinfer_full", "triton"])
 def test_chain_drafters_with_a_draft_prob_verifier_resolve(algorithm, backend):
     args = _args(
         speculative_algorithm=algorithm,
@@ -79,12 +79,6 @@ def test_rl_bitwise_accepts_the_flag_with_a_flashinfer_verifier():
 def test_refuses_without_speculative_decoding():
     with pytest.raises(ValueError, match="needs speculative decoding"):
         ServerArgs(model="x", enable_speculative_sampling=True)
-
-
-def test_dspark_token_wise_rejection_refuses_the_triton_verifier():
-    # Triton reads the dense q only under block verification.
-    with pytest.raises(ValueError, match="draft-prob chain kernel"):
-        _args(speculative_algorithm="DSPARK", sampling_backend="triton")
 
 
 def test_dflash_resolves_with_the_triton_verifier():
@@ -129,7 +123,9 @@ def test_block_verification_resolves_on_the_triton_verifier(algorithm):
     assert args.enable_speculative_sampling and args.sampling_backend == "triton"
 
 
-def test_triton_refuses_the_other_sampled_draft_rules():
+def test_triton_refuses_synthetic_rules_over_sampled_drafts():
+    # Standard rejection resolves on triton (the dense chain rule, above);
+    # synthetic acceptance does not.
     with pytest.raises(
         ValueError,
         match="synthetic-acceptance-length requires --sampling-backend greedy",
@@ -139,11 +135,10 @@ def test_triton_refuses_the_other_sampled_draft_rules():
             sampling_backend="triton",
             synthetic_acceptance_length=3.0,
         )
-    with pytest.raises(ValueError, match="target-sampled exact match"):
-        _args(
-            sampling_backend="triton",
-            speculative_rejection_sample_method="standard",
-        )
+    args = _args(
+        sampling_backend="triton", speculative_rejection_sample_method="standard"
+    )
+    assert args.speculative_rejection_sample_method == "standard"
 
 
 @pytest.mark.parametrize(
@@ -267,10 +262,9 @@ def test_refuses_the_greedy_verifier():
         _args(sampling_backend="greedy")
 
 
-@pytest.mark.parametrize("backend", ["triton", "triton_full"])
-def test_refuses_the_triton_verifiers(backend):
+def test_refuses_the_triton_full_verifier():
     with pytest.raises(ValueError, match="target-sampled exact match"):
-        _args(sampling_backend=backend)
+        _args(sampling_backend="triton_full")
 
 
 def test_threshold_must_lie_in_the_fp32_sentinel_range():

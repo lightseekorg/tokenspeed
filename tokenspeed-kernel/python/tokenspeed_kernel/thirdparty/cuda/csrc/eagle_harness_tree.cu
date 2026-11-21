@@ -431,8 +431,7 @@ __global__ void sample_children_kernel(
     const int64_t* __restrict__ cand_base, int64_t cand_s0, int64_t cand_s1,
     int64_t* __restrict__ tokens_base, int64_t tokens_s0, int64_t tokens_s1,
     float* __restrict__ scores_base, int64_t scores_s0, int64_t scores_s1,
-    const float* __restrict__ temps, const int32_t* __restrict__ top_ks,
-    const float* __restrict__ top_ps, float* __restrict__ q_store, int32_t* __restrict__ qid_store,
+    const float* __restrict__ temps, float* __restrict__ q_store, int32_t* __restrict__ qid_store,
     int32_t* __restrict__ node_slot, int32_t* __restrict__ node_pos, int rows_per_req,
     const int* __restrict__ width_ptr, int slot_base, const int* __restrict__ cumu_start_ptr,
     int num_slots, int max_nodes, int nc, int k, int64_t vocab_limit, uint64_t seed,
@@ -476,39 +475,10 @@ __global__ void sample_children_kernel(
     x[t] = (j < nc && x[t] > -FLT_MAX) ? __expf(x[t] - x_max) : 0.0f;
     e_sum += x[t];
   }
-  float inv_sum = 1.0f / block_sum_128(e_sum, red_v);
-  const int top_k = top_ks[b];
-  const float top_p = top_ps[b];
-  if (top_k < nc || top_p < 1.0f) {
-    __shared__ float s_q[SAMPLE_CHILDREN_THREADS * SAMPLE_CHILDREN_PER_THREAD];
-#pragma unroll
-    for (int t = 0; t < SAMPLE_CHILDREN_PER_THREAD; ++t) {
-      const int j = tid + t * SAMPLE_CHILDREN_THREADS;
-      if (j < nc) s_q[j] = x[t] * inv_sum;
-    }
-    __syncthreads();
-    float kept_sum = 0.0f;
-#pragma unroll
-    for (int t = 0; t < SAMPLE_CHILDREN_PER_THREAD; ++t) {
-      const int j = tid + t * SAMPLE_CHILDREN_THREADS;
-      if (j >= nc || x[t] <= 0.0f) continue;
-      const float q_j = s_q[j];
-      int above = 0;
-      float mass_above = 0.0f;
-      for (int i = 0; i < nc; ++i) {
-        const float q_i = s_q[i];
-        if (q_i > q_j) {
-          ++above;
-          mass_above += q_i;
-        }
-      }
-      if (above < top_k && mass_above < top_p)
-        kept_sum += x[t];
-      else
-        x[t] = 0.0f;
-    }
-    inv_sum = 1.0f / block_sum_128(kept_sum, red_v);
-  }
+  // Not cut to the request's top-k / top-p: the recursive rejection is exact for any q, and a
+  // cut q (often narrower than k at a low temperature) leaves children past its support that
+  // can never be accepted while the target keeps mass there.
+  const float inv_sum = 1.0f / block_sum_128(e_sum, red_v);
   const int s = slot_base + w;
   const int64_t store_row = ((int64_t)b * num_slots + s) * nc;
   const uint64_t stream = static_cast<uint64_t>(round_counter[0]) * 64 + launch;
@@ -549,7 +519,7 @@ __global__ void sample_children_kernel(
       tokens[i] = cand[best_j];
       node_slot[node_row + i] = s;
       node_pos[node_row + i] = best_j;
-      // A child past the cut's support can never be accepted.
+      // A child past q's support can never be accepted.
       if (best_v <= -1e29f) scores[i] = 0.0f;
     }
   }
@@ -1042,8 +1012,8 @@ void eagle_harness_write_verify_tree(TensorView ranked, TensorView pool_tokens,
 }
 
 void eagle_harness_sample_children(TensorView logits, TensorView cand, TensorView tokens,
-                                   TensorView scores, TensorView temps, TensorView top_ks,
-                                   TensorView top_ps, TensorView q_store, TensorView qid_store,
+                                   TensorView scores, TensorView temps, TensorView q_store,
+                                   TensorView qid_store,
                                    TensorView node_slot, TensorView node_pos,
                                    Optional<TensorView> width, int64_t slot_base,
                                    TensorView cumu_start, int64_t vocab_limit, int64_t seed,
@@ -1079,8 +1049,7 @@ void eagle_harness_sample_children(TensorView logits, TensorView cand, TensorVie
       static_cast<const int64_t*>(cand.data_ptr()), cand.stride(0), cand.stride(1),
       static_cast<int64_t*>(tokens.data_ptr()), tokens.stride(0), tokens.stride(1),
       static_cast<float*>(scores.data_ptr()), scores.stride(0), scores.stride(1),
-      static_cast<const float*>(temps.data_ptr()), static_cast<const int32_t*>(top_ks.data_ptr()),
-      static_cast<const float*>(top_ps.data_ptr()), static_cast<float*>(q_store.data_ptr()),
+      static_cast<const float*>(temps.data_ptr()), static_cast<float*>(q_store.data_ptr()),
       static_cast<int32_t*>(qid_store.data_ptr()), static_cast<int32_t*>(node_slot.data_ptr()),
       static_cast<int32_t*>(node_pos.data_ptr()), static_cast<int>(rows_per_req),
       width.has_value() ? static_cast<const int*>(width.value().data_ptr()) : nullptr,
