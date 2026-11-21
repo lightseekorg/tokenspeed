@@ -34,6 +34,8 @@ if current_platform().is_npu:
         name="ascend_attn_merge_state",
         solution="torch_npu",
         capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
-        signatures=format_signatures(("out_a", "out_b"), "dense", {torch.bfloat16}),
+        signatures=format_signatures(
+            ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
+        ),
         priority=Priority.PORTABLE,
     )(attn_merge_state)

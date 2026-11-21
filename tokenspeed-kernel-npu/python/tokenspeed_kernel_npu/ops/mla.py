@@ -363,6 +363,10 @@ def attn_merge_state(
     )
     merged = merged.reshape_as(out_a)
     merged_lse = torch.logaddexp(lse_a, lse_b)
+    # Two empty partials carry no mass; the update operator returns NaN for
+    # them, while the partial-state identity is a zero output.
+    empty = torch.isneginf(lse_a) & torch.isneginf(lse_b)
+    merged = torch.where(empty[..., None], torch.zeros_like(merged), merged)
     if inplace:
         out_a.copy_(merged)
         lse_a.copy_(merged_lse)
