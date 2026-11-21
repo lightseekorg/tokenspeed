@@ -33,10 +33,17 @@ runner:
     - amd-mi35x-8gpu-test
 env:
   CI: "true"
-  # main compiles kernels while serving under this recipe (gaps in the startup warmups); set this to error once those warmups cover them.
+  # Without startup requests, main compiled kernels while serving under this
+  # recipe. --enable-startup-requests (below) now serves them before readiness;
+  # warn stays until a run of this recipe shows no serving compile, then error.
   TOKENSPEED_JIT_COMPILE_CHECK: warn
 install:
   - bash test/ci_system/install_deps_rocm.sh
+# --enable-startup-requests: the engine serves its own startup requests before
+# readiness, which compiles the kernels only a live request reaches (step input
+# preparation, speculative accept bookkeeping, the prefix page copy; gfx950 MoE
+# sorting stage 2 with real weights). Without it those compile on the first
+# client requests (this recipe serves with TOKENSPEED_JIT_COMPILE_CHECK=warn).
 server:
   command: >-
     ts serve
@@ -68,6 +75,7 @@ server:
     --host 127.0.0.1
     --port 8000
     --policy round_robin
+    --enable-startup-requests
     --engine-startup-timeout 3000
     --gateway-startup-timeout 600
   ready:
