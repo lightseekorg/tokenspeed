@@ -207,7 +207,10 @@ it on gfx950 and transposes the router weight once to `[N, K]`.
   row's logits depend only on the M bucket, and repeat calls are bitwise
   stable.
 - One binary per (shape, multiplier, M bucket): power-of-two buckets up to 16,
-  then one per split-K config. `M` is a runtime argument.
+  then one per split-K config. `M` is a runtime argument. With
+  `warm_variants` (the registered op passes it during kernel warmup) the
+  launcher compiles every bucket's binary for its shape without launching,
+  so a batch in a bucket startup never ran does not compile while serving.
 
 #### Algorithm
 
@@ -242,6 +245,8 @@ the router's split-K GEMM and an independent BF16 decode GEMM
 - `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
   16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
   rows and differ from the GEMV's in the last bits at 1-8 rows.
+- One binary per decode GEMM M bucket; `warm_variants` compiles each of them
+  at startup, as for the router GEMV.
 
 #### Algorithm
 
