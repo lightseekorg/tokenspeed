@@ -33,6 +33,8 @@ use crate::CacheObservation;
 /// Maximum request identity copied or formatted by an observation consumer.
 pub const MAX_CACHE_EVENT_REQUEST_BYTES: usize = 256;
 
+type ObservationHandler = dyn Fn(&CacheObservation, &str) + Send + Sync;
+
 /// Lost observations invalidate evidence; they never change scheduling.
 #[derive(Clone)]
 pub struct CacheObservationLosses(Arc<AtomicU64>);
@@ -50,7 +52,7 @@ impl CacheObservationLosses {
 /// The request identity is borrowed only for this call. Delivery failure is
 /// counted rather than unwinding through a native resource destructor.
 pub struct CacheEventObserver {
-    handler: Box<dyn Fn(&CacheObservation, &str) + Send + Sync>,
+    handler: Box<ObservationHandler>,
     losses: CacheObservationLosses,
 }
 
