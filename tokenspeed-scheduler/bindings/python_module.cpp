@@ -337,18 +337,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dropped_cleanings", &tokenspeed::DiskStats::dropped_cleanings)
         .def_ro("wait_timeouts", &tokenspeed::DiskStats::wait_timeouts)
         .def_ro("ready_expirations", &tokenspeed::DiskStats::ready_expirations);
+    nb::enum_<tokenspeed::PeerLandingTier>(m, "PeerLandingTier")
+        .value("Device", tokenspeed::PeerLandingTier::kDevice)
+        .value("Host", tokenspeed::PeerLandingTier::kHost);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
-        .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t,
-                      std::int32_t>(),
+        .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t,
+                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t>(),
              nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
-             nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"))
+             nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"), nb::arg("landing_tier"),
+             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"))
         .def_ro("name", &tokenspeed::PeerConfig::name)
         .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
         .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
         .def_ro("soft_pin_us", &tokenspeed::PeerConfig::soft_pin_us)
         .def_ro("hard_pin_us", &tokenspeed::PeerConfig::hard_pin_us)
         .def_ro("lookup_timeout_us", &tokenspeed::PeerConfig::lookup_timeout_us)
-        .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens);
+        .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens)
+        .def_ro("landing_tier", &tokenspeed::PeerConfig::landing_tier)
+        .def_ro("max_host_landing_blocks", &tokenspeed::PeerConfig::max_host_landing_blocks)
+        .def_ro("host_ready_timeout_us", &tokenspeed::PeerConfig::host_ready_timeout_us);
     scheduler_config.def_rw("peer_config", &tokenspeed::SchedulerConfig::peer_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)

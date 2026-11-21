@@ -1445,6 +1445,9 @@ class HostBootstrap:
                     incarnation=self.peer_sharing.incarnation,
                     answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
                     min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
+                    landing_tier=server_args.peer_prefix_landing_tier,
+                    num_host_blocks=device.host_cache.storage.num_host_lcm_blocks
+                    * max(device.specs.host_group_packing),
                 )
             specs = device.specs
             geometry = specs.cache_geometry

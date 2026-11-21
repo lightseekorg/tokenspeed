@@ -37,6 +37,7 @@
 #include "cache/tier/transfer_manager.h"
 #include "cache/tier/disk_manager.h"
 #include "cache/tier/peer_exports.h"
+#include "cache/tier/peer_host_landings.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
@@ -186,18 +187,20 @@ public:
     bool StorageHasRetainedOperations() const {
         return storage_transfers_ && storage_transfers_->HasRetainedOperations();
     }
-    // Storage covers L3 and the Disk tier, which never run together.
+    // Storage covers L3 and the Disk tier, which never run together, and
+    // peer landings into Host: each writes Host blocks a clear must wait for.
     bool StoragePending() const {
         return (storage_transfers_ && storage_transfers_->HasPending()) ||
-               (disk_transfers_ && disk_transfers_->HasPending());
+               (disk_transfers_ && disk_transfers_->HasPending()) || peerHostLandingsPending();
     }
     bool StorageCurrentPending() const {
         return (storage_transfers_ && storage_transfers_->HasCurrentPending()) ||
-               (disk_transfers_ && disk_transfers_->HasPending());
+               (disk_transfers_ && disk_transfers_->HasPending()) || peerHostLandingsPending();
     }
     bool StorageProgressPending() const {
         return (storage_transfers_ && storage_transfers_->HasProgressPending()) ||
-               (disk_transfers_ && disk_transfers_->HasProgressPending());
+               (disk_transfers_ && disk_transfers_->HasProgressPending()) ||
+               (peer_host_landings_ && peer_host_landings_->HasProgressPending());
     }
     std::size_t StorageBlockingQuarantined() const {
         return storage_transfers_ ? storage_transfers_->NumBlockingQuarantined() : 0;
@@ -563,8 +566,13 @@ private:
     void abortRequest(Request& request);
 
     // A waiting prompt with a peer hint asks its holder, once; one past its
-    // wait gives the holder up.
+    // wait gives the holder up. With Host landings, a prompt the holder
+    // answered starts its landing into Host here (startPeerHostLanding).
     void preparePeer(Request& request);
+    // The answered prompt's landing into Host blocks before its admission:
+    // it waits in Prefetching, or is admitted from its local hit when the
+    // Host cannot take the whole answered prefix.
+    void startPeerHostLanding(Request& request);
     // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
     // request's tables: a token-spanned group's from the block holding
     // hit_tokens through the one holding the end, a State group's live slot.
@@ -590,6 +598,10 @@ private:
     void prepareDisk(Request& request);
     void releaseStorage(Request& request);
     void expireStorage(Request& request);
+    // Whether L3 or the Disk tier issued `lease`, whose waits the storage
+    // clock times; a peer landing into Host keeps the peer clock.
+    bool ownsStorageLease(const StorageLease& lease) const;
+    bool peerHostLandingsPending() const { return peer_host_landings_ && peer_host_landings_->NumLandings() > 0; }
     std::int32_t cacheablePrefixTokens(const Request& request) const;
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
@@ -859,6 +871,10 @@ private:
     // Peer prefix sharing, when configured: the holder's leases, the peer
     // clock, the reader's lease counter and what goes out to other replicas.
     std::unique_ptr<PeerExports> peer_exports_;
+    // A reader's landings into Host, with PeerLandingTier::kHost; null
+    // otherwise. The fetches started since the last plan go out with it.
+    std::unique_ptr<PeerHostLandings> peer_host_landings_;
+    std::vector<PeerFetchOperation> peer_host_fetches_;
     std::int64_t peer_now_us_{0};
     std::uint64_t next_peer_lease_{0};
     std::vector<PeerLookupRequest> peer_lookups_;

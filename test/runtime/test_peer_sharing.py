@@ -39,6 +39,7 @@ from tokenspeed.runtime.cache.host_storage import HostCacheStorage  # noqa: E402
 from tokenspeed.runtime.cache.peer import (  # noqa: E402
     build_peer_geometry,
     peer_incarnation,
+    peer_scheduler_config,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -176,6 +177,7 @@ def _peer_args(**overrides) -> ServerArgs:
     args.peer_prefix_port = 7100
     args.peer_prefix_answer_timeout_ms = 50
     args.peer_prefix_min_fetch_tokens = 256
+    args.peer_prefix_landing_tier = "device"
     args.disaggregation_mode = "null"
     args.enable_kvstore = True
     args.enable_prefix_caching = True
@@ -192,10 +194,36 @@ def test_peer_sharing_runs_with_the_host_tier_and_prefix_caching():
     _peer_args().validate_peer_prefix_options()
     # A decode replica holds the history it decoded (RFC 0005).
     _peer_args(disaggregation_mode="decode").validate_peer_prefix_options()
-    # Off, nothing is checked.
+    # Off, nothing is checked but a stray landing tier.
     _peer_args(
-        peer_prefix_port=None, enable_kvstore=False
+        peer_prefix_port=None, enable_kvstore=False, peer_prefix_landing_tier=None
     ).validate_peer_prefix_options()
+    with pytest.raises(ValueError, match="requires --peer-prefix-port"):
+        _peer_args(peer_prefix_port=None).validate_peer_prefix_options()
+
+
+@pytest.mark.parametrize("tier", [None, "disk"])
+def test_peer_sharing_needs_an_explicit_landing_tier(tier):
+    with pytest.raises(ValueError, match="--peer-prefix-landing-tier"):
+        _peer_args(peer_prefix_landing_tier=tier).validate_peer_prefix_options()
+
+
+def test_host_landings_take_a_share_of_the_host_blocks():
+    ts = pytest.importorskip("tokenspeed_engine.scheduler")
+    common = dict(
+        name="10.0.0.2:7100",
+        incarnation=3,
+        answer_timeout_ms=50,
+        min_fetch_tokens=256,
+        num_host_blocks=100,
+    )
+    host = peer_scheduler_config(landing_tier="host", **common)
+    assert host.landing_tier == ts.PeerLandingTier.Host
+    assert host.max_host_landing_blocks == 50
+    assert host.host_ready_timeout_us > 0
+    device = peer_scheduler_config(landing_tier="device", **common)
+    assert device.landing_tier == ts.PeerLandingTier.Device
+    assert (device.max_host_landing_blocks, device.host_ready_timeout_us) == (0, 0)
 
 
 @pytest.mark.parametrize(

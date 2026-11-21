@@ -542,10 +542,23 @@ mod ffi {
         group_id: u32,
         /// The block's slot in the group's request table.
         slot: i32,
-        /// Whether the block is in the Host pool rather than the Device's.
-        host: bool,
+        /// Where the block is.
+        tier: PeerTier,
         /// The scheduler block id on its tier.
         block_id: i32,
+    }
+
+    /// Where a peer page is (`tokenspeed::CacheTier`): a holder lists a page
+    /// from its Device, its Host pool or its Disk tier; a reader lands into
+    /// its Device or its Host pool.
+    #[derive(Debug)]
+    enum PeerTier {
+        /// The Device cache arena.
+        Device,
+        /// The Host pool.
+        Host,
+        /// The Disk tier's file (`docs/rfcs/0006-disk-tier.md`).
+        Disk,
     }
 
     /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
@@ -814,10 +827,10 @@ pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
     DiskDoneView, DiskOpKind, DiskOpView, DiskStatsView, ForwardBatchView, ForwardEvent,
     ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView,
-    PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView, PeerStatsView, PinSampleView,
-    PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes,
-    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
-    StorageStatsView, StorageTickView, TransferBatchView,
+    PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView, PeerStatsView, PeerTier,
+    PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
+    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3 or the Disk

@@ -88,14 +88,36 @@ PeerLeaseView ToView(const tokenspeed::PeerLeaseId& lease) {
     return PeerLeaseView{.reader = rust::String(lease.reader), .id = lease.id};
 }
 
+PeerTier ToView(tokenspeed::CacheTier tier) {
+    switch (tier) {
+        case tokenspeed::CacheTier::kDevice:
+            return PeerTier::Device;
+        case tokenspeed::CacheTier::kHost:
+            return PeerTier::Host;
+        case tokenspeed::CacheTier::kDisk:
+            return PeerTier::Disk;
+    }
+    throw std::invalid_argument("an unknown cache tier");
+}
+
+tokenspeed::CacheTier FromView(PeerTier tier) {
+    switch (tier) {
+        case PeerTier::Device:
+            return tokenspeed::CacheTier::kDevice;
+        case PeerTier::Host:
+            return tokenspeed::CacheTier::kHost;
+        case PeerTier::Disk:
+            return tokenspeed::CacheTier::kDisk;
+    }
+    throw std::invalid_argument("an unknown peer page tier");
+}
+
 rust::Vec<PeerPageView> ToView(const std::vector<tokenspeed::PeerPage>& pages) {
     rust::Vec<PeerPageView> out;
     out.reserve(pages.size());
     for (const tokenspeed::PeerPage& page : pages) {
-        out.push_back(PeerPageView{.group_id = page.group_id,
-                                   .slot = page.slot,
-                                   .host = page.tier == tokenspeed::CacheTier::kHost,
-                                   .block_id = page.block_id});
+        out.push_back(PeerPageView{
+            .group_id = page.group_id, .slot = page.slot, .tier = ToView(page.tier), .block_id = page.block_id});
     }
     return out;
 }
@@ -114,10 +136,8 @@ std::vector<tokenspeed::PeerPage> FromView(rust::Slice<const PeerPageView> pages
     std::vector<tokenspeed::PeerPage> out;
     out.reserve(pages.size());
     for (const PeerPageView& page : pages) {
-        out.push_back(tokenspeed::PeerPage{.group_id = page.group_id,
-                                           .slot = page.slot,
-                                           .tier = page.host ? tokenspeed::CacheTier::kHost : tokenspeed::CacheTier::kDevice,
-                                           .block_id = page.block_id});
+        out.push_back(tokenspeed::PeerPage{
+            .group_id = page.group_id, .slot = page.slot, .tier = FromView(page.tier), .block_id = page.block_id});
     }
     return out;
 }

@@ -49,9 +49,11 @@ DiskStats Scheduler::GetDiskStats() const {
     stats.wait_timeouts = storage_wait_timeouts_;
     stats.ready_expirations = storage_ready_expirations_;
     for (const auto& request : requests_) {
-        stats.waiting_requests += request->Is<fsm::Prefetching>();
+        const auto* prefetch = request->GetIf<fsm::Prefetching>();
+        stats.waiting_requests += prefetch != nullptr && prefetch->lease.IssuedBy(*disk_transfers_);
         const auto* admission = request->AdmissionResourcesPtr();
-        stats.ready_requests += admission != nullptr && admission->storage_hold.has_value();
+        stats.ready_requests += admission != nullptr && admission->storage_hold &&
+                                admission->storage_hold->lease.IssuedBy(*disk_transfers_);
     }
     return stats;
 }
@@ -64,6 +66,7 @@ void Scheduler::handleEvent(const cache::DiskDone& event) {
 void Scheduler::prepareDisk(Request& request) {
     const DiskConfig& limits = disk_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
+        if (!state->lease.IssuedBy(*disk_transfers_)) return;
         const std::uint64_t operation = state->lease.OperationId();
         if (disk_transfers_->Completed(operation)) {
             const auto deadline =

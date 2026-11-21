@@ -112,7 +112,11 @@ Scheduler::Scheduler(SchedulerConfig config)
                              : nullptr},
       disk_transfers_{config_.HasDiskCache() ? std::make_unique<DiskTransferManager>(coordinator_, *config_.disk_config)
                                              : nullptr},
-      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr} {
+      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr},
+      peer_host_landings_{
+          config_.peer_config && config_.peer_config->landing_tier == PeerLandingTier::kHost
+              ? std::make_unique<PeerHostLandings>(coordinator_, config_.peer_config->max_host_landing_blocks)
+              : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -249,9 +253,9 @@ bool Scheduler::CanClearCacheRetainingStorage() const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
-    // A Disk operation is never retained across a clear: a write finishing
-    // after it would publish the old contents.
-    if (disk_transfers_ && disk_transfers_->HasPending()) return false;
+    // A Disk operation or a peer landing into Host is never retained across a
+    // clear: one finishing after it would publish the old contents.
+    if ((disk_transfers_ && disk_transfers_->HasPending()) || peerHostLandingsPending()) return false;
     std::vector<const CacheBlockRef*> retained;
     if (storage_transfers_) {
         std::vector<std::uint64_t> leases;
@@ -829,6 +833,11 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     }
     if (!built.snapshot_restores.empty()) {
         plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
+    }
+    // Landings into Host start before admission (preparePeer), in this plan
+    // whether or not it forwards.
+    for (PeerFetchOperation& fetch : std::exchange(peer_host_fetches_, {})) {
+        plan.peer_fetches.push_back(std::move(fetch));
     }
     const bool has_storage_work = !storage_operations.empty() || !disk_operations.empty();
     for (auto& operation : storage_operations) {

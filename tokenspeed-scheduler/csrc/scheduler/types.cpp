@@ -155,6 +155,19 @@ void SchedulerConfig::Validate() const {
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: peer prefix sharing excludes L3 storage");
         }
+        if (peer_config->landing_tier == PeerLandingTier::kHost) {
+            if (!HasHostCache()) {
+                throw std::invalid_argument("Scheduler: peer Host landings need a Host L2 cache");
+            }
+            const std::int64_t densest_packing =
+                host_group_packing.empty() ? 1 : *std::ranges::max_element(host_group_packing);
+            if (peer_config->max_host_landing_blocks >
+                std::int64_t{host_allocator.NumUsableBlocks()} * densest_packing) {
+                throw std::invalid_argument(
+                    "Scheduler: peer Host landing credits must not exceed the usable Host parents times the densest "
+                    "Host packing");
+            }
+        }
     }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");

@@ -222,6 +222,7 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         groups.clear();
         buckets.clear();
         result.keys.clear();
+        result.logical_blocks.clear();
         result.blocks.clear();
         result.tail.reset();
         result.tail_prior = ContentHash{};
@@ -235,6 +236,7 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
                 warm_blocks.push_back(std::move(ref));
             } else {
                 result.keys.push_back(key);
+                result.logical_blocks.push_back(logical_block);
                 groups.push_back(key.group_id);
                 buckets.push_back(logical_block % store_.Groups()[key.group_id].Spec().shard_count);
             }
@@ -253,6 +255,7 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         if (result.keys.size() + warm_blocks.size() <= max_blocks) {
             auto allocation = host_.AcquireHostBlocks(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
+                result.num_tokens = probe.num_common_tokens;
                 result.blocks = std::move(allocation.blocks);
                 return result;
             }

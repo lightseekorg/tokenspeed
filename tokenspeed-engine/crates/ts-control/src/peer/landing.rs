@@ -297,7 +297,7 @@ fn deadline(now_us: i64, lifetime_us: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use ts_scheduler::{PeerAnswerKind, PeerPageView};
+    use ts_scheduler::{PeerAnswerKind, PeerPageView, PeerTier};
 
     use super::*;
 
@@ -310,7 +310,7 @@ mod tests {
         PeerPageView {
             group_id: 0,
             slot,
-            host: false,
+            tier: PeerTier::Device,
             block_id: slot + 10,
         }
     }

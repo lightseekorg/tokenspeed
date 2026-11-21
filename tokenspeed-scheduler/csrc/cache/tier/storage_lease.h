@@ -26,8 +26,9 @@ namespace tokenspeed {
 
 class StorageLease;
 
-// What issues storage leases: the L3 transfer manager, or the Disk tier's.
-// Dropping a lease detaches its request from the operation it names.
+// What issues storage leases: the L3 transfer manager, the Disk tier's, or
+// peer sharing's Host landings. Dropping a lease detaches its request from
+// the operation it names.
 class StorageLeaseIssuer {
 protected:
     friend class StorageLease;
@@ -39,7 +40,8 @@ protected:
 };
 
 // A request's claim on one storage operation it started: an L3 query, or an
-// L3 GET or a Disk prefetch and the Host blocks its ticket holds. The
+// L3 GET, a Disk prefetch or a peer landing into Host and the Host blocks its
+// ticket holds. The
 // pre-admission state that waits on the operation owns the lease, so
 // whatever ends the wait -- admission, a soft deadline, an abort -- drops it
 // with the state. Dropping it detaches the request from the operation: a
@@ -58,12 +60,16 @@ public:
     explicit operator bool() const noexcept { return manager_ != nullptr; }
     // The id the runtime reports the operation's completion under.
     std::uint64_t OperationId() const noexcept { return operation_id_; }
+    // Whether `issuer` issued it: a request waits on one issuer's operation,
+    // and each issuer steps only its own leases.
+    bool IssuedBy(const StorageLeaseIssuer& issuer) const noexcept { return manager_ == &issuer; }
     // Detaches now and leaves the lease empty.
     void reset() noexcept;
 
 private:
     friend class StorageTransferManager;
     friend class DiskTransferManager;
+    friend class PeerHostLandings;
 
     StorageLease(StorageLeaseIssuer& manager, std::uint64_t operation_id) noexcept
         : manager_{&manager}, operation_id_{operation_id} {}

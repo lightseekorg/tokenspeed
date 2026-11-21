@@ -48,7 +48,10 @@ PeerConfig Config() {
                       .soft_pin_us = 100,
                       .hard_pin_us = 1000,
                       .lookup_timeout_us = 100,
-                      .min_fetch_tokens = kP};
+                      .min_fetch_tokens = kP,
+                      .landing_tier = PeerLandingTier::kDevice,
+                      .max_host_landing_blocks = 0,
+                      .host_ready_timeout_us = 0};
 }
 
 std::vector<std::string> PageHashes(const std::vector<std::int32_t>& tokens) {

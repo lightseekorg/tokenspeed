@@ -2014,6 +2014,7 @@ request computes the prefix itself.
 | `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
 | `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
+| `--peer-prefix-landing-tier` | required | `device` reads the prefix into the GPU pages the request's admission allocates, which wait out the transfer; `host` reads it into Host blocks before the admission, which then takes it as a Host hit, at the cost of Host capacity and one host-to-device copy ([RFC 0006](../rfcs/0006-disk-tier.md)). |
 
 Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
 A `--disaggregation-mode decode` server serves the history it decoded, its

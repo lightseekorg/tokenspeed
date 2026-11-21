@@ -48,12 +48,6 @@ use ts_scheduler::{
 
 use crate::codec::{Reader, Writer};
 
-/// How long a cache clear waits for the Disk operations in flight to retire.
-/// Direct I/O to a local drive takes milliseconds; an operation still in
-/// flight past this fails the clear, since a Disk operation is never retained
-/// across one (`Scheduler::CanClearCacheRetainingStorage`).
-pub const CLEAR_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Everything a rank's Disk tier starts from, as the data plane resolves it.
 #[derive(Debug, Clone)]
 pub struct DiskSettings {

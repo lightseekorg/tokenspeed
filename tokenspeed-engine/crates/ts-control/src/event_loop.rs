@@ -76,7 +76,7 @@ use crate::{
     cache_ops::{CacheOpError, CacheOps},
     codec::{Reader, Writer},
     control::{self, ControlConfig, Controls, Drain, Effect},
-    disk::{self, DiskError, DiskTier},
+    disk::{DiskError, DiskTier},
     eplb::{self, InternalOp, SlotMoves},
     grammar::{self as grammar_cache, GrammarKey, Grammars, InvalidGrammar, Lookup},
     ingress::{self, Admission, Admitted, IngressLimits},
@@ -196,6 +196,13 @@ const RELOAD_GATE_CODE: i64 = 7;
 
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
+
+/// Without L3, how long a cache clear waits for the Host and Disk writes
+/// still in flight -- the Disk tier's operations, peer landings into Host --
+/// to retire. Each takes milliseconds; one still in flight past this fails
+/// the clear, since none is retained across one
+/// (`Scheduler::CanClearCacheRetainingStorage`).
+const LOCAL_CLEAR_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A failure of a data-plane operation; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
@@ -2088,10 +2095,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let pending = self.scheduler.storage_current_pending();
         if !self.converge(!pending)? {
-            let budget = match (&self.l3, &self.disk) {
-                (Some(l3), _) => l3.executor.config().clear_cache_drain_timeout,
-                (None, Some(_)) => disk::CLEAR_DRAIN_TIMEOUT,
-                (None, None) => Duration::ZERO,
+            let budget = match &self.l3 {
+                Some(l3) => l3.executor.config().clear_cache_drain_timeout,
+                None => LOCAL_CLEAR_DRAIN_TIMEOUT,
             };
             let expired = self.cache_clear_started.expect("clear started").elapsed() >= budget;
             if !self.converge(!expired)? {

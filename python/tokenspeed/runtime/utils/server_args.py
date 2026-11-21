@@ -640,6 +640,10 @@ class ServerArgs:
     peer_prefix_host: str | None = None
     peer_prefix_answer_timeout_ms: int = 50
     peer_prefix_min_fetch_tokens: int = 256
+    # Where a peer prefix lands: "device" (the request's admitted Device
+    # pages) or "host" (Host blocks before its admission). Required with
+    # peer sharing; no default.
+    peer_prefix_landing_tier: str | None = None
     # The Disk tier: the node's local SSD below Host L2
     # (docs/rfcs/0006-disk-tier.md). One directory per drive; None turns it
     # off. The I/O backend and the write budget have no default.
@@ -2655,7 +2659,16 @@ class ServerArgs:
         """``--peer-prefix-port`` and its settings: what peer prefix sharing
         runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
         if self.peer_prefix_port is None:
+            if self.peer_prefix_landing_tier is not None:
+                raise ValueError(
+                    "--peer-prefix-landing-tier requires --peer-prefix-port"
+                )
             return
+        _require_choice(
+            "--peer-prefix-landing-tier",
+            self.peer_prefix_landing_tier,
+            ("device", "host"),
+        )
         unsupported = [
             setting
             for setting, refused in (
@@ -3751,6 +3764,17 @@ class ServerArgs:
             default=ServerArgs.peer_prefix_min_fetch_tokens,
             help="The fewest tokens past the local prefix hit worth reading from "
             "a peer holder; a shorter peer hit is computed instead.",
+        )
+        parser.add_argument(
+            "--peer-prefix-landing-tier",
+            type=str,
+            choices=["device", "host"],
+            default=ServerArgs.peer_prefix_landing_tier,
+            help="Where a peer prefix lands: 'device' reads it into the Device "
+            "pages the request's admission allocates, which wait out the "
+            "transfer; 'host' reads it into Host blocks before the admission, "
+            "which then takes it as a Host hit at the cost of Host capacity and "
+            "one host-to-device copy. Required with --peer-prefix-port.",
         )
         parser.add_argument(
             "--disk-tier-paths",

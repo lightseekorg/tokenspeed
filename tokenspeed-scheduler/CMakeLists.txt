@@ -80,6 +80,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/tier/storage_manager.cpp
     csrc/cache/tier/disk_manager.cpp
     csrc/cache/tier/peer_exports.cpp
+    csrc/cache/tier/peer_host_landings.cpp
     csrc/scheduler/operations/storage.cpp
     csrc/scheduler/operations/disk.cpp
     csrc/scheduler/operations/peer.cpp

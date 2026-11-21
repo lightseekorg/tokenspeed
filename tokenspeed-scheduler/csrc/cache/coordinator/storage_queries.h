@@ -41,7 +41,12 @@
 namespace tokenspeed {
 
 struct StorageReservation {
+    // The boundary the reservation resumes the prompt at; 0 when empty.
+    std::int32_t num_tokens{0};
     std::vector<CacheKey> keys;
+    // Each key's block index in its group's request table, parallel to
+    // `keys` (holes before a sliding window included).
+    std::vector<std::int32_t> logical_blocks;
     std::vector<CacheBlockRef> blocks;
     ContentHash tail_prior;
     std::optional<TailPublication> tail;
