@@ -344,6 +344,11 @@ def validate_context_parallel_roles(
         )
 
 
+# Muse Spark's --prefill-collective-payload choices (the Iris state's
+# MUSE_PAYLOADS; a test checks they match).
+PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
+
+
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
     """Refuse a launch value outside ``flag``'s closed set of ``choices``.
 
@@ -815,6 +820,14 @@ class ServerArgs:
     # switches below (resolve_numerics). Each folded switch can still be set
     # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Muse Spark: the payload encoding of the owned-row prefill collectives
+    # (the QKVG all-to-all and the attention and expert reduce-scatters) in
+    # extend forwards. "bf16" transfers the rows as produced. "int8-block16"
+    # transfers INT8 codes with an FP32 scale per 16 elements, decoded to BF16
+    # by the receiver before the collective's arithmetic: 1.25 bytes an
+    # element instead of 2, and a numerics change. Decode and verify forwards
+    # stay BF16.
+    prefill_collective_payload: str = "bf16"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1135,6 +1148,15 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if (
+            self.prefill_collective_payload != "bf16"
+            and architectures is not None
+            and "MuseSparkForConditionalGeneration" not in architectures
+        ):
+            raise ValueError(
+                "--prefill-collective-payload applies to Muse Spark's owned-row "
+                f"prefill only; this checkpoint is {architectures}"
+            )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
@@ -2333,6 +2355,18 @@ class ServerArgs:
 
         ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice(
+            "--prefill-collective-payload",
+            self.prefill_collective_payload,
+            PREFILL_COLLECTIVE_PAYLOADS,
+        )
+        if self.numerics == "rl-bitwise" and self.prefill_collective_payload != "bf16":
+            # The envelope promises the trainer's bits; the INT8 payload rounds
+            # every prefill collective's inputs.
+            raise ValueError(
+                "--prefill-collective-payload int8-block16 changes prefill "
+                "numerics; --numerics rl-bitwise needs bf16"
+            )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
@@ -5218,6 +5252,16 @@ class ServerArgs:
             "with a row's offset in the buffer, so neither is "
             "batch-invariant. Gathers keep the multicast kernels. Turns off "
             "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--prefill-collective-payload",
+            type=str,
+            default=ServerArgs.prefill_collective_payload,
+            choices=list(PREFILL_COLLECTIVE_PAYLOADS),
+            help="Muse Spark: the payload encoding of the owned-row prefill "
+            "collectives in extend forwards. int8-block16 sends INT8 codes with "
+            "an FP32 scale per 16 elements (a numerics change); decode stays "
+            "BF16.",
         )
         parser.add_argument(
             "--numerics",

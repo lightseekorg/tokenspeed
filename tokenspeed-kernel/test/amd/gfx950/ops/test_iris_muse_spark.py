@@ -375,6 +375,7 @@ def _muse_state(rank, device, max_rows, enable_lamport):
         enable_lamport=enable_lamport,
         owned_route_max_rows=0,
         intermediate_gather_max_rows=0,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -736,7 +737,7 @@ def _muse_owned_packet_worker(rank, world_size, device):
 
     def one(item):
         rows, _, valid_rows, local, ids, weights, branch = item
-        reduced = state.reduce_scatter_owned_rows(branch)
+        reduced = state.reduce_scatter_owned_rows(branch, payload="bf16")
         retained = state.all_gather_owned_rows(reduced, rows, True)
         quantized = rmsnorm_mxfp4_quant(local, norm_weight, 1e-8, 1.0)
         # Pull peers may still read scratch when this rank starts packet packing.
@@ -759,7 +760,7 @@ def _muse_owned_packet_worker(rank, world_size, device):
         )
         generic_snapshot = generic_output.clone()
         # The next scatter overwrites packet staging before outputs are checked.
-        state.reduce_scatter_owned_rows(branch)
+        state.reduce_scatter_owned_rows(branch, payload="bf16")
         return retained, packed_result, bf16_result, generic_snapshot
 
     for item in inputs:
@@ -2589,6 +2590,113 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
             assert bool((region.view(torch.int32) == -(2**31)).all())
 
 
+def _int8_block16_round_trip(x):
+    """decode(encode(x)) of the int8-block16 reference encoder and
+    decoder, computed on the CPU and returned on x's device."""
+    blocks = x.cpu().reshape(-1, 16).float()
+    scale = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
+    # INT8 codes have no negative zero.
+    codes = torch.round(blocks / scale).clamp(-127.0, 127.0).to(torch.int8)
+    return (codes.float() * scale).to(torch.bfloat16).reshape(x.shape).to(x.device)
+
+
+def _muse_int8_block16_payload_worker(rank, world_size, device):
+    """Each owned-row prefill collective with int8-block16 payloads equals the
+    BF16 collective of the reference round trip of the same payload, bit for
+    bit, and row counts stay runtime values."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    )
+    from tokenspeed_kernel.ops.communication._iris.payload import (
+        encode_int8_block16,
+    )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+    from utils import assert_no_triton_compile
+
+    state = prepare_muse_communication(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        # Holds 4099 rows; at 8 ranks the pull scratch (1/8) holds 513 owned rows.
+        producer_direct_max_numel=4104 * 8192,
+        enable_lamport=False,
+        owned_route_max_rows=0,
+        intermediate_gather_max_rows=0,
+        int8_payloads=True,
+        all_reduce=None,
+        device=device,
+    )
+    generator = torch.Generator(device=device).manual_seed(100 + rank)
+
+    def payload(rows, width):
+        # Rows of very different magnitudes, and all-zero blocks.
+        x = torch.randn(rows, width, device=device, generator=generator)
+        x *= torch.logspace(-3, 3, rows, device=device)[:, None]
+        x[::7, :16] = 0
+        return x.bfloat16()
+
+    def check(rows):
+        for width in (8192, 4096):
+            x = payload(rows, width)
+            got = state.reduce_scatter_owned_rows(x, payload="int8-block16").clone()
+            want = state.reduce_scatter_owned_rows(
+                _int8_block16_round_trip(x), payload="bf16"
+            )
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+                "reduce-scatter",
+                rows,
+                width,
+                int((got.view(torch.int16) != want.view(torch.int16)).sum()),
+            )
+        source = state.acquire_owned_qkvg_output(rows)
+        x = payload(source.shape[0], 18432)
+        source.copy_(x)
+        got = state.all_to_all_transpose_qkvg(source, rows, payload="int8-block16")
+        source.copy_(_int8_block16_round_trip(x))
+        want = state.all_to_all_transpose_qkvg(source, rows, payload="bf16")
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+            "all-to-all",
+            rows,
+            int((got.view(torch.int16) != want.view(torch.int16)).sum()),
+        )
+        positions = torch.arange(rows, device=device)
+        cache = torch.randn(rows, 64, device=device, generator=generator)
+        source.copy_(x)
+        got = state.all_to_all_transpose_qkvg_norm_rope(
+            source, rows, positions, cache, 1e-6, 0.125, payload="int8-block16"
+        )
+        source.copy_(_int8_block16_round_trip(x))
+        want = state.all_to_all_transpose_qkvg_norm_rope(
+            source, rows, positions, cache, 1e-6, 0.125, payload="bf16"
+        )
+        for part, actual, expected in zip("qkvg", got, want):
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16)), (
+                "fused all-to-all",
+                part,
+                rows,
+                int((actual.view(torch.int16) != expected.view(torch.int16)).sum()),
+            )
+
+    # Owned rows from the smallest owned-row round, with ragged last owners.
+    check(193)
+    with assert_no_triton_compile(
+        encode_int8_block16,
+        iris_pull_reduce_scatter,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    ):
+        for rows in (2051, 4099):
+            check(rows)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 def _muse_lamport_payload_worker(rank, world_size, device):
     """Distinct per-rank data through each Lamport protocol, grid, and stage."""
     state = _muse_state(rank, device, 128, True)
@@ -2769,6 +2877,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -2965,6 +3074,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=capacity,
         intermediate_gather_max_rows=0,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -3147,6 +3257,7 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
         enable_lamport=True,
         owned_route_max_rows=2049,
         intermediate_gather_max_rows=capacity,
+        int8_payloads=False,
         all_reduce=None,
         device=device,
     )
@@ -3363,7 +3474,7 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
         rows, stream, branch = item
         # A reduce-scatter result occupies pull scratch first, as attention
         # output does.
-        reduced = state.reduce_scatter_owned_rows(branch)
+        reduced = state.reduce_scatter_owned_rows(branch, payload="bf16")
         retained = state.all_gather_owned_rows(reduced, rows, True)
         if rank == rows % world_size:
             torch.cuda._sleep(20000)
@@ -3443,6 +3554,9 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
         ),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(
+            _muse_int8_block16_payload_worker, "nccl", id="int8_block16_payloads"
+        ),
+        pytest.param(
             _muse_lamport_two_shot_order_worker, "nccl", id="lamport_two_shot_order"
         ),
         pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
@@ -3463,3 +3577,99 @@ def test_muse_collective_replay(check, backend, world_size):
         (world_size, _get_open_port(), check, backend),
         world_size,
     )
+
+
+def _int8_block16_payloads(seed):
+    """Payload families [4096, 2048] (BF16), all from one generator: Gaussian,
+    Student t with 3 degrees of freedom (a Gaussian over the root of a scaled
+    chi-square), Gaussian with sparse 100x outliers, and exact ties / zeros."""
+    generator = torch.Generator().manual_seed(seed)
+    gauss = torch.randn(4096, 2048, generator=generator)
+    chi2 = (torch.randn(3, 4096, 2048, generator=generator) ** 2).sum(0)
+    t3 = torch.randn(4096, 2048, generator=generator) / torch.sqrt(chi2 / 3)
+    outliers = gauss.clone()
+    outliers[torch.rand(4096, 2048, generator=generator) < 1e-3] *= 100.0
+    ties = torch.zeros(64, 2048)
+    ties[:, 0::16] = 127.0
+    ties[:, 1::16] = 2.5
+    ties[:, 2::16] = -3.5
+    return {
+        name: x.bfloat16()
+        for name, x in (
+            ("gaussian", gauss),
+            ("student-t3", t3),
+            ("gauss+outliers", outliers),
+            ("ties/zeros", ties),
+        )
+    }
+
+
+def _int8_block16_reference(x):
+    """The definition: per 16 elements scale = max|x| / 127 (1e-30 / 127 for an
+    all-zero block), codes = rint(x / scale) clamped to [-127, 127] as INT8.
+    Returns (codes, scales)."""
+    blocks = x.reshape(-1, 16).float()
+    scales = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
+    codes = torch.round(blocks / scales).clamp(-127.0, 127.0).to(torch.int8)
+    return codes.reshape(-1), scales.reshape(-1)
+
+
+def test_int8_block16_encode_matches_the_reference_bit_for_bit():
+    """Codes and scales equal the reference encoder bit for bit on four
+    payload families; with them the decoded payload is determined."""
+    from tokenspeed_kernel.ops.communication._iris.payload import (
+        encode_int8_block16,
+    )
+
+    for name, x in _int8_block16_payloads(2026).items():
+        codes, scales = _int8_block16_reference(x)
+        device_codes = torch.empty(x.numel(), dtype=torch.int8, device="cuda")
+        device_scales = torch.empty(x.numel() // 16, dtype=torch.float32, device="cuda")
+        encode_int8_block16[(-(-x.numel() // 4096),)](
+            x.cuda(), device_codes, device_scales, x.numel(), BLOCK=4096
+        )
+        assert torch.equal(device_codes.cpu(), codes), name
+        assert torch.equal(
+            device_scales.cpu().view(torch.int32), scales.view(torch.int32)
+        ), name
+
+
+def test_int8_block16_encode_indexes_past_2_31_elements():
+    """The encode's program bases are 64-bit: the far end of a payload past
+    2^31 elements encodes to the reference's codes and scales.
+
+    The Iris state refuses a producer this large, so serving never reaches
+    it; the test guards the kernel's own offset arithmetic, which must not
+    depend on that refusal.
+    """
+    from tokenspeed_kernel.ops.communication._iris.payload import (
+        encode_int8_block16,
+    )
+
+    elements = 2**31 + 4096
+    x = torch.zeros(elements, dtype=torch.bfloat16, device="cuda")
+    tail = torch.randn(4096, generator=torch.Generator().manual_seed(31)).bfloat16()
+    x[-4096:] = tail.cuda()
+    codes = torch.empty(elements, dtype=torch.int8, device="cuda")
+    scales = torch.empty(elements // 16, dtype=torch.float32, device="cuda")
+    encode_int8_block16[(-(-elements // 4096),)](x, codes, scales, elements, BLOCK=4096)
+    want_codes, want_scales = _int8_block16_reference(tail)
+    assert torch.equal(codes[-4096:].cpu(), want_codes)
+    assert torch.equal(
+        scales[-256:].cpu().view(torch.int32), want_scales.view(torch.int32)
+    )
+    assert bool((want_codes != 0).any())
+
+
+def test_int8_block16_payload_choice_is_checked():
+    """An owned-row collective names its payload: an unknown name raises, and
+    int8-block16 raises when its buffers were not prepared."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
+
+    state = MuseIrisState.__new__(MuseIrisState)
+    state.payload_codes = None
+    assert state._int8_block16("bf16") is False
+    with pytest.raises(ValueError, match="unknown collective payload"):
+        state._int8_block16("fp8")
+    with pytest.raises(RuntimeError, match="not prepared"):
+        state._int8_block16("int8-block16")

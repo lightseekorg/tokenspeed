@@ -93,6 +93,14 @@ the partials of columns [512q, 512q + 512) of every route and publishes them
 with their partial sums of squares, then every rank normalizes, weights,
 and sums all columns.
 
+The owned-row prefill collectives (the QKVG all-to-all and the attention and
+expert reduce-scatters) take an explicit payload encoding. `bf16` pulls the
+producer's rows; `int8-block16` first encodes them into INT8 codes with an
+FP32 scale per 16 elements (`payload.py`), and the pulls decode every element
+to BF16 before their unchanged arithmetic, at 1.25 bytes an element. Both
+modes share each kernel; the int8 reduce-scatter runs a wider grid on its own
+ready flags.
+
 Configure the allocator and optional heap capacity on every rank before the
 first preparation:
 
