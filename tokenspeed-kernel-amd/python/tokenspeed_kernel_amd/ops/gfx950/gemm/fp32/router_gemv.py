@@ -396,14 +396,14 @@ def _splitk_launch(
 
 def _router_selections(n: int, k: int) -> list[tuple[int, tuple[int, ...] | None]]:
     """One row count per distinct kernel choice of an ``[N, K]`` router, with
-    the split-K config it selects (None: the GEMV): each GEMV BLOCK_M (a power
-    of two up to MAX_ROWS), then each measured split-K bucket."""
+    the split-K config it selects (None: the GEMV): each GEMV BLOCK_M that a
+    row count up to MAX_ROWS takes, then each measured split-K bucket."""
     selections = {}
-    rows = 1
-    while rows <= MAX_ROWS:
+    for rows in range(1, MAX_ROWS + 1):
         if _choose_splitk_config(rows, n, k) is None and k <= MAX_K:
-            selections.setdefault(("gemv", rows), (rows, None))
-        rows *= 2
+            # The probe row count is the block itself, so it selects BLOCK_M.
+            block_m = triton.next_power_of_2(rows)
+            selections.setdefault(("gemv", block_m), (block_m, None))
     for bound, config in sorted(_PREFERRED_SPLITK_CONFIGS.get((n, k), {}).items()):
         if config is not None:
             selections.setdefault(("splitk", config), (bound, config))
@@ -807,8 +807,9 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
         dtype=torch.float32,
         device=x.device,
     )
-    mm_block_m, mm_block_n = _choose_decode_config(rows, mm_n, mm_k)[:2]
-    mm_split = _choose_decode_config(rows, mm_n, mm_k)[6]
+    mm_config = _choose_decode_config(rows, mm_n, mm_k)
+    mm_block_m, mm_block_n = mm_config[:2]
+    mm_split = mm_config[6]
     mm_tiles = triton.cdiv(rows, mm_block_m) * triton.cdiv(mm_n, mm_block_n)
     if mm_split > 1:
         check_splitk_counters(

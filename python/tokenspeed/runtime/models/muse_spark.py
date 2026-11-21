@@ -3421,18 +3421,15 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         # fused paths serve (rows past _GATHER_MXFP4_MAX_ROWS when the
         # owned-row layout is not taken, such as a mixed round), which startup
         # warm forwards and capture may never reach.
-        for width in sorted(
-            {
-                projection._local_weight().shape[0]
-                for layer in self.model.layers
-                for projection in (
-                    layer.mlp.pre_expert_proj,
-                    layer.mlp.post_expert_proj,
-                )
-                if isinstance(projection, _MuseGatheredLinear)
-                and projection.workspace is not None
-            }
-        ):
+        widths = set()
+        for layer in self.model.layers:
+            for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
+                if (
+                    isinstance(projection, _MuseGatheredLinear)
+                    and projection.workspace is not None
+                ):
+                    widths.add(projection._local_weight().shape[0])
+        for width in sorted(widths):
             state.gather.warmup(width)
         for layer in self.model.layers:
             layer.iris_state = state

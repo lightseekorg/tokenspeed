@@ -208,7 +208,7 @@ it on gfx950 and transposes the router weight once to `[N, K]`.
   stable.
 - One binary per (shape, multiplier, M bucket): power-of-two buckets up to 16,
   then one per split-K config. `M` is a runtime argument. With
-  `warm_variants` (the registered op passes it during kernel warmup) the
+  `warm_variants` (the registered op passes it during kernel warmup), the
   launcher compiles every bucket's binary for its shape without launching,
   so a batch in a bucket startup never ran does not compile while serving.
 
