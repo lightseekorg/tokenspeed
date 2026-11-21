@@ -26,29 +26,16 @@
 
 namespace tokenspeed {
 
-ReqPoolIndex::ReqPoolIndex(std::int32_t slot, std::uint64_t generation, std::uint64_t previous_admission_id,
-                           ReqPoolAllocator* allocator)
-    : slot_(slot), allocator_(allocator), generation_(generation), previous_admission_id_(previous_admission_id) {}
+ReqPoolIndex::ReqPoolIndex(std::int32_t slot, ReqPoolAllocator* allocator) : slot_(slot), allocator_(allocator) {}
 
 ReqPoolIndex::ReqPoolIndex(ReqPoolIndex&& other) noexcept
-    : slot_(std::exchange(other.slot_, -1)),
-      allocator_(std::exchange(other.allocator_, nullptr)),
-      generation_(std::exchange(other.generation_, 0)),
-      previous_admission_id_(other.previous_admission_id_),
-      admission_id_(other.admission_id_),
-      request_id_(std::move(other.request_id_)),
-      bound_(other.bound_) {}
+    : slot_(std::exchange(other.slot_, -1)), allocator_(std::exchange(other.allocator_, nullptr)) {}
 
 ReqPoolIndex& ReqPoolIndex::operator=(ReqPoolIndex&& other) noexcept {
     if (this != &other) {
         release();
         slot_ = std::exchange(other.slot_, -1);
         allocator_ = std::exchange(other.allocator_, nullptr);
-        generation_ = std::exchange(other.generation_, 0);
-        previous_admission_id_ = other.previous_admission_id_;
-        admission_id_ = other.admission_id_;
-        request_id_ = std::move(other.request_id_);
-        bound_ = other.bound_;
     }
     return *this;
 }
@@ -57,38 +44,43 @@ ReqPoolIndex::~ReqPoolIndex() {
     release();
 }
 
-SlotOwnershipEvent ReqPoolIndex::ownership() const {
-    return {slot_, generation_, admission_id_, previous_admission_id_, request_id_};
-}
-
 void ReqPoolIndex::release() noexcept {
     if (allocator_) {
-        if (bound_ && allocator_->event_sink_) {
-            allocator_->event_sink_->OnSlotReleased(ownership());
-        }
         allocator_->deallocate(slot_);
         allocator_ = nullptr;
     }
 }
 
 void ReqPoolIndex::BindOwner(std::string_view request_id, std::uint64_t admission_id) {
-    if (!valid() || bound_) {
+    if (!valid() || allocator_->slot_history_[slot_ - 1].bound) {
         throw std::logic_error("request pool ownership requires a fresh allocated handle");
     }
     if (allocator_->event_sink_ && admission_id == 0) {
         throw std::invalid_argument("observed request pool ownership requires a nonzero admission identity");
     }
-    admission_id_ = admission_id;
-    allocator_->slot_history_[slot_ - 1].admission_id = admission_id;
-    bound_ = true;
+    auto& history = allocator_->slot_history_[slot_ - 1];
+    // Copy before publishing the binding, so an allocation failure cannot
+    // produce a release observation for an owner that was never assigned.
     if (allocator_->event_sink_) {
-        request_id_ = request_id;
-        allocator_->event_sink_->OnSlotAssigned(ownership());
+        history.request_id = request_id;
+    }
+    history.admission_id = admission_id;
+    history.bound = true;
+    if (allocator_->event_sink_) {
+        allocator_->event_sink_->OnSlotAssigned(history.ownership(slot_));
     }
 }
 
 bool ReqPoolIndex::valid() const {
     return allocator_ != nullptr;
+}
+
+std::uint64_t ReqPoolIndex::generation() const {
+    return valid() ? allocator_->slot_history_[slot_ - 1].generation : 0;
+}
+
+std::uint64_t ReqPoolIndex::previous_admission_id() const {
+    return valid() ? allocator_->slot_history_[slot_ - 1].previous_admission_id : 0;
 }
 
 ReqPoolAllocator::ReqPoolAllocator(std::int32_t size) : size_(size) {
@@ -121,9 +113,10 @@ ReqPoolIndex ReqPoolAllocator::Allocate() {
         throw std::overflow_error("request pool slot generation exhausted");
     }
     ++history.generation;
+    history.previous_admission_id = history.admission_id;
     allocated_ = true;
     free_slots_.pop_front();
-    return ReqPoolIndex{slot, history.generation, history.admission_id, this};
+    return ReqPoolIndex{slot, this};
 }
 
 std::int32_t ReqPoolAllocator::Size() const {
@@ -134,6 +127,12 @@ std::int32_t ReqPoolAllocator::AvailableSlots() const {
 }
 
 void ReqPoolAllocator::deallocate(std::int32_t slot) {
+    auto& history = slot_history_[slot - 1];
+    if (history.bound && event_sink_) {
+        event_sink_->OnSlotReleased(history.ownership(slot));
+        std::string{}.swap(history.request_id);
+    }
+    history.bound = false;
     free_slots_.push_back(slot);
 }
 

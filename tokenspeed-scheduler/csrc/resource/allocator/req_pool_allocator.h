@@ -66,8 +66,8 @@ struct ReqPoolIndex {
     ~ReqPoolIndex();
 
     bool valid() const;
-    std::uint64_t generation() const { return generation_; }
-    std::uint64_t previous_admission_id() const { return previous_admission_id_; }
+    std::uint64_t generation() const;
+    std::uint64_t previous_admission_id() const;
     // Called once when an allocated request row is bound to its admission.
     // The external ID is retained only while observing this live ownership.
     void BindOwner(std::string_view request_id, std::uint64_t admission_id);
@@ -78,16 +78,9 @@ struct ReqPoolIndex {
 private:
     friend class ReqPoolAllocator;
 
-    ReqPoolIndex(std::int32_t slot, std::uint64_t generation, std::uint64_t previous_admission_id,
-                 ReqPoolAllocator* allocator);
+    ReqPoolIndex(std::int32_t slot, ReqPoolAllocator* allocator);
     void release() noexcept;
-    SlotOwnershipEvent ownership() const;
     ReqPoolAllocator* allocator_{nullptr};
-    std::uint64_t generation_{0};
-    std::uint64_t previous_admission_id_{0};
-    std::uint64_t admission_id_{0};
-    std::string request_id_;
-    bool bound_{false};
 };
 
 class ReqPoolAllocator {
@@ -119,6 +112,16 @@ private:
     struct SlotHistory {
         std::uint64_t generation{0};
         std::uint64_t admission_id{0};
+        std::uint64_t previous_admission_id{0};
+        bool bound{false};
+        // Only an observed live owner retains its external ID. Keeping it
+        // here avoids moving a string on every request FSM transition (and
+        // on decode-permit moves, which use the same RAII handle).
+        std::string request_id;
+
+        SlotOwnershipEvent ownership(std::int32_t slot) const {
+            return {slot, generation, admission_id, previous_admission_id, request_id};
+        }
     };
     std::vector<SlotHistory> slot_history_;
     SlotEventSink* event_sink_{nullptr};

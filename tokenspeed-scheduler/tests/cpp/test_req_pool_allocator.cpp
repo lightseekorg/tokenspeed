@@ -116,4 +116,92 @@ TEST(ReqPoolAllocatorTest, ObservedOwnershipRequiresAnIdentityAndCannotBeEnabled
     EXPECT_THROW(allocator.SetEventSink(nullptr), std::logic_error);
 }
 
+TEST(ReqPoolAllocatorTest, ObservationOwnsTheRequestIdUntilTheLastHandleMoveReleasesIt) {
+    RecordingCacheEventSink sink;
+    ReqPoolAllocator allocator(1);
+    allocator.SetEventSink(&sink);
+    const std::string expected_id(256, 'a');
+    {
+        auto slot = allocator.Allocate();
+        {
+            std::string submitted_id = expected_id;
+            slot.BindOwner(submitted_id, 11);
+            submitted_id.assign(256, 'b');
+        }
+        auto moved = std::move(slot);
+        slot = std::move(moved);
+        EXPECT_EQ(slot.generation(), 1u);
+        EXPECT_EQ(slot.previous_admission_id(), 0u);
+        ASSERT_EQ(sink.slots.size(), 1u);
+        EXPECT_EQ(sink.slots.front().request_id, expected_id);
+    }
+    ASSERT_EQ(sink.slots.size(), 2u);
+    EXPECT_FALSE(sink.slots.back().assigned);
+    EXPECT_EQ(sink.slots.back().request_id, expected_id);
+    EXPECT_EQ(sink.slots.back().admission_id, 11u);
+
+    // An allocation that never binds must not release the previous owner
+    // again, even though this physical slot keeps its generation history.
+    {
+        auto unbound = allocator.Allocate();
+        EXPECT_EQ(unbound.generation(), 2u);
+        EXPECT_EQ(unbound.previous_admission_id(), 11u);
+    }
+    EXPECT_EQ(sink.slots.size(), 2u);
+    {
+        auto successor = allocator.Allocate();
+        successor.BindOwner("next", 22);
+        EXPECT_EQ(successor.generation(), 3u);
+        EXPECT_EQ(successor.previous_admission_id(), 11u);
+    }
+    ASSERT_EQ(sink.slots.size(), 4u);
+    EXPECT_EQ(sink.slots.back().request_id, "next");
+    EXPECT_EQ(sink.slots.back().generation, 3u);
+    EXPECT_EQ(sink.slots.back().previous_admission_id, 11u);
+}
+
+TEST(ReqPoolAllocatorTest, MovingBetweenAllocatorsPreservesEachOwnersObservation) {
+    RecordingCacheEventSink first_sink;
+    RecordingCacheEventSink second_sink;
+    ReqPoolAllocator first_allocator(1);
+    ReqPoolAllocator second_allocator(1);
+    first_allocator.SetEventSink(&first_sink);
+    second_allocator.SetEventSink(&second_sink);
+    {
+        auto first = first_allocator.Allocate();
+        first.BindOwner("first", 11);
+        auto second = second_allocator.Allocate();
+        second.BindOwner("second", 22);
+        first = std::move(second);
+        EXPECT_EQ(first_allocator.AvailableSlots(), 1);
+        EXPECT_EQ(second_allocator.AvailableSlots(), 0);
+        ASSERT_EQ(first_sink.slots.size(), 2u);
+        EXPECT_FALSE(first_sink.slots.back().assigned);
+        EXPECT_EQ(first_sink.slots.back().request_id, "first");
+        EXPECT_EQ(second_sink.slots.size(), 1u);
+    }
+    ASSERT_EQ(second_sink.slots.size(), 2u);
+    EXPECT_FALSE(second_sink.slots.back().assigned);
+    EXPECT_EQ(second_sink.slots.back().request_id, "second");
+    EXPECT_EQ(second_sink.slots.back().admission_id, 22u);
+    EXPECT_EQ(second_allocator.AvailableSlots(), 1);
+}
+
+TEST(ReqPoolAllocatorTest, UnobservedOwnershipStillKeepsGenerationAndBindingSemantics) {
+    ReqPoolAllocator allocator(1);
+    {
+        auto slot = allocator.Allocate();
+        slot.BindOwner("first", 11);
+        auto moved = std::move(slot);
+        EXPECT_EQ(moved.generation(), 1u);
+        EXPECT_THROW(moved.BindOwner("second", 22), std::logic_error);
+        EXPECT_FALSE(slot.valid());
+        EXPECT_EQ(slot.generation(), 0u);
+    }
+    auto reused = allocator.Allocate();
+    EXPECT_EQ(reused.generation(), 2u);
+    EXPECT_EQ(reused.previous_admission_id(), 11u);
+    reused.BindOwner("second", 22);
+}
+
 }  // namespace tokenspeed::test

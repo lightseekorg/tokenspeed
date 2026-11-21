@@ -1986,11 +1986,16 @@ zero is refused when observing. The sink adds no queue, GPU work, fences, or
 scheduling decisions. Its caller owns bounded delivery and engine/rank labels;
 a dropped observation cannot be used as evidence of a complete recovery.
 
-Request-slot allocations have a slot-local generation. `ReqPoolIndex` carries
-it through moves, including the restore ticket's handoff at ACK. Binding an
+Request-slot allocations have a slot-local generation. The allocator retains
+ownership metadata in one bounded record per slot; `ReqPoolIndex` moves only
+the slot and its allocator, including the restore ticket's handoff at ACK.
+FSM transitions therefore do not move observation strings, even when observing
+is disabled. External request IDs are copied only with a sink installed and
+released with the owning handle. Binding an
 admission emits `OnSlotAssigned`; dropping the owning handle emits
 `OnSlotReleased`, including when cancellation has left it with a transfer.
-The allocator retains only a generation and the last admission ID per slot.
+After release the allocator retains only generations and admission identities,
+not a history of request IDs.
 An assignment to a different admission proves an ownership handoff; it does
 not by itself prove that a GPU forward wrote the row.
 

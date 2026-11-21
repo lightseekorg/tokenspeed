@@ -304,6 +304,52 @@ TEST_F(CacheEventOwnershipTest, ObservationDoesNotChangePlansOrResourceCounts) {
     EXPECT_EQ(sink_->restores.size(), 1u);
 }
 
+class CacheEventDecodeOwnershipTest : public CacheEventOwnershipTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto config = CacheEventOwnershipTest::MakeConfig();
+        config.debug_force_retraction_interval = 0;
+        config.device_allocator.total_pages = 128;
+        config.cache_groups.front().total_pages = 128;
+        return config;
+    }
+};
+
+TEST_F(CacheEventDecodeOwnershipTest, SteadyDecodeMovesKeepOneOwnerAndIdenticalPlans) {
+    Scheduler unobserved(Config());
+    const auto options = Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false};
+    const std::string request_id(256, 'r');
+    auto request = MakeRequestSpec(request_id, 2);
+    request.admission_id = 11;
+    Submit(request);
+    unobserved.SubmitRequests({request});
+    for (int round = 0; round < 64; ++round) {
+        const auto observed_plan = PlanOnce();
+        EXPECT_EQ(observed_plan, unobserved.NextExecutionPlan(options));
+        const auto* batch = FindForwardBatch(observed_plan);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->request_ids, std::vector<std::string>{request_id});
+        ASSERT_EQ(sink_->slots.size(), 1u) << "FSM moves must not assign or release the slot";
+        ExecutionEvent event;
+        event.With(forward::ExtendResult{.request_id = request_id, .tokens = {42 + round}});
+        scheduler_->Advance(event);
+        unobserved.Advance(std::move(event));
+        EXPECT_EQ(scheduler_->RequestTokenSize(request_id), 4 + round + 1);
+        EXPECT_EQ(scheduler_->RequestTokenSize(request_id), unobserved.RequestTokenSize(request_id));
+        EXPECT_EQ(scheduler_->FreeRequestSlots(), unobserved.FreeRequestSlots());
+    }
+    SendFinish(request_id);
+    PlanOnce();
+    ASSERT_EQ(sink_->slots.size(), 2u);
+    const auto& released = sink_->slots.back();
+    EXPECT_FALSE(released.assigned);
+    EXPECT_EQ(released.request_id, request_id);
+    EXPECT_EQ(released.admission_id, 11u);
+    EXPECT_EQ(released.generation, 1u);
+    EXPECT_EQ(released.previous_admission_id, 0u);
+    EXPECT_TRUE(sink_->restores.empty());
+}
+
 class CachePrefixOwnershipTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
