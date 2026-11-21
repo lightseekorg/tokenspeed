@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 __all__ = ["launch_gluon_dsv41_selected_attention_gfx950"]
@@ -50,8 +51,8 @@ _HEAD_DIM = 512
 _BLOCK_H = 16
 _TILE_K = 64
 # The main kernel keeps one workgroup per CU (VGPR-bound occupancy), so rows
-# are split over workgroups only while the grid still fits the 256 CUs once.
-_TARGET_CTAS = 256
+# are split over workgroups only while the grid still fits the device's CUs
+# once.
 _MAX_SPLITS = 16
 # The reduce splits head dims over workgroups too: one workgroup per token and
 # 16-head group alone is too few to stream a small batch's partials.
@@ -1066,7 +1067,7 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         min(
             _MAX_SPLITS,
             max_tiles,
-            _TARGET_CTAS // (tokens * head_blocks),
+            num_cus(q.device) // (tokens * head_blocks),
         ),
     )
     if splits > 1:

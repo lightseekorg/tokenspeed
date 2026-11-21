@@ -52,6 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel_amd._device import num_xcds
 from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import gluon_moe_sorting
@@ -66,8 +67,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
 )
 
 _MXFP4_BLOCK = gl.constexpr(32)
-# gfx950 (MI350/MI355) dispatches workgroups round-robin over 8 XCDs.
-_NUM_XCDS = 8
+# gfx950 dispatches workgroups round-robin over the device's XCDs.
 # Route sets up to this size are sorted inside the quantization launch.
 _FUSED_SORT_MAX_ROUTES = 1024
 
@@ -763,16 +763,16 @@ class _A4W4Config:
     s2_warps_m: int
     s2_warps_n: int
     s2_coalesce_store: bool
-    num_xcds: int
+    use_xcd_grouping: bool
 
 
 # Decode blocks stream each expert's weights once and gain nothing from XCD
 # grouping; larger blocks share activations across N tiles and weights
 # across the blocks of one expert, so they keep those programs on one L2.
 _CONFIGS = {
-    16: _A4W4Config(16, 64, 1, 4, False, 1, 128, 1, 4, False, 1),
-    32: _A4W4Config(32, 64, 1, 2, True, 1, 512, 1, 4, False, _NUM_XCDS),
-    64: _A4W4Config(64, 64, 1, 2, True, 1, 512, 1, 4, True, _NUM_XCDS),
+    16: _A4W4Config(16, 64, 1, 4, False, 1, 128, 1, 4, False, False),
+    32: _A4W4Config(32, 64, 1, 2, True, 1, 512, 1, 4, False, True),
+    64: _A4W4Config(64, 64, 1, 2, True, 1, 512, 1, 4, True, True),
 }
 
 
@@ -925,7 +925,7 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
         WARPS_N=cfg.s1_warps_n,
         A_VIA_LDS=cfg.s1_a_via_lds,
         PREFETCH=cfg.s1_prefetch,
-        NUM_XCDS=cfg.num_xcds,
+        NUM_XCDS=num_xcds(device) if cfg.use_xcd_grouping else 1,
         num_warps=cfg.s1_warps_m * cfg.s1_warps_n,
     )
 
@@ -951,7 +951,7 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
         WARPS_M=cfg.s2_warps_m,
         WARPS_N=cfg.s2_warps_n,
         COALESCE_STORE=cfg.s2_coalesce_store,
-        NUM_XCDS=cfg.num_xcds,
+        NUM_XCDS=num_xcds(device) if cfg.use_xcd_grouping else 1,
         num_warps=cfg.s2_warps_m * cfg.s2_warps_n,
     )
 
