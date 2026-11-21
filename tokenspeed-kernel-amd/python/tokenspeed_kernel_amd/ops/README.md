@@ -1686,10 +1686,10 @@ change FP8 bits; where the 8-wave grid would leave a partial round of the CUs
 it takes the count, up to twice that, that finishes soonest.
 
 The unsplit kernel places its workgroups by KV head when the head count
-divides the 8 XCDs: workgroup `i` lands on XCD `i % 8`, each head gets its own
+divides the eight XCDs: workgroup `i` lands on XCD `i % 8`, each head gets its own
 `8 / heads` XCDs, and a head's blocks alternate over them, so the workgroups
 sharing an XCD's L2 stream one head's pages. Workgroups left over when the
-launch is not a multiple of 8 take each head's last blocks. Blocks then run
+launch is not a multiple of eight take each head's last blocks. Blocks then run
 last to first, so the shortest work ends the launch. Every (query block, KV
 head) pair still runs once, so placement does not change the output.
 
