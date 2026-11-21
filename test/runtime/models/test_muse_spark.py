@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
@@ -1548,8 +1549,6 @@ def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
 ) -> None:
     """The three owned-row prefill flags apply to Muse Spark only: off their
     defaults, another architecture's checkpoint is refused."""
-    import json
-
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     (tmp_path / "config.json").write_text(
