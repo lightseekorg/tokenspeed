@@ -49,9 +49,12 @@ PAYLOAD_BLOCK = 16
 # does not select a new binary.
 @triton.jit(do_not_specialize=["elements"])
 def encode_int8_block16(x_ptr, codes_ptr, scales_ptr, elements, BLOCK: tl.constexpr):
-    """INT8 codes and FP32 block-16 scales of the first ``elements`` BF16
-    values of ``x_ptr`` (a multiple of 16), into ``codes_ptr`` and
-    ``scales_ptr`` [elements / 16]. One program encodes BLOCK elements."""
+    """Encode BF16 values into INT8 codes and FP32 block-16 scales.
+
+    The first ``elements`` values of ``x_ptr`` (a multiple of 16) go into
+    ``codes_ptr`` and ``scales_ptr`` [elements / 16]. One program encodes
+    BLOCK elements.
+    """
     tl.static_assert(BLOCK % 16 == 0)
     # The program's base grows with the payload: int64, so payloads past
     # 2^31 elements index correctly; offsets inside a program stay int32.
@@ -74,8 +77,11 @@ def encode_int8_block16(x_ptr, codes_ptr, scales_ptr, elements, BLOCK: tl.conste
 
 @gluon.jit
 def load_int8_block16(codes_ptr, scales_ptr, offsets, mask):
-    """BF16 decode of the int8-block16 payload elements at ``offsets``
-    (masked lanes read 0): the pulls' replacement for a BF16 load."""
+    """Load int8-block16 payload elements and decode them to BF16.
+
+    The elements are those at ``offsets``; masked lanes read 0. The pulls use
+    it in place of a BF16 load.
+    """
     codes = gl.amd.cdna4.buffer_load(codes_ptr, offsets, mask, 0, cache=".cg")
     scales = gl.amd.cdna4.buffer_load(scales_ptr, offsets // 16, mask, 0.0, cache=".cg")
     return (codes.to(gl.float32) * scales).to(gl.bfloat16)
