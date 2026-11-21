@@ -310,6 +310,13 @@ def _lamport_gather_rmsnorm_worker(rank, world_size, device):
     width = 4096
     local_width = width // world_size
     weight = torch.linspace(-0.5, 0.5, width, device=device).to(torch.bfloat16)
+    # The BF16 gather stays inside the one-shot window; the rest of the slot
+    # serves only the quantizing gather.
+    past_window = state.reduction.lamport_max_numel // local_width + 1
+    assert not state.can_all_gather_rmsnorm(
+        torch.empty(past_window, local_width, dtype=torch.bfloat16, device=device),
+        weight,
+    )
     for rows in (1, 8, 16, 64):
         gen = torch.Generator(device=device).manual_seed(rows)
         full = torch.randn(rows, width, generator=gen, device=device).to(torch.bfloat16)
@@ -1628,7 +1635,7 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
             RANK=rank,
             WORLD_SIZE=world_size,
             total_elements=raw_input.numel(),
-            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            MAX_ELEMENTS=state.reduction.lamport_capacity,
             NUM_STAGES=3,
             PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
@@ -1636,8 +1643,9 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
 
     # 128 rows exceed the pull variant's 84 ready flags; Lamport needs none.
     # 129 and 172 rows end in a padded 32-row scale panel; 160 ends exactly
-    # on a panel boundary.
-    for rows in (1, 3, 16, 128, 129, 160, 172):
+    # on a panel boundary. 173 and 320 rows lie past the one-shot window, in
+    # the rest of the slot.
+    for rows in (1, 3, 16, 128, 129, 160, 172, 173, 320):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, width),))[0]
             local = published[:, rank * local_width : (rank + 1) * local_width]
@@ -1724,7 +1732,9 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
     width, local_width, experts, topk, scale = 4096, 4096 // world_size, 256, 8, 2.5
     weight = (torch.randn(width, device=device) * 0.1).bfloat16()
     bias = torch.randn(experts, device=device) * 0.01
-    for rows in (2, 8, 16):
+    # 17 rows are past the router's shared launch; 173 and 320 past the
+    # one-shot window.
+    for rows in (2, 8, 16, 17, 173, 320):
         local = torch.empty((rows, local_width), dtype=torch.bfloat16, device=device)
         logits = torch.empty((rows, experts), dtype=torch.float32, device=device)
         generator = torch.Generator(device=device)
@@ -1785,7 +1795,7 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
     # The row count is a runtime argument: rows of an already compiled
     # specialization class reuse its binary.
     with assert_no_triton_compile(iris_fused_lamport_allgather_rmsnorm_mxfp4_topk):
-        for rows in (3, 5, 12):
+        for rows in (3, 5, 12, 200, 319):
             local = torch.zeros(
                 (rows, local_width), dtype=torch.bfloat16, device=device
             )
@@ -1831,7 +1841,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             RANK=rank,
             WORLD_SIZE=world_size,
             total_elements=value.numel(),
-            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            MAX_ELEMENTS=state.reduction.lamport_capacity,
             NUM_STAGES=3,
             PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
@@ -2817,7 +2827,7 @@ def _muse_tp_route_scatter_worker(rank, world_size, device):
             RANK=rank,
             WORLD_SIZE=world_size,
             total_elements=raw_input.numel(),
-            MAX_ELEMENTS=state.reduction.lamport_max_numel,
+            MAX_ELEMENTS=state.reduction.lamport_capacity,
             NUM_STAGES=3,
             PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
             num_warps=1,
@@ -3052,7 +3062,7 @@ def _muse_tp_column_routes_worker(rank, world_size, device):
                 RANK=rank,
                 WORLD_SIZE=world_size,
                 total_elements=one_shot_input.numel(),
-                MAX_ELEMENTS=state.reduction.lamport_max_numel,
+                MAX_ELEMENTS=state.reduction.lamport_capacity,
                 NUM_STAGES=3,
                 PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
                 num_warps=1,

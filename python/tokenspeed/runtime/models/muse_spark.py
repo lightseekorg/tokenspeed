@@ -160,14 +160,18 @@ _GATHER_WORKSPACE_ROWS = 64
 _GATHER_MAILBOX_ROWS = 512
 # Past this, multicasting a full partial per rank costs more than the two-shot all-reduce (128 rows: 73 us vs 29).
 _REDUCE_MAILBOX_ROWS = 64
-# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path. It is the
-# TP4 Lamport mailbox capacity (43 * 4096 elements, i.e. 172 rows of a
-# 1024-wide shard), and TP8 uses the same limit. In measurements the fused
-# path was faster than the column gather plus a separate quantize at every
-# row count tested above 64, up to 191 rows at TP8 and 172 at TP4. Pre-expert
-# workspace rows past 64 serve only as the fused path's placeholder for the
-# gathered BF16 rows, which it returns but does not fill.
-_GATHER_MXFP4_MAX_ROWS = 172
+# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path: the TP4
+# Lamport mailbox capacity (ProducerAllReduce.LAMPORT_CAPACITY_ELEMENTS, 320
+# rows of a 1024-wide shard); TP8 uses the same limit. In TP4 graph replay the
+# fused path beat the column gather plus a separate quantize at every row
+# count tested, 64 to 320, with the same bits. Pre-expert workspace rows past
+# 64 serve only as the fused path's placeholder for the gathered BF16 rows,
+# which it returns but does not fill.
+_GATHER_MXFP4_MAX_ROWS = 320
+# Row limit of the fused gather + RMSNorm (BF16 output) path, the one-shot
+# Lamport window (172 rows of a 1024-wide shard). It matches the separate norm
+# within one BF16 ulp, not bit for bit, so it keeps its bound.
+_GATHER_RMSNORM_MAX_ROWS = 172
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
@@ -545,7 +549,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             iris is not None
             and norm.weight is not None
             and self.workspace is not None
-            and x.shape[0] <= min(_GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0])
+            and x.shape[0] <= min(_GATHER_RMSNORM_MAX_ROWS, self.workspace.shape[0])
         ):
             local_weight = self._local_weight()
             local = x.new_empty((x.shape[0], local_weight.shape[0]))
@@ -1888,13 +1892,14 @@ class MuseSparkMoE(nn.Module):
         ]
         | None
     ):
-        """Route and quantize decode rows in two launches, or None.
+        """Route and quantize decode rows in two or three launches, or None.
 
-        The router shares a launch with this rank's pre-expert columns, and the
-        top-k shares one with the column gather, RMSNorm and MXFP4
-        quantization. Neither launch has a dependency between its halves, so
-        this replaces four launches with two. Returns the BF16 placeholder
-        rows, the MXFP4 rows, the router logits and the top-k weights and ids.
+        The top-k shares a launch with the column gather, RMSNorm and MXFP4
+        quantization, and up to the router's shared-launch row limit the router
+        shares one with this rank's pre-expert columns. Neither launch has a
+        dependency between its halves, so this replaces four launches with two
+        (three past that limit). Returns the BF16 placeholder rows, the MXFP4
+        rows, the router logits and the top-k weights and ids.
         """
         iris = self.iris_state
         projection = self.pre_expert_proj
@@ -1912,16 +1917,19 @@ class MuseSparkMoE(nn.Module):
         weight = projection._local_weight()
         local = hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
         bias = self.gate.e_score_correction_bias
-        if not (
-            self.gate.supports_with_mm(router_input, hidden_states, weight)
-            and iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
-                local, norm.weight, bias, self.topk
-            )
+        if not iris.can_all_gather_rmsnorm_mxfp4_quant_topk(
+            local, norm.weight, bias, self.topk
         ):
             return None
-        router_logits = self.gate.forward_with_mm(
-            router_input, hidden_states, weight, local
-        )
+        if self.gate.supports_with_mm(router_input, hidden_states, weight):
+            router_logits = self.gate.forward_with_mm(
+                router_input, hidden_states, weight, local
+            )
+        else:
+            # Rows past the router's shared-launch limit leave the router and
+            # this rank's pre-expert columns a launch each.
+            router_logits = self.gate(router_input, pdl_enabled())
+            projection._project(hidden_states, weight, local)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,
