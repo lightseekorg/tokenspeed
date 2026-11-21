@@ -1862,8 +1862,10 @@ class TestCompactHostParentTest:
 
         def empty(*args, **kwargs):
             # Pinned Host buffers need a GPU; plain CPU tensors stand in.
-            if kwargs.get("pin_memory", False):
-                kwargs["pin_memory"] = False
+            if kwargs.pop("pin_memory", False):
+                tensor = allocate(*args, **kwargs)
+                tensor.is_pinned = lambda: True
+                return tensor
             return allocate(*args, **kwargs)
 
         monkeypatch.setattr(torch, "empty", empty)

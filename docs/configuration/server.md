@@ -1807,8 +1807,9 @@ ratios and the derived retraction snapshot pool) pin that much more Host
 memory; the gigabyte sizes keep their byte budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
-equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Available means the smaller of the host's free memory and
+equal share of the Host memory its node has available, less
+`--kvstore-host-headroom-gib` per rank (10 GiB by default).
+Available means the smaller of the host's free memory and
 what the process's memory cgroup still allows (its limit, `memory.max` or
 `memory.high` on cgroup v2, less its usage with page cache counted as free;
 the tightest limit over its cgroup and the ones above it, found through
@@ -1830,6 +1831,9 @@ settings. A `pinned_max_cached_size_mb` limit also disables rounding above
 its threshold and releases those blocks when unused; it limits individual
 block size, not total cached bytes. Device backends without allocator
 snapshots retain the conservative power-of-two estimate.
+
+On Linux, enable `--kvstore-release-checkpoint-cache` to ask the kernel to
+reclaim clean checkpoint pages before allocating the Host cache.
 
 A ratio size larger than a rank's share is capped to the largest whole-LCM
 buffer that fits under those allocator settings beside its snapshot pool,

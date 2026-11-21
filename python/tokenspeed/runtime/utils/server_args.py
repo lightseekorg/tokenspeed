@@ -629,6 +629,8 @@ class ServerArgs:
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
+    kvstore_host_headroom_gib: int = 10
+    kvstore_release_checkpoint_cache: bool = False
     kvstore_io_backend: str = "kernel"
     # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
     kvstore_write_policy: str = "write_through"
@@ -3730,6 +3732,17 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-release-checkpoint-cache",
+            action="store_true",
+            help="Advise Linux to evict local safetensors checkpoint pages after loading, before pinning the Host cache.",
+        )
+        parser.add_argument(
+            "--kvstore-host-headroom-gib",
+            type=int,
+            default=ServerArgs.kvstore_host_headroom_gib,
+            help="GiB of available Host memory per local rank to reserve outside the pinned cache and retraction pools.",
         )
         parser.add_argument(
             "--kvstore-write-policy",
