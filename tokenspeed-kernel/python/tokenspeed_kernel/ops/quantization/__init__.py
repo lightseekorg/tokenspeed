@@ -20,7 +20,11 @@ from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    SelectedKernel,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -38,6 +42,7 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
+    "supports_quantize_mxfp4",
     "rmsnorm_mxfp4_quant",
     "rmsnorm_nvfp4_quant",
     "rmsnorm_quantize_fp8_group32",
@@ -727,6 +732,66 @@ def quantize_nvfp4(
         )
 
 
+def _select_quantize_mxfp4(
+    dtype: torch.dtype,
+    *,
+    scale_size: int,
+    scale_layout: str,
+    has_global_scale: bool,
+    solution: str | None,
+    override: str | None,
+) -> SelectedKernel:
+    """Select the kernel ``quantize_mxfp4`` runs for these options."""
+    return select_kernel(
+        "quantization",
+        "mxfp4",
+        format_signature(x=dense_tensor_format(dtype)),
+        traits={
+            "scale_size": scale_size,
+            "scale_layout": scale_layout,
+            "has_global_scale": has_global_scale,
+            "scale_encoding": "ue8m0",
+        },
+        solution=solution,
+        override=override,
+    )
+
+
+def supports_quantize_mxfp4(
+    dtype: torch.dtype,
+    *,
+    scale_size: int,
+    scale_layout: Literal["linear", "128x4", "8x4"],
+    has_global_scale: bool,
+) -> bool:
+    """Whether ``quantize_mxfp4`` has a kernel on this platform for these options.
+
+    Selects exactly as ``quantize_mxfp4`` does, so a caller can refuse an
+    unsupported configuration before it has any tensor to quantize.
+
+    Args:
+        dtype: Input tensor dtype.
+        scale_size: Number of values per scale-factor vector.
+        scale_layout: Scale-factor layout, such as linear, 128x4, or 8x4.
+        has_global_scale: Whether a global scale would be passed.
+
+    Returns:
+        True if a registered kernel serves the call.
+    """
+    try:
+        _select_quantize_mxfp4(
+            dtype,
+            scale_size=scale_size,
+            scale_layout=scale_layout,
+            has_global_scale=has_global_scale,
+            solution=None,
+            override=None,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
 def quantize_mxfp4(
     x: torch.Tensor,
     # quantization options
@@ -765,18 +830,11 @@ def quantize_mxfp4(
     if scale_size <= 0:
         raise ValueError(f"scale_size must be positive, got {scale_size}")
 
-    traits = {
-        "scale_size": scale_size,
-        "scale_layout": scale_layout,
-        "has_global_scale": global_scale is not None,
-        "scale_encoding": "ue8m0",
-    }
-    signature = format_signature(x=dense_tensor_format(x.dtype))
-    kernel = select_kernel(
-        "quantization",
-        "mxfp4",
-        signature,
-        traits=traits,
+    kernel = _select_quantize_mxfp4(
+        x.dtype,
+        scale_size=scale_size,
+        scale_layout=scale_layout,
+        has_global_scale=global_scale is not None,
         solution=solution,
         override=override,
     )

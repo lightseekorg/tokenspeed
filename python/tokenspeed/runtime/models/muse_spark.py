@@ -69,6 +69,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_mxfp4,
     rmsnorm_mxfp4_quant,
     rmsnorm_nvfp4_quant,
+    supports_quantize_mxfp4,
 )
 from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,
@@ -77,12 +78,7 @@ from tokenspeed_kernel.ops.residual import (
     residual_gate_coefficients,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.selection import (
-    NoKernelFoundError,
-    resolve_kernel_override,
-    select_kernel,
-)
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
 
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
@@ -2817,6 +2813,12 @@ class MuseSparkModel(BaseTransformerModel):
             prefix=prefix,
             encode_bf16_experts=encoding == "mxfp4",
         )
+        if encoding != "none" and quant_config is None:
+            raise ValueError(
+                f"--quantize-unquantized-experts {encoding}: the checkpoint is not "
+                "quantized, so there is no expert format to encode into; serve "
+                "with none"
+            )
         if encoding != "none" and not encoded_expert_layers:
             raise ValueError(
                 f"--quantize-unquantized-experts {encoding}: the checkpoint leaves "
@@ -2845,24 +2847,17 @@ class MuseSparkModel(BaseTransformerModel):
             scale_size = quant_config.group_size
             # Refuse here, naming the flag, on a platform with no linear-layout
             # MXFP4 quantizer, rather than in the middle of loading weights.
-            try:
-                select_kernel(
-                    "quantization",
-                    "mxfp4",
-                    format_signature(x=dense_tensor_format(torch.bfloat16)),
-                    traits={
-                        "scale_size": scale_size,
-                        "scale_layout": "linear",
-                        "has_global_scale": False,
-                        "scale_encoding": "ue8m0",
-                    },
-                )
-            except NoKernelFoundError as error:
+            if not supports_quantize_mxfp4(
+                torch.bfloat16,
+                scale_size=scale_size,
+                scale_layout="linear",
+                has_global_scale=False,
+            ):
                 raise ValueError(
                     "--quantize-unquantized-experts mxfp4 needs an MXFP4 "
                     "quantization kernel with the linear scale layout, and this "
                     "platform registers none"
-                ) from error
+                )
             self.expert_encoding_scale_size = scale_size
         self.norm = MuseSparkRMSNorm(
             hidden_size=config.hidden_size,

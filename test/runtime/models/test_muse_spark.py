@@ -834,13 +834,16 @@ def test_encoded_bf16_expert_layer_loads_the_repositorys_mxfp4_encoding(
             for projection in ("gate_proj", "up_proj", "down_proj")
         ]
     )
-    build = lambda: MuseSparkForConditionalGeneration(  # noqa: E731
-        config,
-        mapping,
-        quant_config,
-        is_multimodal_active=False,
-        mm_attention_backend=None,
-    )
+
+    def build():
+        return MuseSparkForConditionalGeneration(
+            config,
+            mapping,
+            quant_config,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
+
     if encode and not current_platform().is_cdna4:
         # No linear-layout MXFP4 quantizer is registered off gfx950: the build
         # refuses, naming the flag, before any weight loads.
@@ -912,6 +915,32 @@ def test_encoded_bf16_expert_layer_loads_the_repositorys_mxfp4_encoding(
         )
         assert torch.equal(expected["w2_weight"], shard_codes)
         assert torch.equal(expected["w2_weight_scale"], shard_scales)
+
+
+@requires_gpu
+def test_encoding_refuses_a_checkpoint_that_is_not_quantized(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--quantize-unquantized-experts mxfp4 on a checkpoint without a
+    quantization config has no expert format to encode into: the build says
+    so, rather than that no layer is unquantized."""
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: None
+    )
+    monkeypatch.setitem(
+        module.global_server_args_dict, "quantize_unquantized_experts", "mxfp4"
+    )
+    mapping, _, _ = _layout_mapping("ep4")
+    with torch.device("cuda"), pytest.raises(
+        ValueError, match="the checkpoint is not quantized"
+    ):
+        MuseSparkForConditionalGeneration(
+            _tiny_config(),
+            mapping,
+            None,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
 
 
 @requires_gpu

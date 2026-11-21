@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_mxfp4,
     quantize_mxfp8,
     quantize_nvfp4,
+    supports_quantize_mxfp4,
 )
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.ops.quantization import trtllm as quant_trtllm
@@ -924,3 +925,21 @@ def test_quantize_nvfp4_shape_and_scale(
     assert out.shape[:-1] == x.shape[:-1]
     assert out.shape[-1] == x.shape[-1] // 2
     assert scale.numel() > 0
+
+
+@pytest.mark.parametrize("scale_layout", ["linear", "128x4", "8x4"])
+def test_supports_quantize_mxfp4_agrees_with_the_call(device, scale_layout) -> None:
+    """supports_quantize_mxfp4 answers as quantize_mxfp4 itself selects: where
+    it says yes the call quantizes, and where it says no the call finds no
+    kernel."""
+    x = torch.randn(4, 64, device=device, dtype=torch.bfloat16)
+    supported = supports_quantize_mxfp4(
+        x.dtype, scale_size=32, scale_layout=scale_layout, has_global_scale=False
+    )
+    if supported:
+        codes, scales = quantize_mxfp4(x, scale_size=32, scale_layout=scale_layout)
+        assert codes.shape[0] == x.shape[0]
+        assert scales.numel() > 0
+    else:
+        with pytest.raises(NoKernelFoundError):
+            quantize_mxfp4(x, scale_size=32, scale_layout=scale_layout)
