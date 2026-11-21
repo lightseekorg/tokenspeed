@@ -60,7 +60,7 @@ pub use batch::BatchRows;
 pub use bootstrap::{BootstrapServer, Registry};
 pub use control::{
     BootstrapInfo, EmbeddingChunk, EmbeddingItem, EmbeddingReceiver, EmbeddingSender, LandedItem,
-    LandedRequest, PdError, PdEvent, RemotePrefill, TransferPeer,
+    LandedRequest, PdError, PdEvent, RemotePrefill, SendRing, SendSlot, TransferPeer,
 };
 pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer};
 pub use layout::{
