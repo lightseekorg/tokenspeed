@@ -245,6 +245,17 @@ Operators can prepare compilation variants during ordinary execution with
 `ops.tuning.kernel_warmup(enabled=True)` and `is_warming_up()`. FlashInfer
 profiling uses a separate `autotune` context.
 
+Measured decisions use `selection.autotune_decide`: it measures a cache miss
+only during kernel warmup and outside graph capture, and otherwise returns the
+cached decision or `None` (the caller keeps its heuristic). Under the
+autotune process group, rank 0 measures and broadcasts so every rank decides
+alike. Decisions persist as JSON under `$TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR`
+(default `~/.cache/tokenspeed/kernel-autotune`), one file per device, compute
+unit count and Torch/HIP/CUDA/Triton version, keyed by the operator, the shape
+and a hash of the compared kernels' sources. `SelectionStrategy.AUTOTUNE`
+times the candidates of an operator that registered a benchmark with
+`register_autotune_benchmark`.
+
 Triton operators can register finite launch variants with
 `warmup.register_triton_warmup` for scalar alignment classes and bounded tile
 choices that vary with request shapes. `warmup.kernel_launcher` prepares these
