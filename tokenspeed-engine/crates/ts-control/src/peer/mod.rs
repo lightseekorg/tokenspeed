@@ -783,7 +783,7 @@ impl Peer {
                         metrics.queue_read(
                             fetch.holder.clone(),
                             self.member,
-                            spans.lengths.iter().sum(),
+                            spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
                     self.reads.submit_observed(

@@ -81,6 +81,17 @@ pub struct PushJob {
     pub items: Vec<PushItem>,
 }
 
+impl PushJob {
+    /// The bytes it lands.
+    pub fn bytes(&self) -> u64 {
+        self.items
+            .iter()
+            .flat_map(|item| &item.spans)
+            .map(|span| span.length)
+            .sum()
+    }
+}
+
 /// The member's bounded read workers: jobs in, outcomes out.
 pub struct Reads {
     jobs: Option<mpsc::Sender<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>>,
@@ -135,7 +146,9 @@ impl Reads {
                     };
                     // The push holds the landing too: a failed read still
                     // waits for it, so no write trails the outcome.
+                    let mut disk_bytes = 0;
                     if let Some(push) = job.push {
+                        disk_bytes = push.bytes();
                         let pushed =
                             pusher.push(&push.endpoint, &push.session, push.budget, push.items);
                         outcome = outcome.and(pushed);
@@ -145,6 +158,7 @@ impl Reads {
                             started,
                             started.elapsed(),
                             job.spans.host_bytes,
+                            disk_bytes,
                             outcome.is_ok(),
                         );
                     }

@@ -661,6 +661,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         std::time::Instant::now(),
         std::time::Duration::from_millis(200),
         16,
+        8,
         true,
     );
     drop(cancelled);
@@ -669,6 +670,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         std::time::Instant::now(),
         std::time::Duration::ZERO,
         192,
+        0,
         false,
     );
     engine.peer.usage(Some(10), 14, "used");
@@ -677,7 +679,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
     let Some(text) = render(&directory) else {
         return;
     };
-    for (tier, expected) in [("host", 16.0), ("device", 48.0)] {
+    for (tier, expected) in [("host", 16.0), ("disk", 8.0), ("device", 40.0)] {
         let line = text
             .lines()
             .find(|line| {
