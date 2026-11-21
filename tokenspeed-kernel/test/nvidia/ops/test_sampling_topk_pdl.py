@@ -20,9 +20,9 @@
 
 """Check the fused Top-K/Top-P pipeline behind a producer that signals early."""
 
+import pathlib
 import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -32,12 +32,12 @@ PRODUCER_DELAY_CYCLES = 100_000_000
 
 
 @pytest.fixture(scope="module")
-def topk_pdl_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def topk_pdl_binary(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     nvcc = shutil.which("nvcc")
     if nvcc is None:
         pytest.skip("CUDA compiler is required for the native PDL regression")
-    source = Path(__file__).with_name("sampling_topk_pdl.cu")
-    kernel = Path(__file__).resolve().parents[3]
+    source = pathlib.Path(__file__).with_name("sampling_topk_pdl.cu")
+    kernel = pathlib.Path(__file__).resolve().parents[3]
     include = kernel / "python/tokenspeed_kernel/thirdparty/cuda/csrc/fused_topk_topp"
     binary = tmp_path_factory.mktemp("topk-pdl") / "test"
     compiled = subprocess.run(
@@ -64,7 +64,7 @@ def topk_pdl_binary(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 @pytest.mark.parametrize("mode", ["eager", "graph"])
 def test_fused_pipeline_waits_for_pdl_producer(
-    topk_pdl_binary: Path, mode: str
+    topk_pdl_binary: pathlib.Path, mode: str
 ) -> None:
     completed = subprocess.run(
         [str(topk_pdl_binary), mode, str(PRODUCER_DELAY_CYCLES)],
