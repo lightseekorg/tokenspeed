@@ -882,6 +882,29 @@ class Mailbox:
         )
 
     @gluon.jit
+    def raise_flag_peer(self, region: gl.constexpr, peer, index):
+        """:meth:`raise_flag_peers` on rank ``peer``'s copy only, for a
+        producer whose :meth:`store_words_peer` went to that rank alone."""
+        gl.static_assert(
+            schedule.is_flag(self.plan, region),
+            "raise_flag_peer needs a peer region declared in Plan.flags",
+        )
+        self._check_world()
+        _extern.release_wait_vmem()
+        gl.barrier()
+        lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
+        ptrs = self.peers.translate(
+            self.scratch + self._base(region) + index + lanes * 0, peer
+        )
+        _put(
+            ptrs,
+            gl.full(lanes.shape, 1, gl.int32, lanes.type.layout),
+            self.tag,
+            lanes == 0,
+            "sys",
+        )
+
+    @gluon.jit
     def load_words(self, region: gl.constexpr, index):
         """Load the 32-bit words at ``index`` of ``region`` (int32) that a
         producer published with :meth:`raise_flag`, past the caches

@@ -214,6 +214,8 @@ def _checkpoint_architectures(
 # Checkpoint architectures with decode monokernels (--decode-monokernel). A
 # model adds its architecture here with its monokernel seam.
 DECODE_MONOKERNEL_ARCHITECTURES = (
+    "Inkling2ForConditionalGeneration",
+    "Inkling2LoopForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
@@ -740,6 +742,11 @@ class ServerArgs:
     # A directory for each rank's decode monokernel stuck-poll record file
     # (None: the records stay in pinned memory).
     monokernel_stuck_record_dir: str | None = None
+    # A variable-loop Inkling2 checkpoint's loop passes (None: the
+    # checkpoint's num_passes), and whether all passes of a core layer share
+    # one KV cache (False: one per pass, the checkpoint's layout).
+    inkling2_loop_num_passes: int | None = None
+    inkling2_loop_share_cache: bool = False
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -3201,6 +3208,13 @@ class ServerArgs:
                 "--monokernel-stuck-record-dir needs --decode-monokernel: only "
                 "the monokernel launches write stuck-poll records"
             )
+        if self.inkling2_loop_num_passes is not None and (
+            self.inkling2_loop_num_passes < 1
+        ):
+            raise ValueError(
+                "--inkling2-loop-num-passes must be at least 1, got "
+                f"{self.inkling2_loop_num_passes}"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -4673,6 +4687,30 @@ class ServerArgs:
                 "outlives the process; a run without a stuck poll removes the "
                 "files at exit. Without it the records stay in pinned memory "
                 "and are logged when the failure reaches Python."
+            ),
+        )
+        parser.add_argument(
+            "--inkling2-loop-num-passes",
+            type=int,
+            default=ServerArgs.inkling2_loop_num_passes,
+            help=(
+                "Loop passes per token for an inkling2_loop checkpoint with "
+                "loop_config.is_varloop=true (at least 1); each pass runs "
+                "the loop core's layers once more. Default: the "
+                "checkpoint's num_passes. A draft model needs the "
+                "checkpoint's count: it reads fixed layer visits."
+            ),
+        )
+        parser.add_argument(
+            "--inkling2-loop-share-cache",
+            action="store_true",
+            default=ServerArgs.inkling2_loop_share_cache,
+            help=(
+                "For an inkling2_loop checkpoint with loop_config.is_varloop="
+                "true: every loop pass of a core layer reads and writes that "
+                "layer's one KV cache, so later tokens attend to the last "
+                "pass's K/V, instead of one cache per pass. Cuts the loop "
+                "core's KV memory; convolution state stays one per pass."
             ),
         )
         parser.add_argument(

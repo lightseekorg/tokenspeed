@@ -21,13 +21,22 @@
 """Native recurrent proposals over the common fixed-block draft round."""
 
 import torch
+
+# Triton-only Inkling2 step kernels outside the registry; Triton serves every supported vendor.
+from tokenspeed_kernel.ops.activation._triton.gated_recurrence import (
+    capped_logit_sum_key_blocks,
+)
 from tokenspeed_kernel.ops.metadata import gather_last_accepted_rows
 
-# A stateful NVIDIA collective outside the registry; without a state the gather path runs.
+# A stateful NVIDIA collective outside the registry; without a state the
+# portable block-key path below runs.
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     DistArgmaxState,
     distributed_argmax,
     supports_dist_argmax_shape,
+)
+from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
+    merge_argmax_keys,
 )
 from torch import nn
 
@@ -35,6 +44,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.logits_processor import _dist_argmax_vetoed
+from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
 
 # The distributed argmax reads rows whose width is a multiple of this.
 _STEP_LOGITS_ALIGNMENT = 32
@@ -92,6 +102,10 @@ class Inkling2DSpark(DFlash):
         self._context_written = False
         # Step logits, sized before capture by the first proposal.
         self._step_logits_buf: torch.Tensor | None = None
+        # Without the distributed argmax: the step logits' block argmax keys
+        # and every rank's gathered ones, sized with the step logits.
+        self._step_keys_buf: torch.Tensor | None = None
+        self._step_keys_landing: torch.Tensor | None = None
 
     def wire_target(self, target_model: nn.Module) -> None:
         if (
@@ -219,10 +233,17 @@ class Inkling2DSpark(DFlash):
         distributed argmax's column alignment."""
         if self._step_logits_buf is None:
             width = -(-shard // _STEP_LOGITS_ALIGNMENT) * _STEP_LOGITS_ALIGNMENT
+            max_bs = self.input_buffers.max_bs
             self._step_logits_buf = torch.empty(
-                (self.input_buffers.max_bs, width),
-                dtype=torch.bfloat16,
-                device=self.device,
+                (max_bs, width), dtype=torch.bfloat16, device=self.device
+            )
+            blocks = capped_logit_sum_key_blocks(width)
+            tp_size = int(self.logits_processor.tp_size)
+            self._step_keys_buf = torch.empty(
+                (max_bs, blocks), dtype=torch.int64, device=self.device
+            )
+            self._step_keys_landing = torch.empty(
+                (tp_size * max_bs, blocks), dtype=torch.int64, device=self.device
             )
         return self._step_logits_buf
 
@@ -259,11 +280,28 @@ class Inkling2DSpark(DFlash):
         logits_out = self._step_logits(shard)[: hidden.shape[0]]
         # The probe reads the step-logits width; the gather fallback reuses its verdict.
         state = self._ensure_dist_argmax_state(logits_out.dtype, logits_out.device)
+        rows = hidden.shape[0]
+        keys = None
+        if state is None and logits_out.is_cuda:
+            # The step logits leave their block argmax keys; one gather of
+            # those picks the global argmax, the largest logit's lowest
+            # vocabulary id, as the gather of every shard's maximum does.
+            keys = self._step_keys_buf[:rows]
+            tp_size = int(self.logits_processor.tp_size)
+            landing = self._step_keys_landing[: tp_size * rows]
 
         def sample(logits: torch.Tensor, step: int) -> torch.Tensor:
             if state is not None:
                 # Indices over the -inf-padded shards; the head maps them back to vocabulary ids.
                 return distributed_argmax(state, logits)[1]
+            if keys is not None:
+                gathered = gather_topk_pairs(
+                    keys, landing, tp_size, self.logits_processor.tp_group
+                )
+                return merge_argmax_keys(
+                    gathered,
+                    out=torch.empty(rows, dtype=torch.int32, device=keys.device),
+                )
             return self._greedy_argmax_vocab_parallel(
                 hidden[:, step],
                 out=None,
@@ -277,6 +315,7 @@ class Inkling2DSpark(DFlash):
             hidden_states=hidden,
             f_rnn=self._proposal_features_buf[: hidden.shape[0]],
             logits_out=logits_out,
+            keys_out=keys,
             sampler=sample,
             shard_padding=None if state is None else (logits_out.shape[1], shard),
         )

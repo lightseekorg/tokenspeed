@@ -189,9 +189,19 @@ class AutoBackend(CommBackend):
             if folded is not None:
                 return folded
         rows = tensor.contiguous().view(-1, tensor.shape[-1] if tensor.dim() else 1)
-        # Last-dim gather on the multicast kernels: [rows, world * width], rank-major.
-        gathered = self.all_gather(rows, group, dim=-1)
-        parts = gathered.view(rows.shape[0], world_size, rows.shape[1]).transpose(0, 1)
+        if current_platform().is_amd and not self._iris.gathers_in_one_launch(
+            rows, group
+        ):
+            # Past one Iris launch, NCCL's row gather is faster (TP4 MI350, 2048
+            # rows of 2304: 221 against 778 us) and is already rank-major.
+            parts = rows.new_empty((world_size, *rows.shape))
+            self._nccl.all_gather_single(parts.view(-1, rows.shape[1]), rows, group)
+        else:
+            # Last-dim gather on the multicast kernels: [rows, world * width], rank-major.
+            gathered = self.all_gather(rows, group, dim=-1)
+            parts = gathered.view(rows.shape[0], world_size, rows.shape[1]).transpose(
+                0, 1
+            )
         ordered_fold_sum(parts, rows)
         if rows.data_ptr() != tensor.data_ptr():
             tensor.copy_(rows.view(tensor.shape))
