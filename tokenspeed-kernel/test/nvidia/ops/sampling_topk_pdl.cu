@@ -32,22 +32,22 @@
 
 using TopPCounter = air_top_p::Counter<float>;
 
-void check_cuda(cudaError_t error) {
+void CheckCuda(cudaError_t error) {
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
 template <typename T>
 struct DeviceBuffer {
     T* data = nullptr;
-    explicit DeviceBuffer(size_t count) { check_cuda(cudaMalloc(&data, sizeof(T) * count)); }
+    explicit DeviceBuffer(size_t count) { CheckCuda(cudaMalloc(&data, sizeof(T) * count)); }
     ~DeviceBuffer() { cudaFree(data); }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 };
 
 // Dependents may launch as soon as every CTA has signalled; the stores follow.
-__global__ void early_signal_producer(float* probs, const float* fresh, size_t count,
-                                      unsigned long long delay_cycles) {
+__global__ void EarlySignalProducer(float* probs, const float* fresh, size_t count,
+                                    unsigned long long delay_cycles) {
     cudaTriggerProgrammaticLaunchCompletion();
     auto start = clock64();
     while (clock64() - start < delay_cycles) {
@@ -60,8 +60,11 @@ __global__ void early_signal_producer(float* probs, const float* fresh, size_t c
     }
 }
 
-int run(bool graph_mode, unsigned long long delay_cycles) {
-    constexpr int batch = 8, vocab = 131072, highs = 160;
+int Run(bool graph_mode, unsigned long long delay_cycles) {
+    constexpr int batch = 8;
+    constexpr int vocab = 131072;
+    constexpr int highs = 160;
+    constexpr size_t elements = static_cast<size_t>(batch) * vocab;
     constexpr int no_top_k = 1 << 30;
     // Row 0 takes the Top-P radix; the last row's Top-K indices sit next to its counter.
     const std::vector<int> host_ks = {no_top_k, 1, 20, 64, 20, 50, no_top_k, 128};
@@ -74,19 +77,21 @@ int run(bool graph_mode, unsigned long long delay_cycles) {
     for (int j = 0; j < highs; ++j) high[j] = 0.9 * std::pow(0.97, j) / weight_sum;
     std::vector<float> row(vocab, static_cast<float>(0.1 / (vocab - highs)));
     for (int j = 0; j < highs; ++j) row[vocab - highs + j] = static_cast<float>(high[j]);
-    std::vector<float> host_fresh(size_t(batch) * vocab);
+    std::vector<float> host_fresh(elements);
     for (int b = 0; b < batch; ++b) {
-        std::copy(row.begin(), row.end(), host_fresh.begin() + size_t(b) * vocab);
+        std::copy(row.begin(), row.end(), host_fresh.begin() + static_cast<size_t>(b) * vocab);
     }
 
     DeviceBuffer<unsigned char> workspace(fused_topk_topp::getWorkspaceSize(batch, vocab));
-    DeviceBuffer<float> probs(size_t(batch) * vocab), fresh(size_t(batch) * vocab);
-    DeviceBuffer<float> out(size_t(batch) * vocab), ps(batch);
+    DeviceBuffer<float> probs(elements);
+    DeviceBuffer<float> fresh(elements);
+    DeviceBuffer<float> out(elements);
+    DeviceBuffer<float> ps(batch);
     DeviceBuffer<int> ks(batch);
-    check_cuda(cudaMemcpy(fresh.data, host_fresh.data(), host_fresh.size() * sizeof(float),
+    CheckCuda(cudaMemcpy(fresh.data, host_fresh.data(), host_fresh.size() * sizeof(float),
         cudaMemcpyHostToDevice));
-    check_cuda(cudaMemcpy(ks.data, host_ks.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
-    check_cuda(cudaMemcpy(ps.data, host_ps.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
+    CheckCuda(cudaMemcpy(ks.data, host_ks.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    CheckCuda(cudaMemcpy(ps.data, host_ps.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
 
     auto parts = nv::calc_aligned_pointers(workspace.data, {
         fused_topk_topp::airTopKWorkspaceBytes(batch, vocab),
@@ -95,44 +100,45 @@ int run(bool graph_mode, unsigned long long delay_cycles) {
         air_top_p::getWorkspaceBytes<float>(batch, vocab)});
     auto topp_counters = static_cast<TopPCounter*>(parts[3]);
 
-    cudaStream_t stream, side_stream;
-    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    check_cuda(cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking));
+    cudaStream_t stream;
+    cudaStream_t side_stream;
+    CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CheckCuda(cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking));
     auto launch = [&] {
         // Stale contents the pipeline must not observe.
-        check_cuda(cudaMemsetAsync(probs.data, 0, size_t(batch) * vocab * sizeof(float), stream));
+        CheckCuda(cudaMemsetAsync(probs.data, 0, elements * sizeof(float), stream));
         // A small grid: the sleeping producer must leave the SMs free for the pipeline.
-        early_signal_producer<<<64, 256, 0, stream>>>(probs.data, fresh.data,
-            size_t(batch) * vocab, delay_cycles);
+        EarlySignalProducer<<<64, 256, 0, stream>>>(probs.data, fresh.data, elements,
+            delay_cycles);
         fused_topk_topp::invokeFusedTopKTopP(probs.data, ks.data, ps.data, out.data,
             workspace.data, batch, vocab, stream, side_stream, /*enablePdl=*/true,
             /*inPlaceSkip=*/false);
-        check_cuda(cudaGetLastError());
+        CheckCuda(cudaGetLastError());
     };
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     if (graph_mode) {
-        check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        CheckCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
         launch();
-        check_cuda(cudaStreamEndCapture(stream, &graph));
-        check_cuda(cudaGraphInstantiate(&executable, graph, 0));
+        CheckCuda(cudaStreamEndCapture(stream, &graph));
+        CheckCuda(cudaGraphInstantiate(&executable, graph, 0));
     }
-    std::vector<float> host_out(size_t(batch) * vocab);
+    std::vector<float> host_out(elements);
     std::vector<TopPCounter> topp(batch);
     for (int iteration = 0; iteration < 4; ++iteration) {
-        if (graph_mode) check_cuda(cudaGraphLaunch(executable, stream));
+        if (graph_mode) CheckCuda(cudaGraphLaunch(executable, stream));
         else launch();
-        check_cuda(cudaStreamSynchronize(stream));
-        check_cuda(cudaStreamSynchronize(side_stream));
-        check_cuda(cudaMemcpy(host_out.data(), out.data, host_out.size() * sizeof(float),
+        CheckCuda(cudaStreamSynchronize(stream));
+        CheckCuda(cudaStreamSynchronize(side_stream));
+        CheckCuda(cudaMemcpy(host_out.data(), out.data, host_out.size() * sizeof(float),
             cudaMemcpyDeviceToHost));
-        check_cuda(cudaMemcpy(topp.data(), topp_counters, sizeof(TopPCounter) * batch,
+        CheckCuda(cudaMemcpy(topp.data(), topp_counters, sizeof(TopPCounter) * batch,
             cudaMemcpyDeviceToHost));
         for (int b = 0; b < batch; ++b) {
-            if (topp[b].in != probs.data + size_t(b) * vocab) {
+            if (topp[b].in != probs.data + static_cast<size_t>(b) * vocab) {
                 std::fprintf(stderr, "iteration %d row %d: Top-P input pointer %p, expected %p\n",
                     iteration, b, static_cast<const void*>(topp[b].in),
-                    static_cast<const void*>(probs.data + size_t(b) * vocab));
+                    static_cast<const void*>(probs.data + static_cast<size_t>(b) * vocab));
                 return 1;
             }
             // Top-K keeps the K largest; Top-P then keeps the shortest prefix
@@ -149,7 +155,7 @@ int run(bool graph_mode, unsigned long long delay_cycles) {
                     break;
                 }
             }
-            const float* actual = host_out.data() + size_t(b) * vocab;
+            const float* actual = host_out.data() + static_cast<size_t>(b) * vocab;
             for (int i = 0; i < vocab; ++i) {
                 const int j = i - (vocab - highs);
                 const double expected = (j >= 0 && j < kept) ? row[i] / mass : 0.0;
@@ -162,10 +168,10 @@ int run(bool graph_mode, unsigned long long delay_cycles) {
             }
         }
     }
-    if (executable) check_cuda(cudaGraphExecDestroy(executable));
-    if (graph) check_cuda(cudaGraphDestroy(graph));
-    check_cuda(cudaStreamDestroy(side_stream));
-    check_cuda(cudaStreamDestroy(stream));
+    if (executable) CheckCuda(cudaGraphExecDestroy(executable));
+    if (graph) CheckCuda(cudaGraphDestroy(graph));
+    CheckCuda(cudaStreamDestroy(side_stream));
+    CheckCuda(cudaStreamDestroy(stream));
     return 0;
 }
 
@@ -175,8 +181,8 @@ int main(int argc, char** argv) {
     auto status = cudaGetDeviceCount(&count);
     if (status == cudaErrorNoDevice || (status == cudaSuccess && count == 0)) return 77;
     try {
-        check_cuda(status);
-        return run(std::string(argv[1]) == "graph", std::strtoull(argv[2], nullptr, 10));
+        CheckCuda(status);
+        return Run(std::string(argv[1]) == "graph", std::strtoull(argv[2], nullptr, 10));
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 2;
