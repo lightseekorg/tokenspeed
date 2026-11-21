@@ -1645,6 +1645,12 @@ the partials by LSE.
   sliding-window layers).
   `warmup_gluon_mha_extend_gfx950` compiles every variant without running,
   for startup.
+- K and V are contiguous `[pages, page, kv_heads, head_dim]` arenas whose
+  base addresses are 16-byte aligned; the launcher refuses any other cache
+  (the direct-to-LDS page copy has no lowering without that alignment). The
+  cache pointers are not specialized, so one binary serves startup's small
+  probe arena and the full arena sized after it, whichever side of 2 GB
+  each falls on; the kernels state the alignment instead.
 
 #### Algorithm
 

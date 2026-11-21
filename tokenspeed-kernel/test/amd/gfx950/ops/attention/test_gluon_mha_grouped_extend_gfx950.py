@@ -29,7 +29,13 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from utils import is_amd, move_pages_past_int32
+from utils import assert_no_triton_compile, is_amd, move_pages_past_int32
+
+if is_amd():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_split_gfx950,
+    )
 
 
 @pytest.fixture
@@ -765,7 +771,12 @@ def test_fp8_eight_wave_reads_pages_past_int32_range():
     expected = case.invoke("gluon", return_lse=False)
     (k_far, v_far), far_table = move_pages_past_int32((case.k, case.v), case.table)
     far_case = dataclasses.replace(case, k=k_far, v=v_far, table=far_table)
-    actual = far_case.invoke("gluon", return_lse=False)
+    # The arena pointers are not specialized (serving sizes the arena after
+    # startup's warm-up), so the small pool's binaries serve the large one.
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950, gluon_mha_extend_split_gfx950
+    ):
+        actual = far_case.invoke("gluon", return_lse=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -920,7 +931,12 @@ def test_extend_reads_pages_past_int32_range(queries, prefixes, window, head_dim
     expected = case.invoke("gluon", return_lse=False)
     (k_far, v_far), far_table = move_pages_past_int32((case.k, case.v), case.table)
     far_case = dataclasses.replace(case, k=k_far, v=v_far, table=far_table)
-    actual = far_case.invoke("gluon", return_lse=False)
+    # The arena pointers are not specialized (serving sizes the arena after
+    # startup's warm-up), so the small pool's binaries serve the large one.
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950, gluon_mha_extend_split_gfx950
+    ):
+        actual = far_case.invoke("gluon", return_lse=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -1042,3 +1058,21 @@ def test_work_group_placement_does_not_recompile():
         for queries in ([1056], [1040] * 2, [1040] * 3, [640, 1500], [900, 33, 1200]):
             for prefix in (300, 9000):
                 run(queries, prefix)
+
+
+def test_extend_refuses_an_arena_off_16_bytes(require_gfx950):
+    """The kernels state the arena's 16-byte alignment instead of specializing
+    its pointers; the direct-to-LDS page copy has no lowering without it, so
+    the launcher refuses an unaligned arena rather than failing to compile."""
+    case = make_case(
+        [16, 40], [48, 100], heads=8, kv_heads=1, window=-1, causal=True, sinks=None
+    )
+
+    def shifted(cache):
+        flat = torch.empty(cache.numel() + 1, dtype=cache.dtype, device=cache.device)
+        flat[1:].copy_(cache.flatten())
+        return flat[1:].view_as(cache)
+
+    off = dataclasses.replace(case, k=shifted(case.k), v=shifted(case.v))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        off.invoke("gluon", return_lse=False)
