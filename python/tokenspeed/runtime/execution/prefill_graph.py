@@ -305,6 +305,36 @@ class NarrowingPrefillModel(Protocol):
         ...
 
 
+@runtime_checkable
+class RowStateViews(NarrowedRowState, Protocol):
+    """Owning leading-row views of persistent decoder input storage."""
+
+    def leading(self, rows: int) -> NarrowedRowState: ...
+
+
+class DecoderStateBuffers:
+    """One widest backing for decoder buckets that replay serially."""
+
+    def __init__(self, allocate: Callable[[int], NarrowedRowState]) -> None:
+        self._allocate = allocate
+        self._shared: RowStateViews | None = None
+
+    def for_rows(self, rows: int) -> NarrowedRowState:
+        """Reused storage retains prior values. Fill it with ``land_into`` before use."""
+        if self._shared is not None and rows <= self._shared.rows:
+            return self._shared.leading(rows)
+        state = self._allocate(rows)
+        self._shared = state if isinstance(state, RowStateViews) else None
+        return state
+
+
+@runtime_checkable
+class EncoderReplayState(Protocol):
+    """Encoder outputs the graph rewrites or the runner owns through narrowing."""
+
+    def encoder_replay_view(self) -> NarrowedRowState: ...
+
+
 def text_and_inner_model(
     model: torch.nn.Module | None,
 ) -> tuple[torch.nn.Module | None, torch.nn.Module | None]:
@@ -403,7 +433,7 @@ def _output_spec(output: CapturedForward) -> list[OutputSpec]:
 
 
 class CapturedEncoder(NamedTuple):
-    """A token bucket's captured encoder stage and its pool-pinned output state."""
+    """A token bucket's encoder and its output, valid from replay until narrowing."""
 
     capture: BreakableCapture
     state: NarrowedRowState
@@ -768,6 +798,7 @@ class PrefillGraph:
         ladder = self.capture_ladders(entries)["prefill:decoder"]
         buckets = [ladder.widths[i] for i in ladder.sampled]
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
+        state_buffers = DecoderStateBuffers(self._narrowing.allocate_decoder_state)
         for rows in capture_range:
             if rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -779,7 +810,7 @@ class PrefillGraph:
             bs = -(-rows // per_request)
             self._ctx = self.make_dummy_batch(rows, bs)
             self._input_embeds_buf[:rows].zero_()
-            statics = self._narrowing.allocate_decoder_state(rows)
+            statics = state_buffers.for_rows(rows)
             try:
                 with active_forward(self._ctx):
                     if self.dp_size == 1:
@@ -948,8 +979,11 @@ class PrefillGraph:
             for _ in range(self.num_warmup):
                 self._run_encoder(bucket)
         torch.cuda.synchronize()
-        with observer, cap:
-            state = self._run_encoder(bucket)
+        with observer:
+            with cap:
+                state = self._run_encoder(bucket)
+            if isinstance(state, EncoderReplayState):
+                state = state.encoder_replay_view()
         if self._pool is None:
             self._pool = cap.pool
         cap.replay()

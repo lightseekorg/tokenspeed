@@ -3597,6 +3597,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         encoder_capture = BreakableCapture()
         with encoder_capture:
             encoder_state = encoder(ctx)
+        encoder_state = encoder_state.encoder_replay_view()
         encoder_capture.replay()
     assert encoder_state.rows == bucket
     # Decoder capture: two completing requests of at most a window each, so

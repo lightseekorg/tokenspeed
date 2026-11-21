@@ -31,8 +31,8 @@ decode graph share one pool across batch sizes).
 
 Adapted from vLLM ``csrc/ops.h`` / SGLang ``sgl-kernel/csrc/memory/
 weak_ref_tensor.cpp``. Compiled lazily via ``torch.utils.cpp_extension``
-(pure C++ against ATen -- no nvcc, no wheel rebuild); falls back to identity
-(strong ref: correct, more memory) if compilation is unavailable.
+(pure C++ against ATen). When the extension is unavailable, use the
+non-owning storage constructor used by PyTorch's CUDA graph trees.
 """
 
 from __future__ import annotations
@@ -78,10 +78,8 @@ def _load():
     except Exception as exc:  # pragma: no cover - host without a C++ toolchain
         _load_failed = True
         logger.warning(
-            f"weak_ref_tensor extension unavailable ({type(exc).__name__!s}: {exc!s}); "
-            "falling back to "
-            "identity (strong refs pin graph-pool blocks -- correct, but "
-            "breakable-graph capture memory scales with the bucket sum).",
+            f"Using PyTorch's non-owning storage view because the weak_ref_tensor "
+            f"extension could not load ({exc!s})."
         )
     return _module
 
@@ -96,10 +94,19 @@ def weak_ref_tensor(t: torch.Tensor) -> torch.Tensor:
             producing ``t`` replays before the break reads the view.
 
     Returns:
-        A tensor sharing ``t``'s memory without owning its storage, or ``t``
-        itself if the extension is unavailable (identity fallback).
+        A tensor sharing ``t``'s memory without owning its storage.
     """
+    if not t.is_cuda:
+        raise RuntimeError("weak_ref_tensor expects a CUDA tensor")
     mod = _load()
-    if mod is None:
-        return t
-    return mod.weak_ref_tensor(t)
+    if mod is not None:
+        return mod.weak_ref_tensor(t)
+    # CUDA graph trees reconstruct replay tensors from their recorded storage.
+    # Wrapping the base address preserves offsets for strided and aliased views.
+    storage = t.untyped_storage()
+    borrowed = torch._C._construct_storage_from_data_pointer(
+        storage.data_ptr(), t.device, storage.nbytes()
+    )
+    return torch.empty(0, device=t.device, dtype=t.dtype).set_(
+        borrowed, t.storage_offset(), t.size(), t.stride()
+    )

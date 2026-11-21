@@ -970,7 +970,10 @@ zeroed). The decoder graphs depend only on their row count, so one ladder
 serves every token bucket; it is the token ladder clipped to
 `max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
 its window). A replay is encoder graph → eager narrowing → decoder graph,
-all under the bucket-pinned ambient context. The narrowing and decoder
+all under the bucket-pinned ambient context. V4.1 narrowing reads encoder
+activations and DSpark taps directly after replay, before another graph reuses
+their storage. Each decoder bucket receives its selected rows in a leading view
+of persistent buffers sized for the widest bucket. The narrowing and decoder
 stages size their own collectives from their row counts
 (`report_collective_sizing`). The decoder graph replays with the narrowed
 row count as its valid rows, so its breaks scrub the static tail. A forward
