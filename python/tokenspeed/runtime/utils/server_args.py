@@ -358,6 +358,8 @@ def validate_context_parallel_roles(
         )
 
 
+# Muse Spark's --owned-attention-output choices.
+OWNED_ATTENTION_OUTPUTS = ("reduce-scatter", "all-to-all")
 # Muse Spark's --prefill-collective-payload choices (the Iris state's
 # MUSE_PAYLOADS; a test checks they match).
 PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
@@ -857,6 +859,15 @@ class ServerArgs:
     # (the fused gather's limit) through FP8 E4M3 weights (per-channel scales,
     # converted after loading) and per-row FP8 activations. "none" keeps BF16.
     dense_fp8_small_m: str = "none"
+    # Muse Spark: how owned-row prefill (extend) forwards return attention
+    # outputs to the token owners. "reduce-scatter": every rank projects its
+    # heads of all rows and the partial sums are reduce-scattered.
+    # "all-to-all": each owner receives its rows of every rank's heads and
+    # projects them through the whole output projection, gathered on every
+    # rank after loading (128 MiB a layer, about 7.75 GiB a rank over 62
+    # layers); fewer bytes, a different summation order. Refused where Iris
+    # owned rows do not run.
+    owned_attention_output: str = "reduce-scatter"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1178,13 +1189,17 @@ class ServerArgs:
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
         if (
-            self.prefill_collective_payload != "bf16"
+            (
+                self.owned_attention_output != "reduce-scatter"
+                or self.prefill_collective_payload != "bf16"
+            )
             and architectures is not None
             and "MuseSparkForConditionalGeneration" not in architectures
         ):
             raise ValueError(
-                "--prefill-collective-payload applies to Muse Spark's owned-row "
-                f"prefill only; this checkpoint is {architectures}"
+                "--prefill-collective-payload and --owned-attention-output apply "
+                "to Muse Spark's owned-row prefill only; this checkpoint is "
+                f"{architectures}"
             )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
@@ -2390,6 +2405,21 @@ class ServerArgs:
 
         ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice(
+            "--owned-attention-output",
+            self.owned_attention_output,
+            OWNED_ATTENTION_OUTPUTS,
+        )
+        if (
+            self.numerics == "rl-bitwise"
+            and self.owned_attention_output != "reduce-scatter"
+        ):
+            # It moves the attention output's sum to another order; the
+            # envelope promises the trainer's bits.
+            raise ValueError(
+                "--owned-attention-output all-to-all changes prefill numerics; "
+                "--numerics rl-bitwise needs reduce-scatter"
+            )
         _require_choice(
             "--prefill-collective-payload",
             self.prefill_collective_payload,
@@ -5398,6 +5428,19 @@ class ServerArgs:
             "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
+            "--owned-attention-output",
+            type=str,
+            default=ServerArgs.owned_attention_output,
+            choices=list(OWNED_ATTENTION_OUTPUTS),
+            help="Muse Spark: how owned-row prefill (extend) forwards return "
+            "attention outputs to the token owners. all-to-all sends each owner "
+            "its rows of every rank's heads and projects them through the whole "
+            "output projection, gathered on every rank after loading: 128 MiB "
+            "(8192 x 8192 BF16) a layer, about 7.75 GiB a rank over 62 layers, "
+            "taken from the KV pool. A numerics change. Refused where Iris owned "
+            "rows do not run.",
+        )
+        parser.add_argument(
             "--prefill-collective-payload",
             type=str,
             default=ServerArgs.prefill_collective_payload,
@@ -5405,7 +5448,7 @@ class ServerArgs:
             help="Muse Spark: the payload encoding of the owned-row prefill "
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "
-            "BF16.",
+            "BF16, and so do the heads of --owned-attention-output all-to-all.",
         )
         parser.add_argument(
             "--dense-fp8-small-m",

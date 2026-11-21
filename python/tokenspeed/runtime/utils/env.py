@@ -59,6 +59,7 @@ global_server_args_dict: dict = {
     "numerics": ServerArgs.numerics,
     "prefill_collective_payload": ServerArgs.prefill_collective_payload,
     "dense_fp8_small_m": ServerArgs.dense_fp8_small_m,
+    "owned_attention_output": ServerArgs.owned_attention_output,
     "speculative_rejection_sample_method": (
         ServerArgs.speculative_rejection_sample_method
     ),
@@ -142,6 +143,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "numerics": server_args.numerics,
             "prefill_collective_payload": server_args.prefill_collective_payload,
             "dense_fp8_small_m": server_args.dense_fp8_small_m,
+            "owned_attention_output": server_args.owned_attention_output,
             "speculative_rejection_sample_method": (
                 server_args.speculative_rejection_sample_method
             ),
