@@ -247,6 +247,13 @@ weight copies through `--cold-bytes`, so each timing reads the weight from
 HBM as a serving step does. Another solution can sum K in another order, so
 results differ from the default within BF16 rounding.
 
+The MI355X file also lists Muse Spark TP4 decode and prefill GEMMs whose
+solution was chosen among those that give the default's bits, not only the
+fastest: the output projection (8192 x 2048) at 49-96 and 320 rows, the MoE
+unpooler (8192 x 4096) at 74-96 rows, and three prefill shapes at one row
+count each. Re-tuning the file should keep those rows, or re-pick them by
+the same rule.
+
 To cover GEMMs the file does not list without regenerating it, such as a new
 model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).
 During kernel warmup, before graph capture, serving then runs one eager
