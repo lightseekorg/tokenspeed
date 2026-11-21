@@ -1321,7 +1321,7 @@ def _owned_rows_max_tokens() -> int:
     keeps 8192, and the layout follows the chunk size up to 24576 rows.
     """
     chunk = global_server_args_dict["chunked_prefill_size"]
-    if global_server_args_dict["numerics"] == "rl-bitwise" or chunk is None:
+    if global_server_args_dict["numerics"] in BITWISE_ENVELOPES or chunk is None:
         return MUSE_OWNED_ROWS_MAX_TOKENS
     return min(max(chunk, MUSE_OWNED_ROWS_MAX_TOKENS), MUSE_OWNED_ROWS_LIMIT_TOKENS)
 

@@ -1896,6 +1896,8 @@ fn run_rank<F: Frontend>(
                         .unwrap_or(Duration::from_millis(500)),
                 )
             }),
+            disk: None,
+            disk_metrics: None,
             peer: None,
         },
     );

@@ -243,6 +243,8 @@ def _scheduled_batch():
         ],
         enable_mixed_prefill_decode=False,
         prefix_replay_tokens=0,
+        num_disk_pages=0,
+        disk_config=None,
     )
     scheduler = ts.Scheduler(config)
     for i in range(2):

@@ -1916,7 +1916,7 @@ the following defaults; unknown options are rejected:
 | --- | --- | --- |
 | `max_operations` | `32` | Outstanding operations, including undelivered completions, Ready holds and quarantine |
 | `max_keys_per_operation` | `256` | Key limit per query, GET or PUT |
-| `max_host_blocks` | `max(1, min(256, host_blocks // 2))` | Logical Host references across operations, Ready holds and quarantine; `host_blocks` is the usable Host LCM-parent count |
+| `max_host_blocks` | `max(1, min(256, host_blocks // 2))` | Logical Host references across operations, Ready holds and quarantine; `host_blocks` is the Host pool's blocks in its densest group (the usable LCM parents times the largest packing) |
 | `metadata_entries` | `max(1, host_blocks * 4)` | Limit for negative-key metadata and for backup candidates |
 | `min_prefetch_tokens` | Model prefix granularity | Minimum extension beyond the local hit worth preparing |
 | `max_prefetch_tokens` | `8192` | Maximum extension beyond the local hit, rather than a prompt-length limit |
@@ -1933,7 +1933,9 @@ Prefetch length is also constrained by keys, Host references and group
 geometry: Full history, SWA windows and State checkpoints must fit together.
 Raising `max_prefetch_tokens` alone does not guarantee a longer restore.
 `max_host_blocks` is a logical-reference budget, not bytes or a per-worker
-quota, and cannot exceed the usable Host-parent count. PUTs may use at most
+quota, and cannot exceed `host_blocks`. A hybrid model's GET holds every KV
+page under the State checkpoint it restores, so a long prompt needs a budget
+of at least its KV pages up to that checkpoint, plus the checkpoint. PUTs may use at most
 half of the operation and Host credits, rounded down, to leave room for reads.
 
 `clear_cache_drain_timeout_ms` accepts integers from `0` through
@@ -2015,6 +2017,7 @@ request computes the prefix itself.
 | `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
 | `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
+| `--peer-prefix-landing-tier` | required | `device` reads the prefix into the GPU pages the request's admission allocates, which wait out the transfer; `host` reads it into Host blocks before the admission, which then takes it as a Host hit, at the cost of Host capacity and one host-to-device copy ([RFC 0006](../rfcs/0006-disk-tier.md)). |
 
 Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
 A `--disaggregation-mode decode` server serves the history it decoded, its
@@ -2031,6 +2034,69 @@ each other only within one namespace: the same checkpoints, cache layout,
 numerics and parallel layout (the L3 deployment id), and the same
 `--weight-version`. A flushed weight update must name its `weight_version`,
 which moves the namespace, as it does for L3.
+
+### Local Disk tier
+
+`--disk-tier-paths DIR [DIR ...]` caches prefixes on the node's local SSD
+below Host L2 (design: [RFC 0006](../rfcs/0006-disk-tier.md)). Each rank keeps
+one file in one of the directories, sized by `--disk-tier-size-gb`. Host L2
+writes the entries the GPU evicted into it in the background, and a prompt
+whose prefix only the file holds waits while it is read back into Host, then
+is admitted as a Host hit. The file is recreated empty at every start: its
+contents never outlive the process. The directories must be on a file system
+that supports `O_DIRECT` (XFS or ext4, not tmpfs).
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--disk-tier-paths` | off | One directory per drive; ranks spread over them. |
+| `--disk-tier-size-gb` | — | The file's size per rank, in gigabytes. |
+| `--disk-tier-io` | required | `io_uring`, or `psync` (a thread pool calling `pread`/`pwrite`) where io_uring is unavailable. |
+| `--disk-tier-write-mbps` | required | The MB per second each rank may write: the SSD's endurance budget. Reads are never throttled and go first. |
+| `--disk-tier-config` | — | A JSON object of the tuning keys below. |
+
+| `--disk-tier-config` key | Default | Meaning |
+| --- | --- | --- |
+| `queue_depth` | 32 | Requests in flight on the drive; with `psync`, threads. |
+| `write_queue_depth` | 8 | Of those, at most this many writes. |
+| `max_io_bytes` | 4194304 | Longer ranges are issued as several requests; a multiple of 4096. |
+| `max_operations` | 16 | Disk operations in flight, reads and writes. |
+| `max_blocks_per_operation` | 4096 | Blocks one operation moves. |
+| `host_blocks_fraction` | 0.25 | The share of Host L2 blocks Disk operations may hold at once. |
+| `write_host_blocks_fraction` | 0.5 | Of those, the share writes may hold. |
+| `max_queued_cleanings` | 65536 | Host entries waiting to be written; past it the oldest are skipped. |
+| `min_prefetch_tokens` | 256 | The fewest tokens past the local hit worth a read. |
+| `wait_timeout_ms` | 10000 | How long a prompt waits for its read before it runs from the local hit. |
+| `ready_timeout_ms` | 5000 | How long a finished read is held for its prompt. |
+| `push_ring_mb` | 512 | With `--peer-prefix-port`, the staging memory a peer push reads Disk blocks into, rounded up to whole blocks. |
+
+The Disk tier needs `--kvstore-write-policy write_back` and prefix caching,
+and is refused with `--kvstore-storage-backend` and
+`--pipeline-parallel-size > 1`. With it, every Host block is padded to a
+multiple of 4096 bytes so each one moves in one direct I/O. With peer prefix
+sharing, a replica serves the prefixes its Disk tier holds too: it pushes
+them into the reader's landing, reading each block into a staging ring and
+writing it over RDMA as soon as it is read. A cache flush or
+weight update waits up to 30 s for the Disk operations in flight to finish,
+and fails if one does not.
+
+With `--enable-metrics`, every rank exports the tier's state. The
+scheduler's counts are the same on every rank of a replica; do not sum them
+across TP ranks.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `tokenspeed:disk_scheduler_resources` | `resource` | `disk_blocks`, `free_disk_parents`, `operations`, `held_host_blocks`, `queued_cleanings`, `waiting_requests`, `ready_requests`. |
+| `tokenspeed:disk_blocks_total` | `direction`, `result` | Blocks written or read (`success`), failed (`failure`), or Host entries never written (`write`, `skipped`). |
+| `tokenspeed:disk_read_expirations_total` | `phase` | Reads a prompt stopped waiting for (`waiting`), or did not take in time (`ready`). |
+| `tokenspeed:disk_io_bytes_total` | `direction` | Bytes this rank moved to and from its file. |
+| `tokenspeed:disk_io_queued_bytes` | `state` | `queued_read`, `queued_write` (including what waits for the write budget) and `inflight` bytes. |
+| `tokenspeed:disk_io_failed_jobs_total` | | Executor jobs that failed on this rank. |
+| `tokenspeed:disk_job_seconds` | `direction`, `stage`, `outcome` | Each Disk operation's executor job on this rank: `queued` until its first request reached the kernel (behind reads, other jobs and the write budget), and `total` until it reported. |
+
+A `/start_profile` trace shows each Disk operation on a `Disk read` or
+`Disk write` row from submission to report, with its `queued` part; a
+holder's pushes on `Peer push` rows, with each block's RDMA write; and a
+reader's landings on `Peer landing` rows, phase by phase.
 
 ### Block verification (experimental)
 

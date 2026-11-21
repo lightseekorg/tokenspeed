@@ -247,6 +247,7 @@ TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEnt
                                            .num_state_groups = 0,
                                            .has_prefix_closed_groups = true,
                                            .has_host_tier = false,
+                                           .has_disk_tier = false,
                                            .queue_dead_candidates = false},
                       /*checkpoints=*/nullptr);
     std::vector<PrefixCacheIndex> indexes;
@@ -254,7 +255,8 @@ TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEnt
     std::vector<CacheBlockLocation> locations;
     for (std::uint32_t group = 0; group < 2; ++group) {
         PrefixCacheIndex& index = indexes.emplace_back(group);
-        index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*state=*/false, /*closed=*/true);
+        index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*state=*/false,
+                              /*closed=*/true);
         CacheBlockRef block = pool.AcquireBlock(group);
         locations.push_back(block->Location());
         index.Register(pool, block, CacheKey{.group_id = group, .content_hash = ContentHash{"page"}},
@@ -1426,10 +1428,12 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
                                            .num_state_groups = 0,
                                            .has_prefix_closed_groups = true,
                                            .has_host_tier = false,
+                                           .has_disk_tier = false,
                                            .queue_dead_candidates = false},
                       /*checkpoints=*/nullptr);
     PrefixCacheIndex index(kGroupId);
-    index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*state=*/false, /*closed=*/true);
+    index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*state=*/false,
+                          /*closed=*/true);
     const std::vector<std::string> hashes{"moved"};
     BoundaryTree::Hold publication =
         tree.LinkPublication(CompletedPages{.prefix_hashes = hashes, .first_new_prefix_page = 0});

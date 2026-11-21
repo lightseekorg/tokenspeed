@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/disk.h"
 #include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
@@ -43,6 +44,12 @@ struct SchedulerConfig {
     };
     AllocatorConfig host_allocator;
     AllocatorConfig device_allocator;
+    // The local SSD tier below Host (docs/rfcs/0006-disk-tier.md), packed like
+    // the Host (host_group_packing). total_pages <= 1 means no Disk tier;
+    // anything above it requires disk_config, a Host cache and the
+    // write-back policy.
+    AllocatorConfig disk_allocator;
+    std::optional<DiskConfig> disk_config;
     // The request-private pool a retracted request's image tail lives in
     // (the unaligned tail pages, groups that never publish, and -- with no
     // Host cache -- the whole image). Never prefix-indexed, never evicted.
@@ -67,7 +74,18 @@ struct SchedulerConfig {
     std::vector<std::int32_t> host_group_packing{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
+    bool HasDiskCache() const { return disk_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
+    // The Host pool's blocks in its densest group: its usable parents times
+    // the largest host_group_packing. The bound on the Host credits of L3,
+    // the Disk tier and peer Host landings, which count blocks in any group:
+    // a hybrid model's read holds every KV page under the State checkpoint it
+    // reaches.
+    std::int64_t HostBlockCapacity() const {
+        const std::int64_t densest_packing =
+            host_group_packing.empty() ? 1 : *std::ranges::max_element(host_group_packing);
+        return std::int64_t{host_allocator.NumUsableBlocks()} * densest_packing;
+    }
 
     // What feeds Host L2 from ordinary Device prefix entries; required with a
     // Host tier (Validate says where kWriteBack may run).
