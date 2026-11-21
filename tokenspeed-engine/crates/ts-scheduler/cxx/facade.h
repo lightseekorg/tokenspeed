@@ -32,6 +32,7 @@
 namespace ts_scheduler {
 
 struct RequestSpec;
+struct CacheEventObserver;
 struct ForwardEvent;
 struct CacheEvent;
 struct CacheOpView;
@@ -61,6 +62,9 @@ struct PinSampleView;
 struct PeerStatsView;
 struct PeerLeaseView;
 struct PeerPageView;
+
+std::uint32_t cache_event_protocol_version();
+void install_cache_event_observer(tokenspeed::Scheduler& scheduler, rust::Box<CacheEventObserver> observer);
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,

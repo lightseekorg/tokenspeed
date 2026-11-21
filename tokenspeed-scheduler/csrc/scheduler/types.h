@@ -68,6 +68,10 @@ struct SchedulerConfig {
     // INT32_MIN, with no magnitude in int32, is rejected.
     // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
+    // Optional bound on successful debug-forced retractions per Request.
+    // Omission preserves unlimited forcing. A supplied value must be positive
+    // and requires a nonzero interval; ordinary capacity recovery ignores it.
+    std::optional<std::int32_t> debug_force_retraction_max_per_request;
 
     std::vector<CacheGroupConfig> cache_groups{};
     // Virtual children per compact Host parent, shared by L2 and snapshots.

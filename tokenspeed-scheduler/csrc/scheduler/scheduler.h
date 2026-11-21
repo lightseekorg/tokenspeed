@@ -44,6 +44,7 @@
 #include "fsm/peer_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/checkpoint_lineage.h"
+#include "scheduler/cache_event_sink.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
@@ -120,6 +121,9 @@ public:
     static constexpr std::int64_t kNoProgressAbortPlans{4096};
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
+    // Install before submission. The scheduler keeps the sink alive through
+    // destruction of every request and in-flight slot owner.
+    void SetCacheEventSink(std::shared_ptr<CacheEventSink> sink);
 
     // What one plan call may do, decided by the control plane's prefill-delay
     // vote (docs/design/prefill-delay.md).
@@ -450,6 +454,7 @@ private:
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
+    LoadBackOperation startPrefixLoad(Request& request, std::vector<BlockTransfer> load_pairs);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                  std::vector<LoadBackOperation>& load_back_operations);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
@@ -820,7 +825,8 @@ private:
     // publication is aborted here too.
     void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
-    // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
+    // (N > 0) or Prefilling (N < 0) request with forced budget remaining
+    // every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it. A victim whose image
     // does not fit (imageShortfall) runs on with nothing published; one
     // refused only after its publication is aborted.
@@ -866,6 +872,10 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    // Declared before the allocator, tickets and requests: they release their
+    // slots before the sink's last reference can be destroyed.
+    std::shared_ptr<CacheEventSink> cache_event_sink_;
+    bool submitted_requests_{false};
     ReqPoolAllocator req_pool_allocator_;
     DecodeSlotAllocator decode_slots_;
     // One slot per retracted request: the index of its slot-state blob in

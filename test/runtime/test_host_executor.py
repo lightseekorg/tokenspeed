@@ -231,6 +231,7 @@ class TestGroupAwareWireTest:
         executor = executor_module.HostCacheExecutor.__new__(
             executor_module.HostCacheExecutor
         )
+        executor._cache_observations = executor_module.CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
         executor._ready_load_acks = []
@@ -438,6 +439,7 @@ class TestGroupAwareWireTest:
         HostCacheExecutor = executor_module.HostCacheExecutor
         lanes_module = _lanes_module()
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = executor_module.CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor.attn_tp_rank = 0
@@ -2006,6 +2008,9 @@ class TestL3FlatKvExecutorTest:
         try:
             from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+            from tokenspeed.runtime.cache.transfer.observations import (
+                CompletedObservations,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"needs runtime dependencies: {exc}")
 
@@ -2013,6 +2018,7 @@ class TestL3FlatKvExecutorTest:
         # layer fence and still acknowledges the op (the hooks' replica
         # intersection waits for the owners).
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor._load_poisoned = False

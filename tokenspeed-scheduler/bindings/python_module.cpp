@@ -219,6 +219,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.snapshot_allocator.total_pages = v; })
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
+        .def_rw("debug_force_retraction_max_per_request",
+                &tokenspeed::SchedulerConfig::debug_force_retraction_max_per_request)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
@@ -266,6 +268,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
+        .def_rw("admission_id", &tokenspeed::RequestSpec::admission_id)
         .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
         .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
         .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
@@ -656,8 +659,28 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("num_extends", &tokenspeed::ForwardBatch::NumExtends);
 
     // ─── CacheOperation (attached to the Cache submodule) ──────────
+    nb::class_<tokenspeed::PrefixLoadTelemetry>(cache, "PrefixLoadTelemetry")
+        .def_ro("admission_id", &tokenspeed::PrefixLoadTelemetry::admission_id)
+        .def_ro("op_generation", &tokenspeed::PrefixLoadTelemetry::op_generation)
+        .def_ro("request_pool_index", &tokenspeed::PrefixLoadTelemetry::request_pool_index)
+        .def_ro("slot_generation", &tokenspeed::PrefixLoadTelemetry::slot_generation);
+
+    nb::class_<tokenspeed::RestoreTelemetry>(cache, "RestoreTelemetry")
+        .def_ro("admission_id", &tokenspeed::RestoreTelemetry::admission_id)
+        .def_ro("op_generation", &tokenspeed::RestoreTelemetry::op_generation)
+        .def_ro("previous_slot", &tokenspeed::RestoreTelemetry::previous_slot)
+        .def_ro("previous_slot_generation", &tokenspeed::RestoreTelemetry::previous_slot_generation)
+        .def_ro("slot_generation", &tokenspeed::RestoreTelemetry::slot_generation)
+        .def_ro("slot_previous_admission_id", &tokenspeed::RestoreTelemetry::slot_previous_admission_id)
+        .def_ro("restore_sequence", &tokenspeed::RestoreTelemetry::restore_sequence)
+        .def_ro("committed_tokens", &tokenspeed::RestoreTelemetry::committed_tokens)
+        .def_ro("computed_tokens", &tokenspeed::RestoreTelemetry::computed_tokens)
+        .def_ro("prompt_tokens", &tokenspeed::RestoreTelemetry::prompt_tokens);
+
     nb::class_<tokenspeed::LoadBackBatch>(cache, "LoadBackOp")
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
+        .def_ro("request_ids", &tokenspeed::LoadBackBatch::request_ids)
+        .def_ro("telemetry", &tokenspeed::LoadBackBatch::telemetry)
         .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
@@ -691,6 +714,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // request_pool_indices[i]. Runs after the plan's zeroing.
     nb::class_<tokenspeed::SnapshotRestoreBatch>(cache, "RestoreOp")
         .def_ro("op_ids", &tokenspeed::SnapshotRestoreBatch::op_ids)
+        .def_ro("telemetry", &tokenspeed::SnapshotRestoreBatch::telemetry)
         .def_ro("request_ids", &tokenspeed::SnapshotRestoreBatch::request_ids)
         .def_ro("request_pool_indices", &tokenspeed::SnapshotRestoreBatch::request_pool_indices)
         .def_ro("snapshot_slots", &tokenspeed::SnapshotRestoreBatch::snapshot_slots)

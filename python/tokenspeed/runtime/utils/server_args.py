@@ -678,6 +678,9 @@ class ServerArgs:
     # Decoding (N > 0) or Prefilling (N < 0) request without capacity
     # pressure, to exercise the suspend/restore path. 0 (off) in serving.
     debug_force_retraction_interval: int = 0
+    # None preserves unlimited debug injection; a supplied cap is positive.
+    # Capacity-triggered retractions do not consume this per-admission budget.
+    debug_force_retraction_max_per_request: int | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -1848,6 +1851,21 @@ class ServerArgs:
         to no pool here with a log, as the KVStore's are off on the encode
         role.
         """
+        forced_cap = self.debug_force_retraction_max_per_request
+        if forced_cap is not None:
+            if type(forced_cap) is not int or not 1 <= forced_cap <= 2**31 - 1:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request must be an integer in [1, INT32_MAX]"
+                )
+            if self.debug_force_retraction_interval == 0:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request requires a nonzero "
+                    "--debug-force-retraction-interval"
+                )
+            if not self.retracting_role:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request requires a role that can retract"
+                )
         host_gb = self.retraction_snapshot_host_gb
         ratio = self.retraction_snapshot_ratio
         max_requests = self.retraction_snapshot_max_requests
@@ -3957,6 +3975,16 @@ class ServerArgs:
             "path runs on every request of a test run. Refused with "
             "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
             "in serving.",
+        )
+        parser.add_argument(
+            "--debug-force-retraction-max-per-request",
+            type=int,
+            default=ServerArgs.debug_force_retraction_max_per_request,
+            help="TEST ONLY. Bound successfully imaged forced retractions per "
+            "request admission. Omission preserves unlimited forcing. An explicit "
+            "value must be positive and requires a nonzero "
+            "--debug-force-retraction-interval. Failed attempts and waits do not "
+            "consume it; ordinary capacity retractions are unaffected.",
         )
         # Mamba Cache
         parser.add_argument(

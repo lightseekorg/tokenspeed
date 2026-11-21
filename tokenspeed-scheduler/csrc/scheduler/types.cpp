@@ -256,6 +256,12 @@ void SchedulerConfig::Validate() const {
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
             "pool (--retraction-snapshot-host-gb > 0): without one nothing can be retracted");
     }
+    if (debug_force_retraction_max_per_request &&
+        (*debug_force_retraction_max_per_request <= 0 || debug_force_retraction_interval == 0)) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_max_per_request (--debug-force-retraction-max-per-request) "
+            "must be positive and requires a nonzero --debug-force-retraction-interval");
+    }
     if (prefill_decode_interval < 0) {
         throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
     }

@@ -37,6 +37,13 @@ and encode ranks. Returning from Rust does not finalize Python, so an
 `atexit` hook alone cannot drain those records. Cleanup is bounded because
 an output stream can remain stalled.
 
+[Cache observations](cache-observations.md) use the same nonblocking writer
+when explicitly enabled. Native callbacks report immutable ownership metadata;
+the ordinary ACK poll is followed by a drain of completed CPU copy metadata.
+Neither sideband feeds the scheduler or establishes replica-wide completion.
+The protocol makes rank scope, operation/admission joins, and diagnostic loss
+explicit; incomplete or lossy traces cannot qualify recovery.
+
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
 groups (`Ranks`): the replica, the pipeline (one rank per stage), the
@@ -1337,6 +1344,8 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+In particular, a signal can interrupt a buffered stderr write. Logging again
+can raise before the callback records a failure or requests shutdown.
 
 While serving generation, a fatal control-loop or forward-thread error
 signals the owning launcher once from the thread that detects it. The

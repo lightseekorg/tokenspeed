@@ -1265,3 +1265,23 @@ def test_prefill_page_budget_respects_reserved_workspace(explicit, workspace, ex
     cfg = _config(args, specs)
     assert cfg.max_kv_page_num == expected
     assert cfg.num_device_pages == specs.cache_geometry.num_device_pages
+
+
+@pytest.mark.parametrize("cap", [None, 1, 64, 2**31 - 1])
+def test_rank_setup_preserves_optional_forced_retraction_cap(cap):
+    args = ServerArgs(
+        model="fixture",
+        debug_force_retraction_interval=3,
+        debug_force_retraction_max_per_request=cap,
+    )
+    config = _config(
+        args, _specs(num_host_pages=0, num_snapshot_pages=17, max_retracted=8)
+    )
+    assert config.debug_force_retraction_max_per_request == cap
+    # Preserve raw optional semantics at the translation boundary too; the
+    # native validator rejects this invalid value, rather than seeing None.
+    args.debug_force_retraction_max_per_request = 0
+    config = _config(
+        args, _specs(num_host_pages=0, num_snapshot_pages=17, max_retracted=8)
+    )
+    assert config.debug_force_retraction_max_per_request == 0

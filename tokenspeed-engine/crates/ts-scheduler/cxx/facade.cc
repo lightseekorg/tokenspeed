@@ -56,6 +56,82 @@ void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t e
 
 }  // namespace
 
+namespace {
+
+class RustCacheEventSink final : public tokenspeed::CacheEventSink {
+public:
+    explicit RustCacheEventSink(rust::Box<CacheEventObserver> observer) : observer_(std::move(observer)) {}
+
+    void OnSlotAssigned(const tokenspeed::SlotOwnershipEvent& event) noexcept override {
+        RecordSlot(event, CacheObservationKind::SlotAssigned);
+    }
+
+    void OnSlotReleased(const tokenspeed::SlotOwnershipEvent& event) noexcept override {
+        RecordSlot(event, CacheObservationKind::SlotReleased);
+    }
+
+    void OnPrefixLoadScheduled(const tokenspeed::LoadBackOperation& operation) noexcept override {
+        const auto& metadata = operation.telemetry;
+        CacheObservation value{};
+        value.kind = CacheObservationKind::PrefixLoadScheduled;
+        value.slot = metadata.request_pool_index;
+        value.slot_generation = metadata.slot_generation;
+        value.admission_id = metadata.admission_id;
+        value.op_id = operation.op_id;
+        value.op_generation = metadata.op_generation;
+        Record(value, operation.request_id);
+    }
+
+    void OnRestoreScheduled(const tokenspeed::SnapshotRestoreOperation& operation) noexcept override {
+        const auto& metadata = operation.telemetry;
+        CacheObservation value{};
+        value.kind = CacheObservationKind::RestoreScheduled;
+        value.slot = operation.request_pool_index;
+        value.slot_generation = metadata.slot_generation;
+        value.admission_id = metadata.admission_id;
+        value.slot_previous_admission_id = metadata.slot_previous_admission_id;
+        value.op_id = operation.op_id;
+        value.op_generation = metadata.op_generation;
+        value.previous_slot = metadata.previous_slot;
+        value.previous_slot_generation = metadata.previous_slot_generation;
+        value.restore_sequence = metadata.restore_sequence;
+        value.committed_tokens = metadata.committed_tokens;
+        value.computed_tokens = metadata.computed_tokens;
+        value.prompt_tokens = metadata.prompt_tokens;
+        Record(value, operation.request_id);
+    }
+
+private:
+    void RecordSlot(const tokenspeed::SlotOwnershipEvent& event, CacheObservationKind kind) noexcept {
+        CacheObservation value{};
+        value.kind = kind;
+        value.slot = event.slot;
+        value.slot_generation = event.generation;
+        value.admission_id = event.admission_id;
+        value.slot_previous_admission_id = event.previous_admission_id;
+        Record(value, event.request_id);
+    }
+
+    void Record(CacheObservation value, std::string_view request_id) noexcept {
+        // Borrow bytes rather than manufacturing a Rust string: the receiver
+        // validates the bounded identity before interpreting it as UTF-8.
+        record_cache_observation(*observer_, value,
+            rust::Slice<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(request_id.data()), request_id.size()));
+    }
+
+    rust::Box<CacheEventObserver> observer_;
+};
+
+}  // namespace
+
+std::uint32_t cache_event_protocol_version() {
+    return tokenspeed::kCacheEventProtocolVersion;
+}
+
+void install_cache_event_observer(tokenspeed::Scheduler& scheduler, rust::Box<CacheEventObserver> observer) {
+    scheduler.SetCacheEventSink(std::make_shared<RustCacheEventSink>(std::move(observer)));
+}
+
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
     std::vector<tokenspeed::RequestSpec> converted;
     {
@@ -65,6 +141,7 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
         for (const RequestSpec& spec : specs) {
             converted.push_back(tokenspeed::RequestSpec{
                 .request_id = std::string(spec.request_id),
+                .admission_id = spec.admission_id,
                 .session_id = std::string(spec.session_id),
                 .cache_group_id = std::string(spec.cache_group_id),
                 .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
