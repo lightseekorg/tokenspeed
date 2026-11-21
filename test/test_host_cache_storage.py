@@ -44,8 +44,10 @@ def _cpu_pinned_allocation(monkeypatch):
     def empty(*args, **kwargs):
         # Pinned allocation needs a CUDA device; storage behavior uses real
         # CPU tensors so these tests do not acquire a serving GPU.
-        if kwargs.get("pin_memory", False):
-            kwargs["pin_memory"] = False
+        if kwargs.pop("pin_memory", False):
+            tensor = allocate(*args, **kwargs)
+            tensor.is_pinned = lambda: True
+            return tensor
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
@@ -109,6 +111,22 @@ def _payload_layout(groups):
         consumers=tuple((f"{spec.group_id}.0",) for spec, _ in groups),
     )
     return layout, tuple(spec for spec, _ in groups)
+
+
+@pytest.mark.parametrize("null_address", [False, True])
+def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
+    tensor = torch.zeros(192, dtype=torch.uint8)
+    if null_address:
+        monkeypatch.setattr(tensor, "data_ptr", lambda: 0)
+        monkeypatch.setattr(tensor, "is_pinned", lambda: True)
+
+    def allocate(size, *, dtype, pin_memory):
+        assert size == tensor.numel() and dtype == tensor.dtype and pin_memory
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    with pytest.raises(RuntimeError, match="Failed to allocate 192 pinned CPU bytes"):
+        HostCacheStorage(_layout(), group_specs=_SPECS, num_host_lcm_blocks=2)
 
 
 def test_block_offsets_follow_group_packing_without_overlap():
