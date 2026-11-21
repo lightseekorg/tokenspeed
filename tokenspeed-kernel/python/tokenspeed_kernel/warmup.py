@@ -113,11 +113,11 @@ def kernel_launcher(kernel: Any, grid: Any) -> Callable[..., Any]:
 
 
 def compile_registered_variants(kernel: Any, *args: Any, **kwargs: Any) -> None:
-    """Compile, without launching, every variant registered for ``kernel``
-    around these ordinary launch arguments.
+    """Compile, without launching, every variant registered for ``kernel``.
 
-    Unlike :func:`kernel_launcher`, this runs outside ``kernel_warmup`` too:
-    callers use it to prepare a launch that startup never reaches.
+    The variants are built around these ordinary launch arguments. Unlike
+    :func:`kernel_launcher`, this runs outside ``kernel_warmup`` too: callers
+    use it to prepare a launch that startup never reaches.
 
     Args:
         kernel: Triton or Gluon JIT function with registered variants.

@@ -175,15 +175,15 @@ class IrisAllGather:
         return min(triton.cdiv(local_words, block_words), 84), args, options
 
     def warmup(self, local_hidden_size: int) -> None:
-        """Compile, without running, every column gather of
-        ``local_hidden_size``-wide shards; nothing when the gather cannot
-        serve that width.
+        """Compile, without running, every column gather of this shard width.
 
-        The kernel's compile-time options depend on the shard width and, past
-        a payload size on TP8, its subgroup count; the row count is a runtime
-        argument. Every variant the gather's warmup registration names
-        (``_column_gather_variants``) compiles here, so a startup that never
-        reaches the gather at this width does not compile it while serving.
+        The width is ``local_hidden_size`` elements a rank; nothing compiles
+        when the gather cannot serve it. The kernel's compile-time options
+        depend on the shard width and, past a payload size on TP8, its subgroup
+        count; the row count is a runtime argument. Every variant the gather's
+        warmup registration names (``_column_gather_variants``) compiles here,
+        so a startup that never reaches the gather at this width does not
+        compile it while serving.
 
         Args:
             local_hidden_size: Elements in each rank-local row.

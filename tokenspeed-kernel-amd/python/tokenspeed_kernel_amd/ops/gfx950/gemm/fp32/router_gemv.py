@@ -395,9 +395,12 @@ def _splitk_launch(
 
 
 def _router_selections(n: int, k: int) -> list[tuple[int, tuple[int, ...] | None]]:
-    """One row count per distinct kernel choice of an ``[N, K]`` router, with
-    the split-K config it selects (None: the GEMV): each GEMV BLOCK_M that a
-    row count up to MAX_ROWS takes, then each measured split-K bucket."""
+    """Row counts probing each distinct kernel choice of an ``[N, K]`` router.
+
+    Each comes with the split-K config it selects (None: the GEMV): each GEMV
+    BLOCK_M that a row count up to MAX_ROWS takes, then each measured split-K
+    bucket.
+    """
     selections = {}
     for rows in range(1, MAX_ROWS + 1):
         if _choose_splitk_config(rows, n, k) is None and k <= MAX_K:
@@ -411,14 +414,14 @@ def _router_selections(n: int, k: int) -> list[tuple[int, tuple[int, ...] | None
 
 
 def _compile_router_variants(x, weight, multiplier: float) -> None:
-    """Compile, without launching, every GEMV and split-K variant another row
-    count of this router selects.
+    """Compile, without launching, every GEMV and split-K variant of this router.
 
-    The row count is a runtime argument of both kernels, but the GEMV's
-    BLOCK_M (its power of two; a block shape, so it cannot be left
-    unspecialized) and the split-K tile (its bucket) are compile-time, so a
-    batch in a bucket startup never reached would compile while serving.
-    Stand-in tensors have the dtypes and shapes serving allocates.
+    These are the variants any other row count selects. The row count is a
+    runtime argument of both kernels, but the GEMV's BLOCK_M (its power of two;
+    a block shape, so it cannot be left unspecialized) and the split-K tile
+    (its bucket) are compile-time, so a batch in a bucket startup never reached
+    would compile while serving. Stand-in tensors have the dtypes and shapes
+    serving allocates.
     """
     k, n = x.shape[1], weight.shape[0]
     for rows, config in _router_selections(n, k):
@@ -687,10 +690,12 @@ def _mm_launch(
 
 
 def _compile_router_mm_variants(x, weight, multiplier: float, mm_b) -> None:
-    """Compile, without launching, the router + decode GEMM launch for every
-    decode GEMM bucket another row count up to _WITH_MM_MAX_ROWS selects: the
-    MM_* tile is compile-time and follows the bucket. Stand-in tensors have
-    the dtypes and shapes serving allocates."""
+    """Compile, without launching, the router + decode GEMM launch per bucket.
+
+    One binary per decode GEMM bucket that a row count up to _WITH_MM_MAX_ROWS
+    selects: the MM_* tile is compile-time and follows the bucket. Stand-in
+    tensors have the dtypes and shapes serving allocates.
+    """
     k, n = x.shape[1], weight.shape[0]
     mm_n, mm_k = mm_b.shape
     seen = set()
