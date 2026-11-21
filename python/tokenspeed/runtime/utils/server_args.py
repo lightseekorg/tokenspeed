@@ -5311,7 +5311,7 @@ class ServerArgs:
             help="Muse Spark: the payload encoding of the owned-row prefill "
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "
-            "BF16.",
+            "BF16, and so do the heads of --owned-attention-output all-to-all.",
         )
         parser.add_argument(
             "--numerics",
