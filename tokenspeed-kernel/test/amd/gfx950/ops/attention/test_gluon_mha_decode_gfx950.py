@@ -192,6 +192,22 @@ def test_full_decode_config_keeps_prefetch_within_vmcnt() -> None:
     assert (config.num_kv_splits, config.num_stages) == (64, 1)
 
 
+def test_full_decode_config_keeps_head_dim_256_pipeline_within_lds() -> None:
+    """Four stages of BF16 head dim 256 K and V pages would take 256 KiB of
+    LDS; 8 x 8 rows give the four-wave work-group whose copies fit vmcnt."""
+    q = torch.empty(8, 16, 256, dtype=torch.bfloat16)
+    k_cache = torch.empty(1, PAGE_SIZE, 2, 256, dtype=torch.bfloat16)
+    config = decode.get_config(
+        q=q,
+        k_cache=k_cache,
+        max_seqlen_k=FULL_MAX_SEQLEN_K,
+        max_seqlen_q=8,
+        window_left=-1,
+        softmax_scale=None,
+    )
+    assert (config.num_kv_splits, config.num_warps, config.num_stages) == (64, 4, 1)
+
+
 @pytest.mark.parametrize(
     "cache_lens,num_stages",
     [
@@ -435,6 +451,10 @@ def _check_verify(actual: torch.Tensor, expected: torch.Tensor) -> None:
         # 16 x 6 rows: under a short window, six one-wave blocks whose rows
         # straddle query positions.
         pytest.param(16, 6, 1, 128, id="96-rows"),
+        # Qwen3.5-style full attention: 24 query over 4 KV heads, head dim
+        # 256, at decode and at an 8-token verify (48 rows, four waves).
+        pytest.param(1, 24, 4, 256, id="head-dim-256-decode"),
+        pytest.param(VERIFY_TOKENS, 24, 4, 256, id="head-dim-256"),
     ],
 )
 def test_verify_rows_match_reference_and_replay(
@@ -727,6 +747,8 @@ def _balanced(inputs: dict, sinks=None, schedule=None) -> torch.Tensor:
         pytest.param(3, 12, 2, 64, id="18-rows"),
         pytest.param(16, 8, 1, 64, id="128-rows"),
         pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
+        pytest.param(1, 24, 4, 256, id="head-dim-256-decode"),
+        pytest.param(VERIFY_TOKENS, 24, 4, 256, id="head-dim-256"),
     ],
 )
 def test_balanced_rows_match_reference_and_replay(
