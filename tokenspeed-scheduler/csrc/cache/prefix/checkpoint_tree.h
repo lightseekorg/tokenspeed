@@ -156,6 +156,30 @@ public:
         return it == nodes_.end() ? 0 : it->second.aged_distance[static_cast<std::size_t>(tier)];
     }
 
+    // Publication alone does not prove that a deeper checkpoint replaces a
+    // useful resume point. A real deeper resume hands that protection over;
+    // deleting the descendant does not bring the earlier evidence back.
+    bool LastResumedOnBranch(const ContentHash& hash) const {
+        const auto it = nodes_.find(hash);
+        return it != nodes_.end() && it->second.last_resumed_on_branch;
+    }
+
+    // Called when admission installs a checkpoint or a peer accepts its pin,
+    // never for a candidate lookup. Repeated State groups/tiers and the
+    // publishing request's own chunk continuation are not new uses.
+    bool RecordResume(const ContentHash& hash, std::uint64_t access_epoch) {
+        const auto it = nodes_.find(hash);
+        if (it == nodes_.end()) return false;
+        Node& node = it->second;
+        if (access_epoch == node.access_epoch || access_epoch == node.last_resume_epoch) return false;
+        node.last_resume_epoch = access_epoch;
+        node.last_resumed_on_branch = true;
+        for (Node* parent = node.parent; parent != nullptr; parent = parent->parent) {
+            parent->last_resumed_on_branch = false;
+        }
+        return true;
+    }
+
     // Visits the hashes AgedDistance(hash, tier) == distance, in no order.
     template <typename Visit>
     void ForEachAged(CacheTier tier, std::int32_t distance, const Visit& visit) const {
@@ -208,6 +232,8 @@ private:
         std::int32_t num_tokens{0};
         // The publishing request's access epoch.
         std::uint64_t access_epoch{0};
+        std::uint64_t last_resume_epoch{0};
+        bool last_resumed_on_branch{false};
         std::vector<std::int32_t> tail;
         Node* parent{nullptr};
         std::vector<Node*> children;

@@ -173,8 +173,11 @@ TEST_F(PeerExportsTest, APinHoldsExactlyTheAnsweredPagesUntilTheRelease) {
     Publish(tokens);
     const PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
     EXPECT_EQ(exports_.NumPinnedBlocks(), 0u) << "a soft pin holds no block";
+    const ContentHash checkpoint{PageHashes(tokens).back()};
+    EXPECT_FALSE(coordinator_.Store().Checkpoints().LastResumedOnBranch(checkpoint));
     PinAnswer(answer);
     EXPECT_TRUE(exports_.Held(answer.lease));
+    EXPECT_TRUE(coordinator_.Store().Checkpoints().LastResumedOnBranch(checkpoint));
     EXPECT_EQ(exports_.NumPinnedBlocks(), 3u);
     EXPECT_FALSE(coordinator_.ClearCache()) << "the pin holds the blocks";
 
@@ -190,6 +193,7 @@ TEST_F(PeerExportsTest, APinOfPagesThatChangedHoldsNothing) {
     answer.pages.back().block_id += 1;  // not what the cache holds
     PinAnswer(answer);
     EXPECT_FALSE(exports_.Held(answer.lease));
+    EXPECT_FALSE(coordinator_.Store().Checkpoints().LastResumedOnBranch(ContentHash{PageHashes(tokens).back()}));
     EXPECT_EQ(exports_.NumLeases(), 0u);
     EXPECT_TRUE(coordinator_.ClearCache());
 }

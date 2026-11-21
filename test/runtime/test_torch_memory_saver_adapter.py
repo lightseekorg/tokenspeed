@@ -568,6 +568,119 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
         )
 
 
+def _check_checkpoint_metadata_on_cuda():
+    """Retain real checkpoint consumers through growth and repeated sleep/wake."""
+    from test.runtime.test_gdn_state_checkpoint_in_forward import (
+        _checkpointing_state_backend,
+    )
+
+    from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+        in_forward_state_checkpoints,
+    )
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    retained = []
+    consumers = []
+    scans = []
+    with saver.named_region("attention_state"):
+        backend = _checkpointing_state_backend(spec_tokens=1, device="cuda")
+    for offsets in ([256, 0, 128], [0, 0], [0, 64, 0, 64, 0, 64, 0, 64, 0], [64]):
+        count = len(offsets)
+        host_offsets = torch.tensor(offsets, dtype=torch.int32)
+        lengths = torch.full((count,), 512, dtype=torch.int32)
+        # This is the same region as ForwardStepRunner._init_forward_metadata
+        # and prefill graph construction, including the fresh packed upload.
+        with saver.named_region("attention_state"):
+            base = torch.arange(count * 3, dtype=torch.int32, device="cuda").view(
+                count, 3
+            )
+            tables = {"state0": base, "state1": base + 100}
+            if not any(offsets):
+                tables = {group: table[:, :2] for group, table in tables.items()}
+            checkpoints = in_forward_state_checkpoints(
+                host_offsets, lengths, count, tables, tuple(tables)
+            )
+            if checkpoints is not None:
+                scan, scan_rows = backend._scan_state_checkpoints(checkpoints, lengths)
+                scan.states.copy_(
+                    torch.arange(
+                        scan.states.numel(), dtype=torch.float32, device="cuda"
+                    ).reshape_as(scan.states)
+                )
+                scans.append((scan, scan_rows, scan.states[scan_rows].cpu()))
+        tensors = list(tables.values())
+        if checkpoints is None:
+            assert not any(offsets)
+        else:
+            rows = [row for row, offset in enumerate(offsets) if offset]
+            positions = [row * 512 + offsets[row] for row in rows]
+            consumers.append((checkpoints, tables, rows, positions))
+            tensors.extend(
+                (
+                    checkpoints.device_rows,
+                    checkpoints.device_offsets,
+                    checkpoints.token_index,
+                    *checkpoints.blocks_by_group.values(),
+                )
+            )
+            tensors.extend((scan.cu_starts, scan_rows, scan.states))
+        retained.extend((tensor, tensor.data_ptr(), tensor.cpu()) for tensor in tensors)
+        # Keep the older dataclasses and shared-storage views alive, as captured
+        # and last-forward metadata can remain live across release and growth.
+        for _ in range(3):
+            torch.cuda.synchronize()
+            saver.pause(tag="weights")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            ordinary_bytes = sum(
+                segment["total_size"]
+                for segment in torch.cuda.memory_snapshot()
+                if segment["device"] == torch.cuda.current_device()
+                and tuple(segment["segment_pool_id"]) == (0, 0)
+            )
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            for tensor, pointer, expected in retained:
+                assert tensor.data_ptr() == pointer
+                torch.testing.assert_close(tensor.cpu(), expected, rtol=0, atol=0)
+            with saver.named_region("attention_state"):
+                for scan, scan_rows, expected in scans:
+                    torch.testing.assert_close(
+                        scan.states[scan_rows].cpu(), expected, rtol=0, atol=0
+                    )
+                for checkpoints, tables, rows, positions in consumers:
+                    actual_positions = (
+                        checkpoints.device_rows * 512 + checkpoints.device_offsets
+                    )
+                    assert actual_positions.cpu().tolist() == positions
+                    for table in tables.values():
+                        actual_blocks = table[checkpoints.device_rows, 2]
+                        expected_blocks = table.cpu()[rows, 2]
+                        torch.testing.assert_close(
+                            actual_blocks.cpu(), expected_blocks, rtol=0, atol=0
+                        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_checkpoint_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_checkpoint_metadata_on_cuda; _check_checkpoint_metadata_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )
+
+
 @pytest.mark.parametrize("with_draft", [False, True])
 def test_capture_metadata_survives_sleep_for_target_and_draft(
     memory, buffers, with_draft

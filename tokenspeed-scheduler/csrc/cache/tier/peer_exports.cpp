@@ -174,6 +174,9 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
     lease.deadline_us = Deadline(now_us, hard_pin_us_);
     lease.access_epoch = exported.access_epoch;
     for (CacheCoordinator::ExportedBlock& block : exported.blocks) {
+        if (coordinator.GroupIsState(block.key.group_id)) {
+            coordinator.Store().Checkpoints().RecordResume(block.key.content_hash, exported.access_epoch);
+        }
         lease.pins.push_back(std::move(block.block));
         lease.keys.push_back(std::move(block.key));
     }

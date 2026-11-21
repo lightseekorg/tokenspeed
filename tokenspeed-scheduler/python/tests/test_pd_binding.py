@@ -588,15 +588,18 @@ def test_a_page_aligned_short_prompt_end_keeps_its_state():
     assert prefill_and_hand_off(scheduler, "longer", [1, 2, 3, 4, 5, 6]) == 4
 
 
-def test_dropping_short_prompt_ends_takes_the_prefill_role_and_the_in_forward_checkpoint():
+def test_dropping_short_prompt_ends_requires_prompt_ownership_and_in_forward_checkpoint():
     cfg = make_prefill_state_config(True)
     cfg.state_checkpoint_in_forward = False
     with pytest.raises(ValueError, match="requires state_checkpoint_in_forward"):
         Scheduler(cfg)
     cfg.state_checkpoint_in_forward = True
+    Scheduler(cfg)
     cfg.role = SchedulerConfig.Role.Fused
     cfg.decode_allocation_policy = None
-    with pytest.raises(ValueError, match="P role only"):
+    Scheduler(cfg)
+    cfg.role = SchedulerConfig.Role.D
+    with pytest.raises(ValueError, match="requires a prompt-owning role"):
         Scheduler(cfg)
 
 

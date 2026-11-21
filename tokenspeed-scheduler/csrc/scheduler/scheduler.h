@@ -344,7 +344,7 @@ private:
     struct AdmissionMatch {
         PrefixProbe probe;
         bool waits_for_eviction_store{false};
-        std::string prefix_diagnostic;
+        std::int32_t max_cacheable_tokens{0};
         // Views of the request's immutable prompt hashes. Only an admitted
         // request copies its reused prefix into mutable execution progress.
         std::span<const std::string> candidate_prefix_hashes;
@@ -437,6 +437,8 @@ private:
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     // The same probe, matching no further than max_probe_tokens.
     AdmissionMatch matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens);
+
+    std::string describePrefixAtAdmission(const Request& request, const AdmissionMatch& match) const;
     // Records an admission's fresh pages (to zero) and copies on the plan, a
     // copy from a block an earlier copy of the plan fills reading that copy's
     // source. Asserts that each copy destination is written once and never
@@ -500,11 +502,10 @@ private:
     std::int32_t promptEndCheckpoint(const Request& request, std::int32_t resume_tokens) const;
     bool promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const;
     bool finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const;
-    // SchedulerConfig::drop_short_prompt_end_checkpoints at a finish: whether
-    // the request's computed frontier is the end of a prompt too short for an
-    // in-forward checkpoint, inside a page, which the finish publishes like a
-    // chunk end (finishCheckpointIsDead) and which supersedes no input
-    // (MarkSupersededStateInput).
+    // Whether the prompt end is too short for an in-forward checkpoint and
+    // inside a page, under SchedulerConfig::drop_short_prompt_end_checkpoints.
+    // Reads only the prompt, so admission, first decode and finish agree.
+    // This unpublished end supersedes no input checkpoint.
     bool shortPromptEndIsDropped(const Request& request) const;
     // Whether the first decode of a request that resumed at resume_tokens
     // publishes its prompt end and keeps writing past it, and the copy-in
