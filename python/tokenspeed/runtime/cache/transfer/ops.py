@@ -84,6 +84,42 @@ class CacheTransfer:
 
 
 @dataclass(frozen=True, slots=True)
+class PrefixLoadTelemetry:
+    """Immutable admission and operation identity supplied by the scheduler."""
+
+    admission_id: int
+    op_generation: int
+    request_pool_index: int
+    slot_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreTelemetry:
+    """Scheduler-owned restore frontier and slot ownership at scheduling."""
+
+    admission_id: int
+    op_generation: int
+    previous_slot: int
+    previous_slot_generation: int
+    slot_generation: int
+    slot_previous_admission_id: int
+    restore_sequence: int
+    committed_tokens: int
+    computed_tokens: int
+    prompt_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixLoadOp:
+    """One identified Host prefix load, with the original wire transfer rows."""
+
+    op_id: int
+    request_id: str
+    telemetry: PrefixLoadTelemetry
+    transfers: tuple[CacheTransfer, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SnapshotOp:
     """Store a retracted request's tail pages and slot state to the snapshot pool.
 
@@ -130,3 +166,5 @@ class RestoreOp:
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
     source_tier: tuple[HostTier, ...]
+    # Omission means that this operation has no opt-in scheduler observation.
+    telemetry: RestoreTelemetry | None = None

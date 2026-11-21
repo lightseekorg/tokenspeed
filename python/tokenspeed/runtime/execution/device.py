@@ -152,6 +152,9 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.cache.transfer.observations import (
+    cache_observation_capacity_from_env,
+)
 from tokenspeed.runtime.distributed.cuda_stack import (
     restore_cuda_stack,
     trim_cuda_stack,
@@ -291,6 +294,8 @@ class DeviceSpecs:
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.
+        cache_observation_capacity: Startup capacity of optional completed
+            CPU copy observations; zero when diagnostics are disabled.
     """
 
     cache_geometry: Any
@@ -310,6 +315,7 @@ class DeviceSpecs:
     host_group_packing: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
+    cache_observation_capacity: int = 0
 
 
 def speculative_widths(
@@ -746,6 +752,12 @@ class DeviceHandle:
                 "snapshot pool"
             )
         return l2.poll_results()
+
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """Drain completed CPU diagnostics only; no event query or device work."""
+        if self._l2 is None:
+            return [], 0
+        return self._l2.poll_cache_observations()
 
     def shutdown_model(self) -> None:
         """Drain local readers, then release shared model weights
@@ -1581,6 +1593,7 @@ def build_device_side(
         A ``DeviceBuild``. No device object escapes except inside the
         handle; the specs hold none at all.
     """
+    cache_observation_capacity = cache_observation_capacity_from_env(os.environ)
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_runtime
@@ -1880,6 +1893,7 @@ def build_device_side(
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
             nprocs_per_node=server_args.mapping.nprocs_per_node,
+            cache_observation_capacity=cache_observation_capacity,
             world_cpu_group=(
                 pg_manager.get_process_group("gloo", server_args.mapping.world_group)
                 if server_args.mapping.world_size > 1
@@ -1969,6 +1983,7 @@ def build_device_side(
         executor.config.spec_num_tokens,
     )
     specs = DeviceSpecs(
+        cache_observation_capacity=cache_observation_capacity,
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,

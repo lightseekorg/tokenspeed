@@ -38,7 +38,10 @@ from tokenspeed_engine.scheduler import (
 from tokenspeed.runtime.cache.transfer.ops import (
     CacheTransfer,
     HostTier,
+    PrefixLoadOp,
+    PrefixLoadTelemetry,
     RestoreOp,
+    RestoreTelemetry,
     SnapshotOp,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -566,13 +569,14 @@ def snapshot_ops_from_wire(
 
 
 def restore_ops_from_wire(
-    op, *, request_admission: Callable[[str], int]
+    op, *, request_admission: Callable[[str], int], record_observations: bool = False
 ) -> list[RestoreOp]:
     """One ``RestoreOp`` per request of a ``Cache.RestoreOp`` batch."""
     rows = _check_batch_rows(
         op,
         _snapshot_batch_columns(op)
-        + (op.content_hashes, op.page_offsets, op.source_tiers),
+        + (op.content_hashes, op.page_offsets, op.source_tiers)
+        + ((op.telemetry,) if record_observations else ()),
     )
     ops = []
     for i in range(rows):
@@ -587,24 +591,95 @@ def restore_ops_from_wire(
         tiers = tuple(HostTier(int(tier)) for tier in op.source_tiers[i])
         if len(tiers) != len(transfers):
             raise ValueError(f"ragged cache operation {op.op_ids[i]}")
+        telemetry = None
+        if record_observations:
+            value = op.telemetry[i]
+            telemetry = RestoreTelemetry(
+                admission_id=int(value.admission_id),
+                op_generation=int(value.op_generation),
+                previous_slot=int(value.previous_slot),
+                previous_slot_generation=int(value.previous_slot_generation),
+                slot_generation=int(value.slot_generation),
+                slot_previous_admission_id=int(value.slot_previous_admission_id),
+                restore_sequence=int(value.restore_sequence),
+                committed_tokens=int(value.committed_tokens),
+                computed_tokens=int(value.computed_tokens),
+                prompt_tokens=int(value.prompt_tokens),
+            )
+            if telemetry.admission_id <= 0:
+                raise ValueError(
+                    "An observed restore requires a native admission identity"
+                )
         ops.append(
             RestoreOp(
                 op_id=int(op.op_ids[i]),
                 request_id=str(op.request_ids[i]),
-                admission_id=request_admission(str(op.request_ids[i])),
+                admission_id=(
+                    telemetry.admission_id
+                    if telemetry is not None
+                    else request_admission(str(op.request_ids[i]))
+                ),
                 request_pool_index=int(op.request_pool_indices[i]),
                 snapshot_slot=int(op.snapshot_slots[i]),
                 transfers=transfers,
                 source_tier=tiers,
+                telemetry=telemetry,
             )
         )
     return ops
 
 
+def prefix_load_ops_from_wire(op) -> list[PrefixLoadOp]:
+    """Freeze observed prefix-load identity with its actual operation rows."""
+    count = _check_batch_rows(
+        op,
+        (
+            op.op_ids,
+            op.request_ids,
+            op.telemetry,
+            op.group_ids,
+            op.src_pages,
+            op.dst_pages,
+            op.content_hashes,
+            op.page_offsets,
+        ),
+    )
+    result = []
+    for index in range(count):
+        value = op.telemetry[index]
+        telemetry = PrefixLoadTelemetry(
+            admission_id=int(value.admission_id),
+            op_generation=int(value.op_generation),
+            request_pool_index=int(value.request_pool_index),
+            slot_generation=int(value.slot_generation),
+        )
+        if telemetry.admission_id <= 0:
+            raise ValueError(
+                "An observed prefix load requires a native admission identity"
+            )
+        result.append(
+            PrefixLoadOp(
+                op_id=int(op.op_ids[index]),
+                request_id=str(op.request_ids[index]),
+                telemetry=telemetry,
+                transfers=_wire_transfers(
+                    int(op.op_ids[index]),
+                    op.group_ids[index],
+                    op.src_pages[index],
+                    op.dst_pages[index],
+                    op.content_hashes[index],
+                    op.page_offsets[index],
+                ),
+            )
+        )
+    return result
+
+
 def is_device_cache_op(operation) -> bool:
     """Whether an adapted operation belongs to the GPU copy executor."""
     return isinstance(
-        operation, (Cache.WriteBackOp, Cache.LoadBackOp, SnapshotOp, RestoreOp)
+        operation,
+        (Cache.WriteBackOp, Cache.LoadBackOp, PrefixLoadOp, SnapshotOp, RestoreOp),
     )
 
 
@@ -615,7 +690,10 @@ class CacheOperations(NamedTuple):
     storage I/O and Device copies; tickets and completions express dependencies.
     """
 
-    device: tuple[Cache.WriteBackOp | Cache.LoadBackOp | SnapshotOp | RestoreOp, ...]
+    device: tuple[
+        Cache.WriteBackOp | Cache.LoadBackOp | PrefixLoadOp | SnapshotOp | RestoreOp,
+        ...,
+    ]
     storage: tuple[
         Cache.StorageQueryOp
         | Cache.StorageGetOp
@@ -626,7 +704,10 @@ class CacheOperations(NamedTuple):
 
 
 def cache_ops_from_plan(
-    execution_plan, *, request_admission: Callable[[str], int]
+    execution_plan,
+    *,
+    request_admission: Callable[[str], int],
+    record_observations: bool = False,
 ) -> CacheOperations:
     """Read and validate every cache op once before any owner submits work.
 
@@ -637,12 +718,16 @@ def cache_ops_from_plan(
 
     ``request_admission`` resolves each snapshot/restore request while the
     plan is adapted. The resulting op holds the identity, never a late lookup
-    of an external ID that another admission could reuse.
+    of an external ID that another admission could reuse. Opt-in
+    ``record_observations`` instead requires native immutable restore/prefix
+    telemetry; it never recovers that identity from a later request lookup.
     """
     device: list = []
     storage: list = []
     for op in execution_plan.cache:
-        if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
+        if isinstance(op, Cache.LoadBackOp) and record_observations:
+            device.extend(prefix_load_ops_from_wire(op))
+        elif isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
             device.append(op)
         elif isinstance(op, Cache.SnapshotOp):
             device.extend(
@@ -650,7 +735,11 @@ def cache_ops_from_plan(
             )
         elif isinstance(op, Cache.RestoreOp):
             device.extend(
-                restore_ops_from_wire(op, request_admission=request_admission)
+                restore_ops_from_wire(
+                    op,
+                    request_admission=request_admission,
+                    record_observations=record_observations,
+                )
             )
         elif isinstance(
             op,

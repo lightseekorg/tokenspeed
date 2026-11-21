@@ -86,8 +86,16 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     pinned_host_bytes,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
+from tokenspeed.runtime.cache.transfer.observations import (
+    CompletedObservations,
+    CopyCounts,
+    ObservationBatch,
+    count_owned_rows,
+    observe_copy,
+)
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
+    PrefixLoadOp,
     RestoreOp,
     SnapshotOp,
 )
@@ -116,10 +124,11 @@ class _AckKind(Enum):
 
 
 class _Ack(NamedTuple):
-    """The scheduler ACK kind and IDs of an in-flight Host copy."""
+    """The scheduler ACK and optional CPU observations of one in-flight copy."""
 
     kind: _AckKind
     op_ids: list[int]
+    observations: ObservationBatch = ObservationBatch()
 
 
 def _num_host_lcm_blocks(
@@ -174,6 +183,7 @@ class HostCacheExecutor:
         kvp_rank: int,
         nprocs_per_node: int,
         world_cpu_group,
+        cache_observation_capacity: int = 0,
     ):
         """
         Args:
@@ -209,7 +219,11 @@ class HostCacheExecutor:
                 of the Host memory the node has available.
             world_cpu_group: The gloo group of every rank, over which the Host
                 tier sizes are agreed and compared; None with a single rank.
+            cache_observation_capacity: Maximum completed CPU observations
+                retained between polls. Zero disables optional diagnostics;
+                overflow reports a loss without changing scheduler ACKs.
         """
+        self._cache_observations = CompletedObservations(cache_observation_capacity)
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
         if not l2_tier and snapshot_pool.disabled:
@@ -488,7 +502,7 @@ class HostCacheExecutor:
         self._completions = CompletionQueue()
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
-        self._ready_load_acks: list[int] = []
+        self._ready_load_acks: list[_Ack] = []
 
         # Resolve each buffer binding on its eventual copy stream at startup,
         # so the first serving transfer only uploads its per-operation rows.
@@ -675,6 +689,8 @@ class HostCacheExecutor:
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
         restore_ops: list[RestoreOp] = []
+        load_observations = []
+        restore_observations = []
         restore_rows: dict[HostTier, list[tuple[int, int, int]]] = {
             HostTier.L2: [],
             HostTier.SNAPSHOT_POOL: [],
@@ -691,21 +707,72 @@ class HostCacheExecutor:
                     source_is_device=False,
                     tier=HostTier.L2,
                 )
+                if self._cache_observations.enabled:
+                    # An unobserved wire batch has no trustworthy admission
+                    # identity. Keep its ACK and report missing evidence.
+                    load_observations.append(
+                        ObservationBatch(dropped=len(operation.op_ids))
+                    )
+            elif isinstance(operation, PrefixLoadOp):
+                start = len(transfers)
+                self._append_transfers(
+                    [operation.op_id],
+                    [[row.group_id for row in operation.transfers]],
+                    [[row.source_page for row in operation.transfers]],
+                    [[row.destination_page for row in operation.transfers]],
+                    collected_op_ids=op_ids,
+                    transfers=transfers,
+                    source_is_device=False,
+                    tier=HostTier.L2,
+                )
+                if self._cache_observations.enabled:
+                    load_observations.append(
+                        observe_copy(
+                            kind="prefix_load",
+                            op_id=operation.op_id,
+                            request_id=operation.request_id,
+                            request_pool_index=operation.telemetry.request_pool_index,
+                            telemetry=operation.telemetry,
+                            l2=count_owned_rows(transfers[start:], self.layout.groups),
+                            pool=CopyCounts(0, 0),
+                            slot_state_image_bytes=0,
+                        )
+                    )
             elif isinstance(operation, RestoreOp):
                 restore_ops.append(operation)
-                self._append_restore(operation, rows_by_tier=restore_rows)
+                restore_observations.append(
+                    self._append_restore(operation, rows_by_tier=restore_rows)
+                )
         self._check_distinct(restore_ops)
         # Loads first: the forward reads them layer by layer behind the
         # layerwise fences, while a restore is read by nothing this round, so
         # it rides the same stream behind them instead of delaying them.
         load_index = self._start_loading(
-            op_ids, transfers, prerequisite_stream=prerequisite_stream
+            op_ids,
+            transfers,
+            prerequisite_stream=prerequisite_stream,
+            observations=ObservationBatch(
+                tuple(
+                    record for batch in load_observations for record in batch.records
+                ),
+                sum(batch.dropped for batch in load_observations),
+            ),
         )
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
         if restore_ops:
             self._start_restore(
-                restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
+                restore_ops,
+                restore_rows,
+                prerequisite_stream=prerequisite_stream,
+                observations=ObservationBatch(
+                    tuple(
+                        record
+                        for batch in restore_observations
+                        for record in batch.records
+                    ),
+                    sum(batch.dropped for batch in restore_observations),
+                ),
             )
 
     def _append_write_backs(
@@ -859,10 +926,14 @@ class HostCacheExecutor:
 
     def _append_restore(
         self, op: RestoreOp, *, rows_by_tier: dict[HostTier, list[tuple[int, int, int]]]
-    ) -> None:
+    ) -> ObservationBatch:
         """A restore's rows, split by the Host tier each one reads. Empty
         transfers are legal, mirroring the store: the image is its slot state
         alone."""
+        starts = {
+            tier: len(rows_by_tier[tier])
+            for tier in (HostTier.L2, HostTier.SNAPSHOT_POOL)
+        }
         self._check_snapshot_op(op)
         if len(op.source_tier) != len(op.transfers):
             raise ValueError(f"ragged cache operation {op.op_id}")
@@ -885,6 +956,24 @@ class HostCacheExecutor:
                 source_is_device=False,
                 tier=tier,
             )
+
+        if not self._cache_observations.enabled:
+            return ObservationBatch()
+        return observe_copy(
+            kind="snapshot_restore",
+            op_id=op.op_id,
+            request_id=op.request_id,
+            request_pool_index=op.request_pool_index,
+            telemetry=op.telemetry,
+            l2=count_owned_rows(
+                rows_by_tier[HostTier.L2][starts[HostTier.L2] :], self.layout.groups
+            ),
+            pool=count_owned_rows(
+                rows_by_tier[HostTier.SNAPSHOT_POOL][starts[HostTier.SNAPSHOT_POOL] :],
+                self.layout.groups,
+            ),
+            slot_state_image_bytes=self.blob_bytes,
+        )
 
     @staticmethod
     def _check_distinct(ops: Sequence[SnapshotOp | RestoreOp]) -> None:
@@ -958,6 +1047,7 @@ class HostCacheExecutor:
         rows_by_tier: dict[HostTier, Sequence[tuple[int, int, int]]],
         *,
         prerequisite_stream,
+        observations: ObservationBatch = ObservationBatch(),
     ) -> None:
         """Copy both tiers' rows and the slot state into the restored requests.
 
@@ -1017,6 +1107,7 @@ class HostCacheExecutor:
             _Ack(
                 kind=_AckKind.RESTORE,
                 op_ids=[int(op.op_id) for op in ops],
+                observations=observations,
             ),
         )
 
@@ -1064,6 +1155,7 @@ class HostCacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         *,
         prerequisite_stream,
+        observations: ObservationBatch = ObservationBatch(),
     ) -> int | None:
         if self._load_poisoned:
             raise RuntimeError(
@@ -1080,7 +1172,9 @@ class HostCacheExecutor:
             # is acknowledged from an empty copy -- the hooks' replica
             # intersection completes it once the owners have copied theirs.
             with self._ack_lock:
-                self._ready_load_acks.extend(op_ids)
+                self._ready_load_acks.append(
+                    _Ack(_AckKind.LOAD_BACK, list(op_ids), observations)
+                )
             return None
         if self.attn_tp_rank == 0:
             logger.info(
@@ -1199,7 +1293,7 @@ class HostCacheExecutor:
                 raise RuntimeError("cache transfer layout has no layer consumers")
             self._completions.push(
                 finish,
-                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids),
+                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids, observations=observations),
             )
             return load_index
         except BaseException as original_error:
@@ -1240,7 +1334,9 @@ class HostCacheExecutor:
         """The completed ops' ACKs, both tiers; event queries only, never blocks."""
         results: list = []
         with self._ack_lock:
-            results.extend(self._load_done(op_id) for op_id in self._ready_load_acks)
+            for ack in self._ready_load_acks:
+                results.extend(self._load_done(op_id) for op_id in ack.op_ids)
+                self._cache_observations.extend(ack.observations)
             self._ready_load_acks.clear()
         for ack in self._completions.pop_ready():
             if ack.kind is _AckKind.WRITE_BACK:
@@ -1251,7 +1347,19 @@ class HostCacheExecutor:
                 results.extend(self._snapshot_done(op_id) for op_id in ack.op_ids)
             else:
                 results.extend(self._restore_done(op_id) for op_id in ack.op_ids)
+            if self._cache_observations.enabled:
+                with self._ack_lock:
+                    self._cache_observations.extend(ack.observations)
         return results
+
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """Drain bounded CPU completion metadata and losses after the ACK poll.
+
+        No device query, wait, serialization, or request-state lookup occurs
+        here. The host adds engine/rank context and exports records off-loop.
+        """
+        with self._ack_lock:
+            return self._cache_observations.drain()
 
     @staticmethod
     def _write_done(op_id: int):
@@ -1282,3 +1390,4 @@ class HostCacheExecutor:
         self._completions.drop_all()
         with self._ack_lock:
             self._ready_load_acks.clear()
+            self._cache_observations.clear()
