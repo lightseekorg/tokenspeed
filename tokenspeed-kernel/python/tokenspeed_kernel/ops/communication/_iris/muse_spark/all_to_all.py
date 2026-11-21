@@ -31,11 +31,13 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_rendezvous,
 )
+from tokenspeed_kernel.ops.communication._iris.payload import load_int8_block16
 
 
 @gluon.jit(do_not_specialize=["rows"])
 def iris_a2a_transpose_qkvg(
     source,
+    source_scales,
     output,
     ready_flags,
     heaps,
@@ -44,6 +46,7 @@ def iris_a2a_transpose_qkvg(
     FLAG_ROWS: gl.constexpr,
     BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    INT8_BLOCK16: gl.constexpr,
     WAIT_VMEM: gl.constexpr,
 ):
     """Exchange complete owned Q/K/V/gate rows for this rank's attention heads.
@@ -52,11 +55,16 @@ def iris_a2a_transpose_qkvg(
     per destination rank. Pull this rank's bundle from every row owner into
     output [rows, 18432 / WORLD_SIZE], masking padding. ready_flags publish
     source writes and wait for peer reads before the next projection reuses source.
+    INT8_BLOCK16: source holds the rows' INT8 codes and source_scales their
+    block-16 scales (payload.py), decoded to BF16 on arrival; otherwise
+    source_scales is unused.
     """
     WORLD_SIZE: gl.constexpr = len(heaps)
     BUNDLE_WIDTH: gl.constexpr = 18432 // WORLD_SIZE
     program = gl.program_id(0)
     peers = _iris_peer_pointers(source, heaps, RANK)
+    if INT8_BLOCK16:
+        scale_peers = _iris_peer_pointers(source_scales, heaps, RANK)
     epoch = (
         gl.atomic_add(
             ready_flags + program * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
@@ -77,9 +85,21 @@ def iris_a2a_transpose_qkvg(
         for step in gl.static_range(WORLD_SIZE):
             destination = ((RANK + step) % WORLD_SIZE) * local_elements + offsets
             mask = (offsets < local_elements) & (destination < rows * BUNDLE_WIDTH)
-            values = gl.amd.cdna4.buffer_load(
-                peers[(RANK + step) % WORLD_SIZE], source_offsets, mask, 0, cache=".cg"
-            )
+            if INT8_BLOCK16:
+                values = load_int8_block16(
+                    peers[(RANK + step) % WORLD_SIZE],
+                    scale_peers[(RANK + step) % WORLD_SIZE],
+                    source_offsets,
+                    mask,
+                )
+            else:
+                values = gl.amd.cdna4.buffer_load(
+                    peers[(RANK + step) % WORLD_SIZE],
+                    source_offsets,
+                    mask,
+                    0,
+                    cache=".cg",
+                )
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The output projection may immediately overwrite this buffer. Every reader
     # must finish before any rank returns to that producer on the main stream.
@@ -99,6 +119,7 @@ def iris_a2a_transpose_qkvg(
 @gluon.jit(do_not_specialize=["rows"])
 def iris_fused_a2a_transpose_qkvg_norm_rope(
     source,
+    source_scales,
     query,
     key,
     value,
@@ -114,6 +135,7 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
     EPS: gl.constexpr,
     Q_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    INT8_BLOCK16: gl.constexpr,
     WAIT_VMEM: gl.constexpr,
 ):
     """Exchange owned QKVG rows and normalize/rotate the received Q and K heads.
@@ -122,7 +144,9 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
     Q_SCALE to queries, and optional RoPE using positions and cos_sin_cache;
     compute in FP32 and round once to BF16. Write query/key/value/gate outputs,
     copying V and gate unchanged. ready_flags protect source reuse. The attention
-    prologue still owns the KV-cache write.
+    prologue still owns the KV-cache write. INT8_BLOCK16: source holds INT8
+    codes and source_scales their block-16 scales (payload.py), decoded to BF16
+    on arrival; otherwise source_scales is unused.
     """
     WORLD_SIZE: gl.constexpr = len(heaps)
     BUNDLE_WIDTH: gl.constexpr = 18432 // WORLD_SIZE
@@ -132,6 +156,8 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
     QK_HEADS: gl.constexpr = 144 // WORLD_SIZE
     program = gl.program_id(0)
     peers = _iris_peer_pointers(source, heaps, RANK)
+    if INT8_BLOCK16:
+        scale_peers = _iris_peer_pointers(source_scales, heaps, RANK)
     epoch = (
         gl.atomic_add(
             ready_flags + program * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
@@ -156,11 +182,22 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
             peer = peers[0]
             for candidate in gl.static_range(1, WORLD_SIZE):
                 peer = gl.where(owner == candidate, peers[candidate], peer)
+            if INT8_BLOCK16:
+                scale_peer = scale_peers[0]
+                for candidate in gl.static_range(1, WORLD_SIZE):
+                    scale_peer = gl.where(
+                        owner == candidate, scale_peers[candidate], scale_peer
+                    )
             source_row = local_row * 18432 + RANK * BUNDLE_WIDTH
             offsets = source_row + heads[:, None] * 64 + channels[None, :]
-            raw = gl.amd.cdna4.buffer_load(
-                peer, offsets, heads[:, None] < QK_HEADS, 0, cache=".cg"
-            )
+            if INT8_BLOCK16:
+                raw = load_int8_block16(
+                    peer, scale_peer, offsets, heads[:, None] < QK_HEADS
+                )
+            else:
+                raw = gl.amd.cdna4.buffer_load(
+                    peer, offsets, heads[:, None] < QK_HEADS, 0, cache=".cg"
+                )
             fp32 = raw.to(gl.float32)
             inverse = gl.rsqrt(gl.sum(fp32 * fp32, 1) / 64 + EPS)
             normalized = fp32 * inverse[:, None]
@@ -190,13 +227,14 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
                 row * KV_WIDTH + (heads[:, None] - Q_HEADS) * 64 + channels[None, :],
                 (heads[:, None] >= Q_HEADS) & (heads[:, None] < QK_HEADS),
             )
-            tail = gl.amd.cdna4.buffer_load(
-                peer,
-                source_row + (Q_WIDTH + KV_WIDTH) + copy_lanes,
-                copy_lanes < (Q_WIDTH + KV_WIDTH),
-                0,
-                cache=".cg",
-            )
+            tail_offsets = source_row + (Q_WIDTH + KV_WIDTH) + copy_lanes
+            tail_mask = copy_lanes < (Q_WIDTH + KV_WIDTH)
+            if INT8_BLOCK16:
+                tail = load_int8_block16(peer, scale_peer, tail_offsets, tail_mask)
+            else:
+                tail = gl.amd.cdna4.buffer_load(
+                    peer, tail_offsets, tail_mask, 0, cache=".cg"
+                )
             gl.amd.cdna4.buffer_store(
                 tail, value, row * KV_WIDTH + copy_lanes, copy_lanes < KV_WIDTH
             )

@@ -73,6 +73,10 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_routed_rmsnorm_sum_lamport_allgather,
     iris_routed_rmsnorm_weighted_sum_write_through,
 )
+from tokenspeed_kernel.ops.communication._iris.payload import (
+    PAYLOAD_BLOCK,
+    encode_int8_block16,
+)
 from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
     iris_pull_reduce_scatter,
 )
@@ -109,6 +113,15 @@ _MUSE_ROUTED_LAMPORT_TWO_SHOT_MAX_ROWS = 32
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
+# The int8-block16 pull moves 1.25 bytes an element instead of 2, so its
+# 4096-element tiles cover twice the elements of the BF16 tiles and the payload
+# is half as many tiles; it runs more programs to keep enough loads in flight.
+_MUSE_INT8_SCATTER_PROGRAMS = 64
+# Elements one encode program covers.
+_MUSE_ENCODE_BLOCK = 4096
+# Prefill collective payload encodings (``payload`` of the owned-row
+# collectives): BF16 as produced, or INT8 codes with FP32 block-16 scales.
+MUSE_PAYLOADS = ("bf16", "int8-block16")
 _MUSE_ROW_GATHER_PROGRAMS = 128
 _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
@@ -166,6 +179,7 @@ class MuseIrisState:
         enable_lamport: bool,
         owned_route_max_rows: int,
         intermediate_gather_max_rows: int,
+        int8_payloads: bool,
     ) -> int:
         rows = min(max_numel // _MUSE_BOUNDARY_WIDTH, _MUSE_BOUNDARY_MAX_ROWS)
         size = ProducerAllReduce.heap_bytes(
@@ -184,6 +198,11 @@ class MuseIrisState:
             size += allocation_bytes(
                 (2, _MUSE_ROW_GATHER_PROGRAMS, world_size), torch.uint32
             )
+            if int8_payloads:
+                for shape, dtype in MuseIrisState._int8_payload_buffers(
+                    max_numel, world_size
+                ):
+                    size += allocation_bytes(shape, dtype)
         if owned_route_max_rows:
             size += allocation_bytes(
                 (owned_route_max_rows, _MUSE_TOPK, _MUSE_ROUTE_WIDTH), torch.bfloat16
@@ -211,6 +230,21 @@ class MuseIrisState:
             for shape, dtype in MuseIrisState._attntail_buffers(world_size):
                 size += allocation_bytes(shape, dtype)
         return size
+
+    @staticmethod
+    def _int8_payload_buffers(
+        max_numel: int, world_size: int
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        """Return the int8-block16 payload buffers in allocation order.
+
+        They are the codes and scales of a full producer payload, and the
+        payload reduce-scatter's ready flags.
+        """
+        return (
+            ((max_numel,), torch.int8),
+            ((triton.cdiv(max_numel, PAYLOAD_BLOCK),), torch.float32),
+            ((_MUSE_INT8_SCATTER_PROGRAMS, world_size), torch.uint32),
+        )
 
     @staticmethod
     def _attntail_supported(world_size: int, enable_lamport: bool) -> bool:
@@ -290,6 +324,7 @@ class MuseIrisState:
         enable_lamport: bool,
         owned_route_max_rows: int,
         intermediate_gather_max_rows: int,
+        int8_payloads: bool,
     ):
         self._arch = iris_arch_policy()
         self.all_reduce = all_reduce
@@ -352,6 +387,22 @@ class MuseIrisState:
             if self.row_boundary_supported
             else None
         )
+        # int8-block16 payloads of the owned-row collectives (payload.py): the
+        # codes and scales peers pull instead of BF16 rows, and the ready
+        # flags of their reduce-scatter's wider grid.
+        self.payload_codes, self.payload_scales, self.payload_scatter_flags = (
+            [
+                peers.ctx.zeros(shape, dtype=dtype)
+                for shape, dtype in self._int8_payload_buffers(
+                    capacity, self.world_size
+                )
+            ]
+            if int8_payloads and self.row_boundary_supported
+            else (None, None, None)
+        )
+        # The pulls index payloads with 32-bit buffer offsets, as the BF16
+        # pulls do; a producer payload stays below 2^31 elements.
+        assert self.payload_codes is None or capacity < 2**31
         # Expert TP stages raw routes separately from the producer buffer.
         self.owned_route_max_rows = owned_route_max_rows
         # Expert TP8 completes routes on token owners, normalizes there and
@@ -545,6 +596,31 @@ class MuseIrisState:
             <= self.all_reduce.producer_direct_max_numel
         )
 
+    def _int8_block16(self, payload: str) -> bool:
+        """Whether an owned-row collective's payload travels as int8-block16.
+
+        That is INT8 codes with block-16 scales; ``payload`` is one of
+        MUSE_PAYLOADS.
+        """
+        if payload not in MUSE_PAYLOADS:
+            raise ValueError(f"unknown collective payload {payload!r}")
+        if payload == "int8-block16" and self.payload_codes is None:
+            raise RuntimeError("int8-block16 payloads were not prepared")
+        return payload == "int8-block16"
+
+    def _encode_payload(self, tensor: torch.Tensor) -> None:
+        """Encode a contiguous BF16 payload into the int8-block16 buffers."""
+        elements = tensor.numel()
+        assert elements % PAYLOAD_BLOCK == 0 and elements <= self.payload_codes.numel()
+        encode_int8_block16[(triton.cdiv(elements, _MUSE_ENCODE_BLOCK),)](
+            tensor,
+            self.payload_codes,
+            self.payload_scales,
+            elements,
+            BLOCK=_MUSE_ENCODE_BLOCK,
+            num_warps=8,
+        )
+
     def acquire_owned_qkvg_output(self, rows: int) -> torch.Tensor:
         """Borrow the producer prefix until the QKVG transpose has completed."""
         assert self.can_use_owned_rows(rows)
@@ -554,12 +630,13 @@ class MuseIrisState:
         return self.all_reduce.producer.data[:elements].view(local_rows, 18432)
 
     def all_to_all_transpose_qkvg(
-        self, tensor: torch.Tensor, rows: int
+        self, tensor: torch.Tensor, rows: int, *, payload: str
     ) -> torch.Tensor:
         """Turn owned token rows into this rank's Q/K/V/gate head shard for all tokens.
 
         The source must be the completed producer-direct QKVG projection. The
         result owns its storage; the transpose exit protects input reuse by O.
+        ``payload`` (MUSE_PAYLOADS) is the encoding peers pull.
         """
         expected = self.acquire_owned_qkvg_output(rows)
         assert (
@@ -567,13 +644,17 @@ class MuseIrisState:
         )
         assert tensor.is_contiguous() and tensor.dtype == torch.bfloat16
         assert tensor.device == self.all_reduce.device
+        int8_block16 = self._int8_block16(payload)
+        if int8_block16:
+            self._encode_payload(tensor)
         output = torch.empty(
             (rows, 18432 // self.world_size),
             dtype=tensor.dtype,
             device=self.all_reduce.device,
         )
         iris_a2a_transpose_qkvg[(_MUSE_ROW_GATHER_PROGRAMS,)](
-            tensor,
+            self.payload_codes if int8_block16 else tensor,
+            self.payload_scales if int8_block16 else None,
             output,
             self.row_gather_flags,
             self.all_reduce.peers.addresses[: self.world_size],
@@ -582,6 +663,7 @@ class MuseIrisState:
             FLAG_ROWS=_MUSE_ROW_GATHER_PROGRAMS,
             BLOCK=2048,
             NUM_WARPS=4,
+            INT8_BLOCK16=int8_block16,
             num_warps=4,
             WAIT_VMEM=self._arch.wait_vmem,
         )
@@ -595,11 +677,14 @@ class MuseIrisState:
         cos_sin_cache: torch.Tensor,
         eps: float,
         q_scale: float,
+        *,
+        payload: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return owned QKVG as contiguous, normalized prefill Q/K and V/gate.
 
         PagedAttention stores these prepared K/V rows through its prologue.
         Peer reads finish before the output projection reuses the input.
+        ``payload`` (MUSE_PAYLOADS) is the encoding peers pull.
         """
         expected = self.acquire_owned_qkvg_output(rows)
         assert (
@@ -615,6 +700,9 @@ class MuseIrisState:
         assert cos_sin_cache.ndim == 2 and cos_sin_cache.shape[1] in (0, 64)
         assert cos_sin_cache.dtype == torch.float32 and cos_sin_cache.is_contiguous()
         assert cos_sin_cache.device == self.all_reduce.device
+        int8_block16 = self._int8_block16(payload)
+        if int8_block16:
+            self._encode_payload(tensor)
         outputs = tuple(
             torch.empty(
                 (rows, width // self.world_size),
@@ -624,7 +712,8 @@ class MuseIrisState:
             for width in (8192, 1024, 1024, 8192)
         )
         iris_fused_a2a_transpose_qkvg_norm_rope[(_MUSE_ROW_GATHER_PROGRAMS,)](
-            tensor,
+            self.payload_codes if int8_block16 else tensor,
+            self.payload_scales if int8_block16 else None,
             *outputs,
             positions,
             cos_sin_cache,
@@ -637,6 +726,7 @@ class MuseIrisState:
             EPS=eps,
             Q_SCALE=q_scale,
             NUM_WARPS=8,
+            INT8_BLOCK16=int8_block16,
             num_warps=8,
             enable_fp_fusion=False,
             WAIT_VMEM=self._arch.wait_vmem,
@@ -652,31 +742,56 @@ class MuseIrisState:
             local_rows, width
         )
 
-    def reduce_scatter_owned_rows(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Reduce full BF16 rows and finish all peer reads before returning."""
+    def reduce_scatter_owned_rows(
+        self, tensor: torch.Tensor, *, payload: str
+    ) -> torch.Tensor:
+        """Reduce full BF16 rows and finish all peer reads before returning.
+
+        ``payload`` (MUSE_PAYLOADS) is the encoding peers pull.
+        """
         rows, width = tensor.shape
         assert self.can_use_owned_rows(rows) and width in (4096, 8192)
         assert tensor.is_contiguous() and tensor.dtype == torch.bfloat16
         assert tensor.device == self.all_reduce.device
-        if tensor.data_ptr() != self.all_reduce.producer.data.data_ptr():
+        int8_block16 = self._int8_block16(payload)
+        if int8_block16:
+            self._encode_payload(tensor)
+        elif tensor.data_ptr() != self.all_reduce.producer.data.data_ptr():
             self.all_reduce.producer.data[: tensor.numel()].copy_(tensor.view(-1))
+        return self._pull_reduce_scatter(
+            rows, width, int8_block16=int8_block16, writes_through=False
+        )
+
+    def _pull_reduce_scatter(
+        self, rows: int, width: int, *, int8_block16: bool, writes_through: bool
+    ) -> torch.Tensor:
+        """Reduce producer BF16 rows, or their int8-block16 payload, to owners.
+
+        Each token owner receives its rows' sums in pull scratch.
+        """
         local_rows = triton.cdiv(rows, self.world_size)
         output = self.all_reduce.producer_pull.scratch[: local_rows * width].view(
             local_rows, width
         )
-        iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
-            self.all_reduce.producer.data,
+        programs = (
+            _MUSE_INT8_SCATTER_PROGRAMS if int8_block16 else _MUSE_ROW_SCATTER_PROGRAMS
+        )
+        iris_pull_reduce_scatter[(programs,)](
+            self.payload_codes if int8_block16 else self.all_reduce.producer.data,
+            self.payload_scales if int8_block16 else None,
             output,
-            self.row_scatter_flags,
+            self.payload_scatter_flags if int8_block16 else self.row_scatter_flags,
             self.all_reduce.peers.addresses[: self.world_size],
             ROWS=rows,
             RANK=self.all_reduce.rank_in_group,
             WIDTH=width,
-            BLOCK=2048,
-            PROGRAMS=_MUSE_ROW_SCATTER_PROGRAMS,
+            # One int8-block16 tile moves the bytes of a 2048-element BF16 one.
+            BLOCK=4096 if int8_block16 else 2048,
+            PROGRAMS=programs,
             NUM_WARPS=4,
             EXIT_BARRIER=True,
-            PRODUCER_WRITES_THROUGH=False,
+            PRODUCER_WRITES_THROUGH=writes_through,
+            INT8_BLOCK16=int8_block16,
             num_warps=4,
             WAIT_VMEM=self._arch.wait_vmem,
         )
@@ -725,6 +840,7 @@ class MuseIrisState:
         # Partition whole tokens: all eight routes must reach the same owner.
         iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
             staged,
+            None,
             output,
             self.owned_route_scatter_flags,
             self.all_reduce.peers.addresses[: self.world_size],
@@ -736,6 +852,7 @@ class MuseIrisState:
             NUM_WARPS=4,
             EXIT_BARRIER=True,
             PRODUCER_WRITES_THROUGH=False,
+            INT8_BLOCK16=False,
             num_warps=4,
             WAIT_VMEM=self._arch.wait_vmem,
         )
@@ -751,11 +868,14 @@ class MuseIrisState:
         norm_weight: torch.Tensor,
         eps: float,
         weight_offset: float,
+        *,
+        payload: str,
     ) -> torch.Tensor | None:
         """Normalize and weight expert routes, then reduce to this rank's rows.
 
         Expert inputs must not overlap the shared producer buffer. The result
         borrows pull scratch until the next producer or collective call.
+        ``payload`` (MUSE_PAYLOADS) is the encoding peers pull.
         """
         if not (
             num_tokens >= 192
@@ -787,40 +907,33 @@ class MuseIrisState:
             or value.data_ptr() >= end
             for value in (routes, route_map, route_weights, norm_weight)
         ), "expert inputs must not alias the owned routed-sum prefix"
+        int8_block16 = self._int8_block16(payload)
+        # With int8-block16 the sum writes the payload codes and scales itself
+        # (the pulls read only those), saving the BF16 rows' store and the
+        # separate encode; its ordinary stores publish with release ordering.
         iris_routed_rmsnorm_weighted_sum_write_through[(num_tokens,)](
             routes,
             route_map,
             route_weights,
             norm_weight,
             self.all_reduce.producer.data,
+            self.payload_codes if int8_block16 else None,
+            self.payload_scales if int8_block16 else None,
             routes.stride(0),
             EPS=eps,
             WEIGHT_OFFSET=weight_offset,
+            INT8_BLOCK16=int8_block16,
             num_warps=8,
             WAIT_STORES=self._arch.wait_stores,
         )
-        local_rows = triton.cdiv(num_tokens, self.world_size)
-        output = self.all_reduce.producer_pull.scratch[: local_rows * 4096].view(
-            local_rows, 4096
+        # Otherwise the local producer uses write-through stores; peer reads
+        # need no cache writeback.
+        return self._pull_reduce_scatter(
+            num_tokens,
+            4096,
+            int8_block16=int8_block16,
+            writes_through=not int8_block16,
         )
-        # The local producer uses write-through stores; peer reads need no cache writeback.
-        iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
-            self.all_reduce.producer.data,
-            output,
-            self.row_scatter_flags,
-            self.all_reduce.peers.addresses[: self.world_size],
-            ROWS=num_tokens,
-            RANK=self.all_reduce.rank_in_group,
-            WIDTH=4096,
-            BLOCK=2048,
-            PROGRAMS=_MUSE_ROW_SCATTER_PROGRAMS,
-            NUM_WARPS=4,
-            EXIT_BARRIER=True,
-            PRODUCER_WRITES_THROUGH=True,
-            num_warps=4,
-            WAIT_VMEM=self._arch.wait_vmem,
-        )
-        return output
 
     def can_gather_expert_intermediate(self, rows: int) -> bool:
         """Whether expert TP prefill of ``rows`` tokens exchanges intermediates.
@@ -1307,6 +1420,7 @@ class MuseIrisState:
             shard = self.all_reduce.producer_pull.scratch[: local_rows * width]
             iris_pull_reduce_scatter[(_MUSE_ROW_SCATTER_PROGRAMS,)](
                 branch,
+                None,
                 shard,
                 self.row_scatter_flags,
                 self.all_reduce.peers.addresses[: self.world_size],
@@ -1318,6 +1432,7 @@ class MuseIrisState:
                 NUM_WARPS=4,
                 EXIT_BARRIER=False,
                 PRODUCER_WRITES_THROUGH=False,
+                INT8_BLOCK16=False,
                 num_warps=4,
                 WAIT_VMEM=self._arch.wait_vmem,
             )
@@ -2523,6 +2638,7 @@ def prepare_muse_communication(
     enable_lamport: bool,
     owned_route_max_rows: int,
     intermediate_gather_max_rows: int,
+    int8_payloads: bool,
     all_reduce: IrisAllReduce | None,
     device: torch.device,
 ) -> MuseIrisState:
@@ -2553,6 +2669,7 @@ def prepare_muse_communication(
         enable_lamport=enable_lamport,
         owned_route_max_rows=owned_route_max_rows,
         intermediate_gather_max_rows=intermediate_gather_max_rows,
+        int8_payloads=int8_payloads,
     )
     if all_reduce is None:
         size += IrisAllReduce.heap_bytes(
@@ -2568,6 +2685,7 @@ def prepare_muse_communication(
         enable_lamport=enable_lamport,
         owned_route_max_rows=owned_route_max_rows,
         intermediate_gather_max_rows=intermediate_gather_max_rows,
+        int8_payloads=int8_payloads,
     )
     all_reduce.peers.finish_prepare()
     return state
