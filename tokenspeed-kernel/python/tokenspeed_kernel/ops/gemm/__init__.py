@@ -29,7 +29,7 @@ from math import prod
 from types import MappingProxyType
 
 import torch
-from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.compile_monitor import is_serving, serving_selection
 from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
     interleave_linear_and_gate,
     swizzle_blockscale_2d,
@@ -103,8 +103,10 @@ __all__ = [
     "has_grouped_fp8_projection",
     "prepare_fp8_projection",
     "prepare_grouped_fp8_projection",
+    "warmup_dsv4_linear_fp32",
     "warmup_fp8_projection",
     "warmup_fp8_projections",
+    "warmup_grouped_bf16_projection",
     # MV: small-M dense projection
     "mv",
     "MV_FP8_WEIGHT_MAX_M",
@@ -1815,6 +1817,77 @@ def warmup_fp8_projection(
         x = codes[: tokens * input_dim].view(tokens, input_dim)
         x_scales = scale_storage.as_strided((tokens, input_dim // 128), (1, aligned))
         fp8_projection(x, x_scales, weight, weight_scales, None)
+    torch.cuda.synchronize(device)
+
+
+def warmup_grouped_bf16_projection(
+    weight: torch.Tensor, token_stride: int, quantize_fp8: bool, max_tokens: int
+) -> None:
+    """Launch the grouped BF16 projection once at every token count up to max_tokens.
+
+    The projection may run a library batched GEMM, which picks its kernel per
+    token count and loads a kernel on its first launch (see
+    :func:`warmup_dsv4_linear_fp32`). Kernels are selected as serving selects
+    them.
+
+    Args:
+        weight: BF16 ``[groups, output_dim, input_dim]`` weights.
+        token_stride: Elements between consecutive tokens of the activations:
+            ``groups * input_dim`` for a contiguous input, more for a slice of
+            padded attention heads.
+        quantize_fp8: Launch ``grouped_bf16_projection_quantize_fp8`` instead
+            of ``grouped_bf16_projection``, as the call site does.
+        max_tokens: Largest token count the call site passes.
+    """
+    groups, _, input_dim = weight.shape
+    if token_stride < groups * input_dim:
+        raise ValueError(
+            f"token_stride {token_stride} is below groups * input_dim "
+            f"{groups * input_dim}"
+        )
+    device = weight.device
+    storage = torch.zeros(
+        max_tokens * token_stride, dtype=torch.bfloat16, device=device
+    )
+    with serving_selection():
+        # Largest first, so the outputs each launch allocates reuse cached blocks.
+        for tokens in range(max_tokens, 0, -1):
+            x = storage.as_strided(
+                (tokens, groups, input_dim), (token_stride, input_dim, 1)
+            )
+            if quantize_fp8:
+                grouped_bf16_projection_quantize_fp8(x, weight)
+            else:
+                grouped_bf16_projection(x, weight, None, None)
+    torch.cuda.synchronize(device)
+
+
+def warmup_dsv4_linear_fp32(
+    weight: torch.Tensor, dtype: torch.dtype, max_tokens: int
+) -> None:
+    """Launch ``dsv4_linear_fp32`` once at every token count up to max_tokens.
+
+    Above the small-M kernels' bound the projection runs a library GEMM
+    (cuBLAS on NVIDIA), which picks its kernel per token count and loads a
+    kernel the process has not launched on its first launch. Eager code runs
+    the projection at each forward's real token count, and under the overlap
+    schedule a first load inside a forward, while the previous forward's
+    collective is in flight, has stopped every rank of a TP engine. Launching
+    every count here, before serving and with nothing else in flight, leaves
+    no first load to serving. Kernels are selected as serving selects them
+    (:func:`~tokenspeed_kernel.compile_monitor.serving_selection`).
+
+    Args:
+        weight: ``[N, K]`` weight the call site projects with.
+        dtype: Dtype of the call site's activations.
+        max_tokens: Largest token count the call site passes.
+    """
+    device = weight.device
+    rows = torch.zeros((max_tokens, weight.shape[1]), dtype=dtype, device=device)
+    with serving_selection():
+        # Largest first, so the outputs each launch allocates reuse cached blocks.
+        for tokens in range(max_tokens, 0, -1):
+            dsv4_linear_fp32(rows[:tokens], weight, None, None)
     torch.cuda.synchronize(device)
 
 

@@ -15,6 +15,7 @@ register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
+from tokenspeed_kernel.compile_monitor import serving_selection  # noqa: E402
 
 import tokenspeed.runtime.distributed.comm_manager as comm_manager_module  # noqa: E402
 import tokenspeed.runtime.layers.logits_processor as logits_processor_module  # noqa: E402
@@ -2253,6 +2254,49 @@ def test_dp_head_argmax_and_local_head_input(monkeypatch, attn_tp, head_tp, rank
         torch.testing.assert_close(
             result.next_token_logits, hidden[rank] @ head.weight.T * 2.0
         )
+
+
+def _launched_kernels(block) -> set[str]:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        block()
+        torch.cuda.synchronize()
+    return {
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_lm_head_row_count_warmup_launches_every_serving_kernel():
+    """After the warm-up, the head's GEMM at any row count up to the bound
+    launches only kernels the warm-up launched: none loads while serving."""
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=32000),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    lm_head = SimpleNamespace(
+        weight=torch.randn(32000, 1024, device="cuda", dtype=torch.bfloat16)
+    )
+    sweep = (1, 2, 3, 8, 17, 64, 100, 127, 128)
+    inputs = {
+        rows: torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
+        for rows in sweep
+    }
+    warmed = _launched_kernels(
+        lambda: processor.warmup_row_counts(lm_head, torch.bfloat16, 128)
+    )
+
+    def serve():
+        with serving_selection():
+            for rows in sweep:
+                processor._project_logits(inputs[rows], lm_head, None)
+
+    assert not _launched_kernels(serve) - warmed
 
 
 @pytest.mark.parametrize("reduced", [True, False])

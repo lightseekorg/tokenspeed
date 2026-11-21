@@ -61,9 +61,12 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
 )
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.models import deepseek_v41 as v41
+from tokenspeed.runtime.models import deepseek_v41_dspark as dspark_module
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
@@ -2128,3 +2131,81 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
 
     if tp > 1:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_draft_row_count_warmup_launches_its_own_library_gemms(monkeypatch, adaptive):
+    """Beyond its decoder layers, the draft launches main_proj and context_wkv
+    up to the forward's rows, and the FP32 base logits on the shared head and,
+    under adaptive DSpark, the FP32 confidence head up to the drafted rows, each
+    through the draft's own call."""
+    config = _draft_config()
+    _loader_model(monkeypatch, config, 0, "cpu")
+    # A checkpoint that keeps the draft's own projections in BF16.
+    quant = Fp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+            "ignored_layers": ["model.main_proj", "model.context_wkv"],
+        }
+    )
+    model = DeepseekV41ForCausalLMDSpark(
+        SimpleNamespace(text_config=config), _mapping(0, 4, 4), quant
+    )
+    for key, value in {
+        "chunked_prefill_size": 64,
+        "max_prefill_tokens": 64,
+        "max_model_len": 4096,
+        "max_num_seqs": 4,
+        "max_cudagraph_capture_size": 8,
+        "speculative_algorithm": "DSPARK",
+        "speculative_num_draft_tokens": 6,
+        "enable_dsv41_adaptive_dspark": adaptive,
+    }.items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
+    # Record the GPU-only launches instead of running them.
+    linears, calls = [], []
+    monkeypatch.setattr(
+        UnquantizedLinearMethod,
+        "warmup_row_counts",
+        lambda self, layer, rows: linears.append((layer, rows)),
+    )
+    monkeypatch.setattr(
+        dspark_module,
+        "_warmup_torch_row_counts",
+        lambda call, width, dtype, device, rows: calls.append(
+            (call, width, dtype, rows)
+        ),
+    )
+    monkeypatch.setattr(v41, "_ROW_COUNTS_WARMED", {})
+
+    v41._launch_row_count_sites(model._draft_row_count_sites())
+
+    draft = model.model
+    # Forward rows: the 64-token chunk; drafted rows: 8 graph rows x 6 tokens.
+    assert linears == [(draft.main_proj, 64), (draft.context_wkv, 64)]
+    base_logits, width, dtype, rows = calls[0]
+    head = model.lm_head.weight
+    assert (width, dtype, rows) == (config.hidden_size, head.dtype, 48)
+    # The head is allocated uninitialized; NaN bits in it would fail the exact
+    # comparison below (NaN != NaN) whatever the call.
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        head.normal_(generator=generator)
+    hidden = torch.randn(3, config.hidden_size, dtype=head.dtype, generator=generator)
+    torch.testing.assert_close(
+        base_logits(hidden),
+        draft.local_base_logits(hidden, head),
+        rtol=0,
+        atol=0,
+    )
+    if adaptive:
+        assert calls[1] == (
+            draft.confidence_projection,
+            config.hidden_size + config.dspark_markov_rank,
+            torch.float32,
+            48,
+        )
+    assert len(calls) == 1 + adaptive

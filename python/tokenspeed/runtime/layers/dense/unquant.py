@@ -20,6 +20,7 @@
 
 
 import torch
+from tokenspeed_kernel.compile_monitor import serving_selection
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from tokenspeed_kernel.selection import resolve_kernel_override
@@ -108,3 +109,30 @@ class UnquantizedLinearMethod(LinearMethodBase):
             layer.weight,
             bias=bias,
         )
+
+    @torch.no_grad()
+    def warmup_row_counts(self, layer: torch.nn.Module, max_tokens: int) -> None:
+        """Run the layer's GEMM once at every row count up to max_tokens.
+
+        For a layer that eager code runs at each forward's real row count: the
+        library GEMM this method reaches (cuBLAS on NVIDIA) picks its kernel
+        per row count and loads a kernel on its first launch, which must not
+        happen while serving (see
+        ``tokenspeed_kernel.ops.gemm.warmup_dsv4_linear_fp32``). Kernels are
+        selected as serving selects them.
+
+        Args:
+            layer: A bias-free layer this method serves.
+            max_tokens: Largest row count the layer's caller passes.
+        """
+        if layer.bias is not None:
+            raise ValueError("Row-count warm-up takes bias-free layers only")
+        weight = layer.weight
+        rows = torch.zeros(
+            (max_tokens, weight.shape[1]), dtype=weight.dtype, device=weight.device
+        )
+        with serving_selection():
+            # Largest first, so the outputs each launch allocates reuse cached blocks.
+            for tokens in range(max_tokens, 0, -1):
+                self.apply(layer, rows[:tokens], None)
+        torch.cuda.synchronize(weight.device)

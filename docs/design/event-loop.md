@@ -431,6 +431,17 @@ though they compile once per tile, not per shape: their route was measured
 only inside captured graphs, so eager calls after the mark keep cuBLASLt
 (`tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/README.md`).
 
+A library kernel's first launch is a stall of another kind, and a hang under
+the overlap schedule. cuBLAS picks its kernel per GEMM shape and loads a
+kernel the process has not launched yet on that first launch; a load inside
+a forward while the previous forward's TP collective is still in flight has
+stopped every rank. Code that runs a library GEMM eagerly at the live row
+count therefore launches it at every row count it can see before serving:
+DeepSeek V4.1's attention graph break, narrowing layer and LM head do so in
+`post_quant_warmup`. Those launches select kernels as serving will, under
+`compile_monitor.serving_selection()`, which closes the compile switch for
+the block while the monitor still counts its compilations as startup ones.
+
 A full garbage collection is a stall of the same kind, for every Python
 thread of the process at once. Startup leaves millions of long-lived Python
 objects behind (modules, parameters, captured graphs, kernel caches), and
