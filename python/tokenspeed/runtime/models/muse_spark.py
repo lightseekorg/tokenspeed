@@ -1237,8 +1237,10 @@ MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
 # forwards take the replicated-row path, whose attention-output and expert
 # sums add the ranks in another order.
 MUSE_OWNED_ROWS_MAX_TOKENS = 8192
-# The producer buffer is addressed by 32-bit buffer offsets.
-MUSE_OWNED_ROWS_LIMIT_TOKENS = (2**31 - 1) // (8192 * 2)
+# The largest chunk the layout follows: the size its outputs were checked
+# at against the replicated path. It is well inside the producer buffer's
+# 32-bit offset range (131071 rows).
+MUSE_OWNED_ROWS_LIMIT_TOKENS = 24576
 # Expert TP (EP1) owner-side route staging is [rows, 8, 4096] BF16, so its row
 # limit stays at 8192; larger expert-TP forwards replicate rows.
 MUSE_OWNED_ROUTE_MAX_TOKENS = 8192
@@ -1249,8 +1251,7 @@ def _owned_rows_max_tokens() -> int:
 
     Chunks above 8192 tokens stay on owned rows instead of replicated rows,
     which changes the order their sums are taken in; --numerics rl-bitwise
-    keeps 8192, and a chunk size past the producer buffer's 32-bit range
-    stops at that range.
+    keeps 8192, and the layout follows the chunk size up to 24576 rows.
     """
     chunk = global_server_args_dict["chunked_prefill_size"]
     if global_server_args_dict["numerics"] == "rl-bitwise" or chunk is None:
@@ -3488,8 +3489,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 if buffer is not None
             )
             logger.info(
-                f"Muse Iris buffers sized for "
-                f"{producer.numel() // self.config.hidden_size}-token rows; per-rank "
+                f"Muse Iris owned-row limit "
+                f"{producer.numel() // self.config.hidden_size} token rows; per-rank "
                 f"bytes: producer buffer {producer.numel() * producer.element_size()}, "
                 f"pull scratch {scratch.numel() * scratch.element_size()}, gather "
                 f"output {gather_output.numel() * gather_output.element_size()}, "

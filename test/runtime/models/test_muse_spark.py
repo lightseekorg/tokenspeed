@@ -2068,15 +2068,15 @@ def test_prefill_collective_payload_applies_to_extend_forwards_only(
         (8192, "auto", 8192),
         (24576, "auto", 24576),
         (24576, "rl-bitwise", 8192),
-        (2**20, "auto", (2**31 - 1) // (8192 * 2)),
+        (24577, "auto", 24576),
+        (32768, "auto", 24576),
     ],
 )
 def test_owned_rows_follow_the_prefill_chunk_size(
     monkeypatch: pytest.MonkeyPatch, chunk, numerics: str, expected: int
 ) -> None:
     """The owned-row layout serves the configured prefill chunk, at least
-    8192 rows, within the producer buffer's 32-bit range; --numerics
-    rl-bitwise keeps 8192."""
+    8192 and at most 24576 rows; --numerics rl-bitwise keeps 8192."""
     import tokenspeed.runtime.models.muse_spark as module
 
     monkeypatch.setitem(module.global_server_args_dict, "chunked_prefill_size", chunk)
