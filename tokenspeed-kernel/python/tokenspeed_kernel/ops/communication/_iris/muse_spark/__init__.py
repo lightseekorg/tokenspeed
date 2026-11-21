@@ -236,8 +236,11 @@ class MuseIrisState:
     def _int8_payload_buffers(
         max_numel: int, world_size: int
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
-        """The int8-block16 payload's codes and scales for a full producer
-        payload, and its reduce-scatter's ready flags, in allocation order."""
+        """Return the int8-block16 payload buffers in allocation order.
+
+        They are the codes and scales of a full producer payload, and the
+        payload reduce-scatter's ready flags.
+        """
         return (
             ((max_numel,), torch.int8),
             ((triton.cdiv(max_numel, PAYLOAD_BLOCK),), torch.float32),
@@ -592,8 +595,11 @@ class MuseIrisState:
         )
 
     def _int8_block16(self, payload: str) -> bool:
-        """Whether an owned-row collective transfers its payload as INT8
-        codes with block-16 scales; ``payload`` is one of MUSE_PAYLOADS."""
+        """Whether an owned-row collective's payload travels as int8-block16.
+
+        That is INT8 codes with block-16 scales; ``payload`` is one of
+        MUSE_PAYLOADS.
+        """
         if payload not in MUSE_PAYLOADS:
             raise ValueError(f"unknown collective payload {payload!r}")
         if payload == "int8-block16" and self.payload_codes is None:
@@ -803,8 +809,10 @@ class MuseIrisState:
     def _pull_reduce_scatter(
         self, rows: int, width: int, *, int8_block16: bool, writes_through: bool
     ) -> torch.Tensor:
-        """Reduce the producer buffer's BF16 rows, or the int8-block16
-        payload encoded from them, onto token owners in pull scratch."""
+        """Reduce producer BF16 rows, or their int8-block16 payload, to owners.
+
+        Each token owner receives its rows' sums in pull scratch.
+        """
         local_rows = triton.cdiv(rows, self.world_size)
         output = self.all_reduce.producer_pull.scratch[: local_rows * width].view(
             local_rows, width

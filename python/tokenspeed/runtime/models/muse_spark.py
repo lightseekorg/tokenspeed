@@ -1341,9 +1341,11 @@ def _payload_refusal(cause: str) -> str:
 
 
 def _collective_payload(forward_mode: ForwardMode) -> str:
-    """The payload encoding of an owned-row collective: the
-    --prefill-collective-payload choice for extend forwards; decode (and
-    verify), mixed and idle forwards keep BF16."""
+    """Return the owned-row collective payload encoding for a forward mode.
+
+    Extend forwards take the --prefill-collective-payload choice; decode (and
+    verify), mixed and idle forwards keep BF16.
+    """
     if forward_mode.is_extend():
         return global_server_args_dict["prefill_collective_payload"]
     return "bf16"
