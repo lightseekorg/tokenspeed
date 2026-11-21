@@ -179,6 +179,7 @@ class HostCacheExecutor:
         snapshot_pool: RetractionPoolRequest,
         slot_state_exporters: Sequence[SlotStateExporter] | None,
         io_backend: str,
+        block_alignment: int,
         attn_tp_rank: int,
         kvp_rank: int,
         nprocs_per_node: int,
@@ -211,6 +212,9 @@ class HostCacheExecutor:
                 row. May be None only without a pool.
             io_backend: ``"direct"`` (DMA ranges) or ``"kernel"`` (mapped-Host
                 Triton copies).
+            block_alignment: Every Host block's size, in both pools, is a
+                multiple of this (``cache/disk.py``'s
+                ``host_block_alignment``).
             attn_tp_rank: Attention-TP rank; rank 0 logs.
             kvp_rank: This rank in the KVP subgroup; selects the blocks it
                 owns of a sharded group (the identity for replicated groups).
@@ -247,7 +251,9 @@ class HostCacheExecutor:
             group_ids=scheduler_group_ids or None,
         )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(
-            self.layout, group_specs=contract.group_specs
+            self.layout,
+            group_specs=contract.group_specs,
+            block_alignment=block_alignment,
         )
         shard_by_id = {
             spec.group_id: int(spec.shard_count) for spec in contract.group_specs
@@ -257,7 +263,9 @@ class HostCacheExecutor:
             for group, packing in zip(
                 self.layout.groups,
                 compute_host_group_packing(
-                    self.layout, group_specs=contract.group_specs
+                    self.layout,
+                    group_specs=contract.group_specs,
+                    block_alignment=block_alignment,
                 ),
                 strict=True,
             )
@@ -376,6 +384,7 @@ class HostCacheExecutor:
                 self.layout,
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=host_lcm_blocks,
+                block_alignment=block_alignment,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -400,6 +409,7 @@ class HostCacheExecutor:
                 self.layout,
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
+                block_alignment=block_alignment,
             )
             self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
                 self.layout,

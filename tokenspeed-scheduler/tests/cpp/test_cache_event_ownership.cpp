@@ -43,7 +43,7 @@ TEST(CacheRestoreIdentityTest, WireIdRolloverPreservesGenerationAndTicketOwnersh
     BlockPool host_pool{8, {1}};
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, device_pool, false, &host_pool, nullptr, false, false, 0);
+    auto coordinator = MakeCoordinator(specs, 2, device_pool, false, &host_pool, nullptr, nullptr, false, false, 0);
     ReqPoolAllocator request_slots(2);
     SnapshotSlotAllocator blob_slots(2);
     TierTransferManager manager(coordinator);
@@ -83,7 +83,7 @@ TEST(CacheRestoreIdentityTest, PrefixLoadWireIdsAlsoCarryTheirOwnersWrapGenerati
     BlockPool host_pool{8, {1}};
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, device_pool, false, &host_pool, nullptr, false, false, 0);
+    auto coordinator = MakeCoordinator(specs, 2, device_pool, false, &host_pool, nullptr, nullptr, false, false, 0);
     const std::array<std::int32_t, 1> buckets{0};
     auto device = device_pool.AcquireBlocksInBuckets(0, buckets);
     auto host = host_pool.AcquireBlocksInBuckets(0, buckets);

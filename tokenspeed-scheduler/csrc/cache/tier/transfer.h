@@ -31,6 +31,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache/tier/disk.h"
 #include "cache/tier/storage.h"
 #include "utils.h"
 
@@ -348,7 +349,7 @@ struct SnapshotRestoreBatch {
     bool operator==(const SnapshotRestoreBatch&) const = default;
 };
 
-using CacheOperation =
-    std::variant<LoadBackBatch, WriteBackBatch, SnapshotStoreBatch, SnapshotRestoreBatch, StorageOperation>;
+using CacheOperation = std::variant<LoadBackBatch, WriteBackBatch, SnapshotStoreBatch, SnapshotRestoreBatch,
+                                    StorageOperation, DiskOperation>;
 
 }  // namespace tokenspeed

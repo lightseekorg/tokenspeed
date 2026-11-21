@@ -31,6 +31,7 @@ import importlib.util
 import os
 from typing import TYPE_CHECKING, Any
 
+from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import (
     L3Settings,
     MooncakeStoreSettings,
@@ -321,7 +322,7 @@ def l3_settings(
 
     config = StorageRuntimeConfig.from_extra_config(
         server_args.kvstore_storage_backend_extra_config,
-        host_blocks=host_storage.num_host_lcm_blocks,
+        host_blocks=host_block_capacity(host_storage, ownership.shard_counts),
         prefix_granularity=host_cache.memory_plan.prefix_granularity,
     )
     deployment_id = cache_deployment_id(

@@ -36,6 +36,12 @@ namespace tokenspeed {
 // own Device pages and lets the pin go (release). The holder's scheduler owns
 // every pin as lease state; the reader's scheduler owns the landing.
 
+// Where a reader lands a peer prefix (docs/rfcs/0006-disk-tier.md, Peer
+// sharing): in the Device pages its admission allocates, the request
+// waiting out of forward candidates (RFC 0004); or in Host blocks before
+// its admission, the request then admitted as an ordinary Host hit.
+enum class PeerLandingTier { kDevice, kHost };
+
 // Explicit at the runtime/scheduler boundary; nothing here has a default.
 struct PeerConfig {
     // The name other replicas address this one by, as the router's holder
@@ -55,6 +61,13 @@ struct PeerConfig {
     std::int64_t lookup_timeout_us;
     // Reader: the smallest extension of the local hit worth a fetch.
     std::int32_t min_fetch_tokens;
+    // Reader: where landings go.
+    PeerLandingTier landing_tier;
+    // Reader, Host landings: the Host blocks landings hold at once, and how
+    // long a landed prefix is held for its request's admission. Zero with
+    // Device landings, which use neither.
+    std::int32_t max_host_landing_blocks;
+    std::int64_t host_ready_timeout_us;
     void Validate() const;
 };
 

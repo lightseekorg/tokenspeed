@@ -69,9 +69,10 @@ TEST(CacheDataFlow, HostSuffixReturnsIndependentTierResultsAndLeavesItsInputUnch
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
-    auto coordinator = MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device_pool, /*enable_l3_storage=*/false, &host_pool, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
     const auto all_tokens = std::span{tokens};
     const std::vector<std::span<const std::int32_t>> pages{all_tokens.subspan(0, 4), all_tokens.subspan(4, 4),
@@ -131,9 +132,10 @@ TEST(CacheDataFlow, StoreMetadataKeepsMatchOrderAndGeometryAcrossAllocation) {
                                            .replayable = true,
                                            .cache_blocks_per_lcm_block = 1,
                                            .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const CacheStore& store = std::as_const(coordinator).Store();
     for (const bool allocate : {false, true}) {
         auto block = allocate ? pool.AcquireBlock(0) : CacheBlockRef{};

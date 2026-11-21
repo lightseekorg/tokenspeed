@@ -48,7 +48,10 @@ PeerConfig Config() {
                       .soft_pin_us = 100,
                       .hard_pin_us = 1000,
                       .lookup_timeout_us = 100,
-                      .min_fetch_tokens = kP};
+                      .min_fetch_tokens = kP,
+                      .landing_tier = PeerLandingTier::kDevice,
+                      .max_host_landing_blocks = 0,
+                      .host_ready_timeout_us = 0};
 }
 
 std::vector<std::string> PageHashes(const std::vector<std::int32_t>& tokens) {
@@ -138,10 +141,10 @@ protected:
 
     BlockPool device_{32, {4, 1}};
     BlockPool host_{32, {4, 1}};
-    CacheCoordinator coordinator_ =
-        MakeCoordinator(kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
-                        /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator_ = MakeCoordinator(
+        kSpecs, kP, device_, /*enable_l3_storage=*/false, &host_, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+        /*checkpoint_retention_requests=*/0);
     // Declared after the coordinator, so its pins go first.
     PeerExports exports_{Config()};
 };
@@ -357,10 +360,10 @@ TEST(PeerExportsHostTest, AHostSuffixIsExportedAfterTheDevicesHits) {
     };
     BlockPool device{8, {4}};
     BlockPool host{8, {4}};
-    CacheCoordinator coordinator =
-        MakeCoordinator(kSpecs, kP, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
-                        /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(kSpecs, kP, device, /*enable_l3_storage=*/false, &host,
+                                                   /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true,
+                                                   /*checkpoint_retention_requests=*/0);
     PeerExports exports{Config()};
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     const std::vector<std::string> hashes = PageHashes(tokens);

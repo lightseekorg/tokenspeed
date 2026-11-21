@@ -79,6 +79,7 @@ def wire(monkeypatch):
             StorageGetOp=ts.Cache.StorageGetOp,
             StoragePutOp=ts.Cache.StoragePutOp,
             StorageCancelOp=ts.Cache.StorageCancelOp,
+            DiskOp=ts.Cache.DiskOp,
         ),
     )
 
@@ -232,6 +233,8 @@ def _config(**overrides):
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
     )
     fields.update(overrides)
     return make_config(**fields)

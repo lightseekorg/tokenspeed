@@ -1011,6 +1011,7 @@ class TestGroupAwareWireTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
 
         build_geometry.assert_called_once_with(
@@ -1129,6 +1130,7 @@ class TestGroupAwareWireTest:
                         kvp_rank=0,
                         nprocs_per_node=1,
                         world_cpu_group=None,
+                        block_alignment=1,
                     )
                     assert (executor._transfer_geometry.device_rows) is None
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1470,6 +1472,7 @@ class TestHostMemoryShareTest:
                 kvp_rank=0,
                 nprocs_per_node=nprocs_per_node,
                 world_cpu_group=world_cpu_group,
+                block_alignment=1,
             )
         return executor, logger
 
@@ -1962,6 +1965,7 @@ class TestCompactHostParentTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
 
         parent = 9 * 3_407_872
@@ -2077,6 +2081,7 @@ class TestCompactLayoutRoundTripTest:
                 kvp_rank=kvp_rank,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
         self.executor_cleanup.callback(executor.shutdown)
         return executor, pool, draft_pool

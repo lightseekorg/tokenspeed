@@ -29,11 +29,13 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use ts_metrics::{
-    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3ExecutorSnapshot, L3Labels,
-    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
+    DiskExecutorStats, DiskMetrics, DiskSchedulerStats, EngineLabels, EngineMetrics, Exporter,
+    KvTransferMetrics, L3ExecutorSnapshot, L3Labels, L3Metrics, L3OperationSnapshot,
+    L3SchedulerStats, MetricEvent, MetricsConfig,
 };
 
 fn fixtures() -> PathBuf {
@@ -446,6 +448,161 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
 }
 
 #[test]
+fn disk_samples_export_counter_growth_once_and_current_gauges() {
+    let directory = scratch_dir("disk");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut metrics = DiskMetrics::new(
+        &exporter,
+        &L3Labels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+            tp_rank: 1,
+            engine_role: "null".to_owned(),
+        },
+    );
+    let mut scheduler = DiskSchedulerStats {
+        operations: 2.0,
+        queued_cleanings: 5.0,
+        disk_blocks: 40.0,
+        written_blocks: 40.0,
+        read_blocks: 12.0,
+        failed_reads: 1.0,
+        dropped_cleanings: 3.0,
+        wait_timeouts: 1.0,
+        ..DiskSchedulerStats::default()
+    };
+    let io = DiskExecutorStats {
+        queued_write_bytes: 8192.0,
+        read_bytes: 49152.0,
+        write_bytes: 163840.0,
+        ..DiskExecutorStats::default()
+    };
+    // Totals are cumulative: a repeated sample adds nothing, a grown one
+    // adds its growth.
+    metrics.record(&scheduler, &io);
+    metrics.record(&scheduler, &io);
+    scheduler.written_blocks = 44.0;
+    scheduler.operations = 0.0;
+    metrics.record(&scheduler, &io);
+    // Executor threads observe jobs as they report: a read that queued
+    // 2 ms of its 30 ms, and a write cancelled before it was issued.
+    let jobs = metrics.jobs();
+    std::thread::spawn(move || {
+        jobs.observe(
+            "read",
+            true,
+            Some(Duration::from_millis(2)),
+            Duration::from_millis(30),
+        );
+        jobs.observe("write", false, None, Duration::from_millis(1));
+    })
+    .join()
+    .unwrap();
+    drop(metrics);
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let rank = [
+        ("app_key", ""),
+        ("dp_rank", "0"),
+        ("engine_role", "null"),
+        ("model_name", "m"),
+        ("tp_rank", "1"),
+    ];
+    for (metric, extra, value) in [
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "write"), ("result", "success")][..],
+            44.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "write"), ("result", "skipped")],
+            3.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "read"), ("result", "success")],
+            12.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "read"), ("result", "failure")],
+            1.0,
+        ),
+        (
+            "tokenspeed:disk_read_expirations_total",
+            &[("phase", "waiting")],
+            1.0,
+        ),
+        (
+            "tokenspeed:disk_scheduler_resources",
+            &[("resource", "operations")],
+            0.0,
+        ),
+        (
+            "tokenspeed:disk_scheduler_resources",
+            &[("resource", "disk_blocks")],
+            40.0,
+        ),
+        (
+            "tokenspeed:disk_io_bytes_total",
+            &[("direction", "write")],
+            163840.0,
+        ),
+        (
+            "tokenspeed:disk_io_queued_bytes",
+            &[("state", "queued_write")],
+            8192.0,
+        ),
+    ] {
+        let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();
+        labels.sort_unstable();
+        let rendered_labels: Vec<String> = labels
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{value}\""))
+            .collect();
+        let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
+        assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    let job_sample = |name: &str, labels: &[&str]| -> Option<f64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("tokenspeed:disk_job_seconds_{name}{{"))
+                    && labels.iter().all(|label| line.contains(label))
+            })
+            .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+    };
+    let (read, write) = ("direction=\"read\"", "direction=\"write\"");
+    let (queued, total) = ("stage=\"queued\"", "stage=\"total\"");
+    assert_eq!(
+        job_sample("bucket", &[read, queued, "le=\"0.0025\""]),
+        Some(1.0)
+    );
+    assert_eq!(
+        job_sample("bucket", &[read, total, "le=\"0.025\""]),
+        Some(0.0)
+    );
+    assert_eq!(
+        job_sample("count", &[read, total, "outcome=\"success\""]),
+        Some(1.0)
+    );
+    assert_eq!(
+        job_sample("count", &[write, total, "outcome=\"failure\""]),
+        Some(1.0)
+    );
+    // A job that issued nothing has no queued sample.
+    assert_eq!(job_sample("count", &[write, queued]), None);
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
 fn l3_current_namespace_blocking_changes_without_erasing_historical_quarantine() {
     let directory = scratch_dir("l3-current-namespace");
     let exporter = Exporter::new(&MetricsConfig {
@@ -548,6 +705,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         std::time::Instant::now(),
         std::time::Duration::from_millis(200),
         16,
+        8,
         true,
     );
     drop(cancelled);
@@ -556,6 +714,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         std::time::Instant::now(),
         std::time::Duration::ZERO,
         192,
+        0,
         false,
     );
     engine.peer.usage(Some(10), 14, "used");
@@ -564,7 +723,7 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
     let Some(text) = render(&directory) else {
         return;
     };
-    for (tier, expected) in [("host", 16.0), ("device", 48.0)] {
+    for (tier, expected) in [("host", 16.0), ("disk", 8.0), ("device", 40.0)] {
         let line = text
             .lines()
             .find(|line| {

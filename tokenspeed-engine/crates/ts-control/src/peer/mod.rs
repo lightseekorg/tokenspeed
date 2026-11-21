@@ -35,6 +35,7 @@
 pub mod geometry;
 pub mod landing;
 pub mod net;
+pub mod push;
 pub mod read;
 pub mod servicer;
 pub mod wire;
@@ -50,16 +51,18 @@ use std::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use ts_scheduler::{
-    PeerAnswerKind, PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, Scheduler,
+    PeerAnswerKind, PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerTier,
+    Scheduler,
 };
 
 use crate::{
     codec::{Reader, Writer},
     peer::{
-        geometry::{read_spans, RankGeometry},
+        geometry::{push_items, read_spans, RankGeometry},
         landing::{Action, Landing, Timeouts},
         net::{Inbound, PeerNet},
-        read::{PageReader, ReadJob, Reads},
+        push::PagePusher,
+        read::{PageReader, PushJob, ReadJob, Reads},
         servicer::{empty_event, Holder},
         wire::{read_change, write_change, Prompt, Reply, Request, Stamp},
     },
@@ -278,7 +281,9 @@ pub struct Peer {
 impl Peer {
     /// Start one member with every member's geometry in `replica`.
     /// The first (`member` 0) must supply the bound `listener` and serves
-    /// `scheduler` as a holder; other members must supply `None`.
+    /// `scheduler` as a holder; other members must supply `None`. The
+    /// member reads through `reader` and has holders' Disk pages pushed
+    /// through `pusher` (its rank's push endpoint).
     pub fn start(
         settings: PeerSettings,
         member: usize,
@@ -286,6 +291,7 @@ impl Peer {
         listener: Option<PeerListener>,
         scheduler: Arc<Mutex<Scheduler>>,
         reader: Arc<dyn PageReader>,
+        pusher: Arc<dyn PagePusher>,
     ) -> Result<Self, PeerError> {
         let members = replica.len();
         let geometry = replica.get(member).cloned().ok_or(PeerError::Report)?;
@@ -318,7 +324,7 @@ impl Peer {
             decisions: Vec::new(),
             next_sample_us: 0,
             previous_totals: [0; 2],
-            reads: Reads::start(reader, READ_CONCURRENCY)?,
+            reads: Reads::start(reader, pusher, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
         })
     }
@@ -744,21 +750,40 @@ impl Peer {
                         .map(|page| (*page, *destination))
                 })
                 .collect();
+            // The holder's Disk pages are pushed, the rest read.
+            let (disk_pages, read_pages): (Vec<_>, Vec<_>) = pages
+                .into_iter()
+                .partition(|(source, _)| source.tier == PeerTier::Disk);
+            let budget =
+                Duration::from_micros(u64::try_from(self.settings.timeouts.push_us).unwrap_or(0));
             let job = holder
                 .ok_or_else(|| "no layout of the holder".to_owned())
                 .and_then(|holder| {
-                    read_spans(holder, &self.geometry, &pages)
-                        .map(|spans| (holder.session.clone(), spans))
-                        .map_err(|error| error.to_string())
+                    let spans = read_spans(holder, &self.geometry, &read_pages)
+                        .map_err(|error| error.to_string())?;
+                    let push = if disk_pages.is_empty() {
+                        None
+                    } else {
+                        Some(PushJob {
+                            endpoint: holder.push.clone().ok_or_else(|| {
+                                "the holder named Disk pages without a push endpoint".to_owned()
+                            })?,
+                            session: self.geometry.session.clone(),
+                            budget,
+                            items: push_items(holder, &self.geometry, &disk_pages)
+                                .map_err(|error| error.to_string())?,
+                        })
+                    };
+                    Ok((holder.session.clone(), spans, push))
                 });
             self.reading.insert(request.clone());
             match job {
-                Ok((session, spans)) => {
+                Ok((session, spans, push)) => {
                     let observation = self.read_metrics.as_ref().map(|metrics| {
                         metrics.queue_read(
                             fetch.holder.clone(),
                             self.member,
-                            spans.lengths.iter().sum(),
+                            spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
                     self.reads.submit_observed(
@@ -766,6 +791,7 @@ impl Peer {
                             request_id: request.clone(),
                             session,
                             spans,
+                            push,
                         },
                         observation,
                     );

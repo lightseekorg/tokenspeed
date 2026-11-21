@@ -140,6 +140,7 @@ class CpuConfig:
     memory_regions: tuple = ()
     allow_reload_forward: bool = False
     l3: object = None
+    disk: object = None
     reasoning: object = None
     grammar: object = None
     eplb: object = None
@@ -151,6 +152,7 @@ class CpuConfig:
     engine_metrics: bool = False
     transfer_metrics: bool = False
     l3_metrics: bool = False
+    disk_metrics: bool = False
     metrics_model_name: str = 'cpu-boundary'
     metrics_app_key: str = ''
     dp_rank: int = 0

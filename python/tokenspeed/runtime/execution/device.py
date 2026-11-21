@@ -147,6 +147,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.cache.disk import host_block_alignment
 from tokenspeed.runtime.cache.l2.sizing import (
     NO_POOL,
     RetractionPoolRequest,
@@ -1861,7 +1862,11 @@ def build_device_side(
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
                 layout.groups,
-                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                compute_host_group_packing(
+                    layout,
+                    group_specs=contract.group_specs,
+                    block_alignment=host_block_alignment(server_args),
+                ),
                 strict=True,
             )
         }
@@ -1890,6 +1895,7 @@ def build_device_side(
             snapshot_pool=snapshot_pool,
             slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
+            block_alignment=host_block_alignment(server_args),
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
             nprocs_per_node=server_args.mapping.nprocs_per_node,

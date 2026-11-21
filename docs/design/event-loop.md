@@ -485,7 +485,10 @@ data-plane calls and their waits for the GIL on the control thread, and each
 operation on the forward thread. The profiler merges them into the trace it
 exports, on their threads' lanes, so a forward thread's operation encloses
 the Python it ran; the C++ scheduler's spans are under the `scheduler`
-category, the rest under `host`. The recording follows the torch profiler's window and
+category, the rest under `host`. Work that overlaps on one thread, as Disk
+operations in flight and peer landings do, records on lane rows instead
+(`profile::Lanes`): each piece holds the lowest free row of its family until
+it ends. The recording follows the torch profiler's window and
 costs one atomic load per span outside it; it keeps only the spans that began
 inside the window, so an operation open as a by-stage profile switches stages
 stays out of the next stage's trace. A trace the merge fails on is written

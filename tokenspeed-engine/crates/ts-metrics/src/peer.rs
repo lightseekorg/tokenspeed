@@ -36,13 +36,23 @@ pub struct QueuedPeerRead {
 }
 
 impl QueuedPeerRead {
-    /// Record a completed transport call. Dropping the guard also retires its bytes.
-    pub fn finish(self, started: Instant, elapsed: Duration, host_bytes: u64, ok: bool) {
+    /// Record a completed transport call: of its bytes, `host_bytes` read from
+    /// the holder's Host pool and `disk_bytes` pushed from its Disk tier, the
+    /// rest read from its Device. Dropping the guard also retires its bytes.
+    pub fn finish(
+        self,
+        started: Instant,
+        elapsed: Duration,
+        host_bytes: u64,
+        disk_bytes: u64,
+        ok: bool,
+    ) {
         self.metrics.shard(
             &self,
             started.duration_since(self.queued).as_secs_f64(),
             elapsed.as_secs_f64(),
             host_bytes,
+            disk_bytes,
             ok,
         );
     }
@@ -144,7 +154,8 @@ impl PeerMetrics {
             source_bytes: Metric::counter(
                 exporter,
                 "tokenspeed:peer_read_source_bytes",
-                "Payload bytes of successful peer READ calls by holder memory tier.",
+                "Payload bytes of successful peer READ calls, and of the holder's Disk pages pushed \
+                 with them, by holder memory tier.",
                 &[
                     "model_name",
                     "app_key",
@@ -261,7 +272,15 @@ impl PeerMetrics {
     }
 
     /// Separate physical queue delay from time spent in the transport.
-    fn shard(&self, read: &QueuedPeerRead, queued: f64, elapsed: f64, host_bytes: u64, ok: bool) {
+    fn shard(
+        &self,
+        read: &QueuedPeerRead,
+        queued: f64,
+        elapsed: f64,
+        host_bytes: u64,
+        disk_bytes: u64,
+        ok: bool,
+    ) {
         let holder = read.holder.as_str();
         let rank = read.member.to_string();
         let l = [&*self.model, &*self.app, &*self.dp, holder, &rank];
@@ -281,7 +300,12 @@ impl PeerMetrics {
         );
         if ok {
             self.bytes.inc(&l, read.bytes as f64);
-            for (tier, bytes) in [("host", host_bytes), ("device", read.bytes - host_bytes)] {
+            let device_bytes = read.bytes.saturating_sub(host_bytes + disk_bytes);
+            for (tier, bytes) in [
+                ("host", host_bytes),
+                ("disk", disk_bytes),
+                ("device", device_bytes),
+            ] {
                 if bytes > 0 {
                     self.source_bytes
                         .inc(&[l[0], l[1], l[2], holder, &rank, tier], bytes as f64);

@@ -79,7 +79,10 @@ SchedulerConfig PeerConfigFor(const std::string& name, bool hybrid = false) {
                                  .soft_pin_us = 1000,
                                  .hard_pin_us = 1000,
                                  .lookup_timeout_us = kLookupTimeoutUs,
-                                 .min_fetch_tokens = kP};
+                                 .min_fetch_tokens = kP,
+                                 .landing_tier = PeerLandingTier::kDevice,
+                                 .max_host_landing_blocks = 0,
+                                 .host_ready_timeout_us = 0};
     SetTestSnapshotPool(cfg);
     return WithHostPackingFromDevice(cfg);
 }
@@ -631,6 +634,135 @@ TEST_F(PeerDecodeHolderTest, ADecodeReplicaNeverReads) {
     Send(holder_, pd::BootstrappedEvent{"d"});
     EXPECT_TRUE(Plan(holder_).remote_prefill.has_value()) << "its PD peer sends the whole prompt";
     EXPECT_TRUE(holder_.TakePeerLookups().empty());
+}
+
+// A reader that lands into Host (PeerLandingTier::kHost).
+SchedulerConfig HostLandingConfigFor(const std::string& name, bool hybrid) {
+    SchedulerConfig cfg = PeerConfigFor(name, hybrid);
+    cfg.peer_config->landing_tier = PeerLandingTier::kHost;
+    cfg.peer_config->max_host_landing_blocks = 24;
+    cfg.peer_config->host_ready_timeout_us = 1000;
+    return cfg;
+}
+
+class PeerHostLandingTest : public ::testing::TestWithParam<bool>, protected PeerPair {
+protected:
+    PeerHostLandingTest() : PeerPair(PeerConfigFor("holder", GetParam()), HostLandingConfigFor("reader", GetParam())) {}
+
+    void HolderComputes(const std::vector<std::int32_t>& tokens) {
+        holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
+        EXPECT_EQ(PrefillRows(Plan(holder_)).size(), 1u);
+        Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
+        Send(holder_, forward::Finish{.request_id = "h"});
+        Plan(holder_);
+    }
+
+    // The reader asks for `longer`, whose prefix the holder computed, and
+    // returns its landing.
+    PeerFetchOperation StartLanding(const std::vector<std::int32_t>& longer) {
+        reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer}});
+        EXPECT_TRUE(PrefillRows(Plan(reader_)).empty());
+        RelayLookups();
+        const ExecutionPlan plan = Plan(reader_);
+        EXPECT_TRUE(PrefillRows(plan).empty()) << "the prompt waits for its landing before its admission";
+        EXPECT_EQ(plan.peer_fetches.size(), 1u);
+        return plan.peer_fetches.empty() ? PeerFetchOperation{} : plan.peer_fetches.front();
+    }
+};
+
+INSTANTIATE_TEST_SUITE_P(Groups, PeerHostLandingTest, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) { return info.param ? "Hybrid" : "Full"; });
+
+TEST_P(PeerHostLandingTest, ALandingIntoHostIsAdmittedAsAHostHit) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902, 903, 904});
+    const std::int32_t free_host = reader_.HostPoolFreeBlocks();
+    const PeerFetchOperation fetch = StartLanding(longer);
+    EXPECT_EQ(fetch.end_tokens, static_cast<std::int32_t>(tokens.size()));
+    EXPECT_TRUE(
+        std::ranges::all_of(fetch.destinations, [](const PeerPage& page) { return page.tier == CacheTier::kHost; }));
+    const auto destinations_of = [&](std::uint32_t group) {
+        return std::ranges::count_if(fetch.destinations,
+                                     [group](const PeerPage& page) { return page.group_id == group; });
+    };
+    EXPECT_EQ(destinations_of(0), static_cast<std::ptrdiff_t>(tokens.size() / kP)) << "every full page";
+    if (GetParam()) {
+        EXPECT_EQ(destinations_of(1), 2) << "the window behind the landing's end";
+        EXPECT_TRUE(std::ranges::any_of(fetch.destinations, [](const PeerPage& page) {
+            return page.group_id == 2 && page.slot == kPeerStateSlot;
+        })) << "the State checkpoint fills the live slot";
+    }
+    EXPECT_LT(reader_.HostPoolFreeBlocks(), free_host) << "the destinations are reserved";
+    EXPECT_EQ(reader_.GetPeerStats().landing_requests, 1u);
+    EXPECT_TRUE(reader_.StoragePending()) << "a clear waits for the landing";
+    EXPECT_TRUE(PrefillRows(Plan(reader_)).empty()) << "still landing";
+
+    EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true), fetch.end_tokens);
+    EXPECT_FALSE(reader_.StorageProgressPending()) << "landed: held for the admission";
+    const ExecutionPlan admitted = Plan(reader_);
+    EXPECT_EQ(PrefillRows(admitted), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}))
+        << "the landed prefix is a Host hit";
+    EXPECT_FALSE(CacheOpIds<LoadBackBatch>(admitted).empty()) << "loaded to the Device";
+    EXPECT_EQ(reader_.GetPeerStats().landed_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
+    EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
+}
+
+TEST_P(PeerHostLandingTest, AFailedLandingReturnsItsHostBlocksAndIsAdmittedLocally) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    const std::int32_t free_host = reader_.HostPoolFreeBlocks();
+    const PeerFetchOperation fetch = StartLanding(longer);
+    EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/false), fetch.begin_tokens);
+    EXPECT_EQ(reader_.HostPoolFreeBlocks(), free_host);
+    EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", 0}}));
+    EXPECT_EQ(reader_.GetPeerStats().failed_landings, 1u);
+}
+
+TEST_P(PeerHostLandingTest, AnAbortWhileLandingKeepsTheBlocksUntilTheLandingEnds) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    const std::int32_t free_host = reader_.HostPoolFreeBlocks();
+    const PeerFetchOperation fetch = StartLanding(longer);
+    Send(reader_, forward::Abort{.request_id = "r"});
+    Plan(reader_);
+    EXPECT_LT(reader_.HostPoolFreeBlocks(), free_host) << "the reads may still write its blocks";
+    EXPECT_TRUE(reader_.StoragePending());
+    Fetch(fetch, /*read_succeeds=*/true);
+    Plan(reader_);
+    EXPECT_FALSE(reader_.StoragePending());
+    EXPECT_EQ(reader_.GetPeerStats().landing_requests, 0u);
+}
+
+TEST_P(PeerHostLandingTest, ALandedPrefixNotAdmittedInTimeIsNoLongerHeld) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    const PeerFetchOperation fetch = StartLanding(longer);
+    Fetch(fetch, /*read_succeeds=*/true);
+    // The Ready hold keeps the peer clock: past it, the entries stay in Host
+    // as any other, and the admission still finds them.
+    Send(reader_, cache::PeerTick{.now_us = 5000});
+    EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}));
+}
+
+TEST(PeerSchedulerConfigTest, HostLandingsNeedAHostPoolAndCredits) {
+    EXPECT_NO_THROW(HostLandingConfigFor("ok", /*hybrid=*/false).Validate());
+    SchedulerConfig no_credits = HostLandingConfigFor("c", false);
+    no_credits.peer_config->max_host_landing_blocks = 0;
+    EXPECT_THROW(no_credits.Validate(), std::invalid_argument);
+    SchedulerConfig device_with_credits = PeerConfigFor("d");
+    device_with_credits.peer_config->max_host_landing_blocks = 4;
+    EXPECT_THROW(device_with_credits.Validate(), std::invalid_argument) << "Device landings use no Host credits";
+    SchedulerConfig too_many = HostLandingConfigFor("t", false);
+    too_many.peer_config->max_host_landing_blocks = 32;
+    EXPECT_THROW(too_many.Validate(), std::invalid_argument) << "more credits than Host blocks";
 }
 
 TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingAndNoReplayableGroup) {

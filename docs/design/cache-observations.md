@@ -68,6 +68,12 @@ The scheduler is replicated: mirrored scheduler records from different physical
 ranks are not separate logical operations. One rank's copy completion is not
 replica-wide completion. The existing ACK intersection remains authoritative.
 
+With a Disk tier, prefetch fills Host before Device admission and owns no request
+slot. Disk retirement alone emits neither a slot assignment nor a Device-copy
+observation. The subsequent ordinary Host-to-Device prefix load carries the
+admission and slot identity and completes through the same physical-copy fence.
+Disk operation IDs are not prefix-load IDs and do not enter these joins.
+
 Slot ownership additionally carries `slot_previous_admission_id`. Restore
 records preserve `previous_slot`, `previous_slot_generation`,
 `slot_previous_admission_id`, `restore_sequence`, `committed_tokens`,
