@@ -152,7 +152,8 @@ int run(bool graph_mode, unsigned long long delay_cycles) {
             for (int i = 0; i < vocab; ++i) {
                 const int j = i - (vocab - highs);
                 const double expected = (j >= 0 && j < kept) ? row[i] / mass : 0.0;
-                if (std::abs(actual[i] - expected) > 1e-5 * expected) {
+                // Negated so that a NaN fails the comparison.
+                if (!(std::abs(actual[i] - expected) <= 1e-5 * expected)) {
                     std::fprintf(stderr, "iteration %d row %d token %d: %g, expected %g (kept %d)\n",
                         iteration, b, i, actual[i], expected, kept);
                     return 1;
