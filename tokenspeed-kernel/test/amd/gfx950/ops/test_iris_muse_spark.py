@@ -3583,12 +3583,12 @@ def _int8_block16_payloads(seed):
     """Payload families [4096, 2048] (BF16), all from one generator: Gaussian,
     Student t with 3 degrees of freedom (a Gaussian over the root of a scaled
     chi-square), Gaussian with sparse 100x outliers, and exact ties / zeros."""
-    g = torch.Generator().manual_seed(seed)
-    gauss = torch.randn(4096, 2048, generator=g)
-    chi2 = (torch.randn(3, 4096, 2048, generator=g) ** 2).sum(0)
-    t3 = torch.randn(4096, 2048, generator=g) / torch.sqrt(chi2 / 3)
+    generator = torch.Generator().manual_seed(seed)
+    gauss = torch.randn(4096, 2048, generator=generator)
+    chi2 = (torch.randn(3, 4096, 2048, generator=generator) ** 2).sum(0)
+    t3 = torch.randn(4096, 2048, generator=generator) / torch.sqrt(chi2 / 3)
     outliers = gauss.clone()
-    outliers[torch.rand(4096, 2048, generator=g) < 1e-3] *= 100.0
+    outliers[torch.rand(4096, 2048, generator=generator) < 1e-3] *= 100.0
     ties = torch.zeros(64, 2048)
     ties[:, 0::16] = 127.0
     ties[:, 1::16] = 2.5
