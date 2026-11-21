@@ -240,14 +240,15 @@ void SchedulerConfig::Validate() const {
             "a P node runs no decodes and a D node no local prefill");
     }
     if (max_consecutive_prefill_rounds < 0) {
-        throw std::invalid_argument("Scheduler: max_consecutive_prefill_rounds must be >= 0");
+        throw std::invalid_argument(
+            "Scheduler: max_consecutive_prefill_rounds (--max-consecutive-prefill-rounds) must be >= 0");
     }
     // The cap bounds how long an overdue prompt may suspend the interval:
     // without an interval there is nothing to suspend.
     if (max_consecutive_prefill_rounds != 0 && prefill_decode_interval == 0) {
         throw std::invalid_argument(
-            "Scheduler: max_consecutive_prefill_rounds requires prefill_decode_interval "
-            "(--prefill-decode-interval) > 0");
+            "Scheduler: max_consecutive_prefill_rounds (--max-consecutive-prefill-rounds) requires "
+            "prefill_decode_interval (--prefill-decode-interval) > 0");
     }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
