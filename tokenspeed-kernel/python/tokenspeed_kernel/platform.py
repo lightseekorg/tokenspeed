@@ -505,17 +505,31 @@ def _detect_platform() -> PlatformInfo:
     )
 
 
+@dataclass(frozen=True)
+class _AscendPlatformInfo(PlatformInfo):
+    # Registration only needs the backend and its capabilities. Querying the
+    # current NPU here would give every importing process a device-0 context.
+    device_name: str = field(init=False)
+    total_memory: int = field(init=False)
+    sm_count: int = field(init=False)
+
+    def __getattr__(self, name: str):
+        if name not in ("device_name", "total_memory", "sm_count"):
+            raise AttributeError(name)
+        props = torch.npu.get_device_properties(torch.npu.current_device())
+        object.__setattr__(self, "device_name", props.name)
+        object.__setattr__(self, "total_memory", props.total_memory)
+        object.__setattr__(self, "sm_count", getattr(props, "cube_core_num", 0))
+        return getattr(self, name)
+
+
 def _detect_npu_platform() -> PlatformInfo:
-    """Detect an Ascend platform exposed through torch-npu."""
-    props = torch.npu.get_device_properties(torch.npu.current_device())
-    return PlatformInfo(
+    """Identify Ascend without initializing the launcher's default NPU."""
+    return _AscendPlatformInfo(
         vendor="ascend",
         arch_version=ArchVersion(9, 1),
-        device_name=props.name,
         device_count=torch.npu.device_count(),
-        total_memory=props.total_memory,
         memory_bandwidth=0.0,
-        sm_count=getattr(props, "cube_core_num", 0),
         max_threads_per_sm=0,
         max_shared_memory_per_sm=0,
         sm_features=frozenset({"tensor_core:f16", "tensor_core:bf16"}),
