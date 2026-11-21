@@ -102,7 +102,7 @@ class CopyObservation:
     pool: CopyCounts
     slot_state_image_bytes: int
 
-    def payload(self):
+    def payload(self) -> dict[str, object]:
         """Return scalar CPU metadata for the host's bounded export queue."""
         return {
             "kind": self.kind,
@@ -119,7 +119,12 @@ class CopyObservation:
 
 
 class ObservationBatch(NamedTuple):
-    """Frozen per-ACK records and loss count; neither retains device storage."""
+    """Frozen per-ACK records and loss count; neither retains device storage.
+
+    Attributes:
+        records: Local copy observations captured for the completed operation.
+        dropped: Observations refused while capturing this batch.
+    """
 
     records: tuple[CopyObservation, ...] = ()
     dropped: int = 0
@@ -163,20 +168,26 @@ class CompletedObservations:
 
     Zero capacity disables diagnostics. Overflow discards new observations and
     reports their loss without affecting the scheduler ACKs or copying work.
+
+    Attributes:
+        capacity: Maximum number of retained completed records; zero disables
+            recording.
+        enabled: Whether the configured capacity permits recording observations.
     """
 
-    def __init__(self, capacity):
+    def __init__(self, capacity: int) -> None:
         if type(capacity) is not int or capacity < 0:
             raise ValueError("Observation capacity must be a nonnegative integer")
-        self.capacity = capacity
-        self._records = deque()
-        self._dropped = 0
+        self.capacity: int = capacity
+        self._records: deque[CopyObservation] = deque()
+        self._dropped: int = 0
 
     @property
-    def enabled(self):
+    def enabled(self) -> bool:
+        """Whether diagnostics retain completed observations."""
         return self.capacity > 0
 
-    def extend(self, batch):
+    def extend(self, batch: ObservationBatch) -> None:
         """Append within capacity and accumulate batch and overflow losses.
 
         Keep queued records and drop newer ones beyond the remaining capacity,
@@ -192,7 +203,7 @@ class CompletedObservations:
             else:
                 self._records.append(record)
 
-    def drain(self):
+    def drain(self) -> tuple[list[dict[str, object]], int]:
         """Return ``(payloads, dropped)`` and clear the records and loss counter.
 
         The payloads are the completed records as CPU dictionaries.
@@ -202,6 +213,7 @@ class CompletedObservations:
         self.clear()
         return records, dropped
 
-    def clear(self):
+    def clear(self) -> None:
+        """Discard retained observations and reset the recorded loss count."""
         self._records.clear()
         self._dropped = 0
