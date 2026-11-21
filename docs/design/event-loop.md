@@ -1344,6 +1344,8 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+In particular, a signal can interrupt a buffered stderr write. Logging again
+can raise before the callback records a failure or requests shutdown.
 
 While serving generation, a fatal control-loop or forward-thread error
 signals the owning launcher once from the thread that detects it. The
