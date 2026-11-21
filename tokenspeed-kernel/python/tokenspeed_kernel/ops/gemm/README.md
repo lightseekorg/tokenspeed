@@ -217,9 +217,10 @@ either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
 
 `hipblaslt.py` is the runtime entry point; the loader, the stack check and the
 tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
-`_hipblaslt/configs/`, one per GPU, named like the Triton kernel configs after
-`torch.cuda.get_device_name()` with spaces replaced by underscores, such as
-`device_name=AMD_Instinct_MI355X.csv`. Serving loads the file of its GPU
+`_hipblaslt/configs/`, one per GPU architecture, named after the base of the
+GPU's `gcnArchName`, such as `arch=gfx950.csv`. The marketing device name is
+not used: it comes from libdrm's `amdgpu.ids`, which containers can lack, and
+then reads as a generic `AMD Radeon Graphics`. Serving loads the file of its GPU
 automatically, through `hipblaslt.py`, once per process and before graph
 capture, and replays it read-only through PyTorch TunableOp. GEMMs the file
 does not list keep the default solution. Serving never rewrites the file, and

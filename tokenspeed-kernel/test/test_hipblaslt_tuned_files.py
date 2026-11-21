@@ -42,25 +42,49 @@ _STAMP_KEYS = {
 }
 
 
-def test_file_is_named_after_device():
-    assert tuning.hipblaslt_tuned_file("AMD Instinct MI355X") == os.path.join(
-        tuning.TUNED_CONFIG_DIR, "device_name=AMD_Instinct_MI355X.csv"
+def test_file_is_named_after_arch():
+    assert tuning.hipblaslt_tuned_file("gfx950") == os.path.join(
+        tuning.TUNED_CONFIG_DIR, "arch=gfx950.csv"
     )
+
+
+class _Props:
+    def __init__(self, gcn_arch_name: str):
+        self.gcnArchName = gcn_arch_name
+
+
+@pytest.mark.parametrize("device_name", ["AMD Instinct MI355X", "AMD Radeon Graphics"])
+def test_default_file_ignores_device_name(device_name):
+    # Without libdrm's amdgpu.ids (as in some containers) an MI355X reports
+    # itself as "AMD Radeon Graphics"; the file is still found by its arch.
+    with (
+        patch.object(torch.cuda, "get_device_name", return_value=device_name),
+        patch.object(
+            torch.cuda,
+            "get_device_properties",
+            return_value=_Props("gfx950:sramecc+:xnack-"),
+        ),
+    ):
+        assert tuning.hipblaslt_tuned_file() == tuning.hipblaslt_tuned_file("gfx950")
 
 
 def _committed_files() -> list[str]:
     return sorted(glob.glob(os.path.join(tuning.TUNED_CONFIG_DIR, "*.csv")))
 
 
-def test_mi355x_file_is_committed():
-    assert os.path.exists(tuning.hipblaslt_tuned_file("AMD Instinct MI355X"))
+def test_gfx950_file_is_committed():
+    assert os.path.exists(tuning.hipblaslt_tuned_file("gfx950"))
 
 
 @pytest.mark.parametrize("path", _committed_files(), ids=os.path.basename)
 def test_committed_file_is_wellformed(path):
     name = os.path.basename(path)
-    assert name.startswith("device_name=") and " " not in name
-    assert set(tuning.hipblaslt_file_validators(path)) == _STAMP_KEYS
+    assert name.startswith("arch=gfx") and ":" not in name
+    validators = tuning.hipblaslt_file_validators(path)
+    assert set(validators) == _STAMP_KEYS
+    # The file name's arch is the one TunableOp checks at load.
+    arch = name.removeprefix("arch=").removesuffix(".csv")
+    assert validators["GCN_ARCH_NAME"].split(":")[0] == arch
     entries = 0
     with open(path) as f:
         for line in f:
@@ -79,7 +103,9 @@ def test_committed_file_is_wellformed(path):
 def test_gpu_without_file_is_skipped():
     with (
         patch.object(torch.version, "hip", "7.2"),
-        patch.object(torch.cuda, "get_device_name", return_value="No Such GPU"),
+        patch.object(
+            torch.cuda, "get_device_properties", return_value=_Props("gfx000")
+        ),
     ):
         # Returns before TunableOp or the GPU are touched.
         assert not tuning.load_hipblaslt_tuned_solutions()
