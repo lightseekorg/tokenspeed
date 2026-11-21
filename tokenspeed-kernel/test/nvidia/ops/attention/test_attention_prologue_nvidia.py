@@ -37,6 +37,7 @@ import tokenspeed_kernel.ops.attention.prologue as prologue  # noqa: E402
 from attention_prologue_helpers import (  # noqa: E402
     BF16,
     FP8,
+    assert_bytes_equal,
     bytes_equal,
     cos_sin_cache,
     gqa_cache,
@@ -121,8 +122,10 @@ def test_unnormed_solutions_agree_byte_for_byte(head_dim, rope, return_kv, dtype
         )
         for solution in ("triton", "composite")
     ]
-    for a, b in zip(*runs):
-        assert bytes_equal(a, b)
+    for name, (a, b) in zip(
+        ("Q", "K-cache", "V-cache", "returnedK", "returnedV"), zip(*runs)
+    ):
+        assert_bytes_equal(a, b, name=name)
 
 
 @pytest.mark.parametrize("tokens", [1, 65, 300])
