@@ -42,31 +42,12 @@ def _vector_layout(BLOCK, NUM_WARPS):
     return gl.BlockedLayout([per_lane], [_WAVE], [NUM_WARPS], [0])
 
 
-@gluon.constexpr_function
-def _split_hist_layout(NUM_WARPS):
-    # [splits, 256]: four bins per lane, one split per warp.
-    return gl.BlockedLayout([1, 4], [1, _WAVE], [NUM_WARPS, 1], [1, 0])
-
-
 @gluon.jit
 def _bf16_key(x):
     # torch.topk's order-preserving key of a bf16 value; NaN maps to the maximum.
     bits = x.to(gl.uint16, bitcast=True).to(gl.int32)
     key = gl.where((bits & 0x8000) != 0, bits ^ 0xFFFF, bits ^ 0x8000)
     return gl.where(x != x, 0xFFFF, key)
-
-
-@gluon.jit
-def _kth_bin(hist, target, NUM_WARPS: gl.constexpr):
-    """The bin of the ``target``-th largest key of a 256-bin histogram, and the
-    count of keys in higher bins."""
-    layout: gl.constexpr = _vector_layout(256, NUM_WARPS)
-    hist = gl.convert_layout(hist, layout)  # scans take blocked layouts only
-    bins = gl.arange(0, 256, layout=layout)
-    at_least = gl.sum(hist, 0) - gl.cumsum(hist, 0) + hist  # keys in bins >= b
-    digit = gl.max(gl.where(at_least >= target, bins, 0), 0)
-    above = gl.sum(gl.where(bins == digit, at_least - hist, 0), 0)
-    return digit, above
 
 
 @gluon.jit
@@ -77,180 +58,136 @@ def _shard_keys(scores, stride_s, row, cols, n_cols):
 
 
 @gluon.jit
-def _split_hists(hist, SPLITS: gl.constexpr, SPLITS_PAD: gl.constexpr, layout):
-    # [SPLITS_PAD, 256]: one 256-bin histogram per split of the row, zero padded.
-    splits = gl.arange(0, SPLITS_PAD, layout=gl.SliceLayout(1, layout))
-    bins = gl.arange(0, 256, layout=gl.SliceLayout(0, layout))
-    return gl.load(
-        hist + splits[:, None] * 256 + bins[None, :],
-        mask=(splits < SPLITS)[:, None],
-        other=0,
-    )
+def _kth_key(key, target):
+    """The ``target``-th largest of a register vector's 16-bit keys (-1 for
+    none; at least ``target`` valid), and the count of keys above it.
+
+    A binary search over the key range, one count reduction a step. It costs
+    less than a byte-wise select's two gl.histogram passes and their scans:
+    those cost several times a count per element."""
+    lo = 0  # count(key >= lo) >= target
+    n_above = 0  # count(key >= lo + 2 * q) < target
+    for step in gl.static_range(16):
+        q = 1 << (15 - step)
+        c = gl.sum((key >= lo + q).to(gl.int32), 0)
+        n_above = gl.where(c >= target, n_above, c)
+        lo = gl.where(c >= target, lo + q, lo)
+    return lo, n_above
 
 
-def _shard_topk_hist_metadata(grid, kernel, args):
-    """Report one read of the scores plus the split histogram writes."""
+@gluon.jit
+def _select_top(key, target):
+    """torch.topk's placement of a register vector's ``target`` largest keys:
+    keys above the ``target``-th largest in vector order, then its first ties.
+    Keys are 16-bit, -1 for none; at least ``target`` are valid. Returns which
+    elements are kept and their output slots."""
+    kth, n_gt = _kth_key(key, target)
+    gt = (key > kth).to(gl.int32)
+    eq = (key == kth).to(gl.int32)
+    # Both ranks in one scan: gt in the low 16 bits, eq above.
+    packed = gl.cumsum(gt + (eq << 16), 0)
+    rank_gt = (packed & 0xFFFF) - gt
+    rank_eq = (packed >> 16) - eq
+    take = (gt != 0) | ((eq != 0) & (rank_eq < target - n_gt))
+    slot = gl.where(gt != 0, rank_gt, n_gt + rank_eq)
+    return take, slot
+
+
+def _shard_topk_local_metadata(grid, kernel, args):
+    """Report one read of the scores plus the pool writes."""
     rows, splits = grid[0], grid[1]
     return {
         "name": kernel.name,
-        "bytes": rows * args["n_cols"] * 2 + rows * splits * 256 * 4,
+        "bytes": rows * args["n_cols"] * 2 + rows * splits * args["K"] * 8,
     }
 
 
 @gluon.jit(
-    launch_metadata=_shard_topk_hist_metadata,
+    launch_metadata=_shard_topk_local_metadata,
     do_not_specialize=["stride_s", "n_cols"],
 )
-def gluon_eagle4_shard_topk_hist_gfx950(
+def gluon_eagle4_shard_topk_local_gfx950(
     scores,  # [M, N] bf16
-    hist,  # [M, 2, SPLITS, 256] int32: high byte, then low byte in its bin
+    pool_key,  # [M, SPLITS, K] int32: a split's K largest keys, -1 padded
+    pool_col,  # [M, SPLITS, K] int32: their columns
     stride_s,
     n_cols,
     K: gl.constexpr,
-    PASS: gl.constexpr,
-    SPLITS: gl.constexpr,
-    SPLITS_PAD: gl.constexpr,
+    K_PAD: gl.constexpr,
     CHUNK: gl.constexpr,
-    TILE: gl.constexpr,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
-    tile_layout: gl.constexpr = _vector_layout(TILE, NUM_WARPS)
-    split_layout: gl.constexpr = _split_hist_layout(NUM_WARPS)
-    bin_layout: gl.constexpr = _vector_layout(256, NUM_WARPS)
+    layout: gl.constexpr = _vector_layout(CHUNK, NUM_WARPS)
     row = gl.program_id(0)
-    chunk = gl.program_id(1)
-    row_hist = hist + row * (2 * SPLITS * 256)
-    high = 0
-    if PASS == 1:
-        high, _ = _kth_bin(
-            gl.sum(_split_hists(row_hist, SPLITS, SPLITS_PAD, split_layout), 0),
-            K,
-            NUM_WARPS,
-        )
-    counts = gl.zeros([256], gl.int32, layout=bin_layout)
-    offs = gl.arange(0, TILE, layout=tile_layout)
-    for start in range(0, CHUNK, TILE):
-        cols = chunk * CHUNK + start + offs
-        valid, key = _shard_keys(scores, stride_s, row, cols, n_cols)
-        if PASS == 0:
-            counts += gl.histogram(key >> 8, 256, mask=valid, layout=bin_layout)
-        else:
-            counts += gl.histogram(
-                key & 255, 256, mask=valid & ((key >> 8) == high), layout=bin_layout
-            )
-    bins = gl.arange(0, 256, layout=bin_layout)
-    gl.store(row_hist + (PASS * SPLITS + chunk) * 256 + bins, counts)
-
-
-def _shard_topk_select_metadata(grid, kernel, args):
-    """Report the split histogram reads plus the placement writes."""
-    rows, splits = grid[0], args["SPLITS"]
-    return {
-        "name": kernel.name,
-        "bytes": rows * (2 * splits * 256 * 4 + (2 * splits + 2) * 4),
-    }
-
-
-@gluon.jit(launch_metadata=_shard_topk_select_metadata)
-def gluon_eagle4_shard_topk_select_gfx950(
-    hist,
-    sel,  # [M, 2 * SPLITS + 2] int32: per-split gt and tie bases, kth, n_gt
-    K: gl.constexpr,
-    SPLITS: gl.constexpr,
-    SPLITS_PAD: gl.constexpr,
-):
-    NUM_WARPS: gl.constexpr = gl.num_warps()
-    layout: gl.constexpr = _split_hist_layout(NUM_WARPS)
-    row = gl.program_id(0)
-    row_hist = hist + row * (2 * SPLITS * 256)
-    bins = gl.arange(0, 256, layout=gl.SliceLayout(0, layout))
-    hist_hi = _split_hists(row_hist, SPLITS, SPLITS_PAD, layout)
-    hist_lo = _split_hists(row_hist + SPLITS * 256, SPLITS, SPLITS_PAD, layout)
-    high, above_hi = _kth_bin(gl.sum(hist_hi, 0), K, NUM_WARPS)
-    low, above_lo = _kth_bin(gl.sum(hist_lo, 0), K - above_hi, NUM_WARPS)
-    # Keys above kth and kth ties of each split, to place each split after the
-    # earlier ones.
-    split_gt = gl.sum(gl.where(bins[None, :] > high, hist_hi, 0), 1) + gl.sum(
-        gl.where(bins[None, :] > low, hist_lo, 0), 1
-    )
-    split_eq = gl.sum(gl.where(bins[None, :] == low, hist_lo, 0), 1)
-    split_layout: gl.constexpr = _vector_layout(SPLITS_PAD, NUM_WARPS)
-    split_gt = gl.convert_layout(split_gt, split_layout)
-    split_eq = gl.convert_layout(split_eq, split_layout)
-    splits = gl.arange(0, SPLITS_PAD, layout=split_layout)
-    row_sel = sel + row * (2 * SPLITS + 2)
-    gl.store(row_sel + splits, gl.cumsum(split_gt, 0) - split_gt, mask=splits < SPLITS)
+    split = gl.program_id(1)
+    # One read of the split's columns into registers; the search and the
+    # placement run on them.
+    cols = split * CHUNK + gl.arange(0, CHUNK, layout=layout)
+    valid, key = _shard_keys(scores, stride_s, row, cols, n_cols)
+    # The last split may hold fewer than K columns: it keeps them all.
+    target = gl.minimum(gl.sum(valid.to(gl.int32), 0), K)
+    take, slot = _select_top(key, target)
+    base = (row.to(gl.int64) * gl.num_programs(1) + split) * K
+    gl.store(pool_key + base + slot, key, mask=take)
+    gl.store(pool_col + base + slot, cols, mask=take)
+    pad_layout: gl.constexpr = _vector_layout(K_PAD, NUM_WARPS)
+    pad = gl.arange(0, K_PAD, layout=pad_layout)
     gl.store(
-        row_sel + SPLITS + splits,
-        gl.cumsum(split_eq, 0) - split_eq,
-        mask=splits < SPLITS,
+        pool_key + base + pad,
+        gl.full([K_PAD], -1, gl.int32, layout=pad_layout),
+        mask=(pad >= target) & (pad < K),
     )
-    gl.store(row_sel + 2 * SPLITS, (high << 8) | low)
-    gl.store(row_sel + 2 * SPLITS + 1, above_hi + above_lo)
 
 
-def _shard_topk_metadata(grid, kernel, args):
-    """Report one read of the scores plus the id writes."""
+def _shard_topk_merge_metadata(grid, kernel, args):
+    """Report the pool reads plus the id writes."""
     rows = grid[0]
     return {
         "name": kernel.name,
-        "bytes": rows * args["n_cols"] * 2 + rows * args["K"] * 8,
+        "bytes": rows * (args["POOL"] * 4 + args["K"] * (4 + 8)),
     }
 
 
 @gluon.jit(
-    launch_metadata=_shard_topk_metadata,
-    do_not_specialize=["stride_s", "stride_g", "n_cols", "vocab_start"],
+    launch_metadata=_shard_topk_merge_metadata,
+    do_not_specialize=["stride_g", "vocab_start"],
 )
-def gluon_eagle4_shard_topk_gfx950(
-    scores,
-    sel,
+def gluon_eagle4_shard_topk_merge_gfx950(
+    pool_key,
+    pool_col,
     global_ids,  # [M, K] int64
-    stride_s,
     stride_g,
-    n_cols,
     vocab_start,
     K: gl.constexpr,
-    SPLITS: gl.constexpr,
-    CHUNK: gl.constexpr,
-    TILE: gl.constexpr,
+    POOL: gl.constexpr,
+    BLOCK: gl.constexpr,
 ):
-    layout: gl.constexpr = _vector_layout(TILE, gl.num_warps())
-    row = gl.program_id(0)
-    chunk = gl.program_id(1)
-    row_sel = sel + row * (2 * SPLITS + 2)
-    base_gt = gl.load(row_sel + chunk)
-    base_eq = gl.load(row_sel + SPLITS + chunk)
-    kth = gl.load(row_sel + 2 * SPLITS)
-    # Keys above kth; then K - n_gt of its ties.
-    n_gt = gl.load(row_sel + 2 * SPLITS + 1)
-
-    out_row = global_ids + row.to(gl.int64) * stride_g
-    offs = gl.arange(0, TILE, layout=layout)
-    for start in range(0, CHUNK, TILE):
-        cols = chunk * CHUNK + start + offs
-        _, key = _shard_keys(scores, stride_s, row, cols, n_cols)
-        gt = (key > kth).to(gl.int32)
-        eq = (key == kth).to(gl.int32)
-        tile_gt = gl.sum(gt, 0)
-        tile_eq = gl.sum(eq, 0)
-        # Most tiles hold none of the K keys: skip their scans.
-        if tile_gt + tile_eq > 0:
-            rank_gt = base_gt + gl.cumsum(gt, 0) - gt
-            rank_eq = base_eq + gl.cumsum(eq, 0) - eq
-            take = (gt != 0) | ((eq != 0) & (rank_eq < K - n_gt))
-            slot = gl.where(gt != 0, rank_gt, n_gt + rank_eq)
-            gl.store(out_row + slot, cols.to(gl.int64) + vocab_start, mask=take)
-        base_gt += tile_gt
-        base_eq += tile_eq
+    layout: gl.constexpr = _vector_layout(BLOCK, gl.num_warps())
+    row = gl.program_id(0).to(gl.int64)
+    i = gl.arange(0, BLOCK, layout=layout)
+    in_pool = i < POOL
+    key = gl.load(pool_key + row * POOL + i, mask=in_pool, other=-1)
+    # The row's K largest keys are among the splits' K largest. Each split's
+    # pool lists its keys above its own k-th largest by column, then that key's
+    # ties by column, and the row's k-th largest is at least the split's: so
+    # the pool's keys above the row's k-th largest, and its ties, are each in
+    # column order, and a split keeps every tie the row takes from it.
+    take, slot = _select_top(key, K)
+    col = gl.load(pool_col + row * POOL + i, mask=take, other=0)
+    gl.store(
+        global_ids + row * stride_g + slot,
+        col.to(gl.int64) + vocab_start,
+        mask=take,
+    )
 
 
-# Splits per row: the CUDA kernel's 8-CTA cluster, doubled (no cluster sync here).
-_SHARD_SPLITS = 16
-# Columns a workgroup holds in registers at a time (four per lane, up to eight
-# waves); it loops over its split.
-_SHARD_MIN_TILE = 4 * _WAVE
-_SHARD_MAX_TILE = 2048
+# Columns a split workgroup holds in registers: eight per lane over eight waves.
+_SHARD_CHUNK = 4096
+_SHARD_CHUNK_WARPS = 8
+# The merge holds every split's K keys in registers, 16 a lane (fewer when
+# under one wave).
+_SHARD_MERGE_MAX_LANES = 1024
+_SHARD_MAX_K = 256
 
 
 def launch_gluon_eagle4_shard_topk_gfx950(
@@ -262,7 +199,7 @@ def launch_gluon_eagle4_shard_topk_gfx950(
 
     Args:
         scores: ``[M, N]`` bf16 scores of a vocab shard, unit column stride.
-        k: Ids kept per row, at most ``N``.
+        k: Ids kept per row, 1 to ``min(N, 256)``.
         vocab_start: The vocab id of the shard's column 0.
         global_ids: ``[M, k]`` int64 destination, unit column stride.
     """
@@ -273,47 +210,43 @@ def launch_gluon_eagle4_shard_topk_gfx950(
         raise ValueError("shard top-k takes bf16 scores with unit column stride")
     if global_ids.dtype != torch.int64 or global_ids.stride(1) != 1:
         raise ValueError("shard top-k writes int64 ids with unit column stride")
-    if not 1 <= k <= n_cols:
-        raise ValueError(f"shard top-k keeps 1..{n_cols} ids, got {k}")
-    # N is fixed per server, so the split layout compiles once.
-    tile = min(
-        _SHARD_MAX_TILE,
-        max(
-            _SHARD_MIN_TILE, triton.next_power_of_2(triton.cdiv(n_cols, _SHARD_SPLITS))
-        ),
-    )
-    chunk = triton.cdiv(triton.cdiv(n_cols, _SHARD_SPLITS), tile) * tile
-    splits = triton.cdiv(n_cols, chunk)
-    hist = torch.empty((rows, 2, splits, 256), dtype=torch.int32, device=scores.device)
-    sel = torch.empty((rows, 2 * splits + 2), dtype=torch.int32, device=scores.device)
-    splits_pad = triton.next_power_of_2(splits)
-    tiles = dict(CHUNK=chunk, TILE=tile, num_warps=tile // _SHARD_MIN_TILE)
-    for p in range(2):
-        gluon_eagle4_shard_topk_hist_gfx950[(rows, splits)](
-            scores,
-            hist,
-            scores.stride(0),
-            n_cols,
-            K=k,
-            PASS=p,
-            SPLITS=splits,
-            SPLITS_PAD=splits_pad,
-            **tiles,
+    if not 1 <= k <= min(n_cols, _SHARD_MAX_K):
+        raise ValueError(
+            f"shard top-k keeps 1..{min(n_cols, _SHARD_MAX_K)} ids, got {k}"
         )
-    gluon_eagle4_shard_topk_select_gfx950[(rows,)](
-        hist, sel, K=k, SPLITS=splits, SPLITS_PAD=splits_pad, num_warps=4
-    )
-    gluon_eagle4_shard_topk_gfx950[(rows, splits)](
+    # N is fixed per server, so the split layout compiles once.
+    splits = triton.cdiv(n_cols, _SHARD_CHUNK)
+    pool = splits * k
+    block = triton.next_power_of_2(pool)
+    merge_warps = max(1, min(_SHARD_MERGE_MAX_LANES, block // 16) // _WAVE)
+    if block > 16 * _SHARD_MERGE_MAX_LANES:
+        raise ValueError(
+            f"shard top-k merges at most {16 * _SHARD_MERGE_MAX_LANES} keys a "
+            f"row; {splits} splits of {k} need {pool}"
+        )
+    pool_key = torch.empty((rows, pool), dtype=torch.int32, device=scores.device)
+    pool_col = torch.empty((rows, pool), dtype=torch.int32, device=scores.device)
+    gluon_eagle4_shard_topk_local_gfx950[(rows, splits)](
         scores,
-        sel,
-        global_ids,
+        pool_key,
+        pool_col,
         scores.stride(0),
-        global_ids.stride(0),
         n_cols,
+        K=k,
+        K_PAD=triton.next_power_of_2(k),
+        CHUNK=_SHARD_CHUNK,
+        num_warps=_SHARD_CHUNK_WARPS,
+    )
+    gluon_eagle4_shard_topk_merge_gfx950[(rows,)](
+        pool_key,
+        pool_col,
+        global_ids,
+        global_ids.stride(0),
         vocab_start,
         K=k,
-        SPLITS=splits,
-        **tiles,
+        POOL=pool,
+        BLOCK=block,
+        num_warps=merge_warps,
     )
 
 
@@ -396,30 +329,8 @@ def gluon_eagle4_candidate_tail_gfx950(
     )
     logit = x.to(gl.float32)
     if R > 1:
-        # The NC-th largest key, a byte at a time, then torch.topk's placement:
-        # keys above it in candidate order, then its first ties.
-        key = gl.where(valid, _bf16_key(x), -1)
-        high, above_hi = _kth_bin(
-            gl.histogram(
-                key >> 8, 256, mask=valid, layout=_vector_layout(256, NUM_WARPS)
-            ),
-            NC,
-            NUM_WARPS,
-        )
-        hist_lo = gl.histogram(
-            key & 255,
-            256,
-            mask=valid & ((key >> 8) == high),
-            layout=_vector_layout(256, NUM_WARPS),
-        )
-        low, above_lo = _kth_bin(hist_lo, NC - above_hi, NUM_WARPS)
-        kth = (high << 8) | low
-        n_gt = above_hi + above_lo
-        gt = (key > kth).to(gl.int32)
-        eq = (key == kth).to(gl.int32)
-        rank_eq = gl.cumsum(eq, 0) - eq
-        selected = (gt != 0) | ((eq != 0) & (rank_eq < NC - n_gt))
-        slot = gl.where(gt != 0, gl.cumsum(gt, 0) - gt, n_gt + rank_eq)
+        # The NC largest in torch.topk's placement over candidate order.
+        selected, slot = _select_top(gl.where(valid, _bf16_key(x), -1), NC)
         gl.store(tokens_out + m * NC + slot, tok, mask=selected)
     else:
         selected = valid

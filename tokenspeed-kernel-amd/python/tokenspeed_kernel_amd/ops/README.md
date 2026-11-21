@@ -2079,26 +2079,30 @@ CUDA kernels serve SM90 onward. Both solutions return the same results.
   order. It writes FP32 logits, their ids, and with `top_k > 0` the draft
   top-k probabilities and ids. The probabilities equal `torch.softmax` bit for
   bit; tied probabilities go in slot order.
-- The tail covers NC in 32, 64, 128 and 256, `R * NC <= 1024` and
-  `top_k <= 32`. Row counts and strides are runtime arguments; `k`, `NC`, `R`,
-  `top_k` and the split sizes, which `N` fixes, are compile-time.
+- The shard top-k keeps up to 256 ids a row. The tail covers NC in 32, 64,
+  128 and 256, `R * NC <= 1024` and `top_k <= 32`. Row counts and strides
+  are runtime arguments; `k`, `NC`, `R`, `top_k` and the split count, which
+  `N` fixes, are compile-time.
 
 #### Algorithm
 
-The shard top-k is a radix select on the order-preserving 16-bit key of each
-BF16 score. Each row splits into up to 16 column ranges, and each workgroup
-loops over register tiles of up to 2048 columns in its range. Two histogram
-passes find the k-th largest key, one byte at a time, using `gl.histogram`.
-Each split writes its own histogram, so no atomics are needed. A per-row
-kernel sums the split histograms, finds the k-th key, and takes prefix sums
-of each split's counts above it and tied with it. Those prefix sums are the
-split's output bases. The emit pass rereads the scores and places each key
-with a tile prefix sum. It skips the scans of tiles that hold none of the k
-keys.
+The shard top-k selects on the order-preserving 16-bit key of each BF16
+score, in two launches. The first splits each row into 4096-column ranges,
+one workgroup each, and reads its range into registers once. A binary search
+over the key range, one count reduction a step, finds the range's k-th largest
+key; one packed prefix sum ranks the keys above it and its ties, and the
+workgroup writes its k largest to a per-row pool: keys above the k-th largest
+by column, then its first ties by column, padded with -1. The row's k largest
+are among the ranges' k largest, and the row's k-th largest is at least each
+range's, so the pool's keys above the row's k-th largest, and its ties, are
+each already in column order. One workgroup per row then runs the same select
+over the pool in registers and writes the ids. No pass rereads the scores, and
+no atomics are needed. The search replaces byte-wise `gl.histogram` passes,
+which cost several count reductions per element on gfx950.
 
 The tail runs one workgroup per row, with one element per gathered candidate.
-For `R > 1` it runs the same two-byte select in registers and scatters the NC
-kept candidates into the output. A barrier orders those writes before the
+For `R > 1` it runs the same select in registers and scatters the NC kept
+candidates into the output. A barrier orders those writes before the
 softmax reads them back in slot order. The softmax repeats torch's
 64-lane-wave reduction. Lane `l` of a `min(NC, 64)`-wide warp adds
 `exp(x - max)` over slots `l`, `l + warp`, and so on. The lanes then combine
