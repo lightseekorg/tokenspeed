@@ -20,6 +20,7 @@
 
 // Run the fused Top-K/Top-P pipeline behind a producer that signals PDL launch
 // completion before it stores the probabilities, as the softmax kernels may.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
