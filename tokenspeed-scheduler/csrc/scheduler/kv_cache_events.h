@@ -33,10 +33,11 @@
 
 namespace tokenspeed {
 
-// The memory an event concerns: the GPU cache, or the pinned Host cache (Host
-// L2). A consumer reading no medium takes the Device.
-enum class KvEventMedium : std::uint8_t { kDevice = 0, kHost = 1 };
-inline constexpr std::size_t kNumKvEventMedia = 2;
+// The memory an event concerns: the GPU cache, the pinned Host cache (Host
+// L2), or the Disk tier (docs/rfcs/0006-disk-tier.md). A consumer reading no
+// medium takes the Device.
+enum class KvEventMedium : std::uint8_t { kDevice = 0, kHost = 1, kDisk = 2 };
+inline constexpr std::size_t kNumKvEventMedia = 3;
 
 struct KvBlockStoredEvent {
     std::vector<std::uint64_t> block_hashes;
@@ -117,9 +118,9 @@ private:
 
 // Projects per-boundary residency onto prefix-closed routing views, one per
 // medium. A Device boundary is out when its parent is out on the Device, as
-// before Host events existed. A Host boundary is out when its parent is out
-// on either medium: under write-back the two tiers hold complementary parts of
-// a prefix, and a router continues a match into the Host tier from wherever
+// before Host events existed. A Host or Disk boundary is out when its parent
+// is out on any medium: under write-back the tiers hold complementary parts
+// of a prefix, and a router continues a match into a lower tier from wherever
 // the parent is. This owns only event metadata, never cache blocks or
 // eviction decisions.
 class KvEventPrefixView {

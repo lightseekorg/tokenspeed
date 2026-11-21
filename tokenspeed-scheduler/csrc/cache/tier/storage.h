@@ -40,8 +40,12 @@ struct StoragePressure {
     void Validate() const;
 };
 
-// All limits are explicit at the runtime/scheduler boundary. Host credits count
-// CacheBlock references conservatively: each can prevent one parent recycling.
+// All limits are explicit at the runtime/scheduler boundary. Host credits
+// (max_host_blocks) count the CacheBlock references storage operations hold,
+// in any group, up to the Host's parents times its densest packing: a GET of a
+// hybrid model holds every KV page under the State checkpoint it restores, and
+// a held block can keep its parent from recycling, so the credits are a share
+// of the pool.
 struct StorageConfig {
     std::int32_t max_operations;
     std::int32_t max_keys_per_operation;

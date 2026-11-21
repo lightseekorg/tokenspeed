@@ -88,6 +88,8 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             max_consecutive_prefill_rounds=0,
             storage_config=None,
             cache_groups=groups,
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
 

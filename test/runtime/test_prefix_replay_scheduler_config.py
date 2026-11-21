@@ -41,6 +41,8 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         max_consecutive_prefill_rounds=0,
         storage_config=None,
         **kwargs,
+        num_disk_pages=0,
+        disk_config=None,
     )
 
 
@@ -174,6 +176,8 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         cache_groups=None,
         enable_mixed_prefill_decode=False,
         prefix_replay_tokens=0,
+        num_disk_pages=0,
+        disk_config=None,
     )
     assert config.enable_l3_storage is enable_l3_storage
 

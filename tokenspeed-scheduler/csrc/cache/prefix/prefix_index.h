@@ -348,8 +348,8 @@ public:
     // a checkpoint there while a State group does. `state` and `closed` give
     // this group's kind. The coordinator binds each index once, before
     // anything is registered; an index never bound holds nothing.
-    void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool, bool state,
-                         bool closed) {
+    void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool,
+                         const BlockPool* disk_pool, bool state, bool closed) {
         const auto bind = [&](const BlockPool& pool, CacheTier tier) {
             CacheEntries& cache_index = cacheEntries(pool);
             _assert(cache_index.boundary_tree == nullptr && cache_index.entries.empty(),
@@ -360,6 +360,9 @@ public:
         bind(device_pool, CacheTier::kDevice);
         if (host_pool != nullptr) {
             bind(*host_pool, CacheTier::kHost);
+        }
+        if (disk_pool != nullptr) {
+            bind(*disk_pool, CacheTier::kDisk);
         }
     }
 

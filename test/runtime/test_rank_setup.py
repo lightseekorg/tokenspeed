@@ -100,6 +100,8 @@ def _config(args: ServerArgs, specs):
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
         peer_config=None,
+        num_disk_pages=0,
+        disk_config=None,
     )
 
 
@@ -179,6 +181,8 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
@@ -1108,6 +1112,8 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,

@@ -135,6 +135,8 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             storage_config=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
 

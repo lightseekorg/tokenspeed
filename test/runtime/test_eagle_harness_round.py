@@ -485,6 +485,8 @@ def _decode_batch(bs: int, width: int):
                     attn_kind=ts.AttnKind.Full,
                 )
             ],
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
     for i in range(bs):

@@ -90,6 +90,8 @@ def _scheduler(ts, make_config):
             max_consecutive_prefill_rounds=0,
             storage_config=None,
             cache_groups=groups,
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
 

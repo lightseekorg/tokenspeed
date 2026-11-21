@@ -643,6 +643,18 @@ class ServerArgs:
     peer_prefix_host: str | None = None
     peer_prefix_answer_timeout_ms: int = 50
     peer_prefix_min_fetch_tokens: int = 256
+    # Where a peer prefix lands: "device" (the request's admitted Device
+    # pages) or "host" (Host blocks before its admission). Required with
+    # peer sharing; no default.
+    peer_prefix_landing_tier: str | None = None
+    # The Disk tier: the node's local SSD below Host L2
+    # (docs/rfcs/0006-disk-tier.md). One directory per drive; None turns it
+    # off. The I/O backend and the write budget have no default.
+    disk_tier_paths: list[str] | None = None
+    disk_tier_size_gb: float = 0.0
+    disk_tier_io: str | None = None
+    disk_tier_write_mbps: int | None = None
+    disk_tier_config: str | None = None
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -2650,7 +2662,16 @@ class ServerArgs:
         """``--peer-prefix-port`` and its settings: what peer prefix sharing
         runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
         if self.peer_prefix_port is None:
+            if self.peer_prefix_landing_tier is not None:
+                raise ValueError(
+                    "--peer-prefix-landing-tier requires --peer-prefix-port"
+                )
             return
+        _require_choice(
+            "--peer-prefix-landing-tier",
+            self.peer_prefix_landing_tier,
+            ("device", "host"),
+        )
         unsupported = [
             setting
             for setting, refused in (
@@ -2686,8 +2707,56 @@ class ServerArgs:
         if self.peer_prefix_min_fetch_tokens <= 0:
             raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
 
+    def validate_disk_tier_options(self):
+        """``--disk-tier-paths`` and its settings: what the Disk tier runs
+        with (``docs/rfcs/0006-disk-tier.md``)."""
+        if self.disk_tier_paths is None:
+            for flag, value in (
+                ("--disk-tier-io", self.disk_tier_io),
+                ("--disk-tier-write-mbps", self.disk_tier_write_mbps),
+                ("--disk-tier-config", self.disk_tier_config),
+            ):
+                if value is not None:
+                    raise ValueError(f"{flag} requires --disk-tier-paths")
+            return
+        unsupported = [
+            setting
+            for setting, refused in (
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                (
+                    "--kvstore-write-policy other than write_back",
+                    self.kvstore_write_policy != "write_back",
+                ),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--disk-tier-paths is not supported with " + ", ".join(unsupported)
+            )
+        if not self.disk_tier_paths:
+            raise ValueError("--disk-tier-paths needs at least one directory")
+        if self.disk_tier_size_gb <= 0:
+            raise ValueError("--disk-tier-size-gb must be positive")
+        _require_choice("--disk-tier-io", self.disk_tier_io, ("io_uring", "psync"))
+        if self.disk_tier_write_mbps is None or self.disk_tier_write_mbps <= 0:
+            raise ValueError("--disk-tier-write-mbps must be a positive budget")
+        from tokenspeed.runtime.cache.disk import DiskTierTuning
+
+        DiskTierTuning.from_json(self.disk_tier_config)
+
     def validate_cache_options(self):
         self.validate_peer_prefix_options()
+        self.validate_disk_tier_options()
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -3716,6 +3785,62 @@ class ServerArgs:
             default=ServerArgs.peer_prefix_min_fetch_tokens,
             help="The fewest tokens past the local prefix hit worth reading from "
             "a peer holder; a shorter peer hit is computed instead.",
+        )
+        parser.add_argument(
+            "--peer-prefix-landing-tier",
+            type=str,
+            choices=["device", "host"],
+            default=ServerArgs.peer_prefix_landing_tier,
+            help="Where a peer prefix lands: 'device' reads it into the Device "
+            "pages the request's admission allocates, which wait out the "
+            "transfer; 'host' reads it into Host blocks before the admission, "
+            "which then takes it as a Host hit at the cost of Host capacity and "
+            "one host-to-device copy. Required with --peer-prefix-port.",
+        )
+        parser.add_argument(
+            "--disk-tier-paths",
+            type=str,
+            nargs="+",
+            default=ServerArgs.disk_tier_paths,
+            help="Cache prefixes on the node's local SSD below Host L2: one "
+            "directory per drive, on a file system that supports O_DIRECT "
+            "(XFS or ext4, not tmpfs); each rank keeps one file in one of them. "
+            "Host L2 writes its entries back to the file in the background and "
+            "a request whose prefix only the file holds reads it into Host "
+            "before its admission. The file's contents never outlive the "
+            "process. Needs --kvstore-write-policy write_back and prefix "
+            "caching; refused with --kvstore-storage-backend and "
+            "--pipeline-parallel-size > 1. See docs/rfcs/0006-disk-tier.md.",
+        )
+        parser.add_argument(
+            "--disk-tier-size-gb",
+            type=float,
+            default=ServerArgs.disk_tier_size_gb,
+            help="The Disk tier's size per rank, in gigabytes.",
+        )
+        parser.add_argument(
+            "--disk-tier-io",
+            type=str,
+            choices=["io_uring", "psync"],
+            default=ServerArgs.disk_tier_io,
+            help="How the Disk tier reaches its file: 'io_uring' (needs a "
+            "kernel and seccomp policy that allow it) or 'psync', a pool of "
+            "threads calling pread/pwrite. Required with --disk-tier-paths.",
+        )
+        parser.add_argument(
+            "--disk-tier-write-mbps",
+            type=int,
+            default=ServerArgs.disk_tier_write_mbps,
+            help="The bytes per second, in MB, each rank may write to its Disk "
+            "tier file: the SSD's endurance budget. Required with "
+            "--disk-tier-paths.",
+        )
+        parser.add_argument(
+            "--disk-tier-config",
+            type=str,
+            default=ServerArgs.disk_tier_config,
+            help="JSON object of Disk tier tuning settings; see "
+            "docs/configuration/server.md for the keys and their defaults.",
         )
         # Retraction snapshot pool
         parser.add_argument(
