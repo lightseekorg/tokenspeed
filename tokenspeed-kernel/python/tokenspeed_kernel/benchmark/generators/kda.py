@@ -413,12 +413,7 @@ def prepare_kda_paged_prefill(
         # Preserve the model's device conversion inside the captured work. The
         # hint must bind to the converted tensor to avoid a host read in capture.
         kernel_cu_seqlens = cu_seqlens.to(dtype=torch.int32).contiguous()
-        set_total_chunks_hint_uniform(
-            batch,
-            tokens_per_sequence,
-            kernel_cu_seqlens,
-            (64,),
-        )
+        set_total_chunks_hint_uniform(batch, tokens_per_sequence, kernel_cu_seqlens)
         return kda_ops.kda_paged_prefill(
             q,
             k,
