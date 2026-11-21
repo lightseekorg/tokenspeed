@@ -6,6 +6,15 @@ workflow_stage: model-test
 triggers:
   - per-commit
   - manual
+model_sources:
+  - python/tokenspeed/runtime/models/deepseek_v3.py
+  - python/tokenspeed/runtime/models/glm5.py
+  - python/tokenspeed/runtime/models/kimi_k3.py
+  - python/tokenspeed/runtime/models/kimi_k31.py
+  - python/tokenspeed/runtime/models/kimi_k3_comm.py
+  - python/tokenspeed/runtime/models/kimi_k3_deepep.py
+  - python/tokenspeed/runtime/models/kimi_k3_projection.py
+  - python/tokenspeed/runtime/models/moonvit.py
 runner:
   labels:
     - amd-mi35x-8gpu-test
