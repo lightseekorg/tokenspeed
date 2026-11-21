@@ -347,6 +347,7 @@ def _plan_decode_topk(**overrides):
         forced_initial_local=False,
         q_lens=frozenset({1, 2}),
         workspace_rows=False,
+        row_starts_cpu=False,
     )
     return plan_dsa_topk(**{**kwargs, **overrides})
 
@@ -414,6 +415,8 @@ def test_dsa_topk_plan_checks_the_mode_domain():
         _plan_decode_topk(q_lens=frozenset())
     with pytest.raises(ValueError, match="prefill top-k input"):
         _plan_decode_topk(workspace_rows=True)
+    with pytest.raises(ValueError, match="prefill top-k input"):
+        _plan_decode_topk(row_starts_cpu=True)
 
 
 def _register_project_value(name, *, priority, invariant):

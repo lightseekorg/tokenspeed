@@ -559,6 +559,7 @@ def _probe(index_k_format: str, solution: str | None = None) -> str:
         page_size=64,
         batch_invariant=True,
         solution=solution,
+        row_starts_cpu=False,
     )
 
 
@@ -860,7 +861,6 @@ def row_mirror_leaves(fresh_registry, h100_platform):
             {
                 dsa_pkg.ROW_STARTS_CPU_FEATURE,
                 dsa_pkg.CANDIDATE_LENS_CPU_FEATURE,
-                dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE,
             },
         ),
         ("without_mirror", without_mirror, set()),
@@ -873,7 +873,10 @@ def row_mirror_leaves(fresh_registry, h100_platform):
                 solution=name,
                 format_signatures=_topk_signature(),
                 traits={"index_k_format": frozenset({"bf16"})},
-                features=frozenset(features),
+                features=frozenset(
+                    features
+                    | {"batch_invariant", dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE}
+                ),
                 # Auto-selection must bypass the preferred unsupported leaf.
                 priority=Priority.REFERENCE if features else Priority.PORTABLE,
             ),
@@ -899,17 +902,19 @@ def _row_mirror_plan(solution):
     )
 
 
-def _run_row_mirror(*, empty=False, **extra):
-    starts = torch.tensor([] if empty else [0, 3], dtype=torch.int32)
+def _run_row_mirror(*, batch_invariant: bool, empty=False, **extra):
+    # Shared history and an empty final row exercise per-query bounds.
+    starts = torch.tensor([] if empty else [0, 0, 3, 7], dtype=torch.int32)
     return dsa_pkg.dsa_prefill_topk(
         q=torch.ones((len(starts), 16, HEAD_DIM), dtype=torch.bfloat16),
         weights=torch.ones((len(starts), 16)),
         kv_workspace_slots=torch.arange(7, dtype=torch.int64),
         row_starts=starts,
-        row_ends=torch.tensor([] if empty else [3, 7], dtype=torch.int32),
+        row_ends=torch.tensor([] if empty else [2, 3, 7, 7], dtype=torch.int32),
         topk=2,
         softmax_scale=1.0,
-        batch_invariant=False,
+        batch_invariant=batch_invariant,
+        page_size=64,
         index_k_cache=torch.arange(7, dtype=torch.bfloat16)[:, None]
         .expand(7, HEAD_DIM)
         .contiguous(),
@@ -928,15 +933,21 @@ def test_row_mirror_preserves_scoring(row_mirror_leaves, dispatch, empty, dtype)
     elif dispatch != "auto":
         extra[dispatch] = "mirror"
     # Non-contiguous storage is allowed; the mirror uses workspace row ids.
-    starts = torch.tensor([] if empty else [0, 99, 3, 99], dtype=dtype)[::2]
-    expected = _run_row_mirror(empty=empty, solution="without_mirror")
-    actual = _run_row_mirror(empty=empty, row_starts_cpu=starts, **extra)
+    starts = torch.tensor([] if empty else [0, 99, 0, 99, 3, 99, 7, 99], dtype=dtype)[
+        ::2
+    ]
+    expected = _run_row_mirror(
+        batch_invariant=False, empty=empty, solution="without_mirror"
+    )
+    actual = _run_row_mirror(
+        batch_invariant=False, empty=empty, row_starts_cpu=starts, **extra
+    )
     assert row_mirror_leaves[-1][0] is starts
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)
     if not empty:
-        assert actual[0].tolist() == [[2, 1], [6, 5]]
-        assert actual[1].tolist() == [2, 2]
+        assert actual[0].tolist() == [[1, 0], [2, 1], [6, 5], [-1, -1]]
+        assert actual[1].tolist() == [2, 2, 2, 0]
 
 
 @pytest.mark.parametrize("dispatch", ["solution", "override", "plan"])
@@ -949,28 +960,32 @@ def test_row_mirror_rejects_unsupported_provider(row_mirror_leaves, dispatch):
     else:
         extra[dispatch] = "without_mirror"
     with pytest.raises(error):
-        _run_row_mirror(row_starts_cpu=torch.tensor([0, 3], dtype=torch.int32), **extra)
+        _run_row_mirror(
+            batch_invariant=False,
+            row_starts_cpu=torch.tensor([0, 0, 3, 7], dtype=torch.int32),
+            **extra,
+        )
     # Explicit None has the same meaning as omission, including on saved plans.
-    rows, lens = _run_row_mirror(row_starts_cpu=None, **extra)
-    assert rows.tolist() == [[2, 1], [6, 5]]
-    assert lens.tolist() == [2, 2]
+    rows, lens = _run_row_mirror(batch_invariant=False, row_starts_cpu=None, **extra)
+    assert rows.tolist() == [[1, 0], [2, 1], [6, 5], [-1, -1]]
+    assert lens.tolist() == [2, 2, 2, 0]
 
 
 @pytest.mark.parametrize(
     "mirror",
     [
         torch.zeros(1, dtype=torch.int32),
-        torch.zeros((2, 1), dtype=torch.int32),
-        torch.zeros(2, dtype=torch.bool),
-        torch.zeros(2, dtype=torch.float32),
-        torch.empty(2, dtype=torch.int32, device="meta"),
+        torch.zeros((4, 1), dtype=torch.int32),
+        torch.zeros(4, dtype=torch.bool),
+        torch.zeros(4, dtype=torch.float32),
+        torch.empty(4, dtype=torch.int32, device="meta"),
     ],
 )
 def test_row_mirror_rejects_invalid_metadata(row_mirror_leaves, mirror):
     with pytest.raises(
         ValueError, match="row_starts_cpu must be an int32 or int64 CPU tensor"
     ):
-        _run_row_mirror(row_starts_cpu=mirror)
+        _run_row_mirror(batch_invariant=False, row_starts_cpu=mirror)
 
 
 @pytest.mark.parametrize("planned", [False, True])
@@ -1004,3 +1019,89 @@ def test_row_mirror_with_gathered_keys_and_candidate_lengths(
     assert row_mirror_leaves[-1][1] is lengths
     assert rows.tolist() == [[2, -1], [4, 3], [7, 6], [-1, -1]]
     assert lens.tolist() == [1, 2, 2, 0]
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+@pytest.mark.parametrize("entry", ["probe", "plan"])
+def test_row_mirror_initialization_selects_capable_provider(
+    row_mirror_leaves, mirror, entry
+):
+    common = dict(
+        index_k_format="bf16",
+        q_dtype=torch.bfloat16,
+        weights_dtype=torch.float32,
+        index_heads=16,
+        head_dim=HEAD_DIM,
+        topk=2,
+        page_size=64,
+        row_starts_cpu=mirror,
+    )
+    if entry == "probe":
+        name = dsa_pkg.select_dsa_prefill_topk_for_rows(
+            **common,
+            batch_invariant=True,
+            solution=None,
+        )
+    else:
+        plan = dsa_pkg.plan_dsa_topk(
+            **common,
+            mode="dsa_prefill_topk",
+            slot_order="selection",
+            forced_initial_local=False,
+            q_lens=frozenset(),
+            workspace_rows=True,
+        )
+        name = plan.kernel.name
+    assert name == ("mirror" if mirror else "without_mirror")
+    assert not row_mirror_leaves
+    if entry == "plan":
+        starts = torch.tensor([0, 0, 3, 7], dtype=torch.int32)
+        rows, lens = _run_row_mirror(
+            batch_invariant=True,
+            kernel_plan=plan,
+            row_starts_cpu=starts if mirror else None,
+        )
+        assert rows.tolist() == [[1, 0], [2, 1], [6, 5], [-1, -1]]
+        assert lens.tolist() == [2, 2, 2, 0]
+        if not mirror:
+            with pytest.raises(
+                ValueError,
+                match="Planned kernel does not provide the requested features",
+            ):
+                _run_row_mirror(
+                    batch_invariant=True, kernel_plan=plan, row_starts_cpu=starts
+                )
+
+
+def test_row_mirror_probe_rejects_unsupported_solution(row_mirror_leaves):
+    with pytest.raises(NoKernelFoundError):
+        dsa_pkg.select_dsa_prefill_topk_for_rows(
+            index_k_format="bf16",
+            q_dtype=torch.bfloat16,
+            weights_dtype=torch.float32,
+            index_heads=16,
+            head_dim=HEAD_DIM,
+            topk=2,
+            page_size=64,
+            row_starts_cpu=True,
+            batch_invariant=True,
+            solution="without_mirror",
+        )
+
+    KernelRegistry.get()._unregister("mirror")
+    with pytest.raises(NoKernelFoundError):
+        dsa_pkg.plan_dsa_topk(
+            mode="dsa_prefill_topk",
+            index_k_format="bf16",
+            q_dtype=torch.bfloat16,
+            weights_dtype=torch.float32,
+            index_heads=16,
+            head_dim=HEAD_DIM,
+            topk=2,
+            page_size=64,
+            row_starts_cpu=True,
+            slot_order="selection",
+            forced_initial_local=False,
+            q_lens=frozenset(),
+            workspace_rows=True,
+        )
