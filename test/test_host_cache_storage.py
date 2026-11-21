@@ -127,7 +127,9 @@ def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
 
     monkeypatch.setattr(torch, "empty", allocate)
     with pytest.raises(RuntimeError, match="Failed to allocate 192 pinned CPU bytes"):
-        HostCacheStorage(_layout(), group_specs=_SPECS, num_host_lcm_blocks=2)
+        HostCacheStorage(
+            _layout(), group_specs=_SPECS, num_host_lcm_blocks=2, block_alignment=1
+        )
 
 
 def test_block_offsets_follow_group_packing_without_overlap():
