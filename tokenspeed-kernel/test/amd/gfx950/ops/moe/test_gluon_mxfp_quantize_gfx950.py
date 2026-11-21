@@ -30,6 +30,10 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
+from tokenspeed_kernel.numerics.torch.quantization import (  # noqa: E402
+    dequantize_mxfp4,
+    fake_quantize_mxfp4_even,
+)
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
@@ -437,3 +441,118 @@ def test_dynamic_fp8_quantize_single_pass_bound_matches_spill_cliff() -> None:
     # Exactly on the bound is still single-pass; one element past it is not.
     assert _dynamic_fp8_use_single_pass(_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS)
     assert not _dynamic_fp8_use_single_pass(_DYNAMIC_FP8_SINGLE_PASS_MAX_ELEMENTS + 1)
+
+
+def test_linear_mxfp4_quantize_writes_quarks_even_weight_format() -> None:
+    """The linear-layout ``quantize_mxfp4`` writes the format of Quark's MXFP4
+    weights (Muse Spark encodes its BF16 expert layers with it at load,
+    ``--quantize-unquantized-experts mxfp4``): its codes and UE8M0 scales
+    decode to the "even"-mode round trip exactly, including ties to the even
+    E2M1 code, saturation past 6 and all-zero groups."""
+    torch.manual_seed(11)
+    rows = torch.randn(64, 4096, device="cuda") * torch.logspace(
+        -6, 3, 64, device="cuda"
+    ).unsqueeze(1)
+    special = torch.zeros(4, 4096, device="cuda")
+    # Group 0: amax 6, every E2M1 midpoint (ties) and its neighbours.
+    ties = torch.tensor(
+        [
+            6.0,
+            0.25,
+            0.75,
+            1.25,
+            1.75,
+            2.5,
+            3.5,
+            5.0,
+            -0.25,
+            -0.75,
+            -1.25,
+            -1.75,
+            -2.5,
+            -3.5,
+            -5.0,
+            0.26,
+            0.74,
+            1.26,
+            1.74,
+            2.6,
+            3.4,
+            5.1,
+            4.9,
+            0.0,
+        ],
+        device="cuda",
+    )
+    special[0, : ties.numel()] = ties
+    # Group 1: amax just under 1.75 x a power of two and one just past it.
+    special[1, :32] = 1.7499
+    special[1, 32:64] = 1.7501
+    # Groups that saturate: amax 7 x 2^k scales 7 / 4 > 1.75 down to 4.
+    special[2] = torch.linspace(-7.0, 7.0, 4096, device="cuda")
+    values = torch.cat((rows, special)).to(torch.bfloat16)
+    codes, scales = kernel_quantize_mxfp4(values, scale_layout="linear")
+    assert codes.dtype == torch.uint8 and codes.shape == (68, 2048)
+    assert scales.dtype == torch.uint8 and scales.shape == (68, 128)
+    decoded = dequantize_mxfp4(codes, scales)
+    expected = fake_quantize_mxfp4_even(values.float())
+    assert torch.equal(decoded, expected)
+
+
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _quark_even_mxfp4_bytes(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quark's "even"-mode MXFP4 encoding of ``x`` ([rows, columns], columns a
+    multiple of 32), written from its definition, bit by bit: the block amax
+    rounded at the E8M0 boundary (+2**21 then truncated to the exponent), the
+    scale exponent floor(log2) - 2 clamped to [-127, 127] and stored biased by
+    127, E2M1 codes rounded to nearest with ties to the even code and saturated
+    at 6, two codes a byte with the even column in the low nibble."""
+    values = x.float()
+    rows, columns = values.shape
+    blocks = values.reshape(rows, columns // 32, 32)
+    amax_bits = blocks.abs().amax(-1).contiguous().view(torch.int32).to(torch.int64)
+    rounded = ((amax_bits + 0x200000) & 0xFF800000).to(torch.int32).view(torch.float32)
+    exponent = (torch.log2(rounded).floor() - 2).clamp(-127, 127)
+    scales = (exponent + 127).to(torch.uint8)
+    magnitude = (blocks.abs() / torch.exp2(exponent).unsqueeze(-1)).clamp(max=6.0)
+    grid = torch.tensor(_E2M1_VALUES, device=x.device)
+    distance = (magnitude.unsqueeze(-1) - grid).abs()
+    nearest = distance == distance.amin(-1, keepdim=True)
+    even = torch.arange(len(_E2M1_VALUES), device=x.device) % 2 == 0
+    # A tie sits between an even and an odd code: take the even one.
+    pick = torch.where((nearest & even).any(-1, keepdim=True), nearest & even, nearest)
+    codes = pick.to(torch.uint8).argmax(-1).to(torch.uint8)
+    codes = codes | (torch.signbit(blocks).to(torch.uint8) << 3)
+    codes = codes.reshape(rows, columns)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, scales
+
+
+def test_linear_mxfp4_quantize_matches_quarks_even_bytes() -> None:
+    """The linear-layout ``quantize_mxfp4`` writes Quark's MXFP4 bytes exactly:
+    codes and UE8M0 scale bytes equal an independent bit-level reference of the
+    even mode, on blocks whose amax spans 2**-20 to 2**10 (negative scale
+    exponents included), an all-zero block (scale byte 0), E2M1 ties, and
+    saturation past 6."""
+    torch.manual_seed(5)
+    rows = torch.randn(32, 1024, device="cuda") * torch.logspace(
+        -20, 10, 32, base=2.0, device="cuda"
+    ).unsqueeze(1)
+    special = torch.zeros(3, 1024, device="cuda")
+    ties = torch.tensor(
+        [6.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.25, -1.25, -2.5, -5.0],
+        device="cuda",
+    )
+    special[0, : ties.numel()] = ties
+    special[1, :32] = torch.linspace(-40.0, 40.0, 32, device="cuda")  # saturates
+    # special[2] stays zero: every block of that row is all-zero.
+    x = torch.cat((rows, special)).to(torch.bfloat16)
+    codes, scales = kernel_quantize_mxfp4(x, scale_size=32, scale_layout="linear")
+    expected_codes, expected_scales = _quark_even_mxfp4_bytes(x)
+    assert torch.equal(scales.view(torch.uint8), expected_scales)
+    assert torch.equal(codes.view(torch.uint8), expected_codes)
+    assert torch.equal(
+        scales.view(torch.uint8)[-1], torch.zeros_like(scales[-1]).view(torch.uint8)
+    )

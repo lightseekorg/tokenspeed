@@ -58,6 +58,7 @@ global_server_args_dict: dict = {
     "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
     "numerics": ServerArgs.numerics,
     "prefill_collective_payload": ServerArgs.prefill_collective_payload,
+    "quantize_unquantized_experts": ServerArgs.quantize_unquantized_experts,
     "speculative_rejection_sample_method": (
         ServerArgs.speculative_rejection_sample_method
     ),
@@ -140,6 +141,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
             "prefill_collective_payload": server_args.prefill_collective_payload,
+            "quantize_unquantized_experts": server_args.quantize_unquantized_experts,
             "speculative_rejection_sample_method": (
                 server_args.speculative_rejection_sample_method
             ),

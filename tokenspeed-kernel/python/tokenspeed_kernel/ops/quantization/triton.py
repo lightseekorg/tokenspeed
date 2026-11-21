@@ -1079,7 +1079,9 @@ def _mxfp4_quantize_block(x):
     amax = amax.to(tl.float32, bitcast=True)
     scale_e8m0_unbiased = tl.log2(amax).floor() - 2
     scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    scale_byte = scale_e8m0_unbiased.to(tl.uint8) + 127
+    # Bias before narrowing: the unbiased exponent is negative for any block
+    # whose amax is below 4, and a negative float has no uint8 value.
+    scale_byte = (scale_e8m0_unbiased + 127).to(tl.uint8)
     qx = x * tl.exp2(-scale_e8m0_unbiased)
     qx = qx.to(tl.uint32, bitcast=True)
 

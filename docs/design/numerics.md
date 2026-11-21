@@ -670,6 +670,35 @@ combination is accepted; `--enable-eplb` with the rank-order combine stays an
 never enter the arithmetic; the dispatch algorithm stays static (required
 under rl-bitwise already) and drafts stay trivially placed.
 
+## Load-time weight encodings
+
+`--quantize-unquantized-experts mxfp4` (Muse Spark) encodes, at load, the
+routed-expert layers the checkpoint leaves in BF16 (its quantization config
+excludes their experts: layers 0 and 61 of the Quark MXFP4 checkpoint) into
+the MXFP4 format of the checkpoint's other expert layers (E2M1 codes, a
+UE8M0 scale per 32 values in Quark's "even" mode, round to nearest even),
+and builds those layers exactly as the other expert layers. That changes more
+than their weights:
+
+- the weights are rounded once, at load;
+- the layers' expert inputs are quantized too: they take the MXFP4 layers'
+  dynamic MXFP4 activations (the fused norm-and-quantize prologue,
+  `rmsnorm_mxfp4_quant`, and `forward_mxfp4`) instead of BF16 rows;
+- the expert GEMMs and combine are the MXFP4 layers' kernels: under
+  attention DP the MXFP4 expert exchange instead of the BF16 layers'
+  gathered rows, and at TP8 / EP1 the down-projection column path the MXFP4
+  layers use.
+
+So it is a numerics change of the model, not only of an arithmetic order:
+those layers' outputs move against BF16 everywhere, deterministically and
+run-invariantly. Memory goes down: the two layers' expert weights shrink from
+BF16 to MXFP4 (about 16 to 4.25 bits per weight). The down-projection column
+copy that MXFP4 layers keep at TP8 / EP1 now exists for these layers as well;
+a transient BF16 tensor per expert lives only during load. `none` (the
+default) loads the checkpoint as it is, so default-flag outputs are bitwise
+those of a build without the option. `--numerics rl-bitwise` refuses `mxfp4`:
+the envelope promises the trainer's weights.
+
 ## Acceptance
 
 An envelope is verified end to end, not per switch, and `rl-bitwise` has two

@@ -347,6 +347,8 @@ def validate_context_parallel_roles(
 # Muse Spark's --prefill-collective-payload choices (the Iris state's
 # MUSE_PAYLOADS; a test checks they match).
 PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
+# Muse Spark's --quantize-unquantized-experts choices.
+UNQUANTIZED_EXPERT_ENCODINGS = ("none", "mxfp4")
 
 
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
@@ -825,6 +827,14 @@ class ServerArgs:
     # element instead of 2, and a numerics change. Decode and verify forwards
     # stay BF16.
     prefill_collective_payload: str = "bf16"
+    # Muse Spark: the routed-expert layers the checkpoint leaves in BF16 (its
+    # quantization config excludes their experts; layers 0 and 61 of the
+    # Quark MXFP4 checkpoint). "none" serves them in BF16. "mxfp4" encodes
+    # their BF16 weights at load into the MXFP4 format of the checkpoint's
+    # other expert layers, which then serve them as those layers (MXFP4
+    # weights and dynamic MXFP4 activations, the same expert kernels): a
+    # numerics change.
+    quantize_unquantized_experts: str = "none"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1153,6 +1163,15 @@ class ServerArgs:
             raise ValueError(
                 "--prefill-collective-payload applies to Muse Spark's owned-row "
                 f"prefill only; this checkpoint is {architectures}"
+            )
+        if (
+            self.quantize_unquantized_experts != "none"
+            and architectures is not None
+            and "MuseSparkForConditionalGeneration" not in architectures
+        ):
+            raise ValueError(
+                "--quantize-unquantized-experts applies to Muse Spark only; this "
+                f"checkpoint is {architectures}"
             )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
@@ -2363,6 +2382,21 @@ class ServerArgs:
             raise ValueError(
                 "--prefill-collective-payload int8-block16 changes prefill "
                 "numerics; --numerics rl-bitwise needs bf16"
+            )
+        _require_choice(
+            "--quantize-unquantized-experts",
+            self.quantize_unquantized_experts,
+            UNQUANTIZED_EXPERT_ENCODINGS,
+        )
+        if (
+            self.numerics == "rl-bitwise"
+            and self.quantize_unquantized_experts != "none"
+        ):
+            # The envelope promises the trainer's bits; the encoding rounds the
+            # BF16 expert weights.
+            raise ValueError(
+                "--quantize-unquantized-experts changes the expert weights; "
+                "--numerics rl-bitwise needs none"
             )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
@@ -5241,6 +5275,18 @@ class ServerArgs:
             "collectives in extend forwards. int8-block16 sends INT8 codes with "
             "an FP32 scale per 16 elements (a numerics change); decode stays "
             "BF16.",
+        )
+        parser.add_argument(
+            "--quantize-unquantized-experts",
+            type=str,
+            default=ServerArgs.quantize_unquantized_experts,
+            choices=list(UNQUANTIZED_EXPERT_ENCODINGS),
+            help="Muse Spark: encode the routed-expert layers the checkpoint "
+            "leaves in BF16 (layers 0 and 61 of the Quark MXFP4 checkpoint) at "
+            "load. mxfp4 stores them as the other expert layers do and serves "
+            "them as those layers: MXFP4 weights, dynamic MXFP4 activations and "
+            "the same expert kernels (a numerics change), in less memory than "
+            "BF16. none (the default) keeps BF16.",
         )
         parser.add_argument(
             "--numerics",

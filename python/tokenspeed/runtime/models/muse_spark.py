@@ -65,7 +65,11 @@ from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     AllReduceMailbox,
     KimiK3LatentDownOp,
 )
-from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant, rmsnorm_nvfp4_quant
+from tokenspeed_kernel.ops.quantization import (
+    quantize_mxfp4,
+    rmsnorm_mxfp4_quant,
+    rmsnorm_nvfp4_quant,
+)
 from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,
     post_norm_residual_pre_norm,
@@ -73,7 +77,12 @@ from tokenspeed_kernel.ops.residual import (
     residual_gate_coefficients,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.selection import resolve_kernel_override
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    resolve_kernel_override,
+    select_kernel,
+)
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from torch import nn
 
 from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
@@ -2800,18 +2809,61 @@ class MuseSparkModel(BaseTransformerModel):
         prefix: str,
     ) -> None:
         _widen_modelopt_exclusions(quant_config)
-        exclude_fully_excluded_fused_modules(
+        encoding = global_server_args_dict["quantize_unquantized_experts"]
+        encoded_expert_layers = exclude_fully_excluded_fused_modules(
             quant_config,
             num_layers=config.num_hidden_layers,
             num_experts=config.num_local_experts,
             prefix=prefix,
+            encode_bf16_experts=encoding == "mxfp4",
         )
+        if encoding != "none" and not encoded_expert_layers:
+            raise ValueError(
+                f"--quantize-unquantized-experts {encoding}: the checkpoint leaves "
+                "no routed-expert layer unquantized; serve with none"
+            )
         super().__init__(
             config=config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
         )
+        # --quantize-unquantized-experts mxfp4: the layers whose BF16 expert
+        # tensors load_weights encodes into the other layers' MXFP4 format.
+        self.encoded_expert_layers: frozenset[int] = frozenset(encoded_expert_layers)
+        for layer_id in self.encoded_expert_layers:
+            kind = self.layers[layer_id].mlp.expert_quant_kind
+            if kind != "mxfp4":
+                raise ValueError(
+                    f"--quantize-unquantized-experts mxfp4 encodes layer {layer_id}'s "
+                    f"experts as MXFP4, but this checkpoint's quantized experts are {kind}"
+                )
+        # The values per UE8M0 scale of the checkpoint's MXFP4 layers, which the
+        # encoding reproduces; None when no layer is encoded.
+        self.expert_encoding_scale_size: int | None = None
+        if self.encoded_expert_layers:
+            scale_size = quant_config.group_size
+            # Refuse here, naming the flag, on a platform with no linear-layout
+            # MXFP4 quantizer, rather than in the middle of loading weights.
+            try:
+                select_kernel(
+                    "quantization",
+                    "mxfp4",
+                    format_signature(x=dense_tensor_format(torch.bfloat16)),
+                    traits={
+                        "scale_size": scale_size,
+                        "scale_layout": "linear",
+                        "has_global_scale": False,
+                        "scale_encoding": "ue8m0",
+                    },
+                )
+            except NoKernelFoundError as error:
+                raise ValueError(
+                    "--quantize-unquantized-experts mxfp4 needs an MXFP4 "
+                    "quantization kernel with the linear scale layout, and this "
+                    "platform registers none"
+                ) from error
+            self.expert_encoding_scale_size = scale_size
         self.norm = MuseSparkRMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -3174,7 +3226,8 @@ def exclude_fully_excluded_fused_modules(
     num_layers: int,
     num_experts: int,
     prefix: str,
-) -> None:
+    encode_bf16_experts: bool,
+) -> tuple[int, ...]:
     """Exclude each fused module whose every member projection the checkpoint excludes.
 
     Quark lists excluded projections one by one (``self_attn.q_proj``,
@@ -3188,11 +3241,21 @@ def exclude_fully_excluded_fused_modules(
         num_layers: Decoder layer count.
         num_experts: Routed experts per layer.
         prefix: The decoder model's module prefix.
+        encode_bf16_experts: ``--quantize-unquantized-experts mxfp4``: leave
+            fully excluded ``mlp.experts`` quantized (no fused exclusion, and
+            their per-expert entries removed from ``ignored_layers``), so
+            those layers build the checkpoint's quantized experts, and return
+            them for ``load_weights`` to encode their BF16 tensors.
+
+    Returns:
+        The layers whose BF16 experts ``load_weights`` encodes (empty unless
+        ``encode_bf16_experts``).
     """
     if quant_config is None or not quant_config.ignored_layers:
-        return
+        return ()
     ignored = set(quant_config.ignored_layers)
     fused_exclusions = []
+    encoded_layers = []
     for layer_id in range(num_layers):
         layer = add_prefix(f"layers.{layer_id}", prefix)
         fused_modules = (
@@ -3212,12 +3275,30 @@ def exclude_fully_excluded_fused_modules(
         for fused, members in fused_modules:
             excluded = sum(member in ignored for member in members)
             if excluded == len(members):
-                fused_exclusions.append(fused)
+                if encode_bf16_experts and fused.endswith(".mlp.experts"):
+                    encoded_layers.append(layer_id)
+                else:
+                    fused_exclusions.append(fused)
             elif excluded:
                 raise ValueError(
                     f"checkpoint excludes only some projections of '{fused}'"
                 )
-    quant_config.ignored_layers = [*quant_config.ignored_layers, *fused_exclusions]
+    ignored_layers = quant_config.ignored_layers
+    if encoded_layers:
+        # should_ignore_quant_layer treats an experts module as ignored when
+        # any ignored name contains its prefix, so the encoded layers'
+        # per-expert entries (and their aliases) must go too; their tensors
+        # load through the per-expert path, which does not consult them.
+        encoded_experts = tuple(
+            f"layers.{layer_id}.mlp.experts." for layer_id in encoded_layers
+        )
+        ignored_layers = [
+            name
+            for name in ignored_layers
+            if not any(f".{experts}" in f".{name}" for experts in encoded_experts)
+        ]
+    quant_config.ignored_layers = [*ignored_layers, *fused_exclusions]
+    return tuple(encoded_layers)
 
 
 def resolve_parameter_name(name: str) -> tuple[str, str | None]:
@@ -3727,37 +3808,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             per_expert = resolve_per_expert_tensor(name)
             if per_expert is not None:
                 parameter_name, expert_id, half = per_expert
-                moe = self.model.layers[_layer_id(parameter_name)].mlp
-                local_expert = expert_id - moe.expert_start
-                if not 0 <= local_expert < moe.experts_per_rank:
-                    continue
-                parameter = params.get(parameter_name)
-                if parameter is None:
-                    raise ValueError(f"checkpoint tensor '{name}' has no parameter")
-                target = parameter.data[local_expert]
-                if half is not None:
-                    rows = target.shape[0] // 2
-                    target = target.narrow(0, half * rows, rows)
-                if moe.down_columns is not None and half is None:
-                    moe.down_columns.load(
-                        loaded_weight,
-                        scale=not parameter_name.endswith(".w2_weight"),
-                        expert=local_expert,
+                if _layer_id(parameter_name) in self.model.encoded_expert_layers:
+                    self._load_encoded_expert_tensor(
+                        params, name, parameter_name, expert_id, half, loaded_weight
                     )
-                loaded_weight = shard_expert_projection(
-                    loaded_weight,
-                    target,
-                    moe.tp_rank,
-                    moe.tp_size,
-                    gate_up=half is not None,
-                    fused_gate_up=False,
-                )
-                if target.shape != loaded_weight.shape:
-                    raise ValueError(
-                        f"checkpoint tensor '{name}' has shape "
-                        f"{tuple(loaded_weight.shape)}; expected {tuple(target.shape)}"
+                else:
+                    self._load_per_expert_tensor(
+                        params, name, parameter_name, expert_id, half, loaded_weight
                     )
-                target.copy_(loaded_weight)
                 continue
             parameter_name, shard_id = resolve_parameter_name(name)
             tower = parameter_name.split(".", maxsplit=1)[0]
@@ -3772,6 +3830,11 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 parameter.weight_loader(parameter, loaded_weight, shard_id)
                 continue
             if ".mlp.experts." in parameter_name:
+                if _layer_id(parameter_name) in self.model.encoded_expert_layers:
+                    raise ValueError(
+                        "--quantize-unquantized-experts mxfp4 encodes per-expert "
+                        f"BF16 projections; checkpoint tensor '{name}' is fused"
+                    )
                 moe = self.model.layers[_layer_id(parameter_name)].mlp
                 if parameter_name.endswith("_input_scale"):
                     load_expert_input_scale(parameter, loaded_weight, moe.expert_start)
@@ -3804,6 +3867,100 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         # Reloaded gates (weight updates) must reach the cached coefficients.
         for layer in self.model.layers:
             layer.refresh_residual_gates()
+
+    def _load_per_expert_tensor(
+        self,
+        params: dict[str, nn.Parameter],
+        name: str,
+        parameter_name: str,
+        expert_id: int,
+        half: int | None,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        """Copy one expert's projection tensor into this rank's fused expert
+        weights (``resolve_per_expert_tensor``); other ranks' experts are
+        skipped."""
+        moe = self.model.layers[_layer_id(parameter_name)].mlp
+        local_expert = expert_id - moe.expert_start
+        if not 0 <= local_expert < moe.experts_per_rank:
+            return
+        parameter = params.get(parameter_name)
+        if parameter is None:
+            raise ValueError(f"checkpoint tensor '{name}' has no parameter")
+        target = parameter.data[local_expert]
+        if half is not None:
+            rows = target.shape[0] // 2
+            target = target.narrow(0, half * rows, rows)
+        if moe.down_columns is not None and half is None:
+            moe.down_columns.load(
+                loaded_weight,
+                scale=not parameter_name.endswith(".w2_weight"),
+                expert=local_expert,
+            )
+        loaded_weight = shard_expert_projection(
+            loaded_weight,
+            target,
+            moe.tp_rank,
+            moe.tp_size,
+            gate_up=half is not None,
+            fused_gate_up=False,
+        )
+        if target.shape != loaded_weight.shape:
+            raise ValueError(
+                f"checkpoint tensor '{name}' has shape "
+                f"{tuple(loaded_weight.shape)}; expected {tuple(target.shape)}"
+            )
+        target.copy_(loaded_weight)
+
+    def _load_encoded_expert_tensor(
+        self,
+        params: dict[str, nn.Parameter],
+        name: str,
+        parameter_name: str,
+        expert_id: int,
+        half: int | None,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        """Encode one BF16 expert projection of a ``--quantize-unquantized-experts
+        mxfp4`` layer and load it as the checkpoint's MXFP4 expert layers load
+        theirs.
+
+        Quark stores those layers' weights as E2M1 codes, two a byte with the
+        even column in the low nibble, and one UE8M0 scale per 32 input columns
+        in its "even" mode with round-half-to-even codes; ``quantize_mxfp4``'s
+        linear-layout kernel writes that format, so the codes and scales take
+        the same parameters, sharding and post-load processing.
+        """
+        if not parameter_name.endswith("_weight"):
+            raise ValueError(
+                "--quantize-unquantized-experts mxfp4 encodes a layer whose "
+                f"checkpoint holds BF16 expert weights only; '{name}' is a "
+                "quantization tensor of that layer"
+            )
+        if loaded_weight.dtype != torch.bfloat16:
+            raise ValueError(
+                "--quantize-unquantized-experts mxfp4 encodes BF16 expert "
+                f"weights; checkpoint tensor '{name}' is {loaded_weight.dtype}"
+            )
+        moe = self.model.layers[_layer_id(parameter_name)].mlp
+        if not 0 <= expert_id - moe.expert_start < moe.experts_per_rank:
+            return
+        parameter = params.get(parameter_name)
+        if parameter is None:
+            raise ValueError(f"checkpoint tensor '{name}' has no parameter")
+        weight = loaded_weight.to(device=parameter.device).contiguous()
+        codes, scales = quantize_mxfp4(
+            weight,
+            scale_size=self.model.expert_encoding_scale_size,
+            scale_layout="linear",
+        )
+        for target_name, tensor in (
+            (parameter_name, codes),
+            (f"{parameter_name}_scale", scales),
+        ):
+            self._load_per_expert_tensor(
+                params, name, target_name, expert_id, half, tensor
+            )
 
     def post_quant_warmup(self) -> None:
         """Validate loaded audio weights and warm bounded expert kernel families."""

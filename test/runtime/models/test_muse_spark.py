@@ -769,6 +769,208 @@ def test_tensor_parallel_checkpoint_loading_preserves_gate_up_pairing(
         torch.testing.assert_close(parameter, expected + 1, atol=0, rtol=0)
 
 
+def _layout_mapping(layout: str) -> tuple[Mapping, int, int]:
+    """(mapping, rank, ranks) for an 8-way tensor-parallel or a 4-way
+    expert-parallel MoE layout, built for the last rank."""
+    tp = layout == "tp8"
+    ranks = 8 if tp else 4
+    rank = ranks - 1
+    return (
+        Mapping(
+            rank=rank,
+            world_size=ranks,
+            attn_tp_size=ranks,
+            attn_dp_size=1,
+            dense_tp_size=ranks,
+            dense_dp_size=1,
+            moe_tp_size=ranks if tp else 1,
+            moe_ep_size=1 if tp else ranks,
+            moe_dp_size=1,
+            vision_tp_size=1,
+            vision_dp_size=ranks,
+            linear_attn_tp_size=ranks,
+            pp_size=1,
+            pp_layer_partition=None,
+            nprocs_per_node=ranks,
+            nnodes=1,
+            base_gpu_id=0,
+            gpu_id_step=1,
+        ),
+        rank,
+        ranks,
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("layout", ["tp8", "ep4"])
+@pytest.mark.parametrize("encode", [False, True], ids=["none", "mxfp4"])
+def test_encoded_bf16_expert_layer_loads_the_repositorys_mxfp4_encoding(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, layout: str, encode: bool
+) -> None:
+    """A layer whose experts the Quark config leaves in BF16, loaded through the
+    real loader from Quark's per-expert BF16 tensors. With
+    --quantize-unquantized-experts mxfp4 its MXFP4 parameters hold exactly the
+    repository's own encoding of those weights (quantize_mxfp4, linear layout)
+    on this rank's shard, and scale blocks do not straddle the tensor-parallel
+    shard of down_proj's input columns; with none the layer stays BF16 with the
+    loaded values, as on main."""
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: None
+    )
+    monkeypatch.setitem(
+        module.global_server_args_dict,
+        "quantize_unquantized_experts",
+        "mxfp4" if encode else "none",
+    )
+    mapping, rank, ranks = _layout_mapping(layout)
+    config = _tiny_config()
+    intermediate = 4096
+    config.moe_intermediate_size = intermediate
+    hidden, experts = 128, 4  # _text_config's moe_hidden_size / num_local_experts
+    quant_config = _quark_mxfp4_config(
+        [
+            f"model.language_model.layers.0.mlp.experts.{expert}.{projection}"
+            for expert in range(experts)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ]
+    )
+    build = lambda: MuseSparkForConditionalGeneration(  # noqa: E731
+        config,
+        mapping,
+        quant_config,
+        is_multimodal_active=False,
+        mm_attention_backend=None,
+    )
+    if encode and not current_platform().is_cdna4:
+        # No linear-layout MXFP4 quantizer is registered off gfx950: the build
+        # refuses, naming the flag, before any weight loads.
+        with torch.device("cuda"), pytest.raises(
+            ValueError, match="--quantize-unquantized-experts mxfp4 needs"
+        ):
+            build()
+        return
+    with torch.device("cuda"):
+        model = build()
+    moe = model.model.layers[0].mlp
+    assert moe.expert_quant_kind == ("mxfp4" if encode else "unquant")
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    weights = {
+        (expert, projection): torch.randn(
+            shape, generator=generator, device="cuda", dtype=torch.float32
+        ).to(torch.bfloat16)
+        for expert in range(experts)
+        for projection, shape in (
+            ("gate_proj", (intermediate, hidden)),
+            ("up_proj", (intermediate, hidden)),
+            ("down_proj", (hidden, intermediate)),
+        )
+    }
+    model.load_weights(
+        [
+            (f"model.language_model.layers.0.mlp.experts.{e}.{projection}.weight", w)
+            for (e, projection), w in weights.items()
+        ]
+    )
+    params = dict(moe.experts.named_parameters())
+    tp_ranks = ranks if layout == "tp8" else 1
+    tp_rank = rank if layout == "tp8" else 0
+    local = intermediate // tp_ranks
+    rows = slice(tp_rank * local, (tp_rank + 1) * local)
+    local_experts = range(moe.expert_start, moe.expert_start + moe.experts_per_rank)
+    for slot, expert in enumerate(local_experts):
+        gate, up = weights[(expert, "gate_proj")], weights[(expert, "up_proj")]
+        down = weights[(expert, "down_proj")]
+        if not encode:
+            torch.testing.assert_close(
+                params["w13_weight"][slot],
+                torch.cat((gate[rows], up[rows])),
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                params["w2_weight"][slot], down[:, rows], atol=0, rtol=0
+            )
+            continue
+        gate_codes, gate_scales = module.quantize_mxfp4(gate, scale_layout="linear")
+        up_codes, up_scales = module.quantize_mxfp4(up, scale_layout="linear")
+        down_codes, down_scales = module.quantize_mxfp4(down, scale_layout="linear")
+        code_columns = slice(tp_rank * local // 2, (tp_rank + 1) * local // 2)
+        scale_columns = slice(tp_rank * local // 32, (tp_rank + 1) * local // 32)
+        expected = {
+            "w13_weight": torch.cat((gate_codes[rows], up_codes[rows])),
+            "w13_weight_scale": torch.cat((gate_scales[rows], up_scales[rows])),
+            "w2_weight": down_codes[:, code_columns],
+            "w2_weight_scale": down_scales[:, scale_columns],
+        }
+        for name, tensor in expected.items():
+            assert torch.equal(params[name][slot], tensor), (layout, expert, name)
+        # The rank's slice of the whole tensor's encoding is the encoding of
+        # the rank's slice: no 32-column scale block crosses the shard edge.
+        shard_codes, shard_scales = module.quantize_mxfp4(
+            down[:, rows].contiguous(), scale_layout="linear"
+        )
+        assert torch.equal(expected["w2_weight"], shard_codes)
+        assert torch.equal(expected["w2_weight_scale"], shard_scales)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the MXFP4 expert encoding is gfx950's"
+)
+@pytest.mark.parametrize(
+    ("name", "tensor", "message"),
+    [
+        (
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            torch.zeros(4, 2 * 4096, 128, dtype=torch.bfloat16),
+            "fused",
+        ),
+        (
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight_scale",
+            torch.zeros(128, 4096 // 32, dtype=torch.uint8),
+            "quantization tensor",
+        ),
+        (
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+            torch.zeros(128, 4096, dtype=torch.float32),
+            "encodes BF16 expert weights",
+        ),
+    ],
+    ids=["fused", "scale", "fp32"],
+)
+def test_encoded_bf16_expert_layer_refuses_other_checkpoint_tensors(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, name: str, tensor, message: str
+) -> None:
+    """An encoded layer loads Quark's per-expert BF16 weights only: a fused
+    expert tensor, a scale tensor or a non-BF16 weight there raises."""
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: None
+    )
+    monkeypatch.setitem(
+        module.global_server_args_dict, "quantize_unquantized_experts", "mxfp4"
+    )
+    config = _tiny_config()
+    config.moe_intermediate_size = 4096
+    quant_config = _quark_mxfp4_config(
+        [
+            f"model.language_model.layers.0.mlp.experts.{expert}.{projection}"
+            for expert in range(4)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ]
+    )
+    with torch.device("cuda"):
+        model = MuseSparkForConditionalGeneration(
+            config,
+            _single_rank_mapping(),
+            quant_config,
+            is_multimodal_active=False,
+            mm_attention_backend=None,
+        )
+    with pytest.raises(ValueError, match=message):
+        model.load_weights([(name, tensor.cuda())])
+
+
 @requires_gpu
 def test_muse_spark_checkpoint_names_load_into_runtime_layout(
     bf16_default_dtype,
@@ -946,9 +1148,14 @@ def test_quark_per_projection_exclusions_exclude_the_fused_modules() -> None:
             for projection in ("gate_proj", "up_proj", "down_proj")
         ]
     )
-    exclude_fully_excluded_fused_modules(
-        quant_config, num_layers=2, num_experts=2, prefix="model"
+    encoded = exclude_fully_excluded_fused_modules(
+        quant_config,
+        num_layers=2,
+        num_experts=2,
+        prefix="model",
+        encode_bf16_experts=False,
     )
+    assert encoded == ()
     added = set(quant_config.ignored_layers)
     assert {
         "model.layers.0.self_attn.qkv_proj",
@@ -964,8 +1171,46 @@ def test_quark_exclusions_reject_a_partially_excluded_fused_module() -> None:
     )
     with pytest.raises(ValueError, match="only some projections"):
         exclude_fully_excluded_fused_modules(
-            quant_config, num_layers=1, num_experts=2, prefix="model"
+            quant_config,
+            num_layers=1,
+            num_experts=2,
+            prefix="model",
+            encode_bf16_experts=False,
         )
+
+
+def test_encoding_bf16_experts_keeps_their_layers_quantized() -> None:
+    """--quantize-unquantized-experts mxfp4: a layer whose every expert
+    projection the checkpoint excludes keeps its fused experts quantized (so
+    it builds the other layers' MXFP4 experts) and is returned for load-time
+    encoding; attention exclusions are unchanged."""
+    quant_config = _quark_mxfp4_config(
+        [
+            f"model.language_model.layers.{layer}.self_attn.{projection}"
+            for layer in (0, 1)
+            for projection in ("q_proj", "k_proj", "v_proj", "gate_proj")
+        ]
+        + [
+            f"model.language_model.layers.{layer}.mlp.experts.{expert}.{projection}"
+            for layer in (0, 2)
+            for expert in range(2)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ]
+    )
+    encoded = exclude_fully_excluded_fused_modules(
+        quant_config,
+        num_layers=3,
+        num_experts=2,
+        prefix="model",
+        encode_bf16_experts=True,
+    )
+    assert encoded == (0, 2)
+    added = set(quant_config.ignored_layers)
+    assert {
+        "model.layers.0.self_attn.qkv_proj",
+        "model.layers.1.self_attn.qkv_proj",
+    } <= added
+    assert not any(name.endswith(".mlp.experts") for name in added)
 
 
 @requires_gpu
@@ -2078,6 +2323,59 @@ def test_prefill_collective_payload_is_validated_in_server_args() -> None:
     with pytest.raises(ValueError, match="rl-bitwise"):
         ServerArgs(
             model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
+        )
+
+
+@pytest.mark.parametrize("encode", [False, True])
+def test_quark_bf16_expert_layers_resolve_their_moe_weight_dtype(encode) -> None:
+    """The MoE layer's weight dtype, resolved as MoELayer resolves it, for a
+    Quark MXFP4 config spelled as the Muse Spark checkpoint's: layers 0 and 2
+    list every expert projection under model.language_model. With
+    --quantize-unquantized-experts mxfp4 they resolve MXFP4 like layer 1;
+    without it they stay unquant. (should_ignore_quant_layer matches an
+    experts module whenever an ignored name contains its prefix, so leaving
+    out only the fused exclusion is not enough.)"""
+    from tokenspeed.runtime.layers.moe.expert import moe_expert_weight_dtype
+
+    quant_config = _quark_mxfp4_config(
+        [
+            f"model.language_model.layers.{layer}.mlp.experts.{expert}.{projection}"
+            for layer in (0, 2)
+            for expert in range(4)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ]
+        + [
+            f"model.language_model.layers.{layer}.self_attn.{projection}"
+            for layer in (0, 2)
+            for projection in ("q_proj", "k_proj", "v_proj", "gate_proj")
+        ]
+    )
+    encoded = exclude_fully_excluded_fused_modules(
+        quant_config,
+        num_layers=3,
+        num_experts=4,
+        prefix="model",
+        encode_bf16_experts=encode,
+    )
+    assert encoded == ((0, 2) if encode else ())
+    kinds = [
+        moe_expert_weight_dtype(quant_config, f"model.layers.{layer}.mlp.experts")
+        for layer in range(3)
+    ]
+    excluded = "mxfp4" if encode else "unquant"
+    assert kinds == [excluded, "mxfp4", excluded]
+    # The attention exclusions are untouched either way.
+    assert "model.layers.0.self_attn.qkv_proj" in quant_config.ignored_layers
+
+
+def test_quantize_unquantized_experts_is_validated_in_server_args() -> None:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="--quantize-unquantized-experts"):
+        ServerArgs(model="x", quantize_unquantized_experts="fp8")
+    with pytest.raises(ValueError, match="rl-bitwise"):
+        ServerArgs(
+            model="x", quantize_unquantized_experts="mxfp4", numerics="rl-bitwise"
         )
 
 
