@@ -144,7 +144,8 @@ def _kda_value_panels(
         "kg_pos_stride",
         "read_stride",
         "query_stride",
-        "record_slots",
+        "slot_count",
+        "slot_stride",
         "stamp_slots",
         "u_channel_stride",
         "k_channel_stride",
@@ -177,6 +178,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     retained_decay,
     retained_length,
     live_indices,
+    record_slots,
     u_channel_stride,
     k_channel_stride,
     d_page_stride,
@@ -185,6 +187,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     d_channel_stride,
     length_stride,
     live_stride,
+    slot_stride,
     u_slot_stride,
     u_head_stride,
     u_pos_stride,
@@ -193,7 +196,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     kg_pos_stride,
     read_stride,
     query_stride,
-    record_slots,
+    slot_count,
     stamp_slots,
     total_rows,
     a_log: tl.const,
@@ -223,7 +226,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     LOWER_BOUND,
     EARLY_GATE_ROWS: gl.constexpr,
 ):
-    """Verify candidates into page-owned U, normalized K and decay history."""
+    """Verify candidates into request-slot U, normalized K and decay history."""
     head_program_idx = gl.program_id(0)
     if VALUE_SPLITS > 1:
         # Workgroups go round-robin over the XCDs; keep every split of a head
@@ -305,11 +308,14 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         stamp_slot = gl.load(metadata + sequence_idx * 3)
         generation = gl.load(metadata + sequence_idx * 3 + 1)
         stamp_start = gl.load(metadata + sequence_idx * 3 + 2)
-    recurrent_idx = gl.load(live_indices + sequence_idx.to(gl.int64) * live_stride)
-    slot = recurrent_idx.to(gl.int64)
+    recurrent_idx = gl.load(live_indices + sequence_idx.to(gl.int64) * live_stride).to(
+        gl.int64
+    )
+    slot = gl.load(record_slots + sequence_idx.to(gl.int64) * slot_stride).to(gl.int64)
+    # Candidates append after the request slot's accepted records.
     start = gl.load(
         retained_length + slot * length_stride,
-        mask=(slot > 0) & (slot < NUM_POOL_SLOTS),
+        mask=(slot >= 0) & (slot < slot_count),
         other=-1,
     ).to(gl.int64)
     valid_read = (
@@ -317,6 +323,8 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         & (read_idx < NUM_POOL_SLOTS)
         & (recurrent_idx > 0)
         & (recurrent_idx < NUM_POOL_SLOTS)
+        & (slot >= 0)
+        & (slot < slot_count)
     )
     if not valid_read:
         if value_split_idx == 0:
@@ -329,9 +337,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         return
 
     valid = (
-        (slot >= 0)
-        & (slot < record_slots)
-        & (stamp_slot >= 0)
+        (stamp_slot >= 0)
         & (stamp_slot < stamp_slots)
         & (stamp_start >= 0)
         & (generation >= 0)
@@ -351,7 +357,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     last_row = token_base + token_count - 1
 
     read_page_offset = read_idx.to(gl.int64)
-    read_base = recurrent_idx.to(gl.int64) * STATE_POOL_PAGE_STRIDE + head_idx * D * D
+    read_base = recurrent_idx * STATE_POOL_PAGE_STRIDE + head_idx * D * D
     panel_value_offsets = gl.arange(0, PANEL, layout=value_layout)
 
     # With one split the same program owns every panel, so a one-deep window
@@ -677,6 +683,7 @@ def _launch_kda_verify_gfx1250(
     retained_decay,
     retained_length,
     live_indices,
+    record_slots,
 ) -> torch.Tensor:
     batch = read_indices.numel()
     output = torch.empty(
@@ -723,6 +730,7 @@ def _launch_kda_verify_gfx1250(
         retained_decay,
         retained_length,
         live_indices,
+        record_slots,
         correction.stride(3),
         retained_key.stride(3),
         retained_decay.stride(0),
@@ -731,6 +739,7 @@ def _launch_kda_verify_gfx1250(
         retained_decay.stride(3),
         retained_length.stride(0),
         live_indices.stride(0),
+        record_slots.stride(0),
         correction.stride(0),
         correction.stride(1),
         correction.stride(2),
@@ -804,6 +813,7 @@ def launch_gluon_kda_retained_verify_gfx1250(
     retained_decay,
     retained_length,
     live_indices,
+    record_slots,
     record_metadata,
     record_stamps,
     num_heads,
@@ -831,6 +841,7 @@ def launch_gluon_kda_retained_verify_gfx1250(
         retained_decay,
         retained_length,
         live_indices,
+        record_slots,
         record_metadata,
         record_stamps,
         num_heads,
@@ -845,6 +856,7 @@ def launch_gluon_kda_retained_verify_gfx1250(
         retained_length,
         read_indices,
         live_indices,
+        record_slots,
         query_start_loc,
         heads=num_heads,
         dim=head_dim,
@@ -876,6 +888,7 @@ def launch_gluon_kda_retained_verify_gfx1250(
         retained_decay=retained_decay,
         retained_length=retained_length,
         live_indices=live_indices,
+        record_slots=record_slots,
     )
 
 
@@ -888,6 +901,7 @@ def launch_gluon_kda_retained_commit_gfx1250(
     query_start_loc,
     accepted_length,
     retained_length,
+    record_slots,
     history_capacity,
     record_metadata,
     record_stamps,
@@ -895,7 +909,7 @@ def launch_gluon_kda_retained_commit_gfx1250(
     head_dim,
     draft_token_num,
 ):
-    """Update accepted convolution taps, then publish retained length."""
+    """Update accepted convolution taps, then publish each slot's retained length."""
     launch_kda_retained_commit(
         original_qkv=original_qkv,
         conv_pool=conv_pool,
@@ -904,6 +918,7 @@ def launch_gluon_kda_retained_commit_gfx1250(
         query_start_loc=query_start_loc,
         accepted_length=accepted_length,
         retained_length=retained_length,
+        record_slots=record_slots,
         history_capacity=history_capacity,
         record_metadata=record_metadata,
         record_stamps=record_stamps,

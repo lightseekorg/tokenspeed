@@ -96,7 +96,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         f"{LINEAR_ATTENTION}_2": "latest_snapshot",
     }
     assert pool.arena.runtime_contract.group_page_counts == {
-        FULL_ATTENTION: num_lcm_blocks * 16 + 1,
+        FULL_ATTENTION: num_lcm_blocks * 12 + 1,
         f"{LINEAR_ATTENTION}_0": num_lcm_blocks + 1,
         f"{LINEAR_ATTENTION}_1": num_lcm_blocks + 1,
         f"{LINEAR_ATTENTION}_2": num_lcm_blocks + 1,
@@ -236,14 +236,11 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    "history_capacity, initial_length", [(8, 2), (16, 0), (16, 10)]
-)
 @pytest.mark.parametrize("recurrent_state_dtype", [torch.float32, torch.bfloat16])
 def test_kimi_k3_checkpoint_survives_copy_and_reuse(
-    history_capacity: int, initial_length: int, recurrent_state_dtype: torch.dtype
+    recurrent_state_dtype: torch.dtype,
 ) -> None:
-    """Whole-block copies preserve the endpoint, including accepted history."""
+    """Copy and zero a dense checkpoint without touching an adjacent MLA block."""
     device = "cuda"
     heads, dim = 2, 8
     groups = (
@@ -267,7 +264,6 @@ def test_kimi_k3_checkpoint_survives_copy_and_reuse(
                 conv_shape=(3 * heads * dim, 3),
                 recurrent_shape=(heads, dim, dim),
                 recurrent_state_dtype=recurrent_state_dtype,
-                history_capacity=history_capacity,
             ),
         ),
     )
@@ -291,58 +287,17 @@ def test_kimi_k3_checkpoint_survives_copy_and_reuse(
         rank=0,
         layer_types=(FULL_ATTENTION, LINEAR_ATTENTION),
     )
-    names = (
-        "conv_state",
-        "recurrent_state",
-        "replay_correction",
-        "replay_key",
-        "replay_decay",
-        "replay_length",
-    )
-    fields = dict(
-        zip(
-            names,
-            (*pool.get_state_buffers(1), *pool.get_retained_history_fields(1)),
-            strict=True,
-        )
-    )
-    generator = torch.Generator(device=device).manual_seed(8123)
-    for name, tensor in fields.items():
-        if name == "replay_length":
-            tensor[1:4, 0] = torch.tensor([initial_length, 0, 1], device=device)
-        else:
-            values = torch.randn(
-                tensor[1:4].shape,
-                dtype=tensor.dtype,
-                device=device,
-                generator=generator,
-            )
-            tensor[1:4].copy_(
-                values.sigmoid() if name == "replay_decay" else values / 8
-            )
-    if history_capacity:
-        keys = fields["replay_key"][1:4]
-        keys.copy_(torch.nn.functional.normalize(keys, dim=-1))
-        # A zero-length checkpoint must ignore stale history bytes.
-        for name in ("replay_correction", "replay_key", "replay_decay"):
-            fields[name][2].fill_(float("nan"))
-
-    def endpoint(block: int) -> torch.Tensor:
-        value = fields["recurrent_state"][block].float().clone()
-        length = int(fields["replay_length"][block, 0]) if history_capacity else 0
-        for token in range(length):
-            value = (
-                value * fields["replay_decay"][block, :, token, None, :]
-                + fields["replay_correction"][block, :, token, :, None]
-                * fields["replay_key"][block, :, token, None, :]
-            )
-        return value
+    fields = {
+        name: pool.get_component(1, name) for name in ("conv_state", "recurrent_state")
+    }
+    for index, tensor in enumerate(fields.values(), 1):
+        tensor[1].fill_(index)
+        tensor[2].fill_(index + 3)
 
     # State blocks 1..3 occupy parents 0..2. MLA block 4 owns parent 3.
     latent = pool.get_key_buffer(0)[4]
     latent.fill_(0.25)
     before = {name: tensor.clone() for name, tensor in fields.items()}
-    endpoints = (endpoint(1), endpoint(2))
     arena.copy_blocks({LINEAR_ATTENTION: np.asarray([[1, 2], [2, 3]], dtype=np.int64)})
     for name, tensor in fields.items():
         for destination, source in ((1, 1), (2, 1), (3, 2)):
@@ -353,54 +308,6 @@ def test_kimi_k3_checkpoint_survives_copy_and_reuse(
                 rtol=0,
                 equal_nan=True,
             )
-    torch.testing.assert_close(endpoint(2), endpoints[0], atol=0, rtol=0)
-    torch.testing.assert_close(endpoint(3), endpoints[1], atol=0, rtol=0)
-
-    if history_capacity:
-        # Exercise the storage contract through real pool views. Kernel writes
-        # and accepted-length publication are integrated in later stages.
-        expected = endpoints[0]
-        for accepted in (2, 3):
-            # The second round starts after two accepted rows, overwriting the
-            # previous round's two rejected rows. It does not advance by four.
-            start = int(fields["replay_length"][2, 0])
-            candidates = {}
-            for name in ("replay_correction", "replay_key", "replay_decay"):
-                prefix = fields[name][2, :, :start].clone()
-                values = torch.randn(
-                    (heads, 4, dim), device=device, generator=generator
-                )
-                if name == "replay_key":
-                    values = torch.nn.functional.normalize(values, dim=-1)
-                elif name == "replay_decay":
-                    values = values.sigmoid()
-                candidates[name] = values
-                # Poison rejected rows to detect accidental publication or gaps.
-                values[:, accepted:].fill_(float("nan"))
-                fields[name][2, :, start : start + 4].copy_(values)
-                torch.testing.assert_close(
-                    fields[name][2, :, :start], prefix, atol=0, rtol=0
-                )
-                torch.testing.assert_close(
-                    fields[name][1], before[name][1], atol=0, rtol=0
-                )
-            # Filling the tail changes neither the accepted endpoint nor base.
-            torch.testing.assert_close(endpoint(2), expected, atol=0, rtol=0)
-            torch.testing.assert_close(
-                fields["recurrent_state"][2],
-                before["recurrent_state"][1],
-                atol=0,
-                rtol=0,
-            )
-            for token in range(accepted):
-                expected = (
-                    expected * candidates["replay_decay"][:, token, None, :]
-                    + candidates["replay_correction"][:, token, :, None]
-                    * candidates["replay_key"][:, token, None, :]
-                )
-            # Publication changes only the length, with no record-copy step.
-            fields["replay_length"][2, 0] = start + accepted
-            torch.testing.assert_close(endpoint(2), expected, atol=0, rtol=0)
 
     pool.zero_new_blocks({LINEAR_ATTENTION: np.asarray([2], dtype=np.int64)})
     for name, tensor in fields.items():
@@ -411,9 +318,6 @@ def test_kimi_k3_checkpoint_survives_copy_and_reuse(
         torch.testing.assert_close(
             tensor[3], before[name][2], atol=0, rtol=0, equal_nan=True
         )
-    torch.testing.assert_close(
-        endpoint(2), torch.zeros_like(endpoints[0]), atol=0, rtol=0
-    )
     torch.testing.assert_close(latent, torch.full_like(latent, 0.25), atol=0, rtol=0)
 
 

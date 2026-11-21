@@ -143,7 +143,9 @@ built, and the next plan is built after the head that applies the pin. A
 member whose data plane still runs the plan dispatched before the answer
 touches no page an accepted pin named: that plan's evictions were already in
 the scheduler state the answer read, and the pin rejects Device pages whose
-H2D load has not been acknowledged by every replica member.
+H2D load has not been acknowledged by every replica member, and decoded
+endpoints a retraction published whose deferred state commit has not been
+acknowledged (below).
 
 **Lookup and soft pin.** The holder probes its own Device and Host prefix
 with the ordinary matchers, so a hybrid model's reply is already cut to a
@@ -164,9 +166,14 @@ whole.
 
 **Pin.** The servicer checks that the lookup's prompt, up to the answered
 boundary, still resolves to exactly the answered pages and that none of its
-Device pages is an unacknowledged prefix-load destination. Local forwards
-can use these indexed pages through their layerwise H2D fences; remote reads
-have no such ordering. A pin refused during a load falls back locally;
+Device pages is an unacknowledged prefix-load destination. Nor may it be a
+decoded endpoint that a retraction published in a State group whose decode
+state the runtime commits only at that retraction
+(`CacheGroupConfig::deferred_decode_state`, KDA): the plan carries a
+`state_commit_fence`, and the pin waits for its `StateCommitDone`. Local
+forwards can use these indexed pages through their layerwise H2D fences and
+device order; remote reads have no such ordering. A pin refused during a load
+or a commit falls back locally;
 unrelated Device pages and published Host pages remain available. An accepted
 answer queues the hard pin of exactly those pages; a pin that finds them
 changed at the head holds nothing. The hard pin takes block references

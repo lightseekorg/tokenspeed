@@ -360,7 +360,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         with pages <= 0 marking padding, and query_start_loc gives packed-token
         offsets for windows of at most spec_query_len tokens. retained_history
         owns FP32 correction, normalized key and multiplicative decay records
-        at each live page's accepted-length offset. record_metadata is INT64 [batch, 3] (slot, generation,
+        and writes candidates after each request slot's accepted length.
+        record_metadata is INT64 [batch, 3] (slot, generation,
         absolute start) and record_stamps INT64 [slots, capacity, 2]; both may
         be None only for unstamped diagnostics.
 

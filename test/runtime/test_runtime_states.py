@@ -379,3 +379,23 @@ def test_reused_rid_updates_stop_criteria(
     # while a later overlapped forward is still draining.
     states.bind_stop_criteria([3], [0], [new_criteria])
     assert states.stopped[0].item() == expected_stopped
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_binding_reports_the_slots_that_change_admission(device):
+    """The slots a binding hands to a new admission are the ones whose
+    backend working state the executor clears (``reset_request_workspace``);
+    a slot its admission keeps is not reported again."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    states = RuntimeStates(4, 32, 32, 1, device)
+    criteria = StopCriteria((), 9)
+
+    first = states.bind_stop_criteria([1, 2], [0, 3], [criteria, criteria])
+    assert first.device.type == torch.device(device).type
+    assert first.tolist() == [0, 3]
+    assert states.bind_stop_criteria([1, 2], [0, 3], [criteria, criteria]) is None
+    # Slot 3 starts a new admission; slot 0 keeps its own.
+    assert states.bind_stop_criteria([1, 5], [0, 3], [criteria, criteria]).tolist() == [
+        3
+    ]

@@ -121,30 +121,30 @@ def _inputs(batch, window, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0
 
 
 def _records(x, *, original, capacity, correction_stride=1):
-    """Sentinel-filled page-owned FP32 records, with padding around each page."""
-    capacity = capacity
-    pages, rows = x["state_pool"].shape[0], x["mixed_qkv"].shape[0]
+    """Sentinel-filled request records, with padding around each slot."""
+    slots, rows = x["slots"], x["mixed_qkv"].shape[0]
     correction_rows = torch.full(
-        (pages, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
+        (slots, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
         CORRECTION_FILL,
         device="cuda",
     )
     key_gate_rows = torch.full(
-        (pages, capacity * 2 * WIDTH + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
+        (slots, capacity * 2 * WIDTH + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
     )
     packed = (
         key_gate_rows[:, : capacity * 2 * WIDTH]
-        .view(pages, capacity, HEADS, 2 * DIM)
+        .view(slots, capacity, HEADS, 2 * DIM)
         .transpose(1, 2)
     )
     history = KdaRetainedHistory(
         correction_rows[:, : capacity * WIDTH * correction_stride]
-        .view(pages, capacity, HEADS, DIM * correction_stride)
+        .view(slots, capacity, HEADS, DIM * correction_stride)
         .transpose(1, 2)[..., ::correction_stride],
         packed[..., :DIM],
         packed[..., DIM:],
-        torch.zeros(pages, 1, dtype=torch.int32, device="cuda"),
+        torch.zeros(slots, 1, dtype=torch.int32, device="cuda"),
         x["state_indices"],
+        torch.arange(x["state_indices"].numel(), device="cuda", dtype=torch.int32),
     )
     stamps = torch.full(
         (x["slots"], capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
@@ -290,9 +290,7 @@ def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
         8,
     )
     assert torch.equal(far[0], near[0])
-    for got, want in zip(far[1][:2], near[1][:2]):
-        assert torch.equal(got[far_indices.long()], want[rows])
-    for got, want in zip(far[1][2:], near[1][2:]):
+    for got, want in zip(far[1], near[1]):
         assert torch.equal(got, want)
 
 
@@ -452,3 +450,24 @@ def test_retained_prefix_append_preserves_base_and_publishes_on_commit(
     check_fused_retained_append(
         x, records, expected, _verify, width=3, raw_gate_only=raw_gate_only
     )
+
+
+def test_a_page_past_the_pool_verifies_as_padding():
+    """A page past the checkpoint pool is padding, exactly like page -1: its
+    checkpoint and convolution history are not read, it records nothing, and
+    every result matches the page -1 run bit for bit."""
+    runs = []
+    for past_pool in (False, True):
+        # _inputs draws its pages from the global generator.
+        torch.manual_seed(223)
+        x = _inputs(5, 4, seed=223)
+        if past_pool:
+            x["state_indices"][2] = x["state_pool"].shape[0]
+        state, history = x["state_pool"].clone(), x["conv_states"].clone()
+        runs.append(_fused(x, 4))
+        assert torch.equal(x["state_pool"], state)
+        assert torch.equal(x["conv_states"], history)
+    (out, buffers), (past_out, past_buffers) = runs
+    assert torch.equal(past_out, out)
+    for past, padded in zip(past_buffers, buffers, strict=True):
+        assert torch.equal(past, padded)

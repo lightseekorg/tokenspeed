@@ -40,7 +40,7 @@ def test_retained_t1_strided_pool_matches_reference(batch, cross_page):
     output = verify(case)
     torch.testing.assert_close(output[0].float(), expected[0], atol=2e-4, rtol=1e-2)
     accepted = torch.ones(batch, device="cuda", dtype=torch.int32)
-    commit(case, accepted)
+    commit(case, accepted, ended_slots=())
     check_prefix(case, accepted, expected)
     live = set(case["records"].history.live_state_indices.tolist()) - {0}
     for page in range(case["state"].shape[0]):
@@ -60,7 +60,8 @@ def test_retained_verify_graph_refreshes_input_and_lengths():
     with torch.cuda.graph(graph):
         output = verify(case)
     case["raw"].mul_(0.5)
-    case["records"].history.length[1:5] = 1
+    # Every request slot's accepted count changes between capture and replay.
+    case["records"].history.length.fill_(1)
     expected = reference(case)
     graph.replay()
     torch.testing.assert_close(output[0].float(), expected[0], atol=2e-4, rtol=1e-2)

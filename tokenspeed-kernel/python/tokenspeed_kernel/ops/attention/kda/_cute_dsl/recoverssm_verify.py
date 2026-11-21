@@ -89,10 +89,10 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
 )
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     fake_retained_arguments,
-    initialize_tile,
+    initialize_page_tile,
     retained_arguments,
     retained_length,
-    retained_page,
+    retained_row,
 )
 from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
@@ -507,8 +507,18 @@ class RecoverSsmVerify:
         page = Int64(_load(state_indices, request))
         value_start = value_tile * VT
 
-        if (page <= 0) | (retained_page(retained, request) <= 0) | (valid_tokens <= 0):
-            # Padding requests: zero outputs for their tokens, no records.
+        live_page, slot = retained_row(retained, request)
+        if (
+            (page <= 0)
+            | (page >= retained[0].shape[0])
+            | (live_page <= 0)
+            | (live_page >= retained[0].shape[0])
+            | (slot < 0)
+            | (slot >= retained[1].shape[0])
+            | (valid_tokens <= 0)
+        ):
+            # Padding requests (a nonpositive page or one past the checkpoint
+            # pool): zero outputs for their tokens, no records.
             if tidx < VT:
                 for t in cutlass.range_constexpr(W):
                     row = out + (
@@ -545,17 +555,26 @@ class RecoverSsmVerify:
                 warp,
                 lane,
             )
-            initialize_tile(
-                shared.tile, retained, request, head, value_start, VT, K, tidx, THREADS
+            initialize_page_tile(
+                shared.tile,
+                retained,
+                live_page,
+                slot,
+                head,
+                value_start,
+                VT,
+                K,
+                tidx,
+                THREADS,
             )
             if tidx == 0:
                 cute.arch.mbarrier_arrive(shared.state_barrier)
 
-            slot = Int64(request)
+            stamp_slot = Int64(request)
             generation = Int64(0)
             start = Int64(0)
             if const_expr(self.has_metadata):
-                slot = Int64(_load(metadata, request * 3))
+                stamp_slot = Int64(_load(metadata, request * 3))
                 generation = Int64(_load(metadata, request * 3 + 1))
                 start = Int64(_load(metadata, request * 3 + 2))
             # Reduce the 64-bit start before narrowing so ring positions stay exact.
@@ -575,7 +594,10 @@ class RecoverSsmVerify:
                 if (value_tile == 0) & (head == 0) & (tidx < W) & (tidx < valid_tokens):
                     stamp = cute.make_tensor(
                         stamps
-                        + (slot * ring_capacity + (ring_start + tidx) % ring_capacity)
+                        + (
+                            stamp_slot * ring_capacity
+                            + (ring_start + tidx) % ring_capacity
+                        )
                         * 2,
                         cute.make_layout((2,)),
                     )
@@ -591,9 +613,9 @@ class RecoverSsmVerify:
                 gate_scale,
                 lower_bound,
                 retained,
-                retained_page(retained, request),
+                slot,
                 head,
-                retained_length(retained, retained_page(retained, request)),
+                retained_length(retained, slot),
                 Int32(value_tile == 0),
                 valid_tokens,
                 ring_start,
@@ -609,16 +631,14 @@ class RecoverSsmVerify:
                     + tidx
                 )
                 correction_row = correction + (
-                    retained_page(retained, request) * correction_slot_stride
+                    slot * correction_slot_stride
                     + head * correction_head_stride
                     + value_start
                     + tidx
                 )
                 for t in cutlass.range_constexpr(W):
                     live = Int32(t < valid_tokens)
-                    position = (
-                        retained_length(retained, retained_page(retained, request)) + t
-                    )
+                    position = retained_length(retained, slot) + t
                     _store_if(
                         live, (out_row + t * out_token_stride).toint(), outputs[t], True
                     )
@@ -642,7 +662,7 @@ class RecoverSsmVerify:
         gate_scale: Float32,
         lower_bound: Float32,
         retained: tuple,
-        record_page: Int64,
+        record_slot: Int64,
         record_head: Int32,
         record_start: Int32,
         records_keys: Int32,
@@ -701,7 +721,7 @@ class RecoverSsmVerify:
                     (retained[3], _exp(steps[t])),
                 ):
                     offset = (
-                        record_page * field.stride[0]
+                        record_slot * field.stride[0]
                         + Int64(record_head) * field.stride[1]
                         + position * field.stride[2]
                         + Int64(tidx) * field.stride[3]
@@ -1145,6 +1165,7 @@ def _compile(
     capacity: int,
     state_dtype: torch.dtype,
     live_dtype: torch.dtype,
+    slot_dtype: torch.dtype,
     bounded_gate: bool,
     factored: bool,
     has_metadata: bool,
@@ -1189,9 +1210,9 @@ def _compile(
         state,
         correction,
         normalized_key,
-        slots=slots,
         batch=batch,
         live_dtype=_DTYPES[live_dtype],
+        slot_dtype=_DTYPES[slot_dtype],
     )
     kernel = RecoverSsmVerify(
         key_dim,
@@ -1364,6 +1385,7 @@ def recoverssm_verify(
         correction_cache.shape[2],
         checkpoint_state.dtype,
         retained_history.live_state_indices.dtype,
+        retained_history.record_slots.dtype,
         bounded,
         bounded and spec_query_len * abs(lower_bound) <= FACTORED_DECAY,
         record_metadata is not None,
@@ -1376,7 +1398,12 @@ def recoverssm_verify(
     consolidate_history(
         checkpoint_state, retained_history, state_indices, query_start_loc
     )
-    reset_retained_history(retained_history, state_indices, query_start_loc)
+    reset_retained_history(
+        retained_history,
+        state_indices,
+        query_start_loc,
+        page_count=checkpoint_state.shape[0],
+    )
     kernel(
         q[0],
         k[0],

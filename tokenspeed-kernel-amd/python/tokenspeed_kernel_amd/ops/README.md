@@ -1907,14 +1907,14 @@ prepare kernel with `max-ilp`.
 
 ### KDA retained history (gfx950 / gfx1250)
 
-The direct retained verify and commit APIs use a page-owned history with FP32
-correction U, normalized K, multiplicative decay, and an INT32 accepted length
-L. Each page represents its V-major FP32 or BF16 dense base followed by L accepted
-updates. Reconstruction accumulates in FP32. Materialization rounds only when
-writing the dense base; accepted U, normalized K and decay remain FP32.
-The caller provides all storage, including a private live page for each active
-request. Shared source pages are immutable; a live page must not alias another
-active request's source or live page.
+Each physical page holds only a V-major FP32 or BF16 dense base. Each resident
+request slot holds FP32 correction U, normalized K and multiplicative decay,
+plus an INT32 accepted length L: the records accepted since the dense base of
+the request's page. Verify uses the row's physical page indices for dense
+state, and its record slot for L, all L accepted updates and new candidates.
+Reconstruction accumulates in FP32 and rounds when writing the dense base.
+Shared source pages are immutable dense checkpoints. Each active request has a
+private live page.
 
 Standard target decode is a one-token verify window. Verify retains the Gluon
 fused convolution and LDS vectors. gfx950 batches gate projection and Q/K
@@ -1927,9 +1927,10 @@ architectures use supplied raw gate inputs directly.
 
 Before verify, a source-to-live transition or L + T greater than capacity C
 consolidates the accepted endpoint into the live dense base. T is the actual
-packed request length. A separate, ordered kernel resets the live length after
-all state tiles finish. L + T equal to C still fits. Empty requests and padding
-pages leave page storage unchanged.
+packed request length. A separate, ordered kernel resets the slot's length
+after all state tiles finish; it skips rows whose page lies at or below 0 or
+at or past the pool's page count. L + T equal to C still fits. Empty requests
+and padding pages leave page storage and lengths unchanged.
 
 Verify reconstructs the accepted endpoint from the live base and history, then
 writes candidate U, K and decay at L + token offset. It preserves L and the
@@ -1940,7 +1941,7 @@ by one-token and speculative windows. The registered activation dtype is BF16.
 
 Retained commit clamps the accepted count to the actual window and configured
 bound, updates convolution from the caller's original QKV, then publishes the
-new length. It does not replay dense state or copy retained records. Zero
+slot's new length. It does not replay dense state or copy retained records. Zero
 acceptance still copies source convolution history to a distinct live page.
 Invalid accepted stamps prevent both convolution writes and length publication.
 Stamps validate the current candidate window; accepted history is independent
@@ -1948,15 +1949,21 @@ of stamp-ring reuse.
 
 The public adapter accepts `KdaRetainedRecords`, including its
 `KdaRetainedHistory`; the AMD package receives the tensors explicitly and has
-no dependency on `tokenspeed-kernel`. Batched commit uses a
-nine-column descriptor for QKV, convolution and length pointers, page count,
-and per-layer element strides. One launch updates all layers' convolution;
-the next publishes lengths. Public verify requires retained records;
-unsupported configurations fail instead of selecting another checkpoint format.
+no dependency on `tokenspeed-kernel`. Batched commit uses a 14-column
+descriptor: QKV, convolution and length pointers, the page count, per-layer
+element strides, then the v-major recurrent-state pointer and its strides.
+Record slots select the lengths. One launch updates all layers' convolution;
+the next publishes lengths. A request whose slot is set in `request_stopped`
+ended in this forward: the convolution launch also folds its records into
+its live page, each program taking some heads, and the length launch clears
+its length. Public verify requires retained records; unsupported
+configurations fail instead of selecting another checkpoint format.
 
 Prefill materializes source history into its existing gathered dense input,
-then clears live lengths after storing the final dense state. These utilities
-use wave64 on gfx950 and wave32 on gfx1250 and preserve source page storage.
+then clears the rows' slot lengths. These utilities use wave64 on gfx950 and
+wave32 on gfx1250. Before a retraction stores its image, the victim's accepted
+records are materialized directly into its physical page before its slot's
+length is reset.
 
 
 ## Transform

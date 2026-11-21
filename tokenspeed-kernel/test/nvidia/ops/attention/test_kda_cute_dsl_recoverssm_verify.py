@@ -165,6 +165,7 @@ def _inputs(
         spec_query_len=width,
         lower_bound=lower_bound,
         record_metadata=metadata.to(device).contiguous(),
+        record_slots=record_slots.to(device, index_dtype),
         capacity=capacity,
         slots=slots,
         serving_records=serving_records,
@@ -182,7 +183,6 @@ def _repitch(x, extra):
 def _destinations(inputs):
     _, tokens, heads, key_dim = inputs["q"].shape
     value_dim = inputs["v"].shape[-1]
-    pages = inputs["checkpoint_state"].shape[0]
     cap, slots = inputs["capacity"], inputs["slots"]
     out_rows = torch.full(
         (1, tokens + OUT_GUARD_ROWS, heads, value_dim),
@@ -191,12 +191,12 @@ def _destinations(inputs):
         dtype=torch.bfloat16,
     )
     correction_rows = torch.full(
-        (pages * cap, heads * value_dim + CORRECTION_ROW_PAD),
+        (slots * cap, heads * value_dim + CORRECTION_ROW_PAD),
         CORRECTION_FILL,
         device="cuda",
     )
     key_gate_rows = torch.full(
-        (pages * cap, heads * key_dim + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
+        (slots * cap, heads * key_dim + KEY_GATE_ROW_PAD), KEY_GATE_FILL, device="cuda"
     )
     decay_rows = torch.full_like(key_gate_rows, KEY_GATE_FILL)
     stamp_pool = torch.full(
@@ -209,15 +209,15 @@ def _destinations(inputs):
         key_gate_rows=key_gate_rows,
         decay_rows=decay_rows,
         correction_cache=correction_rows[:, : heads * value_dim]
-        .view(pages, cap, heads, value_dim)
+        .view(slots, cap, heads, value_dim)
         .transpose(1, 2),
         kg_cache=key_gate_rows[:, : heads * key_dim]
-        .view(pages, cap, heads, key_dim)
+        .view(slots, cap, heads, key_dim)
         .transpose(1, 2),
         decay_cache=decay_rows[:, : heads * key_dim]
-        .view(pages, cap, heads, key_dim)
+        .view(slots, cap, heads, key_dim)
         .transpose(1, 2),
-        length=torch.zeros(pages, 1, device="cuda", dtype=torch.int32),
+        length=torch.zeros(slots, 1, device="cuda", dtype=torch.int32),
         stamp_pool=stamp_pool,
         record_stamps=stamp_pool[1, :slots],
     )
@@ -242,6 +242,7 @@ def _run(verify, inputs, with_stamps=True, dest=None, **overrides):
             result["decay_cache"],
             result["length"],
             args["state_indices"],
+            args["record_slots"],
         ),
         query_start_loc=args["query_start_loc"],
         state_indices=args["state_indices"],
@@ -271,6 +272,7 @@ def _supported(inputs, result, **overrides):
             result["decay_cache"],
             result["length"],
             args["state_indices"],
+            args["record_slots"],
         ),
         args["query_start_loc"],
         args["state_indices"],
@@ -367,10 +369,10 @@ def _check_records(inputs, cute, triton, ref_corr, with_stamps):
     scale = max([float(c.abs().max()) for c in ref_corr.values()] + [0.0])
     stamp_written = torch.zeros_like(cute["record_stamps"][..., 0], dtype=torch.bool)
     for (b, t), correction in ref_corr.items():
-        page = int(inputs["state_indices"][b])
+        record_slot = int(inputs["record_slots"][b])
         slot, generation, start = meta[b] if with_stamps else (b, 0, 0)
-        written[page, t] = True
-        got = cute["correction_cache"][page, :, t].double()
+        written[record_slot, t] = True
+        got = cute["correction_cache"][record_slot, :, t].double()
         error = float((got - correction).abs().max())
         assert error <= CORRECTION_TOLERANCE * scale + 1e-9, (b, t, error)
         raw_key = inputs["k"][0, starts[b] + t].float()
@@ -378,7 +380,7 @@ def _check_records(inputs, cute, triton, ref_corr, with_stamps):
             raw_key.square().sum(-1, keepdim=True) + 1e-6
         )
         torch.testing.assert_close(
-            cute["kg_cache"][page, :, t], normalized, atol=2e-7, rtol=2e-6
+            cute["kg_cache"][record_slot, :, t], normalized, atol=2e-7, rtol=2e-6
         )
         if with_stamps:
             pos = (start + t) % cap
@@ -795,3 +797,33 @@ def test_recoverssm_verify_selection(
         },
     )
     assert kernel.name == expected
+
+
+@pytest.mark.parametrize(
+    "verify",
+    [cute_dsl_kda_recoverssm_verify, vllm_triton_kda_recoverssm_verify],
+    ids=["cute_dsl", "triton"],
+)
+def test_a_page_past_the_pool_verifies_as_padding(verify) -> None:
+    """A page past the checkpoint pool is padding, exactly like page -1: zero
+    outputs, no records, and every other request's results bit for bit."""
+    inputs = _inputs(batch=6, width=4, lower_bound=-5.0, seed=29)
+    pages = inputs["checkpoint_state"].shape[0]
+    padded = _run(verify, inputs)
+    past = _run(
+        verify,
+        inputs,
+        state_indices=torch.where(
+            inputs["state_indices"] == -1, pages, inputs["state_indices"]
+        ),
+    )
+    torch.cuda.synchronize()
+    for name in (
+        "out_rows",
+        "correction_rows",
+        "key_gate_rows",
+        "decay_rows",
+        "length",
+        "stamp_pool",
+    ):
+        assert torch.equal(past[name], padded[name]), name

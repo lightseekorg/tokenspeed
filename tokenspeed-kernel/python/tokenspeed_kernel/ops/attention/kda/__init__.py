@@ -164,14 +164,17 @@ def apply_kda_output_norm(
 
 @dataclass(frozen=True)
 class KdaRetainedHistory:
-    """Page-owned accepted history and private verify destinations.
+    """Per-request verify records and accepted lengths, outside the cache pages.
 
-    correction is FP32 [page, head, capacity, value]. key and decay are
-    FP32 [page, head, capacity, key], holding normalized K and multiplicative
-    decay. length is INT32 [page, 1] and publishes only accepted records.
-    live_state_indices maps request rows to unique private pages. Live pages
-    cannot alias another active row's source; immutable sources may be shared.
-    All fields may be strided arena views.
+    correction is FP32 [slot, head, capacity, value]. key and decay are
+    FP32 [slot, head, capacity, key] and hold normalized K and multiplicative
+    decay. length is INT32 [slot, 1] and counts the records a slot has
+    accepted since the dense base of its request's page. record_slots maps
+    each request row to its resident record slot; slot zero is valid.
+    live_state_indices maps each request row to its private physical page.
+    Cache pages hold only dense checkpoints: the owner folds a slot's
+    accepted records into its page before another reader sees that page.
+    The index vectors and storage tensors may be strided views.
 
     Construction validates storage metadata, which must stay fixed for the
     object's lifetime. Tensor contents may be refreshed in place.
@@ -182,34 +185,39 @@ class KdaRetainedHistory:
     decay: torch.Tensor
     length: torch.Tensor
     live_state_indices: torch.Tensor
+    record_slots: torch.Tensor
 
     def __post_init__(self) -> None:
         if self.correction.ndim != 4:
             raise ValueError(
-                "retained correction must be [page, head, capacity, value]"
+                "retained correction must be [slot, head, capacity, value]"
             )
-        pages, heads, capacity, _ = self.correction.shape
+        slots, heads, capacity, _ = self.correction.shape
         if (
             capacity <= 0
             or self.key.ndim != 4
-            or self.key.shape[:3] != (pages, heads, capacity)
+            or self.key.shape[:3] != (slots, heads, capacity)
             or self.decay.shape != self.key.shape
         ):
-            raise ValueError("retained records must share page/head/capacity geometry")
+            raise ValueError("retained records must share slot/head/capacity geometry")
         if any(
             x.dtype != torch.float32 for x in (self.correction, self.key, self.decay)
         ):
             raise ValueError("retained correction, key, and decay must be FP32")
-        if self.length.shape != (pages, 1) or self.length.dtype != torch.int32:
-            raise ValueError("retained length must be INT32 [page, 1]")
-        if self.live_state_indices.ndim != 1 or self.live_state_indices.dtype not in (
-            torch.int32,
-            torch.int64,
+        if self.length.shape != (slots, 1) or self.length.dtype != torch.int32:
+            raise ValueError("retained length must be INT32 [slot, 1]")
+        indices = (self.live_state_indices, self.record_slots)
+        if (
+            self.live_state_indices.ndim != 1
+            or self.record_slots.shape != self.live_state_indices.shape
+            or any(x.dtype not in (torch.int32, torch.int64) for x in indices)
         ):
-            raise ValueError("retained live indices must be an integer vector")
+            raise ValueError(
+                "retained live indices and record slots must be matching integer vectors"
+            )
         if any(
             x.device != self.correction.device
-            for x in (self.key, self.decay, self.length, self.live_state_indices)
+            for x in (self.key, self.decay, self.length, *indices)
         ):
             raise ValueError("retained history fields must be on the same device")
 
@@ -218,12 +226,12 @@ class KdaRetainedHistory:
         """Return the common FP32 row width if every head can use a 16-byte bulk copy."""
         width = self.correction.shape[-1]
         for field in (self.correction, self.key, self.decay):
-            page_stride, head_stride, record_stride, channel_stride = field.stride()
+            slot_stride, head_stride, record_stride, channel_stride = field.stride()
             if (
                 field.shape[-1] != width
                 or record_stride != width
                 or channel_stride != 1
-                or page_stride % 4
+                or slot_stride % 4
                 or head_stride % 4
                 or field.data_ptr() % 16
             ):
@@ -231,26 +239,32 @@ class KdaRetainedHistory:
         return width
 
 
-# Retained commit descriptor ABI: UINT64 [layers, 9].
-# Each layer's row contains 3 pointers, 1 page count, and 5 strides:
+# Retained commit descriptor ABI: UINT64 [layers, 14].
+# Each layer's row contains 4 pointers, 1 page count, and 9 strides:
 #   0: original QKV pointer
 #   1: convolution state pointer
-#   2: retained length pointer
-#   3: page count
+#   2: retained length pointer, one INT32 per request slot
+#   3: page count (the convolution and recurrent pools hold the same pages)
 #   4: QKV row stride
 #   5: convolution page stride
-#   6: retained length page stride
+#   6: retained length slot stride
 #   7: convolution channel stride
 #   8: convolution tap stride
+#   9: v-major recurrent state pointer
+#  10: recurrent page stride
+#  11: recurrent head stride
+#  12: recurrent value stride
+#  13: recurrent key stride
 # All strides count elements. Per-layer values support different arena layouts.
-# Verify already stores U/K/decay records, so commit needs no pointers to them.
-# Commit updates convolution state, then publishes the accepted history length.
-KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 9
+# Verify already stores U/K/decay records; commit reads them only to fold an
+# ended request's accepted records into its live page. Commit updates the
+# convolution state, then publishes the accepted history length.
+KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 14
 
 
 @dataclass(frozen=True)
 class KdaRetainedRecords:
-    """Page-owned history plus packed current-round QKV and validity metadata.
+    """Request-owned records and lengths, packed QKV and validity metadata.
 
     history owns FP32 U/K/decay and accepted lengths. original_qkv optionally
     receives pre-convolution inputs. metadata is INT64 [batch, 3] containing
@@ -420,7 +434,7 @@ def kda_fused_paged_verify(
     """Append candidates to retained history and return packed attention output.
 
     mixed_qkv and convolution inputs describe packed pre-convolution rows.
-    retained_records supplies page-owned history, private live destinations,
+    retained_records supplies request-owned history, private live destinations,
     packed request boundaries and candidate validity stamps. read_indices
     identifies immutable source pages. Verify consolidates accepted history
     when needed; commit subsequently publishes accepted candidate length.
@@ -437,6 +451,8 @@ def kda_fused_paged_verify(
         or draft_token_num <= 0
     ):
         raise ValueError("Unsupported retained KDA verify geometry")
+    if conv_states.shape[0] != state_pool.shape[0]:
+        raise ValueError("KDA convolution and recurrent pools must hold the same pages")
     if retained_records is None:
         raise ValueError("Retained KDA verify requires retained records")
     if draft_token_num > retained_records.history.correction.shape[2]:
@@ -652,9 +668,9 @@ def kda_materialize_retained_state(
 ) -> None:
     """Apply accepted history to gathered dense state in place.
 
-    recurrent is the existing [request, head, V, K] gather output (or K,V
-    for k_major). source_indices selects positive source pages; null rows
-    remain unchanged. Source pages and history storage are never modified.
+    recurrent is the [request, head, V, K] gather output (K,V for k_major).
+    source_indices holds each row's source page, and history.record_slots its
+    records and accepted length. Rows with nonpositive source pages are skipped.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import materialize
 
@@ -663,20 +679,59 @@ def kda_materialize_retained_state(
         history=history,
         source_indices=source_indices,
         recurrent_layout=recurrent_layout,
+        paged=False,
+    )
+
+
+def kda_materialize_retained_pages(
+    recurrent_pool: torch.Tensor,
+    *,
+    history: KdaRetainedHistory,
+    source_indices: torch.Tensor,
+    recurrent_layout: str,
+) -> None:
+    """Fold each request's accepted records into its private page and clear its length.
+
+    recurrent_pool holds [page, head, V, K] state (K,V for k_major).
+    source_indices lists one physical page per history.record_slots entry.
+    Positive pages and their slots must be unique. Rows with nonpositive pages
+    are skipped and keep their lengths. The slot-length reset follows the
+    dense writes on the current stream.
+    """
+    from tokenspeed_kernel.ops.attention.kda._retained import materialize
+
+    materialize(
+        recurrent_pool,
+        history=history,
+        source_indices=source_indices,
+        recurrent_layout=recurrent_layout,
+        paged=True,
     )
 
 
 def kda_reset_retained_length(
-    length: torch.Tensor, *, write_indices: torch.Tensor
+    length: torch.Tensor,
+    *,
+    write_indices: torch.Tensor,
+    record_slots: torch.Tensor,
+    page_count: int,
 ) -> None:
-    """Reset positive destination pages after the final prefill dense store.
+    """Clear the slot lengths of rows whose page received a dense state.
 
-    length is INT32 [page, 1]; write_indices is an integer request vector.
-    A separate ordered launch ensures all dense tiles finish before publication.
+    length is INT32 [slot, 1]. write_indices holds each request row's
+    destination page and record_slots its slot; page_count is the State pool's
+    page count. Padding rows -- a page at or below 0, or at or past
+    page_count -- keep their lengths, as materialization skips them. A
+    separate ordered launch ensures all dense tiles finish before the reset.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import reset_length
 
-    reset_length(length, write_indices=write_indices)
+    reset_length(
+        length,
+        write_indices=write_indices,
+        record_slots=record_slots,
+        page_count=page_count,
+    )
 
 
 def resolve_kda_batched_retained_commit(
@@ -685,8 +740,12 @@ def resolve_kda_batched_retained_commit(
     """Resolve retained cross-layer convolution and length publication.
 
     Returns a callable or None for unsupported geometry/platform. Its uint64
-    [layers, 9] descriptors hold QKV/conv/length pointers, page count, QKV row,
-    conv page, length page, conv channel and conv tap strides, in elements.
+    [layers, 14] descriptors hold QKV/conv/length pointers, the page count,
+    QKV row, conv page, length slot, conv channel and conv tap strides, then
+    the recurrent state pointer and its page, head, value and key strides, in
+    elements. record_slots selects each request's length. A request whose
+    slot is set in request_stopped ended in this forward: its accepted
+    records are folded into its live page and its length is cleared.
     Metadata and all pointers remain stable during CUDA graph capture.
     """
     platform = current_platform()
@@ -789,6 +848,7 @@ __all__ = [
     "KdaRetainedHistory",
     "KdaRetainedRecords",
     "KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS",
+    "kda_materialize_retained_pages",
     "kda_materialize_retained_state",
     "kda_reset_retained_length",
     "resolve_kda_batched_retained_commit",

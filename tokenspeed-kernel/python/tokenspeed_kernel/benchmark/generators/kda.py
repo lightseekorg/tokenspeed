@@ -671,13 +671,15 @@ def _retained_benchmark_layer(common, window, generator, reads, live, metadata, 
     )
     _fill_state_pages(conv, state, reads.long(), generator=generator)
     capacity = max(16, window)
-    shape = (state.shape[0], profile.heads, capacity, profile.head_dim)
+    shape = (reads.numel(), profile.heads, capacity, profile.head_dim)
     history = kda_ops.KdaRetainedHistory(
         torch.zeros(shape, device="cuda"),
         torch.zeros(shape, device="cuda"),
         torch.zeros(shape, device="cuda"),
-        torch.zeros(state.shape[0], 1, device="cuda", dtype=torch.int32),
+        # One accepted-record count per request slot, beside its records.
+        torch.zeros(reads.numel(), 1, device="cuda", dtype=torch.int32),
         live,
+        metadata[:, 0],
     )
     records = kda_ops.KdaRetainedRecords(
         torch.empty_like(projection.mixed_qkv),
@@ -795,26 +797,22 @@ def prepare_kda_fused_paged_verify(
     initial_conv, initial_state = layer["conv"].clone(), layer["state"].clone()
     history = layer["records"].history
     accepted = slice(0, history_length)
-    live_pages = slice(1, batch + 1)
-    history.length[live_pages].fill_(history_length)
+    history.length.fill_(history_length)
     if history_length:
-        # Only the live pages have an accepted prefix. Reset the candidate
+        # Every request slot has an accepted prefix. Reset the candidate
         # suffix between timings and keep those immutable records in place.
-        history.correction[live_pages, :, accepted].normal_(
-            std=0.02, generator=generator
-        )
-        keys = history.key[live_pages, :, accepted]
+        history.correction[:, :, accepted].normal_(std=0.02, generator=generator)
+        keys = history.key[:, :, accepted]
         keys.normal_(generator=generator)
         keys.copy_(torch.nn.functional.normalize(keys, dim=-1))
-        history.decay[live_pages, :, accepted].uniform_(0.7, 0.95, generator=generator)
+        history.decay[:, :, accepted].uniform_(0.7, 0.95, generator=generator)
 
     def reset():
         layer["conv"].copy_(initial_conv)
         layer["state"].copy_(initial_state)
-        history.length.zero_()
-        history.length[live_pages].fill_(history_length)
+        history.length.fill_(history_length)
         for records in (history.correction, history.key, history.decay):
-            records[live_pages, :, history_length : history_length + window].zero_()
+            records[:, :, history_length : history_length + window].zero_()
         stamps.fill_(-1)
 
     def invoke():
@@ -878,7 +876,7 @@ def prepare_kda_retained_commit(
         )
         _invoke_retained_layer(layer, common, override=None, solution=None)
         conv, history = layer["conv"], layer["records"].history
-        qkv = layer["records"].original_qkv
+        qkv, state = layer["records"].original_qkv, layer["state"]
         descriptors.append(
             [
                 qkv.data_ptr(),
@@ -890,6 +888,8 @@ def prepare_kda_retained_commit(
                 history.length.stride(0),
                 conv.stride(1),
                 conv.stride(2),
+                state.data_ptr(),
+                *state.stride(),
             ]
         )
         layer_inputs.append(layer)
@@ -901,6 +901,14 @@ def prepare_kda_retained_commit(
     read_indices = reads.expand(groups, batch).contiguous()
     write_indices = live.expand(groups, batch).contiguous()
     accepted = torch.full((batch,), take, device="cuda", dtype=torch.int32)
+    # The timed commit is a step in which no request ends, so it reads no
+    # record; the first layer's records stand in for every layer's.
+    first = layer_inputs[0]["records"].history
+    records = [
+        field[:, None].expand(-1, layers, -1, -1, -1)
+        for field in (first.correction, first.key, first.decay)
+    ]
+    request_stopped = torch.zeros(batch, device="cuda", dtype=torch.bool)
 
     def reset():
         for layer, (conv, length) in zip(layer_inputs, before):
@@ -908,7 +916,7 @@ def prepare_kda_retained_commit(
             layer["records"].history.length.copy_(length)
 
     def invoke():
-        # Keep page-owned tensors alive while descriptors contain their addresses.
+        # Keep the layers' tensors alive while descriptors contain their addresses.
         _ = layer_inputs
         return kernel(
             descriptors=descriptors,
@@ -917,8 +925,14 @@ def prepare_kda_retained_commit(
             write_indices=write_indices,
             accepted_length=accepted,
             query_start_loc=layer_inputs[0]["records"].query_start_loc,
+            record_slots=metadata[:, 0],
+            record_slot_count=batch,
             record_metadata=metadata,
             record_stamps=stamps,
+            retained_correction=records[0],
+            retained_key=records[1],
+            retained_decay=records[2],
+            request_stopped=request_stopped,
             draft_token_num=window,
             history_capacity=max(16, window),
             num_heads=profile.heads,
@@ -926,6 +940,7 @@ def prepare_kda_retained_commit(
             conv_width=common["conv_kernel_size"],
             activation_dtype=common["dtype"],
             conv_state_dtype=layer_inputs[0]["conv"].dtype,
+            recurrent_state_dtype=layer_inputs[0]["state"].dtype,
         )
 
     return PreparedBenchmark(

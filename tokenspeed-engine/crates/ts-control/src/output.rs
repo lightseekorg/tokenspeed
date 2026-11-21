@@ -456,13 +456,14 @@ pub enum Role {
     Decode,
 }
 
-fn finish(rid: &str, nan_detected: bool) -> ForwardEvent {
-    // Abort rather than Finish keeps numerically corrupted KV out of the
-    // prefix caches.
-    let kind = if nan_detected {
-        ForwardEventKind::Abort
-    } else {
+fn finish(rid: &str, publishable: bool) -> ForwardEvent {
+    // Abort rather than Finish keeps the request's pages out of the prefix
+    // caches: numerically corrupted KV, or a decode state the device did not
+    // complete (`OutputProcessor::defers_decode_state`).
+    let kind = if publishable {
         ForwardEventKind::Finish
+    } else {
+        ForwardEventKind::Abort
     };
     event(kind, rid, Vec::new(), 0)
 }
@@ -510,6 +511,12 @@ pub struct OutputProcessor {
     /// Tokens a request's buffers hold; committing past it is a bug.
     physical_context_len: Option<i64>,
     role: Role,
+    /// A cache group defers its decode state to a request's end
+    /// (`Scheduler::defers_decode_state`, KDA): the device completes it in
+    /// the forward its stop criteria end. A finish only this side saw (a
+    /// grammar's end under `ignore_eos`, a client abort) ends with an abort,
+    /// which publishes nothing.
+    defers_decode_state: bool,
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
@@ -534,13 +541,15 @@ pub struct OutputProcessor {
 
 impl OutputProcessor {
     /// A processor for `spec_num_tokens`-wide verify (or none), the
-    /// server's `stream_interval` and the engine's `role`, logging the
-    /// finish lines `finish_log` selects.
+    /// server's `stream_interval` and the engine's `role`, whose cache
+    /// `defers_decode_state` or not, logging the finish lines `finish_log`
+    /// selects.
     pub fn new(
         spec_num_tokens: Option<usize>,
         stream_interval: i64,
         physical_context_len: Option<i64>,
         role: Role,
+        defers_decode_state: bool,
         finish_log: FinishLog,
         metrics_enabled: bool,
         trace: Option<Arc<crate::trace::TracePublisher>>,
@@ -552,6 +561,7 @@ impl OutputProcessor {
             stream_interval,
             physical_context_len,
             role,
+            defers_decode_state,
             finish_log,
             last_commit_at: 0.0,
             admissions: 0,
@@ -1690,13 +1700,15 @@ impl OutputProcessor {
                 // owns the pages until it succeeds or fails, and the output
                 // goes out then.
                 if nan_detected {
-                    committed.events.push(finish(rid, true));
+                    committed.events.push(finish(rid, false));
                     self.release(rid, &mut committed);
                 }
                 continue;
             }
+            let publishable =
+                !nan_detected && (!self.defers_decode_state || state.device_stopped());
             if state.to_abort && state.finished() {
-                committed.events.push(finish(rid, nan_detected));
+                committed.events.push(finish(rid, publishable));
                 if state.abort_notify_client {
                     streamed.push(rid);
                 } else {
@@ -1706,7 +1718,7 @@ impl OutputProcessor {
             }
             streamed.push(rid);
             if state.finished() {
-                committed.events.push(finish(rid, nan_detected));
+                committed.events.push(finish(rid, publishable));
             } else if is_decode && state.decode_reserve != Some(output_length as i32) {
                 // The scheduler keeps a request's decode reservation until it
                 // is sent another (a retraction's image carries it too), so
@@ -1919,6 +1931,7 @@ mod tests {
             1,
             Some(4096),
             Role::Plain,
+            false,
             NO_FINISH_LOG,
             true,
             None,
@@ -2083,6 +2096,7 @@ mod tests {
                     1,
                     None,
                     role,
+                    false,
                     FinishLog {
                         enabled,
                         request_stats,
@@ -2124,6 +2138,7 @@ mod tests {
                     1,
                     None,
                     role,
+                    false,
                     FinishLog {
                         enabled: true,
                         request_stats: false,
@@ -2212,6 +2227,7 @@ mod tests {
                     1,
                     None,
                     role,
+                    false,
                     FinishLog {
                         enabled: true,
                         request_stats: false,
@@ -2257,6 +2273,7 @@ mod tests {
                 1,
                 None,
                 Role::Decode,
+                false,
                 FinishLog {
                     enabled: true,
                     request_stats: false,
@@ -2312,6 +2329,7 @@ mod tests {
             1,
             Some(4096),
             Role::Prefill,
+            false,
             NO_FINISH_LOG,
             true,
             None,
@@ -2379,7 +2397,8 @@ mod tests {
             (Role::Decode, false),
             (Role::Prefill, true),
         ] {
-            let mut p = OutputProcessor::new(None, 1, None, role, NO_FINISH_LOG, enabled, None);
+            let mut p =
+                OutputProcessor::new(None, 1, None, role, false, NO_FINISH_LOG, enabled, None);
             register(&mut p, "r", 4, 8, &[]);
             p.states.get_mut("r").unwrap().output_ids.push(10);
             stream_at(&mut p, "r", 100.0).unwrap();
@@ -2396,7 +2415,16 @@ mod tests {
 
     #[test]
     fn decode_bootstrap_clock_starts_when_it_is_emitted_and_abort_keeps_sent_tokens() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "r", 4, 8, &[]);
         p.remote_prefill_done("r", 7, 0, None);
         assert!(p.state("r").unwrap().stream_output_timing.is_none());
@@ -2421,8 +2449,16 @@ mod tests {
     #[test]
     fn committed_streams_collect_e2e_on_normal_and_transfer_failure_ends() {
         for transfer_failed in [false, true] {
-            let mut p =
-                OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+            let mut p = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Decode,
+                false,
+                NO_FINISH_LOG,
+                true,
+                None,
+            );
             register(&mut p, "r", 4, 3, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds() - 1.0;
             p.remote_prefill_done("r", 7, 0, None);
@@ -2473,7 +2509,16 @@ mod tests {
 
     #[test]
     fn completion_samples_preserve_request_counts_zeroes_and_drain_boundaries() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "one", 4, 1, &[]);
         p.remote_prefill_done("one", 7, 0, None);
         assert_eq!(p.finish_remote_prefill_only("one").released, ["one"]);
@@ -2501,7 +2546,16 @@ mod tests {
 
     #[test]
     fn decode_ready_wait_starts_at_kv_landing_and_is_observed_once() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "a", 4, 8, &[]);
         assert!(p.take_decode_ready_at("a").is_none());
         let before = Instant::now();
@@ -2524,7 +2578,16 @@ mod tests {
 
     #[test]
     fn decode_ready_wait_does_not_stamp_without_metrics() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, false, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            false,
+            None,
+        );
         register(&mut p, "a", 4, 8, &[]);
         p.remote_prefill_done("a", 7, 0, None);
         assert!(p.take_decode_ready_at("a").is_none());
@@ -2532,8 +2595,16 @@ mod tests {
 
     #[test]
     fn a_decode_landing_sets_the_first_token_boundary_and_reasoning_usage() {
-        let mut p =
-            OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "a", 4, 8, &[]);
         let grammar = crate::grammar::ReasoningGrammar {
             continues: String::new(),
@@ -2562,6 +2633,7 @@ mod tests {
             1,
             None,
             Role::Decode,
+            false,
             FinishLog {
                 enabled: true,
                 request_stats: true,
@@ -2591,8 +2663,16 @@ mod tests {
 
     #[test]
     fn disabled_metrics_do_not_retain_finished_requests() {
-        let mut p =
-            OutputProcessor::new(None, 1, Some(4096), Role::Plain, NO_FINISH_LOG, false, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            Some(4096),
+            Role::Plain,
+            false,
+            NO_FINISH_LOG,
+            false,
+            None,
+        );
         let mut state = RequestState::new(vec![1], 4, BTreeSet::new(), true, None, false);
         state.created_time = 100.0;
         state.first_token_time = 101.0;
@@ -2951,7 +3031,16 @@ mod tests {
 
     #[test]
     fn the_decode_role_ships_no_prompt_logprobs() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
         p.remote_prefill_done("r", 9, 0, Some(-0.25));
@@ -2971,7 +3060,16 @@ mod tests {
 
     #[test]
     fn a_bootstrap_token_without_a_cumulative_probability_keeps_the_column_aligned() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Decode,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
@@ -3010,7 +3108,16 @@ mod tests {
 
     #[test]
     fn the_prefill_role_ships_its_prompt_logprobs_with_its_final_output() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Prefill,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, true);
         let prompt = batch(&[("r", 3, 0, 3)], 1);
         let plan = p.logprob_plan(&prompt).input.unwrap();
@@ -3028,7 +3135,16 @@ mod tests {
 
     #[test]
     fn a_failed_transfer_ends_a_prefill_that_finished_computing() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            None,
+            1,
+            None,
+            Role::Prefill,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "r", 3, 1, &[]);
         let committed = p
             .commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
@@ -3064,8 +3180,16 @@ mod tests {
     fn a_failed_transfer_preserves_client_and_pause_abort_notifications() {
         for max_new in [1, 4] {
             for notify in [false, true] {
-                let mut p =
-                    OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+                let mut p = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    Role::Prefill,
+                    false,
+                    NO_FINISH_LOG,
+                    true,
+                    None,
+                );
                 register(&mut p, "r", 3, max_new, &[]);
                 p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
                     .unwrap();
@@ -3084,7 +3208,8 @@ mod tests {
 
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
-        let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
+        let mut p =
+            OutputProcessor::new(None, 1, None, Role::Plain, false, NO_FINISH_LOG, true, None);
         register_state(
             &mut p,
             "r".to_owned(),
@@ -3143,6 +3268,7 @@ mod tests {
             1,
             Some(4096),
             Role::Plain,
+            false,
             NO_FINISH_LOG,
             false,
             Some(trace),
@@ -3181,6 +3307,7 @@ mod tests {
             1,
             Some(4096),
             Role::Plain,
+            false,
             NO_FINISH_LOG,
             false,
             Some(trace),
@@ -3202,6 +3329,7 @@ mod tests {
                 1,
                 Some(4096),
                 Role::Decode,
+                false,
                 NO_FINISH_LOG,
                 metrics_enabled,
                 Some(trace),
@@ -3269,6 +3397,7 @@ mod tests {
             1,
             None,
             Role::Decode,
+            false,
             NO_FINISH_LOG,
             false,
             Some(trace),
@@ -3291,6 +3420,7 @@ mod tests {
             1,
             Some(4096),
             Role::Prefill,
+            false,
             NO_FINISH_LOG,
             false,
             Some(trace),
@@ -3542,6 +3672,75 @@ mod tests {
         }
     }
 
+    /// A processor whose cache defers its decode state to a request's end.
+    fn deferring_processor(spec_num_tokens: Option<usize>) -> OutputProcessor {
+        OutputProcessor::new(
+            spec_num_tokens,
+            1,
+            Some(4096),
+            Role::Plain,
+            true,
+            NO_FINISH_LOG,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_finish_the_device_did_not_see_publishes_nothing_when_state_is_deferred() {
+        // A grammar's end with no stop token (as under ignore_eos) and a
+        // client abort end where the device's stop criteria do not, so the
+        // deferred decode state is incomplete: the scheduler gets an abort.
+        // The client still sees the grammar's ordinary finish.
+        let mut p = deferring_processor(Some(3));
+        register(&mut p, "g", 2, 10, &[]);
+        p.attach_grammar("g", grammar());
+        p.commit(&batch(&[("g", 2, 0, 2)], 1), None, &result(&[0], &[1]))
+            .unwrap();
+        let mut verify = result(&[1, 8, 5], &[3]);
+        verify.grammar_terminated_at = Some(vec![1]);
+        let c = p
+            .commit(&batch(&[("g", 3, 0, 2)], 0), None, &verify)
+            .unwrap();
+        assert_eq!(c.outputs[0].finish_reason, Some("stop"));
+        assert_eq!(
+            kinds(&c),
+            [
+                ("g".into(), ForwardEventKind::ExtendResult, vec![1, 8, 5]),
+                ("g".into(), ForwardEventKind::Abort, vec![]),
+            ]
+        );
+
+        register(&mut p, "a", 2, 10, &[]);
+        p.commit(&batch(&[("a", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        p.mark_abort("a", false);
+        let c = p
+            .commit(&batch(&[("a", 1, 0, 2)], 0), None, &result(&[4], &[1]))
+            .unwrap();
+        assert_eq!(c.events[1].kind, ForwardEventKind::Abort);
+    }
+
+    #[test]
+    fn a_finish_the_device_saw_publishes_when_state_is_deferred() {
+        // A stop token and a spent budget end the request on the device too.
+        let mut p = deferring_processor(None);
+        register(&mut p, "s", 2, 10, &[7]);
+        p.commit(&batch(&[("s", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        let c = p
+            .commit(&batch(&[("s", 1, 0, 2)], 0), None, &result(&[7], &[1]))
+            .unwrap();
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+
+        register(&mut p, "l", 2, 1, &[]);
+        let c = p
+            .commit(&batch(&[("l", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        assert_eq!(c.outputs[0].finish_reason, Some("length"));
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+    }
+
     #[test]
     fn decode_rows_step_over_whole_verify_windows() {
         // Two decode rows with a 3-token window: row 0 keeps 2, row 1 keeps 3.
@@ -3567,8 +3766,16 @@ mod tests {
     fn a_verify_step_past_the_physical_extent_is_an_engine_error() {
         // A 4-token verify window over buffers holding 8 tokens: a request
         // at 4 committed tokens fits one more window exactly, not two.
-        let mut p =
-            OutputProcessor::new(Some(4), 1, Some(8), Role::Plain, NO_FINISH_LOG, true, None);
+        let mut p = OutputProcessor::new(
+            Some(4),
+            1,
+            Some(8),
+            Role::Plain,
+            false,
+            NO_FINISH_LOG,
+            true,
+            None,
+        );
         register(&mut p, "r", 3, 100, &[]);
         p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[1], &[1]))
             .unwrap();

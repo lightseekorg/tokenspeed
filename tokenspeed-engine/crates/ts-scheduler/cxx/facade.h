@@ -100,6 +100,7 @@ rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& 
 rust::Slice<const std::uint8_t> kv_event_media(const tokenspeed::KvEventBatch& batch);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
+bool defers_decode_state(const tokenspeed::Scheduler& scheduler);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler);

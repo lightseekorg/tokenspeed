@@ -367,10 +367,12 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
             expected_length = (
                 window if mode == "kda_retained_commit" else history_length
             )
-            live = history.live_state_indices.long()
-            assert history.length[live, 0].tolist() == [expected_length]
+            slots = history.record_slots.long()
+            assert history.length[slots, 0].tolist() == [expected_length]
             if history_length:
-                assert torch.count_nonzero(history.correction[live, :, :history_length])
+                assert torch.count_nonzero(
+                    history.correction[history.record_slots.long(), :, :history_length]
+                )
         if snapshots is None:
             snapshots = [value.clone() for value in current]
         else:

@@ -22,6 +22,10 @@
 
 from tokenspeed_kernel._triton import tl, triton
 
+# Row width of the retained commit descriptor ABI
+# (KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS).
+_DESCRIPTOR_COLUMNS = tl.constexpr(14)
+
 
 @triton.jit(
     do_not_specialize=[
@@ -31,6 +35,8 @@ from tokenspeed_kernel._triton import tl, triton
         "d_strides",
         "length_stride",
         "source_stride",
+        "slot_stride",
+        "slots",
         "pages",
     ]
 )
@@ -41,13 +47,17 @@ def retained_materialize_kernel(
     decay,
     length,
     sources,
+    record_slots,
     state_strides,
     u_strides,
     k_strides,
     d_strides,
     length_stride,
     source_stride,
+    slot_stride,
     pages,
+    slots,
+    PAGED: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     CAPACITY: tl.constexpr,
@@ -56,15 +66,20 @@ def retained_materialize_kernel(
 ):
     row, head = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     source = tl.load(sources + row * source_stride).to(tl.int64)
-    valid = (source > 0) & (source < pages)
-    count = tl.load(length + source * length_stride, mask=valid, other=0)
-    valid = valid & (count >= 0) & (count <= CAPACITY)
+    slot = tl.load(record_slots + row * slot_stride).to(tl.int64)
+    valid = (source > 0) & (slot >= 0) & (slot < slots)
+    if PAGED:
+        valid = valid & (source < pages)
+    count = tl.load(length + slot * length_stride, mask=valid, other=0)
+    if count <= 0 or count > CAPACITY:
+        return
+    state_row = source if PAGED else row
     offsets = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
     v, k = (offsets // K).to(tl.int64), (offsets % K).to(tl.int64)
     if V_MAJOR:
         ptr = (
             state
-            + row * state_strides[0]
+            + state_row * state_strides[0]
             + head * state_strides[1]
             + v * state_strides[2]
             + k * state_strides[3]
@@ -72,17 +87,17 @@ def retained_materialize_kernel(
     else:
         ptr = (
             state
-            + row * state_strides[0]
+            + state_row * state_strides[0]
             + head * state_strides[1]
             + k * state_strides[2]
             + v * state_strides[3]
         )
-    mask = valid & (v < V)
+    mask = v < V
     value = tl.load(ptr, mask=mask, other=0).to(tl.float32)
-    for token in range(tl.where(valid, count, 0)):
+    for token in range(count):
         uv = tl.load(
             u
-            + source * u_strides[0]
+            + slot * u_strides[0]
             + head * u_strides[1]
             + token * u_strides[2]
             + v * u_strides[3],
@@ -91,7 +106,7 @@ def retained_materialize_kernel(
         )
         kv = tl.load(
             key
-            + source * k_strides[0]
+            + slot * k_strides[0]
             + head * k_strides[1]
             + token * k_strides[2]
             + k * k_strides[3],
@@ -100,7 +115,7 @@ def retained_materialize_kernel(
         )
         dv = tl.load(
             decay
-            + source * d_strides[0]
+            + slot * d_strides[0]
             + head * d_strides[1]
             + token * d_strides[2]
             + k * d_strides[3],
@@ -111,16 +126,42 @@ def retained_materialize_kernel(
     tl.store(ptr, value, mask=mask)
 
 
-@triton.jit(do_not_specialize=["rows", "pages", "length_stride", "index_stride"])
+@triton.jit(
+    do_not_specialize=[
+        "rows",
+        "length_stride",
+        "index_stride",
+        "slot_stride",
+        "slot_count",
+        "pages",
+    ]
+)
 def retained_reset_length_kernel(
-    length, indices, rows, pages, length_stride, index_stride, BLOCK: tl.constexpr
+    length,
+    indices,
+    record_slots,
+    slot_stride,
+    slot_count,
+    pages,
+    rows,
+    length_stride,
+    index_stride,
+    BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     page = tl.load(indices + row * index_stride, mask=row < rows, other=0).to(tl.int64)
+    slot = tl.load(record_slots + row * slot_stride, mask=row < rows, other=-1).to(
+        tl.int64
+    )
+    # Padding rows carry a page at or below 0, or one past the pool, as the
+    # materialize kernel reads them; their slots may belong to others.
+    valid = (
+        (row < rows) & (page > 0) & (page < pages) & (slot >= 0) & (slot < slot_count)
+    )
     tl.store(
-        length + page * length_stride,
+        length + slot * length_stride,
         0,
-        mask=(row < rows) & (page > 0) & (page < pages),
+        mask=valid,
     )
 
 
@@ -132,6 +173,7 @@ def retained_batched_accept(
     writes,
     accepted,
     starts,
+    record_slots,
     metadata,
     stamps,
     layer,
@@ -141,6 +183,8 @@ def retained_batched_accept(
     write_strides,
     accepted_stride,
     query_stride,
+    record_slot_stride,
+    record_slot_count,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
@@ -155,17 +199,21 @@ def retained_batched_accept(
     target = tl.load(
         writes + group * write_strides[0] + row * write_strides[1], mask=valid, other=0
     ).to(tl.int64)
-    pages = tl.load(descriptors + layer * 9 + 3).to(tl.int64)
-    length = tl.load(descriptors + layer * 9 + 2).to(tl.pointer_type(tl.int32))
-    length_stride = tl.load(descriptors + layer * 9 + 6).to(tl.int64)
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
+    pages = tl.load(base + 3).to(tl.int64)
+    length = tl.load(base + 2).to(tl.pointer_type(tl.int32))
+    length_stride = tl.load(base + 6).to(tl.int64)
     begin = tl.load(starts + row * query_stride).to(tl.int64)
     count = tl.load(starts + (row + 1) * query_stride).to(tl.int64) - begin
+    record_slot = tl.load(record_slots + row * record_slot_stride).to(tl.int64)
     valid = (
         valid
         & (source > 0)
         & (source < pages)
         & (target > 0)
         & (target < pages)
+        & (record_slot >= 0)
+        & (record_slot < record_slot_count)
         & (begin >= 0)
         & (count > 0)
         & (count <= WINDOW)
@@ -174,20 +222,26 @@ def retained_batched_accept(
         tl.maximum(tl.load(accepted + row * accepted_stride), 0),
         tl.minimum(count, WINDOW),
     )
-    old = tl.load(length + target * length_stride, mask=valid, other=0)
+    # The request's accepted count lives in its slot, not in the cache page.
+    length = length + record_slot * length_stride
+    old = tl.load(length, mask=valid, other=0)
     valid = valid & (old >= 0) & (old + take <= CAPACITY)
-    slot = tl.load(metadata + row * 3).to(tl.int64)
+    stamp_slot = tl.load(metadata + row * 3).to(tl.int64)
     generation = tl.load(metadata + row * 3 + 1)
     absolute = tl.load(metadata + row * 3 + 2)
     valid = (
-        valid & (slot >= 0) & (slot < stamp_slots) & (generation >= 0) & (absolute >= 0)
+        valid
+        & (stamp_slot >= 0)
+        & (stamp_slot < stamp_slots)
+        & (generation >= 0)
+        & (absolute >= 0)
     )
     offsets = tl.arange(0, triton.next_power_of_2(WINDOW))
     positions = absolute + offsets
     ptr = (
         stamps
         + layer * stamp_strides[0]
-        + slot * stamp_strides[1]
+        + stamp_slot * stamp_strides[1]
         + (positions % stamp_capacity) * stamp_strides[2]
     )
     mask = valid & (offsets < take)
@@ -202,20 +256,97 @@ def retained_batched_accept(
         )
         == 0
     )
-    return source, target, begin, take, old, valid & fresh, length, length_stride
+    return source, target, begin, take, old, valid & fresh, length, record_slot
+
+
+@triton.jit
+def retained_fold_ended_request(
+    descriptors,
+    correction,
+    retained_key,
+    retained_decay,
+    layer,
+    target,
+    record_slot,
+    count,
+    correction_strides,
+    key_strides,
+    decay_strides,
+    STATE: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fold a slot's first ``count`` records into its live page's dense state.
+
+    The heads are split across axis 2 of the launch grid; each program
+    applies the records to its heads' ``[value, key]`` planes in order.
+    """
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
+    state = tl.load(base + 9).to(tl.pointer_type(STATE))
+    page_stride = tl.load(base + 10).to(tl.int64)
+    head_stride = tl.load(base + 11).to(tl.int64)
+    value_stride = tl.load(base + 12).to(tl.int64)
+    key_stride = tl.load(base + 13).to(tl.int64)
+    u = correction + record_slot * correction_strides[0] + layer * correction_strides[1]
+    k = retained_key + record_slot * key_strides[0] + layer * key_strides[1]
+    d = retained_decay + record_slot * decay_strides[0] + layer * decay_strides[1]
+    page = state + target * page_stride
+    lanes = tl.arange(0, BLOCK)
+    for head in range(tl.program_id(2), HEADS, tl.num_programs(2)):
+        for start in range(0, DIM * DIM, BLOCK):
+            offsets = start + lanes
+            v, c = (offsets // DIM).to(tl.int64), (offsets % DIM).to(tl.int64)
+            mask = v < DIM
+            ptr = page + head * head_stride + v * value_stride + c * key_stride
+            value = tl.load(ptr, mask=mask, other=0).to(tl.float32)
+            for token in range(count):
+                uv = tl.load(
+                    u
+                    + head * correction_strides[2]
+                    + token * correction_strides[3]
+                    + v * correction_strides[4],
+                    mask=mask,
+                    other=0,
+                )
+                kv = tl.load(
+                    k
+                    + head * key_strides[2]
+                    + token * key_strides[3]
+                    + c * key_strides[4],
+                    mask=mask,
+                    other=0,
+                )
+                dv = tl.load(
+                    d
+                    + head * decay_strides[2]
+                    + token * decay_strides[3]
+                    + c * decay_strides[4],
+                    mask=mask,
+                    other=0,
+                )
+                value = value * dv + uv * kv
+            tl.store(ptr, value, mask=mask)
+
+
+_BATCHED_RUNTIME_ARGUMENTS = [
+    "group_count",
+    "read_strides",
+    "write_strides",
+    "accepted_stride",
+    "query_stride",
+    "record_slot_stride",
+    "record_slot_count",
+    "stamp_strides",
+    "stamp_slots",
+    "stamp_capacity",
+    "stopped_count",
+]
 
 
 @triton.jit(
-    do_not_specialize=[
-        "group_count",
-        "read_strides",
-        "write_strides",
-        "accepted_stride",
-        "query_stride",
-        "stamp_strides",
-        "stamp_slots",
-        "stamp_capacity",
-    ]
+    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS
+    + ["correction_strides", "key_strides", "decay_strides"]
 )
 def retained_batched_conv_kernel(
     descriptors,
@@ -224,25 +355,39 @@ def retained_batched_conv_kernel(
     writes,
     accepted,
     starts,
+    record_slots,
     metadata,
     stamps,
+    request_stopped,
     group_count,
     read_strides,
     write_strides,
     accepted_stride,
     query_stride,
+    record_slot_stride,
+    record_slot_count,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
+    stopped_count,
+    correction,
+    retained_key,
+    retained_decay,
+    correction_strides,
+    key_strides,
+    decay_strides,
     CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
     CHANNELS: tl.constexpr,
     ACTIVATION: tl.constexpr,
     CONV: tl.constexpr,
+    STATE: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     layer, row = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
-    source, target, begin, take, old, valid, length, length_stride = (
+    source, target, begin, take, old, valid, length, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -250,6 +395,7 @@ def retained_batched_conv_kernel(
             writes,
             accepted,
             starts,
+            record_slots,
             metadata,
             stamps,
             layer,
@@ -259,6 +405,8 @@ def retained_batched_conv_kernel(
             write_strides,
             accepted_stride,
             query_stride,
+            record_slot_stride,
+            record_slot_count,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
@@ -268,7 +416,7 @@ def retained_batched_conv_kernel(
     )
     if not valid:
         return
-    base = descriptors + layer * 9
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
     original = tl.load(base).to(tl.pointer_type(ACTIVATION))
     conv = tl.load(base + 1).to(tl.pointer_type(CONV))
     qkv_stride = tl.load(base + 4).to(tl.int64)
@@ -294,20 +442,33 @@ def retained_batched_conv_kernel(
     tl.store(ptr, h0, mask=mask)
     tl.store(ptr + tap_stride, h1, mask=mask)
     tl.store(ptr + 2 * tap_stride, h2, mask=mask)
+    # The request ended in this forward: its live page becomes a dense
+    # checkpoint others may read. The publish launch clears the count after
+    # every program of this one has folded its heads.
+    if tl.load(
+        request_stopped + record_slot, mask=record_slot < stopped_count, other=0
+    ):
+        retained_fold_ended_request(
+            descriptors,
+            correction,
+            retained_key,
+            retained_decay,
+            layer,
+            target,
+            record_slot,
+            # Validated against the history capacity above.
+            (old + take).to(tl.int32),
+            correction_strides,
+            key_strides,
+            decay_strides,
+            STATE,
+            HEADS,
+            DIM,
+            BLOCK,
+        )
 
 
-@triton.jit(
-    do_not_specialize=[
-        "group_count",
-        "read_strides",
-        "write_strides",
-        "accepted_stride",
-        "query_stride",
-        "stamp_strides",
-        "stamp_slots",
-        "stamp_capacity",
-    ]
-)
+@triton.jit(do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS)
 def retained_batched_publish_kernel(
     descriptors,
     groups,
@@ -315,21 +476,26 @@ def retained_batched_publish_kernel(
     writes,
     accepted,
     starts,
+    record_slots,
     metadata,
     stamps,
+    request_stopped,
     group_count,
     read_strides,
     write_strides,
     accepted_stride,
     query_stride,
+    record_slot_stride,
+    record_slot_count,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
+    stopped_count,
     CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
 ):
     layer, row = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
-    source, target, begin, take, old, valid, length, length_stride = (
+    source, target, begin, take, old, valid, length, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -337,6 +503,7 @@ def retained_batched_publish_kernel(
             writes,
             accepted,
             starts,
+            record_slots,
             metadata,
             stamps,
             layer,
@@ -346,6 +513,8 @@ def retained_batched_publish_kernel(
             write_strides,
             accepted_stride,
             query_stride,
+            record_slot_stride,
+            record_slot_count,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
@@ -354,4 +523,8 @@ def retained_batched_publish_kernel(
         )
     )
     if valid:
-        tl.store(length + target * length_stride, old + take)
+        stopped = tl.load(
+            request_stopped + record_slot, mask=record_slot < stopped_count, other=0
+        )
+        # An ended request's records are folded into its live page.
+        tl.store(length, tl.where(stopped, 0, old + take))

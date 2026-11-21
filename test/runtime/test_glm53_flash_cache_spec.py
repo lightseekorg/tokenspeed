@@ -155,12 +155,12 @@ def test_lcm_reference_geometry_is_exact() -> None:
         mla_cache_dtype=torch.float8_e4m3fn,
     ).bind(7)
     assert plan.prefix_granularity == 64
-    assert plan.lcm_block_bytes == 12 * 23 * 64 * 512
+    assert plan.lcm_block_bytes == 7_077_888
     assert len(plan.planes) == 12
     assert {
         group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
     } == {
-        "full_attention": 23,
+        "full_attention": 18,
         "linear_attention_0": 1,
         "linear_attention_1": 1,
         "linear_attention_2": 1,
@@ -182,28 +182,41 @@ def test_lcm_reference_geometry_is_exact() -> None:
         )
         == 11
     )
-    assert len(fields_by_group["linear_attention_0"]) == 72
-    assert len(fields_by_group["linear_attention_1"]) == 66
-    assert len(fields_by_group["linear_attention_2"]) == 66
+    assert len(fields_by_group["linear_attention_0"]) == 24
+    assert len(fields_by_group["linear_attention_1"]) == 22
+    assert len(fields_by_group["linear_attention_2"]) == 22
     assert {field.plane_id for field in fields_by_group["linear_attention_0"]} == {
         f"slot.{slot}" for slot in range(12)
     }
 
 
-@pytest.mark.parametrize("mla_cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
-def test_bf16_base_preserves_fp32_retained_history(mla_cache_dtype) -> None:
+def test_bf16_kda_state_halves_the_parent_at_tp8() -> None:
+    """``--mamba-ssm-dtype bfloat16`` halves the KDA page, so the MLA packing
+    that covers one page halves too and so does the parent."""
     plan = _layout(
-        tp_size=8, mla_cache_dtype=mla_cache_dtype, mamba_ssm_dtype="bfloat16"
+        tp_size=8, mla_cache_dtype=torch.float8_e4m3fn, mamba_ssm_dtype="bfloat16"
     ).bind(7)
-    fields = {field.field_id: field for field in plan.fields}
-    assert fields["layer.0.recurrent_state"].dtype == "bfloat16"
-    assert fields["layer.0.conv_state"].dtype == "bfloat16"
-    for name in ("replay_correction", "replay_key", "replay_decay"):
-        assert fields[f"layer.0.{name}"].dtype == "float32"
-    assert fields["layer.0.replay_length"].dtype == "int32"
-    # Only the dense base narrows: retained FP32 rows keep their full size.
-    fp32 = _layout(tp_size=8, mla_cache_dtype=mla_cache_dtype).bind(7)
-    assert plan.lcm_block_bytes < fp32.lcm_block_bytes
+
+    assert {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    } == {
+        "full_attention": 9,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
+    }
+    assert plan.lcm_block_bytes == 7_077_888 // 2
+    recurrent = next(
+        field for field in plan.fields if field.field_id.endswith(".recurrent_state")
+    )
+    assert recurrent.dtype == "bfloat16"
+
+
+def test_bf16_kda_state_rejects_tp8_with_a_bf16_mla_cache() -> None:
+    """Half of the FP32-state packing is too narrow for TP8 with a BF16 MLA
+    cache, so that shape raises instead of mis-packing the layout."""
+    with pytest.raises(NotImplementedError, match="no verified LCM packing"):
+        _layout(tp_size=8, mla_cache_dtype=torch.bfloat16, mamba_ssm_dtype="bfloat16")
 
 
 def test_mtp_layout_reserves_a_separate_index_plane() -> None:
@@ -238,26 +251,19 @@ def test_kda_layers_share_one_page_stride(
     draft_layers: int,
     mamba_ssm_dtype: str,
 ) -> None:
+    # Batched KDA replay addresses every layer's state pages with one stride.
     layout = _layout(
         tp_size=tp_size,
         mla_cache_dtype=mla_cache_dtype,
         draft_layers=draft_layers,
         mamba_ssm_dtype=mamba_ssm_dtype,
     )
-    layer_strides = set()
-    for layer in _LINEAR_LAYER_IDS:
-        fields = [
-            field
-            for field in layout.fields
-            if field.field_id.startswith(f"layer.{layer}.")
-        ]
-        assert len(fields) == 6
-        assert len({field.page_stride_bytes for field in fields}) == 1
-        layer_strides.add(fields[0].page_stride_bytes)
-        assert (
-            sum(field.payload_bytes for field in fields) <= fields[0].page_stride_bytes
-        )
-    assert len(layer_strides) == 1
+    strides = {
+        field.page_stride_bytes
+        for field in layout.fields
+        if field.group_id.startswith(LINEAR_ATTENTION)
+    }
+    assert len(strides) == 1
 
 
 def test_dsa_and_kda_components_own_independent_tp_geometry() -> None:
@@ -276,7 +282,7 @@ def test_dsa_and_kda_components_own_independent_tp_geometry() -> None:
         if field.field_id.endswith(".conv_state")
     )
 
-    assert full_packing == 12
+    assert full_packing == 18
     assert conv.shape == (3 * 64 * 128 // 8, 3)
 
 
@@ -378,79 +384,42 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     assert recipe.select_num_lcm_blocks(layout, max_lcm_blocks=budgeted) == expected
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("width", [1, 4, 20])
-def test_glm_retained_checkpoint_roundtrip_and_zero(width: int) -> None:
-    import numpy as np
-
-    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
-
-    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
-    recipe.attn_config = replace(recipe.attn_config, speculative_num_draft_tokens=width)
-    groups = recipe.groups()
-    layout = pack(
-        groups,
-        prefix_granularity=recipe.prefix_granularity,
-        cache_blocks_per_lcm_block=recipe.packing(groups),
-        alignment=recipe.alignment,
-        max_padding_fraction=recipe.max_padding_fraction,
-    )
-    arena = CacheArena(
-        layout.bind(3), "cuda", cache_group_specs=tuple(spec for spec, _ in groups)
-    )
-    state_group = next(spec for spec, _ in groups if spec.attn_kind == "state")
-    fields = {
-        field.field_id.rsplit(".", 1)[-1]: arena.field(field.field_id)
-        for field in layout.fields
-        if field.field_id.startswith("layer.0.")
-    }
-    assert set(fields) == {
-        "conv_state",
-        "recurrent_state",
-        "replay_correction",
-        "replay_key",
-        "replay_decay",
-        "replay_length",
-    }
-    assert fields["replay_correction"].shape[2] == max(16, width)
-    for index, tensor in enumerate(fields.values(), 1):
-        tensor[1].fill_(index)
-        tensor[2].zero_()
-    fields["replay_length"][1].fill_(2)
-    expected = {name: tensor[1].clone() for name, tensor in fields.items()}
-    arena.copy_blocks({state_group.group_id: np.asarray([[1, 2]], dtype=np.int64)})
-    for name, tensor in fields.items():
-        torch.testing.assert_close(tensor[2], expected[name], atol=0, rtol=0)
-    arena.zero_blocks({state_group.group_id: np.asarray([2], dtype=np.int32)})
-    for name, tensor in fields.items():
-        assert torch.count_nonzero(tensor[2]) == 0
-        torch.testing.assert_close(tensor[1], expected[name], atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("width", [1, 4])
 def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> None:
     recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
-    recipe.attn_config = replace(recipe.attn_config, speculative_num_draft_tokens=width)
+    recipe.attn_config = replace(
+        recipe.attn_config, speculative_num_draft_tokens=width, max_resident_requests=24
+    )
     layers, groups, batch, heads, dim = 34, 3, 16, 8, 128
     conv_channels = 3 * heads * dim
+    # 24 resident requests plus the two reserved request slots each hold FP32
+    # U/K/decay records and one INT32 accepted count per layer.
+    slots = 26
     expected = (
         layers * batch * width * conv_channels * 2
-        + layers * (9 * 8 + 4)
+        + layers * slots * (3 * heads * max(16, width) * dim * 4 + 4)
+        + layers * (14 * 8 + 4)
         + groups * 4 * 8
         + (2 * groups + 1) * batch * 4
-        + batch * 3 * 8
+        + batch * 4 * 8
         + layers * batch * width * 2 * 8
     )
     assert recipe.workspace_bytes() == recipe.pool_options().workspace_bytes + expected
+    recipe.server_args.disaggregation_mode = "prefill"
+    assert recipe.workspace_bytes() == recipe.pool_options().workspace_bytes
 
 
 @pytest.mark.parametrize("width", [1, 4, 20])
-def test_glm_checkpoint_schema_always_reserves_retained_history(width):
+def test_glm_checkpoint_fields_are_independent_of_verify_width(width):
+    """Retained decode history stays in the request-slot workspace."""
     recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+    schema = recipe.groups()
     recipe.attn_config = replace(recipe.attn_config, speculative_num_draft_tokens=width)
+    assert recipe.groups() == schema
     fields = {
         field.field_id: field for _, fields in recipe.groups() for field in fields
     }
-    assert "layer.0.replay_correction" in fields
-    assert fields["layer.0.replay_correction"].shape == (8, max(16, width), 128)
-    assert fields["layer.0.replay_length"].shape == (1,)
+    assert {name for name in fields if name.startswith("layer.0.")} == {
+        "layer.0.conv_state",
+        "layer.0.recurrent_state",
+    }

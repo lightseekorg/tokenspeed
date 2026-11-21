@@ -96,9 +96,12 @@ def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None
     return SimpleNamespace(
         pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=dict,
+        state_folds_arrays=dict,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
+        has_peer_fetches=False,
+        state_commit_fence=None,
     )
 
 

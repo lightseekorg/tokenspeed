@@ -22,8 +22,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import cached_property
 
 import torch
@@ -41,7 +42,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
     kda_recurrent_state_dtype,
-    kda_state_fields,
     kda_verify_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -58,6 +58,38 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 GLM53_FLASH_LOGICAL_BLOCK_TOKENS = 64
+
+# Full-attention pages per LCM parent with an FP32 KDA recurrent state, keyed
+# by (attn tp size, MLA cache element size). The compressed KPool index is a
+# companion field of the same 64-token CacheBlock and therefore shares this
+# packing and block table. KDA state groups always pack one checkpoint per
+# parent; the bounded raw KPool tail is request-local workspace and has no
+# scheduler-facing packing.
+_PACKING = {
+    (1, 2): 72,
+    (1, 1): 144,
+    (2, 2): 36,
+    (2, 1): 72,
+    (4, 2): 18,
+    (4, 1): 36,
+    (8, 2): 9,
+    (8, 1): 18,
+}
+
+# The same shapes with a BF16 recurrent state. A BF16 KDA page is about half
+# the FP32 one, so each entry halves the FP32 packing, which still covers one
+# BF16 KDA page. TP8 with a BF16 MLA cache has no entry: halving its 9 pages
+# leaves the plane narrower than the state, and 5 pages pads the KDA groups
+# past the layout's padding limit.
+_BF16_STATE_PACKING = {
+    (1, 2): 36,
+    (1, 1): 72,
+    (2, 2): 18,
+    (2, 1): 36,
+    (4, 2): 9,
+    (4, 1): 18,
+    (8, 1): 9,
+}
 
 
 @dataclass(frozen=True)
@@ -93,25 +125,33 @@ def _require_non_negative_int(name: str, value: object) -> int:
 
 
 def glm53_flash_packing_counts(
-    groups: tuple[CacheGroupDeclaration, ...],
+    *,
+    tp_size: int,
+    mla_element_size: int,
+    recurrent_state_dtype: torch.dtype,
+    state_group_ids: Sequence[str] = (),
 ) -> dict[str, int]:
-    """Pack MLA pages to cover the actual retained checkpoint fields."""
-    state_bytes = {}
-    mla_page_bytes = None
-    for spec, fields in groups:
-        for field in fields:
-            if spec.attn_kind == "state":
-                key = (spec.group_id, field.plane_id)
-                state_bytes[key] = state_bytes.get(key, 0) + field.payload_bytes
-            elif field.field_id.endswith(".latent_kv") and mla_page_bytes is None:
-                mla_page_bytes = field.payload_bytes
-    if mla_page_bytes is None or not state_bytes:
-        raise ValueError("GLM cache requires MLA and retained KDA fields")
-    full = max(1, -(-max(state_bytes.values()) // mla_page_bytes))
-    return {
-        spec.group_id: full if spec.group_id == FULL_ATTENTION else 1
-        for spec, _ in groups
-    }
+    """Look up the LCM packing for one GLM-5.3-Flash parallel/dtype shape."""
+    table = {torch.float32: _PACKING, torch.bfloat16: _BF16_STATE_PACKING}.get(
+        recurrent_state_dtype
+    )
+    if table is None:
+        raise NotImplementedError(
+            f"GLM-5.3-Flash has no LCM packing for a {recurrent_state_dtype} "
+            "KDA recurrent state"
+        )
+    try:
+        full = table[(int(tp_size), int(mla_element_size))]
+    except KeyError:
+        raise NotImplementedError(
+            f"GLM-5.3-Flash has no verified LCM packing for tp_size={tp_size} "
+            f"with a {mla_element_size}-byte MLA cache and a "
+            f"{recurrent_state_dtype} KDA recurrent state; supported shapes are "
+            f"{sorted(table)}"
+        ) from None
+    packing = {FULL_ATTENTION: full}
+    packing.update(dict.fromkeys(state_group_ids, 1))
+    return packing
 
 
 def _require_dsa_config(config: AttnConfig, role: str) -> DSAConfig:
@@ -179,23 +219,24 @@ def declare_glm53_flash_groups(
             f"{target_dsa.index_k_format!r}"
         )
     target_linear = _require_linear_config(attn_config)
-    state_fields = kda_state_fields(
-        0,
-        "slot.0",
-        conv_shape=target_linear.conv_state_shape,
-        recurrent_shape=target_linear.temporal_state_shape,
-        recurrent_state_dtype=recurrent_state_dtype,
-        history_capacity=max(16, int(attn_config.speculative_num_draft_tokens or 1)),
-    )
-    mla_page_bytes = (
-        GLM53_FLASH_LOGICAL_BLOCK_TOKENS
+    # Batched KDA replay walks every layer's state pages with one stride. A
+    # target-only plan leaves the last KDA plane without an MLA tenant, so a
+    # KDA page narrower than an MLA plane is padded to that plane's width.
+    mla_plane_bytes = (
+        glm53_flash_packing_counts(
+            tp_size=target_dsa.attn_tp_size,
+            mla_element_size=attn_config.kv_cache_dtype.itemsize,
+            recurrent_state_dtype=recurrent_state_dtype,
+        )[FULL_ATTENTION]
+        * GLM53_FLASH_LOGICAL_BLOCK_TOKENS
         * (target_dsa.kv_lora_rank + target_dsa.qk_rope_head_dim)
         * attn_config.kv_cache_dtype.itemsize
     )
-    state_page_bytes = sum(field.payload_bytes for field in state_fields)
-    # Batched state kernels share one page stride across layers. The final
-    # state-only plane must match the planes that also hold exact-stride MLA.
-    state_page_alignment = -(-state_page_bytes // mla_page_bytes) * mla_page_bytes
+    kda_page_bytes = (
+        math.prod(target_linear.conv_state_shape) * torch.bfloat16.itemsize
+        + math.prod(target_linear.temporal_state_shape) * recurrent_state_dtype.itemsize
+    )
+    kda_page_alignment = mla_plane_bytes if kda_page_bytes < mla_plane_bytes else 1
     target_layer_types = _target_layer_types(attn_config, num_target_layers)
     group_ids = (
         tuple(split_recurrent_state_groups(target_layer_types))
@@ -232,14 +273,23 @@ def declare_glm53_flash_groups(
                     scatter_stored_dtype_name(config.kv_cache_dtype),
                 ),
             )
-        return tuple(
-            replace(
-                field,
-                field_id=f"layer.{layer_id}.{field.field_id.rsplit('.', 1)[1]}",
-                plane_id=plane_id,
-                page_stride_alignment_bytes=state_page_alignment,
-            )
-            for field in state_fields
+        return (
+            CacheFieldSpec(
+                f"layer.{layer_id}.conv_state",
+                plane_id,
+                target_linear.conv_state_shape,
+                cache_dtype_name(torch.bfloat16),
+                exact_page_stride=False,
+                page_stride_alignment_bytes=kda_page_alignment,
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.recurrent_state",
+                plane_id,
+                target_linear.temporal_state_shape,
+                cache_dtype_name(recurrent_state_dtype),
+                exact_page_stride=False,
+                page_stride_alignment_bytes=kda_page_alignment,
+            ),
         )
 
     base = group(
@@ -345,11 +395,21 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
-        return glm53_flash_packing_counts(groups)
+        state_group_ids = [
+            spec.group_id
+            for spec, _ in groups
+            if spec.group_id.startswith(LINEAR_ATTENTION)
+        ]
+        return glm53_flash_packing_counts(
+            tp_size=self._dsa_config.attn_tp_size,
+            mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
+            recurrent_state_dtype=self._recurrent_dtype,
+            state_group_ids=state_group_ids,
+        )
 
     @override
     def workspace_bytes(self) -> int:
-        """Shared KPool tails plus the target's KDA verification staging."""
+        """Shared KPool tails, request-slot KDA history and verify staging."""
         tail_bytes = self.pool_options().workspace_bytes
         width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
         if self.server_args.disaggregation_mode == "prefill":

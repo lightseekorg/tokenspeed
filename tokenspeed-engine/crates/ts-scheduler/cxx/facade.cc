@@ -340,6 +340,9 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
             case CacheEventKind::RestoreDone:
                 execution_event.With(tokenspeed::cache::RestoreDone{.op_id = event.op_id});
                 break;
+            case CacheEventKind::StateCommitDone:
+                execution_event.With(tokenspeed::cache::StateCommitDone{.op_id = event.op_id});
+                break;
             default:
                 throw std::invalid_argument("unknown cache event kind");
         }
@@ -501,6 +504,8 @@ bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::St
     return scheduler.CanAbortBeforeAdmission(std::string(request_id));
 }
 
+bool defers_decode_state(const tokenspeed::Scheduler& scheduler) { return scheduler.DefersDecodeState(); }
+
 bool storage_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StoragePending(); }
 
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
@@ -630,7 +635,11 @@ bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
     // A peer landing's reads start from the fence the data plane reports for
     // its plan, which may have no other device work: a prefill replica's
     // landing prepays no decode room, so it zeroes nothing.
-    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value() || !plan.peer_fetches.empty()) {
+    // The commit fence is acknowledged from the device, behind the commit, and
+    // a retraction whose image was refused may leave its state folds as the
+    // plan's only device work.
+    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value() || !plan.peer_fetches.empty() ||
+        plan.state_commit_fence.has_value() || !plan.state_folds.empty()) {
         return true;
     }
     for (const auto& [group_id, pages] : plan.pages_to_zero) {
@@ -730,6 +739,9 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
                 }
             },
             *cache);
+    }
+    if (plan.state_commit_fence) {
+        out.push_back(CacheOpView{.kind = CacheOpKind::StateCommit, .op_id = *plan.state_commit_fence});
     }
     return out;
 }

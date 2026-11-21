@@ -3,10 +3,11 @@
 """Kimi-K3 RecoverSSM kernels with stamped retained KDA records.
 
 Based on vLLM c77b3faa1cc2c39edbe82365f28ce96981af1438. Retained records keep
-FP32 U, normalized K, and multiplicative decay in cache pages. Ordered consolidation,
-reset, and verify prepare private live pages; commit validates candidate stamps
-and publishes only accepted length. Verify retains the upstream recurrence,
-static token loop, and one-warp launch.
+FP32 U, normalized K, multiplicative decay and the accepted length in resident
+request slots. Ordered consolidation, reset, and verify prepare private live
+pages; commit validates candidate stamps and publishes only the slot's accepted
+length. Verify retains the upstream recurrence, static token loop, and one-warp
+launch.
 """
 
 from typing import Any
@@ -78,7 +79,10 @@ def _kda_recurrent_step(
         "length_stride",
         "source_stride",
         "live_stride",
+        "slot_stride",
+        "slots",
         "query_stride",
+        "pages",
     ]
 )
 def _consolidate_kda_history_kernel(
@@ -89,6 +93,7 @@ def _consolidate_kda_history_kernel(
     length_ptr,
     source_ptr,
     live_ptr,
+    slots_ptr,
     query_ptr,
     state_strides,
     correction_strides,
@@ -97,7 +102,10 @@ def _consolidate_kda_history_kernel(
     length_stride,
     source_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
+    pages,
     CAPACITY: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -111,9 +119,19 @@ def _consolidate_kda_history_kernel(
     begin = tl.load(query_ptr + row * query_stride).to(tl.int64)
     end = tl.load(query_ptr + (row + 1) * query_stride).to(tl.int64)
     tokens = end - begin
-    if source <= 0 or live <= 0 or tokens == 0:
+    slot = tl.load(slots_ptr + row * slot_stride).to(tl.int64)
+    # Consolidation and the length reset skip the same rows.
+    if (
+        source <= 0
+        or source >= pages
+        or live <= 0
+        or live >= pages
+        or tokens == 0
+        or slot < 0
+        or slot >= slots
+    ):
         return
-    length = tl.load(length_ptr + source * length_stride)
+    length = tl.load(length_ptr + slot * length_stride)
     valid = (length >= 0) & (length <= CAPACITY) & (tokens > 0) & (tokens <= CAPACITY)
     tl.device_assert(valid, "invalid retained history interval")
     if not valid:
@@ -134,7 +152,7 @@ def _consolidate_kda_history_kernel(
     for position in range(length):
         u = tl.load(
             correction_ptr
-            + source * correction_strides[0]
+            + slot * correction_strides[0]
             + head * correction_strides[1]
             + position * correction_strides[2]
             + values * correction_strides[3],
@@ -143,7 +161,7 @@ def _consolidate_kda_history_kernel(
         )
         key = tl.load(
             key_ptr
-            + source * key_strides[0]
+            + slot * key_strides[0]
             + head * key_strides[1]
             + position * key_strides[2]
             + keys * key_strides[3],
@@ -152,7 +170,7 @@ def _consolidate_kda_history_kernel(
         )
         decay = tl.load(
             decay_ptr
-            + source * decay_strides[0]
+            + slot * decay_strides[0]
             + head * decay_strides[1]
             + position * decay_strides[2]
             + keys * decay_strides[3],
@@ -161,22 +179,34 @@ def _consolidate_kda_history_kernel(
         )
         state = state * decay[None, :] + u[:, None] * key[None, :]
     # Each CTA owns its V tile. Length and records remain untouched until all
-    # these stores finish; a separate ordered kernel resets the live length.
+    # these stores finish; a separate ordered kernel resets the slot's length.
     tl.store(state_ptr + live * state_strides[0] + tile, state, mask=mask)
 
 
 @triton.jit(
-    do_not_specialize=["length_stride", "source_stride", "live_stride", "query_stride"]
+    do_not_specialize=[
+        "length_stride",
+        "source_stride",
+        "live_stride",
+        "slot_stride",
+        "slots",
+        "query_stride",
+        "pages",
+    ]
 )
 def _reset_kda_history_kernel(
     length_ptr,
     source_ptr,
     live_ptr,
+    slots_ptr,
     query_ptr,
     length_stride,
     source_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
+    pages,
     CAPACITY: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -185,15 +215,25 @@ def _reset_kda_history_kernel(
     begin = tl.load(query_ptr + row * query_stride).to(tl.int64)
     end = tl.load(query_ptr + (row + 1) * query_stride).to(tl.int64)
     tokens = end - begin
-    if source <= 0 or live <= 0 or tokens == 0:
+    slot = tl.load(slots_ptr + row * slot_stride).to(tl.int64)
+    # Consolidation and the length reset skip the same rows.
+    if (
+        source <= 0
+        or source >= pages
+        or live <= 0
+        or live >= pages
+        or tokens == 0
+        or slot < 0
+        or slot >= slots
+    ):
         return
-    length = tl.load(length_ptr + source * length_stride)
+    length = tl.load(length_ptr + slot * length_stride)
     valid = (length >= 0) & (length <= CAPACITY) & (tokens > 0) & (tokens <= CAPACITY)
     tl.device_assert(valid, "invalid retained history interval")
     if not valid:
         return
     if source != live or length + tokens > CAPACITY:
-        tl.store(length_ptr + live * length_stride, 0)
+        tl.store(length_ptr + slot * length_stride, 0)
 
 
 @triton.jit(
@@ -201,15 +241,19 @@ def _reset_kda_history_kernel(
         "length_stride",
         "source_stride",
         "live_stride",
+        "slot_stride",
+        "slots",
         "query_stride",
         "accepted_stride",
         "STAMP_SLOTS",
+        "pages",
     ]
 )
 def _publish_kda_history_kernel(
     length_ptr,
     source_ptr,
     live_ptr,
+    slots_ptr,
     query_ptr,
     accepted_ptr,
     metadata_ptr,
@@ -217,9 +261,12 @@ def _publish_kda_history_kernel(
     length_stride,
     source_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     accepted_stride,
     STAMP_SLOTS,
+    pages,
     STAMP_CAPACITY: tl.constexpr,
     CAPACITY: tl.constexpr,
     SPEC_QUERY_LEN: tl.constexpr,
@@ -230,11 +277,20 @@ def _publish_kda_history_kernel(
     begin = tl.load(query_ptr + row * query_stride).to(tl.int64)
     end = tl.load(query_ptr + (row + 1) * query_stride).to(tl.int64)
     tokens = end - begin
-    if source <= 0 or live <= 0 or tokens == 0:
+    payload_slot = tl.load(slots_ptr + row * slot_stride).to(tl.int64)
+    if (
+        source <= 0
+        or source >= pages
+        or live <= 0
+        or live >= pages
+        or tokens == 0
+        or payload_slot < 0
+        or payload_slot >= slots
+    ):
         return
     accepted = tl.load(accepted_ptr + row * accepted_stride)
     accepted = tl.minimum(tl.minimum(tl.maximum(accepted, 0), tokens), SPEC_QUERY_LEN)
-    length = tl.load(length_ptr + live * length_stride)
+    length = tl.load(length_ptr + payload_slot * length_stride)
     valid = (length >= 0) & (length + accepted <= CAPACITY)
     tl.device_assert(valid, "invalid retained publication interval")
     if not valid:
@@ -264,7 +320,9 @@ def _publish_kda_history_kernel(
         tl.device_assert(valid, "stale retained replay record")
         if not valid:
             return
-    tl.store(length_ptr + live * length_stride, (length + accepted).to(tl.int32))
+    tl.store(
+        length_ptr + payload_slot * length_stride, (length + accepted).to(tl.int32)
+    )
 
 
 @triton.heuristics(
@@ -280,7 +338,10 @@ def _publish_kda_history_kernel(
         "RECORD_SLOTS",
         "stride_history_length",
         "stride_live_indices",
+        "stride_record_slots",
+        "payload_slots",
         "decay_strides",
+        "pages",
     ]
 )
 def _kda_recoverssm_verify_kernel(
@@ -301,15 +362,19 @@ def _kda_recoverssm_verify_kernel(
     record_stamps_ptr,
     history_length_ptr,
     live_indices_ptr,
+    slots_ptr,
     decay_cache_ptr,
     stride_history_length,
     stride_live_indices,
+    stride_record_slots,
+    payload_slots,
     decay_strides,
     HISTORY_CAPACITY: tl.constexpr,
     RECORD_CAPACITY: tl.constexpr,
     RECORD_SLOTS,
     lower_bound,
     null_block_id,
+    pages,
     stride_q_token,
     stride_k_token,
     stride_v_token,
@@ -355,9 +420,16 @@ def _kda_recoverssm_verify_kernel(
     mask_v = offs_v < V
     mask_state = mask_v[:, None] & mask_k[None, :]
 
-    valid_source = state_idx > null_block_id
+    valid_source = (state_idx > null_block_id) & (state_idx < pages)
     state_idx = tl.load(live_indices_ptr + pid_b * stride_live_indices).to(tl.int64)
-    if not valid_source or state_idx <= null_block_id:
+    payload_slot = tl.load(slots_ptr + pid_b * stride_record_slots).to(tl.int64)
+    if (
+        not valid_source
+        or state_idx <= null_block_id
+        or state_idx >= pages
+        or payload_slot < 0
+        or payload_slot >= payload_slots
+    ):
         for token_offset in tl.static_range(SPEC_QUERY_LEN):
             token_valid = token_offset < query_len
             tl.store(
@@ -396,8 +468,7 @@ def _kda_recoverssm_verify_kernel(
                 )
                 tl.store(stamp, position, mask=token_offset < query_len)
                 tl.store(stamp + 1, record_generation, mask=token_offset < query_len)
-    history_length = 0
-    history_length = tl.load(history_length_ptr + state_idx * stride_history_length)
+    history_length = tl.load(history_length_ptr + payload_slot * stride_history_length)
     valid_history = (history_length >= 0) & (
         history_length + query_len <= HISTORY_CAPACITY
     )
@@ -422,7 +493,7 @@ def _kda_recoverssm_verify_kernel(
     for position in range(history_length):
         u = tl.load(
             correction_cache_ptr
-            + state_idx * stride_correction_block
+            + payload_slot * stride_correction_block
             + pid_h * stride_correction_head
             + position * stride_correction_pos
             + offs_v * stride_correction_dim,
@@ -431,7 +502,7 @@ def _kda_recoverssm_verify_kernel(
         )
         key = tl.load(
             key_cache_ptr
-            + state_idx * stride_key_block
+            + payload_slot * stride_key_block
             + pid_h * stride_key_head
             + position * stride_key_pos
             + offs_k * stride_key_dim,
@@ -440,7 +511,7 @@ def _kda_recoverssm_verify_kernel(
         )
         decay = tl.load(
             decay_cache_ptr
-            + state_idx * decay_strides[0]
+            + payload_slot * decay_strides[0]
             + pid_h * decay_strides[1]
             + position * decay_strides[2]
             + offs_k * decay_strides[3],
@@ -522,7 +593,6 @@ def _kda_recoverssm_verify_kernel(
             eviction_policy="evict_first",
         )
 
-        payload_slot = state_idx
         payload_position = history_length + token_offset
         correction_ptr = (
             correction_cache_ptr
@@ -549,7 +619,7 @@ def _kda_recoverssm_verify_kernel(
             )
             tl.store(
                 decay_cache_ptr
-                + state_idx * decay_strides[0]
+                + payload_slot * decay_strides[0]
                 + pid_h * decay_strides[1]
                 + payload_position * decay_strides[2]
                 + offs_k * decay_strides[3],
@@ -561,7 +631,7 @@ def _kda_recoverssm_verify_kernel(
 def prepare_retained_history(
     checkpoint_state, retained_history, state_indices, query_start_loc
 ):
-    """Materialize only source copies and capacity overflow, then reset their lengths."""
+    """Materialize only source copies and capacity overflow, then reset their slot lengths."""
     correction_cache = retained_history.correction
     key_cache = retained_history.key
     capacity = correction_cache.shape[2]
@@ -581,6 +651,7 @@ def prepare_retained_history(
         retained_history.length,
         state_indices,
         retained_history.live_state_indices,
+        retained_history.record_slots,
         query_start_loc,
         checkpoint_state.stride(),
         correction_cache.stride(),
@@ -589,7 +660,10 @@ def prepare_retained_history(
         retained_history.length.stride(0),
         state_indices.stride(0),
         retained_history.live_state_indices.stride(0),
+        retained_history.record_slots.stride(0),
+        retained_history.correction.shape[0],
         query_start_loc.stride(0),
+        checkpoint_state.shape[0],
         CAPACITY=capacity,
         K=key_dim,
         V=value_dim,
@@ -598,22 +672,37 @@ def prepare_retained_history(
         num_warps=1,
         debug=True,
     )
-    reset_retained_history(retained_history, state_indices, query_start_loc)
+    reset_retained_history(
+        retained_history,
+        state_indices,
+        query_start_loc,
+        page_count=checkpoint_state.shape[0],
+    )
 
 
-def reset_retained_history(retained_history, state_indices, query_start_loc):
-    """Publish length zero after all materialization tiles have completed."""
+def reset_retained_history(
+    retained_history, state_indices, query_start_loc, *, page_count: int
+):
+    """Publish length zero after all materialization tiles have completed.
+
+    page_count is the checkpoint pool's page count; rows whose source or live
+    page falls outside it are skipped, as consolidation skips them.
+    """
     batch = state_indices.numel()
     capacity = retained_history.correction.shape[2]
     _reset_kda_history_kernel[batch,](
         retained_history.length,
         state_indices,
         retained_history.live_state_indices,
+        retained_history.record_slots,
         query_start_loc,
         retained_history.length.stride(0),
         state_indices.stride(0),
         retained_history.live_state_indices.stride(0),
+        retained_history.record_slots.stride(0),
+        retained_history.correction.shape[0],
         query_start_loc.stride(0),
+        page_count,
         CAPACITY=capacity,
         num_warps=1,
         debug=True,
@@ -708,15 +797,19 @@ def kda_recoverssm_verify(
         record_stamps,
         retained_history.length,
         retained_history.live_state_indices,
+        retained_history.record_slots,
         retained_history.decay,
         retained_history.length.stride(0),
         retained_history.live_state_indices.stride(0),
+        retained_history.record_slots.stride(0),
+        retained_history.correction.shape[0],
         retained_history.decay.stride(),
         capacity,
         stamp_capacity,
         stamp_slots,
         lower_bound,
         NULL_BLOCK_ID,
+        checkpoint_state.shape[0],
         q.stride(1),
         k.stride(1),
         v.stride(1),

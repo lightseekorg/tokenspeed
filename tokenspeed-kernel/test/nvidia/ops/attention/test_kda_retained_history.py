@@ -42,6 +42,10 @@ from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
         ("decay", (3, 2, 7, 64), torch.float32),
         ("key", (3, 2, 8, 64), torch.bfloat16),
         ("length", (3, 2), torch.int32),
+        # One count per request slot, not per cache page.
+        ("length", (4, 1), torch.int32),
+        ("record_slots", (1,), torch.int32),
+        ("record_slots", (2,), torch.float32),
     ],
 )
 def test_retained_history_rejects_invalid_storage_on_construction(field, shape, dtype):
@@ -51,6 +55,7 @@ def test_retained_history_rejects_invalid_storage_on_construction(field, shape, 
         decay=torch.empty(3, 2, 8, 64),
         length=torch.empty(3, 1, dtype=torch.int32),
         live_state_indices=torch.zeros(2, dtype=torch.int32),
+        record_slots=torch.zeros(2, dtype=torch.int64),
     )
     fields[field] = torch.empty(shape, dtype=dtype)
     with pytest.raises(ValueError, match="retained"):
@@ -150,8 +155,8 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
         length_view.copy_(length)
         length = length_view
     indices = torch.tensor([1], device="cuda", dtype=torch.int32)
-    history = history_type(u, key, decay, length, indices)
-    current = _reconstruct(state[1], u[1], key[1], decay[1], initial_length)
+    history = history_type(u, key, decay, length, indices, torch.zeros_like(indices))
+    current = _reconstruct(state[1], u[0], key[0], decay[0], initial_length)
     starts = torch.tensor([0, width], device="cuda", dtype=torch.int32)
     a = torch.randn(heads, device="cuda") * 0.1
     bias = torch.randn(heads, dim, device="cuda") * 0.1
@@ -162,11 +167,11 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
         ]
         beta = torch.randn(1, width, heads, device="cuda").bfloat16()
         out = torch.empty_like(v)
-        old_length = int(length[1, 0])
+        old_length = int(length[0, 0])
         consolidated = old_length + width > capacity
         if consolidated:
             materialized = _reconstruct(
-                base_before[1], u[1], key[1], decay[1], old_length
+                base_before[1], u[0], key[0], decay[0], old_length
             )
             old_length = 0
         verify_kernel(
@@ -187,7 +192,7 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             record_metadata=None,
             record_stamps=None,
         )
-        assert int(length[1, 0]) == old_length
+        assert int(length[0, 0]) == old_length
         if consolidated:
             if state_dtype == torch.bfloat16:
                 # Round the FP32 error bounds to BF16. Adjacent BF16 values
@@ -222,19 +227,19 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
         )
         torch.testing.assert_close(out[0].float(), expected_out, atol=2e-3, rtol=5e-3)
         torch.testing.assert_close(
-            u[1, :, old_length : old_length + width],
+            u[0, :, old_length : old_length + width],
             expected_u.transpose(0, 1),
             atol=2e-6,
             rtol=2e-5,
         )
         torch.testing.assert_close(
-            key[1, :, old_length : old_length + width],
+            key[0, :, old_length : old_length + width],
             expected_k.transpose(0, 1),
             atol=2e-6,
             rtol=2e-5,
         )
         torch.testing.assert_close(
-            decay[1, :, old_length : old_length + width],
+            decay[0, :, old_length : old_length + width],
             expected_decay.transpose(0, 1),
             atol=2e-6,
             rtol=2e-5,
@@ -255,13 +260,13 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             record_metadata=None,
             record_stamps=None,
         )
-        assert int(length[1, 0]) == old_length + accepted
+        assert int(length[0, 0]) == old_length + accepted
         torch.testing.assert_close(state, base_before, atol=0, rtol=0)
         for actual, before in zip((u, key, decay), records_before):
             torch.testing.assert_close(actual, before, atol=0, rtol=0)
         current = expected_states[accepted - 1] if accepted else current
         torch.testing.assert_close(
-            _reconstruct(state[1], u[1], key[1], decay[1], old_length + accepted),
+            _reconstruct(state[1], u[0], key[0], decay[0], old_length + accepted),
             current,
             atol=2e-6,
             rtol=2e-5,
@@ -285,8 +290,10 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     u = torch.randn(pages, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
+    # Counts belong to request slots: rows 0 and 1 start from the shared dense
+    # source; the empty row 2, null row 3 and unused slots keep stale counts.
     length = torch.tensor(
-        [[1], [3], [6], [5], [4], [2]], device="cuda", dtype=torch.int32
+        [[0], [0], [6], [5], [4], [2]], device="cuda", dtype=torch.int32
     )
     sources = torch.tensor([1, 1, 1, 0], device="cuda", dtype=torch.int32)
     live = torch.tensor([2, 3, 4, 5], device="cuda", dtype=torch.int32)
@@ -299,9 +306,9 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
         dtype=torch.int64,
     )
     stamps = torch.full((4, 5, 2), -1, device="cuda", dtype=torch.int64)
-    history = kda_ops.KdaRetainedHistory(u, key, decay, length, live)
+    history = kda_ops.KdaRetainedHistory(u, key, decay, length, live, metadata[:, 0])
     original = tuple(x.clone() for x in (state, u, key, decay, length))
-    shared_endpoint = _reconstruct(state[1], u[1], key[1], decay[1], 3)
+    shared_endpoint = state[1]
     current = [shared_endpoint.clone(), shared_endpoint.clone()]
     a = torch.randn(heads, device="cuda") * 0.1
     bias = torch.randn(heads, dim, device="cuda") * 0.1
@@ -413,12 +420,12 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
             if counts[row]:
                 current[row] = states[counts[row] - 1]
             page = row + 2
-            assert int(length[page, 0]) == (
+            assert int(length[row, 0]) == (
                 counts[row] if not round_index else (2, 1)[row] + counts[row]
             )
             torch.testing.assert_close(
                 _reconstruct(
-                    state[page], u[page], key[page], decay[page], int(length[page, 0])
+                    state[page], u[row], key[row], decay[row], int(length[row, 0])
                 ),
                 current[row],
                 atol=2e-6,
@@ -435,11 +442,14 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
         torch.testing.assert_close(
             out[0, 5], torch.zeros_like(out[0, 5]), atol=0, rtol=0
         )
-        # Shared source, empty destination, and null destination stay immutable.
-        for value, before in zip((state, u, key, decay, length), original):
-            torch.testing.assert_close(
-                value[[0, 1, 4, 5]], before[[0, 1, 4, 5]], atol=0, rtol=0
-            )
+        # Shared source, empty destination, and null destination stay immutable,
+        # and so do the counts of the empty and null rows' slots.
+        torch.testing.assert_close(
+            state[[0, 1, 4, 5]], original[0][[0, 1, 4, 5]], atol=0, rtol=0
+        )
+        torch.testing.assert_close(length[2:], original[4][2:], atol=0, rtol=0)
+        for value, before in zip((u, key, decay), original[1:4]):
+            torch.testing.assert_close(value[2:], before[2:], atol=0, rtol=0)
 
 
 def test_retained_history_large_value_tile_and_acceptance_clamping():
@@ -468,7 +478,7 @@ def test_retained_history_large_value_tile_and_acceptance_clamping():
     indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
     starts = torch.tensor(offsets, device="cuda", dtype=torch.int32)
     counts = torch.tensor(requested, device="cuda", dtype=torch.int32)
-    history = kda_ops.KdaRetainedHistory(u, key, decay, length, indices)
+    history = kda_ops.KdaRetainedHistory(u, key, decay, length, indices, indices)
     base_before = state.clone()
     expected_out = torch.empty_like(v, dtype=torch.float32)
     expected_endpoints = []
@@ -555,3 +565,63 @@ def test_retained_history_large_value_tile_and_acceptance_clamping():
             atol=2e-6,
             rtol=2e-5,
         )
+
+
+def test_rows_outside_the_page_pool_are_skipped_by_verify_and_commit():
+    """A source or live page past the checkpoint pool names no page: verify
+    zeroes the row's output and leaves the pool alone, and commit keeps the
+    row's slot count, as for a null row."""
+    torch.manual_seed(1931)
+    pages, heads, dim, capacity, width = 4, 2, 64, 8, 2
+    state = torch.randn(pages, heads, dim, dim, device="cuda") * 0.02
+    u = torch.randn(2, heads, capacity, dim, device="cuda") * 0.02
+    key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
+    decay = torch.rand_like(key) * 0.2 + 0.7
+    length = torch.tensor([[3], [3]], device="cuda", dtype=torch.int32)
+    # Row 0's source and row 1's live page are one past the pool.
+    sources = torch.tensor([pages, 1], device="cuda", dtype=torch.int32)
+    live = torch.tensor([2, pages], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    history = kda_ops.KdaRetainedHistory(u, key, decay, length, live, slots)
+    starts = torch.tensor([0, 2, 4], device="cuda", dtype=torch.int32)
+    accepted = torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+    q, k, v, gate = [
+        torch.randn(1, 4, heads, dim, device="cuda").bfloat16() for _ in range(4)
+    ]
+    beta = torch.randn(1, 4, heads, device="cuda").bfloat16()
+    out = torch.full_like(v, float("nan"))
+    saved = state.clone()
+    vllm_triton_kda_recoverssm_verify(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        torch.randn(heads, device="cuda") * 0.1,
+        torch.randn(heads, dim, device="cuda") * 0.1,
+        checkpoint_state=state,
+        retained_history=history,
+        query_start_loc=starts,
+        state_indices=sources,
+        spec_query_len=width,
+        lower_bound=None,
+        out=out,
+        record_metadata=None,
+        record_stamps=None,
+    )
+    vllm_triton_kda_recoverssm_commit(
+        q,
+        k,
+        v,
+        checkpoint_state=state,
+        retained_history=history,
+        state_indices=sources,
+        query_start_loc=starts,
+        num_accepted_tokens=accepted,
+        spec_query_len=width,
+        record_metadata=None,
+        record_stamps=None,
+    )
+    torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+    torch.testing.assert_close(state, saved, atol=0, rtol=0)
+    assert length.flatten().tolist() == [3, 3]

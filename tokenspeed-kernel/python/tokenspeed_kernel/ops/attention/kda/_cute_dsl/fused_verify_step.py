@@ -100,7 +100,7 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     load_element,
     retained_arguments,
     retained_length,
-    retained_page,
+    retained_row,
 )
 from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
@@ -458,8 +458,17 @@ class FusedVerifyStep:
         token_start = Int64(_load(query_start_loc, request))
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
-        live_page = retained_page(retained, request)
-        live = (page > 0) & (live_page > 0) & (valid > 0)
+        live_page, slot = retained_row(retained, request)
+        # A page past the checkpoint pool is padding, like a nonpositive one.
+        live = (
+            (page > 0)
+            & (page < retained[0].shape[0])
+            & (live_page > 0)
+            & (live_page < retained[0].shape[0])
+            & (slot >= 0)
+            & (slot < retained[1].shape[0])
+            & (valid > 0)
+        )
 
         accepted = Int32(0)
         packed_checkpoint = Boolean(False)
@@ -484,7 +493,7 @@ class FusedVerifyStep:
                     )
             if (warp >= 2 * WARPS) & (warp < 3 * WARPS):
                 _sync_suffix_warps()
-            accepted = retained_length(retained, live_page)
+            accepted = retained_length(retained, slot)
             projected_history = (accepted > 0) & (accepted <= _MAX_PROJECTED_HISTORY)
             if (accepted == 0) | projected_history:
                 tile_src = state + (
@@ -533,7 +542,7 @@ class FusedVerifyStep:
                             for i in cutlass.range_constexpr(3):
                                 field = retained[i + 1]
                                 base = field.iterator + (
-                                    live_page * field.stride[0]
+                                    slot * field.stride[0]
                                     + Int64(head) * field.stride[1]
                                 )
                                 _bulk_load(
@@ -546,15 +555,13 @@ class FusedVerifyStep:
                         if output_warp:
                             for rec in cutlass.range(accepted, unroll=2):
                                 history_u[rec * THREADS + tidx] = load_element(
-                                    retained[1], live_page, head, rec, tidx
+                                    retained[1], slot, head, rec, tidx
                                 )
                                 weighted_history_keys[rec * THREADS + tidx] = (
-                                    load_element(
-                                        retained[2], live_page, head, rec, tidx
-                                    )
+                                    load_element(retained[2], slot, head, rec, tidx)
                                 )
                                 record_decay[rec * THREADS + tidx] = load_element(
-                                    retained[3], live_page, head, rec, tidx
+                                    retained[3], slot, head, rec, tidx
                                 )
                 if const_expr(not self.fp32_checkpoint):
                     if not packed_checkpoint:
@@ -568,7 +575,7 @@ class FusedVerifyStep:
             else:
                 if output_warp:
                     _replay_step_tile(
-                        tile, retained, live_page, head, tidx, accepted, V, K
+                        tile, retained, live_page, slot, head, tidx, accepted, V, K
                     )
                 cute.arch.barrier()
                 if thread == 0:
@@ -607,7 +614,7 @@ class FusedVerifyStep:
                 for c in cutlass.range_constexpr(3):
                     for i in cutlass.range_constexpr(CONV_TAPS - 1):
                         past = Float32(0.0)
-                        if (valid > 0) & (page >= 0):
+                        if (valid > 0) & (page >= 0) & (page < retained[0].shape[0]):
                             past = _load(history, channels[c] * 3 + i).to(Float32)
                         pasts.append(past)
                 # Convolution over the committed window and this row.
@@ -650,7 +657,7 @@ class FusedVerifyStep:
                     output_coeff = query_scale * key_scale * totals[2]
                     field = retained[2]
                     index = (
-                        live_page * field.stride[0]
+                        slot * field.stride[0]
                         + Int64(head) * field.stride[1]
                         + Int64(accepted) * field.stride[2]
                         + Int64(tidx) * field.stride[3]
@@ -665,7 +672,7 @@ class FusedVerifyStep:
                 if const_expr(self.has_metadata):
                     if (head == 0) & (thread == 2 * THREADS - 1):
                         meta = metadata + Int64(request) * 3
-                        slot = Int64(_load(meta, 0))
+                        stamp_slot = Int64(_load(meta, 0))
                         generation = Int64(_load(meta, 1))
                         start = Int64(_load(meta, 2))
                         position = Int64(0)
@@ -674,7 +681,7 @@ class FusedVerifyStep:
                         else:
                             position = start % ring_capacity
                         tag = cute.make_tensor(
-                            stamps + (slot * ring_capacity + position) * 2,
+                            stamps + (stamp_slot * ring_capacity + position) * 2,
                             cute.make_layout((2,)),
                         )
                         tag[0] = start
@@ -759,7 +766,7 @@ class FusedVerifyStep:
                     decays[gate_row] = new_decay
                     field = retained[3]
                     index = (
-                        live_page * field.stride[0]
+                        slot * field.stride[0]
                         + Int64(head) * field.stride[1]
                         + Int64(accepted) * field.stride[2]
                         + Int64(gate_row) * field.stride[3]
@@ -920,7 +927,7 @@ class FusedVerifyStep:
                     dst = out + (token_start * out_token_stride + head * V + tidx)
                     _store_if(Int32(1), dst.toint(), output, True)
                     entry = correction + (
-                        live_page * correction_slot_stride
+                        slot * correction_slot_stride
                         + head * correction_head_stride
                         + Int64(accepted) * correction_position_stride
                         + tidx
@@ -986,12 +993,12 @@ def _update_step_state(current, decay, u, key, *, loc=None, ip=None):
 
 @cute.jit
 def _replay_step_record(
-    history, page, head, position, first, key, decay, s0, s1, s2, s3
+    history, slot, head, position, first, key, decay, s0, s1, s2, s3
 ):
-    u0 = load_element(history[1], page, head, position, first)
-    u1 = load_element(history[1], page, head, position, first + 1)
-    u2 = load_element(history[1], page, head, position, first + 2)
-    u3 = load_element(history[1], page, head, position, first + 3)
+    u0 = load_element(history[1], slot, head, position, first)
+    u1 = load_element(history[1], slot, head, position, first + 1)
+    u2 = load_element(history[1], slot, head, position, first + 2)
+    u3 = load_element(history[1], slot, head, position, first + 3)
     return (
         _update_step_state(s0, decay, u0, key),
         _update_step_state(s1, decay, u1, key),
@@ -1005,6 +1012,7 @@ def _replay_step_tile(
     tile,
     history,
     page,
+    slot,
     head,
     tidx,
     count,
@@ -1019,10 +1027,10 @@ def _replay_step_tile(
         s2 = load_element(history[0], page, head, first + 2, tidx)
         s3 = load_element(history[0], page, head, first + 3, tidx)
         for position in cutlass.range(count, unroll=1):
-            key = load_element(history[2], page, head, position, tidx)
-            decay = load_element(history[3], page, head, position, tidx)
+            key = load_element(history[2], slot, head, position, tidx)
+            decay = load_element(history[3], slot, head, position, tidx)
             s0, s1, s2, s3 = _replay_step_record(
-                history, page, head, position, first, key, decay, s0, s1, s2, s3
+                history, slot, head, position, first, key, decay, s0, s1, s2, s3
             )
         tile[first * keys + tidx] = s0
         tile[(first + 1) * keys + tidx] = s1
@@ -1036,6 +1044,7 @@ def _compile(
     capacity: int,
     state_dtype: torch.dtype,
     live_dtype: torch.dtype,
+    slot_dtype: torch.dtype,
     packed_history: bool,
     bounded_gate: bool,
     has_metadata: bool,
@@ -1086,9 +1095,9 @@ def _compile(
         state,
         correction,
         normalized_key,
-        slots=slots,
         batch=batch,
         live_dtype=_DTYPES[live_dtype],
+        slot_dtype=_DTYPES[slot_dtype],
     )
     kernel = FusedVerifyStep(
         heads,
@@ -1162,7 +1171,8 @@ def fused_verify_step_supported(
             checkpoint in value-major layout.
         retained_history: Accepted records and per-request live pages.
         query_start_loc: Packed request token boundaries.
-        state_indices: Per-request source pages.
+        state_indices: Per-request source pages. Pages at or below 0, or past
+            the checkpoint pool, are padding: zero history and no records.
         num_heads: Per-rank head count.
         head_dim: Head width.
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
@@ -1202,6 +1212,13 @@ def fused_verify_step_supported(
         and A_log.stride(0) == 1
         and dt_bias.is_contiguous()
         and checkpoint_state.shape[1:] == (num_heads, head_dim, head_dim)
+        # The kernel bounds convolution pages by the checkpoint pool's count.
+        and conv_states.shape[0] == checkpoint_state.shape[0]
+        and retained_history.correction.shape[1] == num_heads
+        and retained_history.correction.shape[3]
+        == retained_history.key.shape[3]
+        == head_dim
+        and retained_history.live_state_indices.shape == state_indices.shape
         and checkpoint_state.stride()[2:] == (head_dim, 1)
         and checkpoint_state.stride(0) % 4 == 0
         and checkpoint_state.stride(1) % 4 == 0
@@ -1318,14 +1335,15 @@ def fused_verify_step(
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
         checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32/BF16
             committed checkpoint in value-major layout; read only.
-        retained_history: Page-owned FP32 U/normalized-K/decay and accepted
-            lengths. Candidates append after each live page's accepted prefix.
+        retained_history: Request-slot FP32 U/normalized-K/decay and accepted
+            lengths. Candidates append after each slot's accepted prefix.
         original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
             the pre-convolution rows for commit.
         query_start_loc: ``[batch + 1]`` token offset of each request.
         state_indices: ``[batch]`` checkpoint and convolution page of each
-            request. Pages at or below 0 are padding: zero outputs and no
-            records, though their pre-convolution rows are still retained.
+            request. Pages at or below 0, or past the checkpoint pool, are
+            padding: zero outputs and no records, though their
+            pre-convolution rows are still retained.
         num_heads: Per-rank head count.
         head_dim: Head width; 128.
         out: ``[tokens, num_heads * head_dim]`` BF16 verify output, or with
@@ -1377,6 +1395,7 @@ def fused_verify_step(
         correction_cache.shape[2],
         checkpoint_state.dtype,
         retained_history.live_state_indices.dtype,
+        retained_history.record_slots.dtype,
         retained_history.packed_record_width == head_dim,
         bounded,
         record_metadata is not None,
@@ -1390,7 +1409,12 @@ def fused_verify_step(
     consolidate_history(
         checkpoint_state, retained_history, state_indices, query_start_loc
     )
-    reset_retained_history(retained_history, state_indices, query_start_loc)
+    reset_retained_history(
+        retained_history,
+        state_indices,
+        query_start_loc,
+        page_count=checkpoint_state.shape[0],
+    )
     kernel(
         mixed_qkv,
         conv_weights,

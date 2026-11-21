@@ -56,13 +56,13 @@ VERIFY = getattr(api, f"gluon_kda_retained_verify_{ARCH}")
 COMMIT = getattr(api, f"gluon_kda_retained_commit_{ARCH}")
 
 
-def _reconstruct(base, history, page, length):
+def _reconstruct(base, history, slot, length):
     current = base.clone()
     for t in range(length):
-        current = current * history.decay[page, :, t, None, :]
+        current = current * history.decay[slot, :, t, None, :]
         current = (
             current
-            + history.correction[page, :, t, :, None] * history.key[page, :, t, None, :]
+            + history.correction[slot, :, t, :, None] * history.key[slot, :, t, None, :]
         )
     return current
 
@@ -154,23 +154,29 @@ def _case(
     )
     state = (torch.randn(pages, heads, dim, dim, device="cuda") * 0.02).to(state_dtype)
     conv = torch.randn(pages, 3 * heads * dim, 3, device="cuda").bfloat16()
-    u = torch.randn(pages, heads, capacity, dim, device="cuda") * 0.02
+    slots = torch.arange(batch, device="cuda", dtype=torch.int64)
+    u = torch.randn(batch, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
-    length = torch.full((pages, 1), initial_length, device="cuda", dtype=torch.int32)
+    # One accepted count per request slot. Rows that share the dense source
+    # page start with empty histories.
+    length = torch.full((batch, 1), initial_length, device="cuda", dtype=torch.int32)
+    if cross_page and batch > 1:
+        length.zero_()
     if strided:
-        u, key, decay, length, live = [
-            _arena(x, arena_step) for x in (u, key, decay, length, live)
+        u, key, decay, length, live, slots = [
+            _arena(x, arena_step) for x in (u, key, decay, length, live, slots)
         ]
         source = _arena(source, arena_step)
-    history = KdaRetainedHistory(u, key, decay, length, live)
+    history = KdaRetainedHistory(u, key, decay, length, live, slots)
     # Deliberately wrong live convolution must never affect a cross-page verify.
     if cross_page:
         conv[live.long()] = 11
     if null_row:
         source[-1] = 0
     expected = [
-        _reconstruct(state[int(s)], history, int(s), initial_length) for s in source
+        _reconstruct(state[page], history, slot, int(length[slot]))
+        for page, slot in zip(source.tolist(), slots.tolist())
     ]
     expected_conv = [conv[int(s)].clone() for s in source]
     weights = torch.randint(-3, 4, (3 * heads * dim, 4), device="cuda").float() * 0.125
@@ -191,7 +197,6 @@ def _case(
         else None
     )
     source_state, source_conv = state[1].clone(), conv[1].clone()
-    source_records = [x[1].clone() for x in (u, key, decay, length)]
     for round_idx, accepted in enumerate(accepted_rounds):
         tokens = starts_list[-1]
         mixed = (
@@ -219,7 +224,7 @@ def _case(
             )
         before = state.clone()
         conv_before = conv.clone()
-        old_lengths = [int(length[int(s), 0]) for s in source]
+        old_lengths = [int(length[int(slot), 0]) for slot in slots]
         references = []
         for r, n in enumerate(lengths):
             if n and int(source[r]) > 0:
@@ -336,7 +341,7 @@ def _case(
                 continue
             consolidated = dst != src or old_lengths[r] + lengths[r] > capacity
             old = 0 if consolidated else old_lengths[r]
-            assert int(length[dst, 0]) == old
+            assert int(length[int(slots[r]), 0]) == old
             torch.testing.assert_close(
                 state[dst].float(),
                 expected[r] if consolidated else before[dst].float(),
@@ -365,7 +370,7 @@ def _case(
             )
             for actual, target in zip((u, key, decay), ref[2:]):
                 torch.testing.assert_close(
-                    actual[dst, :, old : old + lengths[r]],
+                    actual[int(slots[r]), :, old : old + lengths[r]],
                     target.transpose(0, 1),
                     atol=3e-6,
                     rtol=3e-5,
@@ -434,10 +439,10 @@ def _case(
             torch.testing.assert_close(actual, before_record, atol=0, rtol=0)
         for r, n in enumerate(lengths):
             if not n or references[r] is None:
-                dst = int(live[r])
+                dst, slot = int(live[r]), int(slots[r])
                 torch.testing.assert_close(conv[dst], conv_before[dst], atol=0, rtol=0)
                 torch.testing.assert_close(
-                    length[dst], length_before[dst], atol=0, rtol=0
+                    length[slot], length_before[slot], atol=0, rtol=0
                 )
                 continue
             take = max(0, min(accepted, n))
@@ -447,7 +452,7 @@ def _case(
                 if int(source[r]) != dst or old_lengths[r] + n > capacity
                 else old_lengths[r]
             )
-            assert int(length[dst, 0]) == old + take
+            assert int(length[int(slots[r]), 0]) == old + take
             if take:
                 expected[r] = references[r][1][take - 1]
             if take:
@@ -457,7 +462,7 @@ def _case(
                 )[:, -3:]
             torch.testing.assert_close(conv[dst], expected_conv[r], atol=0, rtol=0)
             torch.testing.assert_close(
-                _reconstruct(state[dst], history, dst, old + take),
+                _reconstruct(state[dst], history, int(slots[r]), old + take),
                 expected[r],
                 atol=4e-6,
                 rtol=4e-5,
@@ -465,8 +470,6 @@ def _case(
         if cross_page and round_idx == 0:
             torch.testing.assert_close(state[1], source_state, atol=0, rtol=0)
             torch.testing.assert_close(conv[1], source_conv, atol=0, rtol=0)
-            for actual, before_record in zip((u, key, decay, length), source_records):
-                torch.testing.assert_close(actual[1], before_record, atol=0, rtol=0)
         source = live.clone()
     return history
 

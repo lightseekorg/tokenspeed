@@ -50,13 +50,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 )
 
 # The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
-# load-back ticket, a retraction image's snapshot store, a restore. The data
-# plane reports them to the Rust control plane as ``(kind, op_id)`` payloads.
+# load-back ticket, a retraction image's snapshot store, a restore, a plan's
+# state commit fence. The data plane reports them to the Rust control plane
+# as ``(kind, op_id)`` payloads.
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
+    "StateCommitDoneEvent": Cache.StateCommitDoneEvent,
 }
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
@@ -457,7 +459,7 @@ def cache_event_to_payload(event) -> dict:
     """A cache ACK as the payload the host's data plane reports
     (``HostDataPlane.poll_cache_events``).
 
-    ``(kind, op_id)`` identifies a completed Host copy.
+    ``(kind, op_id)`` identifies a completed Host copy or state commit fence.
     """
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:

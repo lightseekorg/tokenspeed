@@ -127,7 +127,8 @@ def test_channels_last_axis_must_exist_in_field_shape():
 
 @pytest.mark.parametrize("tp", [4, 8, 16])
 @pytest.mark.parametrize("recurrent_state_dtype", ["float32", "bfloat16"])
-def test_retained_checkpoint_transfer_owns_all_fields(tp, recurrent_state_dtype):
+def test_kda_transfers_only_the_dense_checkpoint(tp, recurrent_state_dtype):
+    """Retained decode history stays in request slots and never crosses PD."""
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
         kda_state_fields,
     )
@@ -139,7 +140,6 @@ def test_retained_checkpoint_transfer_owns_all_fields(tp, recurrent_state_dtype)
         conv_shape=(3 * 64 * 128 // tp, 3),
         recurrent_shape=(64 // tp, 128, 128),
         recurrent_state_dtype=recurrent_state_dtype,
-        history_capacity=16,
     )
     groups = (
         (CacheGroupSpec(group_id="state", attn_kind="state", replayable=False), fields),
@@ -152,15 +152,10 @@ def test_retained_checkpoint_transfer_owns_all_fields(tp, recurrent_state_dtype)
     ).bind(2)
     schema = build_cache_transfer_schema(plan, model_config=ModelFacts())
     schema.validate(plan)
-    assert len(plan.fields) == 6
-    for suffix in (
-        "recurrent_state",
-        "replay_correction",
-        "replay_key",
-        "replay_decay",
-    ):
-        partition = schema.partition_for(f"layer.0.{suffix}")
-        assert partition.axis == 0
-        assert partition.global_extent == 64
-    # Accepted length is replicated together with the sharded checkpoint.
-    assert schema.partition_for("layer.0.replay_length") is None
+    assert {field.field_id for field in plan.fields} == {
+        "layer.0.conv_state",
+        "layer.0.recurrent_state",
+    }
+    partition = schema.partition_for("layer.0.recurrent_state")
+    assert partition.axis == 0
+    assert partition.global_extent == 64

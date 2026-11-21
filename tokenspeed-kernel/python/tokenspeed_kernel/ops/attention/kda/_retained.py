@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Validation and launch boundary for page-owned KDA history."""
+"""Validation and launch boundary for request-owned KDA records."""
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -35,14 +35,19 @@ def _kernels():
     return retained, {}
 
 
-def materialize(recurrent, *, history, source_indices, recurrent_layout):
-    pages, heads, capacity, values = history.correction.shape
+def materialize(recurrent, *, history, source_indices, recurrent_layout, paged):
+    slots, heads, capacity, values = history.correction.shape
     keys = history.key.shape[-1]
     expected = (values, keys) if recurrent_layout == "v_major" else (keys, values)
     if recurrent_layout not in ("v_major", "k_major"):
         raise ValueError("unsupported recurrent layout")
+    rows = source_indices.numel()
+    # A paged fold writes pool pages; a gathered fold writes one row per source.
+    pages = recurrent.shape[0]
     if (
-        recurrent.shape != (source_indices.numel(), heads, *expected)
+        recurrent.shape[1:] != (heads, *expected)
+        or (not paged and pages != rows)
+        or history.record_slots.numel() < rows
         or recurrent.dtype not in (torch.float32, torch.bfloat16)
         or source_indices.ndim != 1
         or source_indices.dtype not in (torch.int32, torch.int64)
@@ -64,13 +69,17 @@ def materialize(recurrent, *, history, source_indices, recurrent_layout):
         history.decay,
         history.length,
         source_indices,
+        history.record_slots,
         recurrent.stride(),
         history.correction.stride(),
         history.key.stride(),
         history.decay.stride(),
         history.length.stride(0),
         source_indices.stride(0),
+        history.record_slots.stride(0),
         pages,
+        slots,
+        PAGED=paged,
         K=keys,
         V=values,
         CAPACITY=capacity,
@@ -79,26 +88,49 @@ def materialize(recurrent, *, history, source_indices, recurrent_layout):
         num_warps=4,
         **options,
     )
+    if paged:
+        reset_length(
+            history.length,
+            write_indices=source_indices,
+            record_slots=history.record_slots,
+            page_count=pages,
+        )
 
 
-def reset_length(length, *, write_indices):
+def reset_length(length, *, write_indices, record_slots, page_count):
+    """Zero the slot length of each row whose destination page lies in the pool."""
+    if (
+        isinstance(page_count, bool)
+        or not isinstance(page_count, int)
+        or page_count < 1
+    ):
+        raise ValueError("page_count must be a positive page-pool size")
     if (
         length.ndim != 2
         or length.shape[1] != 1
         or length.dtype != torch.int32
         or write_indices.ndim != 1
-        or write_indices.dtype not in (torch.int32, torch.int64)
-        or write_indices.device != length.device
+        or record_slots.ndim != 1
+        or record_slots.numel() < write_indices.numel()
+        or any(
+            x.dtype not in (torch.int32, torch.int64) or x.device != length.device
+            for x in (write_indices, record_slots)
+        )
     ):
-        raise ValueError("length must be INT32 [page, 1] and indices an integer vector")
+        raise ValueError(
+            "length must be INT32 [slot, 1] and pages/slots integer request vectors"
+        )
     if write_indices.numel() == 0:
         return
     kernels, options = _kernels()
     kernels.retained_reset_length_kernel[(triton.cdiv(write_indices.numel(), 256),)](
         length,
         write_indices,
-        write_indices.numel(),
+        record_slots,
+        record_slots.stride(0),
         length.shape[0],
+        page_count,
+        write_indices.numel(),
         length.stride(0),
         write_indices.stride(0),
         BLOCK=256,
@@ -115,8 +147,14 @@ def batched_commit(
     write_indices,
     accepted_length,
     query_start_loc,
+    record_slots,
+    record_slot_count,
     record_metadata,
     record_stamps,
+    retained_correction,
+    retained_key,
+    retained_decay,
+    request_stopped,
     draft_token_num,
     history_capacity,
     num_heads,
@@ -124,13 +162,17 @@ def batched_commit(
     conv_width,
     activation_dtype,
     conv_state_dtype,
+    recurrent_state_dtype,
 ):
     """Update all layers' convolution, then publish their accepted lengths.
 
-    descriptors is contiguous UINT64 [layers, 9]: original QKV, convolution,
-    length pointers; page count; QKV row, convolution page, length page,
-    convolution channel, convolution tap element strides. QKV channels have
-    unit stride. group_indices maps layers into [groups, requests] page tables.
+    descriptors is contiguous UINT64 [layers, 14]: original QKV, convolution,
+    length pointers; page count; QKV row, convolution page, length slot,
+    convolution channel, convolution tap element strides; the v-major
+    recurrent state pointer and its page, head, value and key element
+    strides. QKV channels have unit stride. Every layer's length holds
+    record_slot_count request slots; record_slots selects each request's slot.
+    group_indices maps layers into [groups, requests] page tables.
     Each live destination is private and cannot overlap another active source.
     Per-layer descriptor values are validated by the cache owner when binding
     its arena; the launch validates shared tensor geometry without GPU reads.
@@ -140,7 +182,13 @@ def batched_commit(
     INT64 [requests, 3]; stamps is INT64 [layers, slots, ring capacity, 2],
     including strided layer subsets. Every accepted stamp must match before
     either phase writes. history_capacity and ring capacity are independent.
-    No dense checkpoints or history vectors are copied by this operation.
+
+    retained_correction, retained_key and retained_decay are the FP32 records
+    [record slots, layers, heads, history_capacity, head_dim]. request_stopped
+    is a bool per request slot, set for a request that ended in this forward.
+    Such a request's accepted records, through this round's acceptance, are
+    folded into its live page's dense state, and its length is cleared
+    instead of advanced. No other dense checkpoint or record is copied.
     """
     if (
         num_heads <= 0
@@ -160,15 +208,18 @@ def batched_commit(
     if (
         activation_dtype not in (torch.bfloat16, torch.float16)
         or conv_state_dtype not in types
+        or recurrent_state_dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise ValueError("unsupported retained activation or convolution dtype")
+        raise ValueError(
+            "unsupported retained activation, convolution or recurrent dtype"
+        )
     if (
         descriptors.ndim != 2
-        or descriptors.shape[1] != 9
+        or descriptors.shape[1] != 14
         or descriptors.dtype != torch.uint64
         or not descriptors.is_contiguous()
     ):
-        raise ValueError("retained descriptors must be contiguous UINT64 [layers, 9]")
+        raise ValueError("retained descriptors must be contiguous UINT64 [layers, 14]")
     layers = descriptors.shape[0]
     batch = accepted_length.numel()
     if (
@@ -179,9 +230,12 @@ def batched_commit(
         or write_indices.shape != read_indices.shape
         or accepted_length.shape != (batch,)
         or query_start_loc.shape != (batch + 1,)
+        or record_slots.shape != (batch,)
+        or record_slot_count <= 0
     ):
         raise ValueError(
-            "retained commit requires layer groups, [groups, batch] pages and packed boundaries"
+            "retained commit requires layer groups, [groups, batch] pages, "
+            "packed boundaries and one record slot per request"
         )
     if any(
         x.dtype not in (torch.int32, torch.int64)
@@ -191,6 +245,7 @@ def batched_commit(
             write_indices,
             accepted_length,
             query_start_loc,
+            record_slots,
         )
     ):
         raise ValueError(
@@ -209,6 +264,18 @@ def batched_commit(
         raise ValueError(
             "retained metadata/stamps must be INT64 [batch,3] and [layers,slots,capacity,2]"
         )
+    records = (retained_correction, retained_key, retained_decay)
+    if any(
+        x.shape != (record_slot_count, layers, num_heads, history_capacity, head_dim)
+        or x.dtype != torch.float32
+        for x in records
+    ):
+        raise ValueError(
+            "retained records must be FP32 [record slots, layers, heads, "
+            "capacity, head_dim]"
+        )
+    if request_stopped.ndim != 1 or request_stopped.dtype != torch.bool:
+        raise ValueError("request stop flags must be a bool vector")
     if any(
         x.device != descriptors.device
         for x in (
@@ -217,8 +284,11 @@ def batched_commit(
             write_indices,
             accepted_length,
             query_start_loc,
+            record_slots,
             record_metadata,
             record_stamps,
+            *records,
+            request_stopped,
         )
     ):
         raise ValueError("retained commit tensors must share a device")
@@ -232,26 +302,36 @@ def batched_commit(
         write_indices,
         accepted_length,
         query_start_loc,
+        record_slots,
         record_metadata,
         record_stamps,
+        request_stopped,
         read_indices.shape[0],
         read_indices.stride(),
         write_indices.stride(),
         accepted_length.stride(0),
         query_start_loc.stride(0),
+        record_slots.stride(0),
+        record_slot_count,
         record_stamps.stride(),
         record_stamps.shape[1],
         record_stamps.shape[2],
+        request_stopped.numel(),
     )
     kernels.retained_batched_conv_kernel[
         (layers, batch, triton.cdiv(3 * num_heads * head_dim, 256))
     ](
         *args,
+        *records,
+        *(x.stride() for x in records),
         CAPACITY=history_capacity,
         WINDOW=draft_token_num,
         CHANNELS=3 * num_heads * head_dim,
         ACTIVATION=types[activation_dtype],
         CONV=types[conv_state_dtype],
+        STATE=types[recurrent_state_dtype],
+        HEADS=num_heads,
+        DIM=head_dim,
         BLOCK=256,
         num_warps=4,
         **options,

@@ -48,13 +48,17 @@ def _validate_retained_request(
     record_stamps: torch.Tensor | None,
 ) -> None:
     """Check request inputs against validated storage without reading GPU values."""
-    pages, heads, _, values = history.correction.shape
-    if checkpoint_state.shape != (
-        pages,
-        heads,
-        values,
-        history.key.shape[3],
-    ) or checkpoint_state.dtype not in (torch.float32, torch.bfloat16):
+    _, heads, _, values = history.correction.shape
+    if (
+        checkpoint_state.ndim != 4
+        or checkpoint_state.shape[1:]
+        != (
+            heads,
+            values,
+            history.key.shape[3],
+        )
+        or checkpoint_state.dtype not in (torch.float32, torch.bfloat16)
+    ):
         raise ValueError(
             "retained FP32/BF16 checkpoint must match the history geometry"
         )
@@ -189,7 +193,7 @@ def vllm_triton_kda_recoverssm_commit(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
 ) -> None:
-    """Validate accepted stamps and publish live retained lengths without changing dense state."""
+    """Validate accepted stamps and publish slot retained lengths without changing dense state."""
     del q, k, v
     batch = state_indices.shape[0]
     _validate_retained_request(
@@ -214,6 +218,7 @@ def vllm_triton_kda_recoverssm_commit(
             retained_history.length,
             state_indices,
             retained_history.live_state_indices,
+            retained_history.record_slots,
             query_start_loc,
             num_accepted_tokens,
             record_metadata,
@@ -221,9 +226,12 @@ def vllm_triton_kda_recoverssm_commit(
             retained_history.length.stride(0),
             state_indices.stride(0),
             retained_history.live_state_indices.stride(0),
+            retained_history.record_slots.stride(0),
+            retained_history.correction.shape[0],
             query_start_loc.stride(0),
             num_accepted_tokens.stride(0),
             record_stamps.shape[0] if record_stamps is not None else 0,
+            checkpoint_state.shape[0],
             STAMP_CAPACITY=(record_stamps.shape[1] if record_stamps is not None else 1),
             CAPACITY=retained_history.correction.shape[2],
             SPEC_QUERY_LEN=spec_query_len,

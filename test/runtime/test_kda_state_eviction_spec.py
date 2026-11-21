@@ -84,20 +84,13 @@ _D = 128
 _FA = 128
 _LAYERS = (0, 1, 2)
 _COMPONENTS = ("conv_state", "recurrent_state")
-_CHECKPOINT_COMPONENTS = (
-    *_COMPONENTS,
-    "replay_correction",
-    "replay_key",
-    "replay_decay",
-    "replay_length",
-)
 
 
 def _checkpoint_components(pool, pages_by_layer):
     return {
         (layer, component): pool.get_component(layer, component)[pages].clone()
         for layer, pages in pages_by_layer.items()
-        for component in _CHECKPOINT_COMPONENTS
+        for component in _COMPONENTS
     }
 
 
@@ -117,6 +110,10 @@ class _KDA:
             self.pool = pool
             self.contract = pool.arena.runtime_contract
         self.backend = _backend("cuda", contract_pool=self.pool, spec_tokens=width)
+        # RuntimeStates.stopped, as the executor binds it: a test marks the
+        # slot of a request whose round ends it, before that round's commit.
+        self.stopped = torch.zeros(16, dtype=torch.bool, device="cuda")
+        self.backend.bind_request_stop_flags(self.stopped)
         self.backend.init_cuda_graph_state(max_bs=8)
         self.backend.preallocate_verify_workspace(8, width)
         generator = torch.Generator(device="cpu").manual_seed(107)
@@ -222,11 +219,13 @@ class _KDA:
             outputs[layer] = output.reshape(end - begin, _H, _D).clone()
         return outputs
 
-    def states(self, tables):
+    def states(self, tables, request_slot: int | None):
         return {
             (layer, component): (
-                _logical_checkpoint(self.pool, layer, tables[group][0][STATE_LIVE_SLOT])
-                if component == "recurrent_state"
+                _logical_checkpoint(
+                    self.backend, layer, tables[group][0][STATE_LIVE_SLOT], request_slot
+                )
+                if component == "recurrent_state" and request_slot is not None
                 else self.pool.get_component(layer, component)[
                     tables[group][0][STATE_LIVE_SLOT]
                 ].clone()
@@ -291,8 +290,10 @@ def _inputs():
     }
 
 
-def _reference(inputs, num_positions: int, params):
-    """Independent PyTorch output/state after each token, without cache execution."""
+def _reference(
+    inputs, num_positions: int, params, *, checkpoints=(), recurrent_dtype=torch.float32
+):
+    """Compute independent tokenwise states, rounding once at each dense checkpoint."""
     from test.runtime.kda_torch_reference import kda_torch_reference
 
     outputs, states = {}, {count: {} for count in range(1, num_positions + 1)}
@@ -301,22 +302,33 @@ def _reference(inputs, num_positions: int, params):
         gate = torch.nn.functional.linear(
             inputs["f_a_out"][:num_positions], weights["f_b_weight"]
         )
-        output, recurrent, windows = kda_torch_reference(
-            inputs["mixed_qkv"][:num_positions].unsqueeze(0),
-            torch.zeros(1, 3 * _H * _D, 3, device="cuda", dtype=torch.bfloat16),
-            torch.zeros(1, _H, _D, _D, device="cuda"),
-            inputs["beta_raw"][:num_positions],
-            conv_weights=weights["conv_weights"],
-            bias=None,
-            gate=gate,
-            A_log=weights["A_log"],
-            dt_bias=weights["dt_bias"],
-            lower_bound=-5.0,
-        )
-        outputs[layer] = output[0]
-        for position in range(num_positions):
-            states[position + 1][layer, "recurrent_state"] = recurrent[0, position]
-            states[position + 1][layer, "conv_state"] = windows[0, position]
+        conv = torch.zeros(1, 3 * _H * _D, 3, device="cuda", dtype=torch.bfloat16)
+        base = torch.zeros(1, _H, _D, _D, device="cuda")
+        parts = []
+        begin = 0
+        for end in (*checkpoints, num_positions):
+            output, recurrent, windows = kda_torch_reference(
+                inputs["mixed_qkv"][begin:end].unsqueeze(0),
+                conv,
+                base,
+                inputs["beta_raw"][begin:end],
+                conv_weights=weights["conv_weights"],
+                bias=None,
+                gate=gate[begin:end],
+                A_log=weights["A_log"],
+                dt_bias=weights["dt_bias"],
+                lower_bound=-5.0,
+            )
+            parts.append(output[0])
+            for i in range(end - begin):
+                states[begin + i + 1][layer, "recurrent_state"] = recurrent[0, i]
+                states[begin + i + 1][layer, "conv_state"] = windows[0, i]
+            if end != num_positions:
+                base = recurrent[:, -1].to(recurrent_dtype).float()
+                conv = windows[:, -1]
+                states[end][layer, "recurrent_state"] = base[0]
+            begin = end
+        outputs[layer] = torch.cat(parts)
     return outputs, states
 
 
@@ -351,6 +363,7 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
     scheduler.submit_requests([request])
     batch, tables = _batch(scheduler, "source")
     assert list(batch.input_lengths) == [4]
+    source_slot = batch.request_pool_indices[0]
     actual.metadata(
         tables,
         begin=0,
@@ -362,17 +375,20 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
     outputs = actual.forward(inputs, begin=0, end=4, prefill=True)
     for layer in _LAYERS:
         _assert_close(outputs[layer], reference_outputs[layer][:4], "initial prefill")
-    _assert_states(actual.states(tables), reference_states[4], "initial prefill")
+    _assert_states(
+        actual.states(tables, source_slot), reference_states[4], "initial prefill"
+    )
     _feedback(scheduler, request_id="source", tokens=[4], decode=False)
     prompt_end_tables = tables
-    prompt_end = actual.states(tables)
+    prompt_end = actual.states(tables, source_slot)
 
     computed = 4
     live_blocks = None
     # Every verify round reads the committed state and commits the accepted
     # prefix into the live block; the first round reads the prompt-end
     # checkpoint from slot 0, every later one evolves the live block in place.
-    for index, accepted in enumerate([1, 2, 3, 2, 1, 3] + [3, 1] * 6):
+    rounds = [1, 2, 3, 2, 1, 3] + [3, 1] * 6
+    for index, accepted in enumerate(rounds):
         batch, tables = _batch(scheduler, "source")
         assert batch.num_extends() == 0
         assert list(batch.input_lengths) == [_WIDTH]
@@ -401,6 +417,10 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
         outputs = actual.forward(
             inputs, begin=computed, end=computed + _WIDTH, prefill=False
         )
+        if index == len(rounds) - 1:
+            # The round reaches the request's token limit: the sampling
+            # epilogue marks its slot before the commit runs.
+            actual.stopped[source_slot] = True
         actual.backend.commit_verified_state(
             torch.tensor([accepted], dtype=torch.int32, device="cuda"),
             accepted_path=None,
@@ -413,7 +433,7 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
                 f"accepted verify outputs at {end}",
             )
         _assert_states(
-            actual.states(tables),
+            actual.states(tables, source_slot),
             reference_states[end],
             f"accepted endpoint {end}",
         )
@@ -428,12 +448,22 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
         assert scheduler.empty_lcm_blocks() == empty_before_feedback
         computed = end
     assert computed == 40
+    # The ending round folded the slot's records: the live block alone holds
+    # the endpoint the finish publishes.
+    finish_endpoint = actual.states(tables, None)
+    for layer in _LAYERS:
+        assert actual.backend._retained_lengths[layer][source_slot].item() == 0
+    _assert_states(finish_endpoint, reference_states[40], "ended live block")
     _assert_states(
-        actual.states(prompt_end_tables), prompt_end, "prompt-end checkpoint"
+        actual.states(prompt_end_tables, None),
+        prompt_end,
+        "prompt-end checkpoint",
     )
     finish = ts.ForwardEvent.Finish()
     finish.request_id = "source"
     scheduler.advance(ts.ExecutionEvent().add_event(finish))
+    # The executor clears the flag when the slot's next request starts.
+    actual.stopped[source_slot] = False
     finish_tables = tables
     source_pages = {
         layer: [
@@ -442,7 +472,7 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
         ]
         for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
     }
-    published_components = _checkpoint_components(actual.pool, source_pages)
+    published_components = None
     aborted_live_pages = set()
     reused_live_pages = set()
 
@@ -456,6 +486,16 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
         request.max_new_tokens = 4
         scheduler.submit_requests([request])
         batch, tables = _batch(scheduler, request.request_id)
+        if published_components is None:
+            published_components = _checkpoint_components(actual.pool, source_pages)
+            for layer in _LAYERS:
+                for component in _COMPONENTS:
+                    assert torch.equal(
+                        published_components[layer, component][1],
+                        finish_endpoint[layer, component],
+                    ), f"publication changed the ended layer {layer} {component}"
+            # The next resident can overwrite the source's former slot.
+            actual.backend._retained_records[source_slot].fill_(float("nan"))
         assert int(batch.extend_prefix_lens[0]) == begin
         checkpoint_tables = prompt_end_tables if begin == 4 else finish_tables
         for group in KIMI_STATE_GROUPS:
@@ -488,7 +528,9 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
                 f"resume {boundary}",
             )
         _assert_states(
-            actual.states(tables), reference_states[end], f"resume {boundary}"
+            actual.states(tables, batch.request_pool_indices[0]),
+            reference_states[end],
+            f"resume {boundary}",
         )
         _feedback(
             scheduler,
@@ -510,7 +552,9 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
         reused_live_pages
     ), f"later probes did not reuse aborted private pages: {reused_live_pages}"
     _assert_states(
-        actual.states(prompt_end_tables), prompt_end, "prompt-end checkpoint"
+        actual.states(prompt_end_tables, None),
+        prompt_end,
+        "prompt-end checkpoint",
     )
     for layer in _LAYERS:
         for component in _COMPONENTS:
@@ -593,6 +637,8 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
         output_length=width,
         device="cuda",
     )
+    # As the executor does: the decode commit reads the epilogue's stop flags.
+    actual.backend.bind_request_stop_flags(runtime.stopped)
     commit = _Commit()
     prompt = list(range(4))
     criteria = StopCriteria(stop_token_ids=(_STOP,), token_limit=len(prompt) + 40)
@@ -684,7 +730,6 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
             assert torch.equal(
                 value.view(torch.uint8), finished_components[key].view(torch.uint8)
             ), f"queued stopped row changed checkpoint component {key}"
-    published = actual.states(tables)
 
     # A prompt extending the reported tokens resumes at the frontier, the
     # position of the stop token, from the live slot the finish published.
@@ -697,6 +742,7 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     scheduler.submit_requests([probe])
     batch, probe_tables = _batch(scheduler, "probe")
     assert int(batch.extend_prefix_lens[0]) == frontier
+    published = actual.states(tables, None)
     for group in KIMI_STATE_GROUPS:
         assert (
             probe_tables[group][0][STATE_INPUT_SLOT]
@@ -719,7 +765,7 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     _assert_states(published, reference_states[frontier], "finish checkpoint")
 
 
-def _transfer_kda_pool(usable_pages: int):
+def _transfer_kda_pool(usable_pages: int, recurrent_dtype: torch.dtype):
     """The production arena and pool, with one parent per cache block."""
     from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -761,8 +807,7 @@ def _transfer_kda_pool(usable_pages: int):
                     "slot.0",
                     conv_shape=(3 * _H * _D, 3),
                     recurrent_shape=(_H, _D, _D),
-                    recurrent_state_dtype=torch.float32,
-                    history_capacity=16,
+                    recurrent_state_dtype=recurrent_dtype,
                 ),
             )
             for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
@@ -797,12 +842,15 @@ def _transfer_kda_pool(usable_pages: int):
 
 @requires_cuda
 @requires_fla
-def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
-    """Real pressure suspends a live retained checkpoint; DMA restores it and
-    production decode continues against the uninterrupted PyTorch oracle.
+@pytest.mark.parametrize("io_backend", ["direct", "kernel"])
+@pytest.mark.parametrize("recurrent_dtype", [torch.float32, torch.bfloat16])
+def test_cache_pressure_restores_retained_kda_state_and_continues_decode(
+    recurrent_dtype, io_backend
+):
+    """Pressure folds accepted updates into the dense page before the store.
 
-    Stores precede copies and zeroing; loads follow them. Only executor
-    completions ACK the image. No oracle state is ever installed in the pool.
+    Restore into another slot, leaving its GPU workspace poisoned, and
+    compare resumed decode to a PyTorch recurrence with the same checkpoints.
     """
     import numpy as np
 
@@ -812,11 +860,14 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
     from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 
     usable_pages = 16
-    pool = _transfer_kda_pool(usable_pages)
+    pool = _transfer_kda_pool(usable_pages, recurrent_dtype)
     actual = _KDA(width=_WIDTH, pool=pool)
+    assert actual.backend.slot_state_bytes() == 0
     inputs = _inputs()
     pressure_inputs = {name: -value for name, value in inputs.items()}
-    reference_outputs, reference_states = _reference(inputs, 47, actual.params)
+    reference_outputs, reference_states = _reference(
+        inputs, 47, actual.params, checkpoints=(8,), recurrent_dtype=recurrent_dtype
+    )
     executor = HostCacheExecutor(
         pool,
         draft_pool=None,
@@ -826,8 +877,8 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
         snapshot_pool=RetractionPoolRequest(
             host_gb=0, ratio=1, max_retracted_requests=1, tail_lcm_blocks_per_request=0
         ),
-        slot_state_exporters=(),
-        io_backend="direct",
+        slot_state_exporters=(actual.backend,),
+        io_backend=io_backend,
         attn_tp_rank=0,
         kvp_rank=0,
         nprocs_per_node=1,
@@ -846,7 +897,13 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
     config.overlap_schedule_depth = 0
     config.enable_mixed_prefill_decode = False
     config.disable_l2_cache = True
-    config.cache_groups = pool_to_cache_groups(pool)
+    # As the data plane configures them: the scheduler lists a retraction
+    # victim's live blocks in these groups for the fold.
+    cache_groups = pool_to_cache_groups(pool)
+    deferred = actual.backend.deferred_decode_state_groups()
+    for group in cache_groups:
+        group.deferred_decode_state = group.group_id in deferred
+    config.cache_groups = cache_groups
     config.host_group_packing = list(executor.host_group_packing)
     scheduler = ts.Scheduler(config)
     group_ids = tuple(spec.group_id for spec in pool.arena.cache_group_specs)
@@ -854,6 +911,7 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
     admission_ids = {"source": 1, "pressure": 2, "reuse": 3}
     source_tables = None
     saved_pages = {}
+    logical_before_store = {}
     snapshot_rows = {}
     stored_fields = {}
     pending_snapshot_acks = []
@@ -902,7 +960,9 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
                     f"pressure integration outputs {begin}:{end}",
                 )
             _assert_states(
-                actual.states(tables), reference_states[end], f"endpoint {end}"
+                actual.states(tables, batch.request_pool_indices[row]),
+                reference_states[end],
+                f"endpoint {end}",
             )
         _feedback(
             scheduler,
@@ -918,9 +978,44 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
         )
         assert not operations.storage
         stream = torch.cuda.current_stream()
+        # As the data plane does first (DeviceHandle.execute): fold the
+        # retraction victims' records into the live pages the plan lists.
+        folds = {
+            group_id: torch.from_numpy(pairs.copy())
+            for group_id, pairs in plan.state_folds_arrays().items()
+            if len(pairs)
+        }
+        if any(isinstance(op, SnapshotOp) for op in operations.device):
+            assert set(folds) == set(KIMI_STATE_GROUPS), folds
+        if folds:
+            actual.backend.fold_deferred_state(folds, stream=stream)
         executor.submit_write_backs(
             operations.device, prerequisite_stream=stream, fence_stream=stream
         )
+        for op in operations.device:
+            if isinstance(op, SnapshotOp):
+                for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True):
+                    live = source_tables[group][0][STATE_LIVE_SLOT]
+                    dense = pool.get_component(layer, "recurrent_state")[live]
+                    torch.testing.assert_close(
+                        dense.float(),
+                        logical_before_store[layer],
+                        atol=2e-7,
+                        rtol=max(2e-5, torch.finfo(recurrent_dtype).eps / 2),
+                    )
+                    pages = [page for page in source_tables[group][0] if page]
+                    saved_pages.update(_checkpoint_components(pool, {layer: pages}))
+                for row in op.transfers:
+                    for field in pool.arena.plan.fields:
+                        if field.group_id == group_ids[row.group_id]:
+                            begin = pool.arena.field_block_byte_offset(
+                                field.field_id, row.source_page
+                            )
+                            stored_fields[row.destination_page, field.field_id] = (
+                                pool.arena.buffer[
+                                    begin : begin + field.payload_bytes
+                                ].clone()
+                            )
         copies = {
             group: pairs
             for group, pairs in plan.pages_to_copy_arrays().items()
@@ -1002,11 +1097,21 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
                 assert snapshot.request_id == "source"
                 assert scheduler.retracted_size() == 1
                 assert source_tables is not None
+                source_slot = snapshot.request_pool_index
                 for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True):
                     live = source_tables[group][0][STATE_LIVE_SLOT]
-                    assert int(pool.get_component(layer, "replay_length")[live, 0]) > 0
-                    pages = [page for page in source_tables[group][0] if page]
-                    saved_pages.update(_checkpoint_components(pool, {layer: pages}))
+                    length = actual.backend._retained_lengths[layer][source_slot].item()
+                    assert 0 < length < actual.backend._retained_capacity
+                    logical_before_store[layer] = _logical_checkpoint(
+                        actual.backend, layer, live, source_slot
+                    )
+                reference_outputs, reference_states = _reference(
+                    inputs,
+                    47,
+                    actual.params,
+                    checkpoints=(8, computed["source"]),
+                    recurrent_dtype=recurrent_dtype,
+                )
                 snapshot_rows = {
                     (group_ids[row.group_id], row.source_page): row.destination_page
                     for row in snapshot.transfers
@@ -1017,18 +1122,8 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
                     for page in rows[0]
                     if page
                 }, "snapshot-only execution must store the entire scheduler image"
-                for row in snapshot.transfers:
-                    for field in pool.arena.plan.fields:
-                        if field.group_id == group_ids[row.group_id]:
-                            begin = pool.arena.field_block_byte_offset(
-                                field.field_id, row.source_page
-                            )
-                            stored_fields[row.destination_page, field.field_id] = (
-                                pool.arena.buffer[
-                                    begin : begin + field.payload_bytes
-                                ].clone()
-                            )
                 execute_cache(plan)
+                actual.backend._retained_records[source_slot].fill_(float("nan"))
                 for batch in plan.forward:
                     for row, rid in enumerate(batch.request_ids):
                         assert rid == "pressure"
@@ -1083,7 +1178,7 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
                         saved_pages[layer, component].view(torch.uint8),
                     )
                     for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
-                    for component in _CHECKPOINT_COMPONENTS
+                    for component in _COMPONENTS
                 ), (
                     f"old checkpoint bytes were never overwritten: "
                     f"source={source_tables}, contender={pressure_tables}, "
@@ -1124,14 +1219,18 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
                     for page in source_tables[group][0]
                     if page
                 ), "every state page restored to its original device address"
+                assert restore.request_pool_index != source_slot
+                records = actual.backend._retained_records[restore.request_pool_index]
+                records.fill_(float("nan"))
                 execute_cache(plan)
+                assert torch.isnan(records).all(), "restore wrote into GPU-only records"
                 for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True):
                     destinations = [
                         restored_pages[group, snapshot_rows[group, page]]
                         for page in source_tables[group][0]
                         if page
                     ]
-                    for component in _CHECKPOINT_COMPONENTS:
+                    for component in _COMPONENTS:
                         assert torch.equal(
                             pool.get_component(layer, component)[destinations].view(
                                 torch.uint8
@@ -1152,7 +1251,7 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode():
                     for group, rows in source_tables.items()
                 }
                 _assert_states(
-                    actual.states(restored_tables),
+                    actual.states(restored_tables, None),
                     reference_states[computed["source"]],
                     "restored endpoint before decode",
                 )

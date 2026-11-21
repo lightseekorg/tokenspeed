@@ -44,7 +44,7 @@ def _case(batch, capacity, count, *, dtype, distinct, strided):
     pages, heads, dim = 2 * batch + 3, 2, 128
     state = (torch.randn(pages, heads, dim, dim, device="cuda") * 0.1).to(dtype)
     fields = [
-        torch.randn(pages, heads, capacity, dim, device="cuda") * 0.03 for _ in range(3)
+        torch.randn(batch, heads, capacity, dim, device="cuda") * 0.03 for _ in range(3)
     ]
     fields[1] = torch.nn.functional.normalize(fields[1], dim=-1)
     fields[2] = fields[2].sigmoid()
@@ -57,18 +57,20 @@ def _case(batch, capacity, count, *, dtype, distinct, strided):
             view.copy_(field)
             extended.append(view)
         state, *fields = extended
-    length = torch.zeros(pages, 3, device="cuda", dtype=torch.int32)[:, 1:2]
-    length[: batch + 1] = count
+    # One strided accepted count per request slot.
+    length = torch.zeros(batch, 3, device="cuda", dtype=torch.int32)[:, 1:2]
+    length[:] = count
     reads = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
     live = reads + batch if distinct else reads.clone()
     starts = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * 4
-    history = KdaRetainedHistory(*fields, length, live)
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    history = KdaRetainedHistory(*fields, length, live, slots)
     return state, history, reads, starts
 
 
 def _materialize(state, history, reads, starts):
     consolidate_history(state, history, reads, starts)
-    reset_retained_history(history, reads, starts)
+    reset_retained_history(history, reads, starts, page_count=state.shape[0])
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -88,16 +90,18 @@ def test_tiled_materialization_writes_only_copy_or_overflow_boundaries(
     expected = saved_state.clone()
     expected_length = saved_length.clone()
     if distinct or count + 4 > capacity:
-        for source, target in zip(reads.tolist(), history.live_state_indices.tolist()):
+        for slot, (source, target) in enumerate(
+            zip(reads.tolist(), history.live_state_indices.tolist())
+        ):
             current = saved_state[source].float()
             for token in range(count):
                 current = (
-                    current * history.decay[source, :, token, None, :]
-                    + history.correction[source, :, token, :, None]
-                    * history.key[source, :, token, None, :]
+                    current * history.decay[slot, :, token, None, :]
+                    + history.correction[slot, :, token, :, None]
+                    * history.key[slot, :, token, None, :]
                 )
             expected[target] = current.to(dtype)
-            expected_length[target] = 0
+            expected_length[slot] = 0
     _materialize(state, history, reads, starts)
     if captured:
         state.copy_(saved_state)
@@ -121,7 +125,27 @@ def test_tiled_materialization_writes_only_copy_or_overflow_boundaries(
         torch.testing.assert_close(actual, saved, atol=0, rtol=0)
 
 
-def test_materialization_does_not_trace_new_batch_or_page_counts():
+def test_rows_outside_the_page_pool_are_skipped_by_both_launches():
+    """A source or live page past the pool names no page: consolidation and
+    the length reset both leave the row alone, so its records stay counted
+    instead of being dropped unfolded."""
+    state, history, reads, starts = _case(
+        3, 8, 5, dtype=torch.float32, distinct=True, strided=False
+    )
+    pages = state.shape[0]
+    reads[0] = pages
+    history.live_state_indices[1] = pages
+    saved_state = state.clone()
+    saved_length = history.length.clone()
+    _materialize(state, history, reads, starts)
+    torch.testing.assert_close(history.length[:2], saved_length[:2], atol=0, rtol=0)
+    assert history.length[2].item() == 0
+    folded = history.live_state_indices[2].item()
+    untouched = [page for page in range(pages) if page != folded]
+    torch.testing.assert_close(state[untouched], saved_state[untouched], atol=0, rtol=0)
+
+
+def test_materialization_does_not_trace_new_batch_page_or_slot_counts():
     _materialize(*_case(4, 8, 5, dtype=torch.float32, distinct=True, strided=False))
     with assert_no_cute_compile():
         for batch, strided in ((1, False), (3, True), (7, False)):

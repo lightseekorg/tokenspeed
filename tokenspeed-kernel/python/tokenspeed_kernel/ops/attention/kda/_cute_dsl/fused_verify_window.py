@@ -97,10 +97,10 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
 )
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     fake_retained_arguments,
-    initialize_tile,
+    initialize_page_tile,
     retained_arguments,
     retained_length,
-    retained_page,
+    retained_row,
 )
 from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
@@ -466,7 +466,17 @@ class FusedVerifyWindow(RecoverSsmVerify):
         token_start = Int64(_load(query_start_loc, request))
         valid_tokens = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
-        live = (page > 0) & (retained_page(retained, request) > 0) & (valid_tokens > 0)
+        live_page, slot = retained_row(retained, request)
+        # A page past the checkpoint pool is padding, like a nonpositive one.
+        live = (
+            (page > 0)
+            & (page < retained[0].shape[0])
+            & (live_page > 0)
+            & (live_page < retained[0].shape[0])
+            & (slot >= 0)
+            & (slot < retained[1].shape[0])
+            & (valid_tokens > 0)
+        )
         if tidx == 0:
             cute.arch.mbarrier_init(shared.state_barrier, 1)
             cute.arch.mbarrier_init(shared.weight_barrier, 1)
@@ -499,8 +509,17 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     VT * GATE_RANK * 2,
                     Int32(shared.weight_barrier.toint()),
                 )
-            initialize_tile(
-                shared.tile, retained, request, head, value_start, VT, K, tidx, THREADS
+            initialize_page_tile(
+                shared.tile,
+                retained,
+                live_page,
+                slot,
+                head,
+                value_start,
+                VT,
+                K,
+                tidx,
+                THREADS,
             )
             if tidx == 0:
                 cute.arch.mbarrier_arrive(shared.state_barrier)
@@ -509,9 +528,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
         channels = []
         tap_words = []
         past_values = []
-        # Padding pages see a zero history, as the split producer's do.
-        has_history = (valid_tokens > 0) & (page >= 0)
-        history = conv_states + cutlass.max(page, Int64(0)) * conv_page_stride
+        # Padding pages see a zero history, as the split producer's do; a page
+        # past the pool is padding too, and its address is never formed.
+        in_pool = (page >= 0) & (page < retained[0].shape[0])
+        has_history = (valid_tokens > 0) & in_pool
+        history = conv_states + Int64(in_pool) * page * conv_page_stride
         for item in cutlass.range_constexpr(self.conv_items):
             c = cutlass.min(item * THREADS + tidx, 3 * VT - 1)
             kind = c // VT
@@ -559,11 +580,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
                             + channel,
                         )
                     )
-            slot = Int64(request)
+            stamp_slot = Int64(request)
             generation = Int64(0)
             start = Int64(0)
             if const_expr(self.has_metadata):
-                slot = Int64(_load(metadata, request * 3))
+                stamp_slot = Int64(_load(metadata, request * 3))
                 generation = Int64(_load(metadata, request * 3 + 1))
                 start = Int64(_load(metadata, request * 3 + 2))
             gate_scale = _exp(a_log_value.to(Float32))
@@ -616,7 +637,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         stamp = cute.make_tensor(
                             stamps
                             + (
-                                slot * ring_capacity
+                                stamp_slot * ring_capacity
                                 + (ring_start + tidx) % ring_capacity
                             )
                             * 2,
@@ -633,9 +654,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     gate_scale,
                     lower_bound,
                     retained,
-                    retained_page(retained, request),
+                    slot,
                     head,
-                    retained_length(retained, retained_page(retained, request)),
+                    retained_length(retained, slot),
                     Int32(value_tile == 0),
                     valid_tokens,
                     ring_start,
@@ -661,16 +682,14 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     token_start * out_token_stride + head * V + value_start + channel
                 )
                 correction_row = correction + (
-                    retained_page(retained, request) * correction_slot_stride
+                    slot * correction_slot_stride
                     + head * correction_head_stride
                     + value_start
                     + channel
                 )
                 for t in cutlass.range_constexpr(W):
                     stored = owner & Int32(t < valid_tokens)
-                    position = (
-                        retained_length(retained, retained_page(retained, request)) + t
-                    )
+                    position = retained_length(retained, slot) + t
                     _store_if(
                         stored,
                         (out_row + t * out_token_stride).toint(),
@@ -932,6 +951,7 @@ def _compile(
     capacity: int,
     state_dtype: torch.dtype,
     live_dtype: torch.dtype,
+    slot_dtype: torch.dtype,
     bounded_gate: bool,
     factored: bool,
     has_metadata: bool,
@@ -980,9 +1000,9 @@ def _compile(
         state,
         correction,
         normalized_key,
-        slots=slots,
         batch=batch,
         live_dtype=_DTYPES[live_dtype],
+        slot_dtype=_DTYPES[slot_dtype],
     )
     kernel = FusedVerifyWindow(
         heads,
@@ -1146,15 +1166,16 @@ def fused_verify_window(
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
         checkpoint_state: ``[pages, num_heads, head_dim, head_dim]`` FP32
             committed checkpoint in value-major layout; read only.
-        retained_history: Page-owned FP32 U/normalized-K/decay and accepted
-            lengths. Candidates append after each live page's accepted prefix.
+        retained_history: Request-slot FP32 U/normalized-K/decay and accepted
+            lengths. Candidates append after each slot's accepted prefix.
         original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
             the pre-convolution rows for commit.
         query_start_loc: ``[batch + 1]`` token offset of each request; a
             request has at most ``window`` tokens.
         state_indices: ``[batch]`` checkpoint and convolution page of each
-            request. Pages at or below 0 are padding: zero outputs and no
-            records, though their pre-convolution rows are still retained.
+            request. Pages at or below 0, or past the checkpoint pool, are
+            padding: zero outputs and no records, though their
+            pre-convolution rows are still retained.
         num_heads: Per-rank head count.
         head_dim: Head width; 128.
         window: Tokens per request window, 2 to 16.
@@ -1215,6 +1236,7 @@ def fused_verify_window(
         correction_cache.shape[2],
         checkpoint_state.dtype,
         retained_history.live_state_indices.dtype,
+        retained_history.record_slots.dtype,
         bounded,
         bounded and window * abs(lower_bound) <= FACTORED_DECAY,
         record_metadata is not None,
@@ -1229,7 +1251,12 @@ def fused_verify_window(
     consolidate_history(
         checkpoint_state, retained_history, state_indices, query_start_loc
     )
-    reset_retained_history(retained_history, state_indices, query_start_loc)
+    reset_retained_history(
+        retained_history,
+        state_indices,
+        query_start_loc,
+        page_count=checkpoint_state.shape[0],
+    )
     kernel(
         mixed_qkv,
         conv_weights,

@@ -18,9 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Gluon helpers for page-owned KDA retained history."""
+"""Gluon helpers for request-owned KDA records and their accepted lengths."""
 
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+
+# Row width of the batched retained commit descriptors: the QKV, convolution
+# and length fields, then the v-major recurrent state pointer and strides.
+_DESCRIPTOR_COLUMNS = gl.constexpr(14)
 
 
 def kda_records_launch_metadata(grid, kernel, args):
@@ -94,18 +98,18 @@ def kda_retained_panel(
     correction,
     key,
     decay,
-    page,
+    slot,
     head,
     length,
-    u_page,
+    u_slot,
     u_head,
     u_pos,
     u_channel,
-    k_page,
+    k_slot,
     k_head,
     k_pos,
     k_channel,
-    d_page,
+    d_slot,
     d_head,
     d_pos,
     d_channel,
@@ -113,7 +117,7 @@ def kda_retained_panel(
     keys,
 ):
     """Reconstruct one owned [value, key] panel from accepted FP32 records."""
-    page = page.to(gl.int64)
+    slot = slot.to(gl.int64)
     head = head.to(gl.int64)
     values = values.to(gl.int64)
     keys = keys.to(gl.int64)
@@ -121,21 +125,21 @@ def kda_retained_panel(
         history_position = position.to(gl.int64)
         u = gl.load(
             correction
-            + page * u_page
+            + slot * u_slot
             + head * u_head
             + history_position * u_pos
             + values * u_channel
         )
         k = gl.load(
             key
-            + page * k_page
+            + slot * k_slot
             + head * k_head
             + history_position * k_pos
             + keys * k_channel
         )
         d = gl.load(
             decay
-            + page * d_page
+            + slot * d_slot
             + head * d_head
             + history_position * d_pos
             + keys * d_channel
@@ -148,11 +152,14 @@ def kda_retained_panel(
 def kda_retained_request(
     reads,
     live,
+    record_slots,
     starts,
     length,
     row,
     read_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     length_stride,
     pages,
@@ -162,6 +169,7 @@ def kda_retained_request(
     row = row.to(gl.int64)
     source = gl.load(reads + row * read_stride).to(gl.int64)
     target = gl.load(live + row * live_stride).to(gl.int64)
+    slot = gl.load(record_slots + row * slot_stride).to(gl.int64)
     begin = gl.load(starts + row * query_stride).to(gl.int64)
     count = gl.load(starts + (row + 1) * query_stride).to(gl.int64) - begin
     valid = (
@@ -169,32 +177,37 @@ def kda_retained_request(
         & (source < pages)
         & (target > 0)
         & (target < pages)
+        & (slot >= 0)
+        & (slot < slots)
         & (count > 0)
         & (count <= WINDOW)
     )
-    old = gl.load(length + source * length_stride, mask=valid, other=0)
+    # The accepted length belongs to the request slot, not to either page.
+    old = gl.load(length + slot * length_stride, mask=valid, other=0)
     valid = valid & (old >= 0) & (old <= CAPACITY)
-    return source, target, begin, count, old, valid
+    return source, target, slot, begin, count, old, valid
 
 
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
     do_not_specialize=[
         "state_stride",
-        "u_page",
+        "u_slot",
         "u_head",
         "u_pos",
         "u_channel",
-        "k_page",
+        "k_slot",
         "k_head",
         "k_pos",
         "k_channel",
-        "d_page",
+        "d_slot",
         "d_head",
         "d_pos",
         "d_channel",
         "read_stride",
         "live_stride",
+        "slot_stride",
+        "slots",
         "query_stride",
         "length_stride",
         "pages",
@@ -208,22 +221,25 @@ def kda_retained_consolidate(
     length,
     reads,
     live,
+    record_slots,
     starts,
     state_stride,
-    u_page,
+    u_slot,
     u_head,
     u_pos,
     u_channel,
-    k_page,
+    k_slot,
     k_head,
     k_pos,
     k_channel,
-    d_page,
+    d_slot,
     d_head,
     d_pos,
     d_channel,
     read_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     length_stride,
     pages,
@@ -234,14 +250,17 @@ def kda_retained_consolidate(
     WAVE: gl.constexpr,
 ):
     row, head, panel = gl.program_id(0), gl.program_id(1), gl.program_id(2)
-    source, target, begin, count, old, valid = kda_retained_request(
+    source, target, slot, begin, count, old, valid = kda_retained_request(
         reads,
         live,
+        record_slots,
         starts,
         length,
         row,
         read_stride,
         live_stride,
+        slot_stride,
+        slots,
         query_stride,
         length_stride,
         pages,
@@ -262,18 +281,18 @@ def kda_retained_consolidate(
         correction,
         key,
         decay,
-        source,
+        slot,
         head,
         old,
-        u_page,
+        u_slot,
         u_head,
         u_pos,
         u_channel,
-        k_page,
+        k_slot,
         k_head,
         k_pos,
         k_channel,
-        d_page,
+        d_slot,
         d_head,
         d_pos,
         d_channel,
@@ -291,6 +310,8 @@ def kda_retained_consolidate(
     do_not_specialize=[
         "read_stride",
         "live_stride",
+        "slot_stride",
+        "slots",
         "query_stride",
         "length_stride",
         "pages",
@@ -300,9 +321,12 @@ def kda_retained_reset(
     length,
     reads,
     live,
+    record_slots,
     starts,
     read_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     length_stride,
     pages,
@@ -310,14 +334,17 @@ def kda_retained_reset(
     WINDOW: gl.constexpr,
 ):
     row = gl.program_id(0)
-    source, target, begin, count, old, valid = kda_retained_request(
+    source, target, slot, begin, count, old, valid = kda_retained_request(
         reads,
         live,
+        record_slots,
         starts,
         length,
         row,
         read_stride,
         live_stride,
+        slot_stride,
+        slots,
         query_stride,
         length_stride,
         pages,
@@ -325,13 +352,14 @@ def kda_retained_reset(
         WINDOW,
     )
     if valid and ((source != target) | (old + count > CAPACITY)):
-        gl.store(length + target * length_stride, 0)
+        gl.store(length + slot * length_stride, 0)
 
 
 @gluon.jit
 def kda_retained_accept(
     reads,
     live,
+    record_slots,
     starts,
     accepted,
     length,
@@ -340,6 +368,8 @@ def kda_retained_accept(
     row,
     read_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     accepted_stride,
     length_stride,
@@ -350,14 +380,17 @@ def kda_retained_accept(
     WINDOW: gl.constexpr,
     WAVE: gl.constexpr,
 ):
-    source, target, begin, count, old_source, valid = kda_retained_request(
+    source, target, slot, begin, count, old, valid = kda_retained_request(
         reads,
         live,
+        record_slots,
         starts,
         length,
         row,
         read_stride,
         live_stride,
+        slot_stride,
+        slots,
         query_stride,
         length_stride,
         pages,
@@ -368,12 +401,11 @@ def kda_retained_accept(
         gl.maximum(gl.load(accepted + row.to(gl.int64) * accepted_stride), 0),
         gl.minimum(count, WINDOW),
     )
-    slot, start, fresh = kda_record_interval(
+    stamp_slot, start, fresh = kda_record_interval(
         metadata, stamps, row, 0, take, stamp_slots, STAMP_CAPACITY, 0, WINDOW, WAVE
     )
-    old = gl.load(length + target * length_stride, mask=valid, other=0)
-    valid = valid & fresh & (old >= 0) & (old + take <= CAPACITY)
-    return source, target, begin, take, old, valid
+    valid = valid & fresh & (old + take <= CAPACITY)
+    return source, target, slot, begin, take, old, valid
 
 
 @gluon.jit(
@@ -385,6 +417,8 @@ def kda_retained_accept(
         "conv_tap",
         "read_stride",
         "live_stride",
+        "slot_stride",
+        "slots",
         "query_stride",
         "accepted_stride",
         "length_stride",
@@ -397,6 +431,7 @@ def kda_retained_conv_commit(
     conv,
     reads,
     live,
+    record_slots,
     starts,
     accepted,
     length,
@@ -408,6 +443,8 @@ def kda_retained_conv_commit(
     conv_tap,
     read_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     accepted_stride,
     length_stride,
@@ -420,9 +457,10 @@ def kda_retained_conv_commit(
     WAVE: gl.constexpr,
 ):
     row = gl.program_id(0)
-    source, target, begin, take, old, valid = kda_retained_accept(
+    source, target, slot, begin, take, old, valid = kda_retained_accept(
         reads,
         live,
+        record_slots,
         starts,
         accepted,
         length,
@@ -431,6 +469,8 @@ def kda_retained_conv_commit(
         row,
         read_stride,
         live_stride,
+        slot_stride,
+        slots,
         query_stride,
         accepted_stride,
         length_stride,
@@ -473,6 +513,8 @@ def kda_retained_conv_commit(
     do_not_specialize=[
         "read_stride",
         "live_stride",
+        "slot_stride",
+        "slots",
         "query_stride",
         "accepted_stride",
         "length_stride",
@@ -484,12 +526,15 @@ def kda_retained_publish(
     length,
     reads,
     live,
+    record_slots,
     starts,
     accepted,
     metadata,
     stamps,
     read_stride,
     live_stride,
+    slot_stride,
+    slots,
     query_stride,
     accepted_stride,
     length_stride,
@@ -501,9 +546,10 @@ def kda_retained_publish(
     WAVE: gl.constexpr,
 ):
     row = gl.program_id(0)
-    source, target, begin, take, old, valid = kda_retained_accept(
+    source, target, slot, begin, take, old, valid = kda_retained_accept(
         reads,
         live,
+        record_slots,
         starts,
         accepted,
         length,
@@ -512,6 +558,8 @@ def kda_retained_publish(
         row,
         read_stride,
         live_stride,
+        slot_stride,
+        slots,
         query_stride,
         accepted_stride,
         length_stride,
@@ -523,7 +571,7 @@ def kda_retained_publish(
         WAVE,
     )
     if valid:
-        gl.store(length + target * length_stride, old + take)
+        gl.store(length + slot * length_stride, old + take)
 
 
 def prepare_kda_retained(
@@ -534,6 +582,7 @@ def prepare_kda_retained(
     length,
     reads,
     live,
+    record_slots,
     starts,
     *,
     heads,
@@ -541,7 +590,7 @@ def prepare_kda_retained(
     window,
     wave,
 ):
-    """Materialize cross-page/overflow endpoints, then reset live lengths."""
+    """Materialize cross-page/overflow endpoints, then reset their slot lengths."""
     batch = reads.numel()
     if not batch:
         return
@@ -554,6 +603,7 @@ def prepare_kda_retained(
         length,
         reads,
         live,
+        record_slots,
         starts,
         state.stride(0),
         *correction.stride(),
@@ -561,6 +611,8 @@ def prepare_kda_retained(
         *decay.stride(),
         reads.stride(0),
         live.stride(0),
+        record_slots.stride(0),
+        correction.shape[0],
         starts.stride(0),
         length.stride(0),
         state.shape[0],
@@ -576,9 +628,12 @@ def prepare_kda_retained(
         length,
         reads,
         live,
+        record_slots,
         starts,
         reads.stride(0),
         live.stride(0),
+        record_slots.stride(0),
+        correction.shape[0],
         starts.stride(0),
         length.stride(0),
         state.shape[0],
@@ -598,6 +653,7 @@ def launch_kda_retained_commit(
     query_start_loc,
     accepted_length,
     retained_length,
+    record_slots,
     history_capacity,
     record_metadata,
     record_stamps,
@@ -606,12 +662,14 @@ def launch_kda_retained_commit(
     draft_token_num,
     wave,
 ):
-    """Commit only convolution taps and publish accepted retained length."""
+    """Commit only convolution taps and publish each slot's accepted retained length."""
     batch = read_indices.numel()
     if not batch:
         return
     if (record_metadata is None) != (record_stamps is None):
         raise ValueError("KDA metadata and stamps must be supplied together")
+    if record_slots.shape != (batch,):
+        raise ValueError("KDA commit needs one record slot per request")
     stamp_slots = batch if record_stamps is None else record_stamps.shape[0]
     stamp_capacity = (
         history_capacity if record_stamps is None else record_stamps.shape[1]
@@ -619,6 +677,8 @@ def launch_kda_retained_commit(
     common = (
         read_indices.stride(0),
         live_indices.stride(0),
+        record_slots.stride(0),
+        retained_length.shape[0],
         query_start_loc.stride(0),
         accepted_length.stride(0),
         retained_length.stride(0),
@@ -630,6 +690,7 @@ def launch_kda_retained_commit(
         conv_pool,
         read_indices,
         live_indices,
+        record_slots,
         query_start_loc,
         accepted_length,
         retained_length,
@@ -651,6 +712,7 @@ def launch_kda_retained_commit(
         retained_length,
         read_indices,
         live_indices,
+        record_slots,
         query_start_loc,
         accepted_length,
         record_metadata,
@@ -684,6 +746,7 @@ def validate_kda_retained_verify(
     decay,
     length,
     live,
+    record_slots,
     metadata,
     stamps,
     heads,
@@ -739,6 +802,7 @@ def validate_kda_retained_verify(
     if (
         reads.shape != (batch,)
         or live.shape != (batch,)
+        or record_slots.shape != (batch,)
         or starts.shape != (batch + 1,)
     ):
         raise ValueError("retained KDA request indices must match query boundaries")
@@ -759,12 +823,12 @@ def validate_kda_retained_verify(
         decay,
         length,
         live,
+        record_slots,
     )
     if metadata is not None:
         if (
             metadata.shape != (batch, 3)
             or stamps.ndim != 3
-            or stamps.shape[0] < batch
             or (stamps.shape[1] < window or stamps.shape[2] != 2)
             or any(
                 x.dtype != torch.int64 or not x.is_contiguous()
@@ -809,6 +873,8 @@ def validate_kda_retained_verify(
         "d_strides",
         "length_stride",
         "source_stride",
+        "slot_stride",
+        "slots",
         "pages",
     ],
 )
@@ -819,13 +885,17 @@ def retained_materialize_kernel(
     decay,
     length,
     sources,
+    record_slots,
     state_strides,
     u_strides,
     k_strides,
     d_strides,
     length_stride,
     source_stride,
+    slot_stride,
     pages,
+    slots,
+    PAGED: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
     CAPACITY: gl.constexpr,
@@ -835,9 +905,14 @@ def retained_materialize_kernel(
 ):
     row, head = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
     source = gl.load(sources + row * source_stride).to(gl.int64)
-    valid = (source > 0) & (source < pages)
-    count = gl.load(length + source * length_stride, mask=valid, other=0)
-    valid = valid & (count >= 0) & (count <= CAPACITY)
+    slot = gl.load(record_slots + row * slot_stride).to(gl.int64)
+    valid = (source > 0) & (slot >= 0) & (slot < slots)
+    if PAGED:
+        valid = valid & (source < pages)
+    count = gl.load(length + slot * length_stride, mask=valid, other=0)
+    if count <= 0 or count > CAPACITY:
+        return
+    state_row = source if PAGED else row
     offsets = gl.program_id(2) * BLOCK + gl.arange(
         0, BLOCK, layout=gl.BlockedLayout([1], [WAVE], [4], [0])
     )
@@ -845,7 +920,7 @@ def retained_materialize_kernel(
     if V_MAJOR:
         ptr = (
             state
-            + row * state_strides[0]
+            + state_row * state_strides[0]
             + head * state_strides[1]
             + v * state_strides[2]
             + k * state_strides[3]
@@ -853,17 +928,17 @@ def retained_materialize_kernel(
     else:
         ptr = (
             state
-            + row * state_strides[0]
+            + state_row * state_strides[0]
             + head * state_strides[1]
             + k * state_strides[2]
             + v * state_strides[3]
         )
-    mask = valid & (v < V)
+    mask = v < V
     value = gl.load(ptr, mask=mask, other=0).to(gl.float32)
-    for token in range(gl.where(valid, count, 0)):
+    for token in range(count):
         uv = gl.load(
             u
-            + source * u_strides[0]
+            + slot * u_strides[0]
             + head * u_strides[1]
             + token * u_strides[2]
             + v * u_strides[3],
@@ -872,7 +947,7 @@ def retained_materialize_kernel(
         )
         kv = gl.load(
             key
-            + source * k_strides[0]
+            + slot * k_strides[0]
             + head * k_strides[1]
             + token * k_strides[2]
             + k * k_strides[3],
@@ -881,7 +956,7 @@ def retained_materialize_kernel(
         )
         dv = gl.load(
             decay
-            + source * d_strides[0]
+            + slot * d_strides[0]
             + head * d_strides[1]
             + token * d_strides[2]
             + k * d_strides[3],
@@ -894,13 +969,23 @@ def retained_materialize_kernel(
 
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
-    do_not_specialize=["rows", "pages", "length_stride", "index_stride"],
+    do_not_specialize=[
+        "rows",
+        "length_stride",
+        "index_stride",
+        "slot_stride",
+        "slot_count",
+        "pages",
+    ],
 )
 def retained_reset_length_kernel(
     length,
     indices,
-    rows,
+    record_slots,
+    slot_stride,
+    slot_count,
     pages,
+    rows,
     length_stride,
     index_stride,
     BLOCK: gl.constexpr,
@@ -910,10 +995,18 @@ def retained_reset_length_kernel(
         0, BLOCK, layout=gl.BlockedLayout([1], [WAVE], [4], [0])
     )
     page = gl.load(indices + row * index_stride, mask=row < rows, other=0).to(gl.int64)
+    slot = gl.load(record_slots + row * slot_stride, mask=row < rows, other=-1).to(
+        gl.int64
+    )
+    # Padding rows carry a page at or below 0, or one past the pool, as the
+    # materialize kernel reads them; their slots may belong to others.
+    valid = (
+        (row < rows) & (page > 0) & (page < pages) & (slot >= 0) & (slot < slot_count)
+    )
     gl.store(
-        length + page * length_stride,
+        length + slot * length_stride,
         0,
-        mask=(row < rows) & (page > 0) & (page < pages),
+        mask=valid,
     )
 
 
@@ -925,6 +1018,7 @@ def retained_batched_accept(
     writes,
     accepted,
     starts,
+    record_slots,
     metadata,
     stamps,
     layer,
@@ -934,6 +1028,8 @@ def retained_batched_accept(
     write_strides,
     accepted_stride,
     query_stride,
+    record_slot_stride,
+    record_slot_count,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
@@ -949,17 +1045,21 @@ def retained_batched_accept(
     target = gl.load(
         writes + group * write_strides[0] + row * write_strides[1], mask=valid, other=0
     ).to(gl.int64)
-    pages = gl.load(descriptors + layer * 9 + 3).to(gl.int64)
-    length = gl.load(descriptors + layer * 9 + 2).to(gl.pointer_type(gl.int32))
-    length_stride = gl.load(descriptors + layer * 9 + 6).to(gl.int64)
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
+    pages = gl.load(base + 3).to(gl.int64)
+    length = gl.load(base + 2).to(gl.pointer_type(gl.int32))
+    length_stride = gl.load(base + 6).to(gl.int64)
     begin = gl.load(starts + row * query_stride).to(gl.int64)
     count = gl.load(starts + (row + 1) * query_stride).to(gl.int64) - begin
+    record_slot = gl.load(record_slots + row * record_slot_stride).to(gl.int64)
     valid = (
         valid
         & (source > 0)
         & (source < pages)
         & (target > 0)
         & (target < pages)
+        & (record_slot >= 0)
+        & (record_slot < record_slot_count)
         & (begin >= 0)
         & (count > 0)
         & (count <= WINDOW)
@@ -968,7 +1068,9 @@ def retained_batched_accept(
         gl.maximum(gl.load(accepted + row * accepted_stride), 0),
         gl.minimum(count, WINDOW),
     )
-    old = gl.load(length + target * length_stride, mask=valid, other=0)
+    # The request's accepted count lives in its slot, not in the cache page.
+    length = length + record_slot * length_stride
+    old = gl.load(length, mask=valid, other=0)
     valid = valid & (old >= 0) & (old + take <= CAPACITY)
     slot = gl.load(metadata + row * 3).to(gl.int64)
     generation = gl.load(metadata + row * 3 + 1)
@@ -1000,21 +1102,99 @@ def retained_batched_accept(
         )
         == 0
     )
-    return source, target, begin, take, old, valid & fresh, length, length_stride
+    return source, target, begin, take, old, valid & fresh, length, record_slot
+
+
+@gluon.jit
+def retained_fold_ended_request(
+    descriptors,
+    correction,
+    retained_key,
+    retained_decay,
+    layer,
+    target,
+    record_slot,
+    count,
+    correction_strides,
+    key_strides,
+    decay_strides,
+    STATE: gl.constexpr,
+    HEADS: gl.constexpr,
+    DIM: gl.constexpr,
+    BLOCK: gl.constexpr,
+    WAVE: gl.constexpr,
+):
+    """Fold a slot's first ``count`` records into its live page's dense state.
+
+    The heads are split across axis 2 of the launch grid; each program
+    applies the records to its heads' ``[value, key]`` planes in order.
+    """
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
+    state = gl.load(base + 9).to(gl.pointer_type(STATE))
+    page_stride = gl.load(base + 10).to(gl.int64)
+    head_stride = gl.load(base + 11).to(gl.int64)
+    value_stride = gl.load(base + 12).to(gl.int64)
+    key_stride = gl.load(base + 13).to(gl.int64)
+    u = correction + record_slot * correction_strides[0] + layer * correction_strides[1]
+    k = retained_key + record_slot * key_strides[0] + layer * key_strides[1]
+    d = retained_decay + record_slot * decay_strides[0] + layer * decay_strides[1]
+    page = state + target * page_stride
+    lanes = gl.arange(0, BLOCK, layout=gl.BlockedLayout([1], [WAVE], [4], [0]))
+    for head in range(gl.program_id(2), HEADS, gl.num_programs(2)):
+        for start in range(0, DIM * DIM, BLOCK):
+            offsets = start + lanes
+            v, c = (offsets // DIM).to(gl.int64), (offsets % DIM).to(gl.int64)
+            mask = v < DIM
+            ptr = page + head * head_stride + v * value_stride + c * key_stride
+            value = gl.load(ptr, mask=mask, other=0).to(gl.float32)
+            for token in range(count):
+                uv = gl.load(
+                    u
+                    + head * correction_strides[2]
+                    + token * correction_strides[3]
+                    + v * correction_strides[4],
+                    mask=mask,
+                    other=0,
+                )
+                kv = gl.load(
+                    k
+                    + head * key_strides[2]
+                    + token * key_strides[3]
+                    + c * key_strides[4],
+                    mask=mask,
+                    other=0,
+                )
+                dv = gl.load(
+                    d
+                    + head * decay_strides[2]
+                    + token * decay_strides[3]
+                    + c * decay_strides[4],
+                    mask=mask,
+                    other=0,
+                )
+                value = value * dv + uv * kv
+            gl.store(ptr, value.to(STATE), mask=mask)
+
+
+_BATCHED_RUNTIME_ARGUMENTS = [
+    "group_count",
+    "read_strides",
+    "write_strides",
+    "accepted_stride",
+    "query_stride",
+    "record_slot_stride",
+    "record_slot_count",
+    "stamp_strides",
+    "stamp_slots",
+    "stamp_capacity",
+    "stopped_count",
+]
 
 
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
-    do_not_specialize=[
-        "group_count",
-        "read_strides",
-        "write_strides",
-        "accepted_stride",
-        "query_stride",
-        "stamp_strides",
-        "stamp_slots",
-        "stamp_capacity",
-    ],
+    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS
+    + ["correction_strides", "key_strides", "decay_strides"],
 )
 def retained_batched_conv_kernel(
     descriptors,
@@ -1023,26 +1203,40 @@ def retained_batched_conv_kernel(
     writes,
     accepted,
     starts,
+    record_slots,
     metadata,
     stamps,
+    request_stopped,
     group_count,
     read_strides,
     write_strides,
     accepted_stride,
     query_stride,
+    record_slot_stride,
+    record_slot_count,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
+    stopped_count,
+    correction,
+    retained_key,
+    retained_decay,
+    correction_strides,
+    key_strides,
+    decay_strides,
     CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
     CHANNELS: gl.constexpr,
     ACTIVATION: gl.constexpr,
     CONV: gl.constexpr,
+    STATE: gl.constexpr,
+    HEADS: gl.constexpr,
+    DIM: gl.constexpr,
     BLOCK: gl.constexpr,
     WAVE: gl.constexpr,
 ):
     layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, length, length_stride = (
+    source, target, begin, take, old, valid, length, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -1050,6 +1244,7 @@ def retained_batched_conv_kernel(
             writes,
             accepted,
             starts,
+            record_slots,
             metadata,
             stamps,
             layer,
@@ -1059,6 +1254,8 @@ def retained_batched_conv_kernel(
             write_strides,
             accepted_stride,
             query_stride,
+            record_slot_stride,
+            record_slot_count,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
@@ -1069,7 +1266,7 @@ def retained_batched_conv_kernel(
     )
     if not valid:
         return
-    base = descriptors + layer * 9
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
     original = gl.load(base).to(gl.pointer_type(ACTIVATION))
     conv = gl.load(base + 1).to(gl.pointer_type(CONV))
     qkv_stride = gl.load(base + 4).to(gl.int64)
@@ -1098,20 +1295,36 @@ def retained_batched_conv_kernel(
     gl.store(ptr, h0, mask=mask)
     gl.store(ptr + tap_stride, h1, mask=mask)
     gl.store(ptr + 2 * tap_stride, h2, mask=mask)
+    # The request ended in this forward: its live page becomes a dense
+    # checkpoint others may read. The publish launch clears the count after
+    # every program of this one has folded its heads.
+    if gl.load(
+        request_stopped + record_slot, mask=record_slot < stopped_count, other=0
+    ):
+        retained_fold_ended_request(
+            descriptors,
+            correction,
+            retained_key,
+            retained_decay,
+            layer,
+            target,
+            record_slot,
+            # Validated against the history capacity above.
+            (old + take).to(gl.int32),
+            correction_strides,
+            key_strides,
+            decay_strides,
+            STATE,
+            HEADS,
+            DIM,
+            BLOCK,
+            WAVE,
+        )
 
 
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
-    do_not_specialize=[
-        "group_count",
-        "read_strides",
-        "write_strides",
-        "accepted_stride",
-        "query_stride",
-        "stamp_strides",
-        "stamp_slots",
-        "stamp_capacity",
-    ],
+    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS,
 )
 def retained_batched_publish_kernel(
     descriptors,
@@ -1120,22 +1333,27 @@ def retained_batched_publish_kernel(
     writes,
     accepted,
     starts,
+    record_slots,
     metadata,
     stamps,
+    request_stopped,
     group_count,
     read_strides,
     write_strides,
     accepted_stride,
     query_stride,
+    record_slot_stride,
+    record_slot_count,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
+    stopped_count,
     CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
     WAVE: gl.constexpr,
 ):
     layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, length, length_stride = (
+    source, target, begin, take, old, valid, length, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -1143,6 +1361,7 @@ def retained_batched_publish_kernel(
             writes,
             accepted,
             starts,
+            record_slots,
             metadata,
             stamps,
             layer,
@@ -1152,6 +1371,8 @@ def retained_batched_publish_kernel(
             write_strides,
             accepted_stride,
             query_stride,
+            record_slot_stride,
+            record_slot_count,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
@@ -1161,4 +1382,8 @@ def retained_batched_publish_kernel(
         )
     )
     if valid:
-        gl.store(length + target * length_stride, old + take)
+        stopped = gl.load(
+            request_stopped + record_slot, mask=record_slot < stopped_count, other=0
+        )
+        # An ended request's records are folded into its live page.
+        gl.store(length, gl.where(stopped, 0, old + take))

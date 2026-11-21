@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     initialize_page_tile,
     retained_arguments,
     retained_length,
+    retained_row,
 )
 
 THREADS = 128
@@ -74,10 +75,19 @@ class ConsolidateHistory:
         tidx, _, _ = cute.arch.thread_idx()
         row = Int64(request)
         source = Int64(reads[row])
-        target = Int64(history[5][row])
+        target, slot = retained_row(history, row)
         tokens = Int64(starts[row + 1]) - Int64(starts[row])
-        if (source > 0) & (target > 0) & (tokens > 0):
-            count = retained_length(history, source)
+        # The length reset (reset_retained_history) skips the same rows.
+        if (
+            (source > 0)
+            & (source < history[0].shape[0])
+            & (target > 0)
+            & (target < history[0].shape[0])
+            & (slot >= 0)
+            & (slot < history[1].shape[0])
+            & (tokens > 0)
+        ):
+            count = retained_length(history, slot)
             if (source != target) | (count + tokens > self.capacity):
                 smem = cutlass.memory.SmemAllocator()
                 tile = smem.allocate_tensor(
@@ -90,6 +100,7 @@ class ConsolidateHistory:
                     tile,
                     history,
                     source,
+                    slot,
                     head,
                     value_start,
                     self.rows,
@@ -124,20 +135,27 @@ def _compile(
     state_dtype,
     read_dtype,
     live_dtype,
+    slot_dtype,
     start_dtype,
 ):
     pages = cute.sym_int()
+    slots = cute.sym_int()
     batch = cute.sym_int()
     # Every arena axis is addressed through its runtime element stride.
     state = make_fake_tensor(
         _DTYPES[state_dtype], (pages, heads, values, keys), leading_dim=None
     )
     correction = make_fake_tensor(
-        Float32, (pages, heads, capacity, values), leading_dim=None
+        Float32, (slots, heads, capacity, values), leading_dim=None
     )
-    key = make_fake_tensor(Float32, (pages, heads, capacity, keys), leading_dim=None)
+    key = make_fake_tensor(Float32, (slots, heads, capacity, keys), leading_dim=None)
     history = fake_retained_arguments(
-        state, correction, key, slots=pages, batch=batch, live_dtype=_DTYPES[live_dtype]
+        state,
+        correction,
+        key,
+        batch=batch,
+        live_dtype=_DTYPES[live_dtype],
+        slot_dtype=_DTYPES[slot_dtype],
     )
     reads = make_fake_tensor(_DTYPES[read_dtype], (batch,))
     starts = make_fake_tensor(_DTYPES[start_dtype], (cute.sym_int(),))
@@ -171,6 +189,7 @@ def consolidate_history(state, history, reads, starts):
         state.dtype,
         reads.dtype,
         history.live_state_indices.dtype,
+        history.record_slots.dtype,
         starts.dtype,
     )
     kernel(retained_arguments(state, history), reads, starts)

@@ -702,6 +702,9 @@ class ModelExecutor:
                 if model_runner.model_config.requires_request_token_history
                 else 0
             )
+        # A backend that defers dense state writes completes them in the
+        # decode commit of the forward that ends a request.
+        self.attn_backend.bind_request_stop_flags(self.runtime_states.stopped)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -2564,17 +2567,26 @@ class ModelExecutor:
         decode. The transferred recurrent state needs no length: it lands in
         the live slot of the request's state row, which the first decode reads
         and evolves in place.
+
+        Each landed slot also starts a new owner's history: the backends clear
+        the working state its previous owner left (``reset_request_workspace``)
+        here, since a retraction may fold the slot before its first forward.
         """
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
             return
-        self._write_valid_cache_lengths(
+        rows = self._write_valid_cache_lengths(
             forward_op.request_pool_indices[:num_extends],
             forward_op.prefill_lengths[:num_extends],
         )
+        self.attn_backend.reset_request_workspace(rows, stream=self.execution_stream)
 
-    def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
-        """Publish per-row valid cache lengths on the execution stream."""
+    def _write_valid_cache_lengths(self, pool_indices, lengths) -> torch.Tensor:
+        """Publish per-row valid cache lengths on the execution stream.
+
+        Returns:
+            The rows' request slots, an int64 device tensor.
+        """
         self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
@@ -2595,6 +2607,7 @@ class ModelExecutor:
             self.attn_backend.invalidate_cache_residency(
                 rows, stream=self.execution_stream
             )
+        return rows
 
     def execute_forward_op(
         self,
@@ -2650,9 +2663,15 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            self.runtime_states.bind_stop_criteria(
+            rebound_slots = self.runtime_states.bind_stop_criteria(
                 admission_ids, forward_op.request_pool_indices, stop_criteria
             )
+            if rebound_slots is not None:
+                # A slot's new owner starts without its previous owner's
+                # backend working state.
+                self.attn_backend.reset_request_workspace(
+                    rebound_slots, stream=self.execution_stream
+                )
             cache_metadata = None
             block_tables = {}
             block_tables_cpu = {}

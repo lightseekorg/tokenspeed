@@ -485,6 +485,7 @@ impl DataPlane for PythonDataPlane {
                     "LoadBackDoneEvent" => CacheEventKind::LoadBackDone,
                     "SnapshotDoneEvent" => CacheEventKind::SnapshotDone,
                     "RestoreDoneEvent" => CacheEventKind::RestoreDone,
+                    "StateCommitDoneEvent" => CacheEventKind::StateCommitDone,
                     _ => return Err(self.fail(format!("unknown cache event {kind}"))),
                 };
                 Ok(CacheEvent { kind, op_id })

@@ -483,4 +483,9 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
     // that would have used them is gone.
 }
 
+void Scheduler::handleEvent(const cache::StateCommitDone& event) {
+    // Every replica member committed the endpoints; a duplicate ACK finds none.
+    state_commit_fences_.erase(event.op_id);
+}
+
 }  // namespace tokenspeed

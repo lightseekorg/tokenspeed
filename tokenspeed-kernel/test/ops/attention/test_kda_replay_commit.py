@@ -44,7 +44,28 @@ def test_retained_commit_matches_every_accepted_prefix(width, cross_page):
     output = verify(case)
     torch.testing.assert_close(output[0].float(), expected[0], atol=2e-4, rtol=1e-2)
     accepted = torch.arange(width + 2, device="cuda", dtype=torch.int32)
-    commit(case, accepted)
+    commit(case, accepted, ended_slots=())
+    check_prefix(case, accepted, expected)
+
+
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("cross_page", [False, True])
+def test_ended_request_commit_leaves_a_dense_endpoint(width, cross_page):
+    """The forward that ends a request folds its records into its live page.
+
+    Rows 0 and 2 end: their pages alone hold the accepted endpoint and their
+    slots count no record. Row 1 keeps its records.
+    """
+    case = make_case(3, width, cross_page=cross_page, strided=True)
+    expected = reference(case)
+    verify(case)
+    accepted = torch.tensor([width, 1, 0], device="cuda", dtype=torch.int32)
+    commit(case, accepted, ended_slots=(0, 2))
+    history = case["records"].history
+    # A cross-page verify folded the two accepted records into row 1's new
+    # live page before appending its candidates.
+    assert history.length[:, 0].tolist() == [0, (0 if cross_page else 2) + 1, 0]
+    # Each live page plus its slot's remaining records is the endpoint.
     check_prefix(case, accepted, expected)
 
 
@@ -56,7 +77,7 @@ def test_retained_capacity_boundary_and_rejected_slot_reuse(accepted_history, wi
         output = verify(case)
         torch.testing.assert_close(output[0].float(), expected[0], atol=2e-4, rtol=1e-2)
         accepted = torch.full((3,), take, device="cuda", dtype=torch.int32)
-        commit(case, accepted)
+        commit(case, accepted, ended_slots=())
         check_prefix(case, accepted, expected)
         case["raw"].mul_(0.9)
 
@@ -67,7 +88,7 @@ def test_retained_commit_rejects_stale_candidate_stamps():
     history = case["records"].history
     before_conv, before_length = case["conv"].clone(), history.length.clone()
     case["records"].stamps[..., 1].fill_(-1)
-    commit(case, torch.ones(3, device="cuda", dtype=torch.int32))
+    commit(case, torch.ones(3, device="cuda", dtype=torch.int32), ended_slots=())
     torch.testing.assert_close(case["conv"], before_conv, atol=0, rtol=0)
     torch.testing.assert_close(history.length, before_length, atol=0, rtol=0)
 
@@ -78,7 +99,7 @@ def test_in_place_commit_full_pool_accounting():
     before_state, before_conv = case["state"].clone(), case["conv"].clone()
     verify(case)
     accepted = torch.tensor([0, 1, 9, 0], device="cuda", dtype=torch.int32)
-    commit(case, accepted)
+    commit(case, accepted, ended_slots=())
     check_prefix(case, accepted, expected)
     torch.testing.assert_close(case["state"], before_state, atol=0, rtol=0)
     for page in (0, 4, 5, 6, 7, 8, 9, 10):

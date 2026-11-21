@@ -1215,6 +1215,19 @@ the image as the split planned:
   `snapshot_slot`), ride one `SnapshotStoreOperation`; the op may carry zero
   page rows, the blob always.
 
+A State group may defer its decode state
+(`CacheGroupConfig::deferred_decode_state`: the runtime commits a decoding
+request's state to slot 1 only at its end or at this retraction, first thing
+in the plan). The retraction lists a decoded victim's slot-1 block in each
+such group in the plan's `state_folds`, as (request pool index, page id),
+once its publication is done and before the split: a victim whose image the
+split then refuses is aborted, but the publication stands and still needs
+the fold. A block the publication swapped for another request's equal entry
+is left out. Local readers order behind the fold on the device, but a peer
+does not: with peers, the slot-1 blocks this publication put into the index
+for a decoded victim join the plan's `state_commit_fence`, and
+`PeerPagesMatch` refuses them until `cache::StateCommitDone`.
+
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
 at it), the shallowest first, and the Host takes the leading boundaries that

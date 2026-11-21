@@ -177,7 +177,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
     def build(*args, **kwargs):
         pool_generation[0] += 1
         return SimpleNamespace(
-            attn_backend=None,
+            # The scheduler's group configs read which groups defer decode state.
+            attn_backend=SimpleNamespace(deferred_decode_state_groups=frozenset),
             draft_attn_backend=None,
             token_to_kv_pool=SimpleNamespace(
                 name=f"target{pool_generation[0]}",
@@ -318,6 +319,15 @@ def _handle(trace, **kwargs):
                 ("candidates", idx, list(ids))
             ),
             mark_remote_cache_ready=lambda slot: trace.append(("ready", slot)),
+            attn_backend=SimpleNamespace(
+                fold_deferred_state=lambda folds, *, stream: trace.append(
+                    (
+                        "fold",
+                        {group: pairs.tolist() for group, pairs in folds.items()},
+                        stream,
+                    )
+                )
+            ),
         ),
         **kwargs,
     )
@@ -331,23 +341,35 @@ def _plan(
     remote_decode=None,
     remote_prefill=None,
     has_peer_fetches=False,
+    state_commit_fence=None,
+    state_folds=None,
 ):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
     plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
     the real plan's shape: every cache group listed, empty or not, with the
-    given pages under ``"kv"``. ``pages_to_copy`` is the
-    ``pages_to_copy_arrays()`` view: ``[n, 2]`` arrays per group id."""
-    copies = {
-        group_id: np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
-        for group_id, pairs in (pages_to_copy or {}).items()
-    }
+    given pages under ``"kv"``. ``pages_to_copy`` and ``state_folds`` are the
+    ``*_arrays()`` views: ``[n, 2]`` int32 arrays per group id, read-only as
+    the binding's are."""
+
+    def arrays(pairs_by_group):
+        out = {}
+        for group_id, pairs in (pairs_by_group or {}).items():
+            view = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+            view.setflags(write=False)
+            out[group_id] = view
+        return out
+
+    copies = arrays(pages_to_copy)
+    folds = arrays(state_folds)
     return SimpleNamespace(
         pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=lambda: copies,
+        state_folds_arrays=lambda: folds,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
         has_peer_fetches=has_peer_fetches,
+        state_commit_fence=state_commit_fence,
     )
 
 
@@ -818,12 +840,13 @@ def test_a_failed_page_copy_fails_the_plan(wire_ops):
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
     """A retraction's image rides ``execute`` with no operation of its own:
-    the snapshot store goes to ``submit_write_backs`` (whose stream-ordered
-    lane fences the default stream the zeroing runs on) ahead of the
-    zeroing, the restore to ``submit_load_backs`` behind it. The binding's
-    batches arrive at the executor as one per-request op each -- the unit it
-    exports/imports a slot for -- carrying the victim's slot on the store and
-    the new slot on the restore."""
+    the victims' live pages are completed first, on the execution stream the
+    stores order behind; the snapshot store goes to ``submit_write_backs``
+    (whose stream-ordered lane fences the default stream the zeroing runs
+    on) ahead of the zeroing, the restore to ``submit_load_backs`` behind it.
+    The binding's batches arrive at the executor as one per-request op each
+    -- the unit it exports/imports a slot for -- carrying the victim's slot on
+    the store and the new slot on the restore."""
     trace: list = []
     plan = _plan(
         pages_to_zero=[9],
@@ -832,6 +855,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
             _SnapshotBatch([(7, 3, 0), (8, 5, 1)]),
             _RestoreBatch([(9, 4, 2)]),
         ],
+        state_folds={"state": [(3, 30), (5, 50)]},
     )
 
     def submit_write_backs(ops, *, prerequisite_stream, fence_stream):
@@ -854,11 +878,19 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
     _execute(handle, plan, None)
 
     kinds = [entry[0] for entry in trace]
-    assert kinds == ["write_backs", "zero", "default waits", "load_backs"]
+    assert kinds == [
+        "fold",
+        "write_backs",
+        "zero",
+        "default waits",
+        "load_backs",
+    ]
+    # The victims' live pages, before anything of the plan reads them.
+    assert trace[0] == ("fold", {"state": [[3, 30], [5, 50]]}, "execution-stream")
     # Stores precede the zeroing, and the fence they record lands on the
     # stream the zeroing runs on.
-    stores = trace[0][1]
-    assert trace[0][2] is handle._executor.default_stream
+    stores = trace[1][1]
+    assert trace[1][2] is handle._executor.default_stream
     assert [type(op).__name__ for op in stores] == [
         "_WriteBackOp",
         "SnapshotOp",
@@ -878,7 +910,59 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         (9, 4, 2)
     ]
     assert trace[-1][2] is handle._executor.default_stream
-    assert trace[2] == ("default waits", "execution-stream")
+    assert trace[3] == ("default waits", "execution-stream")
+
+
+def test_a_peer_pins_the_retracted_endpoints_only_behind_their_commit(wire_ops):
+    """With peers, the plan carries a state commit fence: its ACK waits on an
+    event recorded on the execution stream right behind the victims' commit,
+    so it lands only once every endpoint the retractions published holds its
+    committed state. The handle keeps the fence's ACK itself, beside the Host
+    cache's."""
+    trace: list = []
+    committed = False
+
+    class _Event:
+        def record(self, stream):
+            trace.append(("commit recorded", stream))
+
+        def query(self):
+            return committed
+
+    plan = _plan(
+        cache=[_SnapshotBatch([(7, 3, 0)])],
+        state_commit_fence=11,
+        state_folds={"state": [(3, 30)]},
+    )
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+                trace.append("stores")
+            ),
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
+            ),
+            poll_results=lambda: [],
+        ),
+    )
+    handle._executor.device_module = SimpleNamespace(Event=_Event)
+
+    _execute(handle, plan, None)
+
+    assert trace[:3] == [
+        ("fold", {"state": [[3, 30]]}, "execution-stream"),
+        ("commit recorded", "execution-stream"),
+        "stores",
+    ]
+    assert handle.poll_cache_results() == []
+    committed = True
+    [ack] = handle.poll_cache_results()
+    assert scheduler_utils_module.cache_event_to_payload(ack) == {
+        "kind": "StateCommitDoneEvent",
+        "op_id": 11,
+    }
+    assert handle.poll_cache_results() == []
 
 
 def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
@@ -890,7 +974,11 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     whose fence the forward's prologue inherits, so the export reads the
     victim's bytes even when this very plan's batch reuses the slot."""
     trace: list = []
-    plan = _plan(pages_to_zero=[2], cache=[_SnapshotBatch([(1, 6, 0)])])
+    plan = _plan(
+        pages_to_zero=[2],
+        cache=[_SnapshotBatch([(1, 6, 0)])],
+        state_folds={"state": [(6, 60)]},
+    )
     handle = _handle(
         trace,
         host_cache_executor=SimpleNamespace(
@@ -912,11 +1000,30 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     _execute(handle, plan, planned)
 
     assert trace == [
+        ("fold", {"state": [[6, 60]]}, "execution-stream"),
         ("store", [6]),
         "zero",
         ("default waits", "execution-stream"),
         "load_backs",
         ("forward", [6]),
+    ]
+
+
+def test_a_refused_images_folds_run_with_no_cache_op():
+    """A retraction whose image the scheduler refuses after publishing aborts
+    its victim, which stores nothing, but the endpoint it published stays
+    readable: the plan still lists the victim's live pages, and the handle
+    folds them behind any pending draft round, with no cache op, zeroing or
+    forward to carry them."""
+    trace: list = []
+    handle = _handle(trace)
+    handle._executor.complete_pending_drafting = lambda: trace.append("settle")
+
+    _execute(handle, _plan(state_folds={"state": [(6, 60)], "state2": [(6, 61)]}), None)
+
+    assert trace == [
+        "settle",
+        ("fold", {"state": [[6, 60]], "state2": [[6, 61]]}, "execution-stream"),
     ]
 
 
@@ -991,9 +1098,11 @@ def test_shutdown_cache_closes_the_host_cache():
     assert trace == ["l2_shutdown"]
 
 
-def test_cache_polling_without_kvstore_refuses_loudly():
-    with pytest.raises(RuntimeError, match="enable-kvstore"):
-        _handle([]).poll_cache_results()
+def test_cache_polling_without_a_host_cache_reports_nothing_pending():
+    """Without --enable-kvstore or a snapshot pool there is no Host transfer
+    to acknowledge; the poll answers with nothing instead of failing, since
+    the state commit fences it also reports need no Host cache."""
+    assert _handle([]).poll_cache_results() == []
 
 
 # ----------------------------------------------------------------------
@@ -1710,9 +1819,13 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             self.pages_to_zero = {}
             self.remote_decode = None
             self.remote_prefill = None
+            self.state_commit_fence = None
             self.reads = 0
 
         def pages_to_copy_arrays(self):
+            return {}
+
+        def state_folds_arrays(self):
             return {}
 
         @property

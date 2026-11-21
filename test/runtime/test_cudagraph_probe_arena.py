@@ -252,9 +252,9 @@ def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
 
 
 def test_the_override_reaches_the_plan_through_the_factory_seam() -> None:
-    from test.runtime.conftest import kimi_recipe_with_history
+    from test.runtime.conftest import kimi_recipe
 
-    template = kimi_recipe_with_history(history_capacity=None, max_bs=8)
+    template = kimi_recipe(max_bs=8)
     built = setup.prepare_cache_setup(
         family="kimi_k3",
         server_args=template.server_args,

@@ -42,6 +42,15 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
     if (!PeerExports::Matches(coordinator_, lookup, num_tokens, pages)) {
         return false;
     }
+    // A decoded endpoint a retraction published holds its deferred state only
+    // after the runtime acknowledged the commit (ExecutionPlan::
+    // state_commit_fence); local forwards order behind it, a remote read
+    // does not.
+    if (std::ranges::any_of(pages, [&](const PeerPage& page) {
+            return page.tier == CacheTier::kDevice && awaitsStateCommit(page.group_id, page.block_id);
+        })) {
+        return false;
+    }
     if (!tier_transfers_.HasLoadBacksInFlight()) {
         return true;
     }
@@ -53,6 +62,12 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
         return page.tier == CacheTier::kDevice && loading[page.group_id].contains(page.block_id);
     });
 }
+bool Scheduler::awaitsStateCommit(std::uint32_t group, std::int32_t page) const {
+    const std::pair key{group, page};
+    return uncommitted_state_pages_.contains(key) ||
+           std::ranges::any_of(state_commit_fences_, [&](const auto& fence) { return fence.second.contains(key); });
+}
+
 namespace {
 
 std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {

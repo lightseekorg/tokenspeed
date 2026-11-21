@@ -485,7 +485,7 @@ class RuntimeStates:
         admission_ids: Sequence[int],
         request_pool_indices: Sequence[int],
         stop_criteria: Sequence[StopCriteria],
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Write the stop criteria of every slot whose admission changed.
 
         Runs on the stream the forward runs on, ahead of it; a slot keeps its
@@ -493,6 +493,10 @@ class RuntimeStates:
         binding so even an image taken before first use gets canonical criteria.
         Criteria are fixed at admission; reusing a public request ID creates
         a new admission even when its criteria happen to be equal.
+
+        Returns:
+            The device indices (int64) of the slots whose admission changed,
+            or None when every slot keeps its admission.
         """
         if len(stop_criteria) != len(admission_ids):
             raise ValueError(
@@ -506,7 +510,7 @@ class RuntimeStates:
             if self._stop_criteria_owners[slot] != admission_id
         ]
         if not changed:
-            return
+            return None
         pin = torch.device(self.device).type == "cuda"
         slots = torch.tensor(
             [request_pool_indices[i] for i in changed],
@@ -530,6 +534,7 @@ class RuntimeStates:
         self.token_limits.index_copy_(
             0, slots, limits.to(self.device, non_blocking=True)
         )
+        return slots
 
     def apply_stop_conditions(
         self,

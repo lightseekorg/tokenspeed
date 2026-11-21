@@ -58,6 +58,7 @@ from test.runtime.conftest import requires_cuda
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.backends.state import kda, mamba
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
@@ -170,12 +171,19 @@ def _backend_config(device: str, *, spec_tokens: int = 1):
 
 def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBackend:
     kda_backend = "auto" if current_platform().is_amd else "fla"
+    config, spec = _backend_config(device, spec_tokens=spec_tokens)
     backend = KdaAttnBackend(
-        *_backend_config(device, spec_tokens=spec_tokens),
-        enable_prefill_graph=False,
-        kda_backend=kda_backend,
+        config, spec, enable_prefill_graph=False, kda_backend=kda_backend
     )
     backend.set_kv_pool(contract_pool)
+    # RuntimeStates.stopped, as the executor binds it; no request ends here.
+    backend.bind_request_stop_flags(
+        torch.zeros(
+            RequestSlotLayout(config.max_resident_requests).capacity,
+            dtype=torch.bool,
+            device=device,
+        )
+    )
     return backend
 
 
@@ -244,18 +252,6 @@ class _StubContractPool:
                     device=device,
                     dtype=recurrent_dtype,
                 ),
-                "replay_correction": torch.zeros(
-                    num_pages, num_heads, 16, head_dim, device=device
-                ),
-                "replay_key": torch.zeros(
-                    num_pages, num_heads, 16, head_dim, device=device
-                ),
-                "replay_decay": torch.zeros(
-                    num_pages, num_heads, 16, head_dim, device=device
-                ),
-                "replay_length": torch.zeros(
-                    num_pages, 1, device=device, dtype=torch.int32
-                ),
             }
             for layer_id in self._groups
         }
@@ -268,15 +264,22 @@ class _StubContractPool:
         return self._components[layer_id][name]
 
 
-def _logical_checkpoint(pool, layer, page):
+def _logical_checkpoint(backend, layer, page, request_slot):
+    """The page's dense state followed by its request slot's accepted records."""
+    pool = backend.kv_pool
     state = pool.get_component(layer, "recurrent_state")[page].float().clone()
-    length = int(pool.get_component(layer, "replay_length")[page, 0])
-    for token in range(length):
-        state = (
-            state * pool.get_component(layer, "replay_decay")[page, :, token, None, :]
-            + pool.get_component(layer, "replay_correction")[page, :, token, :, None]
-            * pool.get_component(layer, "replay_key")[page, :, token, None, :]
-        )
+    if backend._retained_records is None:
+        # No decode has allocated the request-slot workspace yet.
+        return state
+    length = int(backend._retained_lengths[layer][request_slot].item())
+    if length:
+        layer_row = backend._descriptor_row_by_layer[layer]
+        correction, key, decay = backend._retained_records[request_slot, layer_row]
+        for token in range(length):
+            state = (
+                state * decay[:, token, None, :]
+                + correction[:, token, :, None] * key[:, token, None, :]
+            )
     return state
 
 
@@ -315,6 +318,25 @@ def test_set_kv_pool_binds_contract_state_groups() -> None:
     assert backend._state_group_ids == _STATE_GROUPS
     assert backend.deferred_state_commit
     assert backend._retained_capacity == 16
+
+
+def test_retained_state_groups_defer_their_decode_state() -> None:
+    """Every KDA State group keeps decode records in request slots until a
+    request ends or is retracted, which the scheduler's peer fence relies on;
+    a composite reports its KDA child's groups and nothing else."""
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+
+    pool = _make_kimi_pool("cpu")
+    backend = _backend("cpu", contract_pool=pool)
+    assert backend.deferred_decode_state_groups() == frozenset(_STATE_GROUPS)
+    config, spec = _backend_config("cpu")
+    full = AttentionBackend(config, spec)
+    assert full.deferred_decode_state_groups() == frozenset()
+    root = HybridLinearAttnBackend(full, backend, [])
+    assert root.deferred_decode_state_groups() == frozenset(_STATE_GROUPS)
 
 
 def _kimi_tables(bs: int, width: int, *, base: int = 1) -> dict[str, np.ndarray]:
@@ -475,6 +497,10 @@ class _KDAHarness:
         self.value_dim = self.H * self.D
         self.conv_dim = 3 * self.key_dim
         self.backend = _backend(device, contract_pool=pool)
+        # RuntimeStates.stopped, as the executor binds it: a test marks the
+        # slot of a request whose round ends it, before that round's commit.
+        self.stopped = torch.zeros(16, dtype=torch.bool, device=device)
+        self.backend.bind_request_stop_flags(self.stopped)
         self.backend.init_cuda_graph_state(max_bs=self.MAX_BS)
         # Per-layer weights and full token streams (so each group is proven
         # independent, not accidentally identical).
@@ -531,7 +557,9 @@ class _KDAHarness:
         }
         return _tables_for(self.contract, np_tables, self.device)
 
-    def extend_metadata(self, tables, seq_lens, extend_prefix_lens, num_extends):
+    def extend_metadata(
+        self, tables, seq_lens, extend_prefix_lens, num_extends, request_slots=None
+    ):
         """An EXTEND batch, or a MIXED one whose rows past ``num_extends``
         decode one token each; the executor's host mirrors carry each row's
         new-token and prefix lengths."""
@@ -541,7 +569,11 @@ class _KDAHarness:
         self.backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
-            req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
+            req_pool_indices=torch.tensor(
+                range(1, bs + 1) if request_slots is None else request_slots,
+                dtype=torch.int32,
+                device=self.device,
+            ),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             forward_mode=ForwardMode.from_num_extends(num_extends, bs),
             block_tables=self._delivered(tables),
@@ -561,7 +593,7 @@ class _KDAHarness:
         self.backend.refresh_decode_metadata(
             bs,
             bs,
-            torch.arange(bs, dtype=torch.int32, device=self.device),
+            torch.arange(1, bs + 1, dtype=torch.int32, device=self.device),
             torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             forward_mode=ForwardMode.DECODE,
             block_tables=self._delivered(tables),
@@ -771,7 +803,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
         conv = pool.get_component(layer_id, "conv_state")
         snap_page, final_page = blocks[gid]
         _assert_close(
-            _logical_checkpoint(pool, layer_id, final_page),
+            _logical_checkpoint(h.backend, layer_id, final_page, 1),
             naive_state,
             f"layer {layer_id} state vs naive",
         )
@@ -882,6 +914,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         seq_lens=[7, 6],
         extend_prefix_lens=[4, 5],
         num_extends=1,
+        request_slots=[2, 1],
     )
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1, 2]
@@ -938,10 +971,14 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     _assert_close(flat_a, naive_a, "branch A out vs naive")
     _assert_close(flat_b, naive_b[4 * h.H :], "branch B out vs naive")
     _assert_close(
-        _logical_checkpoint(pool, layer_id, 2), state_a, "branch A final state vs naive"
+        _logical_checkpoint(h.backend, layer_id, 2, 1),
+        state_a,
+        "branch A final state vs naive",
     )
     _assert_close(
-        _logical_checkpoint(pool, layer_id, 5), state_b, "branch B final state vs naive"
+        _logical_checkpoint(h.backend, layer_id, 5, 2),
+        state_b,
+        "branch B final state vs naive",
     )
 
 
@@ -1016,7 +1053,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         # slab, so pages written by the other groups are allowed to appear
         # through this layer's view — only page 0 must stay zero.
         _assert_close(
-            _logical_checkpoint(pool, layer_id, page),
+            _logical_checkpoint(h.backend, layer_id, page, 1),
             naive_state,
             f"group {gid} state vs naive",
         )

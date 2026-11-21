@@ -162,11 +162,12 @@ def test_vllm_retained_verify_and_publish(batch, width, dim, lower_bound):
     starts = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * width
     capacity = max(16, width)
     history = KdaRetainedHistory(
-        torch.zeros(pages, heads, capacity, dim, device="cuda"),
-        torch.zeros(pages, heads, capacity, dim, device="cuda"),
-        torch.ones(pages, heads, capacity, dim, device="cuda"),
-        torch.zeros(pages, 1, device="cuda", dtype=torch.int32),
+        torch.zeros(batch, heads, capacity, dim, device="cuda"),
+        torch.zeros(batch, heads, capacity, dim, device="cuda"),
+        torch.ones(batch, heads, capacity, dim, device="cuda"),
+        torch.zeros(batch, 1, device="cuda", dtype=torch.int32),
         live,
+        torch.arange(batch, device="cuda", dtype=torch.int32),
     )
     metadata = torch.tensor(
         [[row, 19, 2**32 + 7] for row in range(batch)], device="cuda", dtype=torch.int64
@@ -212,9 +213,12 @@ def test_vllm_retained_verify_and_publish(batch, width, dim, lower_bound):
             record_metadata=metadata,
             record_stamps=stamps,
         )
-        assert history.length[live.long(), 0].tolist() == [accepted] * batch
+        assert history.length[:, 0].tolist() == [accepted] * batch
         actual = torch.stack(
-            [endpoint(state[page], history, page) for page in live.tolist()]
+            [
+                endpoint(state[page], history, row)
+                for row, page in enumerate(live.tolist())
+            ]
         )
         expected = source_before if accepted == 0 else expected_states[accepted - 1]
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)

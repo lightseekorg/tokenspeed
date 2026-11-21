@@ -434,6 +434,42 @@ prompt end from slot 0: slot 1 is the fresh block the padding row never wrote
 prompt-end state onto another request's canonical checkpoint before the
 rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
+KDA keeps its FP32 decode records and their accepted count in the active
+request slot, outside the LCM arena. The live State block holds only the
+dense base and the convolution state, exactly as without retained history;
+the scheduler and the cache see nothing else. Prefill writes complete
+checkpoints. The decode commit of the forward that ends a request (the
+sampling epilogue has set `RuntimeStates.stopped` for its slot) folds the
+slot's accepted records into the live block and clears the count. The block
+a finish publishes is thus a self-contained dense checkpoint before the host
+learns that the request ended. BF16 dense storage rounds at this boundary.
+A finish the device's stop criteria do not explain -- a grammar that ends
+while the request ignores EOS, a client abort -- leaves the records
+unfolded. With a group deferring its decode state
+(`Scheduler::DefersDecodeState`), the control plane ends such a request with
+`forward::Abort` rather than `forward::Finish`, so it publishes nothing, as
+for a numerically corrupted forward; the slot's next admission clears the
+count (`reset_request_workspace`).
+
+A retraction publishes and images the victim's computed frontier. The
+backend declares its State groups as deferring their decode state
+(`deferred_decode_state_groups`, set on the scheduler's `CacheGroupConfig`),
+and the scheduler lists a decoded victim's live block in each of them, the
+one its decode steps write in place, in the plan's `state_folds`, by request
+slot. Before the plan's stores, copies, zeroing and forward, the data plane
+folds each listed slot's records into its block (`DeviceHandle.execute`,
+`fold_deferred_state`). The list does not depend on the image: a retraction
+whose image the split refuses after the publication aborts the victim, but
+its publication stands, and the fold completes it before any reader. A
+block the publication swapped for another request's equal entry is not
+listed; that entry already holds the complete state. The FP32 records stay in
+the GPU workspace. Restore copies the complete dense and convolution states
+and starts the restored slot with an accepted count of zero. A remote peer
+does not observe stream order: with peers, a plan whose retractions publish
+such an endpoint carries a `state_commit_fence`; the data plane acknowledges
+it on the execution stream right behind the folds, and the scheduler refuses
+peer pins of those blocks until the ACK (RFC 0004, "Pin").
+
 State groups may additionally restrict reusable checkpoints with
 `checkpoint_granularity`: intermediate prefill forwards end on its multiples,
 and only prefill-produced states at these positions are published or matched.
@@ -526,88 +562,47 @@ the request without another forward. KDA convolution history may use either
 channel-major or channels-last storage; the PD schema partitions the channel
 axis in each layout, preserving its separate Q/K/V channel segments.
 
-KDA uses retained history for ordinary decode (`T=1`) and speculative
-verification. Verify preserves the logical accepted checkpoint while preparing
-candidate records in the private live block. Acceptance selects the prefix
-that commit publishes. Unsupported configurations fail during initialization
-or kernel selection.
+KDA uses retained history for ordinary decode and speculative verification.
+Each KDA State page holds the convolution window and a dense recurrent base,
+and nothing else. Each resident request has a stable slot outside the LCM
+arena. For each KDA layer, the slot holds FP32 corrections (U), normalized
+keys (K) and per-token decays, plus an INT32 count of the updates accepted
+since the dense base of the request's input page. Batch reordering changes
+the mapping from batch rows to request slots.
 
-The dense base follows `--mamba-ssm-dtype` (FP32 or BF16). Logical-state
-accumulation and retained history stay FP32. Applying accepted history does not
-round at every token; rounding occurs only when materialization writes a new
-dense base. Both dense-base dtypes use the same checkpoint lifecycle.
+Verify replays the accepted updates in order to reconstruct the current
+state. It appends candidates after that accepted prefix. Commit advances the
+slot's count by the accepted count and updates the convolution window. For
+example, after four candidates and two acceptances, the next verify starts
+writing at index two. Generation stamps identify candidates from the current
+round. Eager execution and CUDA graphs use the same page and request-slot
+routing.
 
-The retained-history checkpoint includes these fields in the same state block:
-`replay_correction`, `replay_key`, `replay_decay` and `replay_length`. The first
-three are FP32 `[heads, capacity, channel]` fields containing corrections,
-normalized keys and multiplicative per-token decays. Capacity is the total
-number of slots shared by accepted history and the current verify candidates;
-there is no separate per-round U/K/decay records allocation in this path. The
-INT32 length publishes only the accepted prefix. Zero means the dense base
-alone, even if unused entries contain stale or rejected candidates. Applying
-that prefix in token order reconstructs the accepted endpoint. The convolution
-window describes that endpoint, not the older dense base.
+Each layer has room for `max(16, effective_verify_width)` records per slot.
+When a whole candidate window will no longer fit, verify folds accepted updates
+into the dense base before it reuses the slot. A change of live page likewise
+starts from a materialized base. The base uses `--mamba-ssm-dtype` (FP32 or
+BF16). Replay accumulates in FP32 and rounds when it writes the dense base.
 
-Verify writes candidate records directly into the private live page after
-its accepted prefix. It reserves the entire candidate window before writing:
-`history_length + candidate_count <= capacity`. If the window would not fit,
-verify consolidates only accepted history into the dense base and starts at
-slot zero; the candidate count itself must fit within capacity. Equality fits
-without consolidation. If the input checkpoint is on another page, verify
-reconstructs its accepted endpoint into the private live page's dense base
-and starts there with an empty history. Published input pages remain read-only.
-Both cases keep consolidation in verify.
+Prefill starts from the logical state of its input page, then writes dense
+live and interior checkpoints and clears the rows' counts. A decode commit
+only advances the count, except in the forward that ends the request, which
+folds the records into the live block; a retraction folds them before its
+image is stored (above). A published or imaged block is therefore a
+self-contained dense checkpoint, and prefill to decode transfer carries it
+unchanged. A recycled slot may still count records of an owner whose end the
+device did not see, so the runtime clears the count whenever a slot gets a
+new owner (`reset_request_workspace`): at its first forward
+(`RuntimeStates.bind_stop_criteria`) and, on a PD decode node, already at the
+landing of a prompt computed elsewhere, which a retraction may fold before
+any forward (`ModelExecutor.reset_remote_prefill_cache_lengths`). A restore
+starts the slot at zero itself (`import_slot_state`).
 
-Writing candidates leaves the accepted length unchanged. After acceptance,
-commit advances that length by the accepted count without copying U/K/decay.
-The next verify's append offset is the accepted history length, never the
-previous candidate window's end. For example, writing four candidates at
-slots 0..3 and accepting two makes the next four candidates use slots 2..5;
-rejected slots are reused immediately, without clearing or leaving gaps.
-Publication must follow completion of the candidate writes.
-Commit still updates convolution history for the accepted tokens; original
-QKV retention and per-round routing/validity metadata are separate from these
-record fields. Stable pool storage and device-side page/offset selection serve
-both eager execution and CUDA graphs, for both T=1 and speculative decode.
-
-Prefill gathers the dense base into its existing temporary state buffer and
-applies the source's accepted history there. It never consolidates a shared
-source page in place. After storing a dense endpoint, a separate ordered kernel
-resets the destination's length. This applies to both the live page and each
-in-forward checkpoint page. This keeps existing prefill
-implementations independent of the retained checkpoint representation.
-
-Decode binds candidate history to the private live pages prepared before
-verify. The accepted-state planner retains its source and destination routing;
-batched commit updates convolution across all participating layers before
-publishing their lengths. Its descriptor includes each layer's page count and
-element strides. Mixed forwards use the decode subbatch's packed boundaries
-for both original QKV and commit, not the restored full-batch offsets.
-
-These fields share the base's cache group and block ownership. Whole-block
-copy, zeroing, prefix reuse, retraction and transfer must carry the complete
-checkpoint. Head-valued fields partition with attention TP; the length is
-replicated. The cache planner includes all fields when sizing a state plane;
-retained history is not counted again as transient verify workspace. Supported
-Kimi and GLM consumers declare capacity `max(16, effective_verify_width)` from
-fixed startup configuration. Execution requires both explicit retained verify
-support and batched commit support. Prefill-only engines use the same checkpoint
-schema for matching startup configuration, but allocate no decode workspace.
-PD peers must agree on that schema, including capacity when their verify widths differ.
-
-Records save the normalized keys and multiplicative decays already used by
-verify, together with FP32 corrections. NVIDIA uses CuTe or Triton, and AMD uses Gluon.
-Commit loads source convolution taps before storing live taps so a request's
-own source and destination may alias. The convolution pool keeps its cache
-dtype, independently of activation dtype; original QKV is converted on commit.
-
-The recipes reserve original QKV rows, commit descriptors, page routing and
-record metadata before sizing the arena. Convolution reads the committed
-window directly. Generation stamps and accepted counts describe the current
-verify window. Cache pages own accepted history. The planner uses the same
-descriptor width and payload geometry as the actual allocations. Prefill-only
-engines reserve no decode records. GLM also counts its target/draft-shared
-KPool tails once in the GPU budget.
+The cache recipes reserve the record and count storage by resident request
+capacity, including the reserved slots in `RequestSlotLayout`. They budget
+original QKV, routing and generation stamps separately by verify batch size.
+Adding LCM pages increases the space for dense checkpoints while the record
+budget stays fixed. Prefill-only engines allocate no decode records.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

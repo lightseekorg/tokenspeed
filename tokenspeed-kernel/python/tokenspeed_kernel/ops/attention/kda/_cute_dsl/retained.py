@@ -25,9 +25,9 @@ from cutlass import Float32, Int32, Int64, cute
 
 
 @cute.jit
-def load_element(tensor, page, head, position, channel):
+def load_element(tensor, index, head, position, channel):
     offset = (
-        Int64(page) * tensor.stride[0]
+        Int64(index) * tensor.stride[0]
         + Int64(head) * tensor.stride[1]
         + Int64(position) * tensor.stride[2]
         + Int64(channel) * tensor.stride[3]
@@ -38,21 +38,18 @@ def load_element(tensor, page, head, position, channel):
 
 
 @cute.jit
-def retained_page(history, request):
-    live = history[5]
-    return Int64(
-        cute.make_tensor(
-            live.iterator + Int64(request) * live.stride[0], cute.make_layout((1,))
-        )[0]
-    )
+def retained_row(history, request):
+    row = Int64(request)
+    return Int64(history[5][row]), Int64(history[6][row])
 
 
 @cute.jit
-def retained_length(history, page):
+def retained_length(history, slot):
+    """Accepted records the request in ``slot`` holds beyond its dense base."""
     length = history[4]
     return Int32(
         cute.make_tensor(
-            length.iterator + Int64(page) * length.stride[0], cute.make_layout((1,))
+            length.iterator + Int64(slot) * length.stride[0], cute.make_layout((1,))
         )[0]
     )
 
@@ -62,6 +59,7 @@ def initialize_page_tile(
     tile,
     history,
     page,
+    slot,
     head,
     value_start,
     rows: cutlass.Constexpr[int],
@@ -69,8 +67,8 @@ def initialize_page_tile(
     tidx,
     threads: cutlass.Constexpr[int],
 ):
-    """Load base plus accepted history in FP32 without changing persistent storage."""
-    count = retained_length(history, page)
+    """Load page's base plus slot's accepted history in FP32 without changing storage."""
+    count = retained_length(history, slot)
     for item in cutlass.range_constexpr(0, rows * keys, threads):
         offset = item + tidx
         if offset < rows * keys:
@@ -78,9 +76,9 @@ def initialize_page_tile(
             key = offset % keys
             current = load_element(history[0], page, head, value, key)
             for position in cutlass.range(count):
-                u = load_element(history[1], page, head, position, value)
-                k = load_element(history[2], page, head, position, key)
-                decay = load_element(history[3], page, head, position, key)
+                u = load_element(history[1], slot, head, position, value)
+                k = load_element(history[2], slot, head, position, key)
+                decay = load_element(history[3], slot, head, position, key)
                 current = current * decay + u * k
             tile[offset] = current
     cute.arch.barrier()
@@ -94,38 +92,16 @@ def retained_arguments(state, history):
         history.decay,
         history.length,
         history.live_state_indices,
+        history.record_slots,
     )
 
 
-def fake_retained_arguments(state, correction, key, *, slots, batch, live_dtype):
+def fake_retained_arguments(state, correction, key, *, batch, live_dtype, slot_dtype):
     from quack.compile_utils import make_fake_tensor
 
     decay = make_fake_tensor(Float32, key.shape, leading_dim=None)
-    length = make_fake_tensor(Int32, (slots, 1))
+    # One accepted-record count per request slot, beside its records.
+    length = make_fake_tensor(Int32, (correction.shape[0], 1))
     live = make_fake_tensor(live_dtype, (batch,))
-    return (state, correction, key, decay, length, live)
-
-
-@cute.jit
-def initialize_tile(
-    tile,
-    history,
-    request,
-    head,
-    value_start,
-    rows: cutlass.Constexpr[int],
-    keys: cutlass.Constexpr[int],
-    tidx,
-    threads: cutlass.Constexpr[int],
-):
-    initialize_page_tile(
-        tile,
-        history,
-        retained_page(history, request),
-        head,
-        value_start,
-        rows,
-        keys,
-        tidx,
-        threads,
-    )
+    record_slots = make_fake_tensor(slot_dtype, (batch,), leading_dim=None)
+    return (state, correction, key, decay, length, live, record_slots)

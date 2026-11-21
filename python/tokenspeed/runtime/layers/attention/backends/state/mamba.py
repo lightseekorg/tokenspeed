@@ -219,6 +219,8 @@ class MambaForwardMetadata:
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
     scan_checkpoint_rows: torch.Tensor | None = None
+    # Request slots for families with off-page replay records.
+    req_pool_indices: torch.Tensor | None = None
 
     @property
     def prefill_token_extent(self) -> int | None:
@@ -285,6 +287,7 @@ class MambaAttnBackend(AttentionBackend):
     # both consumers exist.
     cache_consumer_attn_kinds = frozenset({"state"})
     _verify_reads_committed_recurrent_state: bool = False
+    _prefill_needs_request_slots: bool = False
     _verify_packed_qkv_views: bool = False
     _decode_packed_qkv_views: bool = False
     # Whether the family's chunked tree verify scan fills the ReplaySSM payload.
@@ -491,7 +494,11 @@ class MambaAttnBackend(AttentionBackend):
         return not self.is_draft and self.spec_num_tokens > 1
 
     def _prepare_verify_records(
-        self, bs: int, seq_lens: torch.Tensor, draft_token_num: int
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        draft_token_num: int,
+        req_pool_indices: torch.Tensor,
     ) -> None:
         """Refresh family-specific recovery records before eager or graph verify.
 
@@ -1092,6 +1099,9 @@ class MambaAttnBackend(AttentionBackend):
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
             scan_query_start_loc=scan_query_start_loc,
+            req_pool_indices=(
+                req_pool_indices[:bs] if self._prefill_needs_request_slots else None
+            ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             query_start_loc_int64=scan_query_start_loc.to(dtype=torch.int64),
@@ -1178,6 +1188,11 @@ class MambaAttnBackend(AttentionBackend):
             )
         prefill = MambaForwardMetadata(
             query_start_loc=boundaries,
+            req_pool_indices=(
+                req_pool_indices[:num_extends]
+                if self._prefill_needs_request_slots
+                else None
+            ),
             scan_query_start_loc=full_metadata.scan_query_start_loc[: num_extends + 1],
             extend_seq_lens_cpu=lengths,
             cu_extend_seq_lens_cpu=full_metadata.cu_extend_seq_lens_cpu[
@@ -1389,7 +1404,7 @@ class MambaAttnBackend(AttentionBackend):
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
-        del req_pool_indices, kwargs
+        del kwargs
         self._mixed_forward_metadata = None
         real_bs = actual_bs
         num_padding = bs - actual_bs
@@ -1469,7 +1484,9 @@ class MambaAttnBackend(AttentionBackend):
                     draft_token_num,
                     state_in_blocks_by_group,
                 )
-                self._prepare_verify_records(real_bs, seq_lens, draft_token_num)
+                self._prepare_verify_records(
+                    real_bs, seq_lens, draft_token_num, req_pool_indices
+                )
             else:
                 self._verify_commit_ctx = None
                 for group_id in self._state_groups():

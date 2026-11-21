@@ -41,5 +41,5 @@ def test_retained_mtp_matches_sequential_reference(
     actual = verify(case)
     torch.testing.assert_close(actual[0].float(), expected[0], atol=2e-4, rtol=1e-2)
     accepted = torch.arange(batch, device="cuda", dtype=torch.int32) % (width + 1)
-    commit(case, accepted)
+    commit(case, accepted, ended_slots=())
     check_prefix(case, accepted, expected)

@@ -47,7 +47,15 @@ struct RestoreDone {
     std::uint32_t op_id{};
 };
 
+// Every replica member committed the deferred decode state of the endpoints
+// a plan's retractions published (ExecutionPlan::state_commit_fence): peers
+// may pin those blocks.
+struct StateCommitDone {
+    std::uint32_t op_id{};
+};
+
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone,
+                                cache::StateCommitDone>;
 }  // namespace tokenspeed

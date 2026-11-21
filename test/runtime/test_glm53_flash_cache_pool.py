@@ -108,7 +108,17 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         draft_attn_config=draft_attn_config,
         draft_layers=1,
     )
-    packing = glm53_flash_packing_counts(groups)
+    state_group_ids = [
+        spec.group_id
+        for spec, _ in groups
+        if spec.group_id.startswith(LINEAR_ATTENTION)
+    ]
+    packing = glm53_flash_packing_counts(
+        tp_size=4,
+        mla_element_size=torch.float8_e4m3fn.itemsize,
+        recurrent_state_dtype=torch.float32,
+        state_group_ids=state_group_ids,
+    )
     plan = pack(
         groups,
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,

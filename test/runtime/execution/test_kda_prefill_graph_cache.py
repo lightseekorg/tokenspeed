@@ -63,7 +63,7 @@ def metadata(device, page):
 
 
 def configure_prefill(backend):
-    backend._retained_capacity = 0
+    backend._retained_records = None
     backend._prefill_graph_enabled = True
     backend.kda_backend = "cutedsl_kda"
     backend._prefill_metadata = {}
@@ -86,6 +86,7 @@ def _live_metadata(lengths, device):
     bounds = host.to(device=device, dtype=torch.int32)
     return MambaForwardMetadata(
         query_start_loc=bounds,
+        req_pool_indices=torch.arange(len(lengths), 0, -1, device=device),
         scan_query_start_loc=bounds.long(),
         query_start_loc_int64=bounds.long(),
         extend_seq_lens_cpu=lengths,
@@ -125,6 +126,9 @@ def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
     assert retained.extend_seq_lens_cpu.tolist() == lengths + [1] * padding
     assert retained.state_out_blocks_by_group["state"].tolist() == (
         list(range(1, live + 1)) + [-1] * padding
+    )
+    assert (
+        retained.req_pool_indices.tolist() == list(range(live, 0, -1)) + [0] * padding
     )
     assert retained.prefill_token_extent == 512
     with pytest.raises(ValueError, match="exceed the captured capacity"):
@@ -376,7 +380,6 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
 def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
-    history_capacity = 16
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
@@ -398,8 +401,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     torch.manual_seed(42)
     bucket, heads, dim = 2048, 8, 128
     channels = heads * dim
-    conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
-    states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
+    conv = torch.randn(13, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
+    states = torch.randn(13, heads, dim, dim, device="cuda", dtype=torch.float32)
     initial_conv, initial_states = conv.clone(), states.clone()
     # The live input of the captured projection: merged rows [q|k|v|g|f_a|b],
     # padded to the 128-row grid.
@@ -408,14 +411,14 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend._retained_capacity = history_capacity
-    backend._retained_fields = {}
-    if history_capacity:
-        correction = torch.full((12, heads, history_capacity, dim), 0.03, device="cuda")
-        key = torch.full_like(correction, 0.02)
-        decay = torch.full_like(correction, 0.9)
-        length = torch.full((12, 1), 3, device="cuda", dtype=torch.int32)
-        backend._retained_fields[0] = (correction, key, decay, length)
+    backend._descriptor_row_by_layer = {0: 0}
+    backend._retained_records = torch.empty(10, 1, 3, heads, 16, dim, device="cuda")
+    correction, key, decay = backend._retained_records[:, 0].unbind(1)
+    correction.copy_((0.01 * torch.arange(1, 11, device="cuda")).view(10, 1, 1, 1))
+    key.fill_(0.02)
+    decay.fill_(0.9)
+    length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
+    backend._retained_lengths = {0: length}
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
@@ -476,11 +479,12 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         )
         return core.flatten(1) * rows[: core.shape[0], 3 * channels : 4 * channels]
 
-    def reset():
+    def reset(metadata):
         conv.copy_(initial_conv)
         states.copy_(initial_states)
-        if history_capacity:
-            length.fill_(3)
+        length.fill_(3)
+        shared = metadata.state_in_blocks_by_group["state"] == 8
+        length[metadata.req_pool_indices[shared].long()] = 0
 
     def assert_scan_close(actual, expected):
         if backend_name == "cutedsl_kda":
@@ -503,13 +507,21 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         )
         return MambaForwardMetadata(
             query_start_loc=bounds,
+            req_pool_indices=(
+                2 * torch.arange(len(prefixes), device="cuda") + page_shift
+            )
+            % 8
+            + 1,
             scan_query_start_loc=bounds.long(),
             query_start_loc_int64=bounds.long(),
             extend_seq_lens_cpu=lengths,
             cu_extend_seq_lens_cpu=host,
             state_in_blocks_by_group={
                 "state": torch.tensor(
-                    [(8 + page_shift % 2) if prefix else 0 for prefix in prefixes],
+                    [
+                        (8 if page_shift == 2 else page_shift + row) if prefix else 0
+                        for row, prefix in enumerate(prefixes)
+                    ],
                     device="cuda",
                     dtype=torch.int32,
                 )
@@ -594,6 +606,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         "query_start_loc": fixed.query_start_loc,
         "scan_query_start_loc": fixed.scan_query_start_loc,
         "query_start_loc_int64": fixed.query_start_loc_int64,
+        "request_slots": fixed.req_pool_indices,
         "state_in": fixed.state_in_blocks_by_group["state"],
         "state_out": fixed.state_out_blocks_by_group["state"],
     }
@@ -606,7 +619,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         projection.normal_()
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
-        reset()
+        reset(source)
+        expected_lengths = length.clone()
+        expected_lengths[source.req_pool_indices.long()] = 0
         from test.runtime.kda_torch_reference import kda_prefill_reference
 
         expected_conv, expected_states = initial_conv.clone(), initial_states.clone()
@@ -626,11 +641,12 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
                 else torch.zeros_like(initial_conv[0])
             )
             if prefix:
-                for step in range(3):
+                slot = int(source.req_pool_indices[row])
+                for step in range(int(length[slot, 0])):
                     initial = (
-                        initial * decay[source_page, :, step, None, :]
-                        + correction[source_page, :, step, :, None]
-                        * key[source_page, :, step, None, :]
+                        initial * decay[slot, :, step, None, :]
+                        + correction[slot, :, step, :, None]
+                        * key[slot, :, step, None, :]
                     )
             rows = projection[offset : offset + count]
             gate = torch.nn.functional.linear(
@@ -662,7 +678,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         backend.forward_metadata = prepare_capacity_prefill_metadata(
             source, bucket, None, checkpoints=None
         )
-        reset()
+        reset(source)
         fresh_eager = forward(compact=False)[: sum(lengths)].clone()
         assert_scan_close(fresh_eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -673,7 +689,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         # does not admit, such as MIXED batches).
         for metadata in (backend.forward_metadata, source):
             backend.forward_metadata = metadata
-            reset()
+            reset(source)
             ordinary.replay(valid_rows=sum(lengths))
             assert_scan_close(ordinary_output[: sum(lengths)], expected)
             assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -683,7 +699,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         backend.prepare_prefill_metadata(
             bucket, batch_size, ctx.forward_mode, capture=False
         )
-        reset()
+        reset(source)
         eager = forward(compact=False)[: sum(lengths)].clone()
         assert_scan_close(eager, expected)
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
@@ -692,7 +708,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         untouched[source.state_out_blocks_by_group["state"].long()] = False
         assert torch.equal(states[untouched], initial_states[untouched])
         eager_states = states.clone()
-        reset()
+        reset(source)
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
             name: tensor.data_ptr() for name, tensor in retained.items()
@@ -703,15 +719,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
         assert torch.equal(states.view(torch.uint8), eager_states.view(torch.uint8))
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
-        if history_capacity:
-            destinations = source.state_out_blocks_by_group["state"].long()
-            assert torch.count_nonzero(length[destinations]) == 0
-            torch.testing.assert_close(
-                states[8:10], initial_states[8:10], atol=0, rtol=0
-            )
-            torch.testing.assert_close(conv[8:10], initial_conv[8:10], atol=0, rtol=0)
-            assert length[8:10].flatten().tolist() == [3, 3]
-            assert length[0].item() == 3
+        assert torch.equal(length, expected_lengths)
+        torch.testing.assert_close(states[8:], initial_states[8:], atol=0, rtol=0)
+        torch.testing.assert_close(conv[8:], initial_conv[8:], atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -745,13 +755,7 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend._retained_capacity = 16
-    backend._retained_fields = {
-        0: (
-            *(torch.zeros(4, heads, 16, dim, device="cuda") for _ in range(3)),
-            torch.zeros(4, 1, device="cuda", dtype=torch.int32),
-        )
-    }
+    backend._retained_lengths = {0: torch.zeros(4, 1, device="cuda", dtype=torch.int32)}
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
@@ -763,6 +767,7 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     pages = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     backend.forward_metadata = MambaForwardMetadata(
         query_start_loc=bounds,
+        req_pool_indices=torch.tensor([2, 1], device="cuda", dtype=torch.int64),
         scan_query_start_loc=bounds.long(),
         query_start_loc_int64=bounds.long(),
         extend_seq_lens_cpu=lengths,

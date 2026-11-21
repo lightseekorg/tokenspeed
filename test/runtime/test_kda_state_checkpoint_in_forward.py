@@ -360,13 +360,15 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
     lengths, offsets = [300, 200], [256, 128]
     streams = _token_streams(22, sum(lengths))
     server = _Server(params, in_forward=True)
+    # A decode-capable engine keeps accepted counts beside its slot records.
+    server.backend.preallocate_verify_workspace(4, 1)
     tables = {group: [[0, 1, 2], [0, 3, 4]] for group in KIMI_STATE_GROUPS}
     tables["full_attention"] = [[1, 2, 3], [4, 5, 0]]
     lengths_cpu = torch.tensor(lengths, dtype=torch.int32)
     server.backend.init_forward_metadata(
         bs=2,
         num_extends=2,
-        req_pool_indices=torch.arange(2, dtype=torch.int32, device="cuda"),
+        req_pool_indices=torch.tensor([2, 1], dtype=torch.int32, device="cuda"),
         seq_lens=lengths_cpu.to("cuda"),
         forward_mode=ForwardMode.EXTEND,
         block_tables=block_tables_for(server.contract, tables, "cuda"),
@@ -381,10 +383,9 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
         query_shard=None,
     )
     for layer in LAYERS:
-        # Both live and interior checkpoint pages can hold an older history.
-        server.pool.get_component(layer, "replay_length")[1:5].fill_(3)
+        server.backend._retained_lengths[layer][1:3].fill_(3)
         server.forward(layer, streams[layer], 0, sum(lengths), bs=2)
-        assert not server.pool.get_component(layer, "replay_length")[1:5].any()
+        assert not server.backend._retained_lengths[layer][1:3].any()
     torch.cuda.synchronize()
 
     starts = [0, lengths[0]]

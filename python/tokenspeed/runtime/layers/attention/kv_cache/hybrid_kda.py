@@ -71,12 +71,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     ):
         self._layer_types = tuple(layer_types)
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Per-layer arena views: accepted records and unpublished candidates
-        # share each page's capacity. replay_length exposes only accepted rows.
-        self._replay_correction: list[torch.Tensor | None] = []
-        self._replay_key: list[torch.Tensor | None] = []
-        self._replay_decay: list[torch.Tensor | None] = []
-        self._replay_length: list[torch.Tensor | None] = []
         self.requires_page_zeroing = True
 
         if len(self._layer_types) != kwargs["layer_num"]:
@@ -93,10 +87,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
         "recurrent_state": "_recurrent_state",
-        "replay_correction": "_replay_correction",
-        "replay_key": "_replay_key",
-        "replay_decay": "_replay_decay",
-        "replay_length": "_replay_length",
     }
 
     def _bind_layer_planes(self) -> None:
@@ -124,14 +114,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
                 for layer_id, label in enumerate(self._layer_types)
                 if label in STATE_LAYER_TYPES
             ),
-            state_field_suffixes=(
-                "conv_state",
-                "recurrent_state",
-                "replay_correction",
-                "replay_key",
-                "replay_decay",
-                "replay_length",
-            ),
+            state_field_suffixes=("conv_state", "recurrent_state"),
         )
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
@@ -146,32 +129,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             return conv
         if component_name == "recurrent_state":
             return recurrent
-        history = {
-            "replay_correction": self._replay_correction,
-            "replay_key": self._replay_key,
-            "replay_decay": self._replay_decay,
-            "replay_length": self._replay_length,
-        }
-        if component_name in history:
-            component = history[component_name][layer_id]
-            if component is not None:
-                return component
-            raise ValueError(f"layer {layer_id} has no retained KDA history")
         raise ValueError(f"unknown KDA component {component_name!r}")
-
-    def get_retained_history_fields(
-        self, layer_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the complete page-owned U/K/decay/length checkpoint."""
-        fields = (
-            self._replay_correction[layer_id],
-            self._replay_key[layer_id],
-            self._replay_decay[layer_id],
-            self._replay_length[layer_id],
-        )
-        if any(field is None for field in fields):
-            raise ValueError("retained KDA checkpoint requires all four history fields")
-        return fields
 
     def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         try:

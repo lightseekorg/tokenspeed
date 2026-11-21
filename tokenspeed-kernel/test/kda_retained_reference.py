@@ -80,16 +80,18 @@ def make_case(
         state = (torch.randn(pages, heads + 1, dim, dim, device="cuda") * 0.05)[
             :, :heads
         ]
-    shape = (pages, heads, capacity, dim * (2 if strided else 1))
+    shape = (batch, heads, capacity, dim * (2 if strided else 1))
     step = 2 if strided else 1
     correction = (torch.randn(shape, device="cuda") * 0.02)[..., ::step]
     key = (torch.randn(shape, device="cuda") * 0.02)[..., ::step]
     decay = (torch.rand(shape, device="cuda") * 0.2 + 0.7)[..., ::step]
-    length = torch.zeros(pages, 5 if strided else 1, device="cuda", dtype=torch.int32)[
+    # One accepted count per request slot; slot i belongs to row i.
+    length = torch.zeros(batch, 5 if strided else 1, device="cuda", dtype=torch.int32)[
         :, :1
     ]
-    length[reads[reads > 0].long()] = accepted_history
-    history = kda.KdaRetainedHistory(correction, key, decay, length, live)
+    length[reads > 0] = accepted_history
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    history = kda.KdaRetainedHistory(correction, key, decay, length, live, slots)
     metadata = torch.zeros(batch, 3, device="cuda", dtype=torch.int64)
     metadata[:, 0] = torch.arange(batch, device="cuda")
     metadata[:, 1] = 4
@@ -115,13 +117,15 @@ def make_case(
     )
 
 
-def endpoint(base, history, page):
+def endpoint(base, history, row):
+    """Apply row's slot records, up to the slot's accepted count, to base."""
+    slot = int(history.record_slots[row])
     result = base.float().clone()
-    for position in range(int(history.length[page])):
+    for position in range(int(history.length[slot])):
         result = (
-            result * history.decay[page, :, position, None, :]
-            + history.correction[page, :, position, :, None]
-            * history.key[page, :, position, None, :]
+            result * history.decay[slot, :, position, None, :]
+            + history.correction[slot, :, position, :, None]
+            * history.key[slot, :, position, None, :]
         )
     return result
 
@@ -137,6 +141,7 @@ def check_fused_retained_append(
     heads, dim = x["state_pool"].shape[1:3]
     history, reference_history = records.history, expected.history
     pages = x["state_indices"].long()
+    slots = history.record_slots.long()
     accepted = 3
     generator = torch.Generator(device="cuda").manual_seed(707)
     for target, reference_field in zip(
@@ -152,9 +157,9 @@ def check_fused_retained_append(
             prefix = torch.nn.functional.normalize(prefix, dim=-1)
         else:
             prefix = prefix.sigmoid() * 0.2 + 0.7
-        target[pages, :, :accepted] = prefix
+        target[slots, :, :accepted] = prefix
         reference_field.copy_(target)
-    history.length[pages] = accepted
+    history.length[slots] = accepted
     reference_history.length.copy_(history.length)
     initial = [
         value.clone() for value in (x["state_pool"], x["conv_states"], history.length)
@@ -227,7 +232,7 @@ def check_fused_retained_append(
         record_metadata=records.metadata,
         record_stamps=records.stamps,
     )
-    assert history.length[pages, 0].tolist() == [accepted, accepted + width]
+    assert history.length[slots, 0].tolist() == [accepted, accepted + width]
     torch.testing.assert_close(x["state_pool"], initial[0], atol=0, rtol=0)
     for field, before in zip(
         (history.correction, history.key, history.decay), candidates
@@ -243,7 +248,7 @@ def reference(case):
     states, windows = [], []
     for row, (begin, end) in enumerate(zip(starts[:-1], starts[1:])):
         page = int(case["reads"][row])
-        running = endpoint(case["state"][page], records.history, page)
+        running = endpoint(case["state"][page], records.history, row)
         taps = case["conv"][page].float().clone()
         row_states, row_windows = [running.clone()], [taps.clone()]
         for token in range(begin, end):
@@ -318,8 +323,9 @@ def verify(case):
     )
 
 
-def commit(case, accepted):
-    records, conv = case["records"], case["conv"]
+def commit(case, accepted, *, ended_slots):
+    """Commit accepted prefixes; requests in ``ended_slots`` ended this forward."""
+    records, conv, state = case["records"], case["conv"], case["state"]
     history = records.history
     qkv = records.original_qkv
     descriptors = torch.tensor(
@@ -334,11 +340,17 @@ def commit(case, accepted):
                 history.length.stride(0),
                 conv.stride(1),
                 conv.stride(2),
+                state.data_ptr(),
+                *state.stride(),
             ]
         ],
         device="cuda",
         dtype=torch.uint64,
     )
+    request_stopped = torch.zeros(
+        history.length.shape[0], device="cuda", dtype=torch.bool
+    )
+    request_stopped[list(ended_slots)] = True
     kernel = kda.resolve_kda_batched_retained_commit(
         qkv.dtype, num_heads=case["heads"], head_dim=128, recurrent_layout="v_major"
     )
@@ -349,8 +361,15 @@ def commit(case, accepted):
         write_indices=history.live_state_indices[None],
         accepted_length=accepted,
         query_start_loc=records.query_start_loc,
+        record_slots=history.record_slots,
+        record_slot_count=history.length.shape[0],
         record_metadata=records.metadata,
         record_stamps=records.stamps[None],
+        # One layer: the records gain a unit layer axis.
+        retained_correction=history.correction[:, None],
+        retained_key=history.key[:, None],
+        retained_decay=history.decay[:, None],
+        request_stopped=request_stopped,
         draft_token_num=case["width"],
         history_capacity=history.correction.shape[2],
         num_heads=case["heads"],
@@ -358,6 +377,7 @@ def commit(case, accepted):
         conv_width=4,
         activation_dtype=qkv.dtype,
         conv_state_dtype=conv.dtype,
+        recurrent_state_dtype=state.dtype,
     )
 
 
@@ -368,7 +388,7 @@ def check_prefix(case, accepted, expected):
         if int(case["reads"][row]) <= 0 or page <= 0:
             continue
         count = max(0, min(int(accepted[row]), len(states[row]) - 1))
-        actual = endpoint(case["state"][page], history, page)
+        actual = endpoint(case["state"][page], history, row)
         torch.testing.assert_close(actual, states[row][count], atol=2e-4, rtol=1e-2)
         torch.testing.assert_close(
             case["conv"][page],

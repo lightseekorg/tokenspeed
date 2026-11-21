@@ -728,6 +728,12 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     if (!built.snapshot_stores.empty()) {
         plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
     }
+    // The endpoints this plan's retractions published wait for the runtime's
+    // commit, which it acknowledges under one fence for the whole plan.
+    if (!uncommitted_state_pages_.empty()) {
+        plan.state_commit_fence = next_state_commit_fence_++;
+        state_commit_fences_.emplace(*plan.state_commit_fence, std::exchange(uncommitted_state_pages_, {}));
+    }
     if (!built.load_backs.empty()) {
         plan.With(CacheOperation{LoadBackBatch{built.load_backs}});
     }

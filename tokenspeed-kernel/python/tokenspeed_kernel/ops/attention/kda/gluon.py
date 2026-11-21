@@ -241,16 +241,16 @@ if current_platform().is_amd:
 
 
 def _validate_retained_request(
-    history, reads, starts, metadata, stamps, *, heads, dim, window, pages, device
+    history, reads, starts, metadata, stamps, *, heads, dim, window, device
 ):
     """Check current request geometry; immutable storage was checked at construction."""
     batch = reads.numel()
     if (
-        history.correction.shape[:2] != (pages, heads)
+        history.correction.shape[1] != heads
         or history.correction.shape[-1] != dim
         or history.key.shape[-1] != dim
     ):
-        raise ValueError("retained history must match checkpoint page/head geometry")
+        raise ValueError("retained history must match checkpoint head geometry")
     if (
         history.live_state_indices.shape != (batch,)
         or reads.shape != (batch,)
@@ -269,7 +269,6 @@ def _validate_retained_request(
         if (
             metadata.shape != (batch, 3)
             or stamps.ndim != 3
-            or stamps.shape[0] < batch
             or (stamps.shape[1] < window or stamps.shape[2] != 2)
             or any(
                 x.dtype != torch.int64 or not x.is_contiguous() or x.device != device
@@ -302,7 +301,7 @@ def gluon_kda_retained_verify_gfx950(
     draft_token_num: int,
     lower_bound: float | None,
 ) -> torch.Tensor:
-    """Verify packed pre-convolution QKV using page-owned accepted history.
+    """Verify packed pre-convolution QKV using request-owned accepted records.
 
     conv_states and state_pool contain source checkpoints. retained_history
     selects private live pages and FP32 U/normalized-K/decay storage. Verify
@@ -331,7 +330,6 @@ def gluon_kda_retained_verify_gfx950(
         heads=num_heads,
         dim=head_dim,
         window=draft_token_num,
-        pages=state_pool.shape[0],
         device=state_pool.device,
     )
     return _retained_verify_gfx950(
@@ -353,6 +351,7 @@ def gluon_kda_retained_verify_gfx950(
         retained_decay=retained_history.decay,
         retained_length=retained_history.length,
         live_indices=retained_history.live_state_indices,
+        record_slots=retained_history.record_slots,
         record_metadata=record_metadata,
         record_stamps=record_stamps,
         num_heads=num_heads,
@@ -380,7 +379,8 @@ def gluon_kda_retained_commit_gfx950(
 
     conv_states contains source taps. read_indices and query_start_loc map
     request rows; accepted_length is clamped to each row's actual token count.
-    retained_history identifies private live pages and the length to publish.
+    retained_history identifies private live pages and the request slots
+    whose accepted lengths this publishes.
     Metadata/stamps must be supplied together; stale accepted records suppress
     both convolution updates and length publication. num_heads, head_dim and
     draft_token_num specify fixed geometry. Return None.
@@ -394,7 +394,6 @@ def gluon_kda_retained_commit_gfx950(
         heads=num_heads,
         dim=head_dim,
         window=draft_token_num,
-        pages=conv_states.shape[0],
         device=conv_states.device,
     )
     batch = read_indices.numel()
@@ -424,6 +423,7 @@ def gluon_kda_retained_commit_gfx950(
         query_start_loc=query_start_loc,
         accepted_length=accepted_length,
         retained_length=retained_history.length,
+        record_slots=retained_history.record_slots,
         history_capacity=retained_history.correction.shape[2],
         record_metadata=record_metadata,
         record_stamps=record_stamps,
@@ -456,7 +456,7 @@ def gluon_kda_retained_verify_gfx1250(
     draft_token_num: int,
     lower_bound: float | None,
 ) -> torch.Tensor:
-    """Verify packed pre-convolution QKV using page-owned accepted history.
+    """Verify packed pre-convolution QKV using request-owned accepted records.
 
     conv_states and state_pool contain source checkpoints. retained_history
     selects private live pages and FP32 U/normalized-K/decay storage. Verify
@@ -485,7 +485,6 @@ def gluon_kda_retained_verify_gfx1250(
         heads=num_heads,
         dim=head_dim,
         window=draft_token_num,
-        pages=state_pool.shape[0],
         device=state_pool.device,
     )
     return _retained_verify_gfx1250(
@@ -507,6 +506,7 @@ def gluon_kda_retained_verify_gfx1250(
         retained_decay=retained_history.decay,
         retained_length=retained_history.length,
         live_indices=retained_history.live_state_indices,
+        record_slots=retained_history.record_slots,
         record_metadata=record_metadata,
         record_stamps=record_stamps,
         num_heads=num_heads,
@@ -534,7 +534,8 @@ def gluon_kda_retained_commit_gfx1250(
 
     conv_states contains source taps. read_indices and query_start_loc map
     request rows; accepted_length is clamped to each row's actual token count.
-    retained_history identifies private live pages and the length to publish.
+    retained_history identifies private live pages and the request slots
+    whose accepted lengths this publishes.
     Metadata/stamps must be supplied together; stale accepted records suppress
     both convolution updates and length publication. num_heads, head_dim and
     draft_token_num specify fixed geometry. Return None.
@@ -548,7 +549,6 @@ def gluon_kda_retained_commit_gfx1250(
         heads=num_heads,
         dim=head_dim,
         window=draft_token_num,
-        pages=conv_states.shape[0],
         device=conv_states.device,
     )
     batch = read_indices.numel()
@@ -578,6 +578,7 @@ def gluon_kda_retained_commit_gfx1250(
         query_start_loc=query_start_loc,
         accepted_length=accepted_length,
         retained_length=retained_history.length,
+        record_slots=retained_history.record_slots,
         history_capacity=retained_history.correction.shape[2],
         record_metadata=record_metadata,
         record_stamps=record_stamps,
