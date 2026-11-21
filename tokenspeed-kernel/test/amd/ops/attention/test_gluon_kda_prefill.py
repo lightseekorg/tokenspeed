@@ -74,19 +74,27 @@ def _reference_sequence(
 
 
 @pytest.mark.parametrize(
-    ("time_split", "lower_bound", "dtype"),
+    ("time_split", "lower_bound", "dtype", "strided_beta"),
     [
-        (False, -5.0, torch.bfloat16),
-        (False, None, torch.bfloat16),
-        (False, -5.0, torch.float16),
-        (True, -5.0, torch.bfloat16),
+        (False, -5.0, torch.bfloat16, False),
+        (False, None, torch.bfloat16, False),
+        (False, -5.0, torch.float16, False),
+        (False, -5.0, torch.bfloat16, True),
+        (True, -5.0, torch.bfloat16, False),
     ],
-    ids=["chunk_edges", "chunk_edges_unbounded", "chunk_edges_float16", "time_split"],
+    ids=[
+        "chunk_edges",
+        "chunk_edges_unbounded",
+        "chunk_edges_float16",
+        "chunk_edges_strided_beta",
+        "time_split",
+    ],
 )
 def test_kda_prefill_matches_packed_recurrent_reference(
     time_split: bool,
     lower_bound: float | None,
     dtype: torch.dtype,
+    strided_beta: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Few long sequences are split in time. Their gates decay slowly so that
@@ -100,7 +108,10 @@ def test_kda_prefill_matches_packed_recurrent_reference(
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_g = torch.randn_like(q)
-    beta = torch.randn(1, total_tokens, heads, device="cuda", dtype=dtype)
+    # GLM-5.3-Flash slices its betas out of a fused projection's rows.
+    beta_width = 6416 if strided_beta else heads
+    beta = torch.randn(1, total_tokens, beta_width, device="cuda", dtype=dtype)
+    beta = beta[..., :heads]
     initial_state = torch.randn(
         len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
     )

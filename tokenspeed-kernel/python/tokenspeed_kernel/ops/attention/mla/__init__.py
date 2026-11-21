@@ -356,15 +356,7 @@ def mla_project_value(
             return kernel(attention=attention, weight=weight, gate=gate, out=out)
 
     output_view = out.view(batch, heads, value_dim)
-    if current_platform().is_nvidia:
-        torch.bmm(
-            attention.transpose(0, 1),
-            weight,
-            out=output_view.transpose(0, 1),
-        )
-    else:
-        projected = torch.bmm(attention.transpose(0, 1).contiguous(), weight)
-        output_view.copy_(projected.transpose(0, 1))
+    torch.bmm(attention.transpose(0, 1), weight, out=output_view.transpose(0, 1))
     if gate is not None:
         if out.is_cuda:
             from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
