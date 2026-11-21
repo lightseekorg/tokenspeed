@@ -24,6 +24,7 @@
 //! scheduling loop on its main thread with the GIL released. The forward
 //! thread runs the Python data plane; completion queries acquire the GIL.
 
+mod cache_events;
 mod data_plane;
 mod encode;
 mod host_spans;
@@ -182,6 +183,7 @@ fn python_error(py: Python<'_>, error: PyErr) -> HostError {
 struct Args {
     control_fd: i32,
     enable_async_logging: bool,
+    cache_events: Option<cache_events::Settings>,
 }
 
 /// The control and forward threads report to the same launcher.
@@ -722,6 +724,17 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
 }
 
 fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
+    let cache_writer = args
+        .cache_events
+        .as_ref()
+        .map(|_| {
+            logging::cache_event_writer().ok_or_else(|| {
+                HostError::Interpreter(
+                    "cache observations require the host nonblocking logger".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
@@ -756,7 +769,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         return encode::serve(bootstrap, &stop);
     }
 
-    let (bootstrap, scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
+    let (bootstrap, mut scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
         Python::attach(|py| {
             let built = (|| {
                 let bootstrap = bootstrap.into_bound(py);
@@ -807,6 +820,25 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             })();
             built.map_err(|error| python_error(py, error))
         })?;
+
+    // Install before startup requests or client admissions. Scheduler RAII
+    // retains this context through the last slot release, including teardown.
+    let cache_events = args
+        .cache_events
+        .clone()
+        .zip(cache_writer)
+        .map(|(settings, writer)| {
+            cache_events::CacheEvents::install(
+                settings,
+                &config.metrics.engine_role,
+                config.metrics.labels.dp_rank,
+                config.rank,
+                writer,
+                &mut scheduler,
+            )
+            .map_err(HostError::Interpreter)
+        })
+        .transpose()?;
 
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
@@ -861,8 +893,8 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane =
-        PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    let data_plane = PythonDataPlane::start(data_plane, peers.streams, cache_events)
+        .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -1080,14 +1112,21 @@ fn finish_serving(
 /// Run one rank on the calling (main) thread and exit without Python finalization.
 #[pyfunction]
 fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
+    // Reject explicit incompatible settings before any Python model bootstrap.
+    let cache_events = cache_events::Settings::from_env(enable_async_logging)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     py.detach(|| {
         let args = Args {
             control_fd,
             enable_async_logging,
+            cache_events,
         };
         let log_guard = logging::init(args.enable_async_logging);
         let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Outside serve: reacquiring the GIL here drains its deferred
+            // bootstrap/scheduler decrefs, so their last ownership callbacks
+            // can finish the cache trace before the native log guard flushes.
             let _python_logs = logging::PythonLogGuard;
             serve(&args, launcher)
         }));
@@ -1109,11 +1148,19 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
     })
 }
 
+/// Cache observation protocol implemented by the linked native scheduler.
+/// This probe does not bootstrap a model or initialize a device.
+#[pyfunction]
+fn cache_event_protocol() -> String {
+    cache_events::protocol()
+}
+
 /// The rank's native control loop and its single scheduler implementation.
 #[pymodule]
 fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
     module.add_function(wrap_pyfunction!(run_host, module)?)?;
+    module.add_function(wrap_pyfunction!(cache_event_protocol, module)?)?;
     Ok(())
 }
 

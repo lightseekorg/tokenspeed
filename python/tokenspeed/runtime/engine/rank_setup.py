@@ -327,6 +327,7 @@ def scheduler_config_from_args(
         host_write_policy=server_args.kvstore_write_policy,
         decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
+        debug_force_retraction_max_per_request=server_args.debug_force_retraction_max_per_request,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,

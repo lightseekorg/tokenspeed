@@ -709,8 +709,10 @@ class HostDataPlane:
         attn_tp_cpu_group,
         epd_publisher,
         starting: bool,
+        record_cache_observations: bool = False,
     ) -> None:
         self._device = handle
+        self._record_cache_observations = record_cache_observations
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
         self._starting = starting
@@ -912,7 +914,11 @@ class HostDataPlane:
         # Each op once, validated before any owner runs one: the Host copies
         # go to the device; the host's L3 executor took the storage
         # operations.
-        cache_ops = cache_ops_from_plan(plan, request_admission=self._admission_id)
+        cache_ops = cache_ops_from_plan(
+            plan,
+            request_admission=self._admission_id,
+            record_observations=self._record_cache_observations,
+        )
         # The engine's own startup requests let the kernels they reach
         # prepare their compile variants, as model-only warmup does.
         with kernel_warmup(enabled=self._starting):
@@ -971,6 +977,15 @@ class HostDataPlane:
                 cache_event_to_payload, self._device.poll_cache_results()
             )
         ]
+
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """CPU observations completed by the preceding cache ACK poll.
+
+        The Rust host adds trusted engine/rank/instance context and performs
+        bounded nonblocking export. This method performs no device queries,
+        serialization, I/O, or request-ID lookup.
+        """
+        return self._device.poll_cache_observations()
 
     def release(self, rids: list[str]) -> None:
         """Forget requests that ended. Their grammar matchers and
@@ -1759,6 +1774,7 @@ class HostBootstrap:
                     epd_receive.publisher if epd_receive is not None else None
                 ),
                 starting=server_args.enable_startup_requests,
+                record_cache_observations=device.specs.cache_observation_capacity > 0,
             )
             self._device = device.handle
 

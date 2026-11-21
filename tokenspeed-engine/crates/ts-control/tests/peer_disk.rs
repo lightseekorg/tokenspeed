@@ -400,6 +400,7 @@ impl Replica {
         self.scheduler
             .lock()
             .submit_requests(&[RequestSpec {
+                admission_id: 0,
                 request_id: request.to_owned(),
                 session_id: String::new(),
                 cache_group_id: String::new(),

@@ -47,6 +47,13 @@ public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
+    std::uint64_t AdmissionId() const { return admission_id_; }
+    std::uint64_t NextRestoreSequence() {
+        if (restore_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error("request restore sequence exhausted");
+        }
+        return ++restore_sequence_;
+    }
     const std::string& SessionId() const { return session_id_; }
     const std::string& CacheGroupId() const { return cache_group_id_; }
     const std::string& PeerHolder() const { return peer_holder_; }
@@ -80,6 +87,15 @@ public:
     void NoteRetracted() {
         if (retraction_count_ < std::numeric_limits<std::int32_t>::max()) {
             ++retraction_count_;
+        }
+    }
+
+    // Only successful retractions by the debug entry consume its optional
+    // budget. Capacity retractions keep using the separate counter above.
+    std::int32_t ForcedRetractions() const { return forced_retraction_count_; }
+    void NoteForcedRetracted() {
+        if (forced_retraction_count_ < std::numeric_limits<std::int32_t>::max()) {
+            ++forced_retraction_count_;
         }
     }
 
@@ -148,6 +164,9 @@ public:
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
+        if constexpr (std::same_as<std::remove_cvref_t<Event>, fsm::SchedulePrefillFirstChunkEvent>) {
+            forwardResources("first admission").req_pool_index.BindOwner(id_, admission_id_);
+        }
     }
 
     template <typename State>
@@ -386,6 +405,8 @@ private:
     }
 
     std::string id_;
+    std::uint64_t admission_id_{0};
+    std::uint64_t restore_sequence_{0};
     std::string session_id_;
     std::string cache_group_id_;
     std::string peer_holder_;
@@ -396,6 +417,7 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    std::int32_t forced_retraction_count_{0};
     std::int32_t prefill_deferred_rounds_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
