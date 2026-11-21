@@ -22,6 +22,7 @@
 // completion before it stores the probabilities, as the softmax kernels may.
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -37,20 +38,24 @@ void CheckCuda(cudaError_t error) {
 }
 
 template <typename T>
-struct DeviceBuffer {
-    T* data = nullptr;
-    explicit DeviceBuffer(size_t count) { CheckCuda(cudaMalloc(&data, sizeof(T) * count)); }
-    ~DeviceBuffer() { cudaFree(data); }
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(size_t count) { CheckCuda(cudaMalloc(&data_, sizeof(T) * count)); }
+    ~DeviceBuffer() { cudaFree(data_); }
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    T* data() const { return data_; }
+
+private:
+    T* data_ = nullptr;
 };
 
 // Dependents may launch as soon as every CTA has signalled; the stores follow.
 __global__ void EarlySignalProducer(float* probs, const float* fresh, size_t count,
-                                    unsigned long long delay_cycles) {
+                                    uint64_t delay_cycles) {
     cudaTriggerProgrammaticLaunchCompletion();
-    auto start = clock64();
-    while (clock64() - start < delay_cycles) {
+    const auto start = clock64();
+    while (static_cast<uint64_t>(clock64() - start) < delay_cycles) {
         __nanosleep(1000);
     }
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
@@ -60,7 +65,7 @@ __global__ void EarlySignalProducer(float* probs, const float* fresh, size_t cou
     }
 }
 
-int Run(bool graph_mode, unsigned long long delay_cycles) {
+int Run(bool graph_mode, uint64_t delay_cycles) {
     constexpr int batch = 8;
     constexpr int vocab = 131072;
     constexpr int highs = 160;
@@ -88,12 +93,12 @@ int Run(bool graph_mode, unsigned long long delay_cycles) {
     DeviceBuffer<float> out(elements);
     DeviceBuffer<float> ps(batch);
     DeviceBuffer<int> ks(batch);
-    CheckCuda(cudaMemcpy(fresh.data, host_fresh.data(), host_fresh.size() * sizeof(float),
+    CheckCuda(cudaMemcpy(fresh.data(), host_fresh.data(), host_fresh.size() * sizeof(float),
         cudaMemcpyHostToDevice));
-    CheckCuda(cudaMemcpy(ks.data, host_ks.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
-    CheckCuda(cudaMemcpy(ps.data, host_ps.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
+    CheckCuda(cudaMemcpy(ks.data(), host_ks.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    CheckCuda(cudaMemcpy(ps.data(), host_ps.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
 
-    auto parts = nv::calc_aligned_pointers(workspace.data, {
+    auto parts = nv::calc_aligned_pointers(workspace.data(), {
         fused_topk_topp::airTopKWorkspaceBytes(batch, vocab),
         sizeof(float) * batch * fused_topk_topp::K_TOPK_MAX,
         sizeof(int) * batch * fused_topk_topp::K_TOPK_MAX,
@@ -106,12 +111,12 @@ int Run(bool graph_mode, unsigned long long delay_cycles) {
     CheckCuda(cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking));
     auto launch = [&] {
         // Stale contents the pipeline must not observe.
-        CheckCuda(cudaMemsetAsync(probs.data, 0, elements * sizeof(float), stream));
+        CheckCuda(cudaMemsetAsync(probs.data(), 0, elements * sizeof(float), stream));
         // A small grid: the sleeping producer must leave the SMs free for the pipeline.
-        EarlySignalProducer<<<64, 256, 0, stream>>>(probs.data, fresh.data, elements,
+        EarlySignalProducer<<<64, 256, 0, stream>>>(probs.data(), fresh.data(), elements,
             delay_cycles);
-        fused_topk_topp::invokeFusedTopKTopP(probs.data, ks.data, ps.data, out.data,
-            workspace.data, batch, vocab, stream, side_stream, /*enablePdl=*/true,
+        fused_topk_topp::invokeFusedTopKTopP(probs.data(), ks.data(), ps.data(), out.data(),
+            workspace.data(), batch, vocab, stream, side_stream, /*enablePdl=*/true,
             /*inPlaceSkip=*/false);
         CheckCuda(cudaGetLastError());
     };
@@ -126,19 +131,22 @@ int Run(bool graph_mode, unsigned long long delay_cycles) {
     std::vector<float> host_out(elements);
     std::vector<TopPCounter> topp(batch);
     for (int iteration = 0; iteration < 4; ++iteration) {
-        if (graph_mode) CheckCuda(cudaGraphLaunch(executable, stream));
-        else launch();
+        if (graph_mode) {
+            CheckCuda(cudaGraphLaunch(executable, stream));
+        } else {
+            launch();
+        }
         CheckCuda(cudaStreamSynchronize(stream));
         CheckCuda(cudaStreamSynchronize(side_stream));
-        CheckCuda(cudaMemcpy(host_out.data(), out.data, host_out.size() * sizeof(float),
+        CheckCuda(cudaMemcpy(host_out.data(), out.data(), host_out.size() * sizeof(float),
             cudaMemcpyDeviceToHost));
         CheckCuda(cudaMemcpy(topp.data(), topp_counters, sizeof(TopPCounter) * batch,
             cudaMemcpyDeviceToHost));
         for (int b = 0; b < batch; ++b) {
-            if (topp[b].in != probs.data + static_cast<size_t>(b) * vocab) {
+            if (topp[b].in != probs.data() + static_cast<size_t>(b) * vocab) {
                 std::fprintf(stderr, "iteration %d row %d: Top-P input pointer %p, expected %p\n",
                     iteration, b, static_cast<const void*>(topp[b].in),
-                    static_cast<const void*>(probs.data + static_cast<size_t>(b) * vocab));
+                    static_cast<const void*>(probs.data() + static_cast<size_t>(b) * vocab));
                 return 1;
             }
             // Top-K keeps the K largest; Top-P then keeps the shortest prefix
