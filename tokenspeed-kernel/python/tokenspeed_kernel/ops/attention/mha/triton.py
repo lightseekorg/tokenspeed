@@ -31,10 +31,27 @@ from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
 from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F403
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
+# Paged reads also take an fp8 e4m3 KV cache under a 16-bit query: the kernels
+# upcast each K/V tile to the query dtype in registers (unit scale), so q stays
+# in its activation dtype.
+_PORTABLE_KVCACHE_SIGNATURES = format_signatures(
+    ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
+) | {
+    format_signature(
+        q=dense_tensor_format(dtype),
+        k_cache=dense_tensor_format(torch.float8_e4m3fn),
+        v_cache=dense_tensor_format(torch.float8_e4m3fn),
+    )
+    for dtype in _PORTABLE_DTYPES
+}
 
 
 @register_kernel(
@@ -93,9 +110,7 @@ def triton_mha_prefill(
     name="triton_mha_extend_with_kvcache",
     solution="triton",
     capability=_PORTABLE_CAPABILITY,
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
-    ),
+    signatures=_PORTABLE_KVCACHE_SIGNATURES,
     priority=Priority.PORTABLE,
     traits={
         "is_causal": frozenset({False, True}),
@@ -155,9 +170,7 @@ def triton_mha_extend_with_kvcache(
     name="triton_mha_decode_with_kvcache",
     solution="triton",
     capability=_PORTABLE_CAPABILITY,
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
-    ),
+    signatures=_PORTABLE_KVCACHE_SIGNATURES,
     priority=Priority.PORTABLE,
     traits={
         "logit_cap": frozenset({False, True}),
