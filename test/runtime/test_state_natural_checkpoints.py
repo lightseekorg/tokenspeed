@@ -78,6 +78,8 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         cache_groups=_groups(with_state),
         enable_mixed_prefill_decode=False,
         prefix_replay_tokens=0,
+        num_disk_pages=0,
+        disk_config=None,
     )
     return ts.Scheduler(cfg)
 

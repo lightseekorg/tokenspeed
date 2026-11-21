@@ -2031,6 +2031,59 @@ numerics and parallel layout (the L3 deployment id), and the same
 `--weight-version`. A flushed weight update must name its `weight_version`,
 which moves the namespace, as it does for L3.
 
+### Local Disk tier
+
+`--disk-tier-paths DIR [DIR ...]` caches prefixes on the node's local SSD
+below Host L2 (design: [RFC 0006](../rfcs/0006-disk-tier.md)). Each rank keeps
+one file in one of the directories, sized by `--disk-tier-size-gb`. Host L2
+writes the entries the GPU evicted into it in the background, and a prompt
+whose prefix only the file holds waits while it is read back into Host, then
+is admitted as a Host hit. The file is recreated empty at every start: its
+contents never outlive the process. The directories must be on a file system
+that supports `O_DIRECT` (XFS or ext4, not tmpfs).
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--disk-tier-paths` | off | One directory per drive; ranks spread over them. |
+| `--disk-tier-size-gb` | — | The file's size per rank, in gigabytes. |
+| `--disk-tier-io` | required | `io_uring`, or `psync` (a thread pool calling `pread`/`pwrite`) where io_uring is unavailable. |
+| `--disk-tier-write-mbps` | required | The MB per second each rank may write: the SSD's endurance budget. Reads are never throttled and go first. |
+| `--disk-tier-config` | — | A JSON object of the tuning keys below. |
+
+| `--disk-tier-config` key | Default | Meaning |
+| --- | --- | --- |
+| `queue_depth` | 32 | Requests in flight on the drive; with `psync`, threads. |
+| `write_queue_depth` | 8 | Of those, at most this many writes. |
+| `max_io_bytes` | 4194304 | Longer ranges are issued as several requests; a multiple of 4096. |
+| `max_operations` | 16 | Disk operations in flight, reads and writes. |
+| `max_blocks_per_operation` | 4096 | Blocks one operation moves. |
+| `host_blocks_fraction` | 0.25 | The share of Host L2 blocks Disk operations may hold at once. |
+| `write_host_blocks_fraction` | 0.5 | Of those, the share writes may hold. |
+| `max_queued_cleanings` | 65536 | Host entries waiting to be written; past it the oldest are skipped. |
+| `min_prefetch_tokens` | 256 | The fewest tokens past the local hit worth a read. |
+| `wait_timeout_ms` | 10000 | How long a prompt waits for its read before it runs from the local hit. |
+| `ready_timeout_ms` | 5000 | How long a finished read is held for its prompt. |
+
+The Disk tier needs `--kvstore-write-policy write_back` and prefix caching,
+and is refused with `--kvstore-storage-backend` and
+`--pipeline-parallel-size > 1`. With it, every Host block is padded to a
+multiple of 4096 bytes so each one moves in one direct I/O. A cache flush or
+weight update waits up to 30 s for the Disk operations in flight to finish,
+and fails if one does not.
+
+With `--enable-metrics`, every rank exports the tier's state. The
+scheduler's counts are the same on every rank of a replica; do not sum them
+across TP ranks.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `tokenspeed:disk_scheduler_resources` | `resource` | `disk_blocks`, `free_disk_parents`, `operations`, `held_host_blocks`, `queued_cleanings`, `waiting_requests`, `ready_requests`. |
+| `tokenspeed:disk_blocks_total` | `direction`, `result` | Blocks written or read (`success`), failed (`failure`), or Host entries never written (`write`, `skipped`). |
+| `tokenspeed:disk_read_expirations_total` | `phase` | Reads a prompt stopped waiting for (`waiting`), or did not take in time (`ready`). |
+| `tokenspeed:disk_io_bytes_total` | `direction` | Bytes this rank moved to and from its file. |
+| `tokenspeed:disk_io_queued_bytes` | `state` | `queued_read`, `queued_write` (including what waits for the write budget) and `inflight` bytes. |
+| `tokenspeed:disk_io_failed_jobs_total` | | Executor jobs that failed on this rank. |
+
 ### Block verification (experimental)
 
 `--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`

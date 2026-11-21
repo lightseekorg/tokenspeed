@@ -32,8 +32,9 @@ use std::{
 };
 
 use ts_metrics::{
-    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3ExecutorSnapshot, L3Labels,
-    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
+    DiskExecutorStats, DiskMetrics, DiskSchedulerStats, EngineLabels, EngineMetrics, Exporter,
+    KvTransferMetrics, L3ExecutorSnapshot, L3Labels, L3Metrics, L3OperationSnapshot,
+    L3SchedulerStats, MetricEvent, MetricsConfig,
 };
 
 fn fixtures() -> PathBuf {
@@ -431,6 +432,118 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
             "tokenspeed:l3_scheduler_resources",
             &[("resource", "pressure_gate_closed")],
             1.0,
+        ),
+    ] {
+        let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();
+        labels.sort_unstable();
+        let rendered_labels: Vec<String> = labels
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{value}\""))
+            .collect();
+        let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
+        assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn disk_samples_export_counter_growth_once_and_current_gauges() {
+    let directory = scratch_dir("disk");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut metrics = DiskMetrics::new(
+        &exporter,
+        &L3Labels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+            tp_rank: 1,
+            engine_role: "null".to_owned(),
+        },
+    );
+    let mut scheduler = DiskSchedulerStats {
+        operations: 2.0,
+        queued_cleanings: 5.0,
+        disk_blocks: 40.0,
+        written_blocks: 40.0,
+        read_blocks: 12.0,
+        failed_reads: 1.0,
+        dropped_cleanings: 3.0,
+        wait_timeouts: 1.0,
+        ..DiskSchedulerStats::default()
+    };
+    let io = DiskExecutorStats {
+        queued_write_bytes: 8192.0,
+        read_bytes: 49152.0,
+        write_bytes: 163840.0,
+        ..DiskExecutorStats::default()
+    };
+    // Totals are cumulative: a repeated sample adds nothing, a grown one
+    // adds its growth.
+    metrics.record(&scheduler, &io);
+    metrics.record(&scheduler, &io);
+    scheduler.written_blocks = 44.0;
+    scheduler.operations = 0.0;
+    metrics.record(&scheduler, &io);
+    drop(metrics);
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let rank = [
+        ("app_key", ""),
+        ("dp_rank", "0"),
+        ("engine_role", "null"),
+        ("model_name", "m"),
+        ("tp_rank", "1"),
+    ];
+    for (metric, extra, value) in [
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "write"), ("result", "success")][..],
+            44.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "write"), ("result", "skipped")],
+            3.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "read"), ("result", "success")],
+            12.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "read"), ("result", "failure")],
+            1.0,
+        ),
+        (
+            "tokenspeed:disk_read_expirations_total",
+            &[("phase", "waiting")],
+            1.0,
+        ),
+        (
+            "tokenspeed:disk_scheduler_resources",
+            &[("resource", "operations")],
+            0.0,
+        ),
+        (
+            "tokenspeed:disk_scheduler_resources",
+            &[("resource", "disk_blocks")],
+            40.0,
+        ),
+        (
+            "tokenspeed:disk_io_bytes_total",
+            &[("direction", "write")],
+            163840.0,
+        ),
+        (
+            "tokenspeed:disk_io_queued_bytes",
+            &[("state", "queued_write")],
+            8192.0,
         ),
     ] {
         let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();

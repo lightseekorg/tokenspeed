@@ -84,6 +84,10 @@ public:
     bool HasProgressPending() const;
     std::size_t NumOperations() const { return operations_.size(); }
     std::size_t NumHeldHostBlocks() const;
+    // The Host blocks the operations hold: a write's indexed sources, a
+    // read's unpublished targets. A cache clear drains them
+    // (CacheCoordinator::CacheIsClearableAfterStorageDrain).
+    std::vector<const CacheBlockRef*> HeldHostBlockRefs() const;
     std::size_t NumQueuedCleanings() const { return cleaning_.size(); }
     std::uint64_t WrittenBlocks() const { return written_blocks_; }
     std::uint64_t ReadBlocks() const { return read_blocks_; }

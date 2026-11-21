@@ -105,8 +105,13 @@ def _host_parent_bytes(groups: Sequence[tuple[CacheGroupSpec, int]]) -> int:
 
 
 def _compute_host_layout(
-    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+    layout: CacheTransferLayout,
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    block_alignment: int,
 ) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], int, tuple[int, ...]]:
+    if block_alignment <= 0:
+        raise ValueError(f"block_alignment must be positive, got {block_alignment}")
     specs = {spec.group_id: spec for spec in group_specs}
     host_cache_block_bytes = []
     host_field_offsets = []
@@ -116,7 +121,10 @@ def _compute_host_layout(
         for field in group.fields:
             offsets.append(cursor)
             cursor += field.payload_bytes
-        host_cache_block_bytes.append(cursor)
+        # The Disk tier moves each block with one direct I/O, which needs
+        # every block (and so every parent) aligned; the padding follows the
+        # fields.
+        host_cache_block_bytes.append(-(-cursor // block_alignment) * block_alignment)
         host_field_offsets.append(tuple(offsets))
     # Device packing satisfies model/kernel strides. Host bytes have no such
     # stride constraint: one shared parent fits the largest compact payload,
@@ -140,7 +148,10 @@ def _compute_host_layout(
 
 
 def compute_host_lcm_block_bytes(
-    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+    layout: CacheTransferLayout,
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    block_alignment: int,
 ) -> int:
     """Return compact Host bytes required by one LCMBlock.
 
@@ -149,13 +160,20 @@ def compute_host_lcm_block_bytes(
         group_specs: The scheduler's group specs. Their kinds, page sizes,
             shard counts and replay flags decide whether the parent rounds
             up from the largest payload to whole KV pages.
+        block_alignment: Every packed block's size is a multiple of this:
+            the Disk tier's direct-I/O alignment with it, 1 without.
     """
 
-    return _compute_host_layout(layout, group_specs=group_specs)[2]
+    return _compute_host_layout(
+        layout, group_specs=group_specs, block_alignment=block_alignment
+    )[2]
 
 
 def compute_host_group_packing(
-    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+    layout: CacheTransferLayout,
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    block_alignment: int,
 ) -> tuple[int, ...]:
     """Return physical children per shared Host parent in layout group order.
 
@@ -163,9 +181,12 @@ def compute_host_group_packing(
         layout: The transfer layout whose payloads the Host packs.
         group_specs: The scheduler's group specs, as for
             ``compute_host_lcm_block_bytes``.
+        block_alignment: As for ``compute_host_lcm_block_bytes``.
     """
 
-    return _compute_host_layout(layout, group_specs=group_specs)[3]
+    return _compute_host_layout(
+        layout, group_specs=group_specs, block_alignment=block_alignment
+    )[3]
 
 
 def validate_host_group_packing(packing: tuple[int, ...], *, cpu_group) -> None:
@@ -206,6 +227,7 @@ class HostCacheStorage:
         *,
         group_specs: Sequence[CacheGroupSpec],
         num_host_lcm_blocks: int,
+        block_alignment: int,
     ):
         """
         Args:
@@ -213,6 +235,8 @@ class HostCacheStorage:
             group_specs: The scheduler's group specs, which size the shared
                 parent (``compute_host_lcm_block_bytes``).
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
+            block_alignment: Every packed block's size is a multiple of this
+                (``compute_host_lcm_block_bytes``).
         """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -222,7 +246,9 @@ class HostCacheStorage:
             self.host_field_offsets,
             self.host_lcm_block_bytes,
             self.group_packing,
-        ) = _compute_host_layout(layout, group_specs=group_specs)
+        ) = _compute_host_layout(
+            layout, group_specs=group_specs, block_alignment=block_alignment
+        )
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
         import torch

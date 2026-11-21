@@ -70,6 +70,16 @@ std::size_t DiskTransferManager::heldHostBlocks(DiskOpKind kind) const {
     return count;
 }
 
+std::vector<const CacheBlockRef*> DiskTransferManager::HeldHostBlockRefs() const {
+    std::vector<const CacheBlockRef*> refs;
+    for (const auto& [id, ticket] : operations_) {
+        for (const CacheBlockRef& block : ticket.host_blocks) {
+            if (block) refs.push_back(&block);
+        }
+    }
+    return refs;
+}
+
 bool DiskTransferManager::Completed(std::uint64_t id) const {
     const auto it = operations_.find(id);
     return it == operations_.end() || it->second.completed;

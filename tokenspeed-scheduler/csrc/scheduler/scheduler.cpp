@@ -237,8 +237,11 @@ bool Scheduler::CanPrepareStorageClear() const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
-    const auto storage_refs =
-        storage_transfers_ ? storage_transfers_->HeldBlockRefs() : std::vector<const CacheBlockRef*>{};
+    auto storage_refs = storage_transfers_ ? storage_transfers_->HeldBlockRefs() : std::vector<const CacheBlockRef*>{};
+    if (disk_transfers_) {
+        const std::vector<const CacheBlockRef*> disk_refs = disk_transfers_->HeldHostBlockRefs();
+        storage_refs.insert(storage_refs.end(), disk_refs.begin(), disk_refs.end());
+    }
     return coordinator_.CacheIsClearableAfterStorageDrain(storage_refs);
 }
 
@@ -246,6 +249,9 @@ bool Scheduler::CanClearCacheRetainingStorage() const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     if (has_pd_transfers || tier_transfers_.HasAnyInFlight() || RetractedSize() > 0) return false;
+    // A Disk operation is never retained across a clear: a write finishing
+    // after it would publish the old contents.
+    if (disk_transfers_ && disk_transfers_->HasPending()) return false;
     std::vector<const CacheBlockRef*> retained;
     if (storage_transfers_) {
         std::vector<std::uint64_t> leases;

@@ -66,6 +66,12 @@ from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
+from tokenspeed.runtime.cache.disk import (
+    DiskSettings,
+    DiskTierTuning,
+    disk_scheduler_config,
+    disk_settings,
+)
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
@@ -550,6 +556,10 @@ class HostConfig:
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
             and ``--enable-metrics``.
+        disk: With the local Disk tier, what the host starts its executor
+            from; else None.
+        disk_metrics: This rank reports the Disk tier's metrics: with the
+            tier and ``--enable-metrics``.
         attn_tp_rank: This rank's attention-TP rank, an L3 metrics label.
         engine_role: ``--disaggregation-mode``, an L3 metrics label.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
@@ -623,6 +633,8 @@ class HostConfig:
     trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
+    disk: DiskSettings | None
+    disk_metrics: bool
     attn_tp_rank: int
     engine_role: str
     eplb: EplbSettings | None
@@ -648,8 +660,8 @@ def host_in_flight_depth(server_args: ServerArgs) -> int:
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
 
-# The Host pools an L3 executor addresses, kept for the process.
-_L3_HOST_POOLS: list = []
+# The Host pools a native executor (L3, Disk) addresses, kept for the process.
+_ADDRESSED_HOST_POOLS: list = []
 
 
 @dataclass
@@ -1394,8 +1406,26 @@ class HostBootstrap:
             if l3 is not None:
                 # The executor addresses the Host pool by pointer, and native
                 # I/O that cannot prove its retirement keeps it past close.
-                _L3_HOST_POOLS.append(device.host_cache.storage)
+                _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
             storage_config = l3.runtime.scheduler if l3 is not None else None
+            # The local Disk tier under the Host pool; None without
+            # --disk-tier-paths (docs/rfcs/0006-disk-tier.md).
+            disk = None
+            disk_config = None
+            if server_args.disk_tier_paths is not None:
+                disk_tuning = DiskTierTuning.from_json(server_args.disk_tier_config)
+                disk = disk_settings(
+                    server_args,
+                    tuning=disk_tuning,
+                    host_storage=device.host_cache.storage,
+                    ownership=device.host_cache.ownership,
+                    global_rank=global_rank,
+                )
+                disk_config = disk_scheduler_config(
+                    disk_tuning, num_host_lcm_blocks=disk.num_host_lcm_blocks
+                )
+                # The executor addresses the Host pool by pointer as well.
+                _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
             #: With peer prefix sharing, what the host starts this rank's peer
             #: endpoint and reads from (``cache/peer.py``); else None.
             self.peer_sharing = None
@@ -1420,6 +1450,8 @@ class HostBootstrap:
                 server_args,
                 specs,
                 storage_config=storage_config,
+                num_disk_pages=disk.num_disk_lcm_blocks + 1 if disk is not None else 0,
+                disk_config=disk_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
                 max_resident_requests=max_resident_requests,
@@ -1664,6 +1696,8 @@ class HostBootstrap:
                 ),
                 l3=l3,
                 l3_metrics=l3 is not None and server_args.enable_metrics,
+                disk=disk,
+                disk_metrics=disk is not None and server_args.enable_metrics,
                 attn_tp_rank=attn_tp_rank,
                 engine_role=server_args.disaggregation_mode,
             )

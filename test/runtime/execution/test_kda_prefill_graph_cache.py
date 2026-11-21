@@ -1200,6 +1200,7 @@ def kimi_host_cache():
         kvp_rank=0,
         nprocs_per_node=1,
         world_cpu_group=None,
+        block_alignment=1,
     )
     # A model executor without a model: the fields the handle reads.
     model_executor = ModelExecutor.__new__(ModelExecutor)

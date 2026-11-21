@@ -234,7 +234,9 @@ the Device-plus-Host contract.
 - **The holder's read fails during a push**: the landing gives up whole; the
   reader admits from its local hit.
 - **A weight update or flush** clears the Disk index after every Disk
-  operation retired; the file is not touched.
+  operation retired; the file is not touched. A Disk operation is never
+  retained across a clear, since a write finishing after it would publish old
+  contents: one still in flight past the drain timeout fails the clear.
 
 ### Configuration
 

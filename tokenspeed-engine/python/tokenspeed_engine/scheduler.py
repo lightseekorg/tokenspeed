@@ -62,6 +62,9 @@ StorageKind = _ext.StorageKind
 
 PeerConfig = _ext.PeerConfig
 
+DiskConfig = _ext.DiskConfig
+DiskStats = _ext.DiskStats
+
 PD = _ext.PD
 Cache = _ext.Cache
 Forward = _ext.Forward
@@ -95,6 +98,8 @@ __all__ = [
     "StorageStats",
     "HostCacheStats",
     "StorageKind",
+    "DiskConfig",
+    "DiskStats",
     "RequestSpec",
     "AttnKind",
     "CacheGroupConfig",

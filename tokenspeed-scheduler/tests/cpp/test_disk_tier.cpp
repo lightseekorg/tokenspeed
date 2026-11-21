@@ -601,6 +601,22 @@ TEST_F(DiskTierSchedulerTest, APrefetchPastItsDeadlineAdmitsFromTheLocalHit) {
     EXPECT_FALSE(scheduler_->StoragePending());
 }
 
+TEST_F(DiskTierSchedulerTest, ACacheClearDrainsTheDiskOperationsInFlight) {
+    Tick(1);
+    SeedOnHost();
+    const std::vector<DiskOperation> writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "the write is in flight";
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear()) << "the drain discounts the write's Host sources";
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage()) << "a write finishing later would publish old contents";
+    scheduler_->CancelStorageForClear();
+    EXPECT_TRUE(scheduler_->StorageCurrentPending()) << "cancelling leaves the issued write to retire";
+    AckDisk(writes[0], /*success=*/true);
+    EXPECT_FALSE(scheduler_->StorageCurrentPending());
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_EQ(scheduler_->GetDiskStats().disk_blocks, 0u);
+}
+
 TEST(DiskTierConfigTest, ADiskTierNeedsHostWriteBackAndItsLimits) {
     SchedulerConfig config{};
     config.prefix_granularity = 4;

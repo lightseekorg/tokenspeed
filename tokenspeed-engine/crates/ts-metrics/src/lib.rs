@@ -1244,6 +1244,26 @@ impl KvTransferMetrics {
     }
 }
 
+/// A cumulative total's growth since `exported` last saw it, recording it; a
+/// total that went backwards restarted, and counts in full.
+fn counter_growth(
+    exported: &mut HashMap<(&'static str, Vec<String>), f64>,
+    counter: &'static str,
+    value: f64,
+    extra: &[&str],
+) -> f64 {
+    let key = (
+        counter,
+        extra.iter().map(|&label| label.to_owned()).collect(),
+    );
+    let previous = exported.insert(key, value).unwrap_or(0.0);
+    if value >= previous {
+        value - previous
+    } else {
+        value
+    }
+}
+
 /// The L3 metrics' labels: the engine's, plus the attention-TP rank and the
 /// engine's role (`--disaggregation-mode`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1497,19 +1517,9 @@ impl L3Metrics {
             .collect()
     }
 
-    /// Export a cumulative counter's growth since its last export; a total
-    /// that went backwards restarted, and counts in full.
+    /// Export a cumulative counter's growth since its last export.
     fn increment(&mut self, counter: &'static str, value: f64, extra: &[&str]) {
-        let key = (
-            counter,
-            extra.iter().map(|&label| label.to_owned()).collect(),
-        );
-        let previous = self.exported.get(&key).copied().unwrap_or(0.0);
-        let delta = if value >= previous {
-            value - previous
-        } else {
-            value
-        };
+        let delta = counter_growth(&mut self.exported, counter, value, extra);
         if delta > 0.0 {
             let metric = match counter {
                 "events" => &self.events,
@@ -1525,7 +1535,6 @@ impl L3Metrics {
             };
             metric.inc(&self.label_values(extra), delta);
         }
-        self.exported.insert(key, value);
     }
 
     /// Export one snapshot and the scheduler's observations; no request or
@@ -1606,6 +1615,186 @@ impl L3Metrics {
             ("cleanup", scheduler.cleanup_dropped_backup_keys),
         ] {
             self.increment("backup_drops", count, &[reason]);
+        }
+    }
+}
+
+/// The Disk tier's scheduler observations (`DiskStats`), as gauges and
+/// cumulative totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DiskSchedulerStats {
+    /// Disk operations in flight or holding a request's Host blocks.
+    pub operations: f64,
+    /// Host blocks Disk operations hold.
+    pub held_host_blocks: f64,
+    /// Host entries waiting to be written to Disk.
+    pub queued_cleanings: f64,
+    /// Requests waiting for their Disk read.
+    pub waiting_requests: f64,
+    /// Requests holding a finished read for their admission.
+    pub ready_requests: f64,
+    /// Disk entries.
+    pub disk_blocks: f64,
+    /// Empty Disk parents.
+    pub free_disk_parents: f64,
+    /// Blocks written to Disk, cumulative.
+    pub written_blocks: f64,
+    /// Blocks read from Disk, cumulative.
+    pub read_blocks: f64,
+    /// Failed reads, cumulative.
+    pub failed_reads: f64,
+    /// Failed writes, cumulative.
+    pub failed_writes: f64,
+    /// Host entries skipped instead of written, cumulative.
+    pub dropped_cleanings: f64,
+    /// Reads that timed out waiting, cumulative.
+    pub wait_timeouts: f64,
+    /// Finished reads their requests did not take in time, cumulative.
+    pub ready_expirations: f64,
+}
+
+/// This rank's Disk executor (`ts-disk`): its queues and cumulative totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DiskExecutorStats {
+    /// Read bytes waiting to be issued.
+    pub queued_read_bytes: f64,
+    /// Write bytes waiting for the write budget or to be issued.
+    pub queued_write_bytes: f64,
+    /// Bytes the kernel has.
+    pub inflight_bytes: f64,
+    /// Bytes read, cumulative.
+    pub read_bytes: f64,
+    /// Bytes written, cumulative.
+    pub write_bytes: f64,
+    /// Jobs that failed, cumulative.
+    pub failed_jobs: f64,
+}
+
+/// The Disk tier's metrics (`docs/rfcs/0006-disk-tier.md`), with the L3
+/// metrics' labels.
+pub struct DiskMetrics {
+    labels: [String; 5],
+    resources: Metric,
+    blocks: Metric,
+    expirations: Metric,
+    io_bytes: Metric,
+    queued_bytes: Metric,
+    failed_jobs: Metric,
+    /// Counter totals already exported, by counter and extra labels.
+    exported: HashMap<(&'static str, Vec<String>), f64>,
+}
+
+impl DiskMetrics {
+    /// The metrics, exported through `exporter`.
+    pub fn new(exporter: &Arc<Exporter>, labels: &L3Labels) -> Self {
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            L3_LABELS.iter().chain(extra).copied().collect()
+        };
+        Self {
+            labels: [
+                labels.model_name.clone(),
+                labels.app_key.clone(),
+                labels.dp_rank.to_string(),
+                labels.tp_rank.to_string(),
+                labels.engine_role.clone(),
+            ],
+            resources: Metric::gauge(
+                exporter,
+                "tokenspeed:disk_scheduler_resources",
+                "Mirrored Disk tier counts; do not sum across TP ranks.",
+                &with(&["resource"]),
+            ),
+            blocks: Metric::counter(
+                exporter,
+                "tokenspeed:disk_blocks",
+                "Mirrored blocks moved, failed or skipped, by direction and result; do not sum \
+                 across TP ranks.",
+                &with(&["direction", "result"]),
+            ),
+            expirations: Metric::counter(
+                exporter,
+                "tokenspeed:disk_read_expirations",
+                "Mirrored read deadline expirations; do not sum across TP ranks.",
+                &with(&["phase"]),
+            ),
+            io_bytes: Metric::counter(
+                exporter,
+                "tokenspeed:disk_io_bytes",
+                "Bytes this rank's executor moved to and from its file.",
+                &with(&["direction"]),
+            ),
+            queued_bytes: Metric::gauge(
+                exporter,
+                "tokenspeed:disk_io_queued_bytes",
+                "Bytes this rank's executor has queued or in the kernel.",
+                &with(&["state"]),
+            ),
+            failed_jobs: Metric::counter(
+                exporter,
+                "tokenspeed:disk_io_failed_jobs",
+                "Executor jobs that failed on this rank.",
+                &L3_LABELS,
+            ),
+            exported: HashMap::new(),
+        }
+    }
+
+    fn label_values<'a>(&'a self, extra: &[&'a str]) -> Vec<&'a str> {
+        self.labels
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .collect()
+    }
+
+    /// Export a cumulative counter's growth since its last export.
+    fn increment(&mut self, counter: &'static str, value: f64, extra: &[&str]) {
+        let delta = counter_growth(&mut self.exported, counter, value, extra);
+        if delta > 0.0 {
+            let metric = match counter {
+                "blocks" => &self.blocks,
+                "expirations" => &self.expirations,
+                "io_bytes" => &self.io_bytes,
+                "failed_jobs" => &self.failed_jobs,
+                _ => unreachable!("a Disk counter"),
+            };
+            metric.inc(&self.label_values(extra), delta);
+        }
+    }
+
+    /// Export the scheduler's observations and the executor's.
+    pub fn record(&mut self, scheduler: &DiskSchedulerStats, io: &DiskExecutorStats) {
+        for (resource, value) in [
+            ("operations", scheduler.operations),
+            ("held_host_blocks", scheduler.held_host_blocks),
+            ("queued_cleanings", scheduler.queued_cleanings),
+            ("waiting_requests", scheduler.waiting_requests),
+            ("ready_requests", scheduler.ready_requests),
+            ("disk_blocks", scheduler.disk_blocks),
+            ("free_disk_parents", scheduler.free_disk_parents),
+        ] {
+            self.resources.set(&self.label_values(&[resource]), value);
+        }
+        for (direction, result, value) in [
+            ("write", "success", scheduler.written_blocks),
+            ("write", "failure", scheduler.failed_writes),
+            ("write", "skipped", scheduler.dropped_cleanings),
+            ("read", "success", scheduler.read_blocks),
+            ("read", "failure", scheduler.failed_reads),
+        ] {
+            self.increment("blocks", value, &[direction, result]);
+        }
+        self.increment("expirations", scheduler.wait_timeouts, &["waiting"]);
+        self.increment("expirations", scheduler.ready_expirations, &["ready"]);
+        self.increment("io_bytes", io.read_bytes, &["read"]);
+        self.increment("io_bytes", io.write_bytes, &["write"]);
+        self.increment("failed_jobs", io.failed_jobs, &[]);
+        for (state, value) in [
+            ("queued_read", io.queued_read_bytes),
+            ("queued_write", io.queued_write_bytes),
+            ("inflight", io.inflight_bytes),
+        ] {
+            self.queued_bytes.set(&self.label_values(&[state]), value);
         }
     }
 }
