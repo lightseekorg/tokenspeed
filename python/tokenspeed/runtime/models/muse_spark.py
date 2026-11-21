@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Iterable
 from functools import partial
@@ -169,8 +168,6 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-
-logger = logging.getLogger(__name__)
 
 # Row limit of the generic column gather.
 _GATHER_WORKSPACE_ROWS = 64

@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import NoKernelFoundError
