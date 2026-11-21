@@ -2077,8 +2077,6 @@ def test_owned_rows_follow_the_prefill_chunk_size(
 ) -> None:
     """The owned-row layout serves the configured prefill chunk, at least
     8192 and at most 24576 rows; --numerics rl-bitwise keeps 8192."""
-    import tokenspeed.runtime.models.muse_spark as module
-
     monkeypatch.setitem(module.global_server_args_dict, "chunked_prefill_size", chunk)
     monkeypatch.setitem(module.global_server_args_dict, "numerics", numerics)
     assert module._owned_rows_max_tokens() == expected
