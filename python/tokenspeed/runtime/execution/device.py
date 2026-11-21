@@ -1806,14 +1806,12 @@ def build_device_side(
             # in 2 GB (buffer ops address it with 32-bit offsets), so a kernel
             # that specializes the arena's pointers does not serve the
             # full-size arena: without this, it compiles on its first live
-            # batch instead, mid-serve. The GQA prologue, the MHA extend
-            # kernels and the KV store no longer specialize them; others still
-            # do (the gfx950 MHA decode kernels, the Iris attention tails, the
-            # decode monokernel and draft-layer stages, the FP8 / MXFP8 KV
-            # writes, the per-layer KV transfer). Other platforms' kernels do
-            # not key on the arena's size and skip the second warm-up. Warm
-            # again on the final pools with the tactics tuned above; tuning now
-            # would allocate workspaces outside the reserve the rebind sized.
+            # batch instead, mid-serve. Kernels that do not specialize the
+            # arena's pointers compile once and are not affected. Other
+            # platforms' kernels do not key on the arena's size and skip the
+            # second warm-up. Warm again on the final pools with the tactics
+            # tuned above; tuning now would allocate workspaces outside the
+            # reserve the rebind sized.
             with (
                 startup_phase("kernels.rewarm"),
                 current_platform().restore_stack_limit(),

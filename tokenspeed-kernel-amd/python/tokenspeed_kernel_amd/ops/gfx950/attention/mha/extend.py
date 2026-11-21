@@ -1817,11 +1817,8 @@ def _extend(
         )
     align = _CACHE_ALIGN_BYTES.value
     if k_cache.data_ptr() % align or v_cache.data_ptr() % align:
-        # The kernels state the caches' 16-byte alignment, which the
-        # direct-to-LDS page copy needs, instead of specializing the pointers.
-        # An unaligned arena has no direct-to-LDS lowering at all, so main's
-        # pointer specialization could not serve one either; refusing it here
-        # names the cause instead of failing to compile.
+        # The kernels state the caches' alignment, which the direct-to-LDS
+        # page copy needs: it has no lowering for an unaligned arena.
         raise ValueError(
             f"gluon_mha_extend_gfx950 needs {align}-byte aligned K / V caches; got "
             f"{k_cache.data_ptr():#x} / {v_cache.data_ptr():#x}"

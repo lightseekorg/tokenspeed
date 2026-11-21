@@ -11,11 +11,8 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps_rocm.sh
-# --enable-startup-requests: the engine serves its own startup requests before
-# readiness, which compiles the kernels only a live request reaches (step input
-# preparation, speculative accept bookkeeping, the prefix page copy; gfx950 MoE
-# sorting stage 2 with real weights). Without it those compile on the first
-# client requests, which TOKENSPEED_JIT_COMPILE_CHECK=error would fail.
+# Serve the engine's own startup requests before readiness, so the kernels only
+# a live request reaches compile before the first client request.
 server:
   command: >-
     ts serve
