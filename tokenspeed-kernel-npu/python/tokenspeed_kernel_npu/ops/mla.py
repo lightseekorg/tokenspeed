@@ -127,10 +127,12 @@ def mla_prefill(
     del max_seqlen_q, max_seqlen_kv, seq_lens_kv
     if logit_cap:
         raise NotImplementedError("Ascend MLA does not support logit caps")
+    # Projection outputs arrive as split views; the non-paged FIA path
+    # requires contiguous Q/K/V.
     output, lse = torch_npu.npu_fused_infer_attention_score(
-        q,
-        k,
-        v,
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
         atten_mask=_causal_mask(q.device) if is_causal else None,
         actual_seq_lengths=cu_seqlens_q[1:],
         actual_seq_lengths_kv=cu_seqlens_kv[1:],
