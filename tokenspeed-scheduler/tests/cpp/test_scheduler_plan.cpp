@@ -25,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <stdexcept>
@@ -2954,6 +2955,323 @@ TEST_F(PrefillChunkYieldSuite, ALongPromptGivesWayInAtMostTheBoundsRoundsThenFin
     EXPECT_EQ(shared, 2) << ::testing::PrintToString(long_rows);
     EXPECT_LE(static_cast<std::int64_t>(long_rows.size()), 2 + (100 + kBudget - 1) / kBudget)
         << ::testing::PrintToString(long_rows);
+}
+
+// Whole workloads planned round by round until every request is done, with
+// each round written as one line, compared with recorded sequences.
+class PlanSequenceSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kPage = 4;
+    static constexpr std::int32_t kChunk = 32;
+
+    struct Prompt {
+        std::int32_t tokens;
+        std::int32_t output;
+    };
+    // `concurrency` requests are live at a time; the next prompt is
+    // submitted when one finishes.
+    struct Workload {
+        std::vector<Prompt> prompts;
+        std::int32_t concurrency;
+    };
+    struct Settings {
+        Role role;
+        std::int32_t interval;  // prefill_decode_interval
+        std::int32_t yield;     // prefill_chunk_yield_tokens
+        // The two bounds; empty leaves the config's default.
+        std::optional<std::int32_t> cap;
+        std::optional<std::int32_t> yield_max_rounds;
+    };
+
+    // Long prompts arriving together, four chunks each, no shared prefix.
+    static Workload ManyLongPrompts() { return Workload{std::vector<Prompt>(6, Prompt{4 * kChunk, 4}), 6}; }
+
+    // Short prompts queued behind long ones, a few live at a time.
+    static Workload MixedQueue() {
+        Workload workload{.prompts = {}, .concurrency = 3};
+        for (const std::int32_t tokens : {136, 6, 10, 72, 5, 100, 12, 7, 9, 64}) {
+            workload.prompts.push_back(Prompt{tokens, 6});
+        }
+        return workload;
+    }
+
+    // Runs `workload` on a new scheduler and returns one line per round: P
+    // (prefill), D (decode), M (both) or - (no forward), then each row as
+    // id@first_position+tokens (prefill) or id+tokens (decode), then the
+    // prompts handed to the decode side as >id. Every forward lands before
+    // the next plan: a chunk that ends its prompt and every decode step
+    // produce one token. A fused request finishes after its output tokens, a
+    // P-role one when its hand-off is acknowledged.
+    std::vector<std::string> Run(const Workload& workload, const Settings& settings) {
+        const bool fused = settings.role == Role::kFused;
+        std::int32_t longest = 0;
+        for (const Prompt& prompt : workload.prompts) {
+            longest = std::max(longest, prompt.tokens + prompt.output);
+        }
+        SchedulerConfig cfg{};
+        cfg.role = settings.role;
+        cfg.prefix_granularity = kPage;
+        cfg.max_scheduled_tokens = kChunk;
+        cfg.max_batch_size = workload.concurrency;
+        cfg.max_resident_requests = workload.concurrency;
+        cfg.disable_l2_cache = true;
+        // Pages for every live request at once: nothing is retracted.
+        cfg.device_allocator.total_pages = workload.concurrency * (longest / kPage + 2) + 1;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = kPage,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kFull,
+            .transfer_policy = CacheTransferPolicy::FullSuffix,
+        });
+        cfg.prefill_decode_interval = settings.interval;
+        cfg.prefill_chunk_yield_tokens = settings.yield;
+        if (settings.cap) {
+            cfg.max_consecutive_prefill_rounds = *settings.cap;
+        }
+        if (settings.yield_max_rounds) {
+            cfg.prefill_chunk_yield_max_rounds = *settings.yield_max_rounds;
+        }
+        SetTestSnapshotPool(cfg);
+        config_ = WithHostPackingFromDevice(cfg);
+        scheduler_ = std::make_unique<Scheduler>(config_);
+
+        const auto send = [this](auto event_body) {
+            ExecutionEvent event;
+            event.With(std::move(event_body));
+            scheduler_->Advance(std::move(event));
+        };
+        std::vector<std::string> rounds;
+        std::map<std::string, std::int32_t> output_left;  // per live request
+        std::size_t next = 0;
+        std::size_t done = 0;
+        while (done < workload.prompts.size() && rounds.size() < 500) {
+            for (; next < workload.prompts.size() && std::ssize(output_left) < workload.concurrency; ++next) {
+                const std::string id = "r" + std::to_string(next);
+                const auto first_token = static_cast<std::int32_t>(100000 * (next + 1));
+                Submit(RequestSpec{.request_id = id, .tokens = MakeTokens(workload.prompts[next].tokens, first_token)});
+                if (!fused) {
+                    send(pd::BootstrappedEvent{id});
+                }
+                output_left[id] = workload.prompts[next].output;
+            }
+            const ExecutionPlan plan = PlanOnce();
+            std::string round = "-";
+            if (plan.remote_decode) {
+                for (const std::string& id : plan.remote_decode->request_ids) {
+                    send(pd::SucceededEvent{id});
+                    output_left.erase(id);
+                    ++done;
+                    round += " >" + id;
+                }
+            }
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            const std::size_t rows = batch == nullptr ? 0 : batch->request_ids.size();
+            if (rows > 0) {
+                round[0] = batch->NumExtends() == rows ? 'P' : batch->NumExtends() == 0 ? 'D' : 'M';
+            }
+            for (std::size_t i = 0; i < rows; ++i) {
+                const std::string& id = batch->request_ids[i];
+                const bool prefill = i < batch->NumExtends();
+                const std::int32_t end = prefill ? batch->extend_prefix_lens[i] + batch->input_lengths[i] : 0;
+                round += " " + id + (prefill ? "@" + std::to_string(batch->extend_prefix_lens[i]) : "") + "+" +
+                         std::to_string(batch->input_lengths[i]);
+                const bool produces = !prefill || end == batch->prefill_lengths[i];
+                SendForwardDone(id, produces ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+                if (fused && produces && --output_left.at(id) == 0) {
+                    SendFinish(id);
+                    output_left.erase(id);
+                    ++done;
+                }
+            }
+            rounds.push_back(std::move(round));
+        }
+        EXPECT_EQ(done, workload.prompts.size()) << "the workload did not finish: " << ::testing::PrintToString(rounds);
+        return rounds;
+    }
+
+    static Settings Fused(std::int32_t interval) {
+        return Settings{.role = Role::kFused, .interval = interval, .yield = 0, .cap = {}, .yield_max_rounds = {}};
+    }
+    static Settings PrefillRoleWithYield() {
+        return Settings{.role = Role::kP, .interval = 0, .yield = kChunk / 2, .cap = {}, .yield_max_rounds = {}};
+    }
+
+    // The sequences below were recorded with the scheduler as it was before
+    // max_consecutive_prefill_rounds and prefill_chunk_yield_max_rounds
+    // existed, and are unchanged with both at their defaults. A deliberate
+    // change to default scheduling must update them.
+    static std::vector<std::string> ManyLongPromptsUnderTheInterval() {
+        return {
+            "P r0@0+32",
+            "P r0@32+32",
+            "P r0@64+32",
+            "P r0@96+32",
+            "D r0+1",
+            "D r0+1",
+            "P r1@0+32",
+            "P r1@32+32",
+            "P r1@64+32",
+            "P r1@96+32",
+            "P r2@0+32",
+            "P r2@32+32",
+            "P r2@64+32",
+            "P r2@96+32",
+            "P r3@0+32",
+            "P r3@32+32",
+            "P r3@64+32",
+            "P r3@96+32",
+            "P r4@0+32",
+            "P r4@32+32",
+            "P r4@64+32",
+            "P r4@96+32",
+            "P r5@0+32",
+            "P r5@32+32",
+            "P r5@64+32",
+            "P r5@96+32",
+            "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
+            "D r1+1 r2+1 r3+1 r4+1 r5+1",
+            "D r1+1 r2+1 r3+1 r4+1 r5+1",
+        };
+    }
+    static std::vector<std::string> ManyLongPromptsWithoutAnInterval() {
+        return {
+            "P r0@0+32",
+            "P r0@32+32",
+            "P r0@64+32",
+            "P r0@96+32",
+            "P r1@0+32",
+            "P r1@32+32",
+            "P r1@64+32",
+            "P r1@96+32",
+            "P r2@0+32",
+            "P r2@32+32",
+            "P r2@64+32",
+            "P r2@96+32",
+            "P r3@0+32",
+            "P r3@32+32",
+            "P r3@64+32",
+            "P r3@96+32",
+            "P r4@0+32",
+            "P r4@32+32",
+            "P r4@64+32",
+            "P r4@96+32",
+            "P r5@0+32",
+            "P r5@32+32",
+            "P r5@64+32",
+            "P r5@96+32",
+            "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
+            "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
+            "D r0+1 r1+1 r2+1 r3+1 r4+1 r5+1",
+        };
+    }
+    static std::vector<std::string> MixedQueueUnderTheInterval() {
+        return {
+            "P r0@0+32",
+            "P r0@32+32",
+            "P r0@64+32",
+            "P r0@96+32",
+            "P r0@128+8 r1@0+6 r2@0+10",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "D r0+1 r1+1 r2+1",
+            "P r3@0+32",
+            "P r3@32+32",
+            "P r3@64+8 r4@0+5 r5@0+19",
+            "D r3+1 r4+1",
+            "D r3+1 r4+1",
+            "P r5@19+32",
+            "P r5@51+32",
+            "P r5@83+17",
+            "D r3+1 r4+1 r5+1",
+            "D r3+1 r4+1 r5+1",
+            "D r3+1 r4+1 r5+1",
+            "P r6@0+12 r7@0+7",
+            "D r5+1 r6+1 r7+1",
+            "D r5+1 r6+1 r7+1",
+            "P r8@0+9",
+            "D r6+1 r7+1 r8+1",
+            "D r6+1 r7+1 r8+1",
+            "D r6+1 r7+1 r8+1",
+            "P r9@0+32",
+            "D r8+1",
+            "D r8+1",
+            "P r9@32+32",
+            "D r9+1",
+            "D r9+1",
+            "D r9+1",
+            "D r9+1",
+            "D r9+1",
+        };
+    }
+    static std::vector<std::string> MixedQueueWithTheChunkYield() {
+        return {
+            "P r1@0+6 r2@0+10 r0@0+16",
+            "P >r1 >r2 r0@16+32",
+            "P r4@0+5 r0@48+24",
+            "P >r4 r0@72+32",
+            "P r0@104+32",
+            "P >r0 r3@0+32",
+            "P r6@0+12 r3@32+20",
+            "P >r6 r3@52+20 r5@0+12",
+            "P >r3 r7@0+7 r5@12+24",
+            "P >r7 r8@0+9 r5@36+20",
+            "P >r8 r5@56+32",
+            "P r5@88+12 r9@0+20",
+            "P >r5 r9@20+32",
+            "P r9@52+12",
+            "- >r9",
+        };
+    }
+};
+
+// Fused role: the defaults plan the workload as recorded, without a
+// prefill_decode_interval and with one of 2. Under the interval a cap of 1 or
+// 2 plans it differently, so the recorded rounds do cover the suspension the
+// cap bounds.
+TEST_F(PlanSequenceSuite, ManyLongPromptsPlanAsRecordedUnderTheDecodeInterval) {
+    const std::vector<std::string> recorded = ManyLongPromptsUnderTheInterval();
+    EXPECT_EQ(Run(ManyLongPrompts(), Fused(/*interval=*/2)), recorded);
+    EXPECT_EQ(Run(ManyLongPrompts(), Fused(/*interval=*/0)), ManyLongPromptsWithoutAnInterval());
+    for (const std::int32_t cap : {1, 2}) {
+        Settings capped = Fused(/*interval=*/2);
+        capped.cap = cap;
+        EXPECT_NE(Run(ManyLongPrompts(), capped), recorded) << "a cap of " << cap << " changed nothing";
+    }
+}
+
+TEST_F(PlanSequenceSuite, AMixedQueuePlansAsRecordedUnderTheDecodeInterval) {
+    const std::vector<std::string> recorded = MixedQueueUnderTheInterval();
+    EXPECT_EQ(Run(MixedQueue(), Fused(/*interval=*/2)), recorded);
+    for (const std::int32_t cap : {1, 2}) {
+        Settings capped = Fused(/*interval=*/2);
+        capped.cap = cap;
+        EXPECT_NE(Run(MixedQueue(), capped), recorded) << "a cap of " << cap << " changed nothing";
+    }
+}
+
+// P role, chunk yield on: the default plans the queue as recorded. A long
+// prompt gives way more than once in it, so a bound of one round plans it
+// differently.
+TEST_F(PlanSequenceSuite, AMixedQueuePlansAsRecordedWithTheChunkYield) {
+    const std::vector<std::string> recorded = MixedQueueWithTheChunkYield();
+    EXPECT_EQ(Run(MixedQueue(), PrefillRoleWithYield()), recorded);
+    Settings one_round = PrefillRoleWithYield();
+    one_round.yield_max_rounds = 1;
+    EXPECT_NE(Run(MixedQueue(), one_round), recorded);
+}
+
+// The defaults written out (no cap, an unbounded yield) are the fields left
+// out.
+TEST_F(PlanSequenceSuite, TheExplicitDefaultsPlanAsTheFieldsLeftOut) {
+    Settings no_cap = Fused(/*interval=*/2);
+    no_cap.cap = 0;
+    EXPECT_EQ(Run(MixedQueue(), no_cap), MixedQueueUnderTheInterval());
+    Settings unbounded = PrefillRoleWithYield();
+    unbounded.yield_max_rounds = std::numeric_limits<std::int32_t>::max();
+    EXPECT_EQ(Run(MixedQueue(), unbounded), MixedQueueWithTheChunkYield());
 }
 
 }  // namespace tokenspeed::test
