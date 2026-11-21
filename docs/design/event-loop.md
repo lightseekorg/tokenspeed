@@ -99,6 +99,9 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
+With a zero generation budget, the engine still prefills the prompt and can
+score it, then returns an empty completion.
+
 Each accepted request gets a monotonically increasing admission identity
 before data-plane registration. The output processor allocates it once;
 the Python request record, planned forwards and snapshot/restore operations
