@@ -29,6 +29,7 @@ import torch
 from cutlass.base_dsl.dsl import BaseDSL
 from tokenspeed_mla.mla_prefill import (
     _compile_prefill_kernel,
+    _value_input,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
@@ -357,3 +358,107 @@ class TestGPU:
         )
         assert result is out
         assert result.shape == (0, 4, 128) and lse.shape == (0, 4)
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn]
+    )
+    @pytest.mark.parametrize("causal", [False, True])
+    @pytest.mark.parametrize("pdl", [False, True])
+    def test_strided_values_reuse_compilation_and_graph(self, dtype, causal, pdl):
+        # Warm a packed layout, then vary rows, heads, padding and storage offset.
+        raw = _inputs([3], [17], 4, 4)
+        packed = tuple(t.to(dtype) for t in raw[:3]) + raw[3:]
+        _launch(packed, [3], [17], causal, True, pdl)
+        for q_lens, kv_lens, heads, kv_heads, width in (
+            ([1, 127, 3], [17, 259, 1], 4, 4, 256),
+            ([129, 0, 3], [0, 17, 257], 8, 2, 384),
+            ([3, 1], [0, 0], 4, 4, 256),
+        ):
+            raw = _inputs(q_lens, kv_lens, heads, kv_heads)
+            q, k, v = (t.to(dtype) for t in raw[:3])
+            backing = torch.empty(
+                (sum(kv_lens) + 1, kv_heads + 1, width), device="cuda", dtype=dtype
+            )
+            view = backing[1:, :kv_heads, 128:256]
+            view.copy_(v)
+            # The wrapper's contract is zero-copy for these layouts.
+            assert _value_input(view) is view
+            inputs = (q, k, view, *raw[3:])
+            with assert_no_cute_compile():
+                expected = _launch(
+                    (q, k, v, *raw[3:]), q_lens, kv_lens, causal, True, pdl
+                )
+                actual = _launch(inputs, q_lens, kv_lens, causal, True, pdl)
+                torch.testing.assert_close(actual[0], expected[0], atol=0, rtol=0)
+                torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = _launch(inputs, q_lens, kv_lens, causal, True, pdl)
+                view.copy_((v.float() * 0.5).to(dtype))
+                graph.replay()
+                updated = _launch(
+                    (q, k, view.contiguous(), *raw[3:]),
+                    q_lens,
+                    kv_lens,
+                    causal,
+                    True,
+                    pdl,
+                )
+                torch.testing.assert_close(captured[0], updated[0], atol=0, rtol=0)
+                torch.testing.assert_close(captured[1], updated[1], atol=0, rtol=0)
+
+    @pytest.mark.parametrize(
+        "layout", ["unaligned", "channels", "outer_stride", "broadcast", "singleton"]
+    )
+    def test_values_pack_unsupported_layouts(self, layout):
+        raw = _inputs([3], [17], 4, 4)
+        q, k, v = (t.to(torch.bfloat16) for t in raw[:3])
+        if layout == "unaligned":
+            view = torch.empty(v.numel() + 1, device="cuda", dtype=v.dtype)[1:].view(
+                v.shape
+            )
+        elif layout == "channels":
+            view = torch.empty((17, 4, 256), device="cuda", dtype=v.dtype)[..., ::2]
+        elif layout == "outer_stride":
+            view = torch.empty((17, 4, 136), device="cuda", dtype=v.dtype)[..., :128]
+        elif layout == "broadcast":
+            view = v[:1].expand_as(v)
+        else:
+            # A contiguous single-head view may carry an unused odd head stride.
+            v, k = v[:, :1].contiguous(), k[:, :1].contiguous()
+            view = torch.as_strided(v, v.shape, (128, 1, 1))
+        if layout not in ("broadcast", "singleton"):
+            view.copy_(v)
+        prepared = _value_input(view)
+        assert prepared.is_contiguous()
+        assert prepared.data_ptr() % 16 == 0
+        torch.testing.assert_close(prepared, view, atol=0, rtol=0)
+        actual = _launch((q, k, view, *raw[3:]), [3], [17], False, True, False)
+        expected = _launch(
+            (q, k, view.contiguous(), *raw[3:]), [3], [17], False, True, False
+        )
+        torch.testing.assert_close(actual[0], expected[0], atol=0, rtol=0)
+        torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
+
+    def test_large_strided_value_offsets(self):
+        tokens = 2**31 // 256 + 2
+        if torch.cuda.mem_get_info()[0] < 10 * 2**30:
+            pytest.skip("requires 10 GiB free tensor storage")
+        q = torch.ones((1, 1, 192), device="cuda", dtype=torch.bfloat16)
+        k = torch.empty((tokens, 1, 192), device="cuda", dtype=q.dtype)
+        kv = torch.empty((tokens, 1, 256), device="cuda", dtype=q.dtype)
+        v = kv[..., 128:]
+        k[-1:].fill_(1)
+        v[-1:].fill_(0.5)
+        assert (tokens - 1) * v.stride(0) > 2**31
+        assert _value_input(v) is v
+        cq = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        ck = torch.tensor([tokens - 1, tokens], device="cuda", dtype=torch.int32)
+        actual = _launch((q, k, v, cq, ck), [1], [1], False, True, False)
+        torch.testing.assert_close(
+            actual[0], torch.full_like(actual[0], 0.5), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            actual[1], torch.full_like(actual[1], 192**0.5), atol=2e-5, rtol=2e-5
+        )
