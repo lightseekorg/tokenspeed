@@ -85,7 +85,14 @@ class CacheTransfer:
 
 @dataclass(frozen=True, slots=True)
 class PrefixLoadTelemetry:
-    """Immutable admission and operation identity supplied by the scheduler."""
+    """Immutable admission and operation identity supplied by the scheduler.
+
+    Attributes:
+        admission_id: Identity of the request admission, retained across retraction.
+        op_generation: Wrap generation of the scheduler operation ticket.
+        request_pool_index: Request slot captured when the prefix load was scheduled.
+        slot_generation: Allocation generation of that request-pool slot.
+    """
 
     admission_id: int
     op_generation: int
@@ -95,7 +102,23 @@ class PrefixLoadTelemetry:
 
 @dataclass(frozen=True, slots=True)
 class RestoreTelemetry:
-    """Scheduler-owned restore frontier and slot ownership at scheduling."""
+    """Scheduler-owned restore frontier and slot ownership at scheduling.
+
+    Attributes:
+        admission_id: Identity of the same request admission held before retraction.
+        op_generation: Wrap generation of the scheduler operation ticket.
+        previous_slot: Request slot whose state the retraction image captured.
+        previous_slot_generation: Allocation generation of previous_slot at retraction.
+        slot_generation: Allocation generation of the restore's new destination slot.
+        slot_previous_admission_id: Admission last bound to the destination slot,
+            or 0 when no prior admission is recorded.
+        restore_sequence: One-based restore scheduling sequence for this admission.
+        committed_tokens: Complete prompt plus accepted output tokens retained at
+            retraction, independent of client delivery.
+        computed_tokens: Computed prefix length at retraction: the prefill
+            window's end, or ``committed_tokens - 1`` while decoding.
+        prompt_tokens: Full submitted prompt length, including any uncomputed suffix.
+    """
 
     admission_id: int
     op_generation: int
@@ -111,7 +134,14 @@ class RestoreTelemetry:
 
 @dataclass(frozen=True, slots=True)
 class PrefixLoadOp:
-    """One identified Host prefix load, with the original wire transfer rows."""
+    """One identified Host prefix load, with the original wire transfer rows.
+
+    Attributes:
+        op_id: The scheduler's ticket; the ACK carries it back.
+        request_id: The request loading its prefix.
+        telemetry: Frozen scheduler admission, operation and slot identity.
+        transfers: Host L2 block to Device block rows, before local-owner translation.
+    """
 
     op_id: int
     request_id: str
@@ -157,6 +187,8 @@ class RestoreOp:
         snapshot_slot: The arena row the store imaged into.
         transfers: Host block to Device block, both tiers.
         source_tier: ``transfers[i]`` reads ``source_tier[i]``'s buffer.
+        telemetry: Frozen scheduler restore context; None means this operation
+            carries no opt-in scheduler observation.
     """
 
     op_id: int
@@ -166,5 +198,4 @@ class RestoreOp:
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
     source_tier: tuple[HostTier, ...]
-    # Omission means that this operation has no opt-in scheduler observation.
     telemetry: RestoreTelemetry | None = None

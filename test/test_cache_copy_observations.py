@@ -30,7 +30,6 @@ import pytest
 from tokenspeed.runtime.cache.transfer.observations import (
     CompletedObservations,
     CopyCounts,
-    ObservationBatch,
     count_owned_rows,
     observe_copy,
 )

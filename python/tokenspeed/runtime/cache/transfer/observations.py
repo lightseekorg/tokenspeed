@@ -26,15 +26,19 @@ remain control-plane responsibilities.
 """
 
 from collections import deque
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from tokenspeed.runtime.cache.transfer.ops import PrefixLoadTelemetry, RestoreTelemetry
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.transfer.layout import CacheGroupLayout
 
 MAX_REQUEST_ID_BYTES = 256
 
 
-def cache_observation_capacity_from_env(environ):
+def cache_observation_capacity_from_env(environ: Mapping[str, str]) -> int:
     """Resolve the public startup opt-in; it is never reread while serving."""
     value = environ.get("TOKENSPEED_CACHE_EVENT_LOG", "0")
     if value not in ("0", "1"):
@@ -44,11 +48,21 @@ def cache_observation_capacity_from_env(environ):
 
 @dataclass(frozen=True, slots=True)
 class CopyCounts:
+    """Local copy totals for one Host tier.
+
+    Attributes:
+        rows: Number of CacheBlock transfer rows after ownership translation.
+        bytes: Sum of all field payload bytes for those rows, excluding
+            block-stride padding.
+    """
+
     rows: int
     bytes: int
 
 
-def count_owned_rows(rows, groups):
+def count_owned_rows(
+    rows: Iterable[tuple[int, int, int]], groups: Sequence["CacheGroupLayout"]
+) -> CopyCounts:
     """Count local CacheBlocks and the payload bytes that their fields copy."""
     count = 0
     nbytes = 0
@@ -62,6 +76,23 @@ def count_owned_rows(rows, groups):
 
 @dataclass(frozen=True, slots=True)
 class CopyObservation:
+    """Immutable local physical-copy metadata carried by one operation's ACK.
+
+    Attributes:
+        kind: Copy kind, ``prefix_load`` or ``snapshot_restore``.
+        op_id: Scheduler operation ticket, joined with kind and
+            telemetry.op_generation.
+        request_id: External request ID captured for this operation; admission
+            identity distinguishes later reuse of the same ID.
+        request_pool_index: Request slot captured when the operation was scheduled.
+        telemetry: Frozen scheduler identity and, for restores, recovery context.
+        l2: Local Host L2 transfer-row and field-payload byte counts.
+        pool: Local snapshot-pool transfer-row and field-payload byte counts.
+        slot_state_image_bytes: Declared slot-state blob span, not a copied-byte
+            count. An unprepared exporter may import only its marker and no
+            state rows.
+    """
+
     kind: str
     op_id: int
     request_id: str
@@ -69,8 +100,6 @@ class CopyObservation:
     telemetry: PrefixLoadTelemetry | RestoreTelemetry
     l2: CopyCounts
     pool: CopyCounts
-    # The declared blob span is not a count of bytes copied by every exporter:
-    # an unprepared owner may import only its marker and no state rows.
     slot_state_image_bytes: int
 
     def payload(self):
@@ -98,15 +127,15 @@ class ObservationBatch(NamedTuple):
 
 def observe_copy(
     *,
-    kind,
-    op_id,
-    request_id,
-    request_pool_index,
-    telemetry,
-    l2,
-    pool,
-    slot_state_image_bytes,
-):
+    kind: str,
+    op_id: int,
+    request_id: str,
+    request_pool_index: int,
+    telemetry: PrefixLoadTelemetry | RestoreTelemetry | None,
+    l2: CopyCounts,
+    pool: CopyCounts,
+    slot_state_image_bytes: int,
+) -> ObservationBatch:
     """Capture a bounded identity, refusing to truncate it into another request."""
     if telemetry is None or (
         len(request_id) > MAX_REQUEST_ID_BYTES
@@ -148,6 +177,12 @@ class CompletedObservations:
         return self.capacity > 0
 
     def extend(self, batch):
+        """Append within capacity and accumulate batch and overflow losses.
+
+        Keep queued records and drop newer ones beyond the remaining capacity,
+        adding both overflow and ``batch.dropped`` to the dropped count.
+        A disabled queue ignores the batch.
+        """
         if not self.enabled:
             return
         self._dropped += batch.dropped
@@ -158,6 +193,10 @@ class CompletedObservations:
                 self._records.append(record)
 
     def drain(self):
+        """Return ``(payloads, dropped)`` and clear the records and loss counter.
+
+        The payloads are the completed records as CPU dictionaries.
+        """
         records = [record.payload() for record in self._records]
         dropped = self._dropped
         self.clear()

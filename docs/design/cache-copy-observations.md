@@ -12,7 +12,7 @@ observed restore identity comes from the captured native admission, not a later
 lookup of a reusable request ID. The ordinary unobserved adapter is unchanged.
 
 `TOKENSPEED_CACHE_EVENT_LOG=1` explicitly enables diagnostics at startup with
-capacity4096; absent or0 disables them. The builder captures this once in plain
+capacity 4096; absent or 0 disables them. The builder captures this once in plain
 `DeviceSpecs`, passing the same choice to the executor and plan adapter.
 `HostCacheExecutor` also accepts the explicitly configured observation capacity. For each observed prefix load or restore it counts
 rows after the existing ownership translation and sums those rows' field payload
