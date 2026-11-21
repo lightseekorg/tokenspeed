@@ -161,6 +161,7 @@ class _CPUInputGraph(PrefillGraph):
 
     def __init__(self, model: nn.Module) -> None:
         config = ModelExecutorConfig(
+            prefill_graph_decoder_capture_sizes=None,
             max_req_pool_size=2,
             output_length=1,
             enforce_eager=True,
