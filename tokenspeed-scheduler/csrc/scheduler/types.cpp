@@ -131,8 +131,9 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage) {
         if (!storage_config) throw std::invalid_argument("L3 requires an explicit StorageConfig");
         storage_config->Validate();
-        if (storage_config->max_host_blocks > host_allocator.NumUsableBlocks()) {
-            throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
+        if (storage_config->max_host_blocks > HostBlockCapacity()) {
+            throw std::invalid_argument(
+                "L3 Host credits must not exceed the usable Host parents times the densest Host packing");
         }
     }
     if (peer_config) {
@@ -159,10 +160,7 @@ void SchedulerConfig::Validate() const {
             if (!HasHostCache()) {
                 throw std::invalid_argument("Scheduler: peer Host landings need a Host L2 cache");
             }
-            const std::int64_t densest_packing =
-                host_group_packing.empty() ? 1 : *std::ranges::max_element(host_group_packing);
-            if (peer_config->max_host_landing_blocks >
-                std::int64_t{host_allocator.NumUsableBlocks()} * densest_packing) {
+            if (peer_config->max_host_landing_blocks > HostBlockCapacity()) {
                 throw std::invalid_argument(
                     "Scheduler: peer Host landing credits must not exceed the usable Host parents times the densest "
                     "Host packing");
@@ -190,9 +188,7 @@ void SchedulerConfig::Validate() const {
         if (disable_prefix_cache) {
             throw std::invalid_argument("Scheduler: a Disk tier needs prefix caching");
         }
-        const std::int64_t densest_packing =
-            host_group_packing.empty() ? 1 : *std::ranges::max_element(host_group_packing);
-        if (disk_config->max_host_blocks > std::int64_t{host_allocator.NumUsableBlocks()} * densest_packing) {
+        if (disk_config->max_host_blocks > HostBlockCapacity()) {
             throw std::invalid_argument(
                 "Scheduler: Disk tier Host credits must not exceed the usable Host parents times the densest "
                 "Host packing");

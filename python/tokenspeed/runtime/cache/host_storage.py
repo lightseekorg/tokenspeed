@@ -189,6 +189,25 @@ def compute_host_group_packing(
     )[3]
 
 
+def host_block_capacity(storage: HostCacheStorage, shard_counts: Sequence[int]) -> int:
+    """The Host pool's blocks in its densest group, as the scheduler counts
+    them: its parents times the largest packing times owners
+    (``SchedulerConfig::HostBlockCapacity``). The Host credits of L3, the Disk
+    tier and peer Host landings are shares of it, counted in blocks of any
+    group: a hybrid model's read holds every KV page under the State
+    checkpoint it reaches.
+
+    Args:
+        storage: The Host pool.
+        shard_counts: Each group's owner count, in the pool's group order.
+    """
+    densest = max(
+        int(packing) * int(shards)
+        for packing, shards in zip(storage.group_packing, shard_counts, strict=True)
+    )
+    return storage.num_host_lcm_blocks * densest
+
+
 def validate_host_group_packing(packing: tuple[int, ...], *, cpu_group) -> None:
     """Require identical Host block IDs on every mirrored scheduler rank.
 

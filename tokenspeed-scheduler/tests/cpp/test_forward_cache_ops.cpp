@@ -910,6 +910,26 @@ TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
+// Credits count Host blocks in any group, up to the parents times the densest
+// packing: a hybrid model's GET holds every KV page under its checkpoint.
+TEST(SchedulerConfigValidateTest, L3HostCreditsCountBlocksOfTheDensestGroup) {
+    SchedulerConfig config = MakeValidConfig();
+    config.host_allocator.total_pages = 9;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    config.enable_l3_storage = true;
+    config.cache_groups[0].cache_blocks_per_lcm_block = 4;
+    config = WithHostPackingFromDevice(config);
+    ASSERT_EQ(config.HostBlockCapacity(), 8 * 4);
+    const auto credits = [](std::int32_t blocks) {
+        return StorageConfig{
+            8, 32, blocks, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
+    };
+    config.storage_config = credits(32);
+    EXPECT_NO_THROW(config.Validate()) << "more credits than parents";
+    config.storage_config = credits(33);
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "more credits than Host blocks";
+}
+
 TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
     // What feeds Host L2 is a cache policy, so a Host tier states it on every
     // role; without a Host tier (the null page alone, or disabled) there is

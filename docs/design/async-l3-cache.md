@@ -155,8 +155,11 @@ dependencies before allocation; eviction between QUERY and GET can shorten
 the restore, never establish a hit.
 
 `max_host_blocks` counts logical references across all groups and outstanding
-storage operations, including recurrent-state checkpoints. It is neither a
-byte budget nor a quota per worker. Page sharding changes the transferred bytes,
+storage operations, including recurrent-state checkpoints, up to the Host
+pool's blocks in its densest group (`SchedulerConfig::HostBlockCapacity`): a
+hybrid model's GET holds every KV page under the checkpoint it restores, more
+blocks than the Host has parents when several pages pack into one. It is
+neither a byte budget nor a quota per worker. Page sharding changes the transferred bytes,
 not this logical count. A read with no legal prefix within the remaining budget
 uses ordinary local admission; deployments must budget for the prefix lengths
 and concurrency they intend to restore together.

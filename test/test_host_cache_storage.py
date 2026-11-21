@@ -27,6 +27,7 @@ from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
     compute_host_group_packing,
     compute_host_lcm_block_bytes,
+    host_block_capacity,
     validate_host_group_packing,
 )
 from tokenspeed.runtime.cache.transfer.layout import (
@@ -153,6 +154,17 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
         HostCacheStorage(
             layout, group_specs=_SPECS, num_host_lcm_blocks=1, block_alignment=0
         )
+
+
+def test_the_host_block_capacity_is_the_densest_groups_blocks():
+    # Three 32-byte KV pages per 96-byte parent beside one 80-byte State.
+    storage = HostCacheStorage(
+        _layout(), group_specs=_SPECS, num_host_lcm_blocks=5, block_alignment=1
+    )
+    assert storage.group_packing == (3, 1)
+    assert host_block_capacity(storage, (1, 1)) == 15
+    # A group sharded over two owners counts two virtual blocks a slot.
+    assert host_block_capacity(storage, (2, 1)) == 30
 
 
 @pytest.mark.parametrize("group_index,block_id", [(0, 0), (0, 7), (1, 3)])

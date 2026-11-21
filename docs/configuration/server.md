@@ -1915,7 +1915,7 @@ the following defaults; unknown options are rejected:
 | --- | --- | --- |
 | `max_operations` | `32` | Outstanding operations, including undelivered completions, Ready holds and quarantine |
 | `max_keys_per_operation` | `256` | Key limit per query, GET or PUT |
-| `max_host_blocks` | `max(1, min(256, host_blocks // 2))` | Logical Host references across operations, Ready holds and quarantine; `host_blocks` is the usable Host LCM-parent count |
+| `max_host_blocks` | `max(1, min(256, host_blocks // 2))` | Logical Host references across operations, Ready holds and quarantine; `host_blocks` is the Host pool's blocks in its densest group (the usable LCM parents times the largest packing) |
 | `metadata_entries` | `max(1, host_blocks * 4)` | Limit for negative-key metadata and for backup candidates |
 | `min_prefetch_tokens` | Model prefix granularity | Minimum extension beyond the local hit worth preparing |
 | `max_prefetch_tokens` | `8192` | Maximum extension beyond the local hit, rather than a prompt-length limit |
@@ -1932,7 +1932,9 @@ Prefetch length is also constrained by keys, Host references and group
 geometry: Full history, SWA windows and State checkpoints must fit together.
 Raising `max_prefetch_tokens` alone does not guarantee a longer restore.
 `max_host_blocks` is a logical-reference budget, not bytes or a per-worker
-quota, and cannot exceed the usable Host-parent count. PUTs may use at most
+quota, and cannot exceed `host_blocks`. A hybrid model's GET holds every KV
+page under the State checkpoint it restores, so a long prompt needs a budget
+of at least its KV pages up to that checkpoint, plus the checkpoint. PUTs may use at most
 half of the operation and Host credits, rounded down, to leave room for reads.
 
 `clear_cache_drain_timeout_ms` accepts integers from `0` through

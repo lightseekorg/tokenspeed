@@ -72,6 +72,7 @@ from tokenspeed.runtime.cache.disk import (
     disk_scheduler_config,
     disk_settings,
 )
+from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
@@ -1426,8 +1427,10 @@ class HostBootstrap:
                 )
                 disk_config = disk_scheduler_config(
                     disk_tuning,
-                    num_host_blocks=disk.num_host_lcm_blocks
-                    * max(device.specs.host_group_packing),
+                    num_host_blocks=host_block_capacity(
+                        device.host_cache.storage,
+                        device.host_cache.ownership.shard_counts,
+                    ),
                 )
                 # The executor addresses the Host pool by pointer as well.
                 _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
@@ -1449,8 +1452,10 @@ class HostBootstrap:
                     answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
                     min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
                     landing_tier=server_args.peer_prefix_landing_tier,
-                    num_host_blocks=device.host_cache.storage.num_host_lcm_blocks
-                    * max(device.specs.host_group_packing),
+                    num_host_blocks=host_block_capacity(
+                        device.host_cache.storage,
+                        device.host_cache.ownership.shard_counts,
+                    ),
                 )
             specs = device.specs
             geometry = specs.cache_geometry
