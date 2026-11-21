@@ -75,27 +75,35 @@ def _request(url: str, body: dict | None, timeout: float) -> tuple[int, dict]:
 
 
 def run(args: argparse.Namespace) -> int:
-    """Reload every worker behind the gateway in turn; returns the exit status."""
+    """Reload the gateway's TokenSpeed workers and return the exit status."""
     base = args.url.rstrip("/")
     status, listing = _request(f"{base}/v1/rl/workers", None, 60.0)
     if status != 200:
         print(f"cannot list workers at {base}/v1/rl/workers (HTTP {status}): {listing}")
+        return 1
+    worker_ids = [
+        worker["id"]
+        for worker in listing["workers"]
+        if worker["engine"] == "tokenspeed"
+    ]
+    if not worker_ids:
+        print(f"No TokenSpeed workers found at {base}.", file=sys.stderr)
         return 1
     # One id for every engine, so their gates run the same reload together.
     body: dict = {"mode": args.mode, "id": uuid.uuid4().hex, "timeout_s": args.timeout}
     if args.modules is not None:
         body["modules"] = args.modules
     failed = False
-    for worker in listing["workers"]:
+    for worker_id in worker_ids:
         started = time.monotonic()
         status, reply = _request(
-            f"{base}/v1/rl/workers/{worker['id']}/engine/reload_forward",
+            f"{base}/v1/rl/workers/{worker_id}/engine/reload_forward",
             body,
             # The engine answers once the reload ran or timed out.
             args.timeout + _REPLY_MARGIN_S,
         )
         elapsed = time.monotonic() - started
-        print(f"{worker['id']} ({elapsed:.1f} s, HTTP {status}): {json.dumps(reply)}")
+        print(f"{worker_id} ({elapsed:.1f} s, HTTP {status}): {json.dumps(reply)}")
         # HTTP 200 still carries a refused or undone reload, as success false.
         failed |= status != 200 or reply.get("body", {}).get("success") is not True
     return 1 if failed else 0

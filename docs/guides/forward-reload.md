@@ -25,8 +25,9 @@ ts reload-forward --url http://127.0.0.1:8000  # 4. reload, warm, recapture
                                                # 5. benchmark again, repeat
 ```
 
-`ts reload-forward` prints, per worker, what it reloaded and how long each
-step took, for example:
+`ts reload-forward` targets workers the gateway identifies as TokenSpeed.
+It exits with an error if it finds none. For each target it reports what
+was reloaded and how long each step took.
 
 ```text
 reloaded tokenspeed.runtime.models.qwen3 and 0 dependent module(s), 31 object(s) patched in 0.05 s;
