@@ -1541,13 +1541,12 @@ def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
     [
         ("prefill_collective_payload", "int8-block16"),
         ("owned_attention_output", "all-to-all"),
-        ("owned_rows_max_tokens", 24576),
     ],
 )
 def test_owned_row_prefill_flags_are_refused_for_other_checkpoints(
     tmp_path, flag: str, value
 ) -> None:
-    """The three owned-row prefill flags apply to Muse Spark only: off their
+    """The owned-row prefill flags apply to Muse Spark only: off their
     defaults, another architecture's checkpoint is refused."""
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -2198,20 +2197,35 @@ def test_owned_row_flags_are_validated_in_server_args() -> None:
 
     with pytest.raises(ValueError, match="--owned-attention-output"):
         ServerArgs(model="x", owned_attention_output="all-gather")
-    for tokens in (8191, 2**17):
-        with pytest.raises(ValueError, match="--owned-rows-max-tokens"):
-            ServerArgs(model="x", owned_rows_max_tokens=tokens)
     with pytest.raises(ValueError, match="rl-bitwise"):
         ServerArgs(
             model="x", owned_attention_output="all-to-all", numerics="rl-bitwise"
         )
-    with pytest.raises(ValueError, match="rl-bitwise"):
-        ServerArgs(model="x", owned_rows_max_tokens=24576, numerics="rl-bitwise")
-    assert ServerArgs(model="x").owned_rows_max_tokens == 8192
-    assert (
-        ServerArgs(model="x", owned_rows_max_tokens=24576).owned_rows_max_tokens
-        == 24576
-    )
+
+
+@pytest.mark.parametrize(
+    "chunk,numerics,expected",
+    [
+        (None, "auto", 8192),
+        (-1, "auto", 8192),
+        (4096, "auto", 8192),
+        (8192, "auto", 8192),
+        (24576, "auto", 24576),
+        (24576, "rl-bitwise", 8192),
+        (2**20, "auto", (2**31 - 1) // (8192 * 2)),
+    ],
+)
+def test_owned_rows_follow_the_prefill_chunk_size(
+    monkeypatch: pytest.MonkeyPatch, chunk, numerics: str, expected: int
+) -> None:
+    """The owned-row layout serves the configured prefill chunk, at least
+    8192 rows, within the producer buffer's 32-bit range; --numerics
+    rl-bitwise keeps 8192."""
+    import tokenspeed.runtime.models.muse_spark as module
+
+    monkeypatch.setitem(module.global_server_args_dict, "chunked_prefill_size", chunk)
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", numerics)
+    assert module._owned_rows_max_tokens() == expected
 
 
 def test_prefill_collective_payload_choices_match_the_iris_state() -> None:

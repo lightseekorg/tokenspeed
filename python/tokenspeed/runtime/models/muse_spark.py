@@ -1282,14 +1282,33 @@ MUSE_OWNED_ROWS_MIN_TOKENS = 192
 MUSE_OWNED_QKVG_MIN_TOKENS = 2048
 # NVIDIA owns rows over NCCL from here; below it the split collectives cost more than they save.
 MUSE_NCCL_OWNED_ROWS_MIN_TOKENS = 4096
-# The most token rows the owned-row layout serves is --owned-rows-max-tokens
-# (8192 by default). Startup sizes three per-rank buffers from min(max forward
-# tokens, it) full 8192-wide BF16 rows: the Iris producer buffer, its pull
-# scratch holding one rank's share of them, and the prepared gather's local
-# output. Larger forwards take the replicated-row path.
+# The owned-row layout serves forwards up to the prefill chunk the server is
+# configured for (--chunked-prefill-size), and at least 8192 rows. Startup
+# sizes three per-rank buffers from min(max forward tokens, that) full
+# 8192-wide BF16 rows: the Iris producer buffer, its pull scratch holding one
+# rank's share of them, and the prepared gather's local output. Larger
+# forwards take the replicated-row path, whose attention-output and expert
+# sums add the ranks in another order.
+MUSE_OWNED_ROWS_MAX_TOKENS = 8192
+# The producer buffer is addressed by 32-bit buffer offsets.
+MUSE_OWNED_ROWS_LIMIT_TOKENS = (2**31 - 1) // (8192 * 2)
 # Expert TP (EP1) owner-side route staging is [rows, 8, 4096] BF16, so its row
 # limit stays at 8192; larger expert-TP forwards replicate rows.
 MUSE_OWNED_ROUTE_MAX_TOKENS = 8192
+
+
+def _owned_rows_max_tokens() -> int:
+    """The most token rows a forward takes on the owned-row layout.
+
+    Chunks above 8192 tokens stay on owned rows instead of replicated rows,
+    which changes the order their sums are taken in; --numerics rl-bitwise
+    keeps 8192, and a chunk size past the producer buffer's 32-bit range
+    stops at that range.
+    """
+    chunk = global_server_args_dict["chunked_prefill_size"]
+    if global_server_args_dict["numerics"] == "rl-bitwise" or chunk is None:
+        return MUSE_OWNED_ROWS_MAX_TOKENS
+    return min(max(chunk, MUSE_OWNED_ROWS_MAX_TOKENS), MUSE_OWNED_ROWS_LIMIT_TOKENS)
 
 
 def _owned_heads_to_owners(o_proj: nn.Module) -> bool:
@@ -3534,8 +3553,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         )
 
         capacity = (
-            min(max_num_tokens, global_server_args_dict["owned_rows_max_tokens"])
-            * self.config.hidden_size
+            min(max_num_tokens, _owned_rows_max_tokens()) * self.config.hidden_size
         )
         owned_route_max_rows = (
             min(max_num_tokens, MUSE_OWNED_ROUTE_MAX_TOKENS)

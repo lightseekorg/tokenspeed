@@ -870,12 +870,9 @@ def _int8_block16_round_trip(x):
 
 
 def _muse_owned_rows_default_cap_worker(rank, world_size, device):
-    """At the default --owned-rows-max-tokens (8192) the owned-row buffers are
-    sized as before the flag existed, and 8192 rows take owned rows, 8193 not."""
+    """At the default prefill chunk size the owned-row buffers hold 8192 rows
+    whatever the largest forward, and 8192 rows take owned rows, 8193 not."""
     torch.set_grad_enabled(False)
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    assert global_server_args_dict["owned_rows_max_tokens"] == 8192
     _, state = _prepare_muse_backend(
         world_size, None, None, expert_tp_size=1, max_num_tokens=24577
     )
@@ -890,7 +887,7 @@ def _muse_owned_rows_default_cap_worker(rank, world_size, device):
 
 
 def _muse_owned_far_rows_worker(rank, world_size, device):
-    """Owned rows at --owned-rows-max-tokens 24576 use the last element of the
+    """Owned rows at a 24576-token prefill chunk use the last element of the
     producer buffer and of pull scratch bit for bit (reduce-scatter in BF16 and
     int8-block16, row gathers, both QKVG all-to-alls, the heads all-to-all and
     the MoE-input gather), and row counts up to the cap compile nothing new."""
@@ -915,9 +912,9 @@ def _muse_owned_far_rows_worker(rank, world_size, device):
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     cap = 24576
-    # The served recipe's cap, with int8-block16 payloads prepared too. This
-    # worker runs in its own spawned process.
-    global_server_args_dict["owned_rows_max_tokens"] = cap
+    # A 24576-token prefill chunk, with int8-block16 payloads prepared too.
+    # This worker runs in its own spawned process.
+    global_server_args_dict["chunked_prefill_size"] = cap
     global_server_args_dict["prefill_collective_payload"] = "int8-block16"
     with torch.device(device):
         projection = QKVOGateParallelLinear(

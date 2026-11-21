@@ -346,8 +346,6 @@ def validate_context_parallel_roles(
 
 # Muse Spark's --owned-attention-output choices.
 OWNED_ATTENTION_OUTPUTS = ("reduce-scatter", "all-to-all")
-# Main's owned-row cap; --owned-rows-max-tokens defaults to it.
-OWNED_ROWS_MAX_TOKENS_DEFAULT = 8192
 # Muse Spark's --prefill-collective-payload choices (the Iris state's
 # MUSE_PAYLOADS; a test checks they match).
 PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
@@ -837,12 +835,6 @@ class ServerArgs:
     # rank after loading (+1 full output weight a layer); fewer bytes, a
     # different summation order. Refused where Iris owned rows do not run.
     owned_attention_output: str = "reduce-scatter"
-    # Muse Spark: the most token rows a forward takes on the Iris owned-row
-    # layout; larger forwards replicate rows. The default is the layout's
-    # long-standing cap. Above it, forwards of up to this many rows move from
-    # the replicated path to owned rows, whose attention-output and expert sums
-    # use another summation order: a numerics change for those forwards.
-    owned_rows_max_tokens: int = OWNED_ROWS_MAX_TOKENS_DEFAULT
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -1166,16 +1158,15 @@ class ServerArgs:
         if (
             (
                 self.owned_attention_output != "reduce-scatter"
-                or self.owned_rows_max_tokens != OWNED_ROWS_MAX_TOKENS_DEFAULT
                 or self.prefill_collective_payload != "bf16"
             )
             and architectures is not None
             and "MuseSparkForConditionalGeneration" not in architectures
         ):
             raise ValueError(
-                "--prefill-collective-payload, --owned-attention-output and "
-                "--owned-rows-max-tokens apply to Muse Spark's owned-row prefill "
-                f"only; this checkpoint is {architectures}"
+                "--prefill-collective-payload and --owned-attention-output apply "
+                "to Muse Spark's owned-row prefill only; this checkpoint is "
+                f"{architectures}"
             )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
@@ -2380,27 +2371,15 @@ class ServerArgs:
             self.owned_attention_output,
             OWNED_ATTENTION_OUTPUTS,
         )
-        # The owned-row producer buffer holds this many full 8192-wide BF16
-        # rows and is addressed by 32-bit buffer offsets.
-        if not (
-            OWNED_ROWS_MAX_TOKENS_DEFAULT
-            <= self.owned_rows_max_tokens
-            <= (2**31 - 1) // (8192 * 2)
+        if (
+            self.numerics == "rl-bitwise"
+            and self.owned_attention_output != "reduce-scatter"
         ):
+            # It moves the attention output's sum to another order; the
+            # envelope promises the trainer's bits.
             raise ValueError(
-                f"--owned-rows-max-tokens must be in [{OWNED_ROWS_MAX_TOKENS_DEFAULT}, "
-                f"{(2**31 - 1) // (8192 * 2)}], got {self.owned_rows_max_tokens}"
-            )
-        if self.numerics == "rl-bitwise" and (
-            self.owned_attention_output != "reduce-scatter"
-            or self.owned_rows_max_tokens != OWNED_ROWS_MAX_TOKENS_DEFAULT
-        ):
-            # Both move owned-row prefill sums to another order; the envelope
-            # promises the trainer's bits.
-            raise ValueError(
-                "--owned-attention-output all-to-all and a raised "
-                "--owned-rows-max-tokens change prefill numerics; --numerics "
-                "rl-bitwise needs the defaults"
+                "--owned-attention-output all-to-all changes prefill numerics; "
+                "--numerics rl-bitwise needs reduce-scatter"
             )
         _require_choice(
             "--prefill-collective-payload",
@@ -5292,16 +5271,6 @@ class ServerArgs:
             "its rows of every rank's heads and projects them through the whole "
             "output projection (+1 output weight a layer; a numerics change). "
             "Refused where Iris owned rows do not run.",
-        )
-        parser.add_argument(
-            "--owned-rows-max-tokens",
-            type=int,
-            default=ServerArgs.owned_rows_max_tokens,
-            help="Muse Spark: the most token rows a forward takes on the Iris "
-            "owned-row layout (default 8192). Raising it moves larger forwards "
-            "from the replicated path to owned rows, whose attention-output and "
-            "expert sums use another summation order (a numerics change for "
-            "those forwards); it also sizes the owned-row buffers.",
         )
         parser.add_argument(
             "--prefill-collective-payload",
