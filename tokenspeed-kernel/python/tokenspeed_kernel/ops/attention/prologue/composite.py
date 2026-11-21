@@ -27,15 +27,19 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel.ops.attention.prologue.types import (
     BOOLS,
+    KV_CONVS,
     ROPE_STYLES,
+    ConvStream,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
     KVCacheFormat,
+    KVShortConv,
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
     MRope,
+    RelativeHeadNorm,
     RopeStyle,
     Rotary,
 )
@@ -122,11 +126,14 @@ def _write_kv(
     "gqa_prologue",
     name="composite_gqa_prologue",
     solution="composite",
+    features=frozenset({"materialized_qk_norm"}),
     capability=CapabilityRequirement(vendors=frozenset({"amd", "ascend", "nvidia"})),
     signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
         "has_norm": BOOLS,
+        "relative_norm": BOOLS,
+        "kv_conv": KV_CONVS,
         "kv_format": frozenset({"native", "fp8", "mxfp8"}),
         "kv_convert": BOOLS,
         "mrope": BOOLS,
@@ -140,13 +147,15 @@ def composite_gqa_prologue(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    norm: HeadNorm | None,
+    norm: HeadNorm | RelativeHeadNorm | None,
     rotary: Rotary | None,
     cache: HeadKVCache,
     query_dtype: torch.dtype,
     return_kv: bool,
     enable_pdl: bool,
 ) -> GQAPrologueOutput:
+    if isinstance(norm, RelativeHeadNorm):
+        return _relative_prologue(q, k, v, norm, rotary, cache, return_kv, enable_pdl)
     q = q.flatten(1)
     if norm is not None:
         q, k = qk_rmsnorm(
@@ -172,6 +181,81 @@ def composite_gqa_prologue(
         q=q.to(query_dtype),
         k=k if return_kv else None,
         v=v if return_kv else None,
+    )
+
+
+def _relative_prologue(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    norm: RelativeHeadNorm,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+    return_kv: bool,
+    enable_pdl: bool,
+) -> GQAPrologueOutput:
+    """The K/V convolution, ``rel_mha_head_norms``, then the cache store of
+    its K/V rows."""
+    # The relative-attention kernels import the prologue's types.
+    from tokenspeed_kernel.ops.attention.rmha._triton.head_norms import (
+        rel_mha_head_norms,
+    )
+
+    if rotary is not None:
+        raise ValueError("relative head steps take no rotary embedding")
+    kv_heads, head_dim = cache.k_cache.shape[1:]
+    tokens = q.shape[0]
+    if norm.kv_conv is not None:
+        k = _convolve(k, norm.kv_conv.k, norm.kv_conv)
+        v = _convolve(v, norm.kv_conv.v, norm.kv_conv)
+    q, k, v, rel_logits = rel_mha_head_norms(
+        q.view(tokens, -1, head_dim),
+        k.view(tokens, kv_heads, head_dim),
+        v.view(tokens, kv_heads, head_dim),
+        norm.relative,
+        q_scale=norm.q_scale,
+        k_scale=norm.k_scale,
+        rel_scale=norm.rel_scale,
+        output_scale=norm.q_output_scale,
+        q_threshold=norm.q_threshold,
+        k_threshold=norm.k_threshold,
+        rel_threshold=norm.rel_threshold,
+        clip_eps=norm.clip_eps,
+        value_norm_eps=norm.value_norm_eps,
+        rel_projection=norm.projection,
+    )
+    k, v = k.flatten(1), v.flatten(1)
+    _write_kv(cache, k, v, enable_pdl)
+    return GQAPrologueOutput(
+        q=q.flatten(1),
+        k=k if return_kv else None,
+        v=v if return_kv else None,
+        rel_logits=rel_logits,
+    )
+
+
+def _convolve(x: torch.Tensor, stream: ConvStream, conv: KVShortConv) -> torch.Tensor:
+    # The conv kernels import the attention package.
+    from tokenspeed_kernel.ops.conv import inkling_ring_sconv
+
+    batch = conv.batch
+    return inkling_ring_sconv(
+        x,
+        stream.weight,
+        stream.ring,
+        batch.cu_seqlens,
+        batch.seq_idx,
+        batch.cache_indices,
+        batch.has_initial_state,
+        batch.seq_lens,
+        batch.block_table,
+        stream.checkpoint,
+        None,
+        num_extends=batch.num_extends,
+        publish_live=batch.publish_live,
+        dynamic_weights=stream.dynamic_weights,
+        output_scale=conv.output_scale,
+        token_range=None,
     )
 
 

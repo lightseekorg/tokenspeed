@@ -30,9 +30,11 @@ order of the startup steps -- not the shape of the production source.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal, get_args
@@ -202,6 +204,7 @@ def test_engine_role_selects_warmup_and_prefill_buckets(
         prefill_graph_max_tokens=prefill_graph_max_tokens,
     )
     assert config.attention_tp_size == attention_tp_size
+    assert config.moe_tp_ep_size == 16
     assert config.data_parallel_size == 16 // attention_tp_size
     assert config.decode_only_attention is (role == "decode")
     assert config.prefill_only is (role == "prefill")
@@ -305,9 +308,15 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # autotune() runs its dummy forwards on the serving stream.
+        self.device_module = torch.get_device_module(self.device)
+        self.execution_stream = self.device_module.Stream()
         # The stub gathers whole sampled rows, so autotune() runs no
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
+
+    # autotune() and warm_kernels() both run the real traversal.
+    _warm_kernels = ModelExecutor._warm_kernels
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
@@ -485,6 +494,72 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     assert not tuning_module.is_autotuning()
     for tensor in metadata:
         tensor.fill_(1)  # Capture must be able to mutate warmup metadata later.
+
+
+def test_rewarm_after_a_rebind_compiles_but_tunes_nothing(monkeypatch, tmp_path):
+    # The post-rebind warm-up runs the same forwards under kernel warmup, but
+    # with profiling off and no cache load or save, so it allocates no tuning
+    # workspace outside the rebind's reserve.
+    events = []
+
+    def forward(**kwargs):
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append(("target", kwargs["input_ids"].numel()))
+
+    def draft(*, batch_sizes, graph_phase):
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append("draft")
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(
+            chunked_prefill_size=16,
+            attention_tp_size=1,
+            autotune_cache_key={},
+            disable_autotune=False,
+            prefill_only=False,
+        ),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **_: events.append("scrub"),
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(warmup_decode_path=draft, max_decode_bs=8),
+        drafter=_DrafterDouble(events),
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=events,
+    )
+    monkeypatch.setattr(
+        executor_module, "autotune_cache_path", lambda key: str(tmp_path / "cache.json")
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "load_autotune_cache",
+        lambda *args: events.append("load"),
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "save_autotune_cache",
+        lambda *args: events.append("save"),
+    )
+    ModelExecutor.warm_kernels(executor)
+    assert events == [
+        "scrub",
+        ("target", 16),
+        ("draft_extend", 16),
+        ("draft_experts", 16),
+        "draft",
+    ]
+    assert not tuning_module.is_warming_up()
 
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
@@ -747,16 +822,10 @@ class _DrafterCaptureDouble:
     def capture_prefill_graph(self, stream, observer):
         self._on_capture(stream)
 
-    def extend_graph_plan(self, token_buckets, request_counts):
+    def extend_graph_plan(self, token_buckets):
         if not self._extend_graphs:
             return {}
-        return {
-            "prefill:drafter-step0": [
-                (bucket, bs)
-                for bucket in token_buckets
-                for bs in request_counts(bucket)
-            ]
-        }
+        return {"prefill:drafter-kv": [(max(token_buckets), 1)]}
 
     def capture_extend_graphs(self, capture, *, observer):
         self._on_capture(capture.stream)
@@ -769,13 +838,9 @@ class _ObserverDouble:
 
 @dataclass
 class _CaptureConfig:
-    """The ModelExecutorConfig fields capture_graphs() reads."""
+    """The ModelExecutorConfig field capture_graphs() reads."""
 
-    enable_drafter_prefill_graph: bool = True
-    prefill_graph_capture_batch_sizes: list[int] | None = None
-    context_len: int = 4096
-    max_num_seqs: int = 4
-    data_parallel_size: int = 1
+    enable_cudagraph_gc: bool
 
 
 class _CaptureExecutor:
@@ -787,8 +852,8 @@ class _CaptureExecutor:
     drafter_extend_ladders = ModelExecutor.drafter_extend_ladders
     _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
 
-    def __init__(self, *, forward_step, prefill_graph, drafter):
-        self.config = _CaptureConfig()
+    def __init__(self, *, forward_step, prefill_graph, drafter, enable_cudagraph_gc):
+        self.config = _CaptureConfig(enable_cudagraph_gc=enable_cudagraph_gc)
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
@@ -837,6 +902,7 @@ def test_capture_lifecycle_preserves_main_order(
                 extend_graphs=drafter_graphs == "extend", on_capture=capture_draft
             )
         ),
+        enable_cudagraph_gc=False,
     )
     ModelExecutor.capture_graphs(
         executor,
@@ -850,6 +916,133 @@ def test_capture_lifecycle_preserves_main_order(
         *(["draft"] if not prefill_disabled and drafter_graphs is not None else []),
     ]
     reset_workspace_pools()
+
+
+@pytest.fixture
+def unfrozen_heap() -> Iterator[int]:
+    """Yield the freeze count of a heap nothing froze, with fresh workspace pools."""
+    gc.unfreeze()
+    # A collection parks CPython's immortal objects in the permanent generation.
+    gc.collect()
+    reset_workspace_pools()
+    yield gc.get_freeze_count()
+    reset_workspace_pools()
+
+
+def _record_gc_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    for name, real in (
+        ("collect", gc.collect),
+        ("freeze", gc.freeze),
+        ("unfreeze", gc.unfreeze),
+    ):
+
+        def record(
+            *args: int, name: str = name, real: Callable[..., object] = real
+        ) -> object:
+            calls.append(name)
+            return real(*args)
+
+        monkeypatch.setattr(gc, name, record)
+    return calls
+
+
+def _capture_executor(
+    capture: Callable[[str], Callable[..., None]],
+    *,
+    decode_disabled: bool,
+    prefill_disabled: bool,
+    drafter_graphs: Literal["own", "extend"],
+    enable_cudagraph_gc: bool,
+) -> _CaptureExecutor:
+    return _CaptureExecutor(
+        forward_step=_DecodeCaptureDouble(
+            disable=decode_disabled, stream=object(), on_capture=capture("decode")
+        ),
+        prefill_graph=_PrefillCaptureDouble(
+            disable=prefill_disabled, on_capture=capture("prefill")
+        ),
+        drafter=_DrafterCaptureDouble(
+            extend_graphs=drafter_graphs == "extend", on_capture=capture("draft")
+        ),
+        enable_cudagraph_gc=enable_cudagraph_gc,
+    )
+
+
+@pytest.mark.parametrize("enable_cudagraph_gc", [False, True])
+@pytest.mark.parametrize("decode_disabled", [False, True])
+@pytest.mark.parametrize("prefill_disabled", [False, True])
+@pytest.mark.parametrize("drafter_graphs", ["own", "extend"])
+def test_capture_freezes_the_heap_once_around_every_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    unfrozen_heap: int,
+    enable_cudagraph_gc: bool,
+    decode_disabled: bool,
+    prefill_disabled: bool,
+    drafter_graphs: Literal["own", "extend"],
+) -> None:
+    """One freeze spans the decode, prefill and drafter captures unless
+    --enable-cudagraph-gc, and a boot that captures nothing collects nothing."""
+    frozen: dict[str, bool] = {}
+
+    def capture(name: str) -> Callable[..., None]:
+        def run(*_args: object) -> None:
+            frozen[name] = gc.get_freeze_count() > unfrozen_heap
+
+        return run
+
+    executor = _capture_executor(
+        capture,
+        decode_disabled=decode_disabled,
+        prefill_disabled=prefill_disabled,
+        drafter_graphs=drafter_graphs,
+        enable_cudagraph_gc=enable_cudagraph_gc,
+    )
+    calls = _record_gc_calls(monkeypatch)
+    ModelExecutor.capture_graphs(executor, entries=None, observer=_ObserverDouble())
+
+    captured = [
+        *([] if decode_disabled else ["decode"]),
+        *([] if prefill_disabled else ["prefill", "draft"]),
+    ]
+    assert frozen == {name: not enable_cudagraph_gc for name in captured}
+    if not captured:
+        assert calls == []
+    elif enable_cudagraph_gc:
+        assert calls == ["collect"]
+    else:
+        assert calls == ["collect", "freeze", "unfreeze", "collect"]
+    assert gc.get_freeze_count() == unfrozen_heap
+
+
+@pytest.mark.parametrize(
+    ("failing", "drafter_graphs"),
+    [("decode", "own"), ("prefill", "own"), ("draft", "own"), ("draft", "extend")],
+)
+def test_a_failed_capture_leaves_the_heap_unfrozen(
+    unfrozen_heap: int, failing: str, drafter_graphs: Literal["own", "extend"]
+) -> None:
+    frozen: list[bool] = []
+
+    def capture(name: str) -> Callable[..., None]:
+        def run(*_args: object) -> None:
+            frozen.append(gc.get_freeze_count() > unfrozen_heap)
+            if name == failing:
+                raise RuntimeError(f"{name} capture failed")
+
+        return run
+
+    executor = _capture_executor(
+        capture,
+        decode_disabled=False,
+        prefill_disabled=False,
+        drafter_graphs=drafter_graphs,
+        enable_cudagraph_gc=False,
+    )
+    with pytest.raises(RuntimeError, match=f"{failing} capture failed"):
+        ModelExecutor.capture_graphs(executor, entries=None, observer=_ObserverDouble())
+    assert frozen and all(frozen)
+    assert gc.get_freeze_count() == unfrozen_heap
 
 
 # ---------------------------------------------------------------------------
@@ -1386,7 +1579,7 @@ class _FiGemmDouble:
         self.dispatches = []
         self._dispatch = dispatch
 
-    def _get_cache_buf(self, name, size, device):
+    def _get_stream_cache_buf(self, name, size, device):
         self.cache_buf_requests.append((name, size, device))
         return self.workspace
 
@@ -2015,3 +2208,82 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class _StreamDouble:
+    """A stream that records the streams it is ordered after."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self._log = log
+
+    def wait_stream(self, other):
+        self._log.append(("wait", self.name, other.name))
+
+
+class _DeviceModuleDouble:
+    """Tracks the current stream through ``stream()`` like torch.cuda does."""
+
+    def __init__(self, log):
+        self._log = log
+        self.current = _StreamDouble("current", log)
+
+    def current_stream(self, device=None):
+        return self.current
+
+    def stream(self, stream):
+        module = self
+
+        class _Use:
+            def __enter__(self):
+                self.previous = module.current
+                module.current = stream
+
+            def __exit__(self, *exc):
+                module.current = self.previous
+
+        return _Use()
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_startup_warmup_runs_on_the_serving_stream_only_on_npu(monkeypatch, is_npu):
+    """Ascend warms on the serving stream after the caller's writes; other
+    platforms keep the dummy forward on the caller's current stream."""
+    log = []
+    device_module = _DeviceModuleDouble(log)
+
+    def forward(**kwargs):
+        log.append(("forward", device_module.current.name))
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(chunked_prefill_size=16, prefill_only=True),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.arange(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **kwargs: None,
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(),
+        drafter=None,
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=[],
+    )
+    executor.device_module = device_module
+    executor.execution_stream = _StreamDouble("serving", log)
+    platform = type("_Platform", (), {"is_npu": is_npu})()
+    monkeypatch.setattr(executor_module, "current_platform", lambda: platform)
+    for name in ("load_autotune_cache", "save_autotune_cache"):
+        monkeypatch.setattr(executor_module, name, lambda *args: None)
+    monkeypatch.setattr(executor_module, "set_autotune_process_group", lambda g: None)
+    _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+    if is_npu:
+        assert log == [("wait", "serving", "current"), ("forward", "serving")]
+    else:
+        assert log == [("forward", "current")]
+    assert device_module.current.name == "current"

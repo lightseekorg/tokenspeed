@@ -164,3 +164,126 @@ forward thread runs, so GIL contention is not included.
 `BATCH * (PROMPT - 1)` prompt positions cross this callback together. Under
 chunked prefill the real per-callback count follows the scheduled token budget;
 the largest cases are burst stress tests, not assumed production batch shapes.
+
+## Synchronized request completion
+
+`tests/finish_burst.rs` drives the real C++ scheduler and Rust output processor
+with CPU-only forward results. Every request ends in the same result batch.
+One full-history cache group uses explicit page granularity, with ample capacity
+and distinct prefixes per row. `steps=1` finishes immediately after prefill;
+`steps=2` first publishes the prompt through an ordinary decode admission.
+Larger step counts exercise longer generation before the same completion burst.
+A positive hit percentage seeds each request's page-aligned prefix through the
+real scheduler before admission. All setup, seeding, earlier forwards and
+scheduler destruction are outside the completion timers. Each trial constructs
+a fresh scheduler, so cache occupancy is controlled rather than accumulated.
+
+```bash
+cargo test --release -p tokenspeed-control --test finish_burst --no-run
+# Use the test executable printed above, on an otherwise idle CPU.
+TS_FINISH_CONFIG='{"batch":512,"prompt":131072,"steps":2,"page":64,"hit_percent":0,"prefix_cache":true,"events":false,"profile":false,"warmups":3,"repeats":21}' \
+TS_FINISH_OUTPUT=finish.json taskset -c 20 ./finish_burst-tests \
+  --ignored --exact benchmark_finish_burst
+```
+
+Every JSON field is required. `prefix_cache=false` requires zero hits.
+`events` enables real KV-event generation and draining. `profile=true` records
+the scheduler's existing nested spans during the final advance; use separate
+profiled runs for attribution because recording adds overhead. `profile_ms`
+contains inclusive durations summed over requests; nested spans must not be added.
+
+| Timer | Work included |
+| --- | --- |
+| `commit` | Final token processing, stop checks, output construction, Rust request-state removal and destruction |
+| `scheduler_finish` | Rust/C++ event conversion, final results and Finish events, cache publication, page-reference and request-slot release |
+| `cleanup_plan` | The next plan, which erases finished scheduler requests and destroys their token history and other remaining state |
+| `events` | Drain the final advance's KV events through the Rust bridge; earlier events were drained before timing |
+| `kv_encode` | Call the real KV codec synchronously for decomposition; serving encodes on the publisher thread |
+| `output_batch`, `encode` | Build and encode the final output batch; serving normally runs these on the I/O worker |
+| `metadata_drop` | Destroy retained execution plans, batch/result columns, and event/release-ID lists |
+| `wire_drop` | Destroy encoded frames, KV-event payload and drained KV-event objects |
+| `before_finish_plan` | For `steps>1`, the last preceding decode plan; excluded from completion cost |
+
+Sum matching samples' `scheduler_finish` and `cleanup_plan` for scheduler
+completion cost, then compute percentiles. Do not add phase percentiles.
+The benchmark does not run the event loop, Python data-plane release, GPU work,
+network sends or publisher queue backpressure, overlap draining, PD, L2/L3, grammar, logging, tracing, metrics,
+or hybrid cache groups. Its stage sum is CPU work across these APIs, not
+end-to-end latency or a complete event-loop measurement. Extremely large
+prefill batches deliberately ignore a production deployment's chunk budget.
+
+The ordinary test runs small immediate/decode completions, cache enabled/disabled,
+seeded prefixes and KV events. It checks final output, zero active pages, empty
+subsequent plans, reusable request IDs and the next request's actual prefix hit.
+
+## Completion A/B matrices and the real event loop
+
+The measured completion optimization results and control checks are in
+[finish_optimization.md](finish_optimization.md).
+The checked-in `finish_stages_matrix.json` and `finish_loop_matrix.json` contain
+the measured primary matrices; `finish_profiles_matrix.json`,
+`finish_control_matrix.json`, and `finish_purge_matrix.json` provide the diagnostics.
+Adjust CPU affinity for the machine running them.
+
+`run_finish_burst.py` runs an explicit JSON matrix sequentially and preserves
+per-trial wall/thread-CPU samples, process maximum RSS and binary hashes. A case
+is `{"name": "unique-label", "config": {...}}`; all configuration fields pass
+through to the workload. Use one output directory per binary/matrix. Completed
+matching cases are reused after an interrupted run; mixing binaries is rejected.
+Build and finish all compilation before measuring on otherwise idle CPUs.
+
+```bash
+python crates/ts-control/benches/run_finish_burst.py \
+  --binary ./finish_burst-tests --suite stages --matrix crates/ts-control/benches/finish_stages_matrix.json \
+  --output results/stages --cpu-set 20 --revision REVISION --timeout-seconds 1800
+```
+
+`tests/bench.rs` also registers
+`finish_event_loop::benchmark_finish_event_loop`. It runs real ingress,
+`EventLoop::round`, the C++ scheduler, output processing, KV publisher, and output
+encoding with immediate CPU-produced forward results. Plans and token outputs
+are freed/encoded on worker threads. Whole batches arrive in successive waves;
+each wave is submitted after the preceding wave finishes its outputs, including
+when its scheduler retirement still waits for an overlapping forward. Requests
+have distinct prefixes. The pool fits two full waves, avoiding prefix hits and
+deliberate capacity thrashing in the documented two-wave matrix.
+
+All `TS_LOOP_CONFIG` keys are required:
+
+```json
+{"batch":128,"prompt":524288,"steps":2,"waves":2,"page":64,"overlap":1,"events":true,"queue_capacity":1,"control_cpu":20,"warmups":1,"repeats":7}
+```
+
+Use `--suite loop` and a process CPU set such as `--cpu-set 20-23`; workers are
+created with that set before the control thread is pinned to `control_cpu`.
+A null `control_cpu` leaves affinity unchanged (the small behavioral test uses
+it). The workload is Linux-only because it reads `/proc` RSS and uses `taskset`.
+It checks actual length finishes and output tokens, waits for plan/output workers
+and all accepted KV batches, then samples total process CPU and final RSS. Cache
+and interpreter teardown are outside the active interval. The publisher uses a
+real local IPC socket without subscribers: this measures encoding and queue work,
+not delivery to a slow remote consumer. The separate KV-event tests exercise
+subscriber delivery and replay against real sockets.
+
+Each sample retains every round's wall/thread CPU and the publisher backlog,
+plus active wall time, total process CPU, final/peak RSS and publisher drain time.
+Report control-round P50/P95 together with trial count, total CPU, RSS and queue
+high-water marks. Queue capacity is a batch-count bound; pending bytes describe
+the data queued by that binary, not total memory or network buffers. Do not treat
+fast enqueueing alone as completed event processing.
+
+For an allocator diagnostic, repeat a case in a separate output directory with
+`MIMALLOC_PURGE_DELAY=-1`; the runner records this override in its metadata.
+Keep the default allocator for primary comparisons. Short runs do not establish
+the long-term RSS cost of disabling purge.
+
+Native profile runs record `SchedulerBridge::convertForwardEvents` and
+`destroyForwardEvents` around event conversion and destruction. Conversion
+includes backing-array growth and string/token payload allocations. Nested
+`Scheduler::Advance` measures the core. The bridge keeps its event array local to the call; the routing view reuses its
+traversal/change buffers.
+`KvEvents::encode`, `releaseBatch` and `send` identify the publisher worker's work.
+Use profiling separately from the uninstrumented distributions.
+
+Interpreter initialization and fixture construction stay outside completion
+timers.

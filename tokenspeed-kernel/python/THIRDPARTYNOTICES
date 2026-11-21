@@ -89,6 +89,13 @@ The Kimi-K3 CUDA router derives from FlashInfer v0.7.2
 (d84335d8c54e0c8f9f7e22faa15c7e34a58abf94), Copyright (c) 2026 NVIDIA CORPORATION.
 It retains the routing computation and omits the expert-aligned plan.
 
+The Kimi-K3 fused front projections (tokenspeed_kernel/thirdparty/cuda/csrc/kimi3_latent_front
+and kimi3_latent_front.py) derive from FlashInfer v0.7.3
+(775207deb34055667df89ed618fb4b06fc84de74), flashinfer/experimental/kimi_k3_latent_moe,
+Copyright (c) 2026 by FlashInfer team. The generated programs are unchanged; the host
+plan and launch binding retain the prefill front route of one rank with full shared
+experts and omit the decode, sharded-shared-expert and tail routes.
+
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
 
 Notice for fla-org/flash-linear-attention

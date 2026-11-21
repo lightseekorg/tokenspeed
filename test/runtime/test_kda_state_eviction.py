@@ -44,7 +44,7 @@ import pytest
 import torch
 from ci_system.ci_register import register_cuda_ci
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from test.runtime.conftest import (  # noqa: E402
     KIMI_STATE_GROUPS,
@@ -175,6 +175,7 @@ class _ScheduledKDA:
         config.max_retracted_requests = 0
         config.max_scheduled_tokens = _P
         config.max_batch_size = 1
+        config.max_resident_requests = 1
         config.decode_input_tokens = 1
         config.overlap_schedule_depth = 0
         config.enable_mixed_prefill_decode = False

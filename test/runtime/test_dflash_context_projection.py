@@ -52,12 +52,19 @@ TAPS = 3
 ROWS = 24
 
 
-def _draft(mapping: Mapping, hidden: int) -> DFlashDraftModel:
-    """A layerless draft: only its context projection is under test."""
+def _draft(mapping: Mapping, hidden: int, layers: int = 0) -> DFlashDraftModel:
+    """A draft whose layers have 128-wide heads; layerless unless asked."""
     config = PretrainedConfig(
         hidden_size=hidden,
-        num_hidden_layers=0,
+        num_hidden_layers=layers,
+        num_attention_heads=hidden // 128,
+        num_key_value_heads=2,
+        head_dim=128,
+        intermediate_size=2 * hidden,
+        hidden_act="silu",
         rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
         dflash_config={"target_layer_ids": list(range(TAPS)), "block_size": 8},
     )
     return DFlashDraftModel(config, mapping)
@@ -255,14 +262,20 @@ def _sink_drafter(model, device, max_bs: int, spec_num_tokens: int):
     drafter.target_layer_ids = list(model.target_layer_ids)
     drafter.spec_num_tokens = spec_num_tokens
     drafter.draft_model_runner = SimpleNamespace(model=model)
+    # A layerless draft writes no K/V.
+    drafter.token_to_kv_pool = None
     drafter.input_buffers = SimpleNamespace(
         max_bs=max_bs,
         positions_buf=torch.arange(max_bs * spec_num_tokens, device=device),
     )
     drafter.attn_backend = SimpleNamespace(
-        decode_window_locations=lambda: (
-            torch.arange(max_bs * spec_num_tokens, device=device) + 100
+        draft_write_locations_uniform=lambda out, starts, width: out.copy_(
+            torch.arange(out.numel(), device=device) + 100
         )
+    )
+    drafter.context_starts_buf = torch.zeros(max_bs, dtype=torch.int64, device=device)
+    drafter.context_locs_buf = torch.zeros(
+        max_bs * spec_num_tokens, dtype=torch.int32, device=device
     )
     drafter._fused_kv_enabled = True
     drafter._init_context_taps()
@@ -405,6 +418,67 @@ def _check_extend_warmup(rank, world_size, port):
         torch.cuda.synchronize()
 
 
+def _slot_rows(cache: torch.Tensor) -> torch.Tensor:
+    """A ``[pages, page_size, heads, head_dim]`` cache as one row per slot."""
+    return cache.reshape(-1, *cache.shape[-2:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_extend_warmup_compiles_the_context_write_into_slot_0():
+    """The extend warmup runs an extend's per-layer K/V write, whose K norm
+    is at head width, and lands every row in the dummy slot 0."""
+    from test.runtime.cache_pool_test_utils import make_mha_memory_plan, make_pool
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+    from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
+
+    device = torch.device("cuda")
+    # As the loader builds it: BF16 weights, FP32 RoPE table.
+    with set_default_torch_dtype(torch.bfloat16), device:
+        model = _draft(Mapping(rank=0, world_size=1, attn_tp_size=1), 1024, layers=1)
+    # Unloaded weights are uninitialized memory, which may hold NaN.
+    torch.manual_seed(0)
+    for param in model.parameters():
+        param.data.normal_(std=0.02)
+    plan = make_mha_memory_plan(
+        size=256,
+        prefix_granularity=64,
+        layer_num=1,
+        kv_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+    )
+    _, pool = make_pool(
+        MHATokenToKVPool,
+        plan,
+        device="cuda",
+        dtype=torch.bfloat16,
+        head_num=2,
+        head_dim=128,
+        layer_num=1,
+        rank=0,
+    )
+    drafter = _sink_drafter(model, device, 1, 8)
+    drafter.token_to_kv_pool = pool
+    key, value = pool.get_kv_buffer(0)
+    key.fill_(7)
+    value.fill_(7)
+
+    drafter.warmup_extend(64)
+    torch.cuda.synchronize()
+    for cache in (key, value):
+        assert (_slot_rows(cache)[1:] == 7).all()
+        assert (_slot_rows(cache)[0] == 0).all()
+
+    taps = torch.randn(48, model.context_in_features, device=device)
+    positions = torch.arange(48, device=device)
+    slots = torch.arange(1, 49, dtype=torch.int32, device=device)
+    with _kernel_test_utils().assert_no_cute_compile():
+        drafter._write_native_cache(taps, positions, slots)
+        torch.cuda.synchronize()
+    assert (_slot_rows(key)[1:49] != 7).all()
+
+
 def _warmup_worker(rank, world_size, port, error_dict):
     try:
         _check_extend_warmup(rank, world_size, port)
@@ -485,6 +559,7 @@ def _check_final_norm(rank, world_size, port, fusion_max_tokens):
         input_num_tokens=ROWS,
         forward_mode=ForwardMode.DECODE,
     )
+    model.prepare_communication_runtime(ROWS)
     out = model.final_norm(partials[rank].clone(), residual.clone(), ctx)
     reference = model.norm(partials.sum(dim=0), residual.clone())[0]
     assert torch.equal(out, reference), (out - reference).abs().max()

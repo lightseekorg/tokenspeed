@@ -218,9 +218,45 @@ impl ReasoningTokens {
     }
 }
 
+/// Remote interval confirmed for this request and its first committed use.
+#[derive(Clone, Debug, Default)]
+pub struct PeerUsage {
+    /// Prediction absent for older clients.
+    pub expected: Option<u64>,
+    /// Landing interval beyond the reader's local prefix.
+    pub window: Option<(i32, i32)>,
+    /// First successful prefill commit resolves this exactly once.
+    pub actual: Option<u64>,
+    /// Last authoritative peer lifecycle result observed by this request.
+    pub disposition: &'static str,
+    /// Time of the first lookup dispatch.
+    pub lookup_at: Option<std::time::Instant>,
+    /// Time at which a successful lookup advanced to admission.
+    pub admission_at: Option<std::time::Instant>,
+}
+
+/// Actual nonempty output blocks on this engine, independent of forward timing.
+/// Present only after a metrics-enabled request emits its first token block.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamOutputTiming {
+    pub first_output: f64,
+    pub last_output: f64,
+    pub first_chunk_tokens: usize,
+    pub output_tokens: usize,
+}
+
+impl StreamOutputTiming {
+    pub fn e2e_tpot(&self, finished: f64) -> Option<f64> {
+        let subsequent = self.output_tokens - self.first_chunk_tokens;
+        (subsequent > 0).then(|| (finished - self.first_output).max(0.0) / subsequent as f64)
+    }
+}
+
 /// One admitted request.
 #[derive(Debug, Clone)]
 pub struct RequestState {
+    /// Present on requests dispatched with a peer hint.
+    pub peer_usage: Option<PeerUsage>,
     /// Prompt token ids.
     pub prompt_ids: Vec<i32>,
     /// Prompt length.
@@ -293,13 +329,18 @@ pub struct RequestState {
     /// When it reached the scheduler's waiting queue, until its first
     /// forward observes the wait.
     pub submitted_at: Option<std::time::Instant>,
+    /// Decode KV landing, until its first decode dispatch observes the wait.
+    pub decode_ready_at: Option<std::time::Instant>,
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
-    /// When its first output token existed (wall-clock seconds), 0 until
-    /// then. Unlike `timings`, this is collected whenever the rank reports
-    /// engine metrics.
+    /// When this role's first output token existed (wall-clock seconds), 0
+    /// until then. On a decode role this is normally the first local decode
+    /// output; a remote prefill's bootstrap token alone does not stamp it,
+    /// except when that token ends the request. Unlike `timings`, this is
+    /// collected whenever the rank reports engine metrics.
     pub first_token_time: f64,
+    pub(crate) stream_output_timing: Option<StreamOutputTiming>,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
     /// Sampled PD timings, consumed at the first output or terminal release.
@@ -369,6 +410,7 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            peer_usage: None,
             session_id: None,
             spec_verify_ct: 0,
             decode_reserve: None,
@@ -378,8 +420,10 @@ impl RequestState {
             to_abort: false,
             abort_notify_client: false,
             submitted_at: None,
+            decode_ready_at: None,
             created_time: 0.0,
             first_token_time: 0.0,
+            stream_output_timing: None,
             timings: None,
             ttft: None,
             grammar: None,
@@ -593,19 +637,20 @@ impl RequestState {
         if self.finished() {
             return !self.finished_output;
         }
-        let generated = self.output_ids.len() as i64;
         if self.stream {
-            // A zero interval would divide by zero; it means every token.
+            // An interval below one means every step.
             let interval = self
                 .stream_interval
                 .unwrap_or(default_stream_interval)
-                .max(1);
-            if interval > 1 {
-                generated % interval == 1
-            } else {
-                generated % interval == 0
-            }
+                .max(1) as usize;
+            // Send the first step's tokens at once, then whenever at least
+            // `interval` tokens are unsent. A speculative step appends several
+            // tokens, so the output length can step over any given value;
+            // counting unsent tokens doesn't depend on hitting an exact length.
+            let unsent = self.output_ids.len().saturating_sub(self.send_token_offset);
+            interval == 1 || (unsent > 0 && (self.send_token_offset == 0 || unsent >= interval))
         } else {
+            let generated = self.output_ids.len() as i64;
             generated == 1 || generated % FORCED_STREAM_INTERVAL == 0
         }
     }
@@ -633,6 +678,7 @@ mod tests {
             schema_slot: String::new(),
             markers,
             implicit_closer,
+            boundary: None,
         }
     }
 
@@ -700,27 +746,46 @@ mod tests {
         assert_eq!(request.finished_reason.unwrap().wire_type(), "abort");
     }
 
-    #[test]
-    fn stream_intervals_follow_the_python_schedule() {
-        let due = |stream: bool, interval: Option<i64>, generated: usize| {
-            let mut request = RequestState::new(
-                vec![1, 2, 3],
-                1000,
-                BTreeSet::new(),
-                stream,
-                interval,
-                false,
-            );
-            request.output_ids = vec![0; generated];
-            request.output_due(1)
-        };
-        assert!((1..5).all(|n| due(true, None, n)));
-        // An interval above one fires on its first token and every interval after.
-        assert_eq!(
-            (1..8).map(|n| due(true, Some(3), n)).collect::<Vec<_>>(),
-            [true, false, false, true, false, false, true]
+    /// Runs `steps` decode steps that each append `tokens_per_step` tokens and
+    /// returns the output lengths at which an output was sent. A send advances
+    /// `send_token_offset` as `OutputProcessor::stream_state` does.
+    fn sent_at(
+        stream: bool,
+        interval: Option<i64>,
+        tokens_per_step: usize,
+        steps: usize,
+    ) -> Vec<usize> {
+        let mut request = RequestState::new(
+            vec![1, 2, 3],
+            1000,
+            BTreeSet::new(),
+            stream,
+            interval,
+            false,
         );
+        let mut sent = Vec::new();
+        for _ in 0..steps {
+            request
+                .output_ids
+                .extend(std::iter::repeat_n(0, tokens_per_step));
+            if request.output_due(1) {
+                request.send_token_offset = request.output_ids.len();
+                sent.push(request.output_ids.len());
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn stream_intervals_send_once_enough_tokens_are_unsent() {
+        assert_eq!(sent_at(true, None, 1, 4), [1, 2, 3, 4]);
+        // An interval above one sends the first step's tokens, then every interval after.
+        assert_eq!(sent_at(true, Some(3), 1, 7), [1, 4, 7]);
+        // Speculative steps append several tokens, so the output length can
+        // step over any given value; an output still goes out once at least an
+        // interval's worth of tokens is unsent.
+        assert_eq!(sent_at(true, Some(40), 4, 30), [4, 44, 84]);
         // Non-streaming requests: the first token, then every 50.
-        assert!(due(false, None, 1) && !due(false, None, 2) && due(false, None, 50));
+        assert_eq!(sent_at(false, None, 1, 100), [1, 50, 100]);
     }
 }

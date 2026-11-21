@@ -38,9 +38,12 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
+    _verify_state_groups_kernel,
     commit_state_pages,
     verify_state_blocks,
+    verify_state_groups,
 )
+from utils import assert_no_triton_compile  # noqa: E402
 
 
 def _two_slot_table(bs, *, generator, null_input_rows):
@@ -97,6 +100,143 @@ def test_layouts_and_arguments_the_kernel_cannot_serve_are_rejected():
             table,
             batch_size=8,
             pages_out=torch.empty(8, dtype=torch.int64, device="cuda"),
+        )
+
+
+def _packed_group_tables(groups, rows, width, *, seed):
+    """Group tables as views of one packed upload, the way the bridge ships them."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    packed = torch.randint(
+        1,
+        900,
+        (groups * rows * width + 1,),
+        device="cuda",
+        dtype=torch.int32,
+        generator=g,
+    )
+    # The odd leading word puts the tables at unaligned offsets.
+    tables = [
+        packed[1 + i * rows * width : 1 + (i + 1) * rows * width].view(rows, width)
+        for i in range(groups)
+    ]
+    for i, table in enumerate(tables):
+        table[i % 2 :: 2, 0] = 0
+    return tables
+
+
+def test_a_group_off_the_gpu_keeps_its_own_resolve():
+    """Tables on different devices skip the shared launch, not the CPU path."""
+    gpu, cpu = _packed_group_tables(2, 4, 3, seed=11)
+    cpu = cpu.cpu()
+    pages = [
+        torch.full((6,), -9, dtype=torch.int32, device=table.device)
+        for table in (gpu, cpu)
+    ]
+    verify_state_groups(
+        [gpu, cpu],
+        batch_size=4,
+        padded_batch_size=6,
+        pages_out=pages,
+        live_pages_out=None,
+        pad_page=-1,
+    )
+    for table, page in zip((gpu, cpu), pages):
+        want = torch.full((6,), -1, dtype=torch.int32)
+        want[:4] = torch_verify_state_blocks(table, batch_size=4).cpu()
+        assert torch.equal(page.cpu(), want)
+
+
+@pytest.mark.parametrize("groups", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize(
+    "batch_size, padded_batch_size", [(1, 1), (3, 4), (5, 8), (0, 2)]
+)
+@pytest.mark.parametrize("live", [True, False])
+def test_grouped_resolve_matches_each_group_and_pads_the_graph_rows(
+    groups, batch_size, padded_batch_size, live
+):
+    """One launch per call does what a resolve per group plus padding fills did."""
+    tables = _packed_group_tables(groups, max(batch_size, 1), 3, seed=groups)
+    width = padded_batch_size + 3
+    pages = [torch.full((width,), -9, dtype=torch.int32, device="cuda") for _ in tables]
+    lives = [torch.full((width,), -9, dtype=torch.int32, device="cuda") for _ in tables]
+    verify_state_groups(
+        tables,
+        batch_size=batch_size,
+        padded_batch_size=padded_batch_size,
+        pages_out=pages,
+        live_pages_out=lives if live else None,
+        pad_page=-1,
+    )
+    for table, page, live_page in zip(tables, pages, lives):
+        want = torch.full((width,), -9, dtype=torch.int32, device="cuda")
+        want[:padded_batch_size] = -1
+        want[:batch_size] = torch_verify_state_blocks(table, batch_size=batch_size)
+        assert torch.equal(page, want)
+        want_live = torch.full((width,), -9, dtype=torch.int32, device="cuda")
+        if live:
+            want_live[:padded_batch_size] = -1
+            want_live[:batch_size] = table[:batch_size, 1]
+        assert torch.equal(live_page, want_live)
+
+
+def test_grouped_resolve_compiles_once_across_batches_and_offsets():
+    """The packed upload moves the tables with every batch; that must not recompile."""
+    pages = [torch.empty(64, dtype=torch.int32, device="cuda") for _ in range(3)]
+    lives = [torch.empty(64, dtype=torch.int32, device="cuda") for _ in range(3)]
+
+    def resolve(batch_size, padded_batch_size):
+        tables = _packed_group_tables(3, batch_size, 2, seed=batch_size)
+        verify_state_groups(
+            tables,
+            batch_size=batch_size,
+            padded_batch_size=padded_batch_size,
+            pages_out=pages,
+            live_pages_out=lives,
+            pad_page=-1,
+        )
+
+    resolve(1, 1)
+    resolve(16, 16)
+    with assert_no_triton_compile(_verify_state_groups_kernel):
+        for batch_size, padded_batch_size in (
+            (2, 2),
+            (3, 4),
+            (7, 8),
+            (32, 32),
+            (33, 48),
+        ):
+            resolve(batch_size, padded_batch_size)
+
+
+def test_grouped_resolve_rejects_mismatched_outputs():
+    tables = _packed_group_tables(2, 4, 2, seed=3)
+    pages = [torch.empty(4, dtype=torch.int32, device="cuda") for _ in tables]
+    with pytest.raises(ValueError, match="own page outputs"):
+        verify_state_groups(
+            tables,
+            batch_size=4,
+            padded_batch_size=4,
+            pages_out=pages[:1],
+            live_pages_out=None,
+            pad_page=-1,
+        )
+    with pytest.raises(ValueError, match="padded_batch_size rows"):
+        verify_state_groups(
+            tables,
+            batch_size=4,
+            padded_batch_size=5,
+            pages_out=pages,
+            live_pages_out=None,
+            pad_page=-1,
+        )
+    with pytest.raises(ValueError, match="batch_size <= padded_batch_size"):
+        verify_state_groups(
+            tables,
+            batch_size=4,
+            padded_batch_size=3,
+            pages_out=pages,
+            live_pages_out=None,
+            pad_page=-1,
         )
 
 

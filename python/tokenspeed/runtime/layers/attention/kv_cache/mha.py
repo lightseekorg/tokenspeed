@@ -28,15 +28,18 @@ from tokenspeed_kernel.ops.attention.prologue import (
     MXFP8Scales,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
+    dequant_gather_kv_mxfp8,
     quantize_store_kv_mxfp8,
     store_kv_cache,
 )
+from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     MXFP8_KV_SCALE_TILE_TOKENS,
     MXFP8_SCALE_BLOCK_SIZE,
+    is_flat_kv_plane,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -105,14 +108,39 @@ class MHATokenToKVPool(CachePool):
         "v": "v_buffer",
     }
 
+    @override
+    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+        for (_, plane), field_id in self.layer_fields.items():
+            if plane not in ("k", "v"):
+                continue
+            field = self.arena.plan.field(field_id)
+            if field.group_id != group_id:
+                continue
+            if not is_flat_kv_plane(field.plane_id):
+                continue
+            if self._layer_kv_head_counts is not None:
+                raise NotImplementedError(
+                    "FlatKV atom pages currently require uniform K/V head geometry"
+                )
+        return super().atom_pages_per_block(group_id, kernel_page_size)
+
     def get_kv_size_bytes(self):
-        # Different layer views may share an address through the memory plan.
-        # Count each physical region once, independent of Python identity.
-        k_caches = {t.data_ptr(): t for t in self.k_buffer if t is not None}
-        v_caches = {t.data_ptr(): t for t in self.v_buffer if t is not None}
-        k_size_bytes = sum(t.nbytes for t in k_caches.values())
-        v_size_bytes = sum(t.nbytes for t in v_caches.values())
-        return k_size_bytes, v_size_bytes
+        # Count planned payload, not the atom view's span across neighboring
+        # fields. Aliased layer views still count once by their base address.
+        def planned_size(buffers, plane):
+            sizes = {}
+            for layer, buf in enumerate(buffers):
+                if buf is None:
+                    continue
+                field = self.arena.plan.field(self.layer_fields[(layer, plane)])
+                group = self.arena.plan.group(field.group_id)
+                sizes[buf.data_ptr()] = group.page_count * field.payload_bytes
+            return sum(sizes.values())
+
+        return (
+            planned_size(self.k_buffer, "k"),
+            planned_size(self.v_buffer, "v"),
+        )
 
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.
@@ -301,6 +329,66 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         return (
             self._layer_scale_view(k_sf, layer_id),
             self._layer_scale_view(v_sf, layer_id),
+        )
+
+    def dequant_kv_view(
+        self,
+        layer_id: int,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_lens: torch.Tensor | int,
+        window_left: int,
+        kernel_page_size: int,
+        *,
+        scratch: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """BF16 paged view of the pages one attention call reads.
+
+        Dequantizes the pages a BF16 kernel would read for each request --
+        all of them, or for a sliding window those holding the last
+        ``query_lens + window_left`` keys plus a spare page -- into
+        ``scratch`` (contiguous BF16 key and value buffers), and returns
+        ``(k_cache, v_cache, page_table)`` in the ``[pages, kernel_page_size,
+        heads, head_dim]`` shape the backends pass to their kernels. The values equal the cache's dequantized values
+        bit for bit, so the kernel's result is that of the MXFP8 cache.
+        The caller sizes ``scratch`` for the call's pages: pages past its end
+        are not gathered.
+        """
+        heads = self._layer_heads_per_rank(layer_id)
+        k_rows = self.get_key_buffer(layer_id).view(-1, heads, self.head_dim)
+        v_rows = self.get_value_buffer(layer_id).view(-1, heads, self.head_dim)
+        kp = kernel_page_size
+        last = torch.div(seq_lens + kp - 1, kp, rounding_mode="floor")
+        if window_left >= 0:
+            start = seq_lens - query_lens - window_left - 1
+            first = torch.div(start, kp, rounding_mode="floor") - 1
+            first = torch.minimum(torch.clamp(first, min=0), last)
+        else:
+            first = torch.zeros_like(last)
+        rows = scratch[0].numel() // (heads * self.head_dim) // kp * kp
+        elements = rows * heads * self.head_dim
+        k_out = scratch[0].view(-1)[:elements].view(rows, heads, -1)
+        v_out = scratch[1].view(-1)[:elements].view(rows, heads, -1)
+        out_page_table = torch.empty_like(page_table)
+        dequant_gather_kv_mxfp8(
+            k_rows,
+            v_rows,
+            self.k_scale_buffer[layer_id],
+            self.v_scale_buffer[layer_id],
+            page_table,
+            seq_lens,
+            first.to(torch.int32),
+            (last - first).to(torch.int32),
+            k_out,
+            v_out,
+            out_page_table,
+            kernel_page_size=kp,
+            page_tokens=self._layer_page_tokens(layer_id),
+        )
+        return (
+            k_out.view(-1, kp, heads, self.head_dim),
+            v_out.view(-1, kp, heads, self.head_dim),
+            out_page_table,
         )
 
     def kv_write_target(

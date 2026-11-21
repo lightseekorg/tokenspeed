@@ -48,12 +48,13 @@ public:
 
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
-    // The registration of SessionId() under the request's access epoch that
+    const std::string& CacheGroupId() const { return cache_group_id_; }
+    const std::string& PeerHolder() const { return peer_holder_; }
+    std::span<const std::int32_t> SharedPrefixTokens() const { return shared_prefix_tokens_; }
+    // The registration of its group/session owner under the access epoch that
     // its first admission returned: held for the request's whole life, which
     // every later admission, publication and restore under that epoch lies in.
-    void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
-        session_access_ = std::move(session_access);
-    }
+    void HoldSessionAccess(SessionAccess session_access) { session_access_ = std::move(session_access); }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -73,15 +74,37 @@ public:
     // the request could not be readmitted at all. An undeclared budget
     // stays optimistic and relies on the victim policy to make progress.
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
-        return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
+        return static_cast<std::int32_t>(std::min<std::int64_t>(RemainingNewTokens(), escalatedWindows(safe_steps)));
     }
-    void NoteRetracted() { ++retraction_count_; }
+    // Saturates rather than wraps; by then the windows cover any budget.
+    void NoteRetracted() {
+        if (retraction_count_ < std::numeric_limits<std::int32_t>::max()) {
+            ++retraction_count_;
+        }
+    }
 
     // Decode rounds in which the prefill/decode interval held this prompt
-    // back (Submitted or Prefilling). Never reset, so the interval's bound
-    // on it spans every chunk.
+    // back (Submitted or Prefilling). Never reset by default, so the
+    // interval's bound on it spans every chunk; with
+    // max_consecutive_prefill_rounds the scheduler restarts it whenever one
+    // of the prompt's chunks runs, so the bound applies per chunk.
     std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
     void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+    void ResetPrefillDeferred() { prefill_deferred_rounds_ = 0; }
+
+    // Rounds in which this prompt's chunk gave way to carried prompts
+    // (prefill_chunk_yield_tokens): it was cut shorter or a carried prompt
+    // ran beside it. Never reset, so prefill_chunk_yield_max_rounds bounds
+    // the prompt across all its chunks.
+    std::int32_t PrefillRoundsGivenWay() const { return prefill_rounds_given_way_; }
+    void NotePrefillGaveWay() { ++prefill_rounds_given_way_; }
+
+    // P role, deferred decode allocation: a pd::DestinationReadyEvent
+    // arrived, so every Decode rank allocated the destination. Until then a
+    // computed prompt waits for it in PrefillAwaitingDestination instead of
+    // sending its KV.
+    bool DestinationReady() const { return destination_ready_; }
+    void MarkDestinationReady() { destination_ready_ = true; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
@@ -98,7 +121,7 @@ public:
     // resident request looked covered nothing could be retracted to free
     // the next page.
     bool ReserveCoversGeneration(std::int32_t safe_steps) const {
-        return max_new_tokens_ > 0 && safe_steps * (1 + retraction_count_) >= RemainingNewTokensAtAdmission();
+        return max_new_tokens_ > 0 && escalatedWindows(safe_steps) >= RemainingNewTokensAtAdmission();
     }
 
     // Tokens generated so far / still permitted. Both compare against the
@@ -239,7 +262,15 @@ public:
     }
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
+    // Every returned span stays valid, with unchanged contents, for the
+    // request's lifetime: later calls only append to the same storage.
     std::span<const std::string> PromptPrefixHashes();
+    // Compute only the requested prompt prefix; storage can be bounded below
+    // the admission frontier. Later calls extend the same immutable chain.
+    std::span<const std::string> PromptPrefixHashes(std::int32_t num_pages);
+    // Append complete pages, reusing prompt identities already computed by
+    // admission or storage. Does not force hashing an unfinished prompt.
+    void AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t num_pages) const;
     // The external KV-event hashes (HashKvBlock) of the first num_pages full
     // pages, each chained on the one before. A page is hashed once, the first
     // time it is asked for: its tokens never change.
@@ -280,6 +311,11 @@ public:
 
     std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
+    bool HasDecodeSlot() const { return forwardResources("HasDecodeSlot").decode_slot.valid(); }
+
+    // The reference must not outlive the request or cross Request::Apply.
+    fsm::ForwardResources& ForwardResourcesRef() { return forwardResources("ForwardResourcesRef"); }
+
     const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
@@ -313,6 +349,9 @@ public:
             Overloaded{
                 [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [](const fsm::PrefillAwaitingResult& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillAwaitingDestination& state) {
+                    return state.ReserveNumTokensInNextScheduleEvent();
+                },
                 [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
@@ -324,41 +363,55 @@ public:
     }
 
     std::string StateName() const {
-        return std::visit(Overloaded{
-                              [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
-                              [](const fsm::Submitted&) -> std::string { return "Submitted"; },
-                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
-                              [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
-                              [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
-                              [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
-                              [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
-                              [](const fsm::Decoding&) -> std::string { return "Decoding"; },
-                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
-                              [](const fsm::Retracted&) -> std::string { return "Retracted"; },
-                              [](const fsm::Restoring&) -> std::string { return "Restoring"; },
-                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
-                              [](const fsm::Finished&) -> std::string { return "Finished"; },
-                          },
-                          state_);
+        return std::visit(
+            Overloaded{
+                [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
+                [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
+                [](const fsm::PeerLooking&) -> std::string { return "PeerLooking"; },
+                [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                [](const fsm::PeerLanding&) -> std::string { return "PeerLanding"; },
+                [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
+                [](const fsm::PrefillAwaitingDestination&) -> std::string { return "PrefillAwaitingDestination"; },
+                [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
+                [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
+                [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                [](const fsm::Finishing&) -> std::string { return "Finishing"; },
+                [](const fsm::Finished&) -> std::string { return "Finished"; },
+            },
+            state_);
     }
 
 private:
     friend struct SchedulerTestAccess;
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
+    // One safe-step window plus one per retraction, in int64: 2^19
+    // retractions of 4096-step windows already pass INT32_MAX.
+    std::int64_t escalatedWindows(std::int32_t safe_steps) const {
+        return std::int64_t{safe_steps} * (std::int64_t{retraction_count_} + 1);
+    }
 
     std::string id_;
     std::string session_id_;
-    CacheCoordinator::SessionAccess session_access_;
+    std::string cache_group_id_;
+    std::string peer_holder_;
+    std::vector<std::int32_t> shared_prefix_tokens_;
+    SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
     std::int32_t prefill_deferred_rounds_{0};
+    std::int32_t prefill_rounds_given_way_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
+    bool destination_ready_{false};
     std::int32_t prefix_granularity_{};
     std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
     std::vector<std::uint64_t> kv_event_block_hashes_;

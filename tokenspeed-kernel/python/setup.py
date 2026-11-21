@@ -310,7 +310,6 @@ def _selected_install_requires() -> list[str]:
                 "nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl"
             ).replace("nvidia-cutlass-dsl-libs-cu13", "nvidia-cutlass-dsl-libs-cu12")
             for requirement in requirements
-            if not requirement.startswith("tokenspeed-cutedsl-kda==")
         ]
 
     deduped = []
@@ -391,6 +390,7 @@ PRECISE_MATH_GROUPS = frozenset(
 # The 4-tuple form lets a kernel append nvcc flags on top of the global set —
 # e.g., fused_topk_topp needs ``--expt-extended-lambda`` for CUB lambdas.
 KERNEL_GROUPS = [
+    ("ple_host_gather", [CUDA_CSRC_DIR / "ple_host_gather.cu"], []),
     (
         "rope",
         [
@@ -582,6 +582,38 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
+    ),
+    (
+        "dsv3_fused_a_gemm",
+        [
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm.cu",
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "indexer_topk",
+        [
+            CUDA_CSRC_DIR / "indexer_topk.cu",
+            CUDA_CSRC_DIR / "indexer_topk_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "trtllm_fp8_quant",
+        [
+            CUDA_CSRC_DIR / "trtllm_fp8_quant.cu",
+            CUDA_CSRC_DIR / "trtllm_fp8_quant_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "cublaslt_fp4_gemm",
+        [
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm.cu",
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm_binding.cu",
+        ],
+        ["-lcublas", "-lcublasLt"],
     ),
 ]
 
@@ -1123,9 +1155,14 @@ setup(
             "_cuda/*.cu",
             "_cuda/*.cuh",
         ],
+        # Committed TunableOp results (tuned BLAS solutions), one per GPU.
+        "tokenspeed_kernel.ops.gemm._hipblaslt": ["configs/*.csv"],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
             "csrc/kimi3_router.cu",
+            # Vendored FlashInfer/Cake Kimi-K3 front programs, JIT-built like the router.
+            "csrc/kimi3_latent_front/*.cu",
+            "csrc/kimi3_latent_front/*.h",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",
@@ -1136,10 +1173,12 @@ setup(
             "LICENSE",
             "README.md",
         ],
-        # Optional JIT adapter for fused AllGather quantization.
+        # Optional JIT adapters: fused AllGather quantization and the
+        # stand-alone block-scaled batched GEMM.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",
             "sm90_moe.patch",
+            "trtllm_block_scaled_bmm.cu",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

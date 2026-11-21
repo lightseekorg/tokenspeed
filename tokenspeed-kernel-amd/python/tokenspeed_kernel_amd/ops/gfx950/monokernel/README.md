@@ -123,6 +123,10 @@ A `Plan` lists the stages in execution order and the mailbox regions.
 - **The key.** `Plan.key` is the plan's canonical JSON. It is a `str`, so
   Triton can hash and serialize it as a compile-time argument. It also
   carries the `Plan` object for the compile-time helpers.
+- **Model dimensions.** `Plan.dims` (optional) holds a model's dimensions
+  as a frozen dataclass, part of the key. Stages read them at compile time
+  (`schedule.dims(plan)`), so one stage source serves every geometry of a
+  model and each geometry compiles its own launches.
 - **Placement.** A stage module's `stages(bases, ...)` takes the base of each
   stage from a table that the layer gives. `placement(bases, names)` checks
   that the table names exactly those stages, in that order.
@@ -184,8 +188,9 @@ Memory rules on gfx950 (coarse-grained VRAM):
 - Data that a later launch reads from another GPU follows the same rule
   without a flag: the writer stores write-through (`.wt`) and the reader
   loads past the caches (`.cv`), since a peer's store does not update the
-  reader's L2. A draft's taps, stored by the target's launches on every
-  GPU, cross launches and GPUs this way.
+  reader's L2. A draft's taps cross launches this way too: each GPU's
+  launches store its own copy, but the draft's CTAs on other XCDs would
+  otherwise read an earlier step's line from their L2.
 - Many waves that spin on `sc1` loads can starve the producers' stores, and
   the grid can then livelock. Before a poll that all waves of many CTAs make,
   `pre_poll` (or `pre_poll_spread`) lets wave 0 spin on one hint pair for each

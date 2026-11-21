@@ -58,8 +58,7 @@ public:
         if (num_tokens <= available_tokens) {
             return 0;
         }
-        const std::int32_t over = num_tokens - available_tokens;
-        return (over + block_granularity_ - 1) / block_granularity_;
+        return CeilDiv(num_tokens - available_tokens, block_granularity_);
     }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
@@ -74,7 +73,7 @@ public:
         return std::visit(
             Overloaded{
                 [&](const DenseGrowth& dense) {
-                    return BlocksNeededFor(table, dense.num_tokens + demand.reserve_tokens);
+                    return BlocksNeededFor(table, denseExtent(dense.num_tokens, demand.reserve_tokens));
                 },
                 [&](const SparseSuffix& sparse) {
                     return BlocksNeededFor(table.NumBlocks(), sparse, demand.reserve_tokens);
@@ -105,27 +104,29 @@ public:
 
     AcquirePlan PlanAcquire(const BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens) const {
         _assert(num_tokens >= 0 && reserve_tokens >= 0, "token demand and reserve must be non-negative");
-        const std::int32_t num_blocks = BlocksNeededFor(table, num_tokens + reserve_tokens);
+        const std::int32_t num_blocks = BlocksNeededFor(table, denseExtent(num_tokens, reserve_tokens));
         return AcquirePlan{
             .num_blocks = num_blocks,
             .suffix_start = -1,
             .table_blocks_after = table.NumBlocks() + num_blocks,
-            .available_tokens_after = table.AvailableTokens() + num_blocks * block_granularity_ - num_tokens,
+            // At least reserve_tokens and less than one block more.
+            .available_tokens_after = CheckedInt32(std::int64_t{table.AvailableTokens()} +
+                                                   std::int64_t{num_blocks} * block_granularity_ - num_tokens),
         };
     }
 
-    // Pages [0, result), except retained sink blocks, have expired under the group's
+    // Blocks [0, result), except retained sink blocks, have expired under the group's
     // retention policy at this progress; kFull never expires and a State
     // group's slots are released by StateStep, not by token retention. This
-    // is where the sliding-window token policy meets page arithmetic, so it
+    // is where the sliding-window token policy meets block arithmetic, so it
     // lives here and not in the (token-free) allocator.
-    std::int32_t ExpiredBlocksAt(const CacheGroupSpec& spec, std::int32_t num_computed_tokens) const {
+    std::int32_t ExpiredBlockEndAt(const CacheGroupSpec& spec, std::int32_t num_computed_tokens) const {
         if (spec.attn_kind != AttnKind::kSlidingWindow) {
             return 0;
         }
         _assert(spec.sliding_window > 0, "retention window must be > 0");
         const std::int32_t skipped = num_computed_tokens - spec.sliding_window + 1;
-        // Only fully-slid-out pages expire.
+        // Only fully-slid-out blocks expire.
         return skipped <= 0 ? 0 : skipped / BlockGranularity();
     }
 
@@ -166,8 +167,16 @@ private:
             .head_blocks =
                 std::max(0, std::min({sparse.head_blocks, sparse.first_block, logical_blocks}) - table.NumBlocks()),
             .table_blocks_after = logical_blocks,
-            .available_tokens_after = logical_blocks * block_granularity_ - sparse.extent_tokens,
+            .available_tokens_after =
+                CheckedInt32(std::int64_t{logical_blocks} * block_granularity_ - sparse.extent_tokens),
         };
+    }
+
+    // Tokens a dense demand spans past the table's consumed ones. They lie
+    // within the request's token limit and its decode reserve, which
+    // CapacityModel::MaxRequestTokenLimit keeps inside the int32 range.
+    static std::int32_t denseExtent(std::int32_t num_tokens, std::int32_t reserve_tokens) {
+        return CheckedInt32(std::int64_t{num_tokens} + reserve_tokens, "a dense demand exceeds int32 token positions");
     }
 
     std::int32_t block_granularity_;

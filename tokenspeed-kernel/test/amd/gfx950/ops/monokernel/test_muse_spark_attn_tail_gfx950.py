@@ -34,6 +34,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from monokernel_testing import fill, payloads, words  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
@@ -55,6 +56,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 
 WORLD, HIDDEN, Q, OWNED = 8, 8192, 1024, 1024
 LAUNCHES = 2
+ALL = tuple(range(WORLD))
 
 
 @gluon.jit
@@ -94,29 +96,38 @@ def _plan(rows: int) -> Plan:
     )
 
 
-def _rank_inputs(rank: int, launch: int, rows: int):
+def _rank_inputs(rank: int, launch: int, rows: int, present):
+    """``rank``'s attention output ``z`` and o_proj shard ``w``. Ranks outside
+    ``present`` have a zero shard, and every shard's rows into the columns
+    they own are zero (a zero-shard model: those ranks put exactly zero)."""
     g = torch.Generator().manual_seed(100 * launch + rank)
     z = torch.randn(rows, Q, generator=g).to(torch.bfloat16)
     w = (torch.randn(HIDDEN, Q, generator=g) / Q**0.5).to(torch.bfloat16)
+    if rank not in present:
+        w = torch.zeros_like(w)
+    w[standins.absent_columns(HIDDEN, OWNED, present)] = 0
     return z, w
 
 
-def _shared_inputs(launch: int, rows: int):
+def _shared_inputs(launch: int, rows: int, present):
+    """``h`` (zero in the columns of ranks outside ``present``), ``alpha``,
+    ``beta`` and the pre-expert gain."""
     g = torch.Generator().manual_seed(9000 + launch)
     h = torch.randn(rows, HIDDEN, generator=g) * 3
+    h[:, standins.absent_columns(HIDDEN, OWNED, present)] = 0
     alpha = torch.rand(HIDDEN, generator=g) + 0.5
     beta = torch.rand(HIDDEN, generator=g) + 0.5
     pre_gain = (torch.randn(HIDDEN, generator=g) * 0.1 + 1.0).to(torch.bfloat16).float()
     return h, alpha, beta, pre_gain
 
 
-def _reference_b(launch: int, rows: int):
+def _reference_b(launch: int, rows: int, present):
     """The reduced, BF16-rounded ``o_proj`` output ``b``, and the sum of the
     ranks' partials' magnitudes, both ``[rows, 8192]``."""
     b = torch.zeros(rows, HIDDEN)
     spread = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
-        z, w = _rank_inputs(r, launch, rows)
+        z, w = _rank_inputs(r, launch, rows, present)
         part = (z.float() @ w.float().T).to(torch.bfloat16).float()
         b = b + part
         spread = spread + part.abs()
@@ -133,12 +144,14 @@ def _rank_order_sum(red: torch.Tensor) -> torch.Tensor:
     return total.to(torch.bfloat16).float()
 
 
-def _reference_tail(launch: int, b: torch.Tensor):
+def _reference_tail(launch: int, b: torch.Tensor, present):
     """``(h', u)`` of ``b [rows, 8192]`` in FP64, and the size of each one's
     terms: ``|beta * b'| + |alpha * h|`` for h' (where the two cancel, FP32
     rounding is an absolute error at that size), carried through the norm
     for u."""
-    h, alpha, beta, pre_gain = (x.double() for x in _shared_inputs(launch, b.shape[0]))
+    h, alpha, beta, pre_gain = (
+        x.double() for x in _shared_inputs(launch, b.shape[0], present)
+    )
     b = b.double()
     inv = torch.rsqrt(b.pow(2).mean(-1, keepdim=True) + 1e-8)
     hp = beta * b * inv + alpha * h
@@ -147,29 +160,50 @@ def _reference_tail(launch: int, b: torch.Tensor):
     return hp, hp * inv_hp * pre_gain, hp_size, hp_size * inv_hp * pre_gain.abs()
 
 
-def _worker(rank: int, port: int, rows: int) -> None:
-    torch.cuda.set_device(rank)
+def _worker(me: int, port: int, rows: int, present) -> None:
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``me`` runs ``present[me]``) in a
+    zero-shard model whose other ranks' puts (exactly zero) the host
+    writes before each launch."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = _plan(rows)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, model, bases = me, ALL, group.bases
+        else:
+            rank, model = present[me], present
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         group.finish_prepare()
         # Each launch has new inputs and a new step (the peer regions'
         # copies alternate). z is this launch's input, filled by the host.
         for k in range(LAUNCHES):
             step = 7 + k
-            z, w = _rank_inputs(rank, k, rows)
-            h, alpha, beta, pre_gain = _shared_inputs(k, rows)
+            z, w = _rank_inputs(rank, k, rows, model)
+            h, alpha, beta, pre_gain = _shared_inputs(k, rows, model)
+            if present is not None:
+                standins.standin_fill(
+                    scratch,
+                    plan,
+                    present,
+                    [(0, t) for t in range(rows)],
+                    step,
+                    0,
+                    step & 1,
+                    True,
+                )
             for row in range(rows):
                 fill(
                     scratch,
@@ -182,7 +216,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
             tail_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
-                group.bases,
+                bases,
                 bf16_tiles(w).to(device),
                 h[:, own].contiguous().to(device),
                 alpha[own].to(device),
@@ -216,7 +250,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
                     for row in range(rows)
                 ]
             )
-            want_b, spread = _reference_b(k, rows)
+            want_b, spread = _reference_b(k, rows, model)
             err = (b - want_b[:, own]).abs()
             bound = 2**-7 * (spread[:, own] + want_b[:, own].abs())
             assert torch.all(err <= bound), float((err / bound).max())
@@ -224,11 +258,12 @@ def _worker(rank: int, port: int, rows: int) -> None:
             # cancel, and would amplify b's rounding steps. h' is FP32: a few
             # FP32 roundings and the norm's reordered sum, well within 2^-16
             # of its terms' size.
-            parts = [torch.empty_like(b) for _ in range(WORLD)]
+            parts = [torch.empty_like(b) for _ in range(dist.get_world_size())]
             dist.all_gather(parts, b)
-            want_hp, want_u, hp_size, u_size = _reference_tail(
-                k, torch.cat(parts, dim=1)
-            )
+            whole_b = torch.zeros(rows, HIDDEN)  # the absent ranks' b is zero
+            for r, part in zip(ALL if present is None else present, parts):
+                whole_b[:, r * OWNED : (r + 1) * OWNED] = part
+            want_hp, want_u, hp_size, u_size = _reference_tail(k, whole_b, model)
             for row in range(rows):
                 hp = payloads(scratch, plan, "hp", OWNED, tag, row=row)
                 err = (hp.view(torch.float32).cpu().double() - want_hp[row, own]).abs()
@@ -249,6 +284,10 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 err = (xin.view(torch.bfloat16).cpu().double() - want_u[row]).abs()
                 bound = 2**-7 * want_u[row].abs() + 2**-16 * u_size[row]
                 assert torch.all(err <= bound), float((err / bound).max())
+                if present is not None:
+                    # The absent ranks' columns of the MoE input stay zero.
+                    absent = standins.absent_columns(HIDDEN, OWNED, present)
+                    assert not xin.view(torch.bfloat16).cpu()[absent].float().any()
             dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -261,4 +300,21 @@ def test_attention_tail_reduces_scatters_and_normalizes_across_ranks(rows: int):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows, None), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("rows", [1, 8])
+def test_attention_tail_reduces_scatters_and_normalizes_on_two_gpus(rows: int, present):
+    """As :func:`test_attention_tail_reduces_scatters_and_normalizes_across_ranks`
+    with the production rank programs ``present`` on two GPUs, in a
+    zero-shard model whose six other ranks put exactly zero (the host
+    writes it): b, h' and the MoE input against the reference, and the
+    absent ranks' columns stay zero. Two non-zero terms per sum cannot
+    check the rank order of an eight-rank sum (see muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_worker, args=(port, rows, present), nprocs=2, join=True)

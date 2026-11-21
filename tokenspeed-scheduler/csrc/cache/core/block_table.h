@@ -148,8 +148,9 @@ private:
         blocks_.push_back(std::move(block));
     }
     void appendAll(std::uint32_t group_id, std::vector<CacheBlockRef>&& blocks) {
-        page_ids_.reserve(page_ids_.size() + blocks.size());
-        parents_.reserve(parents_.size() + blocks.size());
+        // page_ids_ and parents_ keep geometric growth: decode appends a block
+        // or two per round, and an exact reserve would reallocate and copy a
+        // long table's whole contents on each append.
         for (const CacheBlockRef& block : blocks) {
             page_ids_.push_back(ResolvedPageId(group_id, block));
             parents_.emplace_back(active_parents_, block);

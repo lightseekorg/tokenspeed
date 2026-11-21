@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Drafter prefill graph replays on a GPU (``--enable-drafter-prefill-graph``).
+"""Drafter prefill graph replays on a GPU.
 
 A real Eagle drafter over the toy draft model and backend
 (``drafter_prefill_graph_test_utils``) captures its extend-round graphs; each
@@ -26,12 +26,13 @@ round then replays them and must leave the same draft tokens and draft cache
 as a second drafter running the same round eager. Also covered: a step
 published through ``run_eager`` re-runs on every replay with the host state
 of that moment, recording such a publication into the graph instead makes the
-replay diverge, and a replay waits for a Host load into the draft cache.
+replay diverge, and a split draft's K/V writer waits for a Host load into the
+draft cache.
 
-The last test serves a real Qwen4-Exp MTP checkpoint with and without the
-switch; it runs only when ``TOKENSPEED_DRAFTER_PREFILL_GRAPH_MODEL`` names the
-checkpoint (``TOKENSPEED_DRAFTER_PREFILL_GRAPH_ARGS`` adds engine flags), for
-example::
+The last test serves a real MTP checkpoint (Qwen3.5 or Qwen4-Exp, both split
+drafts) with and without the prefill graph; it runs only when
+``TOKENSPEED_DRAFTER_PREFILL_GRAPH_MODEL`` names the checkpoint
+(``TOKENSPEED_DRAFTER_PREFILL_GRAPH_ARGS`` adds engine flags), for example::
 
     TOKENSPEED_DRAFTER_PREFILL_GRAPH_MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4 \\
     TOKENSPEED_DRAFTER_PREFILL_GRAPH_ARGS="--kv-cache-dtype fp8_e4m3" \\
@@ -50,6 +51,7 @@ from test.runtime.drafter_prefill_graph_test_utils import (
     VOCAB,
     WIDTH,
     ToyBackend,
+    ToySplitDraftModel,
     capture_input,
     extend_input,
     make_eagle,
@@ -109,9 +111,9 @@ def test_run_eager_reruns_on_replay_with_live_host_state() -> None:
             assert torch.equal(x, before + 1 + 10.0 * (index + 1))
 
 
-def _capture(drafter: Eagle, backend: ToyBackend, buckets, counts) -> None:
+def _capture(drafter: Eagle, backend: ToyBackend, buckets) -> None:
     capture = capture_input(
-        drafter, backend, buckets, counts, entries=None, stream=torch.cuda.Stream()
+        drafter, backend, buckets, entries=None, stream=torch.cuda.Stream()
     )
     with torch.inference_mode():
         drafter.capture_extend_graphs(capture, observer=NULL_MEMORY_DELTA_OBSERVER)
@@ -144,49 +146,31 @@ def _inputs(lengths, generator):
 
 
 def test_replays_match_the_eager_round() -> None:
-    """Exact and padded buckets, one to three requests, cached prefixes,
-    final chunks (the sampled token patched into the last row) and mid chunks
-    (step 0 alone, its cache writes kept), the decode steps replaying behind
-    an eager step 0 past the largest bucket, and the eager fallback at an
-    uncaptured request count: the replayed round leaves the same verify
-    window and draft cache as the eager one, the dummy slot aside. The toy's
-    token-shaped part is row-wise, so padded buckets match exactly too."""
+    """Decode steps replayed after an eager step 0 leave the eager round's state."""
     generator = torch.Generator().manual_seed(0)
     graphed, graphed_backend = make_eagle(device="cuda")
     eager, eager_backend = make_eagle(device="cuda")
-    _capture(
-        graphed,
-        graphed_backend,
-        [16, 32, 64],
-        lambda bucket: [1, 2, 3] if bucket >= 32 else [1, 2],
-    )
-    route = eagle_module._ExtendRoute
+    _capture(graphed, graphed_backend, [16, 32, 64])
     cases = [
-        # (lengths, prefixes, final, expected route)
-        ([16], [0], True, route((16, 1), True)),
-        ([5], [40], True, route((16, 1), True)),
-        ([9, 7], [0, 100], True, route((16, 2), True)),
-        ([20, 3, 1], [7, 0, 300], True, route((32, 3), True)),
-        ([30], [0], False, route((32, 1), True)),
-        ([12, 12], [64, 0], False, route((32, 2), True)),
-        ([64], [128], True, route((64, 1), True)),
-        ([33, 31], [0, 0], True, route((64, 2), True)),
-        ([70], [0], True, route(None, True)),
-        ([3], [0], True, route((16, 1), True)),
-        # Four requests: no graph at this request count.
-        ([3, 3, 3, 3], [0, 0, 0, 0], True, None),
+        # (lengths, prefixes, final)
+        ([16], [0], True),
+        ([5], [40], True),
+        ([9, 7], [0, 100], True),
+        ([20, 3, 1], [7, 0, 300], True),
+        ([30], [0], False),
+        ([12, 12], [64, 0], False),
+        ([33, 31], [0, 0], True),
+        ([70], [0], True),
+        ([3, 3, 3, 3], [0, 0, 0, 0], True),
     ]
     with torch.inference_mode():
-        for lengths, prefixes, final, expected in cases:
+        for lengths, prefixes, final in cases:
             inputs = _inputs(lengths, generator)
             prepare_extend(
                 graphed, graphed_backend, lengths, prefixes, final=final, ids=inputs[0]
             )
-            assert (
-                graphed._extend_graph_route(
-                    len(lengths), extend_input(graphed, lengths, hidden=inputs[2])
-                )
-                == expected
+            assert graphed._replays_decode_steps(
+                len(lengths), extend_input(graphed, lengths, hidden=inputs[2])
             ), lengths
             window, forwards = _round(
                 graphed, graphed_backend, lengths, prefixes, final, inputs
@@ -194,17 +178,66 @@ def test_replays_match_the_eager_round() -> None:
             want, eager_forwards = _round(
                 eager, eager_backend, lengths, prefixes, final, inputs
             )
-            # A replayed step runs no eager forward.
-            if expected is None:
-                assert forwards == eager_forwards
-            else:
-                assert forwards == (0 if expected.first_step is not None else 1)
+            # Step 0 alone runs eager.
+            assert forwards == 1
             assert eager_forwards == (STEPS if final else 1)
             assert torch.equal(window, want), lengths
             assert torch.equal(graphed_backend.cache[1:], eager_backend.cache[1:])
             if not final:
                 # A mid chunk drafts step 0 only; the rest repeat column 0.
                 assert torch.equal(window[:, 2], window[:, 0])
+
+
+def test_a_split_round_replays_what_the_narrowed_eager_round_drafts() -> None:
+    """Replayed split rounds leave the narrowed eager round's window and cache."""
+    generator = torch.Generator().manual_seed(0)
+    split, split_backend = make_eagle(device="cuda", model=ToySplitDraftModel("cuda"))
+    eager, eager_backend = make_eagle(device="cuda")
+    _capture(split, split_backend, [32, 64])
+    assert split._kv_tile.ids.shape[0] == 64
+    # The tile stages both locations the toy names, zero past the live rows.
+    assert len(split._kv_tile.locations) == 2
+    cases = [
+        # (lengths, prefixes, final)
+        ([16], [0], True),
+        ([5], [40], True),
+        ([9, 7], [0, 100], True),
+        ([20, 3, 1], [7, 0, 300], True),
+        ([64], [128], True),
+        ([70], [0], True),
+        ([100, 60, 30, 10], [0, 0, 0, 0], True),
+        ([30], [0], False),
+        ([12, 12], [64, 0], False),
+    ]
+    with torch.inference_mode():
+        for lengths, prefixes, final in cases:
+            inputs = _inputs(lengths, generator)
+            prepare_extend(
+                split, split_backend, lengths, prefixes, final=final, ids=inputs[0]
+            )
+            # The decode-steps graphs open at step 0: no unsplit round takes them.
+            assert not split._replays_decode_steps(
+                len(lengths), extend_input(split, lengths, hidden=inputs[2])
+            ), lengths
+            window, forwards = _round(
+                split, split_backend, lengths, prefixes, final, inputs
+            )
+            want, _ = _round(eager, eager_backend, lengths, prefixes, final, inputs)
+            assert forwards == 0, lengths
+            assert torch.equal(split_backend.cache[1:], eager_backend.cache[1:])
+            if final:
+                assert torch.equal(window, want), lengths
+            else:
+                assert torch.equal(window[:, 0], want[:, 0])
+                assert torch.equal(window, window[:, :1].expand_as(window))
+        # The writer reads the target's hidden rows at the captured width and dtype.
+        ids, sampled, _ = _inputs([8], generator)
+        for hidden in (
+            torch.randn(8, WIDTH + 8),
+            torch.randn(8, WIDTH, dtype=torch.bfloat16),
+        ):
+            with pytest.raises(RuntimeError, match="not the ones the draft K/V writer"):
+                _round(split, split_backend, [8], [0], True, (ids, sampled, hidden))
 
 
 def test_a_publication_recorded_into_the_graph_diverges_from_eager(
@@ -218,7 +251,7 @@ def test_a_publication_recorded_into_the_graph_diverges_from_eager(
     generator = torch.Generator().manual_seed(1)
     graphed, graphed_backend = make_eagle(device="cuda")
     eager, eager_backend = make_eagle(device="cuda")
-    _capture(graphed, graphed_backend, [2, 16], lambda _bucket: [1, 2])
+    _capture(graphed, graphed_backend, [2, 16])
     lengths, prefixes = [1, 1], [20, 30]
     inputs = _inputs(lengths, generator)
     with torch.inference_mode():
@@ -226,25 +259,22 @@ def test_a_publication_recorded_into_the_graph_diverges_from_eager(
             graphed, graphed_backend, lengths, prefixes, True, inputs
         )
         want, _ = _round(eager, eager_backend, lengths, prefixes, True, inputs)
-    assert forwards == 0
+    # Step 0 alone runs eager.
+    assert forwards == 1
     assert not (
         torch.equal(window, want)
         and torch.equal(graphed_backend.cache[1:], eager_backend.cache[1:])
     )
 
 
-def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
-    """The draft prologue writes K/V inside a captured segment, which holds
-    no per-layer Host-load wait, so a step-0 replay waits for the draft
-    pool's whole load first. A load still copying into the round's pages
-    (delayed on its stream) must land before the replay's writes, not over
-    them."""
+def test_the_kv_writer_waits_for_a_host_load_into_the_draft_cache() -> None:
+    """A split K/V writer's replay lands after the draft pool's Host load."""
     sentinel = 1.0e30
     lengths, prefixes = [16], [40]
     pages = slice(1 + prefixes[0], 1 + prefixes[0] + lengths[0])
     generator = torch.Generator().manual_seed(2)
-    drafter, backend = make_eagle(device="cuda")
-    _capture(drafter, backend, [16], lambda _bucket: [1])
+    drafter, backend = make_eagle(device="cuda", model=ToySplitDraftModel("cuda"))
+    _capture(drafter, backend, [16])
     load_stream = torch.cuda.Stream()
 
     def round_after_a_slow_load(tracker):
@@ -268,27 +298,31 @@ def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
     tracker = LayerwiseLoadTracker(1)
     tracker.set_consumers(0)
     assert not round_after_a_slow_load(tracker).any()
+    # ROCm streams can share a hardware queue, which orders the replay after the load.
+    if torch.version.hip is not None:
+        return
     # Without a tracker nothing orders the replay after the load, which then
     # lands over the replay's writes: the case the wait exists for.
     assert round_after_a_slow_load(None).all()
 
 
 # ----------------------------------------------------------------------
-# A real Qwen4-Exp MTP checkpoint (opt-in).
+# A real MTP checkpoint (opt-in).
 # ----------------------------------------------------------------------
 
 _MODEL = os.environ.get("TOKENSPEED_DRAFTER_PREFILL_GRAPH_MODEL")
 _EXTRA_ARGS = shlex.split(os.environ.get("TOKENSPEED_DRAFTER_PREFILL_GRAPH_ARGS", ""))
-# Chunks no wider than the largest bucket, so a mid chunk replays step 0.
-_CHUNK = 1024
+# Chunks twice the largest bucket, so a round's K/V writer replays two tiles.
+_BUCKET = 1024
+_CHUNK = 2 * _BUCKET
 _SAMPLING = {"max_new_tokens": 12, "temperature": 0}
 _CAPTURED = re.compile(
-    r"drafter prefill graph: captured step 0 at \(tokens, requests\) "
-    r"(\[.*?\]), decode steps at requests (\[.*?\])"
+    r"drafter prefill graph: captured decode steps at requests (\[.*?\]), "
+    r"the draft K/V writer at (\d+) rows"
 )
 
 
-def _engine(*, drafter_graph: bool):
+def _engine(*, prefill_graph: bool):
     # Imported here: the driver needs the engine's frontend extension.
     from tokenspeed.runtime.entrypoints.wire_driver import WireDriver
 
@@ -303,11 +337,7 @@ def _engine(*, drafter_graph: bool):
         "--chunked-prefill-size",
         str(_CHUNK),
         "--prefill-graph-max-tokens",
-        str(_CHUNK),
-        "--prefill-graph-capture-batch-sizes",
-        "1",
-        "2",
-        "3",
+        str(_BUCKET),
         "--max-num-seqs",
         "8",
         "--max-model-len",
@@ -315,7 +345,7 @@ def _engine(*, drafter_graph: bool):
         "--gpu-memory-utilization",
         "0.8",
         "--disable-kvstore",
-        *(["--enable-drafter-prefill-graph"] if drafter_graph else []),
+        *([] if prefill_graph else ["--disable-prefill-graph"]),
         *_EXTRA_ARGS,
     ]
     return WireDriver(
@@ -325,9 +355,9 @@ def _engine(*, drafter_graph: bool):
 
 def _workload() -> list[list[list[int]]]:
     """Batches of prompts, each submitted at once (one prefill forward when
-    it fits a chunk): one to three requests per forward (each captured),
-    four (no graph), token counts across the bucket ladder, a cached prefix,
-    and a prompt longer than a chunk (mid chunks replay step 0 alone)."""
+    it fits a chunk): one to four requests per forward, token counts across
+    the bucket ladder and past it (two writer tiles), a cached prefix, and a
+    prompt longer than a chunk (a mid chunk writes its draft cache alone)."""
     rng = random.Random(2026)
 
     def prompt(n: int) -> list[int]:
@@ -340,6 +370,7 @@ def _workload() -> list[list[list[int]]]:
         [prompt(16)],
         [prompt(300), prompt(150), prompt(77)],
         [prompt(500), prompt(500)],
+        [prompt(1500)],
         [shared],
         [shared + prompt(90)],
         [shared + prompt(33), prompt(40)],
@@ -365,20 +396,21 @@ def _serve(engine) -> list[list[int]]:
 
 
 @pytest.mark.skipif(_MODEL is None, reason="set TOKENSPEED_DRAFTER_PREFILL_GRAPH_MODEL")
-def test_a_real_mtp_model_serves_the_same_tokens_with_the_switch(capfd) -> None:
-    """The engine captures drafter graphs, replays them, and serves the
-    tokens it serves without the switch: the target decides every token at
-    temperature 0, so only a near-tie flipped by different verify rounds
-    could change one."""
-    with _engine(drafter_graph=True) as engine:
+def test_a_real_mtp_model_serves_the_same_tokens_split(capfd) -> None:
+    """Replayed split rounds serve what eager rounds serve (prefill graph off)."""
+    with _engine(prefill_graph=True) as engine:
         graphed = _serve(engine)
     log = "".join(capfd.readouterr())
     print("\n".join(line for line in log.splitlines() if "drafter prefill" in line))
     captures = _CAPTURED.findall(log)
-    assert captures, "no drafter prefill graphs were captured"
-    assert all(first != "[]" and decode != "[]" for first, decode in captures)
-    assert "drafter prefill graph ENGAGED" in log
+    assert captures, "no split drafter graphs were captured"
+    assert all(decode != "[]" and int(rows) == _BUCKET for decode, rows in captures)
+    assert "drafter prefill graph ENGAGED: split draft" in log
 
-    with _engine(drafter_graph=False) as engine:
+    with _engine(prefill_graph=False) as engine:
         eager = _serve(engine)
     assert graphed == eager
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -47,12 +47,14 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed_kernel.ops.sampling import vocab_shard_topk  # noqa: E402
 from tokenspeed_kernel.ops.sampling.triton.topk_topp import (  # noqa: E402
+    _top_k_top_p_candidates_stage1_kernel,
     _top_k_top_p_gumbel_stage2_kernel,
 )
 from tokenspeed_kernel.ops.sampling.triton.vocab_topk import (  # noqa: E402
     _vocab_shard_topk_kernel,
     _vocab_topk_merge_kernel,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 
 from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
     get_apply_vocab_mask_func,
@@ -115,7 +117,10 @@ def _backend() -> TritonSamplingBackend:
     return TritonSamplingBackend(_config())
 
 
-def _prepare(backend, top_k, top_p, num_tokens_per_req, rid="r") -> torch.Tensor:
+def _prepare(
+    backend, top_k, top_p, num_tokens_per_req, rid="r", *, admission_start: int
+) -> torch.Tensor:
+    admission_ids = list(range(admission_start, admission_start + BS))
     rids = [f"{rid}{i}" for i in range(BS)]
     params = []
     for rid, k, p in zip(rids, top_k, top_p):
@@ -125,7 +130,7 @@ def _prepare(backend, top_k, top_p, num_tokens_per_req, rid="r") -> torch.Tensor
         params.append(sp)
     pool_indices = [2, 5, 7]
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=admission_ids,
         request_pool_indices=pool_indices,
         sampling_params_list=params,
         num_tokens_per_req=num_tokens_per_req,
@@ -178,9 +183,11 @@ class _Group:
     def shard(self, rank: int) -> SampledVocabShard:
         return SampledVocabShard(
             logits=self.raw[:, rank * SHARD : (rank + 1) * SHARD],
+            columns=SHARD,
             vocab_start=rank * SHARD,
             logit_scale=SCALE,
             softcap=SOFTCAP,
+            softcap_form="sigmoid",
             tp_size=RANKS,
             tp_group=tuple(range(RANKS)),
             gather_full=lambda logits: self.whole.clone(),
@@ -197,7 +204,10 @@ class _Group:
                 peer * SHARD,
                 landing[peer * rows : (peer + 1) * rows],
                 softcap=SOFTCAP,
+                softcap_form="sigmoid",
                 vocab_mask=None if self.mask is None else self.mask[:rows],
+                values_out=None,
+                halo_out=None,
             )
 
 
@@ -247,7 +257,7 @@ def test_verify_on_shards_matches_whole_rows(
         LogitsProcessorOutput(next_token_logits=None, vocab_shard=group.shard(5)),
     ):
         backend = _backend()
-        req_pool_indices = _prepare(backend, top_k, top_p, N)
+        req_pool_indices = _prepare(backend, top_k, top_p, N, admission_start=1)
         q = _draft_q(group, req_pool_indices) if with_q else None
         candidates = _candidates(_draft_q(group, req_pool_indices), req_pool_indices)
         predict, accept_length = backend.verify(
@@ -275,7 +285,9 @@ def test_sample_on_shards_matches_whole_rows(monkeypatch, masked) -> None:
         LogitsProcessorOutput(next_token_logits=None, vocab_shard=group.shard(2)),
     ):
         backend = _backend()
-        req_pool_indices = _prepare(backend, [64, 7, 128], [1.0, 0.9, 1.0], 1)
+        req_pool_indices = _prepare(
+            backend, [64, 7, 128], [1.0, 0.9, 1.0], 1, admission_start=1
+        )
         sampled, _ = backend.sample(
             logits_output, _info(req_pool_indices, group.mask, None)
         )
@@ -295,7 +307,7 @@ def test_other_routes_gather_whole_rows(monkeypatch) -> None:
 
     shard = dataclasses.replace(group.shard(0), gather_full=gather_full)
     backend = _backend()
-    req_pool_indices = _prepare(backend, [-1] * BS, [1.0] * BS, 1)
+    req_pool_indices = _prepare(backend, [-1] * BS, [1.0] * BS, 1, admission_start=1)
     sampled, _ = backend.sample(
         LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard),
         _info(req_pool_indices, None, None),
@@ -340,9 +352,11 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
     def shard_of(rows: int) -> SampledVocabShard:
         return SampledVocabShard(
             logits=raw[:rows, shard : 2 * shard],
+            columns=shard,
             vocab_start=shard,
             logit_scale=None,
             softcap=None,
+            softcap_form=None,
             tp_size=ranks,
             tp_group=tuple(range(ranks)),
             gather_full=lambda logits: raw[:rows].clone(),
@@ -358,7 +372,10 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
                 peer * shard,
                 landing[peer * rows : (peer + 1) * rows],
                 softcap=None,
+                softcap_form=None,
                 vocab_mask=None,
+                values_out=None,
+                halo_out=None,
             )
 
     monkeypatch.setattr(shard_module, "all_gather_single", all_gather_single)
@@ -387,7 +404,15 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
             for masked in (False, True):
                 # New requests each time, so the backend picks the count again.
                 rid = f"s{step}m{int(masked)}r"
-                req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], 1, rid)
+                admission_start = 1 + (2 * step + int(masked)) * BS
+                req_pool_indices = _prepare(
+                    backend,
+                    top_k,
+                    [0.9, 1.0, 1.0],
+                    1,
+                    rid,
+                    admission_start=admission_start,
+                )
                 info = _info(req_pool_indices, mask[:BS] if masked else None, None)
                 info.vocab_size = vocab
                 sampled, _ = backend.sample(
@@ -397,7 +422,14 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
                     info,
                 )
                 assert bool(((sampled >= 0) & (sampled < vocab)).all())
-                req_pool_indices = _prepare(backend, top_k, [0.9, 1.0, 1.0], N, rid)
+                req_pool_indices = _prepare(
+                    backend,
+                    top_k,
+                    [0.9, 1.0, 1.0],
+                    N,
+                    rid,
+                    admission_start=admission_start,
+                )
                 info = _info(req_pool_indices, mask if masked else None, q)
                 info.vocab_size = vocab
                 _, accept_length = backend.verify(
@@ -409,3 +441,64 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
                     tree=None,
                 )
                 assert bool(((accept_length >= 1) & (accept_length <= N)).all())
+
+
+@requires_cuda
+def test_warm_verify_compiles_the_eager_full_logit_routes() -> None:
+    """After a verify in the startup warm-up, eager sample and verify on whole
+    logit rows compile nothing at either candidate count.
+
+    The warm decode and graph capture verify at 128 candidates; an eager step
+    whose top_k all fit in 64 selects 64, and the first token after a prefill
+    is a one-row sample. A vocabulary used by no other test keeps the
+    compiles this test checks its own.
+    """
+    vocab = 7001
+    backend = TritonSamplingBackend(
+        dataclasses.replace(
+            _config(),
+            vocab_size=vocab,
+            tp_group=None,
+            enable_speculative_sampling=False,
+        )
+    )
+    logits = (
+        torch.randn(BS * N, vocab, generator=torch.Generator().manual_seed(43)) * 3
+    ).to("cuda", torch.float32)
+    candidates = torch.zeros((BS, N), dtype=torch.int32, device="cuda")
+    req_pool_indices = _prepare(
+        backend, [128, 128, 128], [1.0, 1.0, 1.0], N, "w", admission_start=1
+    )
+    info = _info(req_pool_indices, None, None)
+    info.vocab_size = vocab
+    with kernel_warmup(enabled=True):
+        backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits), info, candidates, tree=None
+        )
+    kernels = (_top_k_top_p_candidates_stage1_kernel, _top_k_top_p_gumbel_stage2_kernel)
+    with _kernel_test_utils().assert_no_triton_compile(*kernels):
+        for step, top_k in enumerate(([5, 64, 1], [100, 3, 128])):
+            rid = f"f{step}r"
+            # Fresh admissions each step, clear of the warm-up requests.
+            start = 1 + BS * (step + 1)
+            req_pool_indices = _prepare(
+                backend, top_k, [1.0, 1.0, 1.0], 1, rid, admission_start=start
+            )
+            info = _info(req_pool_indices, None, None)
+            info.vocab_size = vocab
+            sampled, _ = backend.sample(
+                LogitsProcessorOutput(next_token_logits=logits[:BS]), info
+            )
+            assert bool(((sampled >= 0) & (sampled < vocab)).all())
+            req_pool_indices = _prepare(
+                backend, top_k, [1.0, 1.0, 1.0], N, rid, admission_start=start
+            )
+            info = _info(req_pool_indices, None, None)
+            info.vocab_size = vocab
+            _, accept_length = backend.verify(
+                LogitsProcessorOutput(next_token_logits=logits),
+                info,
+                candidates,
+                tree=None,
+            )
+            assert bool(((accept_length >= 1) & (accept_length <= N)).all())

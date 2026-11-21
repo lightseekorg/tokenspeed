@@ -1,8 +1,9 @@
 # Attention prologue
 
 Everything between a layer's projections and its core attention is one
-operation: optional per-head QK RMSNorm, RoPE (full, partial, or multimodal),
-quantization, and the KV cache write. Models describe which steps apply to a
+operation: optional per-head QK RMSNorm or relative attention's head steps
+(with an optional short convolution of the K/V rows), RoPE (full, partial, or
+multimodal), quantization, and the KV cache write. Models describe which steps apply to a
 `PagedAttention` layer. They never apply its per-head norm, rotate, quantize, or
 write its new K/V rows themselves. An MLA model still normalizes its latent
 and projects its absorbed query before the prologue. DeepSeek V4.1
@@ -28,15 +29,38 @@ first:
 
 Head geometry comes from the cache descriptor and the input shapes, and the
 storage format from the cache's rows and planes. No argument restates either.
-Typed holders carry each optional step: `HeadNorm`, `Rotary` (with `MRope`),
+Typed holders carry each optional step: `HeadNorm` or `RelativeHeadNorm`
+(with `KVShortConv`, its `ConvStream`s and `ConvBatch`),
+`Rotary` (with `MRope`),
 `HeadKVCache` (with `MXFP8Scales`), `LatentKVCache` (with
 `PerTokenHeadPlanes`), and `MLAExpandedKV`.
 
 In the runtime, a layer states its steps once: `PagedAttention(...,
 rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 `PagedAttention.forward` runs a GQA layer's prologue before core attention.
+After core attention, `PagedAttention.attend(..., rmsnorm_output_gate=(gate,
+eps))` returns `weightless_rmsnorm_gated_sigmoid` of the output. A decode whose
+backend `gates_decode_output` applies it in the kernel store that writes the
+output; every other forward runs the separate op after. Both give the same
+bits, so the choice is a parameter of the one path.
 When a projection or collective has already applied the same head-step numerics,
 `PagedAttention.store_prepared` uses `gqa_prologue` with no norm or rotary step.
+Relative attention (Inkling 2) takes per-call head steps, so its layer states
+no norm or RoPE and calls `PagedAttention.relative_prologue(q, k, v, ctx,
+RelativeHeadNorm(...))`: the query and key heads L2-clipped (the query and
+relative heads times an optional per-row scale), the value heads
+RMS-normalized, and the clipped relative heads projected to the per-distance
+logits `attend` takes as `rel_logits`, which the prologue returns in
+`GQAPrologueOutput.rel_logits` along with the query. With
+`RelativeHeadNorm.kv_conv` the layer passes its K and V projections
+instead, and the prologue first applies Inkling's short causal convolution to
+them: each stream's taps over the request's recent rows, read from the conv
+ring (decode) or the input checkpoint (extend). Like the KV write, the
+convolution's state writes belong to the prologue: the raw rows go to the
+ring and a chunk-end window to the live checkpoint block, as
+`inkling_ring_sconv` writes them. The model only registers the streams with
+the backend and passes their ring and checkpoint views; the cache subsystem
+owns those buffers.
 The prologue still owns slot selection and KV conversion/writes; the returned
 query/key rows need no additional copy in the Triton solution unless the
 backend asks for an FP8 query.
@@ -48,6 +72,30 @@ carries exactly one row per write slot. `prologue` rejects any other count. A
 native cache is bf16 (`--kv-cache-dtype auto`). An fp16 model's rows round to
 it at the store, as the pool converted them on write, and its activations stay
 fp16.
+
+## QSA index overlap
+
+The Qwen QSA target can prepare its sparse selection alongside the main
+attention projections and prologue. The layer projects index Q/K on the main
+stream, then forks the indexer's existing cache-write/selection tail onto its
+auxiliary stream. Main computes Q/K/V and calls `PagedAttention.prologue` once.
+It joins the selection before core attention consumes either result, passing
+`k = v = None` to preserve the prepared-query contract. Output gating and
+projection use the same path as serial attention.
+
+The current latency policy covers up to 128 target requests on TP1 and one
+request on other TP sizes, with four verify rows per request. Prefill and mixed
+rounds, draft narrowing, layerwise load-backs, FP8 attention projections and
+prefill graph breaks retain serial ordering. A layer without an auxiliary
+stream is serial too. Index geometry is derived from the
+indexer, not a fixed model width or TP topology. Eager forwards record the
+cross-stream temporary lifetimes; graph capture records fork/join dependencies
+and keeps graph-pool storage. There is no new persistent request or cache state.
+
+The model owns the batch/shape performance policy and disables the fork at
+construction for FP8 projections. `QSAIndexer.can_overlap` owns the execution
+constraints: a complete target verify batch, no live-row graph break, and no
+layerwise load-back. The model does not inspect indexer backend internals.
 
 ## Accepted inputs
 
@@ -85,6 +133,17 @@ The entries validate each request once, from metadata only, and raise
   `head_dim` for GQA and equal to the RoPE channels for MLA;
 * MLA RoPE is 64, 128, 256, or 512 channels wide, or absent;
 * norm weights are dense `[head_dim]` vectors;
+* relative heads are `[num_tokens, num_q_heads, rel_dim]` rows of packed heads
+  in the query dtype, the relative projection a contiguous `[rel_dim, extent]`
+  weight in that dtype, and a query output scale a dense fp32 `[num_tokens]`
+  vector;
+* a K/V convolution's streams take `[kv_channels, W >= 2]` taps in the query
+  dtype, `[slots, R >= W, kv_channels]` ring views and `[pages, W - 1,
+  kv_channels]` checkpoint fields, both channel-dense, and optional floating
+  `[num_tokens, heads, W]` coefficients; the K and V streams share one
+  layout; its batch holds a sequence index of at least `num_tokens` rows and
+  an input and a live block per request, and a decode batch uniform chunks
+  of at most `R - (W - 1)` rows;
 * MXFP8 caches hold 128-wide FP8 heads, their scale pages span a positive
   multiple of 128 tokens, and their scale planes are dense e8m0 starting and
   ending on a 4-byte boundary, with one scale per 32 channels of every row.
@@ -99,7 +158,13 @@ per activation).
 ## Numerics
 
 In the fused solutions the steps compute in fp32. Every output (query, key,
-value, and cache row) rounds once. A norm's weight arrives raw with an fp32
+value, and cache row) rounds once. Relative head steps are `rel_mha_head_norms`'
+numerics: each clipped or normalized head rounds once, the relative logits are
+the matmul of the stored clipped heads, and the cache rows are the rounded
+key and value heads. A K/V convolution is `inkling_ring_sconv`'s: taps
+accumulate in fp32 in its tap order, the residual row adds before the output
+scale, and each convolved row rounds once to the row dtype before its head
+step. A norm's weight arrives raw with an fp32
 offset, so Gemma's `1 + w` never rounds to the activation dtype, except under
 Ascend's norm, which forms it in the weight dtype as before. M-RoPE selects
 each rotation pair's position row and then applies the ordinary rotation, so
@@ -114,6 +179,15 @@ table to the activation dtype first. A backend that attends the returned rows
 instead of the cache (a prefill with no cached prefix) and casts them to an FP8
 cache's dtype itself rounds them twice, as it did before, while the cache holds
 them rounded once.
+
+A model whose normalized Q/K must round to the activation dtype before rotation
+passes `HeadNorm(round_before_rope=True)` as `PagedAttention.qk_norm`. Only a
+solution with the `materialized_qk_norm` feature serves it: the composite one,
+through its separate normalization step, and the Triton one, which sums each
+head's statistic in the per-head norm kernel's order and rounds the normalized
+heads before rotating, so the two produce the same bytes. An override naming
+another fails rather than drop that rounding point. Norm-module pairs keep their current
+selection, and models still never normalize heads themselves.
 
 Solutions that round once produce the same bytes wherever two serve a request.
 Tests compare them byte for byte. The CUDA and Triton `embedding.rope`
@@ -159,7 +233,10 @@ the round's extend span, then the decode window. A forward asks for one slot
 per row it carries through `padded_write_locations(layer, mode, rows)`: the
 extend span, then a MIXED round's decode rows, then the dummy slot 0 for the
 padding. Per-mode callers, such as MLA models that split a MIXED round, keep
-using `write_locations`.
+using `write_locations`. A split draft's K/V writer
+(`PagedAttention.write_kv_at`) runs the prologue's head steps over an extend's
+rows and writes to slots its caller stages: the extend's padded write
+locations, tile by tile, and slot 0 for a padded row.
 
 Sparse KV offloading keeps `write_locations` as the authoritative-history
 accessor. Before the latent write, the caller supplies selection and positions
@@ -241,13 +318,12 @@ the store. Its captured expanded pass is spent. The backends' own breaks nest
 inside these and pass through, and remain for callers that reach a backend
 directly. Prefill graphs capture the target model and replay a round with
 draft narrowing eagerly, so draft layers need no break. A narrowed draft
-step writes every row itself and skips the pre-break prologue. The drafter
-prefill graph (`--enable-drafter-prefill-graph`, see
-[unified_path.md](unified_path.md#drafter-prefill-graphs)) records a draft's
-extend step only when the draft model declares
-`supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
-in the captured segment and attends at `PagedAttention.attend`, like the
-target.
+step writes every row itself and skips the pre-break prologue. A split draft
+(a `SplitExtendDraft`: the MTP heads of Qwen3.5 and Qwen4-Exp, see
+[unified_path.md](unified_path.md#drafter-prefill-graphs)) stores every row's
+K/V of an extend round through `write_kv_at` from the drafter's K/V writer
+graph, with no break, and step 0 then runs from each request's last row as a
+decode step.
 
 ## Formats and scales
 
@@ -308,8 +384,9 @@ native, FP8, or MXFP8 cache; every step but the write is optional.
 
 | Solution | Kernel | Covers |
 | --- | --- | --- |
-| `triton` | one launch; each program takes a tile of tokens of one head (4 at decode sizes, up to 2048 elements past 256 tokens) | AMD and NVIDIA, native or FP8 caches |
-| `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store | everything; rounds between steps; the path for MXFP8 caches and Ascend |
+| `triton` | one launch; each program takes a tile of tokens of one head (4 at decode sizes, up to 2048 elements past 256 tokens) | AMD and NVIDIA, native or FP8 caches; no relative head steps |
+| `triton` (`triton_relative_gqa_prologue`) | relative head steps and the K/V store in `rel_mha_head_norms`' launch, whose K and V programs first convolve their rows over a decode batch; past 128 tokens the clipped relative heads go through one GEMM | relative head steps, no RoPE, native caches of the activation dtype, K/V convolutions of decode batches |
+| `composite` | `qk_rmsnorm`, `embedding.rope`, then the cache store; or `inkling_ring_sconv` per K/V stream, `rel_mha_head_norms`, then the cache store | everything; rounds between steps; the path for MXFP8 caches, Ascend and K/V convolutions of extend batches |
 
 The tiled Triton kernel beats the CUDA `embedding.rope` with its fused K/V
 store at every size measured (1 to 8192 tokens, 64 to 512 wide heads), so no
@@ -333,11 +410,25 @@ Register it under `("attention", "gqa_prologue")` or
 it rounds like the solutions it competes with. Add a test that compares it
 with them byte for byte over those cases, and one that shows it declines the
 rest. A trait the kernel does not declare admits every value, so declare each
-behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded`, and the rest)
+behavioral trait (`has_norm`, `relative_norm`, `kv_conv`, `mrope`, `return_kv`,
+`expanded`, and the rest)
 the kernel does not implement for every value. An `override` naming a kernel
 this platform cannot run, or whose traits exclude the request, raises.
 
 ## Ascend integration
+
+Numerical variants can reuse Prefill storage and communication independently
+of the native numerical backend.
+`AscendDSAAttention._prepare_lora_scales` isolates native norm-weight folding
+from checkpoint projection preparation. A variant that scales after the BF16
+norm output overrides that step and supplies its own numerical forward.
+`AscendQCPPrefill` prepares batch metadata once, then supplies each layer's
+cache to the shared history/current exchange and cache-write runtime.
+Additional fixed scratch belongs to the backend, is shared across its layers,
+and must be reserved by the cache recipe before allocation.
+Prefill transport and Index-K scatter are data-only entry points; they do not
+load the native fused Indexer/SFA library when a variant selects different
+arithmetic.
 
 Shared Ascend DSA and MLA components own attention execution. Models supply
 configuration and checkpoint weights; kernel selection and weight preparation
@@ -346,10 +437,10 @@ preserves coefficients and dtype.
 
 DSA's indexer uses the normalized Q latent before the main attention's Q-LoRA
 scale. Prefill and fused Decode with 16/32 Indexer heads scale the BF16 main
-Q projection result; the 64-head fused path retains scaled weight panels.
+Q projection result. Indexer64 is unsupported.
 The shared Q norm and indexer query projection remain unscaled. Indexer score
 projections retain FP32 and include `index_head_dim**-0.5 * index_n_heads**-0.5`;
-the 16-head fused path applies this factor after projection, while 32/64-head
+the 16-head fused path applies this factor after projection, while 32-head
 paths fold it into FP32 weights. These rounding boundaries do not establish
 cross-provider bitwise equality.
 
@@ -362,15 +453,21 @@ DSA Prefill uses token-local queries with all heads, gathers KV and Indexer-K,
 and returns complete output rows without Q/TopK/output/LSE exchanges. MLA
 Prefill keeps its head partition: it gathers normalized Q latents, projects
 local heads, consumes gathered KV history and current rows, and retains the
-existing output reduction. Indexer-K and KV share one BF16 transport packet
-per phase; gathering and cache commit preserve their bits.
+existing output reduction. Historical KV and Indexer-K gather directly into
+their respective attention planes. Current rows share a BF16 packet; one
+kernel unpacks both planes, fills partial history pages and writes owner caches.
+Gathering and cache commit preserve all bits, including BF16 NaN payloads.
 
-The preceding KDA segment may submit history gathering. The attention entry
-ensures it if absent. Receive and packet tensors are temporary and follow actual
-batch page geometry; fixed gather workspaces are not part of the model cache.
-All user-managed Prefill work uses one execution stream and synchronous HCCL
-interfaces. Tensor references and allocator stream tracking cover every queued
-consumer. Weight preparation and Decode graph behavior remain unchanged.
+At each attention layer the backend gathers history, then gathers and commits
+current rows before index selection. The cache recipe reserves one persistent
+Torch workspace with attention planes, send space and current-row receive space.
+Layers reuse this storage in execution-stream order. The executor synchronizes
+before handing off the workspace or releasing its owner.
+The Decode model runtime shares the fused prologue
+producer buffers across sequential layers and selects projection computations
+through the attention registry. The DSA module constructs its checkpoint
+projections and absorbed attention directly; it does not construct then discard
+a dense MLA projection or retain unused fused-norm children.
 These byte-preserving gathers do not establish cross-provider bitwise equality
 for attention arithmetic or reductions.
 
@@ -378,8 +475,8 @@ Prefill KV transport borrows an isolated accelerator process group from the
 runtime process-group manager. All world ranks create the cache-owner groups
 in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
-rank still participates in startup. Temporary tensor ownership ends after
-the final consumer, while the process-group manager retains the communicator.
+rank still participates in startup. The backend retains its shared workspace
+across layers, while the process-group manager retains the communicator.
 
 ### V4.1 fused decode attention
 
@@ -414,3 +511,58 @@ K and V fields share a plane. Prologue and context scatters resolve a token
 slot as ``page * page_stride + row * row_stride``; flattening these pages
 would discard the gap occupied by the other field. Dense row caches keep
 their existing three-dimensional views.
+
+
+### Ascend DSA execution ownership
+
+DSA Prefill prepares its batch metadata and reusable transport in
+`attention/ascend_qcp_prefill.py`. The DSA backend's `forward_extend` performs
+history/current KV preparation, Indexer selection and SFA in order. Each layer
+gathers its history at the attention entry and commits current KV/Index-K before
+selection. The next layer reuses the same buffers.
+
+`attention/backends/paged/ascend_dsa_local_decode.py` owns TP1/KVP1 Decode,
+including single-token and multi-token causal metadata. It has no DCP metadata
+or communicator. The
+TP/KVP attention, fused projections and communication registration live together
+in `attention/backends/paged/ascend_dsa_tp_kvp_decode.py`. Native resource
+release remains explicit after graph teardown; PyTorch buffers follow owner
+lifetime and are reused across layers.
+
+Token-local Prefill uses complete projections for each rank's query rows.
+A Prefill-only replica loads these weights directly. A unified replica serving
+TP/KVP Decode keeps the local Decode weights and gathers the Prefill views
+after each weight load. It gathers QB, KC and VC along the head dimension
+and O along its input dimension. Later loads refresh the same buffers for graph
+replay. A Decode-only replica needs only the local weights. Local KVP1 Decode
+requires TP1 projections. With KVP1, a TP4 Prefill group replicates KV on
+each rank.
+
+NoPE native DSA Decode writes the prepared latent directly with `latent_store`;
+its Q is already complete. Prefill defers the owner-local KV write to the shared
+transport after gathering current rows. Ranks with no query rows participate in
+that transport before skipping Indexer/SFA. The model derives the contiguous
+query span from the batch token count and KVP rank, using the same `scatter_count`
+as the backend; it does not search the backend tree during forward.
+
+An Ascend model plugin opts into QCP Prefill by reserving memory in its cache recipe using `AscendQCPPrefillWorkspaceLayout`,
+the same layout used for allocation. The recipe's optional `pool_options` passes
+directly to the backend's Prefill preallocation hook. Cache pools expose cache
+planes without carrying platform-specific workspace configuration.
+History capacity also limits scheduler KV admission, and the shared workspace
+is allocated once per backend rather than once per layer.
+
+`AscendQCPPrefill.prepare_batch_metadata` partitions current queries, plans the
+history gather, and builds the attention page table, Q/K boundaries and per-query
+causal metadata. `prepare_qcp_prefill_gather_metadata` only prepares addresses
+and counts; it does not read KV or issue collectives. Native and bitwise NPU
+paths use the same device metadata builder; the CPU branch is its reference.
+`prepare_layer_kv` then supplies the current layer's KV/Index-K cache and
+projections to `AscendQCPPrefillTransport` in `tokenspeed_kernel_npu.ops.qcp_prefill`.
+
+The workspace has three storage groups: `_attention_kv`/`_attention_index`
+(`attention_plane_rows`) hold final attention inputs and receive history
+directly; `_gather_send` (`gather_send_rows`) is reused for history and current
+sends; `_current_receive` (`current_receive_rows`) holds gathered current rows
+before they are unpacked. `current_rank_stride` is the aligned distance between
+producers' current regions in the attention planes, distinct from send capacity.

@@ -37,6 +37,7 @@ from utils import assert_no_triton_compile, is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
@@ -47,6 +48,8 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E4
 
 WORLD, HIDDEN, TAPS_K, LAYERS, HEAD, ROWS = 8, 8192, 40960, 5, 128, 8
 EPS = 1e-5
+OWNED = HIDDEN // WORLD
+ALL = tuple(range(WORLD))
 
 
 def _rope_table(n: int, device) -> torch.Tensor:
@@ -78,22 +81,43 @@ def _reference(taps, fc, norm_w, qkv, k_norm, cos_sin, positions):
     return out
 
 
-def _worker(rank: int, port: int, seed: int) -> None:
-    torch.cuda.set_device(rank)
+def _worker(me: int, port: int, seed: int, present) -> None:
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``me`` runs ``present[me]``). The
+    launches checked against the reference run a zero-shard model (the
+    other ranks' fc rows are zero, so they put exactly zero, which the host
+    writes before each launch); the two-requests launches, compared with
+    each other, read keyed stand-ins for the other ranks
+    (:func:`muse_spark_standins.standin_fill`)."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         # Two requests' plan is the larger: one scratch serves both.
         plan = draft_context.context_plan(2 * ROWS)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, bases = me, group.bases
+        else:
+            rank = present[me]
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
+
+        def stand_ins(step: int, rows: list[tuple[int, int]], zero: bool) -> None:
+            if present is not None:
+                launch_plan = draft_context.context_plan(len(rows))
+                standins.standin_fill(
+                    scratch, launch_plan, present, rows, step, 0, step & 1, zero
+                )
+
         group.finish_prepare()
         g = torch.Generator(device=device).manual_seed(seed)
 
@@ -104,6 +128,10 @@ def _worker(rank: int, port: int, seed: int) -> None:
 
         taps = randn(ROWS, TAPS_K, std=1.0)
         fc = randn(HIDDEN, TAPS_K, std=0.005)
+        if present is not None:
+            # A zero-shard model: the absent ranks' fc rows (the columns
+            # they own) are zero, so their sums and normed columns are zero.
+            fc[standins.absent_columns(HIDDEN, OWNED, present).to(device)] = 0
         norm_w = (1 + randn(HIDDEN, std=0.1).float()).to(torch.bfloat16)
         mine = torch.Generator(device=device).manual_seed(seed * 100 + rank + 1)
         qkv = [randn(1280, HIDDEN, std=0.01, gen=mine) for _ in range(LAYERS)]
@@ -140,6 +168,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
             )
             slots = far + torch.randperm(slots_n, generator=g, device=device)[:ROWS]
             slots = slots.to(torch.int32)
+            stand_ins(step, [(0, t) for t in range(ROWS)], True)
             # The second launch, at other rows, runs the first one's binary.
             with (
                 assert_no_triton_compile(
@@ -158,7 +187,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                     cos_sin=cos_sin,
                     scratch=scratch,
                     step=torch.full((1,), step, dtype=torch.int32, device=device),
-                    peer_bases=group.bases,
+                    peer_bases=bases,
                     trace_buf=None,
                     compile_only=False,
                 )
@@ -187,11 +216,15 @@ def _worker(rank: int, port: int, seed: int) -> None:
             : 2 * ROWS
         ]
         caches = {}
+        # The stand-ins are keyed by request and row: each launch's absent
+        # ranks put the same values for the same request's row.
+        keys = [(0, t) for t in range(ROWS)] + [(1, t) for t in range(ROWS)]
         for name, rows, step in (
             ("a", slice(0, ROWS), 5),
             ("b", slice(ROWS, 2 * ROWS), 6),
             ("both", slice(0, 2 * ROWS), 7),
         ):
+            stand_ins(step, keys[rows], False)
             ks = tuple(
                 torch.zeros(slots_n, 1, HEAD, dtype=torch.bfloat16, device=device)
                 for _ in range(LAYERS)
@@ -207,7 +240,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                 cos_sin=cos_sin,
                 scratch=scratch,
                 step=torch.full((1,), step, dtype=torch.int32, device=device),
-                peer_bases=group.bases,
+                peer_bases=bases,
                 trace_buf=None,
                 compile_only=False,
             )
@@ -231,7 +264,27 @@ def test_draft_context_write_in_one_launch_matches_fc_norm_and_kv(seed: int):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, seed), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, seed, None), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("seed", [0])
+def test_draft_context_write_in_one_launch_matches_fc_norm_and_kv_on_two_gpus(
+    seed: int, present
+):
+    """As :func:`test_draft_context_write_in_one_launch_matches_fc_norm_and_kv`
+    with the production rank programs ``present`` on two GPUs: K and V
+    against the reference in a zero-shard model (the other ranks' fc rows
+    are zero; the host writes their zero sums and columns), and two
+    requests in one launch against a launch each with keyed stand-ins for
+    the other ranks. Two non-zero terms per sum cannot check the rank order
+    of the eight-rank sum of squares (see muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_worker, args=(port, seed, present), nprocs=2, join=True)
 
 
 def test_one_binary_serves_every_step_position_and_slot():

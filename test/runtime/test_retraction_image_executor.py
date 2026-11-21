@@ -43,6 +43,8 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -141,7 +143,9 @@ class _Pool:
         self._layout = layout
         contract = _contract(layout, shard_counts)
         self.arena = SimpleNamespace(
-            cache_group_specs=contract.group_specs, runtime_contract=contract
+            cache_group_specs=contract.group_specs,
+            runtime_contract=contract,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
         )
         self.load_tracker = None
 
@@ -163,11 +167,11 @@ class _SlotState:
     def slot_state_bytes(self):
         return self.nbytes
 
-    def export_slot_state(self, slot, out, stream, *, request_id):
-        self.exports.append((slot, out, stream, request_id))
+    def export_slot_state(self, slot, out, stream, *, admission_id):
+        self.exports.append((slot, out, stream, admission_id))
 
-    def import_slot_state(self, slot, src, stream, *, request_id):
-        self.imports.append((slot, src, stream, request_id))
+    def import_slot_state(self, slot, src, stream, *, admission_id):
+        self.imports.append((slot, src, stream, admission_id))
 
 
 class _WriteBackOp:
@@ -209,6 +213,7 @@ def _snapshot_op(op_id, slot, transfers, *, pool_index=1):
         request_pool_index=pool_index,
         snapshot_slot=slot,
         transfers=tuple(transfers),
+        admission_id=op_id,
     )
 
 
@@ -221,6 +226,7 @@ def _restore_op(op_id, slot, rows, *, pool_index=1):
         snapshot_slot=slot,
         transfers=tuple(transfer for _, transfer in rows),
         source_tier=tuple(tier for tier, _ in rows),
+        admission_id=op_id,
     )
 
 
@@ -340,6 +346,7 @@ def _build(
             kvp_rank=rank,
             nprocs_per_node=1,
             world_cpu_group=None,
+            block_alignment=1,
         )
     return executor, slot_state, lanes
 
@@ -350,7 +357,14 @@ def _build(
 
 
 def test_op_dataclasses_carry_the_wire_fields():
-    wire = ("op_id", "request_id", "request_pool_index", "snapshot_slot", "transfers")
+    wire = (
+        "op_id",
+        "request_id",
+        "admission_id",
+        "request_pool_index",
+        "snapshot_slot",
+        "transfers",
+    )
     assert tuple(f.name for f in fields(SnapshotOp)) == wire
     assert tuple(f.name for f in fields(RestoreOp)) == wire + ("source_tier",)
     assert tuple(f.name for f in fields(CacheTransfer)) == (
@@ -390,6 +404,7 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
         with pytest.raises(ValueError, match="slot-state rows"):
             HostCacheExecutor(
@@ -404,6 +419,7 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
     # Too small a size holds no whole block and is refused, not rounded to none.
     with pytest.raises(ValueError, match="no whole LCM block"):
@@ -546,8 +562,8 @@ def test_both_store_legs_ride_the_write_stream_under_one_fence():
     # Each victim's slot is exported into its arena row, on the write stream,
     # as the victim's (a request-keyed owner images whether it prepared it).
     assert [(slot, stream, rid) for slot, _, stream, rid in slot_state.exports] == [
-        (3, executor.write_stream, "r7"),
-        (6, executor.write_stream, "r8"),
+        (3, executor.write_stream, 7),
+        (6, executor.write_stream, 8),
     ]
     assert slot_state.exports[0][1].data_ptr() == executor.blob_arena[1].data_ptr()
     assert slot_state.exports[1][1].data_ptr() == executor.blob_arena[2].data_ptr()
@@ -596,7 +612,7 @@ def test_slot_state_only_image_round_trips_through_empty_ops():
     lanes["restore_l2"].start_h2d.assert_not_called()
     lanes["restore_pool"].start_h2d.assert_not_called()
     executor.load_stream.wait_stream.assert_called_once_with("default-stream")
-    assert [(slot, rid) for slot, _, _, rid in slot_state.imports] == [(5, "r2")]
+    assert [(slot, rid) for slot, _, _, rid in slot_state.imports] == [(5, 2)]
     assert slot_state.imports[0][1].data_ptr() == executor.blob_arena[1].data_ptr()
     tracker.begin_load.assert_not_called()
     assert _acks(executor.poll_results()) == _restore_done(2)
@@ -693,7 +709,7 @@ def test_restore_reads_both_tiers_imports_the_slot_and_acks_once():
         backend="dma",
     )
     assert slot_state.imports == [
-        (4, slot_state.imports[0][1], executor.load_stream, "r9")
+        (4, slot_state.imports[0][1], executor.load_stream, 9)
     ]
     assert slot_state.imports[0][1].data_ptr() == executor.blob_arena[3].data_ptr()
     finish.record.assert_called_once_with(executor.load_stream)
@@ -799,6 +815,7 @@ def test_plan_level_checks_refuse_duplicates_bad_slots_and_ragged_tiers():
         snapshot_slot=1,
         transfers=(_transfer(0, 1, 1),),
         source_tier=(),
+        admission_id=1,
     )
     duplicate_restore = _restore_op(
         6, 1, [(HostTier.SNAPSHOT_POOL, _transfer(0, 1, 2))]
@@ -901,7 +918,7 @@ def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend
         assert num_blocks > 0, "the transport was asked for a zero-row transfer"
 
     with patch.object(lanes_module, "HostTransferWorkspace", Mock):
-        lane = HostTransferLane()
+        lane = HostTransferLane(TorchMemorySaverAdapter.create(enable=False))
     lane.workspace.load_block_transfers.side_effect = fake_load
     lane.workspace.commit_block_transfers.side_effect = fake_commit
     lane.workspace.prepare_backend.return_value = SimpleNamespace(
@@ -980,10 +997,10 @@ class _CudaSlotState:
     def slot_state_bytes(self):
         return slot_state_image_bytes(self.slot_state_rows(0))
 
-    def export_slot_state(self, slot, out, stream, *, request_id):
+    def export_slot_state(self, slot, out, stream, *, admission_id):
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
-    def import_slot_state(self, slot, src, stream, *, request_id):
+    def import_slot_state(self, slot, src, stream, *, admission_id):
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
 
@@ -1065,7 +1082,9 @@ def _round_trip_two_ranks(io_backend, executors):
                 cache_transfer_layout=lambda layout=layout: layout,
                 register_layerwise_load_tracker=lambda tracker: None,
                 arena=SimpleNamespace(
-                    cache_group_specs=contract.group_specs, runtime_contract=contract
+                    cache_group_specs=contract.group_specs,
+                    runtime_contract=contract,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
                 ),
             )
             executors[rank] = HostCacheExecutor(
@@ -1081,6 +1100,7 @@ def _round_trip_two_ranks(io_backend, executors):
                 kvp_rank=rank,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
     assert (executors[0].num_host_pages, executors[0].num_snapshot_pages) == (4, 4)
     for buffer in buffers.values():

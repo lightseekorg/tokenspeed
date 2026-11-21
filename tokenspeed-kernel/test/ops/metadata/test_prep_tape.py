@@ -129,6 +129,15 @@ def test_filltail_writes_int64_buffers():
     assert dst.dtype == torch.int64
 
 
+def test_filltail_preserves_full_tiles_before_the_tail():
+    dst = torch.arange(131, dtype=torch.int32, device="cuda")
+    tape = PrepTape("cuda")
+    tape.filltail(dst, Reg.BS, dst.numel(), -7)
+    tape.finalize()
+    tape.run({Reg.BS: 129})
+    assert dst.tolist() == list(range(129)) + [-7, -7]
+
+
 def test_filltail_int32_and_int64_share_one_launch():
     """Mixed widths must coexist in a stage: that is what the input buffers are."""
     a = torch.zeros(12, dtype=torch.int32, device="cuda")

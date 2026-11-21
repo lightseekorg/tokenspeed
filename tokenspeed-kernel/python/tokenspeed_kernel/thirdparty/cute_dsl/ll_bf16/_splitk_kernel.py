@@ -39,6 +39,20 @@ def st_shared_remote_f32(remote_addr, val, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def prefetch_l2(ptr, *, loc=None, ip=None):
+    """Ask L2 for the 128-byte line holding global ``ptr``."""
+    _llvm.inline_asm(
+        None,
+        [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class LLBf16SplitK:
     """BF16 router GEMM kernel based on clustered split-K MMA.
 
@@ -412,6 +426,22 @@ class LLBf16SplitK:
                 pred=tBpB,
             )
             if const_expr(self.use_pdl):
+                # B is constant: while A is pending, ask L2 for the rest of
+                # this CTA's B (its N rows over its K tiles), which the
+                # pipeline would otherwise stream from HBM after the wait.
+                row_lines = bK * mB.element_type.width // 8 // 128
+                line_cols = 128 * 8 // mB.element_type.width
+                total = bN * num_k_tiles * row_lines
+                for item in cutlass.range(
+                    dma_tidx, total, self.num_dma_threads, unroll=1
+                ):
+                    rest = item // row_lines
+                    n = bid_n * bN + rest // num_k_tiles
+                    col = (k_start + (rest % num_k_tiles) * self.split_k) * bK + (
+                        item % row_lines
+                    ) * line_cols
+                    if n < mB.shape[0] and col < K_total:
+                        prefetch_l2(mB.iterator + mB.layout((n, col)))
                 cute.arch.griddepcontrol_wait()
             cute.copy(
                 tiled_copy_A,

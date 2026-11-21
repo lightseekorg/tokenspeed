@@ -243,10 +243,16 @@ def expert_partials(rank: int, experts: int, pooled, gain, ids) -> torch.Tensor:
     """Rank ``rank``'s BF16 route partials ``[rows, 8, 4096]`` of each row's
     picks ``ids [rows, 8]`` (``pooled [rows, 4096]``), on ``pooled``'s device.
     Each picked expert is dequantized once."""
+    return expert_partials_of(raw_experts(rank, experts), pooled, gain, ids)
+
+
+def expert_partials_of(raw, pooled, gain, ids) -> torch.Tensor:
+    """:func:`expert_partials` of the raw MXFP4 shards ``raw`` (``(w13, s13,
+    w2, s2)``, as :func:`raw_experts` makes them)."""
     x = pooled.float()
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(x.device)
     xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float())
-    w13, s13, w2, s2 = (t.to(x.device) for t in raw_experts(rank, experts))
+    w13, s13, w2, s2 = (t.to(x.device) for t in raw)
     out = torch.empty(ids.shape[0], TOP_K, POOLED, device=x.device)
     for e in ids.unique().tolist():
         up = dequantize_mxfp4(w13[e], s13[e]).float()

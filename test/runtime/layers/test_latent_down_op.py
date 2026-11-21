@@ -48,7 +48,13 @@ def _stub_slot():
     allocation, so they have to hand back something slot-shaped.
     """
     return latent_down._MailboxSlot(
-        torch.zeros(1, 8, 64, dtype=torch.bfloat16), _rendezvous_stub(), 0, {}, {}
+        torch.zeros(1, 8, 64, dtype=torch.bfloat16),
+        _rendezvous_stub(),
+        0,
+        {},
+        {},
+        latent_down._DOWN_SENTINEL,
+        False,
     )
 
 
@@ -101,7 +107,7 @@ def _eligible(
 
 
 def _library_gemm(x, weight, out):
-    return x @ weight.t()
+    return out.copy_(x @ weight.t())
 
 
 def _passing_vote(tensor, **kwargs):
@@ -256,7 +262,7 @@ def test_initialize_remembers_that_a_slot_could_not_be_built() -> None:
     assert len(calls) == latent_down._DOWN_POOL_DEPTH
     # The widths the op was initialized with are the widths the slot is built
     # for; transposing them compiles kernels that fail on the first batch.
-    assert calls[0] == (group, 7168, 3584, torch.device("cpu"), 8, None)
+    assert calls[0] == (group, 7168, 3584, torch.device("cpu"), 8, None, False)
 
 
 def test_pool_key_separates_process_groups() -> None:
@@ -277,7 +283,15 @@ def test_the_width_gate_is_the_ceiling_it_was_built_with(ceiling: int) -> None:
     op built narrow must not.
     """
     op = latent_down.KimiK3LatentDownOp(
-        latent_down._MailboxSlot(torch.zeros(1), _rendezvous_stub(), 0, {}, {}),
+        latent_down._MailboxSlot(
+            torch.zeros(1),
+            _rendezvous_stub(),
+            0,
+            {},
+            {},
+            latent_down._DOWN_SENTINEL,
+            False,
+        ),
         448,
         0,
         ceiling,
@@ -323,6 +337,8 @@ def _stub_op(rank: int, shard_dim: int, latent: int, seen: dict, max_m: int = 8)
             for m in range(1, max_m + 1)
         },
         gather_by_m={m: gather for m in range(1, max_m + 1)},
+        sentinel=latent_down._DOWN_SENTINEL,
+        rank_major=False,
     )
     return latent_down.KimiK3LatentDownOp(slot, shard_dim, rank, max_m)
 
@@ -425,7 +441,9 @@ def test_the_vote_takes_the_minimum_so_one_refusal_is_decisive() -> None:
 def test_a_pooled_slot_is_re_armed_before_it_is_handed_out() -> None:
     """A reload must not inherit whatever an abandoned round left behind."""
     mailbox = torch.zeros(1, latent_down._FUSED_MAX_M, 64, dtype=torch.bfloat16)
-    slot = latent_down._MailboxSlot(mailbox, _rendezvous_stub(), 1, {}, {})
+    slot = latent_down._MailboxSlot(
+        mailbox, _rendezvous_stub(), 1, {}, {}, latent_down._DOWN_SENTINEL, False
+    )
     built: list = []
     with _eligible(), _voting_ranks(built, _passing_vote, lambda: slot):
         _initialize()
@@ -462,6 +480,7 @@ def test_build_slot_arms_and_binds_what_the_kernels_need() -> None:
             torch.device("cpu"),
             latent_down._FUSED_MAX_M,
             None,
+            False,
         )
     assert slot is not None
     assert slot.mailbox.shape == (1, latent_down._FUSED_MAX_M, latent)
@@ -530,7 +549,7 @@ def test_build_slot_declines_when_the_pointer_vote_fails() -> None:
         ),
     ):
         slot = latent_down.KimiK3LatentDownOp._build_slot(
-            _voting_group(), 7168, 3584, torch.device("cpu"), 8, None
+            _voting_group(), 7168, 3584, torch.device("cpu"), 8, None, False
         )
     assert slot is None
 
@@ -609,7 +628,7 @@ def test_build_slot_votes_about_the_address_it_actually_got() -> None:
     # _agree_on_pointer stays unpatched: it must be asked about the real address.
     with _building(rank=0, tp_size=8, multicast_ptr=0):
         slot = latent_down.KimiK3LatentDownOp._build_slot(
-            group, 7168, 3584, torch.device("cpu"), 8, None
+            group, 7168, 3584, torch.device("cpu"), 8, None, False
         )
 
     assert slot is None
@@ -621,7 +640,7 @@ def test_build_slot_sizes_everything_to_the_ceiling_it_is_given() -> None:
     group = _voting_group()
     with _building(rank=3, tp_size=tp, multicast_ptr=4096) as made:
         slot = latent_down.KimiK3LatentDownOp._build_slot(
-            group, hidden_size, latent, torch.device("cpu"), ceiling, None
+            group, hidden_size, latent, torch.device("cpu"), ceiling, None, False
         )
     assert slot is not None
     assert slot.mailbox.shape == (1, ceiling, latent)
@@ -702,6 +721,7 @@ def test_the_wide_producer_publishes_through_the_multicast_view() -> None:
         max_m=ceiling,
         device=torch.device("cpu"),
         publish_gemm=None,
+        rank_major=False,
     )
     assert seen["pointer"] == 4096 + rank * shard_dim * 2
     assert seen["shape"] == (ceiling, shard_dim)
@@ -716,6 +736,34 @@ def test_the_wide_producer_publishes_through_the_multicast_view() -> None:
     assert torch.equal(backing[9:], stale[9:])
 
 
+def test_a_rank_major_producer_stores_compact_rows_into_its_own_block() -> None:
+    """A rank-major slot gives each rank a ``[max_m, shard]`` block the GEMM fills directly."""
+    latent, shard_dim, rank, ceiling, k = 3584, 448, 3, 32, 128
+    backing = torch.zeros(ceiling, shard_dim)
+    seen: dict = {}
+    producer = _wide_producer_over(
+        backing,
+        seen,
+        multicast_ptr=4096,
+        rank=rank,
+        shard_dim=shard_dim,
+        latent_size=latent,
+        max_m=ceiling,
+        device=torch.device("cpu"),
+        publish_gemm=_library_gemm,
+        rank_major=True,
+    )
+    assert seen["pointer"] == 4096 + rank * ceiling * shard_dim * 2
+    assert seen["shape"] == (ceiling, shard_dim)
+    assert seen["strides"] == (shard_dim, 1)
+    torch.manual_seed(13)
+    hidden = torch.randn(5, k)
+    weight_block = torch.randn(shard_dim, k)
+    producer(hidden, weight_block, object(), 4096)
+    torch.testing.assert_close(backing[:5], hidden @ weight_block.T)
+    assert not backing[5:].any()
+
+
 def _initialize(**overrides):
     """Drive initialize with the shapes every rank agrees on, past the overrides."""
     kwargs = dict(
@@ -728,6 +776,7 @@ def _initialize(**overrides):
         model_scope="s",
         max_m=8,
         publish_gemm=None,
+        rank_major=False,
     )
     kwargs.update(overrides)
     return latent_down.KimiK3LatentDownOp.initialize(**kwargs)
@@ -944,26 +993,29 @@ def test_the_library_producer_keeps_its_ceiling_and_builds_no_fused_kernel() -> 
         # A width off the fused k-tile is eligible for the library producer only.
         assert "k-tile" in reason(**args, tp_size=8, group=None, fused_producer=True)
         assert reason(**args, tp_size=8, group=None, fused_producer=False) is None
-    assert built[0][4:] == (4, _library_gemm)
+    assert built[0][4:] == (4, _library_gemm, False)
 
 
 @pytest.mark.skipif(
     not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
 )
-@pytest.mark.parametrize("writes_out", [False, True])
+@pytest.mark.parametrize("rank_major", [False, True])
 def test_the_library_producer_publishes_the_weight_it_is_handed(
-    writes_out: bool,
+    rank_major: bool,
 ) -> None:
-    """Pooled across layers, it must never keep a weight, and may write rows itself."""
+    """Pooled across layers, it must never keep a weight, and must write the rows it is given."""
     latent, shard, hidden, max_m = 32, 8, 16, 4
     mailbox = torch.zeros(max_m, latent, dtype=torch.bfloat16, device="cuda")
     latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
     armed = mailbox.view(torch.int16).clone()
+    # Rank 1's block: interleaved, its columns of every row; rank-major, the second block.
+    if rank_major:
+        block = mailbox.view(-1)[max_m * shard : 2 * max_m * shard].view(max_m, shard)
+    else:
+        block = mailbox[:, shard : 2 * shard]
     writes = []
 
     def gemm(x, weight, out):
-        if not writes_out:
-            return x @ weight.t()
         writes.append(out.data_ptr())
         return out.copy_(x @ weight.t())
 
@@ -975,6 +1027,7 @@ def test_the_library_producer_publishes_the_weight_it_is_handed(
         max_m=max_m,
         device=mailbox.device,
         publish_gemm=gemm,
+        rank_major=rank_major,
     )
     torch.manual_seed(2)
     x = torch.randn(2, hidden, dtype=torch.bfloat16, device="cuda")
@@ -985,16 +1038,33 @@ def test_the_library_producer_publishes_the_weight_it_is_handed(
         weight = -torch.rand(shard, hidden, dtype=torch.bfloat16, device="cuda")
         producer(x, weight, mailbox, mailbox.data_ptr())
         torch.cuda.synchronize()
-        published.append(mailbox[:2, shard : 2 * shard].clone())
+        published.append(block[:2].clone())
         assert torch.equal(
             published[-1].view(torch.int16), (x @ weight.t()).view(torch.int16)
         )
     assert not torch.equal(published[0][0], published[1][0])
-    # Every other rank's column and every row past the batch keeps the sentinel.
-    words = mailbox.view(torch.int16).clone()
-    words[:2, shard : 2 * shard] = armed[:2, shard : 2 * shard]
-    assert torch.equal(words, armed)
-    assert writes == [mailbox[0, shard:].data_ptr()] * (2 if writes_out else 0)
+    # Every other rank's block and every row past the batch keeps the sentinel.
+    written = torch.zeros(max_m, latent, dtype=torch.bool, device=mailbox.device)
+    if rank_major:
+        start = (block.data_ptr() - mailbox.data_ptr()) // 2
+        written.view(-1)[start : start + 2 * shard] = True
+    else:
+        written[:2, shard : 2 * shard] = True
+    assert torch.equal(mailbox.view(torch.int16)[~written], armed[~written])
+    assert writes == [block.data_ptr()] * 2
+    # A GEMM that leaves its rows elsewhere would publish nothing.
+    elsewhere = latent_down._MulticastVaGemm(
+        multicast_ptr=mailbox.data_ptr(),
+        rank=1,
+        shard_dim=shard,
+        latent_size=latent,
+        max_m=max_m,
+        device=mailbox.device,
+        publish_gemm=lambda x, weight, out: x @ weight.t(),
+        rank_major=rank_major,
+    )
+    with pytest.raises(RuntimeError, match="must write"):
+        elsewhere(x, weight, mailbox, mailbox.data_ptr())
     for tokens in (0, max_m + 1):
         with pytest.raises(ValueError, match="do not fit"):
             producer(
@@ -1006,20 +1076,20 @@ def test_the_library_producer_publishes_the_weight_it_is_handed(
 
 
 @pytest.mark.parametrize(
-    "publish_gemm,sentinel,polls",
+    "publish_gemm,rank_major,sentinel,polls",
     [
-        (None, latent_down._DOWN_SENTINEL, False),
-        (_library_gemm, latent_down.HALF_POLLED_SENTINEL, True),
+        (None, False, latent_down._DOWN_SENTINEL, False),
+        (_library_gemm, False, latent_down.HALF_POLLED_SENTINEL, True),
+        (_library_gemm, True, latent_down.HALF_POLLED_SENTINEL, None),
     ],
 )
 def test_only_the_library_producer_asks_the_gather_to_poll_halves(
-    publish_gemm, sentinel: int, polls: bool
+    publish_gemm, rank_major: bool, sentinel: int, polls: bool | None
 ) -> None:
-    """K3's -0 slot keeps word compares; the NaN slot arms, polls halves, warms up."""
+    """K3's -0 slot keeps word compares; the NaN slot arms and polls halves; a rank-major slot builds no gather."""
     group = mock.Mock()
     group.group_name = "halves"
     producer: dict = {}
-    published: list = []
     with (
         _building(rank=1, tp_size=4, multicast_ptr=0x1000) as made,
         mock.patch.object(
@@ -1027,21 +1097,21 @@ def test_only_the_library_producer_asks_the_gather_to_poll_halves(
             "_MulticastVaGemm",
             side_effect=lambda **kw: producer.setdefault("kwargs", kw),
         ),
-        mock.patch.object(
-            latent_down,
-            "multicast_publish",
-            side_effect=lambda block, out: published.append((block, out)),
-        ),
     ):
         slot = latent_down.KimiK3LatentDownOp._build_slot(
-            group, 8192, 4096, torch.device("cpu"), 4, publish_gemm
+            group, 8192, 4096, torch.device("cpu"), 4, publish_gemm, rank_major
         )
     assert slot is not None and slot.sentinel == sentinel
+    assert slot.rank_major is rank_major
     words = slot.mailbox.view(torch.int32)
     expected = sentinel - 0x1_0000_0000 if sentinel >= 0x8000_0000 else sentinel
     assert torch.equal(words, torch.full_like(words, expected))
-    assert made["gathers"][0]["sentinel"] == sentinel
-    assert made["gathers"][0]["poll_halves"] is polls
+    if polls is None:
+        # Its consumers poll the blocks themselves.
+        assert made["gathers"] == [] and slot.gather_by_m == {}
+    else:
+        assert made["gathers"][0]["sentinel"] == sentinel
+        assert made["gathers"][0]["poll_halves"] is polls
     assert sorted(slot.gemm_by_m) == [1, 2, 3, 4]
     if publish_gemm is not None:
         # The library producer covers every width; no fused kernel is built.
@@ -1049,14 +1119,7 @@ def test_only_the_library_producer_asks_the_gather_to_poll_halves(
         assert producer["kwargs"]["multicast_ptr"] == 0x1000
         assert producer["kwargs"]["shard_dim"] == 1024
         assert producer["kwargs"]["max_m"] == 4
-        # The publish kernel is warmed on local scratch at the mailbox's row pitch.
-        [(block, destination)] = published
-        assert block.shape == destination.shape == (1, 1024)
-        assert destination.stride() == (4096, 1)
-        end = slot.mailbox.data_ptr() + slot.mailbox.numel() * 2
-        assert not slot.mailbox.data_ptr() <= destination.data_ptr() < end
-    else:
-        assert published == []
+        assert producer["kwargs"]["rank_major"] is rank_major
 
 
 def test_publish_hands_out_the_arriving_rows_for_a_consumer_to_gather() -> None:
@@ -1073,6 +1136,30 @@ def test_publish_hands_out_the_arriving_rows_for_a_consumer_to_gather() -> None:
     assert seen["tokens"] == 4
     assert "mailbox" not in seen
     assert op.sentinel == latent_down._DOWN_SENTINEL
+
+
+def test_a_rank_major_slot_hands_out_each_blocks_first_rows() -> None:
+    """Consumers read ``[ranks, tokens, shard]``: block ``r`` is rank ``r``'s rows, capacity apart."""
+    latent, tp, max_m = 64, 4, 8
+    shard = latent // tp
+    mailbox = torch.arange(max_m * latent, dtype=torch.float32).to(torch.bfloat16)
+    slot = latent_down._MailboxSlot(
+        mailbox.view(1, max_m, latent),
+        _rendezvous_stub(),
+        0,
+        {},
+        {},
+        latent_down.HALF_POLLED_SENTINEL,
+        True,
+    )
+    op = latent_down.KimiK3LatentDownOp(slot, shard, 2, max_m)
+    rows = op.rows(3)
+    assert rows.shape == (tp, 3, shard)
+    assert rows.stride() == (max_m * shard, shard, 1)
+    assert rows.data_ptr() == mailbox.data_ptr()
+    assert torch.equal(rows[2], mailbox.view(tp, max_m, shard)[2, :3])
+    with pytest.raises(ValueError, match="no side-by-side partials"):
+        op.all_reduce_mailbox(3)
 
 
 if __name__ == "__main__":

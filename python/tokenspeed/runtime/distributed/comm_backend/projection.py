@@ -21,7 +21,6 @@
 """Projection collective dispatch with separately owned persistent workspaces."""
 
 import logging
-import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -35,6 +34,10 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._cute_dsl.gemm_reduce_scatter import (
+        GemmReduceScatterState,
+    )
+
     from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
@@ -57,10 +60,14 @@ class ProjectionSpec:
     Sequential layers may share a prepared object with the same spec. Separate
     streams or concurrently executing models must prepare separate objects.
     Sizes are full (unsharded) widths; max_tokens is physical rows per owner.
+    Column and row projections take owner rows and return them complete. A
+    gather projection returns every owner's rows through this rank's output
+    shard, and a scatter projection reduces every rank's partial of all rows
+    into owner rows.
     """
 
     group: Group
-    kind: Literal["column", "row"]
+    kind: Literal["column", "row", "gather", "scatter"]
     input_size: int
     output_size: int
     max_tokens: int
@@ -70,13 +77,90 @@ class ProjectionSpec:
     @property
     def scratch_specs(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         """Simultaneously live send, receive and GEMM buffers for this layout."""
-        width = self.input_size if self.kind == "row" else self.output_size
-        gemm_width = self.input_size if self.kind == "column" else self.output_size
+        rows = self.max_tokens
+        # Gathers and scatters exchange no channel shards around their GEMM.
+        sent = 0 if self.kind == "scatter" else rows * self.input_size
+        received = {"column": self.output_size, "row": self.input_size}
+        reduced = self.kind in ("row", "scatter")
         return (
-            ((self.max_tokens * self.input_size,), self.dtype),
-            ((self.max_tokens * width,), self.dtype),
-            ((len(self.group) * self.max_tokens, gemm_width), self.dtype),
+            ((sent,), self.dtype),
+            ((rows * received.get(self.kind, 0),), self.dtype),
+            (
+                (
+                    len(self.group) * rows,
+                    self.output_size if reduced else self.input_size,
+                ),
+                self.dtype,
+            ),
         )
+
+
+class CopyEngineGather:
+    """This rank's padded owner rows in symmetric memory, pulled by peers' copy engines.
+
+    A gather writes the rows and passes a barrier before peers pull them. A
+    second barrier, on the copy stream after this rank's pulls, passes once
+    every peer has pulled; the gather joins it before returning, so the next
+    gather may rewrite the rows.
+    """
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        max_rows: int,
+        width: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        self.rank = group.rank()
+        self.rows = symm_mem.empty((max_rows, width), dtype=dtype, device=device)
+        self.handle = symm_mem.rendezvous(self.rows, group.group_name)
+        self.peer_rows = [
+            self.handle.get_buffer(peer, self.rows.shape, dtype)
+            for peer in range(group.size())
+        ]
+        self.stream = torch.cuda.Stream(device)
+
+    def gather_mm(
+        self,
+        inputs: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        gathered: torch.Tensor,
+    ) -> torch.Tensor:
+        """``projection_gather_mm``, projecting each owner's rows as they land.
+
+        The copy engine pulls peers' rows while this rank's rows project, so
+        the SMs stay on the GEMMs.
+        """
+        from tokenspeed_kernel.ops.gemm import mm
+
+        size = len(self.peer_rows)
+        own = self.rows[:rows]
+        own[: inputs.shape[0]].copy_(inputs)
+        own[inputs.shape[0] :].zero_()
+        self.handle.barrier(channel=0)
+        main = torch.cuda.current_stream()
+        self.stream.wait_stream(main)
+        landed = []
+        with torch.cuda.stream(self.stream):
+            for step in range(1, size):
+                peer = (self.rank + step) % size
+                block = slice(peer * rows, (peer + 1) * rows)
+                gathered[block].copy_(self.peer_rows[peer][:rows])
+                event = torch.cuda.Event()
+                event.record()
+                landed.append((block, event))
+            self.handle.barrier(channel=1)
+        mm(own, weight, out=out[self.rank * rows : (self.rank + 1) * rows])
+        for block, event in landed:
+            main.wait_event(event)
+            mm(gathered[block], weight, out=out[block])
+        main.wait_stream(self.stream)
+        return out
 
 
 class ProjectionWorkspace:
@@ -99,12 +183,13 @@ class ProjectionWorkspace:
         scratch_pool: "WorkspacePool | None" = None,
     ):
         if (
-            spec.kind not in ("column", "row")
+            spec.kind not in ("column", "row", "gather", "scatter")
             or len(spec.group) < 2
             or min(spec.input_size, spec.output_size, spec.max_tokens) <= 0
         ):
             raise ValueError("Invalid prepared projection dimensions")
-        width = spec.input_size if spec.kind == "row" else spec.output_size
+        reduced = spec.kind in ("row", "scatter")
+        width = spec.input_size if reduced else spec.output_size
         if width % len(spec.group):
             raise ValueError("Projection channel width must be divisible by TP")
         self.spec = spec
@@ -125,14 +210,16 @@ class ProjectionWorkspace:
         # and grown during reconfiguration.
         self.scratch_pool: "WorkspacePool | None" = scratch_pool
         self.send, self.received, gemm = scratch_pool.allocate(*spec.scratch_specs)
-        self.gathered = gemm if spec.kind == "column" else None
-        self.partial = gemm if spec.kind == "row" else None
+        self.gathered = None if reduced else gemm
+        self.partial = gemm if reduced else None
         self.gather = None
         self.gather_quant = None
         self.a2a = None
         self.reduction = None
         self.fused_column = None
         self.fused_row = None
+        self.copy_engine: CopyEngineGather | None = None
+        self.gemm_reduce_scatter: "GemmReduceScatterState | None" = None
 
     def close(self) -> None:
         """Collectively release native resources and owned scratch references.
@@ -154,6 +241,8 @@ class ProjectionWorkspace:
             self.fused_row.close()
             self.fused_row = None
         self.a2a = None
+        self.copy_engine = None
+        self.gemm_reduce_scatter = None
         if self.gather is not None:
             self.gather.close()
             self.gather = self.gather_quant = None
@@ -181,9 +270,20 @@ def _warmup_projection(workspace: ProjectionWorkspace) -> None:
     backend = workspace.backend
     # Exercise the selected paths before capture, including optional fusion.
     # Generic backends use ordinary collectives; Auto may use native resources.
-    probe = workspace.send[: spec.input_size].view(1, spec.input_size)
+    # A scatter sends nothing ahead of its GEMM, so it probes with a partial row.
+    probe = (
+        workspace.partial[:1]
+        if spec.kind == "scatter"
+        else workspace.send[: spec.input_size].view(1, spec.input_size)
+    )
     probe.zero_()
-    if spec.kind == "column":
+    if spec.kind == "gather":
+        backend.projection_all_gather(probe, 1, False, workspace)
+    elif spec.kind == "scatter":
+        partial = backend.acquire_projection_output(1, workspace)
+        partial.zero_()
+        backend.projection_reduce_scatter(partial, 1, workspace)
+    elif spec.kind == "column":
         backend.projection_all_gather(probe, 1, False, workspace)
         backend.projection_all_gather(probe, 1, True, workspace)
         local = probe.new_zeros(len(spec.group), spec.output_size // len(spec.group))
@@ -242,6 +342,19 @@ def _check_workspace(
         raise RuntimeError("Projection communication is closed or exceeds capacity")
 
 
+def _check_gather(weight: torch.Tensor, workspace: ProjectionWorkspace) -> None:
+    spec = workspace.spec
+    # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
+    if (
+        spec.kind != "gather"
+        or weight.shape != (spec.output_size // len(spec.group), spec.input_size)
+        or weight.shape[0] == weight.shape[1]
+    ):
+        raise ValueError(
+            "A gather GEMM takes its gather workspace's non-square [N / TP, K] shard"
+        )
+
+
 def _check_a2a_options(inverse: bool, quantize: bool, out: torch.Tensor | None) -> None:
     if inverse and (quantize or out is None):
         raise ValueError("Inverse A2A requires owned output and no quantization")
@@ -267,6 +380,59 @@ def projection_all_gather(
     gathered = workspace.gathered[: len(workspace.spec.group) * rows]
     backend.all_gather_single(gathered, send, workspace.spec.group)
     return gathered, None
+
+
+def projection_gather_mm(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> torch.Tensor:
+    """Gather padded owner rows through backend, then project them into ``out``."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    _check_gather(weight, workspace)
+    gathered, _ = backend.projection_all_gather(inputs, rows, False, workspace)
+    return mm(gathered, weight, out=out)
+
+
+def _check_scatter(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+) -> None:
+    spec = workspace.spec
+    # gemm.mm infers the weight layout from its shape, so a square one is ambiguous.
+    if (
+        spec.kind != "scatter"
+        or inputs.shape[0] > len(spec.group) * rows
+        or weight.shape != (spec.output_size, spec.input_size // len(spec.group))
+        or weight.shape[0] == weight.shape[1]
+    ):
+        raise ValueError(
+            "A scatter GEMM takes at most TP * rows rows and its scatter "
+            "workspace's non-square [N, K / TP] shard"
+        )
+
+
+def projection_mm_reduce_scatter(
+    inputs: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> torch.Tensor:
+    """Project all rows into borrowed partials, then reduce them through backend."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    _check_scatter(inputs, rows, weight, workspace)
+    partial = backend.acquire_projection_output(rows, workspace)
+    mm(inputs, weight, out=partial[: inputs.shape[0]])
+    partial[inputs.shape[0] :].zero_()
+    return backend.projection_reduce_scatter(partial, rows, workspace)
 
 
 def projection_all_to_all(
@@ -392,6 +558,18 @@ def projection_reduce_scatter(
     return backend.reduce_scatter(partial, workspace.spec.group)
 
 
+def _gemm_reduce_scatter_supported(spec: ProjectionSpec) -> bool:
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        gemm_reduce_scatter_supported,
+    )
+    from tokenspeed_kernel.ops.communication.multimem import multimem_available
+
+    size = len(spec.group)
+    return multimem_available() and gemm_reduce_scatter_supported(
+        size, spec.output_size, spec.input_size // size, spec.dtype, spec.device
+    )
+
+
 class ProjectionBackend:
     """Dispatch prepared projection operations through native or fallback kernels.
 
@@ -419,11 +597,14 @@ class ProjectionBackend:
             "Lamport transport is unavailable for this device, dtype, or routing policy"
         )
         if use_lamport:
-            # CUDA IPC requires a node-local group. Agree on topology before
-            # any rank attempts collective native allocation.
+            # Agree on peer-memory reachability before collective allocation.
             from tokenspeed_kernel.ops.communication.cute_dsl import (
                 fused_tp_column_projection_supported,
                 fused_tp_row_projection_supported,
+            )
+            from tokenspeed_kernel.ops.communication.fabric import (
+                group_has_fabric,
+                host_identity,
             )
 
             supported = (
@@ -437,8 +618,16 @@ class ProjectionBackend:
             min_fused_rows = (
                 _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
             )
-            if batch_invariant:
+            if spec.kind == "gather":
+                fused_disabled_reason = "a gather has no fused projection"
+            elif batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
+            elif spec.kind == "scatter":
+                fused_disabled_reason = (
+                    None
+                    if _gemm_reduce_scatter_supported(spec)
+                    else "unsupported device or dimensions for the GEMM reduce-scatter"
+                )
             elif len(spec.group) not in fused_tp_sizes:
                 fused_disabled_reason = (
                     f"automatic TP{len(spec.group)} fusion is disabled"
@@ -465,7 +654,7 @@ class ProjectionBackend:
             dist.all_gather_object(
                 hosts,
                 (
-                    socket.gethostname(),
+                    host_identity(),
                     batch_invariant,
                     fused_disabled_reason is None,
                 ),
@@ -475,14 +664,34 @@ class ProjectionBackend:
                 raise ValueError(
                     "Batch-invariant collective setting differs across ranks"
                 )
-            if len({value[0] for value in hosts}) == 1:
+            if len({value[0] for value in hosts}) == 1 or group_has_fabric(spec.group):
                 self._prepare_lamport(workspace, use_lamport_reduction)
-                if all(value[2] for value in hosts):
+                if spec.kind == "gather":
+                    workspace.copy_engine = CopyEngineGather(
+                        pg_manager.get_device_process_group(spec.group),
+                        spec.max_tokens,
+                        spec.input_size,
+                        spec.dtype,
+                        spec.device,
+                    )
+                elif all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
                         create_fused_tp_column_projection_state,
+                        create_gemm_reduce_scatter_state,
                     )
 
-                    if spec.kind == "row":
+                    if spec.kind == "scatter":
+                        size = len(spec.group)
+                        workspace.gemm_reduce_scatter = (
+                            create_gemm_reduce_scatter_state(
+                                pg_manager.get_device_process_group(spec.group),
+                                spec.device,
+                                size * spec.max_tokens,
+                                spec.output_size,
+                                spec.input_size // size,
+                            )
+                        )
+                    elif spec.kind == "row":
                         from tokenspeed_kernel.ops.communication.cute_dsl import (
                             create_fused_tp_row_projection_state,
                         )
@@ -507,11 +716,15 @@ class ProjectionBackend:
                 elif fused_disabled_reason is None:
                     fused_disabled_reason = "one or more peers cannot prepare fusion"
             else:
-                fused_disabled_reason = "the projection group spans multiple nodes"
+                fused_disabled_reason = (
+                    "the cross-node projection group lacks NVLink fabric"
+                )
 
         if (
-            workspace.fused_column is None
+            spec.kind != "gather"
+            and workspace.fused_column is None
             and workspace.fused_row is None
+            and workspace.gemm_reduce_scatter is None
             and dist.get_rank() == spec.group[0]
         ):
             logger.info(
@@ -622,7 +835,7 @@ class ProjectionBackend:
         group = pg_manager.get_device_process_group(spec.group)
         sms = torch.cuda.get_device_properties(spec.device).multi_processor_count
         if (
-            spec.kind == "column"
+            spec.kind in ("column", "gather")
             and size in (2, 4, 8, 16)
             and spec.input_size % 128 == 0
         ):
@@ -636,7 +849,7 @@ class ProjectionBackend:
                     group, min(spec.max_tokens, 128), spec.input_size, spec.device, True
                 )
         if (
-            spec.kind == "row"
+            spec.kind in ("row", "scatter")
             and use_reduction
             and size in (2, 4, 8, 16)
             and spec.output_size % 8 == 0
@@ -645,7 +858,11 @@ class ProjectionBackend:
                 group, min(spec.max_tokens, 128), spec.output_size, spec.device
             )
         channels = spec.input_size if spec.kind == "row" else spec.output_size
-        if size in (2, 4, 8) and channels % (2 * size) == 0:
+        if (
+            spec.kind in ("column", "row")
+            and size in (2, 4, 8)
+            and channels % (2 * size) == 0
+        ):
             workspace.a2a = TokenSpeedA2ALamportState(
                 group, min(spec.max_tokens, 512), channels, spec.device, min(128, sms)
             )
@@ -675,6 +892,54 @@ class ProjectionBackend:
         if quantize and workspace.gather_quant is not None:
             return trtllm_allgather_fp8_quantize(workspace.gather_quant, send)
         return trtllm_allgather(workspace.gather, send), None
+
+    def gather_mm(
+        self,
+        inputs: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        # Lamport gathers the rows it holds; the copy engine takes larger ones.
+        if workspace.copy_engine is None or (
+            workspace.gather is not None and rows <= workspace.gather.max_rows
+        ):
+            return projection_gather_mm(
+                inputs, rows, weight, out, workspace, self._fallback
+            )
+        _check_workspace(rows, workspace, self._fallback)
+        _check_gather(weight, workspace)
+        return workspace.copy_engine.gather_mm(
+            inputs, rows, weight, out, workspace.gathered
+        )
+
+    def mm_reduce_scatter(
+        self,
+        inputs: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        # Lamport reduces the rows it holds; one fused kernel takes larger ones.
+        state = workspace.gemm_reduce_scatter
+        if state is None or (
+            workspace.reduction is not None and rows <= workspace.reduction.max_rows
+        ):
+            return projection_mm_reduce_scatter(
+                inputs, rows, weight, workspace, self._fallback
+            )
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_gemm_reduce_scatter,
+        )
+
+        _check_workspace(rows, workspace, self._fallback)
+        _check_scatter(inputs, rows, weight, workspace)
+        padding = len(workspace.spec.group) * rows - inputs.shape[0]
+        if padding:
+            inputs = torch.nn.functional.pad(inputs, (0, 0, 0, padding))
+        # Not through select_kernel: a collective with state prepared before capture.
+        return cute_dsl_gemm_reduce_scatter(state, inputs, weight)
 
     def all_to_all(
         self,

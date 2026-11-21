@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.sampling import write_synthetic_verify_outputs
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend import get_global_backend
@@ -190,12 +192,17 @@ class SamplingBackend(ABC):
 
     Per-slot state is part of the retraction image (``SlotStateExporter``):
     a restored request samples exactly as it would have unretracted, so the
-    import suppresses the rid-flip reset for the restored slot.
+    import suppresses the admission-change reset for the restored slot.
     """
 
     # Admission checks this exclusive bound. None means the backend handles
     # every positive finite top_k itself, before writing device scalars.
     top_k_exclusive_max: int | None = 128
+    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
+    supports_tree_verify: bool = False
+    # Packed target rows use query_start_loc CSR offsets; candidates and
+    # outputs retain their fixed per-request width (see verify()).
+    supports_packed_verify: bool = False
 
     # Subclasses that hold per-pool-idx state (scalars like temperature /
     # top_k, plus large rows like _counts / _logit_bias) flip this to True
@@ -264,21 +271,17 @@ class SamplingBackend(ABC):
                     (config.max_bs,), device=config.device
                 )
 
-        # Sentinel of "which rid currently owns each slot from this backend's
-        # point of view". rid is just a comparison value here, not a lookup
-        # key, so this is pool-keyed state (size O(pool_rows) strings), not
-        # rid-keyed state. A mismatch against the incoming rid is a flip.
-        if self._HAS_POOL_STATE:
-            pool_rows = config.max_req_pool_size + 1
-            self._last_rid_per_slot: list[str | None] = [None] * pool_rows
-            # Batch-composition version: prepare_step bumps it whenever the
-            # serving batch's membership can change — a slot flip (new
-            # request in a slot) or a size change (a retraction departs
-            # without flipping anything). Batch-aggregate facts that depend
-            # only on the mix (the Triton route/pad) cache against it and
-            # recompute only on a bump.
-            self._batch_composition_epoch: int = 0
-            self._last_step_bs: int | None = None
+        # The admission whose sampling state was prepared in each slot.
+        # A reused external request ID must still reset its previous state.
+        pool_rows = config.max_req_pool_size + 1 if self._HAS_POOL_STATE else 0
+        self._last_admission_per_slot: list[int | None] = [None] * pool_rows
+
+        # Batch-aggregate facts (the Triton route/pad) follow the admissions
+        # actually scheduled, not all prepared slots. A restored admission
+        # already owns its slot, and equally sized resident batches may
+        # alternate without any slot changing owners.
+        self._batch_composition_epoch: int = 0
+        self._last_step_admission_ids: tuple[int, ...] | None = None
 
         # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
         # backends' per-request stream) take int32 pool indices and a
@@ -430,7 +433,9 @@ class SamplingBackend(ABC):
 
         Args:
             dtype: The shard logits' dtype, as the processor hands them over.
-            columns: Vocabulary columns per shard.
+            columns: Real vocabulary columns of the narrowest shard: every
+                shard's, or the last one's where the vocabulary ends inside
+                the padded head.
             tp_size: Ranks the vocabulary is sharded over.
         """
         from tokenspeed_kernel.ops.sampling import (
@@ -535,7 +540,7 @@ class SamplingBackend(ABC):
 
     def prepare_step(
         self,
-        request_ids: list[str],
+        admission_ids: Sequence[int],
         request_pool_indices: list[int],
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int = 1,
@@ -545,8 +550,8 @@ class SamplingBackend(ABC):
         Synthetic lengths refresh even for backends without pool state so
         graph replay sees fresh lengths. Pool-state backends also perform:
 
-        1. Flip detection: a slot's owning rid changed since last step
-           (first-use and rid-recycling look the same). Delegates to
+        1. Flip detection: a slot's admission identity changed since last step.
+           External request IDs can be reused after retirement. Delegates to
            _reset_slot which scatters all per-slot persistent state
            (scalars, counts, bias, generators).
         2. Per-step dynamic refill: coin buffers, etc. Delegated to the
@@ -560,29 +565,29 @@ class SamplingBackend(ABC):
             return
 
         assert (
-            len(request_ids) == len(request_pool_indices) == len(sampling_params_list)
+            len(admission_ids) == len(request_pool_indices) == len(sampling_params_list)
         ), (
             f"prepare_step expects aligned per-request lists; got "
-            f"rids={len(request_ids)}, pool_indices={len(request_pool_indices)}, "
+            f"admissions={len(admission_ids)}, pool_indices={len(request_pool_indices)}, "
             f"sp_list={len(sampling_params_list)}"
         )
 
-        pool_rows = len(self._last_rid_per_slot)
-        batch_size = len(request_pool_indices)
-        membership_changed = batch_size != self._last_step_bs
-        for rid, pool_idx, sp in zip(
-            request_ids, request_pool_indices, sampling_params_list
+        pool_rows = len(self._last_admission_per_slot)
+        step_admission_ids = tuple(admission_ids)
+        membership_changed = step_admission_ids != self._last_step_admission_ids
+        for admission_id, pool_idx, sp in zip(
+            admission_ids, request_pool_indices, sampling_params_list
         ):
             assert (
                 0 <= pool_idx < pool_rows
-            ), f"pool_idx {pool_idx} out of range [0, {pool_rows}) for rid={rid}"
-            if self._last_rid_per_slot[pool_idx] != rid:
+            ), f"pool_idx {pool_idx} out of range [0, {pool_rows}) for admission_id={admission_id}"
+            if self._last_admission_per_slot[pool_idx] != admission_id:
                 self._reset_slot(pool_idx, sp)
-                self._last_rid_per_slot[pool_idx] = rid
+                self._last_admission_per_slot[pool_idx] = admission_id
                 membership_changed = True
         if membership_changed:
             self._batch_composition_epoch += 1
-        self._last_step_bs = batch_size
+        self._last_step_admission_ids = step_admission_ids
 
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,
@@ -660,29 +665,20 @@ class SamplingBackend(ABC):
     def write_synthetic_outputs(
         self,
         candidates: torch.Tensor,
-        target_tokens: torch.Tensor,
+        targets: torch.Tensor,
         lengths: torch.Tensor,
         predict: torch.Tensor,
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
     ) -> None:
-        """Commit a draft prefix followed by its target correction/bonus token."""
-        bs, n = candidates.shape
-        positions = torch.arange(n, device=candidates.device).expand(bs, n)
-        output = predict.view(bs, n)
-        output[:, : n - 1].copy_(candidates[:, 1:])
-        output.masked_fill_(positions >= lengths[:, None] - 1, 0)
-        output.scatter_(
-            1, (lengths - 1).long()[:, None], target_tokens.to(predict.dtype)[:, None]
+        """Commit a draft prefix followed by its target correction/bonus token.
+
+        ``targets`` is each row's token, or its ``[bs, n]`` target row whose
+        token at the cutoff is taken; ``lengths`` past ``n`` count as ``n``.
+        """
+        write_synthetic_verify_outputs(
+            candidates, targets, lengths, predict, accept_index, accept_length
         )
-        accept_index.copy_(
-            torch.where(
-                positions < lengths[:, None],
-                positions + torch.arange(bs, device=candidates.device)[:, None] * n,
-                -1,
-            )
-        )
-        accept_length.copy_(lengths - 1)
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         """Return sampler-specific CUDA graph variants to capture."""
@@ -756,47 +752,62 @@ class SamplingBackend(ABC):
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         if not self._HAS_POOL_STATE:
             return
-        # The slot holds ``request_id``'s state only once prepare_step ran a
+        # The slot holds ``admission_id``'s state only once prepare_step ran a
         # forward for it there; a victim retracted before its first forward
         # (a PD decode role's landed request) still holds the previous
         # occupant's, so the image carries the marker alone.
-        prepared = self._last_rid_per_slot[slot] == request_id
+        prepared = self._last_admission_per_slot[slot] == admission_id
         write_prepared_marker(out, prepared)
         if prepared:
             self._export_slot_payload(slot, out[PREPARED_MARKER_BYTES:], stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         if not self._HAS_POOL_STATE:
             return
         if read_prepared_marker(src):
             self._import_slot_payload(slot, src[PREPARED_MARKER_BYTES:], stream)
-            # ``prepare_step`` compares the incoming rid against this sentinel;
-            # a match is not a flip, so the restored rows are not reset as a
-            # new occupant's.
-            self._last_rid_per_slot[slot] = request_id
+            # The next prepare_step sees the same admission and preserves
+            # the restored rows instead of initializing a new occupant.
+            self._last_admission_per_slot[slot] = admission_id
         else:
             # Nobody's: the first prepare_step resets the slot from the
             # request's own SamplingParams, as it would have unretracted.
-            self._last_rid_per_slot[slot] = None
+            self._last_admission_per_slot[slot] = None
 
     def get_packed_output_d2h(
         self,
         output_tokens: torch.Tensor,
         output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """If the backend wrote both outputs into a single contiguous GPU
-        buffer, return CPU views obtained from one D2H copy. Otherwise
-        return None and let the caller fall back to two separate D2Hs."""
-        return None
+        """One D2H of the packed predict+accept_length region.
 
-    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
-    supports_tree_verify: bool = False
+        Applies when both outputs alias into ``_output_pack_buf``, where
+        ``verify()`` lands them (and a backend's ``sample()`` may). Otherwise
+        returns None and the caller falls back to two D2Hs.
+        """
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
+        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # the saved launch beats the wasted bandwidth.
+        size = self._predict_max + n_l
+        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
+        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
+        return (
+            cpu_pack[:n_t].view(output_tokens.shape),
+            cpu_pack[self._predict_max : self._predict_max + n_l],
+        )
 
     @abstractmethod
     def sample(
@@ -813,7 +824,21 @@ class SamplingBackend(ABC):
         candidates: torch.Tensor,
         *,
         tree: TreeVerifyBatch | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Verify each request's draft window; ``tree`` is the draft tree
-        (``None`` for a chain) and needs ``supports_tree_verify``; a tree
-        verify leaves its agreed path in ``accepted_path``."""
+        """Verify each request's draft window.
+
+        ``tree`` is the draft tree (``None`` for a chain) and requires
+        ``supports_tree_verify``; tree verification leaves its agreed path
+        in ``accepted_path``.
+
+        Only backends declaring ``supports_packed_verify`` accept
+        ``query_start_loc``: ``[bs + 1]`` CSR offsets into the target logits.
+        Request i uses rows ``[query_start_loc[i], query_start_loc[i + 1])``;
+        trailing logits rows may be graph padding. Candidates remain
+        ``[bs, N]`` at the native width, and outputs remain flat ``[bs * N]``
+        tokens plus ``[bs]`` accepted lengths, including the residual or bonus
+        token. Only each output's accepted prefix is valid. Unsupported
+        backends must reject packed offsets rather than ignore them; callers
+        omit the keyword for backends that do not declare the capability.
+        """

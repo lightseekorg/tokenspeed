@@ -212,8 +212,6 @@ def draft_layer_inputs(prefix: int, rank: int, rows: int, device):
     Returns:
         ``(host, weights, runtime)``.
     """
-    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_layer
-
     parts, residual, in_gain, a_coef, a_base, q_norm, k_norm = draft_attn_shared(
         prefix, rows
     )
@@ -254,31 +252,7 @@ def draft_layer_inputs(prefix: int, rank: int, rows: int, device):
         cos_sin=draft_rope_table(end + 8),
         end=end,
     )
-    weights = draft_layer.pack_draft_layer(
-        {
-            "input_norm": in_gain,
-            "post_norm": post_gain,
-            "attn_coef": a_coef,
-            "mlp_coef": m_coef,
-            "attn_base": a_base,
-            "mlp_base": m_base,
-            "qkv": qkv_w,
-            "q_norm": q_norm,
-            "k_norm": k_norm,
-            "o_proj": o_w,
-            "gate_up": gu_w,
-            "down": down_w,
-        },
-        rank,
-    )
-    weights = draft_layer.DraftLayerWeights(
-        rank=rank,
-        **{
-            f: getattr(weights, f).to(device)
-            for f in weights.__dataclass_fields__
-            if f != "rank"
-        },
-    )
+    weights = draft_layer_weights(host, rank, device)
     runtime = dict(
         x=parts[rank].to(device),
         residual=residual.to(device),
@@ -295,3 +269,35 @@ def draft_layer_inputs(prefix: int, rank: int, rows: int, device):
         cos_sin=host["cos_sin"].to(device),
     )
     return host, weights, runtime
+
+
+def draft_layer_weights(host: dict, rank: int, device):
+    """``rank``'s packed ``DraftLayerWeights`` on ``device`` of the host
+    tensors of :func:`draft_layer_inputs` (``host``)."""
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_layer
+
+    packed = draft_layer.pack_draft_layer(
+        {
+            "input_norm": host["in_gain"],
+            "post_norm": host["post_gain"],
+            "attn_coef": host["a_coef"],
+            "mlp_coef": host["m_coef"],
+            "attn_base": host["a_base"],
+            "mlp_base": host["m_base"],
+            "qkv": host["qkv_w"],
+            "q_norm": host["q_norm"],
+            "k_norm": host["k_norm"],
+            "o_proj": host["o_w"],
+            "gate_up": host["gu_w"],
+            "down": host["down_w"],
+        },
+        rank,
+    )
+    return draft_layer.DraftLayerWeights(
+        rank=rank,
+        **{
+            f: getattr(packed, f).to(device)
+            for f in packed.__dataclass_fields__
+            if f != "rank"
+        },
+    )

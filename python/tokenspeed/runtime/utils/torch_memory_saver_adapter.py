@@ -18,19 +18,81 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Map runtime allocation owners to shared pools and memory-saver lifecycle tags."""
+
+import os
+import re
 from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+from threading import RLock
 
 import torch
+
+_allocator_lock = RLock()
+_allocator_env = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+@contextmanager
+def _non_expandable_allocation():
+    if (
+        torch.version.cuda is None
+        or torch.cuda.memory.get_allocator_backend() != "native"
+    ):
+        yield
+        return
+    # PyTorch's setting is process-wide. Serialize saver scopes at startup and
+    # during drained maintenance, when other CUDA allocators are idle.
+    with _allocator_lock:
+        settings = torch.cuda.memory._snapshot()["allocator_settings"]
+        config = settings["PYTORCH_CUDA_ALLOC_CONF"]
+        expandable = settings["expandable_segments"]
+        previous = {name: os.environ.get(name) for name in _allocator_env}
+        try:
+            if expandable:
+                torch.cuda.memory._set_allocator_settings(
+                    f"{config},expandable_segments:False"
+                )
+            for name, value in previous.items():
+                if value is not None:
+                    os.environ[name] = re.sub(
+                        r"(expandable_segments\s*:\s*)True\b", r"\g<1>False", value
+                    )
+            yield
+        finally:
+            for name, value in previous.items():
+                if value is not None:
+                    os.environ[name] = value
+            if expandable:
+                # The last config string may omit the still-active setting.
+                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+                torch.cuda.memory._set_allocator_settings(config)
+
+
+_NAMED_REGION_POOLS = {
+    "executor_inputs": "persistent_buffers",
+    "runtime_states": "persistent_buffers",
+    "attention_state": "persistent_buffers",
+    "workspace": "persistent_buffers",
+}
 
 try:
     import torch_memory_saver
 
     _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
+    # A separate CUDA MemPool prevents allocator block reuse from mixing
+    # discardable weights/KV with persistent runtime buffers that must survive sleep.
+    _buffer_memory_savers = {
+        "persistent_buffers": torch_memory_saver.TorchMemorySaver()
+    }
 except ImportError:
     pass
+
+
+_active_buffer_pool: ContextVar[object | None] = ContextVar(
+    "tokenspeed_active_buffer_pool", default=None
+)
 
 
 _communication_initializers: ContextVar[list[Callable[[], None]] | None] = ContextVar(
@@ -64,6 +126,20 @@ class TorchMemorySaverAdapter(ABC):
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
+    def named_region(self, name: str):
+        """Allocate an owner's persistent buffers in its named region.
+
+        Logical names may alias the same CPU-backed pool. These buffers keep
+        their addresses and contents across the existing ``weights`` lifecycle.
+
+        Args:
+            name: The allocation owner's registered region name.
+
+        Raises:
+            KeyError: The region name is not registered.
+        """
+        raise NotImplementedError
+
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         """Capture context for ``graph``: ``torch.cuda.graph`` whose private
         memory pool, when the saver is enabled, lands in the pausable region
@@ -79,6 +155,27 @@ class TorchMemorySaverAdapter(ABC):
 
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+    @contextmanager
+    def named_region(self, name: str):
+        """Resolve the owner's pool and reuse it across nested allocation scopes."""
+        pool = _buffer_memory_savers[_NAMED_REGION_POOLS[name]]
+        # The native pause/resume API operates on process-wide tags. Restore
+        # before weight updates, even when KV is still paused. Back up values:
+        # some buffers contain constant tables, pointers and kernel semaphores.
+        # A backend can construct or grow the shared WorkspacePool. TMS disallows
+        # nested regions; allocations in this case already have the right owner.
+        if _active_buffer_pool.get() is pool:
+            yield
+            return
+        token = _active_buffer_pool.set(pool)
+        try:
+            with _non_expandable_allocation(), pool.region(
+                tag="weights", enable_cpu_backup=True
+            ):
+                yield
+        finally:
+            _active_buffer_pool.reset(token)
+
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
@@ -92,7 +189,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             pending: list[Callable[[], None]] = []
             token = _communication_initializers.set(pending)
             try:
-                with _primary_memory_saver.region(
+                with _non_expandable_allocation(), _primary_memory_saver.region(
                     tag=tag or "default", enable_cpu_backup=enable_cpu_backup
                 ):
                     yield
@@ -105,25 +202,43 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
 
         return active_region()
 
+    @contextmanager
     def cuda_graph(self, graph, *, pool, stream, tag: str):
+        """Back up graph RNG state before capturing discardable graph buffers."""
+        # PyTorch creates seed/offset storage when the generator is first
+        # registered, before graph capture enters its private allocator pool.
+        with self.named_region("runtime_states"):
+            graph.register_generator_state(
+                torch.cuda.default_generators[torch.cuda.current_device()]
+            )
         # Requires the library's preload hook mode, which configure_subprocess
         # sets up for the scheduler processes.
-        return _primary_memory_saver.cuda_graph(
+        with _non_expandable_allocation(), _primary_memory_saver.cuda_graph(
             cuda_graph=graph,
             pool=pool,
             stream=stream,
             tag=tag,
             enable_cpu_backup=False,
-        )
+        ):
+            yield
 
     def pause(self, tag: str | None = None):
-        return _primary_memory_saver.pause(tag=tag)
+        with _non_expandable_allocation():
+            return _primary_memory_saver.pause(tag=tag)
 
     def resume(self, tag: str | None = None):
-        return _primary_memory_saver.resume(tag=tag)
+        with _non_expandable_allocation():
+            return _primary_memory_saver.resume(tag=tag)
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+    @contextmanager
+    def named_region(self, name: str):
+        """Validate the owner name while leaving its allocations unmanaged."""
+        if name not in _NAMED_REGION_POOLS:
+            raise KeyError(name)
+        yield
+
     @contextmanager
     def configure_subprocess(self):
         yield

@@ -416,6 +416,49 @@ def test_staged_verify_reading_committed_state_matches_seeded_scratch(
     torch.testing.assert_close(in_place_state, seeded_state, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_chain_verify_conv_rows_match_the_split(state_dtype, replay):
+    """A chain verify whose conv update writes dense q/k/v rows and the
+    ReplaySSM payload, with the gates left as projection views, verifies and
+    commits exactly like the split of the convolved projection."""
+    conv, recurrent = _initial_pools(state_dtype=state_dtype)
+    inputs = _inputs()
+    # The model hands over views into one projection row: q | k | v | z | b | a.
+    projection = torch.cat(
+        (
+            inputs["mixed_qkv"],
+            torch.zeros_like(inputs["mixed_qkv"][:, :VALUE_DIM]),
+            inputs["b"],
+            inputs["a"],
+        ),
+        dim=-1,
+    )
+    inputs = dict(
+        inputs,
+        mixed_qkv=projection[:, :CONV_DIM],
+        b=projection[:, -2 * NUM_V_HEADS : -NUM_V_HEADS],
+        a=projection[:, -NUM_V_HEADS:],
+    )
+    accepted = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
+    results = []
+    for conv_rows in (False, True):
+        backend, pool = _make_backend(conv.clone(), recurrent.clone(), replay=replay)
+        backend._verify_conv_writes_rows = conv_rows
+        out = _prepare_verify(backend, pool, inputs)
+        backend.commit_verified_state(accepted, accepted_path=None)
+        torch.cuda.synchronize()
+        results.append(
+            (
+                out,
+                pool.get_component(0, "conv_state").clone(),
+                pool.get_component(0, "recurrent_state").clone(),
+            )
+        )
+    for split, rows in zip(*results):
+        torch.testing.assert_close(rows, split, atol=0.0, rtol=0.0)
+
+
 def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     """GdnAttnBackend reads the committed state in place and the packed q/k/v
     views exactly where the selected verify kernel accepts them."""

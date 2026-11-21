@@ -157,6 +157,7 @@ def install(source: Path) -> None:
             sys.executable,
             "-c",
             "import os, tokenspeed_engine; "
+            "from tokenspeed_engine._host import run_host; "
             "assert os.access(tokenspeed_engine.host_binary(), os.X_OK)",
         ],
         check=True,
@@ -213,7 +214,9 @@ def install_engine(workspace: Path, requirements: list[str]) -> None:
     """
     # Resolve the declared build dependencies first, then key their actual
     # versions. PEP 517 isolation would hide a different set from this key.
-    pip("install", *requirements)
+    with (workspace / "tokenspeed-engine/pyproject.toml").open("rb") as stream:
+        dependencies = tomllib.load(stream)["project"]["dependencies"]
+    pip("install", *requirements, *dependencies)
     start = time.monotonic()
     root = wheel_cache_root()
     if root is None:

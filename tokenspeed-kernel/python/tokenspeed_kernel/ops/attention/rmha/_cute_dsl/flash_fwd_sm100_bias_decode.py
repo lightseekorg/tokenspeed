@@ -55,6 +55,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import torch
 from cutlass import testing
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack
@@ -87,6 +88,19 @@ from quack import copy_utils
 
 # Kernel invariants
 mma_modes = (0, 1, 2)
+# MXFP8-KV mode: BF16 K stages (64 head_dim columns of a 128-token tile) in
+# tensor memory, BF16 V stages in shared memory, and at most this many raw
+# FP8 tile stages (128x128 plus scales) in the rest of shared memory.
+kv_mxfp8_k_stages = 4
+kv_mxfp8_v_stages = 4
+kv_mxfp8_max_raw_stages = 8
+# Per-thread registers of the MXFP8-KV mode's warpgroups after resizing:
+# (MMA/TMA, softmax, dequant); the correction warpgroup takes the rest.
+kv_mxfp8_regs = (32, 112, 64)
+# MXFP8-KV dequantization: V passes (8 token rows each) per load batch, and
+# K TMEM columns per store (one 16-dim chunk).
+kv_mxfp8_v_chunk = 8
+kv_mxfp8_k_store_cols = 8
 mma_dice = (None, None, None)  # (MMA, #MMA_M, #MMA_K)
 warp_threads = 32
 warpgroup_warps = 4
@@ -321,6 +335,81 @@ def cvt_bf16x2_ue8m0x2(
     )
 
 
+@dsl_user_op
+def cvt_bf16x8_e4m3x8_ue8m0(
+    lo: Int32, hi: Int32, scales: Int32, *, loc=None, ip=None
+) -> Tuple[Int32, Int32, Int32, Int32]:
+    """Eight E4M3 values (two words, element 0 in the low byte) times one
+    UE8M0 scale, duplicated in bytes 0 and 1 of ``scales``, as four packed
+    BF16 pairs: one fused scaled converter instruction per pair, rounding
+    the exact product to nearest."""
+    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>")
+    res = llvm.inline_asm(
+        struct_ty,
+        [
+            Int32(lo).ir_value(loc=loc, ip=ip),
+            Int32(hi).ir_value(loc=loc, ip=ip),
+            Int32(scales).ir_value(loc=loc, ip=ip),
+        ],
+        "{.reg .b16 a0, a1, a2, a3, s0, s1;\n\t"
+        "mov.b32 {a0, a1}, $4;\n\t"
+        "mov.b32 {a2, a3}, $5;\n\t"
+        "mov.b32 {s0, s1}, $6;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 $0, a0, s0;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 $1, a1, s0;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 $2, a2, s0;\n\t"
+        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 $3, a3, s0;}",
+        "=r,=r,=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    i32 = T.i32()
+    return tuple(
+        Int32(llvm.extractvalue(i32, res, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+@dsl_user_op
+def byte_pair(word: Int32, byte: Int32, *, loc=None, ip=None) -> Int32:
+    """Byte ``byte`` of ``word`` in bytes 0 and 1 of the result (one PRMT)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(word).ir_value(loc=loc, ip=ip),
+                Int32(byte * 0x11 + 0x4400).ir_value(loc=loc, ip=ip),
+            ],
+            "prmt.b32 $0, $1, 0, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def sigmoid_reference(x: Float32, *, loc=None, ip=None) -> Float32:
+    """``rcp.approx(ex2.approx(-x * log2(e)) + 1)``, subnormals kept: the
+    reference kernels' sigmoid, bit for bit as ``rel_mha_gate_sink`` evaluates
+    it on NVIDIA."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 t; mul.rn.f32 t, $1, 0fBFB8AA3B; ex2.approx.f32 t, t; "
+            "add.rn.f32 t, t, 0f3F800000; rcp.approx.f32 $0, t; }",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 @cute.jit
 def cvt_tensor_ue8m0_to_bf16(scales: cute.Tensor, output: cute.Tensor):
     """Convert an even-sized UE8M0 register fragment to BF16."""
@@ -480,6 +569,13 @@ class FlashAttentionDecodeSm100Bias:
         window_size_left: Optional causal sliding-window left extent.
         page_size: Optional physical KV page size (8, 16, 32, 64, 128, or 256).
             Page sizes 128 and 256 are supported for dense BF16/FP16 Q/K/V only.
+        kv_mxfp8: Static K/V-storage gate. When true, the paged K/V cache is
+            MXFP8 (FP8 E4M3 plus one UE8M0 scale per token, head and 32
+            head_dim elements, in ``quantize_store_kv_mxfp8``'s layout). A
+            fifth warpgroup dequantizes each tile to BF16, K into tensor
+            memory (GEMM1's A operand) and V into shared memory; both GEMMs
+            then compute exactly what they do with a BF16 cache and BF16 Q.
+            Requires 128-token pages, 128-token sequence tiles and D = 128.
     """
 
     def __init__(
@@ -503,6 +599,7 @@ class FlashAttentionDecodeSm100Bias:
         window_size_left=None,
         page_size=None,
         use_pdl: bool = True,
+        kv_mxfp8: bool,
     ):
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
@@ -522,8 +619,11 @@ class FlashAttentionDecodeSm100Bias:
         self.window_size_left = window_size_left
         self.page_size = page_size
         self.use_pdl = use_pdl
+        self.kv_mxfp8 = kv_mxfp8
         self.is_paged_kv = page_size is not None
-        self.threads_per_cta = 4 * warpgroup_threads
+        # MXFP8 K/V adds a warpgroup that dequantizes the cache tiles.
+        self.dequant_threads = warpgroup_threads if kv_mxfp8 else 0
+        self.threads_per_cta = 4 * warpgroup_threads + self.dequant_threads
 
         assert headdim > 0 and headdim % 64 == 0
         assert grouped_head_tile * prediction_tile in (1, 2, 4, 8, 16, 32)
@@ -538,6 +638,13 @@ class FlashAttentionDecodeSm100Bias:
         assert page_size not in (128, 256) or not (qk_blockscaled or v_dequant)
         assert page_size is None or sequence_tile % page_size == 0
         assert page_size is None or 128 % page_size == 0 or page_size % 128 == 0
+        assert not kv_mxfp8 or (
+            page_size == 128
+            and sequence_tile == 128
+            and headdim == 128
+            and not qk_blockscaled
+            and not v_dequant
+        )
 
     ##############################
     # Launch helpers
@@ -832,6 +939,16 @@ class FlashAttentionDecodeSm100Bias:
         )
         return cute.make_tensor(t_pshg.iterator, layout)
 
+    @staticmethod
+    def paged_kv_scale_view(t_phb: cute.Tensor):
+        """View (pages, heads, bytes) MXFP8 KV scales as (bytes, (heads, pages))."""
+        pages, heads, sf_bytes = t_phb.shape
+        stride_p, stride_h, _ = t_phb.stride
+        layout = cute.make_layout(
+            (sf_bytes, (heads, pages)), stride=(1, (stride_h, stride_p))
+        )
+        return cute.make_tensor(t_phb.iterator, layout)
+
     # Pack, reorder, and group modes for GEMM workspace
     @staticmethod
     def gemm_view_bsh(t_bsh: cute.Tensor, h_k: int):
@@ -1053,6 +1170,9 @@ class FlashAttentionDecodeSm100Bias:
         max_seqlen_k: Int32 | int | None = None,
         mPageTable: Optional[cute.Tensor] = None,
         mPageTableOffsets: Optional[cute.Tensor] = None,
+        lse_bsh: Optional[cute.Tensor] = None,
+        gate_bshd: Optional[cute.Tensor] = None,
+        sink_bsh: Optional[cute.Tensor] = None,
         stream: cuda.CUstream = None,
     ):
         """Launch fixed-length, native packed-varlen, or paged-KV Decode.
@@ -1088,6 +1208,10 @@ class FlashAttentionDecodeSm100Bias:
         FP8 V is dequantized into v_mma_dtype after TMA and GEMM2 remains a
         normal BF16/FP16 multiply with FP32 accumulation.
 
+        ``lse_bsh`` (kernel reduction only) receives each query row's
+        natural-log softmax LSE, FP32 (B, Sq, Hq); rows without a visible key
+        get ``-inf``. ``o_bshd`` may be FP32 for an unrounded output.
+
         Returns:
             None. Results are written to ``o_bshd`` and, for non-direct fixed
             modes, the supplied reduction workspaces.
@@ -1097,9 +1221,13 @@ class FlashAttentionDecodeSm100Bias:
         ##############################
         qk_dtype = q_bshd.dtype
         v_dtype = v_bshd.dtype
-        v_mma_dtype = (
-            self.v_mma_dtype if cutlass.const_expr(self.v_dequant) else v_dtype
-        )
+        # MXFP8 K/V become BF16 in shared memory: the GEMMs see the Q dtype.
+        if cutlass.const_expr(self.v_dequant):
+            v_mma_dtype = self.v_mma_dtype
+        elif cutlass.const_expr(self.kv_mxfp8):
+            v_mma_dtype = qk_dtype
+        else:
+            v_mma_dtype = v_dtype
         p_dtype = v_mma_dtype
         sf_dtype = q_sf.dtype if cutlass.const_expr(q_sf is not None) else qk_dtype
         vsf_dtype = v_sf.dtype if cutlass.const_expr(v_sf is not None) else v_dtype
@@ -1112,7 +1240,7 @@ class FlashAttentionDecodeSm100Bias:
         is_varlen_k = (
             mCuSeqlensK is not None or mSeqUsedK is not None
         ) and not is_paged_kv
-        assert k_bshd.dtype == qk_dtype
+        assert k_bshd.dtype == (Float8E4M3FN if self.kv_mxfp8 else qk_dtype)
         if cutlass.const_expr(bias_bshr is not None):
             assert bias_bshr.dtype == v_mma_dtype
         if cutlass.const_expr(mTau is not None):
@@ -1160,13 +1288,20 @@ class FlashAttentionDecodeSm100Bias:
             assert not self.v_dequant or v_dtype in (Float8E4M3FN, Float8E5M2)
             if cutlass.const_expr(is_varlen_q):
                 assert cute.rank(q_sf) == cute.rank(k_sf) == 6
+        elif cutlass.const_expr(self.kv_mxfp8):
+            # (pages, heads_k, 512) scale bytes per page and head.
+            assert is_paged_kv and qk_dtype == BFloat16 and q_sf is None
+            assert v_dtype == Float8E4M3FN
+            assert k_sf is not None and v_sf is not None
+            assert k_sf.dtype == v_sf.dtype == Float8E8M0FNU
+            assert cute.rank(k_sf) == cute.rank(v_sf) == 3
         else:
             assert q_sf is None and k_sf is None
             assert self.v_dequant or qk_dtype == v_dtype
         if cutlass.const_expr(self.v_dequant):
             assert v_sf is not None and v_sf.dtype == Float8E8M0FNU
             assert v_dtype in (Float8E4M3FN, Float8E5M2)
-        else:
+        elif cutlass.const_expr(not self.kv_mxfp8):
             assert v_sf is None
             assert v_dtype in (BFloat16, Float16)
 
@@ -1250,6 +1385,12 @@ class FlashAttentionDecodeSm100Bias:
                 acc_dtype,
                 tcgen05.CtaGroup.ONE,
                 qk_mma_tile_mnk[:2],
+                # Dequantized MXFP8 K tiles live in tensor memory.
+                (
+                    tcgen05.OperandSource.TMEM
+                    if cutlass.const_expr(self.kv_mxfp8)
+                    else tcgen05.OperandSource.SMEM
+                ),
             )
             qsf_mma_tile_mnk = qk_mma_tile_mnk
             tiled_mma_qsf = tiled_mma_kq
@@ -1306,6 +1447,10 @@ class FlashAttentionDecodeSm100Bias:
         tmem_alloc_cols = mma_tile_n * o_stages  # per-thread colsum
         tmem_alloc_cols += tiles_dm * mma_tile_n * o_stages  # O
         sf_tmem_cols = 32 if cutlass.const_expr(self.qk_blockscaled) else 0
+        # MXFP8 K: packed BF16 pairs, 32-bit columns per K stage.
+        k_stages = kv_mxfp8_k_stages if cutlass.const_expr(self.kv_mxfp8) else 0
+        k_tmem_stage_cols = qk_mma_tile_k * qk_dtype.width // 32
+        tmem_alloc_cols += k_stages * k_tmem_stage_cols  # K
         max_s_stages = (
             tmem_capacity_cols - tmem_alloc_cols - sf_tmem_cols
         ) // tmem_s_stage_cols
@@ -1385,15 +1530,35 @@ class FlashAttentionDecodeSm100Bias:
             else max(k_stage_bits + ksf_stage_bits, v_stage_bits)
         )
         kv_stage_bits += ksf_scratch_stage_bits
-        kv_stages = remaining_bits // kv_stage_bits
-        kv_pipeline_count = 3 if parallel_v_dequant else 1
-        kv_stages -= (
-            1
-            if (kv_stages * pipe_stage_bits * kv_pipeline_count > alignment_bits)
-            else 0
-        )
+        if cutlass.const_expr(self.kv_mxfp8):
+            # Shared memory holds the BF16 V stages (an even count: a V tile's
+            # two stages are always adjacent) and, in the rest, raw FP8 tiles
+            # (data + scales, in 1024 B and 128 B aligned buffers).
+            kv_stages = kv_mxfp8_v_stages
+            raw_tile_elems = mma_tile_m * blk_tile_d
+            raw_sf_elems = mma_tile_m * (blk_tile_d // 32)
+            raw_stage_bits = (
+                raw_tile_elems * v_dtype.width
+                + raw_sf_elems * vsf_dtype.width
+                + pipe_stage_bits
+            )
+            remaining_bits -= kv_stages * (v_stage_bits + pipe_stage_bits)
+            remaining_bits -= k_stages * pipe_stage_bits + (1024 + 128) * 8
+            raw_stages = min(kv_mxfp8_max_raw_stages, remaining_bits // raw_stage_bits)
+            assert raw_stages >= 2
+        else:
+            raw_stages = 0
+            kv_stages = remaining_bits // kv_stage_bits
+            kv_pipeline_count = 3 if parallel_v_dequant else 1
+            kv_stages -= (
+                1
+                if (kv_stages * pipe_stage_bits * kv_pipeline_count > alignment_bits)
+                else 0
+            )
 
-        print(f"\ts stages: {s_stages}\tkv stages: {kv_stages}")
+        print(
+            f"\ts stages: {s_stages}\tkv stages: {kv_stages}\traw stages: {raw_stages}"
+        )
 
         ##############################
         # TMA creation
@@ -1410,7 +1575,9 @@ class FlashAttentionDecodeSm100Bias:
             # ((h_g, s_q), d, (h_k, b))
             mQ_nkl = self.gemm_view(self.gqa_pack(q_bshd, h_k), True)
             mK_mkl = self.gemm_view(k_bshd, True)
-            mV_mkl = self.gemm_view(v_bshd, False)
+            # Raw MXFP8 V tiles load token-major like K; dequantization
+            # writes them in the MMA's V layout.
+            mV_mkl = self.gemm_view(v_bshd, self.kv_mxfp8)
             # (d, (h_g, s_q), (h_k, b_partial))
             mO_mnl = self.gemm_view(self.gqa_pack(o_bshd_, h_k), False)
         if cutlass.const_expr(self.qk_blockscaled):
@@ -1482,13 +1649,20 @@ class FlashAttentionDecodeSm100Bias:
                 )
         else:
             mVSF_mkl = None
+        if cutlass.const_expr(self.kv_mxfp8):
+            mKSF_mkl = self.paged_kv_scale_view(k_sf)
+            mVSF_mkl = self.paged_kv_scale_view(v_sf)
 
         # (MMA, MMA_M/N, MMA_K, stages)
         smem_layout_q = sm100_utils.make_smem_layout_b(
             tiled_mma_kq, qk_mma_tile_mnk, qk_dtype, tiles_dk
         )
+        # MXFP8 K stages are tensor memory; this layout addresses them.
         smem_layout_k = sm100_utils.make_smem_layout_a(
-            tiled_mma_kq, qk_mma_tile_mnk, qk_dtype, kv_stages
+            tiled_mma_kq,
+            qk_mma_tile_mnk,
+            qk_dtype,
+            k_stages if cutlass.const_expr(self.kv_mxfp8) else kv_stages,
         )
         smem_layout_v = sm100_utils.make_smem_layout_a(
             tiled_mma_vp, pv_mma_tile_mnk, v_mma_dtype, kv_stages
@@ -1511,7 +1685,7 @@ class FlashAttentionDecodeSm100Bias:
         else:
             smem_layout_vq = smem_layout_v
             smem_layout_vsf = None
-        if cutlass.const_expr(is_paged_kv):
+        if cutlass.const_expr(is_paged_kv and not self.kv_mxfp8):
             # TMA cannot span a non-affine page-table mapping.  Re-express the
             # MMA stage as page/chunk slots so multiple page-local TMAs
             # reconstruct the same contiguous K/V tile in shared memory.
@@ -1590,6 +1764,24 @@ class FlashAttentionDecodeSm100Bias:
         else:
             smem_layout_ksf_scratch = None
             smem_layout_ksf_scratch_tma = None
+        if cutlass.const_expr(self.kv_mxfp8):
+            # One raw stage holds a token-major FP8 K or V tile, 128 B rows in
+            # 128 B swizzle atoms (a thread reading its own K row and a warp
+            # reading V rows both avoid bank conflicts), and its scales as
+            # the cache stores them (u32 word (r % 32) * 4 + r // 32 of token
+            # row r; byte g scales dims [32 g, 32 g + 32)).
+            smem_layout_raw = cute.tile_to_shape(
+                tcgen05.make_smem_layout_atom(
+                    tcgen05.mma.SmemLayoutAtomKind.K_SW128, v_dtype
+                ),
+                (mma_tile_m, blk_tile_d, raw_stages),
+                order=(0, 1, 2),
+            )
+            smem_layout_raw_sf = cute.make_layout(
+                (raw_sf_elems, raw_stages), stride=(1, raw_sf_elems)
+            )
+        else:
+            smem_layout_raw = smem_layout_raw_sf = None
 
         o_smem_dtype = mO_mnl.dtype
         smem_layout_atom_o = tcgen05.make_smem_layout_atom(
@@ -1620,7 +1812,15 @@ class FlashAttentionDecodeSm100Bias:
             qk_tma_tile_mnk,
             tiled_mma_kq,
         )
-        if cutlass.const_expr(is_paged_kv):
+        if cutlass.const_expr(self.kv_mxfp8):
+            raw_stage_layout = cute.slice_(smem_layout_raw, (None, None, 0))
+            tma_atom_k, tma_tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op, mK_mkl, raw_stage_layout, (mma_tile_m, blk_tile_d)
+            )
+            tma_atom_v, tma_tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op, mV_mkl, raw_stage_layout, (mma_tile_m, blk_tile_d)
+            )
+        elif cutlass.const_expr(is_paged_kv):
             tma_atom_k, tma_tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
                 tma_load_op,
                 mK_mkl,
@@ -1712,6 +1912,22 @@ class FlashAttentionDecodeSm100Bias:
         else:
             tma_atom_ksf = tma_tensor_ksf = None
             tma_atom_qsf = tma_tensor_qsf = None
+        if cutlass.const_expr(self.kv_mxfp8):
+            raw_sf_stage_layout = cute.slice_(smem_layout_raw_sf, (None, 0))
+            tma_atom_ksf, tma_tensor_ksf = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mKSF_mkl,
+                raw_sf_stage_layout,
+                (raw_sf_elems,),
+                internal_type=cutlass.Int16,
+            )
+            tma_atom_vsf, tma_tensor_vsf = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mVSF_mkl,
+                raw_sf_stage_layout,
+                (raw_sf_elems,),
+                internal_type=cutlass.Int16,
+            )
 
         # GEMM views for workspace tensors
         mM_partial_nl = mL_partial_nl = None
@@ -1806,6 +2022,8 @@ class FlashAttentionDecodeSm100Bias:
             mM_partial_nl,
             mL_partial_nl,
             scale_s_log2_e,
+            smem_layout_raw,
+            smem_layout_raw_sf,
             mTau,
         ).launch(
             grid=grid,
@@ -1816,6 +2034,9 @@ class FlashAttentionDecodeSm100Bias:
             use_pdl=self.use_pdl,
         )
 
+        if cutlass.const_expr(lse_bsh is not None or gate_bshd is not None):
+            assert self.do_kernel_red, "the kernel reduction writes lse_bsh and gates"
+        assert (gate_bshd is None) == (sink_bsh is None), "gate and sink go together"
         if cutlass.const_expr(self.do_kernel_red):
             self.launch_reduction(
                 self.headdim,
@@ -1823,6 +2044,9 @@ class FlashAttentionDecodeSm100Bias:
                 o_partial_bshd,
                 m_partial_bsh,
                 l_partial_bsh,
+                lse_bsh,
+                gate_bshd,
+                sink_bsh,
                 stream,
                 self.use_pdl,
             )
@@ -2118,6 +2342,292 @@ class FlashAttentionDecodeSm100Bias:
         cute.arch.fence_view_async_shared()
         cute.arch.sync_warp()
 
+    @cute.jit
+    def dequant_v_tile_mxfp8(
+        self,
+        sRaw: cute.Tensor,
+        sRawSF: cute.Tensor,
+        sDst: cute.Tensor,
+        raw_stage: Int32,
+        dst_pair: Int32,
+        rows_valid: Int32,
+        tidx: Int32,
+        num_threads: int,
+    ):
+        """Dequantize one raw MXFP8 V tile into its two BF16 V stages.
+
+        ``sRaw`` (tokens, dims, raw stages) holds the FP8 tiles, ``sRawSF``
+        (bytes, raw stages) their scales, and ``sDst`` (tokens, dims, stage
+        pairs) views the BF16 V stages. Element (t, d) becomes
+        fp8 * 2^(scale - 127), exact in BF16; tokens at or past ``rows_valid``
+        are zero, as cache rows past the sequence may hold stale NaNs.
+        """
+        tile_tokens, tile_dims, raw_stages = (
+            cute.size(sRaw, mode=[i]) for i in range(3)
+        )
+        num_elems = 8
+        threads_per_row = tile_dims // num_elems
+        tiled_copy_s2r = copy_utils.tiled_copy_2d(
+            sRaw.element_type,
+            threads_per_row=threads_per_row,
+            num_threads=num_threads,
+            num_copy_elems=num_elems,
+        )
+        tiled_copy_r2s = copy_utils.tiled_copy_2d(
+            sDst.element_type,
+            threads_per_row=threads_per_row,
+            num_threads=num_threads,
+            num_copy_elems=num_elems,
+        )
+        thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
+        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+        # Pass p covers token rows [p * rows_per_pass, (p + 1) * rows_per_pass);
+        # this thread takes row r0 of them and dims [8 c, 8 c + 8).
+        source = thr_copy_s2r.partition_S(sRaw)[None, None, 0, raw_stage]
+        destination = thr_copy_r2s.partition_D(sDst)[None, None, 0, dst_pair]
+        # Token r's scales are u32 word (r % 32) * 4 + r // 32 of the stage,
+        # byte g covering dims [32 g, 32 g + 32).
+        sSF_words = cute.make_tensor(
+            cute.recast_ptr(sRawSF.iterator, dtype=Int32),
+            cute.make_layout(
+                ((32, tile_tokens // 32), raw_stages),
+                stride=((4, 1), tile_tokens),
+            ),
+        )
+        store = partial(
+            self.dequant_v_rows_mxfp8,
+            source=source,
+            destination=destination,
+            sSF_words=sSF_words,
+            tiled_copy_r2s=tiled_copy_r2s,
+            raw_stage=raw_stage,
+            rows_per_pass=num_threads // threads_per_row,
+            row_in_pass=tidx // threads_per_row,
+            scale_byte=(tidx % threads_per_row) * num_elems // 32,
+            rows_valid=rows_valid,
+        )
+        # Only a request's last tile has rows past its length.
+        if rows_valid >= tile_tokens:
+            store(masked=False)
+        else:
+            store(masked=True)
+
+    @cute.jit
+    def dequant_v_rows_mxfp8(
+        self,
+        source: cute.Tensor,
+        destination: cute.Tensor,
+        sSF_words: cute.Tensor,
+        tiled_copy_r2s: cute.TiledCopy,
+        raw_stage: Int32,
+        rows_per_pass: int,
+        row_in_pass: Int32,
+        scale_byte: Int32,
+        rows_valid: Int32,
+        masked: cutlass.Constexpr[bool],
+    ):
+        """Convert and store this thread's passes of one V tile, a chunk of
+        passes at a time with the chunk's loads ahead of its stores."""
+        num_passes = cute.size(source.shape[1])
+        chunk = min(kv_mxfp8_v_chunk, num_passes)
+        # With 8-row passes, pass p = 4 a + b reads scale word
+        # (8 b + r0) * 4 + a: one vector load per b serves a chunk's a's.
+        tokens = cute.size(sSF_words, mode=[0])
+        assert rows_per_pass == 8 and tokens == 128 and chunk % 4 == 0
+        words_per_load = chunk // 4
+        sSF_groups = cute.make_tensor(
+            sSF_words.iterator,
+            cute.make_layout(
+                (
+                    (words_per_load, 4 // words_per_load),
+                    8,
+                    4,
+                    cute.size(sSF_words, mode=[1]),
+                ),
+                stride=((1, words_per_load), 4, 32, tokens),
+            ),
+        )
+        for first in cutlass.range_constexpr(0, num_passes, chunk):
+            raws = []
+            scale_words = []
+            grouped = cute.make_rmem_tensor((words_per_load, 4), Int32)
+            for b in cutlass.range_constexpr(4):
+                cute.autovec_copy(
+                    sSF_groups[(None, first // chunk), row_in_pass, b, raw_stage],
+                    grouped[None, b],
+                )
+            for p in cutlass.range_constexpr(first, first + chunk):
+                raw = cute.make_fragment_like(source[None, p])
+                cute.autovec_copy(source[None, p], raw)
+                raws.append(cute.recast_tensor(raw, Int32))
+                scale_words.append(grouped[(p - first) // 4, p % 4])
+            for i in cutlass.range_constexpr(chunk):
+                lo = raws[i][0]
+                hi = raws[i][1]
+                scales = byte_pair(scale_words[i], scale_byte)
+                if cutlass.const_expr(masked):
+                    # Past the sequence: zero data and a unit scale (127).
+                    valid = (first + i) * rows_per_pass + row_in_pass < rows_valid
+                    lo = lo if valid else Int32(0)
+                    hi = hi if valid else Int32(0)
+                    scales = scales if valid else Int32(0x7F7F)
+                dst_values = destination[None, first + i]
+                converted = cute.make_fragment_like(dst_values)
+                converted_words = cute.recast_tensor(converted, Int32)
+                bf16_pairs = cvt_bf16x8_e4m3x8_ue8m0(lo, hi, scales)
+                for pair in cutlass.range_constexpr(4):
+                    converted_words[pair] = bf16_pairs[pair]
+                cute.copy(tiled_copy_r2s, converted, dst_values)
+
+    @cute.jit
+    def dequant_v_item_mxfp8(
+        self,
+        sRaw: cute.Tensor,
+        sRawSF: cute.Tensor,
+        sV_tiles: cute.Tensor,
+        rows_valid: Int32,
+        raw_pipeline: pipeline.PipelineTmaAsync,
+        v_pipeline: pipeline.PipelineAsyncUmma,
+        raw_state: pipeline.PipelineState,
+        v_state: pipeline.PipelineState,
+        tidx: Int32,
+    ):
+        """The dequant warpgroup turns the raw V tile at ``raw_state`` into
+        the BF16 V stage pair at ``v_state`` in shared memory."""
+        second_state = v_state.clone()
+        second_state.advance()
+        raw_pipeline.consumer_wait(raw_state)
+        v_pipeline.producer_acquire(v_state)
+        v_pipeline.producer_acquire(second_state)
+        self.dequant_v_tile_mxfp8(
+            sRaw,
+            sRawSF,
+            sV_tiles,
+            raw_state.index,
+            v_state.index // 2,
+            rows_valid,
+            tidx,
+            warpgroup_threads,
+        )
+        # Every lane fences its writes for the MMA (async proxy); after the
+        # warp sync, each warp's lane 0 releases the raw stage and commits
+        # both stages.
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        raw_pipeline.consumer_release(raw_state)
+        if tidx % warp_threads == 0:
+            v_pipeline.producer_commit(v_state)
+            v_pipeline.producer_commit(second_state)
+        raw_state.advance()
+        second_state.advance()
+        return raw_state, second_state
+
+    @cute.jit
+    def dequant_k_item_mxfp8(
+        self,
+        sRaw: cute.Tensor,
+        sRawSF: cute.Tensor,
+        tKtK: cute.Tensor,
+        chunk_layout: cute.Layout,
+        stage_cols: int,
+        rows_valid: Int32,
+        raw_pipeline: pipeline.PipelineTmaAsync,
+        k_pipeline: pipeline.PipelineAsyncUmma,
+        raw_state: pipeline.PipelineState,
+        k_state: pipeline.PipelineState,
+        tidx: Int32,
+    ):
+        """The dequant warpgroup turns the raw K tile at ``raw_state`` into
+        BF16 K stages of ``tKtK`` (MMA C-shaped, 128 lanes x ``stage_cols``
+        32-bit columns per stage) in tensor memory: thread t converts token
+        row t into lane t, column c holding dims 2c and 2c + 1 of the stage."""
+        tile_tokens, tile_dims, raw_stages = (
+            cute.size(sRaw, mode=[i]) for i in range(3)
+        )
+        num_elems = 16
+        stage_dims = stage_cols * 2
+        chunks_per_stage = stage_dims // num_elems
+        # Thread t reads row t, 16 bytes per copy (the raw tile's 128 B swizzle
+        # atoms keep a warp's rows on distinct banks).
+        tiled_copy_s2r = copy_utils.tiled_copy_2d(
+            sRaw.element_type,
+            threads_per_row=1,
+            num_threads=warpgroup_threads,
+            num_copy_elems=num_elems,
+        )
+        thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
+        sSF_words = cute.make_tensor(
+            cute.recast_ptr(sRawSF.iterator, dtype=Int32),
+            cute.make_layout(
+                ((32, tile_tokens // 32), raw_stages),
+                stride=((4, 1), tile_tokens),
+            ),
+        )
+        # Converted columns are stored kv_mxfp8_k_store_cols at a time.
+        chunk_cols = kv_mxfp8_k_store_cols
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.St32x32bOp(tcgen05.Repetition(chunk_cols)), Float32
+        )
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.Ld32x32bOp(tcgen05.Repetition(chunk_cols)), Float32
+        )
+        valid = tidx < rows_valid
+        num_subs = tile_dims // stage_dims
+        stage_states = [k_state.clone()]
+        for _ in cutlass.range_constexpr(num_subs - 1):
+            stage_states.append(stage_states[-1].clone())
+            stage_states[-1].advance()
+        raw_pipeline.consumer_wait(raw_state)
+        source = thr_copy_s2r.partition_S(sRaw)[None, 0, None, raw_state.index]
+        scale_word = sSF_words[tidx, raw_state.index]
+        raws = []
+        for chunk in cutlass.range_constexpr(tile_dims // num_elems):
+            raw = cute.make_fragment_like(source[None, chunk])
+            cute.autovec_copy(source[None, chunk], raw)
+            raws.append(cute.recast_tensor(raw, Int32))
+        for sub in cutlass.range_constexpr(num_subs):
+            state = stage_states[sub]
+            k_pipeline.producer_acquire(state)
+            chunks_per_store = chunk_cols * 2 // num_elems
+            for g in cutlass.range_constexpr(chunks_per_stage // chunks_per_store):
+                columns = cute.make_tensor(
+                    tKtK.iterator + state.index * stage_cols + g * chunk_cols,
+                    chunk_layout,
+                )
+                thr_tmem = tcgen05.make_tmem_copy(tmem_load_atom, columns).get_slice(
+                    tidx
+                )
+                words = cute.make_rmem_tensor(
+                    thr_tmem.partition_D(columns).shape, Float32
+                )
+                words_i32 = cute.recast_tensor(words, Int32)
+                for cc in cutlass.range_constexpr(chunks_per_store):
+                    c = g * chunks_per_store + cc
+                    chunk = sub * chunks_per_stage + c
+                    scales = byte_pair(scale_word, chunk * num_elems // 32)
+                    # Past the sequence: zero data and a unit scale (127).
+                    scales = scales if valid else Int32(0x7F7F)
+                    for half in cutlass.range_constexpr(2):
+                        lo = raws[chunk][2 * half] if valid else Int32(0)
+                        hi = raws[chunk][2 * half + 1] if valid else Int32(0)
+                        pairs = cvt_bf16x8_e4m3x8_ue8m0(lo, hi, scales)
+                        for w in cutlass.range_constexpr(4):
+                            words_i32[cc * 8 + half * 4 + w] = pairs[w]
+                cute.copy(tmem_store_atom, words, thr_tmem.partition_S(columns))
+        # The raw tile is consumed; the stores complete before each warp's
+        # lane 0 commits the stages.
+        cute.arch.sync_warp()
+        raw_pipeline.consumer_release(raw_state)
+        cute.arch.fence_view_async_tmem_store()
+        cute.arch.sync_warp()
+        if tidx % warp_threads == 0:
+            for sub in cutlass.range_constexpr(num_subs):
+                k_pipeline.producer_commit(stage_states[sub])
+        for _ in cutlass.range_constexpr(num_subs):
+            k_state.advance()
+        raw_state.advance()
+        return raw_state, k_state
+
     @cute.kernel
     def decode(
         self,
@@ -2180,6 +2690,9 @@ class FlashAttentionDecodeSm100Bias:
         mM_partial: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
+        # Raw FP8 K/V tile and scale stages of the MXFP8-KV mode
+        smem_layout_raw: Optional[cute.ComposedLayout],
+        smem_layout_raw_sf: Optional[cute.Layout],
         # Optional fp32 per-query-row scale on the total pre-softmax logits
         mTau: Optional[cute.Tensor] = None,
     ):
@@ -2230,6 +2743,10 @@ class FlashAttentionDecodeSm100Bias:
         is_local = window_size_left is not None
         is_paged_kv = self.is_paged_kv
         parallel_v_dequant = self.v_dequant
+        kv_mxfp8 = self.kv_mxfp8
+        # K and V stages in separate pipelines: MMA KQ and VP each consume
+        # only their own (no skipping the other warp's stages).
+        split_kv_pipelines = parallel_v_dequant or kv_mxfp8
         is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
         is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         if cutlass.const_expr(is_paged_kv):
@@ -2256,21 +2773,34 @@ class FlashAttentionDecodeSm100Bias:
 
         correction_warpgroup_id = warpgroup_id
         warpgroup_id += 1
+
+        # MXFP8 K/V: a free-running warpgroup turns raw FP8 tiles into the
+        # BF16 MMA stages, so no warp of the softmax/correction handshakes
+        # waits on the dequantization.
+        dequant_warpgroup_id = warpgroup_id
+        if cutlass.const_expr(kv_mxfp8):
+            warpgroup_id += 1
         assert self.threads_per_cta == warpgroup_id * warpgroup_threads
 
-        # Register allocations
+        # Register allocations. Every warp launches with launch_regs: an
+        # SM partition's 16K registers over its (up to five) warps, in
+        # 8-register steps. The warpgroups then resize within that pool.
         use_reg_reconfig = blk_tile_n > 16
         max_sw_regs_per_wg_thread = 256  # CUDA limitation
-        max_hw_regs_per_wg_thread = 64 * 1024 // warpgroup_threads  # 64K regs per SM
+        warps_per_partition = self.threads_per_cta // warp_threads // 4
+        launch_regs = 16 * 1024 // (warps_per_partition * warp_threads) // 8 * 8
+        pool_regs_per_wg_thread = launch_regs * warpgroup_id
         mma_tma_regs = 96 if cutlass.const_expr(self.v_dequant) else 64
         softmax_regs = 120
+        dequant_regs = 0
+        if cutlass.const_expr(kv_mxfp8):
+            mma_tma_regs, softmax_regs, dequant_regs = kv_mxfp8_regs
         correction_regs = min(
             max_sw_regs_per_wg_thread,
-            max_hw_regs_per_wg_thread - mma_tma_regs - softmax_regs * 2,
+            pool_regs_per_wg_thread - mma_tma_regs - softmax_regs * 2 - dequant_regs,
         )
-        assert (
-            mma_tma_regs + softmax_regs * 2 + correction_regs
-        ) <= max_hw_regs_per_wg_thread
+        assert mma_tma_regs <= launch_regs <= correction_regs
+        assert dequant_regs <= launch_regs
 
         # Read thread indices
         kv_splits, tiles_hp, tiles_hb = cute.arch.grid_dim()
@@ -2369,6 +2899,9 @@ class FlashAttentionDecodeSm100Bias:
             if cutlass.const_expr(self.qk_blockscaled):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_qsf)
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ksf)
+            if cutlass.const_expr(kv_mxfp8):
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_ksf)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_vsf)
         init_warp += 1
 
         ##############################
@@ -2410,6 +2943,8 @@ class FlashAttentionDecodeSm100Bias:
         elect_one_cooperative = thr_cg(1)
         warpgroup_cooperative = thr_cg(warpgroup_threads)
         correction_warps_cooperative = thr_cg(warpgroup_warps)
+        # One elected lane per warp of the dequant warpgroup arrives.
+        dequant_warps_cooperative = thr_cg(warpgroup_warps)
         mma_group = elect_one_cooperative
         tma_group = elect_one_cooperative
         softmax_group = warpgroup_cooperative
@@ -2462,15 +2997,58 @@ class FlashAttentionDecodeSm100Bias:
                 // 8
             )
         kv_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
-        kv_producer, kv_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=kv_stages,
-            producer_group=tma_group,
-            consumer_group=mma_group,
-            tx_count=k_stage_bytes,
-            barrier_storage=kv_pipeline_ptr,
-            cta_layout_vmnk=mcast_layout,
-            defer_sync=True,
-        ).make_participants()
+        if cutlass.const_expr(kv_mxfp8):
+            # TMA fills raw FP8 tiles; the dequant warpgroup turns each K tile
+            # into two BF16 K stages in tensor memory (kv_pipeline) and each
+            # V tile into two BF16 V stages in shared memory (v_mma_pipeline).
+            kv_pipeline = pipeline.PipelineAsyncUmma.create(
+                num_stages=kv_stages,
+                producer_group=dequant_warps_cooperative,
+                consumer_group=mma_group,
+                barrier_storage=kv_pipeline_ptr,
+                cta_layout_vmnk=mcast_layout,
+                defer_sync=True,
+            )
+            kv_consumer = kv_pipeline.make_consumer()
+            v_stages = smem_layout_v.shape[-1]
+            v_mma_pipeline_ptr = smem.allocate_array(Int64, v_stages * 2)
+            v_mma_pipeline = pipeline.PipelineAsyncUmma.create(
+                num_stages=v_stages,
+                producer_group=dequant_warps_cooperative,
+                consumer_group=mma_group,
+                barrier_storage=v_mma_pipeline_ptr,
+                cta_layout_vmnk=mcast_layout,
+                defer_sync=True,
+            )
+            v_mma_consumer = v_mma_pipeline.make_consumer()
+            raw_stages = cute.size(smem_layout_raw, mode=[2])
+            raw_stage_bytes = cute.size_in_bytes(
+                v_dtype, cute.slice_(smem_layout_raw, (None, None, 0))
+            ) + cute.size_in_bytes(
+                vsf_dtype, cute.slice_(smem_layout_raw_sf, (None, 0))
+            )
+            raw_pipeline_ptr = smem.allocate_array(Int64, raw_stages * 2)
+            raw_pipeline = pipeline.PipelineTmaAsync.create(
+                num_stages=raw_stages,
+                producer_group=tma_group,
+                consumer_group=dequant_warps_cooperative,
+                tx_count=raw_stage_bytes,
+                barrier_storage=raw_pipeline_ptr,
+                cta_layout_vmnk=mcast_layout,
+                tidx=warpgroup_tidx,
+                defer_sync=True,
+            )
+            raw_producer = raw_pipeline.make_producer()
+        else:
+            kv_producer, kv_consumer = pipeline.PipelineTmaUmma.create(
+                num_stages=kv_stages,
+                producer_group=tma_group,
+                consumer_group=mma_group,
+                tx_count=k_stage_bytes,
+                barrier_storage=kv_pipeline_ptr,
+                cta_layout_vmnk=mcast_layout,
+                defer_sync=True,
+            ).make_participants()
         if cutlass.const_expr(parallel_v_dequant):
             raw_v_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
             raw_v_pipeline = pipeline.PipelineTmaAsync.create(
@@ -2537,10 +3115,21 @@ class FlashAttentionDecodeSm100Bias:
         thrblk_mma_vsf = tiled_mma_vsf.get_slice(0)
 
         # Q, K, V
-        tAsK = smem.allocate_tensor(
-            k_dtype, smem_layout_k.outer, stensor_align, smem_layout_k.inner
-        )  # (MMA, #MMA_M, #MMA_K, kv_stages)
-        if cutlass.const_expr(self.v_dequant):
+        if cutlass.const_expr(kv_mxfp8):
+            # K lives in tensor memory; shared memory holds the BF16 V stages.
+            tAsK = None
+            tAsV = smem.allocate_tensor(
+                v_mma_dtype, smem_layout_v.outer, stensor_align, smem_layout_v.inner
+            )
+            tAsVq = tAsV
+            sVSF = None
+        else:
+            tAsK = smem.allocate_tensor(
+                k_dtype, smem_layout_k.outer, stensor_align, smem_layout_k.inner
+            )  # (MMA, #MMA_M, #MMA_K, kv_stages)
+        if cutlass.const_expr(kv_mxfp8):
+            pass
+        elif cutlass.const_expr(self.v_dequant):
             tAsVq = smem.allocate_tensor(
                 v_dtype, smem_layout_vq.outer, stensor_align, smem_layout_vq.inner
             )
@@ -2575,6 +3164,13 @@ class FlashAttentionDecodeSm100Bias:
             sKSF = None
             sKSFScratch = None
             sQSF = None
+        if cutlass.const_expr(kv_mxfp8):
+            sRaw = smem.allocate_tensor(
+                v_dtype, smem_layout_raw.outer, 1024, smem_layout_raw.inner
+            )
+            sRawSF = smem.allocate_tensor(vsf_dtype, smem_layout_raw_sf, stensor_align)
+        else:
+            sRaw = sRawSF = None
 
         # S
         # (MMA_MN, #MMA_M=1, #MMA_N=1, #TILE_SM, s_stages)
@@ -2607,7 +3203,11 @@ class FlashAttentionDecodeSm100Bias:
 
         # O
         # Reuse KV smem for O TMA store
-        sO_iterator = cute.recast_ptr(tAsK.iterator, smem_layout_o.inner, dtype=o_dtype)
+        sO_iterator = cute.recast_ptr(
+            (tAsV if cutlass.const_expr(kv_mxfp8) else tAsK).iterator,
+            smem_layout_o.inner,
+            dtype=o_dtype,
+        )
         # (MMA_TILE_M, MMA_TILE_N, #TILE_DM)
         sO_mma = cute.make_tensor(sO_iterator, smem_layout_o.outer)
         # (MMA, #MMA_M, #MMA_N, #TILE_DM, o_stages)
@@ -2674,6 +3274,45 @@ class FlashAttentionDecodeSm100Bias:
             cute.recast_ptr(tmem_ptr + tmem_offset, dtype=acc_dtype), tCtO.layout
         )
         tmem_offset += tcgen05.find_tmem_tensor_col_offset(tCtO)
+
+        if cutlass.const_expr(kv_mxfp8):
+            # BF16 K stages: lane = token row, 32-bit column = a pair of head
+            # dims. tKtK is the dequant warpgroup's FP32-word view of them and
+            # tCrK the GEMM1 A operand over the same columns.
+            k_stage_cols = qk_mma_tile_k * k_dtype.width // acc_dtype.width
+            # A C-shaped (128 lanes x k_stage_cols) layout per stage.
+            tmem_k_mma = sm100_utils.make_trivial_tiled_mma(
+                k_dtype,
+                k_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                acc_dtype,
+                tcgen05.CtaGroup.ONE,
+                (mma_tile_m, k_stage_cols),
+            )
+            tKtK = tmem_k_mma.get_slice(0).make_fragment_C(
+                tmem_k_mma.partition_shape_C((mma_tile_m, k_stage_cols, kv_stages))
+            )
+            tKtK = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + tmem_offset, dtype=acc_dtype), tKtK.layout
+            )
+            # The A fragment counts K elements (two per column) from the
+            # allocation's first column.
+            k_elems_per_col = acc_dtype.width // k_dtype.width
+            tK = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr, dtype=acc_dtype), smem_layout_k.outer
+            )
+            tCrK_stage = thrblk_mma_kq.make_fragment_A(tK)[None, None, None, 0]
+            tCrK = cute.make_tensor(
+                tCrK_stage.iterator + tmem_offset * k_elems_per_col,
+                cute.append(
+                    tCrK_stage.layout,
+                    cute.make_layout(
+                        (kv_stages,), stride=(k_stage_cols * k_elems_per_col,)
+                    ),
+                ),
+            )
+            tmem_offset += k_stage_cols * kv_stages
 
         if cutlass.const_expr(self.qk_blockscaled):
             tCtKSF_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -2748,7 +3387,55 @@ class FlashAttentionDecodeSm100Bias:
             if cutlass.const_expr(use_reg_reconfig):
                 cute.arch.setmaxregister_decrease(mma_tma_regs)
 
-            if cutlass.const_expr(is_paged_kv):
+            if cutlass.const_expr(kv_mxfp8):
+                # One TMA per 128-token page loads a whole FP8 tile, and one
+                # its scales; the page coordinate is the final GMEM mode.
+                gK_page = cute.local_tile(
+                    mK,
+                    (mma_tile_m, blk_tile_d),
+                    coord=(None, None, (coord_hk, None)),
+                )
+                tGSsK, tGSgK = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_k,
+                    mcast_coord,
+                    mcast_layout,
+                    smem_tensor=cute.group_modes(sRaw, 0, 2),
+                    gmem_tensor=cute.group_modes(gK_page, 0, 2),
+                )
+                gV_page = cute.local_tile(
+                    mV,
+                    (mma_tile_m, blk_tile_d),
+                    coord=(None, None, (coord_hk, None)),
+                )
+                tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_v,
+                    mcast_coord,
+                    mcast_layout,
+                    smem_tensor=cute.group_modes(sRaw, 0, 2),
+                    gmem_tensor=cute.group_modes(gV_page, 0, 2),
+                )
+                raw_sf_elems = cute.size(sRawSF, mode=[0])
+                gKSF_page = cute.local_tile(
+                    mKSF, (raw_sf_elems,), coord=(0, (coord_hk, None))
+                )
+                tGSsKSF, tGSgKSF = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_ksf,
+                    mcast_coord,
+                    mcast_layout,
+                    smem_tensor=cute.group_modes(sRawSF, 0, 1),
+                    gmem_tensor=cute.group_modes(gKSF_page, 0, 1),
+                )
+                gVSF_page = cute.local_tile(
+                    mVSF, (raw_sf_elems,), coord=(0, (coord_hk, None))
+                )
+                tGSsVSF, tGSgVSF = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_vsf,
+                    mcast_coord,
+                    mcast_layout,
+                    smem_tensor=cute.group_modes(sRawSF, 0, 1),
+                    gmem_tensor=cute.group_modes(gVSF_page, 0, 1),
+                )
+            elif cutlass.const_expr(is_paged_kv):
                 # The physical-page coordinate is the final GMEM mode.  Each
                 # page TMA fills one slot of the original MMA stage.
                 sK_page = cute.make_tensor(tAsK.iterator, smem_layout_k_tma.outer)
@@ -2906,20 +3593,49 @@ class FlashAttentionDecodeSm100Bias:
                     tGSsKSF = cute.filter_zeros(tGSsKSF)
                     tGSgKSF = cute.filter_zeros(tGSgKSF)
 
-            if cutlass.const_expr(self.use_pdl):
+            # A paged cache's earlier rounds are complete: under PDL only a tile
+            # reaching this call's new rows, which the kernel before this one
+            # writes, loads after the (idempotent) wait. Other key layouts may
+            # be that kernel's output throughout.
+            new_rows_begin = Int32(0)
+            if cutlass.const_expr(is_paged_kv):
+                new_rows_begin = seqlen - prediction
+            elif cutlass.const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_wait()
 
             # Sequence loop
             prefetch_tiles = prefetch_iters * kv_splits
             kv_token = True  # Producer always acquires first
             raw_v_token = True
+            raw_kv_token = True
             for s in cutlass.range(
                 kv_split_idx, prefetch_tiles + active_tiles_s, kv_splits
             ):
                 # Load K
                 if s < active_tiles_s:
                     tile_s = tile_begin_s + s
-                    if cutlass.const_expr(is_paged_kv):
+                    if cutlass.const_expr(self.use_pdl and is_paged_kv):
+                        if (tile_s + 1) * blk_tile_s > new_rows_begin:
+                            cute.arch.griddepcontrol_wait()
+                    if cutlass.const_expr(kv_mxfp8):
+                        raw_handle = raw_producer.acquire_and_advance(raw_kv_token)
+                        raw_kv_token = raw_producer.try_acquire()
+                        physical_page_idx = Int32(-1)
+                        if tile_s < page_count:
+                            physical_page_idx = mPageTable[table_offset + tile_s]
+                        cute.copy(
+                            tma_atom_k,
+                            tGSgK[None, 0, 0, physical_page_idx],
+                            tGSsK[None, raw_handle.index],
+                            tma_bar_ptr=raw_handle.barrier,
+                        )
+                        cute.copy(
+                            tma_atom_ksf,
+                            tGSgKSF[None, physical_page_idx],
+                            tGSsKSF[None, raw_handle.index],
+                            tma_bar_ptr=raw_handle.barrier,
+                        )
+                    elif cutlass.const_expr(is_paged_kv):
                         for sm in cutlass.range_constexpr(tiles_sm):
                             for dk in cutlass.range_constexpr(tiles_dk):
                                 kv_handle = kv_producer.acquire_and_advance(kv_token)
@@ -2982,7 +3698,28 @@ class FlashAttentionDecodeSm100Bias:
                 # Load V
                 if s >= prefetch_tiles:
                     tile_v = tile_begin_s + s - prefetch_tiles
-                    if cutlass.const_expr(is_paged_kv):
+                    if cutlass.const_expr(self.use_pdl and is_paged_kv):
+                        if (tile_v + 1) * blk_tile_s > new_rows_begin:
+                            cute.arch.griddepcontrol_wait()
+                    if cutlass.const_expr(kv_mxfp8):
+                        raw_handle = raw_producer.acquire_and_advance(raw_kv_token)
+                        raw_kv_token = raw_producer.try_acquire()
+                        physical_page_idx = Int32(-1)
+                        if tile_v < page_count:
+                            physical_page_idx = mPageTable[table_offset + tile_v]
+                        cute.copy(
+                            tma_atom_v,
+                            tGSgV[None, 0, 0, physical_page_idx],
+                            tGSsV[None, raw_handle.index],
+                            tma_bar_ptr=raw_handle.barrier,
+                        )
+                        cute.copy(
+                            tma_atom_vsf,
+                            tGSgVSF[None, physical_page_idx],
+                            tGSsVSF[None, raw_handle.index],
+                            tma_bar_ptr=raw_handle.barrier,
+                        )
+                    elif cutlass.const_expr(is_paged_kv):
                         for sk in cutlass.range_constexpr(tiles_sk):
                             for dm in cutlass.range_constexpr(tiles_dm):
                                 if cutlass.const_expr(parallel_v_dequant):
@@ -3113,6 +3850,12 @@ class FlashAttentionDecodeSm100Bias:
 
             if cutlass.const_expr(self.use_pdl):
                 cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(do_kernel_red):
+                    # The reduction kernel loads the gate and sink, rows of the
+                    # projection, before its own wait, so it launches only once
+                    # this CTA has waited (the KV loader may never wait); it then
+                    # sets up while this CTA runs.
+                    cute.arch.griddepcontrol_launch_dependents()
 
             # Load Q
             cute.copy(
@@ -3174,7 +3917,11 @@ class FlashAttentionDecodeSm100Bias:
                 cute.arch.setmaxregister_decrease(mma_tma_regs)
 
             # Setup mma descriptors
-            tAsK_desc = thrblk_mma_kq.make_fragment_A(tAsK)
+            # MXFP8 K is already the TMEM A operand.
+            if cutlass.const_expr(kv_mxfp8):
+                tAsK_desc = tCrK
+            else:
+                tAsK_desc = thrblk_mma_kq.make_fragment_A(tAsK)
             tBsQ_desc = thrblk_mma_kq.make_fragment_B(tBsQ)
 
             # Wait for Q
@@ -3186,7 +3933,7 @@ class FlashAttentionDecodeSm100Bias:
 
                 # Advance for MMA VP
                 # Could relax the wait under certain tile + stage counts {$nv-internal-release}
-                if cutlass.const_expr(not parallel_v_dequant):
+                if cutlass.const_expr(not split_kv_pipelines):
                     if s >= prefetch_iters + 1:
                         for _ in cutlass.range_constexpr(tiles_dm * tiles_sk):
                             kv_consumer.advance()
@@ -3238,7 +3985,7 @@ class FlashAttentionDecodeSm100Bias:
                             )
                             tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, True)
                         else:
-                            mmas_k = cute.size(tAsK.shape[2])
+                            mmas_k = cute.size(tAsK_desc.shape[2])
                             for mma_k in cutlass.range_constexpr(mmas_k):
                                 cute.gemm(
                                     tiled_mma_kq,
@@ -3273,7 +4020,7 @@ class FlashAttentionDecodeSm100Bias:
             # Prefetch loop
             mma_order_vp_nbar.arrive()
             for s in cutlass.range_constexpr(prefetch_iters):
-                if cutlass.const_expr(not parallel_v_dequant):
+                if cutlass.const_expr(not split_kv_pipelines):
                     if s < iters_s:
                         for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
                             kv_consumer.advance()
@@ -3286,12 +4033,12 @@ class FlashAttentionDecodeSm100Bias:
                 o_token = o_producer.try_acquire()
 
                 # Advance for MMA KQ
-                if cutlass.const_expr(not parallel_v_dequant):
+                if cutlass.const_expr(not split_kv_pipelines):
                     if s < iters_s - prefetch_iters:
                         for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
                             kv_consumer.advance()
                 mma_order_kq_nbar.arrive_and_wait()
-                if cutlass.const_expr(parallel_v_dequant):
+                if cutlass.const_expr(split_kv_pipelines):
                     v_token = v_mma_consumer.try_wait()
                 else:
                     v_token = kv_consumer.try_wait()
@@ -3300,7 +4047,7 @@ class FlashAttentionDecodeSm100Bias:
                 o_handle = o_producer.acquire_and_advance(o_token)
                 for sk in cutlass.range_constexpr(tiles_sk):
                     for dm in cutlass.range_constexpr(tiles_dm):
-                        if cutlass.const_expr(parallel_v_dequant):
+                        if cutlass.const_expr(split_kv_pipelines):
                             v_handle = v_mma_consumer.wait_and_advance(v_token)
                         else:
                             v_handle = kv_consumer.wait_and_advance(v_token)
@@ -3308,7 +4055,7 @@ class FlashAttentionDecodeSm100Bias:
                         if is_last_iter:
                             mma_order_vp_nbar.arrive()
                         else:
-                            if cutlass.const_expr(parallel_v_dequant):
+                            if cutlass.const_expr(split_kv_pipelines):
                                 v_token = v_mma_consumer.try_wait()
                             else:
                                 v_token = kv_consumer.try_wait()
@@ -3356,7 +4103,11 @@ class FlashAttentionDecodeSm100Bias:
         elif warpgroup_idx in softmax_warpgroup_ids:
             # Free registers
             if cutlass.const_expr(use_reg_reconfig):
-                cute.arch.setmaxregister_decrease(softmax_regs)
+                # The five-warpgroup MXFP8-KV CTA launches with fewer.
+                if cutlass.const_expr(softmax_regs > launch_regs):
+                    cute.arch.setmaxregister_increase(softmax_regs)
+                else:
+                    cute.arch.setmaxregister_decrease(softmax_regs)
 
             # Initialize for dual warpgroups
             softmax_phase = (warpgroup_idx - 1) % softmax_warpgroups
@@ -3534,55 +4285,63 @@ class FlashAttentionDecodeSm100Bias:
                                 + sm * mma_tile_m
                                 + warpgroup_tidx
                             )
+                            # Within a query row's window branch the heads' bias
+                            # loads are in bounds and unconditional, so a thread
+                            # issues them together instead of one dependent load
+                            # per score; padded heads keep their scores.
                             for p in cutlass.range_constexpr(blk_tile_p):
                                 query_idx = coord_p * blk_tile_p + p
                                 rel_idx = query_idx + (seqlen - prediction) - key_idx
-                                for h in cutlass.range_constexpr(blk_tile_h):
-                                    query_head = (
-                                        coord_hk * grouped_heads
-                                        + coord_hg * blk_tile_h
-                                        + h
-                                    )
-                                    score_log2 = scores_log2_rmem[h, p, sm]
-                                    if query_idx < prediction:
-                                        if query_head < heads_q:
-                                            if rel_idx >= 0:
-                                                if rel_idx < bias_extent:
-                                                    bias_idx = rel_idx
-                                                    if cutlass.const_expr(
-                                                        self.bias_is_sheared
-                                                    ):
-                                                        bias_idx = (
-                                                            self.sheared_bias_column(
-                                                                query_idx,
-                                                                key_idx,
-                                                                coord_hg * blk_tile_h
-                                                                + h,
-                                                                grouped_heads,
-                                                                prediction,
-                                                                seqlen,
-                                                                bias_storage_extent,
-                                                            )
-                                                        )
-                                                    if cutlass.const_expr(is_varlen_q):
-                                                        bias_value = mBias[
-                                                            offset_q + query_idx,
-                                                            query_head,
-                                                            bias_idx,
-                                                        ]
-                                                    else:
-                                                        bias_value = mBias[
-                                                            coord_b,
-                                                            query_idx,
-                                                            query_head,
-                                                            bias_idx,
-                                                        ]
-                                                    bias_log2 = (
-                                                        bias_value.to(acc_dtype)
-                                                        * log2_e
-                                                    )
-                                                    score_log2 += bias_log2
-                                    scores_log2_rmem[h, p, sm] = score_log2
+                                if (
+                                    query_idx < prediction
+                                    and rel_idx >= 0
+                                    and rel_idx < bias_extent
+                                ):
+                                    for h in cutlass.range_constexpr(blk_tile_h):
+                                        query_head = (
+                                            coord_hk * grouped_heads
+                                            + coord_hg * blk_tile_h
+                                            + h
+                                        )
+                                        load_head = cutlass.min(query_head, heads_q - 1)
+                                        bias_idx = rel_idx
+                                        if cutlass.const_expr(self.bias_is_sheared):
+                                            # A padded head's column may fall outside.
+                                            bias_idx = cutlass.max(
+                                                cutlass.min(
+                                                    self.sheared_bias_column(
+                                                        query_idx,
+                                                        key_idx,
+                                                        coord_hg * blk_tile_h + h,
+                                                        grouped_heads,
+                                                        prediction,
+                                                        seqlen,
+                                                        bias_storage_extent,
+                                                    ),
+                                                    bias_storage_extent - 1,
+                                                ),
+                                                Int32(0),
+                                            )
+                                        if cutlass.const_expr(is_varlen_q):
+                                            bias_value = mBias[
+                                                offset_q + query_idx,
+                                                load_head,
+                                                bias_idx,
+                                            ]
+                                        else:
+                                            bias_value = mBias[
+                                                coord_b, query_idx, load_head, bias_idx
+                                            ]
+                                        score_log2 = scores_log2_rmem[h, p, sm]
+                                        biased = (
+                                            score_log2
+                                            + bias_value.to(acc_dtype) * log2_e
+                                        )
+                                        scores_log2_rmem[h, p, sm] = (
+                                            biased
+                                            if query_head < heads_q
+                                            else score_log2
+                                        )
                 if cutlass.const_expr(mTau is not None):
                     # Per-query-row scale on the total logits. log2 space is
                     # linear, so this composes with scale_s and the bias; it
@@ -3907,6 +4666,86 @@ class FlashAttentionDecodeSm100Bias:
             sO_final_nbar.arrive()
 
         ##############################
+        # MXFP8 K/V Dequant Dispatch
+        ##############################
+        elif warpgroup_idx == dequant_warpgroup_id:
+            if cutlass.const_expr(kv_mxfp8):
+                if cutlass.const_expr(use_reg_reconfig):
+                    cute.arch.setmaxregister_decrease(dequant_regs)
+                # Loader step i issues K of iteration i and V of iteration
+                # i - prefetch_iters; the MMA warps consume the stages of each
+                # in that order, so they are produced in it.
+                raw_kv_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, raw_stages
+                )
+                k_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, kv_stages
+                )
+                v_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, v_stages
+                )
+                # (token, dim, stage pair) view of the BF16 V stages: a V tile
+                # splits its tokens over two stages.
+                stage_elems = mma_tile_m * pv_mma_tile_k
+                sV_tiles = cute.composition(
+                    tAsV,
+                    cute.make_layout(
+                        ((pv_mma_tile_k, tiles_sk), mma_tile_m, v_stages // 2),
+                        stride=((mma_tile_m, stage_elems), 1, 2 * stage_elems),
+                    ),
+                )
+                # kv_mxfp8_k_store_cols columns of a K stage, C-shaped.
+                tmem_k8_mma = sm100_utils.make_trivial_tiled_mma(
+                    k_dtype,
+                    k_dtype,
+                    OperandMajorMode.K,
+                    OperandMajorMode.K,
+                    acc_dtype,
+                    tcgen05.CtaGroup.ONE,
+                    (mma_tile_m, kv_mxfp8_k_store_cols),
+                )
+                tKtK_chunk_layout = (
+                    tmem_k8_mma.get_slice(0)
+                    .make_fragment_C(
+                        tmem_k8_mma.partition_shape_C(
+                            (mma_tile_m, kv_mxfp8_k_store_cols)
+                        )
+                    )
+                    .layout
+                )
+                tile_tokens = mma_tile_m
+                tile_base = tile_begin_s + kv_split_idx
+                for step in cutlass.range(iters_s + prefetch_iters, unroll=1):
+                    if step < iters_s:
+                        tile_k = tile_base + step * kv_splits
+                        raw_kv_state, k_producer_state = self.dequant_k_item_mxfp8(
+                            sRaw,
+                            sRawSF,
+                            tKtK,
+                            tKtK_chunk_layout,
+                            k_stage_cols,
+                            seqlen - tile_k * tile_tokens,
+                            raw_pipeline,
+                            kv_pipeline,
+                            raw_kv_state,
+                            k_producer_state,
+                            warpgroup_tidx,
+                        )
+                    if step >= prefetch_iters:
+                        tile_v = tile_base + (step - prefetch_iters) * kv_splits
+                        raw_kv_state, v_producer_state = self.dequant_v_item_mxfp8(
+                            sRaw,
+                            sRawSF,
+                            sV_tiles,
+                            seqlen - tile_v * tile_tokens,
+                            raw_pipeline,
+                            v_mma_pipeline,
+                            raw_kv_state,
+                            v_producer_state,
+                            warpgroup_tidx,
+                        )
+
+        ##############################
         # Reduction Dispatch
         ##############################
         if warp_idx == reduction_warp_id:
@@ -4115,6 +4954,9 @@ class FlashAttentionDecodeSm100Bias:
         o_partial_bshd: cute.Tensor,  # partial O per kv split
         m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
         l_partial_bsh: cute.Tensor,  # partial colsum_p per kv split
+        lse_bsh: Optional[cute.Tensor],  # final natural-log LSE per query row
+        gate_bshd: Optional[cute.Tensor],  # output gate logits, with sink_bsh
+        sink_bsh: Optional[cute.Tensor],  # attention-sink logit per query row
         stream: cuda.CUstream,
         use_pdl: cutlass.Constexpr[bool] = True,
     ):
@@ -4130,11 +4972,19 @@ class FlashAttentionDecodeSm100Bias:
         o_partial_dhsb = reverse(o_partial_bshd)
         m_partial_hsb = reverse(m_partial_bsh)
         l_partial_hsb = reverse(l_partial_bsh)
+        lse_hsb = reverse(lse_bsh) if cutlass.const_expr(lse_bsh is not None) else None
+        gate_dhsb = (
+            reverse(gate_bshd) if cutlass.const_expr(gate_bshd is not None) else None
+        )
+        sink_hsb = (
+            reverse(sink_bsh) if cutlass.const_expr(sink_bsh is not None) else None
+        )
 
         d_per_thr = 32 // o_bshd.dtype.width
         thr_per_blk = d_per_blk // d_per_thr
         d_blks = cute.ceil_div(d, d_per_blk)
-        smem_bytes = (splits * 2) * Float32.width // 8
+        # Every split's colmax, colsum and O row (see reduction_kernel).
+        smem_bytes = splits * (2 + d_per_blk) * Float32.width // 8
 
         FlashAttentionDecodeSm100Bias.reduction_kernel(
             (thr_per_blk, d_per_thr, d_per_blk),
@@ -4142,6 +4992,9 @@ class FlashAttentionDecodeSm100Bias:
             o_partial_dhsb,
             m_partial_hsb,
             l_partial_hsb,
+            lse_hsb,
+            gate_dhsb,
+            sink_hsb,
             use_pdl,
         ).launch(
             grid=[d_blks, h_q * s_q, b],
@@ -4161,8 +5014,14 @@ class FlashAttentionDecodeSm100Bias:
         o_partial_dhsb: cute.Tensor,
         m_partial_hsb: cute.Tensor,
         l_partial_hsb: cute.Tensor,
+        lse_hsb: Optional[cute.Tensor],
+        gate_dhsb: Optional[cute.Tensor],
+        sink_hsb: Optional[cute.Tensor],
         use_pdl: cutlass.Constexpr[bool],
     ):
+        """Merge a row's split partials; with a gate, store
+        ``(o * sigmoid(gate)) * sigmoid(lse - sink)`` instead of ``o``, each
+        sigmoid ``sigmoid_reference``, as ``rel_mha_gate_sink`` does."""
         thr_per_blk, d_per_thr, d_per_blk = tile_d
         d, h_q, s_q, b, splits = o_partial_dhsb.shape
         d_blk_idx, coord_hs, coord_b = cute.arch.block_idx()
@@ -4182,12 +5041,17 @@ class FlashAttentionDecodeSm100Bias:
         gM_partial_0 = gM_partial[None, tidx]
         gL_partial_0 = gL_partial[None, tidx]
 
+        # Shared memory holds every split's colmax, colsum and this block's O
+        # row: one cp.async batch stages them all, one L2 round trip.
         smem_ptr = cute.arch.get_dyn_smem(Float32)
         partial_layout = cute.make_layout((1, splits))
         sM_partial = cute.make_tensor(smem_ptr, partial_layout)
         sL_partial = cute.make_tensor(smem_ptr + splits, partial_layout)
         sL_partial_0 = sL_partial[None, tidx]
         sM_partial_0 = sM_partial[None, tidx]
+        sO_partial = cute.make_tensor(
+            smem_ptr + 2 * splits, cute.make_layout((d_per_blk, splits))
+        )
 
         cpasync_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32
@@ -4200,11 +5064,25 @@ class FlashAttentionDecodeSm100Bias:
 
         tCgO_partial = thr_copy.partition_S(gO_partial)  # (CPY, #CPY=1, splits)
         tCgO_partial = tCgO_partial[None, 0, None]  # (CPY, splits)
+        tCsO_partial = thr_copy.partition_D(sO_partial)[None, 0, None]  # (CPY, splits)
         tCgO = thr_copy.partition_D(gO)  # (CPY, #CPY=1)
         tCgO = tCgO[None, 0]  # (CPY)
         tCrO_final = cute.zeros_like(tCgO, Float32)
 
+        if cutlass.const_expr(gate_dhsb is not None):
+            # The gate and sink are rows of the query projection, complete once
+            # the decode kernel this one follows has waited: load them first.
+            gGate = cute.local_tile(gate_dhsb, (d_per_blk,), coord_o[:-1])
+            tCgGate = thr_copy.partition_S(gGate)[None, 0]
+            rGate = cute.make_fragment_like(tCgO, Float32)
+            if not_oob_d:
+                rGate.store(tCgGate.load().to(Float32))
+            sink = sink_hsb[coord_h, coord_s, coord_b].to(Float32)
+
         if cutlass.const_expr(use_pdl):
+            # The output projection after it reads only its weights before its
+            # own wait: release it to stream them while this kernel merges.
+            cute.arch.griddepcontrol_launch_dependents()
             cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after PDL wait
             cute.arch.griddepcontrol_wait()
 
@@ -4221,6 +5099,16 @@ class FlashAttentionDecodeSm100Bias:
             sM_partial_n = sM_partial[None, split_idx]
             cute.copy(cpasync_atom, gM_partial_n, sM_partial_n)
 
+        if not_oob_d:
+            # Every split's row, inactive ones included: their workspace is
+            # never read back below.
+            for split_idx in cutlass.range(splits, unroll=8):
+                cute.copy(
+                    cpasync_atom,
+                    tCgO_partial[None, split_idx],
+                    tCsO_partial[None, split_idx],
+                )
+
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
@@ -4231,19 +5119,33 @@ class FlashAttentionDecodeSm100Bias:
             max_final = cute.arch.fmax(max_final, sM_partial[0, max_split_idx])
         sum_final = Float32(0)
         if max_final > -Float32.inf and not_oob_d:
+            # An inactive split (max -inf) weighs exp2(-inf) = 0 and reads split
+            # 0's finite partials instead of its own unwritten workspace.
             for split_idx in cutlass.range(splits, unroll=8):
                 max_partial = sM_partial[0, split_idx]
-                if max_partial > -Float32.inf:
-                    correction = exp2(max_partial - max_final)
-                    sum_final += correction * sL_partial[0, split_idx]
-                    tCrO_final += correction * tCgO_partial[None, split_idx].load()
+                load_idx = split_idx if max_partial > -Float32.inf else Int32(0)
+                correction = exp2(max_partial - max_final)
+                sum_final += correction * sL_partial[0, load_idx]
+                tCrO_final += correction * tCsO_partial[None, load_idx].load()
             tCrO_final *= cute.arch.rcp_approx(sum_final)
 
-        if cutlass.const_expr(use_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
-
+        # The split maxima are log2-scaled logits, so lse = (max + log2(sum)) * ln(2).
+        lse = Float32(-Float32.inf)
+        if max_final > -Float32.inf:
+            lse = (max_final + cute.math.log2(sum_final)) * math.log(2.0)
         if not_oob_d:
-            tCgO.store(tCrO_final.to(o_dhsb.dtype))
+            if cutlass.const_expr(gate_dhsb is not None):
+                rO = cute.make_fragment_like(tCgO, Float32)
+                rO.store(tCrO_final)
+                sink_gate = sigmoid_reference(lse - sink)
+                for i in cutlass.range_constexpr(cute.size(rO)):
+                    rO[i] = (rO[i] * sigmoid_reference(rGate[i])) * sink_gate
+                tCgO.store(rO.load().to(o_dhsb.dtype))
+            else:
+                tCgO.store(tCrO_final.to(o_dhsb.dtype))
+        if cutlass.const_expr(lse_hsb is not None):
+            if d_blk_idx == 0 and tidx == 0:
+                lse_hsb[coord_h, coord_s, coord_b] = lse
 
         return
 
@@ -4496,6 +5398,7 @@ def run(
         v_mma_dtype=pv_dtype,
         window_size_left=window_size_left,
         page_size=page_size,
+        kv_mxfp8=False,
     )
 
     seqlen_q = prediction
@@ -4858,6 +5761,7 @@ def run(
         None,  # max_seqlen_k
         page_table_cute,
         table_offsets_cute,
+        None,  # lse_bsh
         current_stream,
     )
     print("Finished Compiling")
@@ -4921,6 +5825,7 @@ def run(
             None,
             page_table_cute,
             table_offsets_cute,
+            None,  # lse_bsh
             current_stream,
         )
         print("Verifying results...")
@@ -5078,6 +5983,7 @@ def run(
             None,
             workspace_page_table_cute,
             workspace_table_offsets_cute,
+            None,  # lse_bsh
             profile_stream,
         )
 

@@ -150,6 +150,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
+    def takes_owned_decode_topk(self, layer):
+        return self._backend_for_layer(layer.layer_id).takes_owned_decode_topk(layer)
+
+    def dcp_decode_query_rider(self, layer, q):
+        return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)
+
     def reads_fp8_kv_scales(self, layer):
         return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
 
@@ -206,6 +212,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             max_bs, draft_token_num
         )
 
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        return self.full_attn_backend.preallocate_history_gather_workspace(
+            max_model_len
+        )
+
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
         # including both full-attention and mamba layers. Normal attention
@@ -213,6 +224,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # that dispatch, so its full-attention child needs the same counter.
         self.step_counter = step_counter
         self.full_attn_backend.register_step_counter(step_counter)
+        # State backends may publish staged prefill state before this wrapper
+        # records readiness. Children do not record a second step here.
+        self.linear_attn_backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)

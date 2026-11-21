@@ -36,7 +36,10 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
+from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+    MLAAttnBackend,
+    MLAMetadataBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.support import (
     resolve_cuda_graph_support,
 )
@@ -109,7 +112,7 @@ def reference_provider(monkeypatch):
     return registry
 
 
-def _backend():
+def _geometry(device):
     spec = MLAConfig(
         backend_name="mla",
         num_attention_heads=4,
@@ -124,15 +127,44 @@ def _backend():
         scaling=192**-0.5,
     )
     config = AttnConfig(
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         components=(spec,),
     )
-    return MLAAttnBackend(config, spec, kernel_page_size=64)
+    return config, spec
+
+
+def _backend():
+    return MLAAttnBackend(*_geometry("cuda"), kernel_page_size=64)
+
+
+def test_delegate_refreshes_decode_metadata_without_an_attention_provider(monkeypatch):
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+    monkeypatch.setattr(KernelRegistry, "_instance", KernelRegistry())
+    config, spec = _geometry("cpu")
+    with pytest.raises(NoKernelFoundError, match="mla_extend_with_kvcache"):
+        MLAAttnBackend(config, spec, kernel_page_size=64)
+
+    metadata = MLAMetadataBackend(config, spec, kernel_page_size=64)
+    metadata.init_cuda_graph_state(2)
+    pages = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    lengths = torch.tensor([100, 80], dtype=torch.int32)
+    metadata.refresh_decode_metadata(2, 2, lengths, pages)
+    assert torch.equal(metadata.forward_decode_metadata.seq_lens, lengths)
+    assert torch.equal(metadata.forward_decode_metadata.page_table[:, :2], pages)
+    assert metadata.batch_invariant
+    with pytest.raises(NotImplementedError, match="cannot compute attention"):
+        metadata.forward_decode(None, None, None, None, None, None, 2)
+    with pytest.raises(NotImplementedError, match="cannot compute attention"):
+        metadata.forward_extend(None, None, None, None, None, None, 2)
 
 
 def _prepare(backend, prefixes):

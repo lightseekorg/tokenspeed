@@ -22,6 +22,7 @@
 
 import os
 import sys
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
 
 import pytest
 import torch
@@ -108,6 +109,7 @@ def test_mha_pool_and_leaf_preserve_consecutive_kv_fields_with_page_padding():
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=1,
+        max_resident_requests=1,
         speculative_num_draft_tokens=8,
         components=(spec,),
     )
@@ -202,9 +204,6 @@ def test_context_write_uses_draft_router_before_proposal_publication():
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-    from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-        learn_cache_group_geometry,
-    )
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
@@ -235,19 +234,20 @@ def test_context_write_uses_draft_router_before_proposal_publication():
             kv_cache_quant_method="none",
             context_len=512,
             max_bs=1,
+            max_resident_requests=1,
             speculative_num_draft_tokens=4,
             is_draft=draft,
             components=(component,),
         )
         leaf = MHAAttnBackend(config, component, kernel_page_size=128)
         result = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaf,
             is_draft=draft,
             spec_num_tokens=4,
             device="cpu",
             consumed_group_ids=None,
         )
-        result.bind(learn_cache_group_geometry((group,)), {group_id: leaf})
+        result.set_cache_pool(make_mha_pool_for_groups((group,), device="cpu"))
         result.init_cuda_graph_state(1)
         return result
 
@@ -278,6 +278,8 @@ def test_context_write_uses_draft_router_before_proposal_publication():
                 runtime_states=States(torch.tensor([256], dtype=torch.int32)),
             )
             self.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+            self.context_starts_buf = torch.zeros(1, dtype=torch.int64)
+            self.context_locs_buf = torch.zeros(4, dtype=torch.int32)
             self.cache = torch.zeros(2048, 4)
 
         def _write_native_cache(self, hidden, positions, locations, *, decode_only):

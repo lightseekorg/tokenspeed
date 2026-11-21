@@ -42,13 +42,25 @@ struct SchedulerAbortView;
 struct SchedulerSizes;
 struct AdmissionSnapshot;
 struct PrefillGateProbe;
+struct SharedPrefixPublication;
 struct CacheGroupPages;
 struct KvEventView;
 struct StorageTickView;
 struct StorageCancellationView;
 struct StorageDoneView;
 struct StorageStatsView;
+struct DiskOpView;
+struct DiskDoneView;
+struct DiskStatsView;
 struct PrefixHitView;
+struct PeerEventView;
+struct PeerAnswerView;
+struct PeerLookupView;
+struct PeerFetchView;
+struct PinSampleView;
+struct PeerStatsView;
+struct PeerLeaseView;
+struct PeerPageView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,
@@ -56,26 +68,65 @@ std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Sched
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
-                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const DiskDoneView> disk_done,
+                  rust::Slice<const CacheEvent> cache_events);
+void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
+rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
+bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
+                      rust::Slice<const PeerPageView> pages);
+bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
+std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler);
+rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler);
+PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler);
 std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step);
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler);
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events);
+std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch);
+std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::int32_t> kv_event_block_sizes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::size_t> kv_event_hash_offsets(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::size_t> kv_event_token_offsets(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint8_t> kv_event_media(const tokenspeed::KvEventBatch& batch);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
+bool storage_current_pending(const tokenspeed::Scheduler& scheduler);
+bool storage_progress_pending(const tokenspeed::Scheduler& scheduler);
+std::size_t storage_blocking_quarantined(const tokenspeed::Scheduler& scheduler);
+bool storage_non_storage_clearable(const tokenspeed::Scheduler& scheduler);
+bool can_prepare_storage_clear(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
+DiskStatsView disk_stats(const tokenspeed::Scheduler& scheduler);
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler);
 bool clear_cache(tokenspeed::Scheduler& scheduler);
+void cancel_storage_backups(tokenspeed::Scheduler& scheduler);
+void cancel_storage_for_clear(tokenspeed::Scheduler& scheduler);
+bool can_clear_cache_retaining_storage(const tokenspeed::Scheduler& scheduler);
+bool clear_cache_retaining_storage(tokenspeed::Scheduler& scheduler);
+bool storage_has_retained_operations(const tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan);
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);
@@ -85,6 +136,8 @@ rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::Exec
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<DiskOpView> plan_disk_ops(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan);
 
 void set_profile_span_sink(bool installed);
 

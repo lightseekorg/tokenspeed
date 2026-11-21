@@ -1,10 +1,7 @@
 # FP8 quantization
 
-TRT-LLM providers are optional: their FP8 leaves are registered only when
-`trtllm_kernel` is installed. Importing the common operators remains possible
-without that extension, and directly requesting the TRT-LLM group quantizer
-reports the missing package. Providers that depend on this quantizer, including
-DeepGEMM DSA, follow the same availability requirement.
+The TRT-LLM FP8 providers (the 1x128 token-group and per-token quantizers)
+are built into tokenspeed-kernel's CUDA extension, adapted from TensorRT-LLM.
 
 `quantize_fp8` returns `(values, scales)`. A plain cast has no scales;
 static scaling returns the supplied scale. Dynamic `token` quantization
@@ -80,14 +77,14 @@ MN-major storage alone does not guarantee TMA alignment.
 
 This entry eliminates the contiguous-scale copy in the quantization wrapper.
 A downstream GEMM can also skip its scale repack only when it accepts the
-native strides and encoding. In particular, it does not guarantee that
-Blackwell consumers can skip scale alignment or encoding conversion.
+native strides and encoding. The TRT-LLM CuTe-DSL block-FP8 GEMM does; other
+Blackwell consumers may still need scale alignment or encoding conversion.
 
 Ordinary quantization requests token-major storage and excludes this entry
 from ranked selection. Explicit `override` selects the native entry; its
 implementation validates the supported quantization parameters. Callers
-opting in must support the returned strides. This entry does not change
-model projections or GEMM dispatch.
+opting in must support the returned strides. Block-FP8 linear layers select it
+when `mm_activation_scale_layout` reports that their GEMM reads MN-major scales.
 
 ## DeepGEMM packed UE8M0
 
@@ -135,3 +132,7 @@ and gate loads follow it. Rows and tensor strides remain runtime arguments.
 `try_output_fp8_quant_pack` checks the input requirements and launches the
 fusion when they hold. It returns `None` when callers need to run the separate
 gate or norm and quantization operations.
+
+The shared Triton MXFP4 index-row codec lives in `_triton_mxfp4.py`.
+KV-cache writers and attention implementations use the same arithmetic without
+importing attention backend registration from a cache helper.

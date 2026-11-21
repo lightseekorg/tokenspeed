@@ -169,11 +169,21 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     inputs = make_inputs(case)
     expected = reference(inputs)
     for solution in ("triton", "gluon"):
-        check_output(mha_decode_with_kvcache(**inputs, solution=solution), expected)
+        check_output(
+            mha_decode_with_kvcache(**inputs, solution=solution, block_draft=False),
+            expected,
+        )
+    # A draft's block positions share their request's table row and length:
+    # read as uniform groups, they take each request's keys once, bit for bit.
+    groups = 16 if mode == "draft" else 1
+    if groups > 1:
+        assert_uniform_groups_bitwise(inputs, groups)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = mha_decode_with_kvcache(**inputs, solution="gluon")
+        actual = mha_decode_with_kvcache(
+            **inputs, solution="gluon", block_draft=False, uniform_row_groups=groups
+        )
     graph.replay()
     check_output(actual, expected)
     changed_inputs(inputs)
@@ -186,7 +196,119 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     ):
         # Eager dispatch under the guard verifies dynamic values do not become
         # specialization keys; graph replay alone could not establish that.
-        check_output(mha_decode_with_kvcache(**inputs, solution="gluon"), expected)
+        check_output(
+            mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False),
+            expected,
+        )
+        if groups > 1:
+            assert_uniform_groups_bitwise(inputs, groups)
         graph.replay()
         check_output(actual, expected)
     assert torch.cuda.max_memory_allocated() < 8 * 1024**3
+
+
+def assert_uniform_groups_bitwise(inputs, groups):
+    """Uniform row groups give the one-row requests' bits: on the kernel that
+    reads them (gluon) and on one that serves the rows as they are (triton)."""
+    for solution in ("gluon", "triton"):
+        rows = mha_decode_with_kvcache(**inputs, solution=solution, block_draft=False)
+        grouped = mha_decode_with_kvcache(
+            **inputs, solution=solution, block_draft=False, uniform_row_groups=groups
+        )
+        assert torch.equal(grouped.view(torch.int16), rows.view(torch.int16)), solution
+
+
+@pytest.mark.parametrize("running", [8, 12, 16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("window", [2047, -1])
+def test_uniform_row_groups_keep_every_bit_at_draft_shapes(running, kv_dtype, window):
+    """A block drafter's attention (8 positions, 16 query / 2 KV heads, dim 128)
+    over ragged lengths: tiny, around a page boundary, around the window edge
+    and long."""
+    if not is_cdna4():
+        pytest.skip("requires gfx950")
+    torch.manual_seed(running)
+    positions, page = 8, 64
+    lengths = torch.tensor(
+        [
+            [1, 9, 63, 64, 65, 2047, 2048, 2049, 30001, 70000, 88000, 129][i % 12]
+            for i in range(running)
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    width = int(lengths.max()) // page + 2
+    pages = running * width
+    k = torch.randn(pages, page, 2, 128, device="cuda").to(kv_dtype)
+    v = torch.randn(pages, page, 2, 128, device="cuda").to(kv_dtype)
+    table = torch.randperm(pages, device="cuda").view(running, width).to(torch.int32)
+    inputs = {
+        "q": torch.randn(running * positions, 16, 128, device="cuda").to(kv_dtype),
+        "k_cache": k,
+        "v_cache": v,
+        "page_table": table.repeat_interleave(positions, dim=0),
+        "cache_seqlens": lengths.repeat_interleave(positions),
+        "max_seqlen_k": 262144,
+        "max_seqlen_q": 1,
+        "window_left": window,
+    }
+    rows = mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False)
+    grouped = mha_decode_with_kvcache(
+        **inputs, solution="gluon", block_draft=False, uniform_row_groups=positions
+    )
+    assert torch.equal(grouped.view(torch.int16), rows.view(torch.int16))
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("window", [2047, -1])
+def test_uniform_row_groups_with_an_output_gate_keep_every_bit(kv_dtype, window):
+    """A grouped block with an output gate (64-wide heads, the gate's range)
+    stores what its one-row requests followed by the separate gated norm
+    give, bit for bit, without launching that op."""
+    if not is_cdna4():
+        pytest.skip("requires gfx950")
+    from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.manual_seed(11)
+    running, positions, page, heads, dim = 9, 8, 64, 16, 64
+    lengths = torch.tensor(
+        [1, 63, 64, 65, 2047, 2048, 2049, 30001, 129], device="cuda", dtype=torch.int32
+    )
+    width = int(lengths.max()) // page + 2
+    pages = running * width
+    k = torch.randn(pages, page, 2, dim, device="cuda").to(kv_dtype)
+    v = torch.randn(pages, page, 2, dim, device="cuda").to(kv_dtype)
+    table = torch.randperm(pages, device="cuda").view(running, width).to(torch.int32)
+    rows = running * positions
+    inputs = {
+        "q": torch.randn(rows, heads, dim, device="cuda").to(kv_dtype),
+        "k_cache": k,
+        "v_cache": v,
+        "page_table": table.repeat_interleave(positions, dim=0),
+        "cache_seqlens": lengths.repeat_interleave(positions),
+        "max_seqlen_k": 262144,
+        "max_seqlen_q": 1,
+        "window_left": window,
+    }
+    gate = torch.randn(rows, heads * dim, device="cuda").bfloat16()
+    plain = mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False)
+    expected = weightless_rmsnorm_gated_sigmoid(
+        plain.view(rows, heads * dim), gate, heads, dim, 1e-6, False
+    )
+    # A fallback to the separate op would give the same bits; the profile
+    # shows the kernel's own store applied the gate.
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        grouped = mha_decode_with_kvcache(
+            **inputs,
+            solution="gluon",
+            block_draft=False,
+            uniform_row_groups=positions,
+            output_gate=gate,
+            output_gate_eps=1e-6,
+        )
+        torch.cuda.synchronize()
+    assert not any("gated_sigmoid" in event.name for event in prof.events())
+    assert torch.equal(
+        grouped.view(rows, -1).view(torch.int16), expected.view(torch.int16)
+    )

@@ -128,6 +128,8 @@ async fn streams_tokens_until_finished() {
     assert_eq!(snapshots[0].0, 0);
     assert_eq!(snapshots[0].1.kv_used_pages, 7);
     assert_eq!(snapshots[0].1.kv_active_pages, 0);
+    assert_eq!(snapshots[0].1.num_resident_tokens, Some(0));
+    assert_eq!(snapshots[0].1.num_waiting_uncached_tokens, Some(0));
     assert!(client.fresh_loads(Duration::ZERO).is_empty());
 }
 

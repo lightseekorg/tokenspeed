@@ -554,6 +554,33 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
     )
 
 
+def mnnvl_allgather_serves(
+    allgather_in: torch.Tensor, workspace: MnnvlAllReduceFusionWorkspace
+) -> bool:
+    """Whether ``trtllm_mnnvl_allgather`` gathers ``[T, W]`` rows of this shape on ``workspace``.
+
+    Args:
+        allgather_in: ``[T, W]`` rows of this rank.
+        workspace: The group's workspace.
+
+    Returns:
+        True for 16-bit rows whose shape the one-shot exchange serves.
+    """
+    if allgather_in.dim() != 2:
+        return False
+    token_num, width = allgather_in.shape
+    # Refuse only on what every rank shares: a rank-local refusal strands its peers.
+    return (
+        allgather_in.dtype.itemsize == 2
+        and 0 < token_num
+        and 0 < width <= 4096
+        and width % 128 == 0
+        and token_num * width * 2 <= MNNVL_ALLGATHER_MAX_BYTES
+        # Each 16-bit value travels as a 32-bit word.
+        and token_num * workspace.tp_size * width * 4 <= workspace.buffer_size_bytes
+    )
+
+
 def trtllm_mnnvl_allgather(
     allgather_in: torch.Tensor,
     workspace: MnnvlAllReduceFusionWorkspace,
@@ -571,16 +598,7 @@ def trtllm_mnnvl_allgather(
         when the workspace does not serve the rows.
     """
     token_num, width = allgather_in.shape
-    # Refuse only on what every rank shares: a rank-local refusal strands its peers.
-    if not (
-        allgather_in.dtype.itemsize == 2
-        and 0 < token_num
-        and 0 < width <= 4096
-        and width % 128 == 0
-        and token_num * width * 2 <= MNNVL_ALLGATHER_MAX_BYTES
-        # Each 16-bit value travels as a 32-bit word.
-        and token_num * workspace.tp_size * width * 4 <= workspace.buffer_size_bytes
-    ):
+    if not mnnvl_allgather_serves(allgather_in, workspace):
         return None
     if allgather_in.stride() != (width, 1) or allgather_in.data_ptr() % 16:
         allgather_in = allgather_in.clone(memory_format=torch.contiguous_format)

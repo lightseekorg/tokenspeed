@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -33,6 +34,15 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    index_k_scale_word,
+)
+from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
+    _mxfp4_index_rows,
+    _ue8m0_word,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
@@ -56,6 +66,8 @@ __all__ = [
     "compact_window_rows",
     "copy_page_fields",
     "copy_state_rows",
+    "copy_state_rows_compact",
+    "dequant_gather_kv_mxfp8",
     "fused_fp8_set_kv_buffer",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
@@ -233,7 +245,10 @@ def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
     _arrive_and_signal_layer(count_ptr, flag_ptr, nprogs - 1)
 
 
-@triton.jit
+# A transfer's geometry rows and their offset follow the cache group it copies,
+# so they change between transfers: specializing on them (value 1, a multiple
+# of 16) would compile again mid-serve.
+@triton.jit(do_not_specialize=["num_geometry_rows", "geometry_offset"])
 def _transfer_cache_blocks_kernel(
     buffer_addresses_ptr,
     geometry_ptr,
@@ -671,7 +686,7 @@ def copy_page_fields(
 # -----------------------------------------------------------------------------
 
 
-@triton.jit(do_not_specialize=["rows_per_layer", "work_start"])
+@triton.jit(do_not_specialize=["rows_per_layer", "work_start", "verify_width"])
 def _copy_state_rows_kernel(
     src_addresses_ptr,
     dst_addresses_ptr,
@@ -681,16 +696,18 @@ def _copy_state_rows_kernel(
     dst_rows_ptr,
     rows_per_layer,
     work_start,
-    ROW_I32: tl.constexpr,
-    BLOCK_I32: tl.constexpr,
+    compact_scratch,
+    verify_width,
+    ROW_ELEMENTS: tl.constexpr,
+    BLOCK_ELEMENTS: tl.constexpr,
+    COMPACT_STATE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    """Copy one state row between two slabs of one layer.
+    """Copy or reconstruct one state row between two slabs of one layer.
 
-    Row strides are per-layer (int32 units) so page-interleaved ``as_strided``
-    slab views and dense scratch tensors mix freely. A negative source row id
-    stores zeros instead (seed-invalid fill). A negative destination row id
-    skips the store entirely, which is how callers mask a null cache page.
+    Full rows use int32 strides. Compact scratch is dense and uses the state
+    dtype with per-layer destination strides in elements. A negative source
+    row id stores zeros. A negative destination row id skips the store.
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -700,19 +717,36 @@ def _copy_state_rows_kernel(
 
     src_address = tl.load(src_addresses_ptr + layer_index)
     dst_address = tl.load(dst_addresses_ptr + layer_index)
-    src_ptr = tl.cast(src_address, tl.pointer_type(tl.int32))
-    dst_ptr = tl.cast(dst_address, tl.pointer_type(tl.int32))
-    src_stride = tl.load(src_strides_ptr + layer_index)
     dst_stride = tl.load(dst_strides_ptr + layer_index)
 
     src_row = tl.load(src_rows_ptr + work_index).to(tl.int64)
     dst_row = tl.load(dst_rows_ptr + work_index).to(tl.int64)
 
-    offsets = chunk_index * BLOCK_I32 + tl.arange(0, BLOCK_I32)
-    mask = offsets < ROW_I32
+    offsets = chunk_index * BLOCK_ELEMENTS + tl.arange(0, BLOCK_ELEMENTS)
+    mask = offsets < ROW_ELEMENTS
+    src_mask = mask & (src_row >= 0)
+    if COMPACT_STATE:
+        src_ptr = tl.cast(src_address, compact_scratch.dtype)
+        dst_ptr = tl.cast(dst_address, compact_scratch.dtype)
+        request = src_row // (verify_width + 1)
+        accepted = src_row % (verify_width + 1)
+        channel = offsets // COMPACT_STATE
+        position = accepted + offsets % COMPACT_STATE
+        carried_or_input = tl.where(
+            position < COMPACT_STATE,
+            channel * COMPACT_STATE + position,
+            (1 + position - COMPACT_STATE) * ROW_ELEMENTS + channel,
+        )
+        source_offset = request * (verify_width + 1) * ROW_ELEMENTS + carried_or_input
+        src_mask &= dst_row >= 0
+    else:
+        src_ptr = tl.cast(src_address, tl.pointer_type(tl.int32))
+        dst_ptr = tl.cast(dst_address, tl.pointer_type(tl.int32))
+        src_stride = tl.load(src_strides_ptr + layer_index)
+        source_offset = src_row * src_stride + offsets.to(tl.int64)
     values = tl.load(
-        src_ptr + src_row * src_stride + offsets.to(tl.int64),
-        mask=mask & (src_row >= 0),
+        src_ptr + source_offset,
+        mask=src_mask,
         other=0,
     )
     tl.store(
@@ -722,6 +756,31 @@ def _copy_state_rows_kernel(
     )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
+
+
+def _state_row_copy_geometry(
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    dst_row_strides: torch.Tensor,
+) -> tuple[int, int]:
+    total = src_rows.numel()
+    num_layers = src_addresses.numel()
+    if total == 0:
+        return total, num_layers
+    if num_layers == 0 or total % num_layers:
+        raise ValueError("src_rows must hold rows_per_layer ids per layer")
+    if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
+        raise ValueError("slab address tables must have dtype torch.uint64")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
+    if dst_row_strides.dtype != torch.int64 or dst_row_strides.numel() != num_layers:
+        raise ValueError("row stride tables must be int64 with one entry per layer")
+    if dst_rows.numel() != total or dst_addresses.numel() != num_layers:
+        raise ValueError("source/destination table sizes must match")
+    return total, num_layers
 
 
 def copy_state_rows(
@@ -751,7 +810,7 @@ def copy_state_rows(
         dst_rows: CUDA int32 or int64 tensor, same layout, destination row ids.
             A negative id suppresses that row's store, so a caller holding a
             null cache page id can mask it instead of clamping it onto page 0.
-        row_bytes: Byte width of the copied row payload (divisible by 4).
+        row_bytes: Byte width of a full state row. Divisible by 4 for full copies.
         src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
             source slabs in int32 units (``stride_bytes // 4``).
         dst_row_strides: CUDA int64 ``[num_layers]`` destination row strides in
@@ -761,33 +820,23 @@ def copy_state_rows(
         None. Rows are copied in place. Ascend uses a conservative cap of
         65535 programs per launch; other devices use one launch.
     """
-    enable_pdl = pdl_enabled()
-    total = src_rows.numel()
+    total, num_layers = _state_row_copy_geometry(
+        src_addresses, dst_addresses, src_rows, dst_rows, dst_row_strides
+    )
     if total == 0:
         return
-    num_layers = src_addresses.numel()
-    if num_layers == 0 or total % num_layers:
-        raise ValueError("src_rows must hold rows_per_layer ids per layer")
-    if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
-        raise ValueError("slab address tables must have dtype torch.uint64")
-    row_id_dtypes = (torch.int32, torch.int64)
-    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
-        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
     if (
-        src_row_strides.dtype != torch.int64
-        or dst_row_strides.dtype != torch.int64
+        src_row_strides is None
+        or src_row_strides.dtype != torch.int64
         or src_row_strides.numel() != num_layers
-        or dst_row_strides.numel() != num_layers
     ):
         raise ValueError("row stride tables must be int64 with one entry per layer")
-    if dst_rows.numel() != total or dst_addresses.numel() != num_layers:
-        raise ValueError("source/destination table sizes must match")
     if row_bytes <= 0 or row_bytes % 4:
         raise ValueError("row_bytes must be positive and divisible by 4")
 
-    row_i32 = row_bytes // 4
-    block_i32 = 1024
-    chunks = triton.cdiv(row_i32, block_i32)
+    enable_pdl = pdl_enabled()
+    row_elements, block_elements = row_bytes // 4, 1024
+    chunks = triton.cdiv(row_elements, block_elements)
     # Ascend flattens the logical Triton grid into coreDim. Keep a conservative
     # 65535-program cap and split only grids that exceed it.
     rows_per_launch = (
@@ -805,15 +854,87 @@ def copy_state_rows(
             dst_rows,
             total // num_layers,
             start,
-            ROW_I32=row_i32,
-            BLOCK_I32=block_i32,
+            None,
+            0,
+            ROW_ELEMENTS=row_elements,
+            BLOCK_ELEMENTS=block_elements,
+            COMPACT_STATE=0,
             ENABLE_PDL=enable_pdl,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
+def copy_state_rows_compact(
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    *,
+    row_bytes: int,
+    dst_row_strides: torch.Tensor,
+    scratch: torch.Tensor,
+    verify_width: int,
+) -> None:
+    """Reconstruct accepted state windows from compact verify scratch.
+
+    Args:
+        src_addresses: CUDA uint64 base address of each layer's scratch slab.
+        dst_addresses: CUDA uint64 base address of each layer's state slab.
+        src_rows: Layer-major int32 or int64 row IDs encoded as
+            ``request * (verify_width + 1) + accepted_count``. Negative IDs
+            zero-fill the destination.
+        dst_rows: Layer-major int32 or int64 destination row IDs. Negative IDs
+            skip the write.
+        row_bytes: Byte width of one destination state window.
+        dst_row_strides: Int64 destination stride per layer in state elements.
+        scratch: A dense CUDA scratch slab defining the common
+            ``[rows, channels, state]`` geometry and dtype. Each request stores
+            its carried window followed by one channel vector per candidate.
+        verify_width: Number of candidates per request in the scratch layout.
+
+    Returns:
+        None. The reconstructed windows are written in place.
+    """
+    total, num_layers = _state_row_copy_geometry(
+        src_addresses, dst_addresses, src_rows, dst_rows, dst_row_strides
+    )
+    if total == 0:
+        return
+    channels, state = scratch.shape[1:]
+    row_elements = channels * state
+    if row_elements == 0:
+        return
+    if (
+        not scratch.is_cuda
+        or not scratch.is_contiguous()
+        or verify_width < 0
+        or row_bytes != row_elements * scratch.element_size()
+    ):
+        raise ValueError(
+            "compact copies require dense CUDA state scratch and matching row_bytes"
+        )
+    enable_pdl = pdl_enabled()
+    block_elements = 256
+    _copy_state_rows_kernel[(total, triton.cdiv(row_elements, block_elements))](
+        src_addresses,
+        dst_addresses,
+        None,
+        dst_row_strides,
+        src_rows,
+        dst_rows,
+        total // num_layers,
+        0,
+        scratch,
+        verify_width,
+        ROW_ELEMENTS=row_elements,
+        BLOCK_ELEMENTS=block_elements,
+        COMPACT_STATE=state,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+
+
 @triton.jit(
-    do_not_specialize=["num_rows", "state_width"],
     **(
         {"do_not_specialize_on_alignment": ["blocks"]}
         if current_platform().is_npu
@@ -824,26 +945,23 @@ def _store_state_rows_kernel(
     states,
     slab,
     blocks,
-    num_rows,
-    state_width,
-    state_dim_2,
-    state_dim_3,
+    state_width: tl.constexpr,
+    state_dim_2: tl.constexpr,
+    state_dim_3: tl.constexpr,
     state_stride_0,
-    state_stride_1,
-    state_stride_2,
-    state_stride_3,
+    state_stride_1: tl.constexpr,
+    state_stride_2: tl.constexpr,
+    state_stride_3: tl.constexpr,
     slab_stride_0,
-    slab_stride_1,
-    slab_stride_2,
-    slab_stride_3,
+    slab_stride_1: tl.constexpr,
+    slab_stride_2: tl.constexpr,
+    slab_stride_3: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
-    row = offsets // state_width
-    feature = offsets % state_width
-    live = row < num_rows
-    destination = tl.load(blocks + row, mask=live, other=-1).to(tl.int64)
-    live = live & (destination >= 0)
+    row = tl.program_id(0).to(tl.int64)
+    feature = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    destination = tl.load(blocks + row).to(tl.int64)
+    live = (feature < state_width) & (destination >= 0)
     # int64 element offsets: a slab block id times its stride, or a late row of
     # a wide state, exceeds int32 on large pools.
     dim_1_index = feature // (state_dim_2 * state_dim_3)
@@ -901,12 +1019,11 @@ def store_state_rows(
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
     state_width = states[0].numel()
-    block = 256
-    _store_state_rows_kernel[(triton.cdiv(blocks.numel() * state_width, block),)](
+    block = 512
+    _store_state_rows_kernel[(blocks.numel(), triton.cdiv(state_width, block))](
         states,
         slab,
         blocks,
-        blocks.numel(),
         state_width,
         states.shape[2],
         states.shape[3],
@@ -2064,7 +2181,26 @@ def get_mla_kv_buffer_triton(
 # -----------------------------------------------------------------------------
 
 
-@triton.jit
+# A destination row's alignment in bytes, which vectorizes the KV store's writes.
+_CACHE_ROW_ALIGN_BYTES = tl.constexpr(16)
+
+
+@functools.cache
+def _log_unaligned_store() -> None:
+    """Say once that store_kv_cache writes a cache whose rows are off
+    _CACHE_ROW_ALIGN_BYTES, which takes slower, unvectorized stores."""
+    logger.warning(
+        f"store_kv_cache: a K / V cache's rows are not "
+        f"{_CACHE_ROW_ALIGN_BYTES.value}-byte aligned, so its writes are not "
+        f"vectorized"
+    )
+
+
+# The destination cache pointers are not specialized: Triton keys a binary on
+# whether a tensor's storage fits in 2 GB, and the KV arena is sized after
+# startup's warm-up. Rows are addressed from int64 offsets, and their
+# alignment, which vectorizes the stores, is a launch constant (ROWS_ALIGNED).
+@triton.jit(do_not_specialize=["k_dst_ptr", "v_dst_ptr"])
 def _store_kv_cache_kernel(
     k_src_ptr,
     v_src_ptr,
@@ -2081,6 +2217,7 @@ def _store_kv_cache_kernel(
     n_kv_per_token: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    ROWS_ALIGNED: tl.constexpr,
 ):
     """Scatter rows of k_src/v_src into k_dst/v_dst at indices loc_ptr.
 
@@ -2099,16 +2236,26 @@ def _store_kv_cache_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     dst_row = tl.load(loc_ptr + row).to(tl.int64)
+    k_row = (
+        k_dst_ptr
+        + (dst_row // dst_page_size) * k_dst_page_stride
+        + (dst_row % dst_page_size) * k_dst_row_stride
+    )
+    v_row = (
+        v_dst_ptr
+        + (dst_row // dst_page_size) * v_dst_page_stride
+        + (dst_row % dst_page_size) * v_dst_row_stride
+    )
+    if ROWS_ALIGNED:
+        k_row = tl.multiple_of(k_row, _CACHE_ROW_ALIGN_BYTES)
+        v_row = tl.multiple_of(v_row, _CACHE_ROW_ALIGN_BYTES)
 
     if is_v == 1:
         src = tl.load(
             v_src_ptr + row * v_src_token_stride + offsets, mask=mask, other=0
         )
         tl.store(
-            v_dst_ptr
-            + (dst_row // dst_page_size) * v_dst_page_stride
-            + (dst_row % dst_page_size) * v_dst_row_stride
-            + offsets,
+            v_row + offsets,
             src,
             mask=mask,
         )
@@ -2117,10 +2264,7 @@ def _store_kv_cache_kernel(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
         tl.store(
-            k_dst_ptr
-            + (dst_row // dst_page_size) * k_dst_page_stride
-            + (dst_row % dst_page_size) * k_dst_row_stride
-            + offsets,
+            k_row + offsets,
             src,
             mask=mask,
         )
@@ -2175,6 +2319,17 @@ def store_kv_cache(
     block = triton.next_power_of_2(n_kv_k)
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
+    # Fixed for a cache: every row starts on _CACHE_ROW_ALIGN_BYTES.
+    rows_aligned = all(
+        value % _CACHE_ROW_ALIGN_BYTES.value == 0
+        for dst in (k_dst, v_dst)
+        for value in (
+            dst.data_ptr(),
+            *(stride * dst.element_size() for stride in dst.stride()[:-1]),
+        )
+    )
+    if not rows_aligned:
+        _log_unaligned_store()
     if use_pdl:
         kwargs["launch_pdl"] = True
     _store_kv_cache_kernel[(n_tokens, 2)](
@@ -2193,6 +2348,7 @@ def store_kv_cache(
         n_kv_k,
         BLOCK=block,
         ENABLE_PDL=use_pdl,
+        ROWS_ALIGNED=rows_aligned,
         **kwargs,
     )
 
@@ -3246,6 +3402,214 @@ def quantize_mxfp8_rows(
     return data, sf
 
 
+# -----------------------------------------------------------------------------
+# MXFP8 KV dequantize + gather (a BF16 paged view of an MXFP8 cache)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _dequant_mxfp8_tile(src_ptr, sf_ptr, slot, sf_word, valid, row_stride, head_off):
+    """Dequantize [ROWS, 128] fp8 rows of one head with their packed UE8M0 words.
+
+    Rows past the request's length read as zero: the pool bytes there may be
+    stale fp8 or scale NaNs that would poison P @ V.
+    """
+    d_off = tl.arange(0, 128)
+    q8 = tl.load(
+        src_ptr + slot[:, None] * row_stride + head_off + d_off[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    x = q8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    packed = tl.load(sf_ptr + sf_word, mask=valid, other=0).to(tl.uint32, bitcast=True)
+    exp = (packed[:, None] >> (8 * (d_off[None, :] // 32)).to(tl.uint32)) & 0xFF
+    y = x * tl.exp2(exp.to(tl.float32) - 127.0)
+    return tl.where(valid[:, None], y, 0.0).to(tl.bfloat16)
+
+
+@triton.jit
+def _dequant_gather_kv_mxfp8_kernel(
+    k_src_ptr,  # fp8 cache rows as u8, row = slot
+    v_src_ptr,
+    k_sf_ptr,  # SF slabs as u32 (4 packed e8m0), interleaved atom layout
+    v_sf_ptr,
+    page_table_ptr,  # [B, W] int32 source pages (kernel-page units)
+    seq_lens_ptr,  # [B] int32 tokens per request
+    first_page_ptr,  # [B] int32 first gathered logical page
+    num_pages_ptr,  # [B] int32 gathered pages
+    base_page_ptr,  # [B] int32 first scratch page of the request
+    k_dst_ptr,  # bf16 scratch rows, row = scratch slot
+    v_dst_ptr,
+    out_page_table_ptr,  # [B, W] int32
+    page_table_stride,
+    out_page_table_stride,
+    src_row_stride,
+    dst_row_stride,
+    sf_page_stride,  # nheads * chunks_per_page * 128 (u32 units)
+    page_tokens,  # tokens per page of the layer's group (SF layout unit)
+    width,
+    capacity_pages,
+    KERNEL_PAGE: tl.constexpr,
+    NHEADS: tl.constexpr,
+    PAGES_PER_PROG: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + b)
+    first = tl.load(first_page_ptr + b)
+    count = tl.load(num_pages_ptr + b)
+    base = tl.load(base_page_ptr + b)
+    rows = tl.arange(0, ROWS)
+    d_off = tl.arange(0, 128)
+    chunks_per_page = page_tokens // 128
+    for j in range(PAGES_PER_PROG):
+        i = chunk * PAGES_PER_PROG + j
+        if i < width:
+            dst_page = base + i - first
+            keep = (i >= first) & (i < first + count) & (dst_page < capacity_pages)
+            # Pages outside the gathered range point at scratch page 0: the
+            # kernels never read them (outside the window or past the length).
+            tl.store(
+                out_page_table_ptr + b * out_page_table_stride + i,
+                tl.where(keep, dst_page, 0),
+            )
+            if keep:
+                src_page = tl.load(page_table_ptr + b * page_table_stride + i).to(
+                    tl.int64
+                )
+                for r0 in range(0, KERNEL_PAGE, ROWS):
+                    valid = i * KERNEL_PAGE + r0 + rows < seq_len
+                    slot = src_page * KERNEL_PAGE + r0 + rows
+                    dst_slot = dst_page.to(tl.int64) * KERNEL_PAGE + r0 + rows
+                    page_off = slot % page_tokens
+                    row = page_off % 128
+                    sf_word = (
+                        (slot // page_tokens) * sf_page_stride
+                        + (page_off // 128) * 128
+                        + (row % 32) * 4
+                        + row // 32
+                    )
+                    for h in tl.static_range(NHEADS):
+                        word = sf_word + h * chunks_per_page * 128
+                        dst = (
+                            dst_slot[:, None] * dst_row_stride
+                            + h * 128
+                            + d_off[None, :]
+                        )
+                        k = _dequant_mxfp8_tile(
+                            k_src_ptr,
+                            k_sf_ptr,
+                            slot,
+                            word,
+                            valid,
+                            src_row_stride,
+                            h * 128,
+                        )
+                        tl.store(k_dst_ptr + dst, k)
+                        v = _dequant_mxfp8_tile(
+                            v_src_ptr,
+                            v_sf_ptr,
+                            slot,
+                            word,
+                            valid,
+                            src_row_stride,
+                            h * 128,
+                        )
+                        tl.store(v_dst_ptr + dst, v)
+
+
+def dequant_gather_kv_mxfp8(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    first_page: torch.Tensor,
+    num_pages: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    out_page_table: torch.Tensor,
+    *,
+    kernel_page_size: int,
+    page_tokens: int,
+) -> None:
+    """Dequantize the MXFP8 cache pages an attention call reads into BF16 pages.
+
+    Request ``b`` reads logical pages ``[first_page[b], first_page[b] +
+    num_pages[b])`` of its ``page_table`` row; they land on consecutive
+    scratch pages (requests in batch order) and ``out_page_table`` maps them,
+    so a BF16 paged-attention kernel run on ``(k_out, v_out, out_page_table)``
+    sees exactly the dequantized cache. Other ``out_page_table`` entries are 0.
+    Rows at or past ``seq_lens[b]`` are zero. Pages beyond the scratch
+    capacity are not gathered; callers size the scratch for the batch.
+
+    Args:
+        k_cache, v_cache: fp8-e4m3 row views ``[slots, H, 128]`` (the views
+            ``quantize_store_kv_mxfp8`` writes), slot = page * kernel_page_size + row.
+        k_sf, v_sf: e8m0 scale slabs in the interleaved layout of
+            ``quantize_store_kv_mxfp8`` for ``page_tokens``.
+        page_table: ``[B, W]`` int32 source pages in kernel-page units.
+        seq_lens: ``[B]`` int32 tokens per request.
+        first_page, num_pages: ``[B]`` int32 gathered page range per request.
+        k_out, v_out: BF16 scratch rows ``[scratch_slots, H, 128]``.
+        out_page_table: ``[B, W]`` int32 output page table.
+        kernel_page_size: Tokens per page-table entry.
+        page_tokens: Tokens per page of the layer's group (multiple of 128).
+    """
+    assert page_tokens % 128 == 0
+    if k_cache.dim() != 3 or k_cache.shape[-1] != 128 or v_cache.shape != k_cache.shape:
+        raise ValueError(
+            f"MXFP8 KV caches hold [slots, heads, 128] rows: "
+            f"{tuple(k_cache.shape)} / {tuple(v_cache.shape)}"
+        )
+    if k_out.dtype != torch.bfloat16 or k_out.shape[1:] != k_cache.shape[1:]:
+        raise ValueError(
+            f"scratch {tuple(k_out.shape)} {k_out.dtype} must be BF16 rows of "
+            f"the cache's {tuple(k_cache.shape[1:])} heads"
+        )
+    if v_out.shape != k_out.shape or v_out.dtype != k_out.dtype:
+        raise ValueError("the value scratch must match the key scratch")
+    if page_table.shape != out_page_table.shape:
+        raise ValueError("out_page_table must match page_table")
+    for t in (k_cache, v_cache, k_out, v_out):
+        assert t.stride(-1) == 1 and t.stride(-2) == 128
+    b, width = page_table.shape
+    if b == 0:
+        return
+    nheads = k_cache.shape[1]
+    base_page = torch.cumsum(num_pages, 0, dtype=torch.int32) - num_pages
+    pages_per_prog = 8
+    grid = (b, triton.cdiv(width, pages_per_prog))
+    _dequant_gather_kv_mxfp8_kernel[grid](
+        k_cache.view(torch.uint8),
+        v_cache.view(torch.uint8),
+        k_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1),
+        v_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1),
+        page_table,
+        seq_lens,
+        first_page,
+        num_pages,
+        base_page,
+        k_out,
+        v_out,
+        out_page_table,
+        page_table.stride(0),
+        out_page_table.stride(0),
+        k_cache.stride(0),
+        k_out.stride(0),
+        nheads * (page_tokens // 128) * 128,
+        page_tokens,
+        width,
+        k_out.shape[0] // kernel_page_size,
+        KERNEL_PAGE=kernel_page_size,
+        NHEADS=nheads,
+        PAGES_PER_PROG=pages_per_prog,
+        ROWS=32,
+    )
+
+
 # GLM-5 DSA block-split index-K scatter
 
 
@@ -3318,7 +3682,9 @@ def index_k_block_split_scatter(
         buf: uint8 slot matrix or paged byte view. Pages may have padding
             between them; bytes within each page must be contiguous.
         index_k_fp8: ``[tokens, head_dim]`` FP8 values.
-        index_k_scale: ``[tokens, num_groups]`` float32 scales.
+        index_k_scale: ``[tokens, num_groups]`` scale words in the plane's
+            encoding (``kvcache/index_k_scale.py``): float32 scales, or the
+            int32 UE8M0 words of a Blackwell plane.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
             dtype).
         write_mask: Required explicit ownership mask, or None to write all rows.
@@ -3355,8 +3721,12 @@ def index_k_block_split_scatter(
     if buf.storage_offset() % 4 or page_bytes % 4:
         raise ValueError("Index-K pages must be float32 aligned")
 
+    if index_k_scale.dtype not in (torch.float32, torch.int32):
+        raise ValueError(
+            f"index-K scale words are float32 or int32, got {index_k_scale.dtype}"
+        )
     fp8_buf = buf
-    scale_buf = buf.view(torch.float32)  # aliases the same storage
+    scale_buf = buf.view(index_k_scale.dtype)  # aliases the same storage
     k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
     k_scale = index_k_scale.reshape(-1, ng).contiguous()
 
@@ -3491,7 +3861,7 @@ def index_k_layernorm_scatter(
 @triton.jit
 def _index_k_layernorm_fp8_scatter_row(
     fp8_buf_ptr,  # uint8 flat view of the paged plane
-    scale_buf_ptr,  # float32 flat view of the same storage
+    scale_buf_ptr,  # float32 (int32 for MXFP4) flat view of the same storage
     x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
     weight_ptr,  # [HD] LayerNorm weight
     bias_ptr,  # [HD] LayerNorm bias
@@ -3500,7 +3870,7 @@ def _index_k_layernorm_fp8_scatter_row(
     t,  # int64 row
     x_row_stride,
     page_bytes,  # bytes per page (page stride)
-    scale_base_off,  # float32 offset of a page's scales ((ps*hd)//4)
+    scale_base_off,  # 4-byte offset of a page's scales (code bytes // 4)
     eps,
     HAS_WRITE_MASK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -3509,7 +3879,10 @@ def _index_k_layernorm_fp8_scatter_row(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
 ):
+    tl.static_assert(not MXFP4 or (HD == 128 and GROUP == 32))
     g = tl.arange(0, BLOCK_NG)[:, None]
     c = tl.arange(0, GROUP)[None, :]
     d = g * GROUP + c
@@ -3523,25 +3896,51 @@ def _index_k_layernorm_fp8_scatter_row(
     bias = tl.load(bias_ptr + d, mask=mask, other=0.0).to(tl.float32)
     # The keys are model-dtype rows before they are quantized.
     y = (centered * rstd * weight + bias).to(x_ptr.dtype.element_ty).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
-    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
 
-    store_mask = mask
+    write = True
     if HAS_WRITE_MASK:
-        store_mask = store_mask & tl.load(write_mask_ptr + t).to(tl.int1)
+        write = tl.load(write_mask_ptr + t).to(tl.int1)
     loc = tl.load(loc_ptr + t).to(tl.int64)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
-    tl.store(
-        fp8_buf_ptr + page * page_bytes + slot * HD + d,
-        codes.to(tl.uint8, bitcast=True),
-        mask=store_mask,
-    )
-    tl.store(
-        scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
-        scale[:, None],
-        mask=store_mask,
-    )
+    if MXFP4:
+        # DSV4.1's index codec: UE8M0 2**ceil(log2(amax / 6)) per 32 elements.
+        grouped = tl.reshape(y, (1, NG, GROUP))
+        amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
+        packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
+        tl.store(
+            fp8_buf_ptr
+            + page * page_bytes
+            + slot * (HD // 2)
+            + tl.arange(0, HD // 2)[None, :],
+            packed,
+            mask=write,
+        )
+        tl.store(
+            scale_buf_ptr
+            + page * (page_bytes // 4)
+            + scale_base_off
+            + slot
+            + tl.arange(0, 1),
+            _ue8m0_word(exponent),
+            mask=write,
+        )
+    else:
+        scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+        # The plane's scale-word encoding (kvcache/index_k_scale.py).
+        scale, word = index_k_scale_word(scale, UE8M0)
+        codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+        store_mask = mask & write
+        tl.store(
+            fp8_buf_ptr + page * page_bytes + slot * HD + d,
+            codes.to(tl.uint8, bitcast=True),
+            mask=store_mask,
+        )
+        tl.store(
+            scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
+            word[:, None],
+            mask=store_mask,
+        )
 
 
 @triton.jit
@@ -3564,6 +3963,8 @@ def _index_k_layernorm_fp8_scatter_kernel(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
 ):
     _index_k_layernorm_fp8_scatter_row(
         fp8_buf_ptr,
@@ -3585,6 +3986,8 @@ def _index_k_layernorm_fp8_scatter_kernel(
         NG,
         BLOCK_NG,
         FP8_MAX,
+        MXFP4,
+        UE8M0,
     )
 
 
@@ -3599,12 +4002,16 @@ def _index_k_layernorm_fp8_scatter_args(
     page_size: int,
     group_size: int,
     write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[tuple, dict[str, object]]:
     """Validate an :func:`index_k_layernorm_fp8_scatter` write (same arguments).
 
     Returns ``(args, constexprs)``: the runtime arguments and the constexprs
     ``_index_k_layernorm_fp8_scatter_kernel`` takes for it.
     """
+    if index_k_format not in ("fp8_scaled", "mxfp4"):
+        raise ValueError(f"unsupported index_k_format {index_k_format!r}")
+    mxfp4 = index_k_format == "mxfp4"
     tokens = index_k.shape[0]
     head_dim = index_k.shape[1] if index_k.ndim == 2 else -1
     if index_k.ndim != 2 or index_k.stride(-1) != 1:
@@ -3626,8 +4033,11 @@ def _index_k_layernorm_fp8_scatter_args(
         or write_mask.device != loc.device
     ):
         raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
+    if mxfp4 and (head_dim != 128 or group_size != 32):
+        raise ValueError("mxfp4 index keys need head_dim 128 and group_size 32")
     ng = head_dim // group_size
-    row_bytes = head_dim + ng * 4
+    code_bytes = head_dim // 2 if mxfp4 else head_dim
+    row_bytes = code_bytes + (4 if mxfp4 else ng * 4)
     page_bytes = page_size * row_bytes
     if buf.ndim == 3:
         buf = buf.view(buf.shape[0], -1)
@@ -3644,7 +4054,8 @@ def _index_k_layernorm_fp8_scatter_args(
         raise ValueError("Index-K pages must be float32 aligned")
     args = (
         buf,
-        buf.view(torch.float32),
+        # Scale words are stored as int32 in every encoding.
+        buf.view(torch.int32),
         index_k,
         weight.contiguous(),
         bias.contiguous(),
@@ -3652,7 +4063,7 @@ def _index_k_layernorm_fp8_scatter_args(
         write_mask,
         index_k.stride(0),
         page_bytes,
-        (page_size * head_dim) // 4,
+        (page_size * code_bytes) // 4,
         float(eps),
     )
     constexprs = {
@@ -3663,8 +4074,86 @@ def _index_k_layernorm_fp8_scatter_args(
         "NG": ng,
         "BLOCK_NG": _next_power_of_two(ng),
         "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
+        "MXFP4": mxfp4,
+        "UE8M0": not mxfp4 and index_k_scale_ue8m0(),
     }
     return args, constexprs
+
+
+@triton.jit
+def _quantize_index_k_rows_kernel(
+    x_ptr,
+    codes_ptr,
+    words_ptr,
+    x_row_stride,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    UE8M0: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, BLOCK_NG)[:, None]
+    c = tl.arange(0, GROUP)[None, :]
+    d = g * GROUP + c
+    mask = g < NG
+    y = tl.load(x_ptr + t * x_row_stride + d, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+    scale, word = index_k_scale_word(scale, UE8M0)
+    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    tl.store(codes_ptr + t * HD + d, codes, mask=mask)
+    tl.store(words_ptr + t * NG + g, word[:, None], mask=mask)
+
+
+def quantize_index_k_rows(
+    index_k: torch.Tensor, *, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize index keys to ``fp8_scaled`` rows in the plane's encoding.
+
+    Each ``group_size`` group gets the scale ``max(amax, 1e-10) / 448``, in
+    the scale-word encoding of this GPU's planes (``kvcache/index_k_scale.py``),
+    and the E4M3 codes of the clamped quotient: the rows
+    ``index_k_layernorm_fp8_scatter`` writes for already normalized keys, as
+    ``index_k_block_split_scatter`` takes them.
+
+    Args:
+        index_k: ``[tokens, head_dim]`` keys with unit inner stride.
+        group_size: Elements per scale; a power of two dividing ``head_dim``.
+
+    Returns:
+        ``[tokens, head_dim]`` E4M3 codes and ``[tokens, head_dim //
+        group_size]`` scale words (float32 scales, or int32 UE8M0 words).
+    """
+    tokens, head_dim = index_k.shape
+    if index_k.ndim != 2 or index_k.stride(-1) != 1:
+        raise ValueError("index_k must be [tokens, head_dim] with unit inner stride")
+    if group_size <= 0 or head_dim % group_size or group_size & (group_size - 1):
+        raise ValueError(
+            f"group_size {group_size} must be a power of two dividing {head_dim}"
+        )
+    ng = head_dim // group_size
+    codes = torch.empty(
+        (tokens, head_dim), dtype=torch.float8_e4m3fn, device=index_k.device
+    )
+    words = torch.empty(
+        (tokens, ng), dtype=index_k_scale_dtype(), device=index_k.device
+    )
+    if tokens:
+        _quantize_index_k_rows_kernel[(tokens,)](
+            index_k,
+            codes,
+            words.view(torch.int32),
+            index_k.stride(0),
+            HD=head_dim,
+            GROUP=group_size,
+            NG=ng,
+            BLOCK_NG=_next_power_of_two(ng),
+            FP8_MAX=float(torch.finfo(torch.float8_e4m3fn).max),
+            UE8M0=index_k_scale_ue8m0(),
+            num_warps=1,
+        )
+    return codes, words
 
 
 def index_k_layernorm_fp8_scatter(
@@ -3678,13 +4167,15 @@ def index_k_layernorm_fp8_scatter(
     page_size: int,
     group_size: int,
     write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
 ) -> None:
     """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
 
-    One launch equivalent of ``index_k_block_split_scatter(buf, *fp8(ln(x)),
-    loc, ...)`` where ``ln`` is the FP32 LayerNorm rounded to ``index_k``'s
-    dtype and ``fp8`` gives each ``group_size`` group the scale
-    ``max(amax, 1e-10) / 448`` and the E4M3 codes of the clamped quotient.
+    One launch equivalent of ``index_k_block_split_scatter(buf,
+    *quantize_index_k_rows(ln(x)), loc, ...)`` where ``ln`` is the FP32
+    LayerNorm rounded to ``index_k``'s dtype: each ``group_size`` group gets
+    the scale ``max(amax, 1e-10) / 448`` in the plane's encoding
+    (``kvcache/index_k_scale.py``) and the E4M3 codes of the clamped quotient.
 
     Args:
         buf: uint8 ``index_k_block_split_scatter`` plane: a ``[slots,
@@ -3700,6 +4191,11 @@ def index_k_layernorm_fp8_scatter(
         group_size: Elements per scale; divides ``head_dim``.
         write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
             not written. None writes every row.
+        index_k_format: ``"fp8_scaled"``, or ``"mxfp4"`` for DSV4.1's index
+            codec: 64 nibble-packed E2M1 code bytes per row (even element in
+            the low nibble) and then each row's four UE8M0 exponents of
+            ``2**ceil(log2(max(amax, 6 * 2**-126) / 6))``. mxfp4 needs
+            ``head_dim`` 128 and ``group_size`` 32.
 
     Returns:
         None; ``buf`` is written in place.
@@ -3714,6 +4210,7 @@ def index_k_layernorm_fp8_scatter(
         page_size=page_size,
         group_size=group_size,
         write_mask=write_mask,
+        index_k_format=index_k_format,
     )
     if index_k.shape[0] == 0:
         return

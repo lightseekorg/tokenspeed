@@ -28,7 +28,7 @@
 
 namespace tokenspeed::fsm {
 
-std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
+std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling, PeerLanding>
 SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t prefix_granularity = state.PrefixGranularity();
@@ -60,6 +60,12 @@ SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
         // destination pages until RemotePrefillDone.
         return RemotePrefilling{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
     }
+    if (source_ == PrefillSource::kPeer) {
+        // Another replica's cache fills the window; this engine computes the
+        // rest of the prompt once it has landed.
+        _assert(window.begin + window.size < token_container->PrefillSize(), "a landing leaves a prompt to compute");
+        return PeerLanding{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
+    }
     if (window.begin + window.size == token_container->PrefillSize()) {
         if (awaits_result_) {
             return PrefillAwaitingResult{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
@@ -86,6 +92,10 @@ std::variant<PrefillDone, PrefillAwaitingResult, Prefilling> SchedulePrefillEven
 
 template <typename State>
 Decoding ScheduleDecodeEvent::decode(State&& state) {
+    if (decode_slot_.valid()) {
+        _assert(!state.resources.decode_slot.valid(), "a request acquires its decode permit once");
+        state.resources.decode_slot = std::move(decode_slot_);
+    }
     return Decoding{std::move(state.resources), decode_input_tokens_};
 }
 
@@ -102,15 +112,15 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 }
 
 Finishing FinishEvent::operator()(PrefillDone&& state) {
-    return Finishing{std::move(state.resources)};
+    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true};
 }
 
 Finishing FinishEvent::operator()(PrefillAwaitingResult&& state) {
-    return Finishing{std::move(state.resources)};
+    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true};
 }
 
 Finishing FinishEvent::operator()(Decoding&& state) {
-    return Finishing{std::move(state.resources)};
+    return Finishing{std::move(state.resources), /*publish_completed_pages=*/true};
 }
 
 Finished FinishEvent::operator()(Retracted&&) {
@@ -162,6 +172,10 @@ Finished AbortEvent::operator()(PrefillDone&& state) {
 }
 
 Finished AbortEvent::operator()(PrefillAwaitingResult&& state) {
+    return abortForward(std::move(state));
+}
+
+Finished AbortEvent::operator()(PrefillAwaitingDestination&& state) {
     return abortForward(std::move(state));
 }
 
@@ -254,6 +268,7 @@ std::variant<Prefilling, PrefillDone, Decoding> RestoreDoneEvent::operator()(Res
     _assert(req_pool_index_.valid(), "RestoreDoneEvent hands over the row the restore imported into");
     _assert(!state.resources.req_pool_index.valid(), "a Restoring request holds no row of its own");
     state.resources.req_pool_index = std::move(req_pool_index_);
+    state.resources.decode_slot = std::move(decode_slot_);
     // A resumed prefill chunk carries its input ids like any chunk; a resumed
     // decode is marked so its first step carries the token explicitly (the
     // device has no in-flight capture for the new slot).

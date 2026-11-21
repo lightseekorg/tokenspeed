@@ -30,6 +30,9 @@ Every rank runs the same two-stage plan in one persistent launch:
 Launches follow each other without a host sync, with new inputs each time, so
 a rank can start its next launch while a slower rank still reads this one: the
 two copies of the peer region (by launch parity) must keep them apart.
+
+The group has 2 or 8 ranks: the exchange is the same at any world size, so
+the 2-rank case runs where 8 GPUs are not available.
 """
 
 from __future__ import annotations
@@ -54,14 +57,13 @@ from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage  # noqa: E402
 
-WORLD = 8
 N = gl.constexpr(8192)  # values each rank contributes
 SLICE = gl.constexpr(64)  # values per task
 TASKS = int(N) // int(SLICE)
 LAUNCHES = 6
 
 
-def peer_plan() -> Plan:
+def peer_plan(world: int) -> Plan:
     # ``sum`` sits on other CTAs than ``push``, so it polls while peers push.
     return Plan(
         grid=2 * TASKS,
@@ -69,10 +71,10 @@ def peer_plan() -> Plan:
             Stage("push", TASKS, 0, writes=("part",)),
             Stage("sum", TASKS, TASKS, reads=("part",)),
         ),
-        regions=(("part", WORLD * int(N)),),
+        regions=(("part", world * int(N)),),
         rows=1,
         chain=1,
-        world=WORLD,
+        world=world,
         peers=("part",),
     )
 
@@ -110,20 +112,20 @@ def _inputs(rank: int, launch: int) -> torch.Tensor:
     return torch.randn(int(N), generator=g)
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, world: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
         rank=rank,
-        world_size=WORLD,
+        world_size=world,
         timeout=timedelta(seconds=300),
     )
     try:
         device = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
-        plan = peer_plan()
+        plan = peer_plan(world)
         # Nothing clears the buffer: each launch has a new tag.
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         xs = [_inputs(rank, k).to(device) for k in range(LAUNCHES)]
@@ -147,17 +149,19 @@ def _worker(rank: int, port: int) -> None:
         torch.cuda.synchronize()
         for k in range(LAUNCHES):
             want = _inputs(0, k)
-            for r in range(1, WORLD):
+            for r in range(1, world):
                 want = want + _inputs(r, k)
             assert torch.equal(outs[k].cpu(), want), f"launch {k}"
     finally:
         dist.destroy_process_group()
 
 
-def test_peer_regions_sum_every_ranks_slices_across_launches():
-    if torch.cuda.device_count() < WORLD:
-        pytest.skip(f"requires {WORLD} GPUs")
+# ut-tokenspeed-kernel-amd-2gpu selects the world2 case by this id.
+@pytest.mark.parametrize("world", [2, 8], ids=["world2", "world8"])
+def test_peer_regions_sum_every_ranks_slices_across_launches(world: int):
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"requires {world} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, world), nprocs=world, join=True)

@@ -339,8 +339,28 @@ class InklingModelConfig(PretrainedConfig):
         return [i for i in range(self.num_hidden_layers) if i not in local]
 
     @property
+    def num_cache_layers(self) -> int:
+        """Attention cache layers: one per decoder layer."""
+        return self.num_hidden_layers
+
+    @property
+    def num_conv_layers(self) -> int:
+        """Convolution state layers: one per decoder layer."""
+        return self.num_hidden_layers
+
+    def conv_layers_of_cache_layer(self, cache_layer: int) -> tuple[int, ...]:
+        """Convolution state layers whose checkpoints ride this cache layer's
+        pages: its own."""
+        return (cache_layer,)
+
+    @property
+    def local_cache_layer_ids(self) -> list[int]:
+        """Cache layers of sliding-window (local) attention layers."""
+        return list(self.local_layer_ids)
+
+    @property
     def cache_layer_types(self) -> list[str]:
-        """Per-layer cache-group labels derived from ``local_layer_ids``.
+        """Per-cache-layer group labels derived from ``local_cache_layer_ids``.
 
         Deliberately NOT named ``layer_types``: transformers strictly
         validates that attribute against its own vocabulary
@@ -361,16 +381,17 @@ class InklingModelConfig(PretrainedConfig):
         scheduler ext, so the scheduler-blind contract above still holds
         there.
         """
-        local = set(self.local_layer_ids)
-        full_count = self.num_hidden_layers - len(local)
+        num_layers = self.num_cache_layers
+        local = set(self.local_cache_layer_ids)
+        full_count = num_layers - len(local)
         if not local:
-            return ["full_attention"] * self.num_hidden_layers
+            return ["full_attention"] * num_layers
         if not full_count:
-            return ["sliding_attention"] * self.num_hidden_layers
+            return ["sliding_attention"] * num_layers
         subgroups = -(-len(local) // full_count)  # ceil div
         labels: list[str] = []
         rank = 0
-        for i in range(self.num_hidden_layers):
+        for i in range(num_layers):
             if i in local:
                 labels.append(f"sliding_attention_{rank % subgroups}")
                 rank += 1

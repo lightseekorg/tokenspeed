@@ -198,7 +198,8 @@ pub struct HistorySeeds {
 /// before the seeded tail remain unspecified. A forward seeds its committed
 /// prefix after a prefix-cache hit, a slot handoff, a retracted request's restore into
 /// another slot, or a PD decode landing. Ownership is per admission, not
-/// per request id, which clients may reuse.
+/// per request id, which clients may reuse. Only the request's latest slot
+/// holds its current history; returning to an earlier slot must seed again.
 ///
 /// A model that reads at most `lookback` committed tokens behind the
 /// frontier (an n-gram hash, say) needs only those seeded: a 200K-token
@@ -234,6 +235,12 @@ impl HistoryRows {
                 .state(rid)
                 .ok_or_else(|| CommitError::History(rid.clone()))?;
             let held = self.owners.insert(slot, state.admission) == Some(state.admission);
+            if !held {
+                // An old row becomes stale as this request advances elsewhere.
+                // Forget it on a move, including before a prefix-zero extend.
+                self.owners
+                    .retain(|other_slot, owner| *other_slot == slot || *owner != state.admission);
+            }
             let total = state.prompt_ids.len() + state.output_ids.len();
             let boundary = if i < batch.num_extends {
                 batch.extend_prefix_lens[i].max(0) as usize
@@ -475,16 +482,26 @@ pub struct FinishLog {
 /// Per-request latency samples and token totals since the last drain.
 #[derive(Debug, Default)]
 pub struct RequestMetrics {
+    /// Expected and actually consumed remote tokens per finished hinted request.
+    pub peer_usage: Vec<(Option<u64>, u64, &'static str)>,
+    /// Unfinished lookup/admission intervals closed by request completion.
+    pub peer_stops: Vec<(String, Option<Instant>, Option<Instant>, bool)>,
     /// Time from request creation to its first output token.
     pub ttft_seconds: Vec<f64>,
     /// Time from request creation to its end (role-specific end boundary).
     pub request_seconds: Vec<f64>,
     /// Decode phase: first token to request end (plain and decode roles).
     pub decode_seconds: Vec<f64>,
-    /// Decode seconds per generated token after the first one.
+    /// Gap between consecutive nonempty output blocks, per token in the later block.
     pub tpot_seconds: Vec<f64>,
+    /// First actual output to request end, per token after the first output block.
+    pub e2e_tpot_seconds: Vec<f64>,
     /// Output tokens the requests produced, including the bootstrap token.
     pub completion_tokens: u64,
+    /// One output-token count per ended request, including zero-token ends.
+    pub completion_token_samples: Vec<u64>,
+    /// Mean output tokens per verify round, including bonus, per ended request.
+    pub spec_decode_accept_length_samples: Vec<f64>,
 }
 
 /// The admitted requests and their outputs.
@@ -502,10 +519,12 @@ pub struct OutputProcessor {
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
-    /// Requests registered so far, numbering each admission.
+    /// Identities allocated so far, before data-plane admission.
     admissions: u64,
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
+    peer_stops: Vec<(String, Option<Instant>, Option<Instant>, bool)>,
+    peer_samples: Vec<(Option<u64>, u64, &'static str)>,
     generated_tokens: u64,
     prompt_tokens: u64,
     cache_hit_tokens: u64,
@@ -513,7 +532,10 @@ pub struct OutputProcessor {
     request_seconds: Vec<f64>,
     decode_seconds: Vec<f64>,
     tpot_seconds: Vec<f64>,
+    e2e_tpot_seconds: Vec<f64>,
     completion_tokens: u64,
+    completion_token_samples: Vec<u64>,
+    spec_decode_accept_length_samples: Vec<f64>,
     /// The OTLP trace exporter, when tracing is on. Presence also widens
     /// the request-stats clock: the trace needs the same timestamps.
     trace: Option<Arc<crate::trace::TracePublisher>>,
@@ -544,6 +566,8 @@ impl OutputProcessor {
             admissions: 0,
             metrics_enabled,
             trace,
+            peer_stops: Vec::new(),
+            peer_samples: Vec::new(),
             generated_tokens: 0,
             prompt_tokens: 0,
             cache_hit_tokens: 0,
@@ -551,18 +575,28 @@ impl OutputProcessor {
             request_seconds: Vec::new(),
             decode_seconds: Vec::new(),
             tpot_seconds: Vec::new(),
+            e2e_tpot_seconds: Vec::new(),
             completion_tokens: 0,
+            completion_token_samples: Vec::new(),
+            spec_decode_accept_length_samples: Vec::new(),
         }
     }
 
     /// Per-request latency samples and token totals since the last drain.
     pub fn take_request_metrics(&mut self) -> RequestMetrics {
         RequestMetrics {
+            peer_stops: std::mem::take(&mut self.peer_stops),
+            peer_usage: std::mem::take(&mut self.peer_samples),
             ttft_seconds: std::mem::take(&mut self.ttft_seconds),
             request_seconds: std::mem::take(&mut self.request_seconds),
             decode_seconds: std::mem::take(&mut self.decode_seconds),
             tpot_seconds: std::mem::take(&mut self.tpot_seconds),
+            e2e_tpot_seconds: std::mem::take(&mut self.e2e_tpot_seconds),
             completion_tokens: std::mem::take(&mut self.completion_tokens),
+            completion_token_samples: std::mem::take(&mut self.completion_token_samples),
+            spec_decode_accept_length_samples: std::mem::take(
+                &mut self.spec_decode_accept_length_samples,
+            ),
         }
     }
 
@@ -610,12 +644,37 @@ impl OutputProcessor {
 
     /// Log a request's stats line as it leaves the processor.
     fn log_end(&mut self, rid: &str, state: &RequestState) {
+        self.collect_stream_end(state, wall_seconds());
         self.log_finished(rid, state);
         if self.metrics_enabled {
+            if let Some(usage) = &state.peer_usage {
+                if usage.lookup_at.is_some() || usage.admission_at.is_some() {
+                    self.peer_stops.push((
+                        rid.to_owned(),
+                        usage.lookup_at,
+                        usage.admission_at,
+                        state.to_abort,
+                    ));
+                }
+                let actual = usage.actual.unwrap_or(0);
+                let outcome = if actual > 0 {
+                    "used"
+                } else if state.to_abort {
+                    "aborted"
+                } else {
+                    usage.disposition
+                };
+                self.peer_samples.push((usage.expected, actual, outcome));
+            }
             // Cache and prompt totals feed the derived cache metrics.
             self.prompt_tokens += state.prompt_len.max(0) as u64;
             self.cache_hit_tokens += state.cached_tokens.max(0) as u64;
-            self.completion_tokens += state.output_ids.len() as u64;
+            let completion_tokens = state.output_ids.len() as u64;
+            self.completion_tokens += completion_tokens;
+            self.completion_token_samples.push(completion_tokens);
+            if let Some(accept_length) = request_stats::accept_draft_tokens(state) {
+                self.spec_decode_accept_length_samples.push(accept_length);
+            }
             self.collect_request_latencies(state);
         }
     }
@@ -659,8 +718,9 @@ impl OutputProcessor {
     ///
     /// A prefill role's request ends when its KV transfer completes, so its
     /// request time includes the transfer; a decode role's request ends
-    /// after generation, and its decode time starts when the bootstrap token
-    /// landed. Both report the role-local views fluentllm's P/D servers do.
+    /// after generation, and its decode time starts at its first local
+    /// decode output, after the bootstrap token landed. Both report the
+    /// role-local views fluentllm's P/D servers do.
     fn collect_request_latencies(&mut self, state: &RequestState) {
         let created = state.created_time;
         if created <= 0.0 {
@@ -678,9 +738,20 @@ impl OutputProcessor {
         }
         let decode = (finish - first).max(0.0);
         self.decode_seconds.push(decode);
-        let generated = state.output_ids.len().saturating_sub(1);
-        if generated > 0 {
-            self.tpot_seconds.push(decode / generated as f64);
+    }
+
+    /// Finish the stream metric even when a terminal path publishes no final block.
+    /// These are engine output boundaries; TTFT and RequestTime keep their own clocks.
+    fn collect_stream_end(&mut self, state: &RequestState, finished: f64) {
+        if !self.metrics_enabled || self.role == Role::Prefill {
+            return;
+        }
+        if let Some(seconds) = state
+            .stream_output_timing
+            .as_ref()
+            .and_then(|timing| timing.e2e_tpot(finished))
+        {
+            self.e2e_tpot_seconds.push(seconds);
         }
     }
 
@@ -728,6 +799,14 @@ impl OutputProcessor {
         self.spec_num_tokens
     }
 
+    /// Whether this rank can collect sampled PD first-output summaries.
+    pub(crate) fn ttft_sampling_enabled(&self) -> bool {
+        self.finish_log.enabled
+            && self.finish_log.ttft_percentage > 0
+            && self.role != Role::Plain
+            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
+    }
+
     /// When `rid` reached the scheduler's waiting queue, the first time this
     /// is asked after it did: a retraction re-queues
     /// a request without re-stamping it.
@@ -735,16 +814,65 @@ impl OutputProcessor {
         self.states.get_mut(rid)?.submitted_at.take()
     }
 
+    /// Observe KV-ready waiting once, only for a request that starts decode.
+    pub fn take_decode_ready_at(&mut self, rid: &str) -> Option<Instant> {
+        let state = self.states.get_mut(rid)?;
+        let at = state.decode_ready_at.take();
+        if state.to_abort || state.finished() {
+            return None;
+        }
+        at
+    }
+
     /// Stamp `rid`'s arrival in the scheduler's waiting queue.
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
             state.submitted_at = Some(at);
+            if let Some(trace) = state.ttft.as_mut() {
+                let now = trace.ms();
+                trace.submitted_ms.get_or_insert(now);
+            }
+        }
+    }
+
+    /// Stamp the first plan selecting a sampled request, before DP agreement.
+    /// Remote admission reserves the D landing pages; it is not a forward.
+    pub fn mark_planned(&mut self, rids: &[String], remote_admission: bool) {
+        if self.finish_log.ttft_percentage == 0 {
+            return;
+        }
+        for rid in rids {
+            if let Some(trace) = self
+                .states
+                .get_mut(rid)
+                .and_then(|state| state.ttft.as_mut())
+            {
+                let now = trace.ms();
+                if remote_admission {
+                    trace.remote_admitted_ms.get_or_insert(now);
+                } else {
+                    trace.planned_ms.get_or_insert(now);
+                }
+            }
         }
     }
 
     /// Requests admitted and not ended.
     pub fn num_running(&self) -> usize {
         self.states.len()
+    }
+
+    /// Usage attribution for a running peer-hinted request.
+    pub(crate) fn peer_usage(&mut self, rid: &str) -> Option<&mut crate::request::PeerUsage> {
+        self.states.get_mut(rid)?.peer_usage.as_mut()
+    }
+
+    /// Prompt plus committed output tokens of every request the rank holds.
+    pub fn num_resident_tokens(&self) -> i64 {
+        self.states
+            .values()
+            .map(|state| state.prompt_len + state.output_ids.len() as i64)
+            .sum()
     }
 
     /// A running request's state.
@@ -757,10 +885,7 @@ impl OutputProcessor {
         state: &mut RequestState,
         bootstrap: Option<&ts_pd::BootstrapInfo>,
     ) {
-        if self.finish_log.enabled
-            && self.finish_log.ttft_percentage > 0
-            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
-        {
+        if self.ttft_sampling_enabled() {
             state.ttft = bootstrap.and_then(|b| {
                 request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
             });
@@ -775,10 +900,23 @@ impl OutputProcessor {
         }
     }
 
-    /// Admit a request. An abort that arrived before it applies now.
-    pub fn register(&mut self, rid: String, mut state: RequestState) {
-        self.admissions += 1;
+    /// Give a new request its identity before either plane registers it.
+    pub fn assign_admission(&mut self, state: &mut RequestState) {
+        assert_eq!(
+            state.admission, 0,
+            "request already has an admission identity"
+        );
+        self.admissions = self
+            .admissions
+            .checked_add(1)
+            .expect("admission identity exhausted");
         state.admission = self.admissions;
+    }
+
+    /// Register a request whose identity was assigned before data-plane admission.
+    /// An abort that arrived before it applies now.
+    pub fn register(&mut self, rid: String, mut state: RequestState) {
+        assert_ne!(state.admission, 0, "assign an identity before registration");
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -819,10 +957,16 @@ impl OutputProcessor {
         }
         state.finished_output = false;
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+            )
+            .into_iter()
+            .collect();
         }
         self.log_end(rid, &state);
         self.trace_end(rid, &state);
@@ -830,8 +974,11 @@ impl OutputProcessor {
         committed
     }
 
-    /// D role: the prefill node's KV landed. Its first token joins the
-    /// output, which streams with the next commit.
+    /// D role: the prefill node's KV landed. Its bootstrap token joins the
+    /// output, which streams with the next local commit. The landing closes
+    /// the queue/prefill boundary but does not start the decode window: the
+    /// first local decode output is the role's first token, so a wait for a
+    /// decode permit stays in TTFT rather than TPOT.
     pub fn remote_prefill_done(
         &mut self,
         rid: &str,
@@ -842,6 +989,9 @@ impl OutputProcessor {
         let Some(state) = self.states.get_mut(rid) else {
             return;
         };
+        if self.metrics_enabled {
+            state.decode_ready_at.get_or_insert_with(Instant::now);
+        }
         if let Some(trace) = &mut state.ttft {
             trace.transfer_done_ms = Some(trace.ms());
         }
@@ -850,14 +1000,12 @@ impl OutputProcessor {
         if let Some(tokens) = &mut state.reasoning_tokens {
             tokens.push([bootstrap_token]);
         }
-        if (self.metrics_enabled || state.timings.is_some()) && state.first_token_time == 0.0 {
-            // The decode node never samples this token; its arrival is the
-            // decode role's first-token boundary.
-            state.first_token_time = wall_seconds();
-            if let Some(timings) = state.timings.as_mut() {
-                timings.mark_prefill_done(state.first_token_time);
-                timings.mark_first_token(state.first_token_time);
-            }
+        if let Some(timings) = state.timings.as_mut() {
+            // The remote bootstrap token is not this role's first output.
+            // Its landing closes the prefill/queue boundary; the first
+            // local decode commit stamps `first_token_time`, so the wait for
+            // a decode permit is TTFT, not decode time.
+            timings.mark_prefill_done(wall_seconds());
         }
         if state.return_logprob {
             match bootstrap_logprob {
@@ -901,10 +1049,16 @@ impl OutputProcessor {
         }
         let mut state = self.states.remove(rid).expect("present above");
         if !state.to_abort || state.abort_notify_client {
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+            )
+            .into_iter()
+            .collect();
         }
         let kind = if state.to_abort {
             ForwardEventKind::Abort
@@ -930,12 +1084,18 @@ impl OutputProcessor {
             state.abort("PD/EPD remote transfer failed or timed out", true, None);
         }
         if state.abort_notify_client {
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+            )
+            .into_iter()
+            .collect();
         }
-        self.log_finished(rid, &state);
+        self.log_end(rid, &state);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -984,10 +1144,17 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
+        let output = Self::stream_state(
+            rid,
+            &mut state,
+            self.stream_interval,
+            self.spec_num_tokens,
+            self.metrics_enabled,
+            Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+        );
+        self.collect_stream_end(&state, wall_seconds());
         self.log_finished(rid, &state);
-        Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-            .into_iter()
-            .collect()
+        output.into_iter().collect()
     }
 
     /// The ids of the requests registered and not ended.
@@ -1005,11 +1172,18 @@ impl OutputProcessor {
         };
         if state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+            )
+            .into_iter()
+            .collect();
         }
+        self.collect_stream_end(&state, wall_seconds());
         self.log_finished(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -1033,10 +1207,16 @@ impl OutputProcessor {
         }
         if !state.to_abort || state.abort_notify_client {
             state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
+            committed.outputs = Self::stream_state(
+                rid,
+                &mut state,
+                self.stream_interval,
+                self.spec_num_tokens,
+                self.metrics_enabled,
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+            )
+            .into_iter()
+            .collect();
         }
         self.log_end(rid, &state);
         self.trace_end(rid, &state);
@@ -1063,6 +1243,8 @@ impl OutputProcessor {
                     &mut state,
                     self.stream_interval,
                     self.spec_num_tokens,
+                    self.metrics_enabled,
+                    Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
                 ));
             } else if state.abort_notify_client {
                 committed.outputs.extend(Self::stream_state(
@@ -1070,6 +1252,8 @@ impl OutputProcessor {
                     &mut state,
                     self.stream_interval,
                     self.spec_num_tokens,
+                    self.metrics_enabled,
+                    Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
                 ));
             }
             self.log_end(&abort.request_id, &state);
@@ -1282,6 +1466,18 @@ impl OutputProcessor {
         for i in 0..batch.num_extends {
             if let Some(state) = self.states.get_mut(&batch.request_ids[i]) {
                 let hit = i64::from(batch.extend_prefix_lens[i] + batch.extend_replay_lens[i]);
+                if let Some(usage) = &mut state.peer_usage {
+                    // Replayed positions execute again. Count only the remote interval
+                    // below the first committed forward's actual starting position.
+                    usage.actual.get_or_insert_with(|| {
+                        usage.window.map_or(0, |(begin, end)| {
+                            batch.extend_prefix_lens[i]
+                                .min(end)
+                                .saturating_sub(begin)
+                                .max(0) as u64
+                        })
+                    });
+                }
                 state.cached_tokens += (hit - state.computed_length).max(0);
             }
         }
@@ -1514,6 +1710,9 @@ impl OutputProcessor {
             if is_decode && self.metrics_enabled {
                 self.generated_tokens += (state.output_ids.len() - before) as u64;
             }
+            // The role's first output token. On a decode role this is the
+            // first local decode commit, after any wait for a decode permit;
+            // a remote prefill's bootstrap token alone does not stamp it.
             if (self.metrics_enabled || state.timings.is_some())
                 && state.first_token_time == 0.0
                 && !state.output_ids.is_empty()
@@ -1603,6 +1802,15 @@ impl OutputProcessor {
         }
     }
 
+    /// Pair the sample destination with its output clock, only when collected.
+    fn tpot_observation(
+        metrics_enabled: bool,
+        role: Role,
+        samples: &mut Vec<f64>,
+    ) -> Option<(&mut Vec<f64>, f64)> {
+        (metrics_enabled && role != Role::Prefill).then(|| (samples, wall_seconds()))
+    }
+
     /// The output due from one request this step, at its stream interval,
     /// if any is. A free function so the commit streams states in place
     /// without lifting them out of the map.
@@ -1611,9 +1819,26 @@ impl OutputProcessor {
         state: &mut RequestState,
         stream_interval: i64,
         spec_num_tokens: Option<usize>,
+        metrics_enabled: bool,
+        tpot_observation: Option<(&mut Vec<f64>, f64)>,
     ) -> Option<StreamedOutput> {
         if !state.output_due(stream_interval) {
             return None;
+        }
+        // The normal path stamps `first_token_time` at the first local decode
+        // commit. A decode request that finishes at landing has no such
+        // commit: its bootstrap token is the only output. This fallback
+        // covers that case (and any terminal stream before a commit) without
+        // making a non-streaming request wait for its forced flush.
+        if (metrics_enabled || state.timings.is_some())
+            && state.first_token_time == 0.0
+            && !state.output_ids.is_empty()
+        {
+            let first = wall_seconds();
+            state.first_token_time = first;
+            if let Some(timings) = state.timings.as_mut() {
+                timings.mark_first_token(first);
+            }
         }
         if state.finished() {
             state.finished_output = true;
@@ -1633,6 +1858,22 @@ impl OutputProcessor {
         let output_ids = state.output_ids[sent..].to_vec();
         state.send_token_offset = state.output_ids.len();
         let n_new = output_ids.len();
+        if n_new > 0 {
+            if let Some((samples, now)) = tpot_observation {
+                if let Some(timing) = &mut state.stream_output_timing {
+                    samples.push((now - timing.last_output).max(0.0) / n_new as f64);
+                    timing.last_output = now;
+                    timing.output_tokens += n_new;
+                } else {
+                    state.stream_output_timing = Some(crate::request::StreamOutputTiming {
+                        first_output: now,
+                        last_output: now,
+                        first_chunk_tokens: n_new,
+                        output_tokens: n_new,
+                    });
+                }
+            }
+        }
         let output_logprobs = if state.return_logprob {
             let start = state.output_logprobs.len().saturating_sub(n_new);
             state.output_logprobs[start..].to_vec()
@@ -1691,12 +1932,20 @@ impl OutputProcessor {
     fn stream(&mut self, rids: &[&str], released: &mut Vec<String>) -> Vec<StreamedOutput> {
         let interval = self.stream_interval;
         let spec = self.spec_num_tokens;
+        let metrics_enabled = self.metrics_enabled;
         let mut outputs = Vec::with_capacity(rids.len());
         for &rid in rids {
             let Some(state) = self.states.get_mut(rid) else {
                 continue;
             };
-            if let Some(output) = Self::stream_state(rid, state, interval, spec) {
+            if let Some(output) = Self::stream_state(
+                rid,
+                state,
+                interval,
+                spec,
+                metrics_enabled,
+                Self::tpot_observation(self.metrics_enabled, self.role, &mut self.tpot_seconds),
+            ) {
                 outputs.push(output);
             }
             if state.finished() {
@@ -1763,9 +2012,15 @@ mod tests {
         )
     }
 
+    fn register_state(p: &mut OutputProcessor, rid: String, mut state: RequestState) {
+        p.assign_admission(&mut state);
+        p.register(rid, state);
+    }
+
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
         let stops: BTreeSet<i32> = stop.iter().copied().collect();
-        p.register(
+        register_state(
+            p,
             rid.to_owned(),
             RequestState::new(vec![0; prompt as usize], max_new, stops, true, None, false),
         );
@@ -1794,7 +2049,7 @@ mod tests {
             top_logprobs_num: top_k,
             computes_prompt_logprobs,
         });
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// The forward result of a plan's rows: each row's logprob is
@@ -1823,7 +2078,7 @@ mod tests {
     fn register_history(p: &mut OutputProcessor, rid: &str, prompt: &[i32], output: &[i32]) {
         let mut state = RequestState::new(prompt.to_vec(), 8, BTreeSet::new(), true, None, false);
         state.output_ids = output.to_vec();
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// One forward over `rows` of (rid, slot, extend prefix length), the
@@ -1866,6 +2121,7 @@ mod tests {
             schema_slot: String::new(),
             markers: Some((1, 2)),
             implicit_closer: None,
+            boundary: None,
         };
         let mut state = RequestState::new(vec![1], 10, BTreeSet::new(), true, None, false);
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
@@ -1873,7 +2129,7 @@ mod tests {
             &state.prompt_ids,
         ));
         let mut p = processor(None);
-        p.register("r".to_owned(), state);
+        register_state(&mut p, "r".to_owned(), state);
 
         for (i, (token, expected)) in [(10, 1), (11, 2), (2, 2), (12, 2)].into_iter().enumerate() {
             let input_length = i as i32 + 1;
@@ -1885,6 +2141,57 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(committed.outputs[0].reasoning_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn ttft_sampling_depends_on_pd_summary_settings_and_the_log_filter() {
+        use tracing::Level;
+
+        for (level, role, enabled, percentage, request_stats, expected) in [
+            (Level::INFO, Role::Prefill, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 1, false, true),
+            (Level::INFO, Role::Prefill, true, 0, false, false),
+            (Level::INFO, Role::Decode, true, 0, true, false),
+            (Level::DEBUG, Role::Decode, true, 0, false, false),
+            (Level::WARN, Role::Decode, true, 100, true, false),
+            (Level::INFO, Role::Decode, false, 100, true, false),
+            (Level::INFO, Role::Plain, true, 100, true, false),
+            (Level::DEBUG, Role::Decode, true, 100, false, true),
+        ] {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(std::io::sink)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled,
+                        request_stats,
+                        ttft_percentage: percentage,
+                    },
+                    false,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                // Room 4 is selected even at one percent sampling.
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                assert_eq!(state.ttft.is_some(), expected);
+                assert_eq!(processor.ttft_sampling_enabled(), expected);
+            });
         }
     }
 
@@ -1923,9 +2230,12 @@ mod tests {
                         port: 8080,
                     };
                     processor.sample_ttft(&mut state, Some(&bootstrap));
-                    processor.register(rid.into(), state);
+                    register_state(&mut processor, rid.into(), state);
+                    processor.mark_submitted(rid, Instant::now());
+                    processor.bootstrapped(rid);
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
+                        processor.mark_planned(&[rid.into()], false);
                         processor.mark_scheduled(&[rid.into()]);
                         let committed = processor
                             .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
@@ -1937,6 +2247,7 @@ mod tests {
                         }
                         processor.finish_prefill(rid);
                     } else {
+                        processor.mark_planned(&[rid.into()], true);
                         processor.remote_prefill_done(rid, 10, 1, None);
                         processor.finish_remote_prefill_only(rid);
                     }
@@ -1959,12 +2270,126 @@ mod tests {
             assert_eq!(summary["room"], 4);
             assert_eq!(summary["status"], "first_output");
             assert!(summary["phases_ms"]["bootstrap"].is_number());
+            assert!(summary["milestones_ms"]["submitted"].is_number());
         }
         assert_eq!(summaries[0]["prefill_chunks"], 1);
         assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["ready_to_plan"].is_number());
+        assert!(summaries[0]["phases_ms"]["plan_to_dispatch"].is_number());
+        assert!(summaries[1]["phases_ms"]["remote_admission"].is_number());
+        assert!(summaries[1]["milestones_ms"]["first_planned"].is_null());
         assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
         assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
         assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
+    fn admission_failure_emits_one_ttft_breakdown() {
+        use std::{io::Read, os::unix::net::UnixStream};
+        for role in [Role::Prefill, Role::Decode] {
+            let (writer, mut reader) = UnixStream::pair().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.try_clone().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let mut processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled: true,
+                        request_stats: false,
+                        ttft_percentage: 100,
+                    },
+                    true,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                state.abort("invalid request", true, Some(400));
+                let outputs = processor.publish_finished_at_admission("rejected", state);
+                assert_eq!(outputs.len(), 1);
+                assert!(processor.rids().is_empty());
+                let metrics = processor.take_request_metrics();
+                assert!(metrics.tpot_seconds.is_empty());
+                assert!(metrics.e2e_tpot_seconds.is_empty());
+            });
+            let mut log = String::new();
+            reader.read_to_string(&mut log).unwrap();
+            assert_eq!(log.matches("TTFTBreakdown ").count(), 1, "{log}");
+            assert_eq!(log.matches("event=ts_request_finished").count(), 1, "{log}");
+            assert!(log.contains("\"status\":\"abort\""), "{log}");
+        }
+    }
+
+    #[test]
+    fn sampled_milestones_keep_the_first_submission_and_each_plan_kind() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut processor = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Decode,
+                FinishLog {
+                    enabled: true,
+                    request_stats: false,
+                    ttft_percentage: 100,
+                },
+                false,
+                None,
+            );
+            let mut state = RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+            processor.sample_ttft(
+                &mut state,
+                Some(&ts_pd::BootstrapInfo {
+                    room: 4,
+                    host: "p".into(),
+                    port: 8080,
+                }),
+            );
+            register_state(&mut processor, "r".into(), state);
+            processor.mark_submitted("r", Instant::now());
+            processor.bootstrapped("r");
+            processor.mark_planned(&["r".into()], true);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_submit = trace.submitted_ms.unwrap();
+            let remote_admitted = trace.remote_admitted_ms.unwrap();
+            assert!(trace.planned_ms.is_none());
+
+            processor.remote_prefill_done("r", 10, 0, None);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_plan = trace.planned_ms.unwrap();
+            let first_dispatch = trace.scheduled_ms.unwrap();
+            assert!(remote_admitted <= trace.transfer_done_ms.unwrap());
+            assert!(trace.transfer_done_ms.unwrap() <= first_plan);
+            assert!(first_plan <= first_dispatch);
+
+            processor.mark_submitted("r", Instant::now());
+            processor.mark_planned(&["r".into()], true);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            assert_eq!(trace.submitted_ms, Some(first_submit));
+            assert_eq!(trace.remote_admitted_ms, Some(remote_admitted));
+            assert_eq!(trace.planned_ms, Some(first_plan));
+            assert_eq!(trace.scheduled_ms, Some(first_dispatch));
+        });
     }
 
     #[test]
@@ -1994,8 +2419,277 @@ mod tests {
         assert_eq!(p.take_request_metrics().completion_tokens, 0);
     }
 
+    fn stream_at(p: &mut OutputProcessor, rid: &str, now: f64) -> Option<StreamedOutput> {
+        OutputProcessor::stream_state(
+            rid,
+            p.states.get_mut(rid).unwrap(),
+            p.stream_interval,
+            p.spec_num_tokens,
+            p.metrics_enabled,
+            (p.metrics_enabled && p.role != Role::Prefill).then_some((&mut p.tpot_seconds, now)),
+        )
+    }
+
     #[test]
-    fn a_decode_landing_sets_the_first_token_boundary_and_reasoning_usage() {
+    fn stream_tpot_uses_emitted_chunks_and_ignores_empty_outputs() {
+        let mut p = processor(Some(4));
+        p.stream_interval = 3;
+        register(&mut p, "r", 4, 20, &[]);
+        p.states.get_mut("r").unwrap().output_ids.extend([10, 11]);
+        assert_eq!(stream_at(&mut p, "r", 100.0).unwrap().output_ids, [10, 11]);
+        p.states.get_mut("r").unwrap().output_ids.push(12);
+        assert!(stream_at(&mut p, "r", 101.0).is_none());
+        p.states.get_mut("r").unwrap().output_ids.extend([13, 14]);
+        assert_eq!(
+            stream_at(&mut p, "r", 106.0).unwrap().output_ids,
+            [12, 13, 14]
+        );
+        p.stream_interval = 1;
+        assert!(stream_at(&mut p, "r", 110.0).unwrap().output_ids.is_empty());
+        p.states.get_mut("r").unwrap().output_ids.extend([15, 16]);
+        assert_eq!(stream_at(&mut p, "r", 112.0).unwrap().output_ids, [15, 16]);
+        p.states.get_mut("r").unwrap().finished_reason = Some(FinishReason::Length(7));
+        assert!(stream_at(&mut p, "r", 118.0).unwrap().output_ids.is_empty());
+        let state = p.states.remove("r").unwrap();
+        p.collect_stream_end(&state, 118.0);
+        let samples = p.take_request_metrics();
+        assert_eq!(samples.tpot_seconds, [2.0, 3.0]);
+        assert_eq!(samples.e2e_tpot_seconds, [18.0 / 5.0]);
+        let drained = p.take_request_metrics();
+        assert!(drained.tpot_seconds.is_empty());
+        assert!(drained.e2e_tpot_seconds.is_empty());
+    }
+
+    #[test]
+    fn disabled_and_prefill_outputs_do_not_keep_stream_metric_state() {
+        for (role, enabled) in [
+            (Role::Plain, false),
+            (Role::Decode, false),
+            (Role::Prefill, true),
+        ] {
+            let mut p = OutputProcessor::new(None, 1, None, role, NO_FINISH_LOG, enabled, None);
+            register(&mut p, "r", 4, 8, &[]);
+            p.states.get_mut("r").unwrap().output_ids.push(10);
+            stream_at(&mut p, "r", 100.0).unwrap();
+            p.states.get_mut("r").unwrap().output_ids.push(11);
+            stream_at(&mut p, "r", 104.0).unwrap();
+            let state = p.states.remove("r").unwrap();
+            assert!(state.stream_output_timing.is_none());
+            p.collect_stream_end(&state, 106.0);
+            let samples = p.take_request_metrics();
+            assert!(samples.tpot_seconds.is_empty());
+            assert!(samples.e2e_tpot_seconds.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_bootstrap_clock_starts_when_it_is_emitted_and_abort_keeps_sent_tokens() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 4, 8, &[]);
+        p.remote_prefill_done("r", 7, 0, None);
+        assert!(p.state("r").unwrap().stream_output_timing.is_none());
+        assert_eq!(stream_at(&mut p, "r", 100.0).unwrap().output_ids, [7]);
+        p.states.get_mut("r").unwrap().output_ids.extend([8, 9]);
+        assert_eq!(stream_at(&mut p, "r", 106.0).unwrap().output_ids, [8, 9]);
+        // The client disappears before this token can be sent.
+        p.states.get_mut("r").unwrap().output_ids.push(10);
+        p.mark_abort("r", false);
+        let before = wall_seconds();
+        assert!(p.finish_remote_prefill_only("r").outputs.is_empty());
+        let after = wall_seconds();
+        let samples = p.take_request_metrics();
+        assert_eq!(samples.tpot_seconds, [3.0]);
+        assert_eq!(samples.e2e_tpot_seconds.len(), 1);
+        // Only the two tokens actually sent after the bootstrap count.
+        assert!(samples.e2e_tpot_seconds[0] >= (before - 100.0) / 2.0);
+        assert!(samples.e2e_tpot_seconds[0] <= (after - 100.0) / 2.0);
+        assert!(p.take_request_metrics().e2e_tpot_seconds.is_empty());
+    }
+
+    #[test]
+    fn committed_streams_collect_e2e_on_normal_and_transfer_failure_ends() {
+        for transfer_failed in [false, true] {
+            let mut p =
+                OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+            register(&mut p, "r", 4, 3, &[]);
+            p.states.get_mut("r").unwrap().created_time = wall_seconds() - 1.0;
+            p.remote_prefill_done("r", 7, 0, None);
+            stream_at(&mut p, "r", wall_seconds()).unwrap();
+            let second = p
+                .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
+                .unwrap();
+            assert_eq!(second.outputs[0].output_ids, [8]);
+            let ended = if transfer_failed {
+                p.fail_transfer("r")
+            } else {
+                p.commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[9], &[1]))
+                    .unwrap()
+            };
+            assert_eq!(ended.released, ["r"]);
+            let samples = p.take_request_metrics();
+            assert_eq!(
+                samples.tpot_seconds.len(),
+                if transfer_failed { 1 } else { 2 }
+            );
+            assert_eq!(samples.e2e_tpot_seconds.len(), 1);
+            let completed = if transfer_failed { 2 } else { 3 };
+            assert_eq!(samples.completion_tokens, completed);
+            assert_eq!(samples.completion_token_samples, [completed]);
+            assert_eq!(samples.request_seconds.len(), 1);
+            assert_eq!(samples.ttft_seconds.len(), 1);
+            assert_eq!(samples.decode_seconds.len(), 1);
+            assert_eq!(p.take_request_tokens(), (4, 0));
+        }
+    }
+
+    #[test]
+    fn one_chunk_requests_and_zero_token_finishes_have_no_tpot() {
+        for tokens in [vec![], vec![10], vec![10, 11, 12]] {
+            let mut p = processor(None);
+            register(&mut p, "r", 4, 8, &[]);
+            let state = p.states.get_mut("r").unwrap();
+            state.output_ids = tokens;
+            state.finished_reason = Some(FinishReason::Length(state.output_ids.len() as i64));
+            stream_at(&mut p, "r", 100.0).unwrap();
+            let state = p.states.remove("r").unwrap();
+            p.collect_stream_end(&state, 105.0);
+            let samples = p.take_request_metrics();
+            assert!(samples.tpot_seconds.is_empty());
+            assert!(samples.e2e_tpot_seconds.is_empty());
+        }
+    }
+
+    #[test]
+    fn request_acceptance_samples_include_bonus_and_drain_once_per_request() {
+        let mut p = processor(Some(3));
+
+        register(&mut p, "two_rounds", 1, 5, &[]);
+        p.commit(
+            &batch(&[("two_rounds", 1, 0, 1)], 1),
+            None,
+            &result(&[0], &[1]),
+        )
+        .unwrap();
+        p.commit(
+            &batch(&[("two_rounds", 3, 0, 1)], 0),
+            None,
+            &result(&[1, 2], &[2]),
+        )
+        .unwrap();
+        assert_eq!(
+            p.commit(
+                &batch(&[("two_rounds", 3, 0, 1)], 0),
+                None,
+                &result(&[3, 4], &[2]),
+            )
+            .unwrap()
+            .released,
+            ["two_rounds"]
+        );
+
+        register(&mut p, "one_round", 1, 4, &[]);
+        p.commit(
+            &batch(&[("one_round", 1, 0, 1)], 1),
+            None,
+            &result(&[10], &[1]),
+        )
+        .unwrap();
+        assert_eq!(
+            p.commit(
+                &batch(&[("one_round", 3, 0, 1)], 0),
+                None,
+                &result(&[11, 12, 13], &[3]),
+            )
+            .unwrap()
+            .released,
+            ["one_round"]
+        );
+
+        // Finishing during prefill has no verify round and emits no sample.
+        register(&mut p, "no_verify", 1, 1, &[]);
+        assert_eq!(
+            p.commit(
+                &batch(&[("no_verify", 1, 0, 1)], 1),
+                None,
+                &result(&[20], &[1]),
+            )
+            .unwrap()
+            .released,
+            ["no_verify"]
+        );
+
+        let samples = p.take_request_metrics();
+        // Three verify rounds across two requests produce exactly two samples.
+        // Each value includes every round's bonus token: (5 - 1) / 2 and 4 - 1.
+        assert_eq!(samples.spec_decode_accept_length_samples, [2.0, 3.0]);
+        assert_eq!(samples.completion_token_samples, [5, 4, 1]);
+        assert!(p
+            .take_request_metrics()
+            .spec_decode_accept_length_samples
+            .is_empty());
+    }
+
+    #[test]
+    fn completion_samples_preserve_request_counts_zeroes_and_drain_boundaries() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        register(&mut p, "one", 4, 1, &[]);
+        p.remote_prefill_done("one", 7, 0, None);
+        assert_eq!(p.finish_remote_prefill_only("one").released, ["one"]);
+
+        register(&mut p, "two", 4, 2, &[]);
+        p.remote_prefill_done("two", 7, 0, None);
+        let committed = p
+            .commit(&batch(&[("two", 1, 0, 4)], 0), None, &result(&[8], &[1]))
+            .unwrap();
+        assert_eq!(committed.released, ["two"]);
+
+        register(&mut p, "zero", 4, 2, &[]);
+        p.mark_abort("zero", false);
+        assert_eq!(p.finish_remote_prefill_only("zero").released, ["zero"]);
+        let metrics = p.take_request_metrics();
+        assert_eq!(metrics.completion_tokens, 3);
+        assert_eq!(metrics.completion_token_samples, [1, 2, 0]);
+        let drained = p.take_request_metrics();
+        assert_eq!(drained.completion_tokens, 0);
+        assert!(drained.completion_token_samples.is_empty());
+        // Reaping an already removed request cannot duplicate its sample.
+        assert!(p.finish_remote_prefill_only("zero").released.is_empty());
+        assert!(p.take_request_metrics().completion_token_samples.is_empty());
+    }
+
+    #[test]
+    fn decode_ready_wait_starts_at_kv_landing_and_is_observed_once() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        register(&mut p, "a", 4, 8, &[]);
+        assert!(p.take_decode_ready_at("a").is_none());
+        let before = Instant::now();
+        p.remote_prefill_done("a", 7, 0, None);
+        let after = Instant::now();
+        let ready = p.take_decode_ready_at("a").unwrap();
+        assert!(before <= ready && ready <= after);
+        assert!(p.take_decode_ready_at("a").is_none());
+
+        register(&mut p, "cancelled", 4, 8, &[]);
+        p.remote_prefill_done("cancelled", 7, 0, None);
+        p.states.get_mut("cancelled").unwrap().to_abort = true;
+        assert!(p.take_decode_ready_at("cancelled").is_none());
+
+        register(&mut p, "finished", 4, 1, &[]);
+        p.remote_prefill_done("finished", 7, 0, None);
+        p.finish_remote_prefill_only("finished");
+        assert!(p.take_decode_ready_at("finished").is_none());
+    }
+
+    #[test]
+    fn decode_ready_wait_does_not_stamp_without_metrics() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, false, None);
+        register(&mut p, "a", 4, 8, &[]);
+        p.remote_prefill_done("a", 7, 0, None);
+        assert!(p.take_decode_ready_at("a").is_none());
+    }
+
+    #[test]
+    fn a_decode_landing_seeds_the_bootstrap_without_starting_the_decode_window() {
         let mut p =
             OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
         register(&mut p, "a", 4, 8, &[]);
@@ -2005,6 +2699,7 @@ mod tests {
             schema_slot: String::new(),
             markers: Some((0, 2)),
             implicit_closer: None,
+            boundary: None,
         };
         let state = p.states.get_mut("a").unwrap();
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
@@ -2013,13 +2708,13 @@ mod tests {
         ));
         p.remote_prefill_done("a", 7, 0, None);
         let state = p.state("a").expect("still registered");
-        assert!(state.first_token_time > 0.0);
+        assert_eq!(state.first_token_time, 0.0);
         assert_eq!(state.output_ids, vec![7]);
         assert_eq!(state.reasoning_tokens.unwrap().count(), 1);
     }
 
     #[test]
-    fn decode_request_stats_use_the_bootstrap_arrival_without_an_exporter() {
+    fn decode_request_stats_start_at_the_first_local_output_without_an_exporter() {
         let mut p = OutputProcessor::new(
             None,
             1,
@@ -2035,9 +2730,11 @@ mod tests {
         );
         register(&mut p, "r", 3, 8, &[]);
         p.remote_prefill_done("r", 9, 0, None);
-        let first = p.state("r").unwrap().first_token_time;
+        assert_eq!(p.state("r").unwrap().first_token_time, 0.0);
         p.commit(&batch(&[("r", 1, 0, 3)], 0), None, &result(&[10], &[1]))
             .unwrap();
+        let first = p.state("r").unwrap().first_token_time;
+        assert!(first > 0.0);
         let state = p.states.get_mut("r").unwrap();
         state.created_time = first - 1.0;
         let line = request_stats::stats_line(
@@ -2066,6 +2763,27 @@ mod tests {
         assert!(samples.request_seconds.is_empty());
         assert!(samples.decode_seconds.is_empty());
         assert!(samples.tpot_seconds.is_empty());
+    }
+
+    #[test]
+    fn peer_usage_counts_only_the_remote_prefix_used_at_the_first_commit() {
+        let mut p = processor(None);
+        register(&mut p, "r", 12, 1, &[]);
+        p.states.get_mut("r").unwrap().peer_usage = Some(crate::request::PeerUsage {
+            expected: Some(8),
+            window: Some((4, 10)),
+            disposition: "unused_after_landing",
+            ..Default::default()
+        });
+        p.commit(&batch(&[("r", 2, 8, 12)], 1), None, &result(&[0], &[1]))
+            .unwrap();
+        p.commit(&batch(&[("r", 2, 10, 12)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        assert_eq!(
+            p.take_request_metrics().peer_usage,
+            vec![(Some(8), 4, "used")]
+        );
+        assert!(p.take_request_metrics().peer_usage.is_empty());
     }
 
     #[test]
@@ -2132,6 +2850,47 @@ mod tests {
         // "a" recovers into slot 1 after "b" used it: reseed its prefix.
         let recovery = rows.seeds(&history_batch(&[("a", 1, 4)], 1), &p).unwrap();
         assert_eq!(recovery.unwrap().prefix_lengths, [4]);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_decode_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 0)], 0), &p).unwrap();
+        // The request advanced in slot 2 before a second restore returned
+        // it to slot 1. Slot 1 still names it, but holds an older history.
+        p.states.get_mut("a").unwrap().output_ids.extend([22, 23]);
+        let restored = history_batch(&[("a", 1, 0)], 0);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![7],
+                tokens: vec![vec![20, 21, 22]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_prefill_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13, 14, 15], &[]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 2)], 1), &p).unwrap();
+        let restored = history_batch(&[("a", 1, 4)], 1);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![4],
+                tokens: vec![vec![11, 12, 13]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
     }
 
     #[test]
@@ -2507,7 +3266,8 @@ mod tests {
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
         );
@@ -2615,7 +3375,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_trace_starts_at_the_remote_token_before_local_dispatch() {
+    fn decode_trace_starts_at_the_first_local_output() {
         for (max_new, metrics_enabled) in [(1, false), (1, true), (2, false), (2, true)] {
             let (trace, received) = crate::trace::TracePublisher::for_tests(1.0);
             let mut p = OutputProcessor::new(
@@ -2637,8 +3397,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .trace_points();
-            assert!(first_token > 0.0, "stamp arrival before any local decode");
-            assert_eq!(prefill_done, first_token);
+            assert!(prefill_done > 0.0, "stamp KV landing");
+            assert_eq!(first_token, 0.0, "the remote token does not start decode");
             if max_new == 1 {
                 assert_eq!(p.finish_remote_prefill_only("r").released, ["r"]);
             } else {
@@ -2651,21 +3411,25 @@ mod tests {
             }
             let record = received.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(record.role, Role::Decode);
-            assert_eq!(record.first_token, first_token);
+            assert!(record.first_token > 0.0, "stamp the first local output");
+            assert!(record.first_token >= prefill_done);
             assert_eq!(record.prefill_done, prefill_done);
             assert_eq!(record.output_tokens, max_new);
             if max_new == 1 {
                 assert_eq!(record.scheduled, 0.0);
             } else {
-                assert!(record.scheduled >= first_token);
+                assert!(record.scheduled <= record.first_token);
             }
             let metrics = p.take_request_metrics();
             if metrics_enabled {
-                assert_eq!(metrics.ttft_seconds, [first_token - record.created]);
+                assert_eq!(metrics.ttft_seconds, [record.first_token - record.created]);
                 assert_eq!(metrics.request_seconds.len(), 1);
                 assert_eq!(metrics.decode_seconds.len(), 1);
-                assert_eq!(metrics.tpot_seconds.len(), usize::from(max_new > 1));
+                // Bootstrap and decode tokens are emitted together in this test.
+                assert!(metrics.tpot_seconds.is_empty());
+                assert!(metrics.e2e_tpot_seconds.is_empty());
                 assert_eq!(metrics.completion_tokens, max_new as u64);
+                assert_eq!(metrics.completion_token_samples, [max_new as u64]);
                 assert_eq!(p.take_request_tokens(), (4, 2));
             } else {
                 assert!(metrics.ttft_seconds.is_empty());
@@ -2673,6 +3437,7 @@ mod tests {
                 assert!(metrics.decode_seconds.is_empty());
                 assert!(metrics.tpot_seconds.is_empty());
                 assert_eq!(metrics.completion_tokens, 0);
+                assert!(metrics.completion_token_samples.is_empty());
                 assert_eq!(p.take_request_tokens(), (0, 0));
             }
         }
@@ -2765,6 +3530,14 @@ mod tests {
     }
 
     #[test]
+    fn resident_tokens_include_waiting_prompts_and_committed_output() {
+        let mut p = processor(None);
+        register_history(&mut p, "decoding", &[1, 2, 3], &[7, 8]);
+        register_history(&mut p, "waiting", &[4, 5, 6, 7, 8], &[]);
+        assert_eq!(p.num_resident_tokens(), 10);
+    }
+
+    #[test]
     fn a_request_streams_until_its_stop_token() {
         let mut p = processor(None);
         register(&mut p, "r", 4, 10, &[2]);
@@ -2781,6 +3554,7 @@ mod tests {
             (vec![7], None)
         );
         assert_eq!(c.outputs[0].prompt_tokens, 4);
+        assert_eq!(p.num_resident_tokens(), 5);
 
         let c = p
             .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
@@ -2804,6 +3578,7 @@ mod tests {
         );
         assert_eq!(c.released, ["r"]);
         assert_eq!(p.num_running(), 0);
+        assert_eq!(p.num_resident_tokens(), 0);
     }
 
     #[test]
@@ -3020,7 +3795,8 @@ mod tests {
     #[test]
     fn sampled_logprobs_ride_with_their_tokens() {
         let mut p = processor(None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::new(), true, None, true),
         );
@@ -3036,7 +3812,8 @@ mod tests {
     fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
         let mut p = processor(None);
         for (rid, logprobs) in [("scored", true), ("plain", false)] {
-            p.register(
+            register_state(
+                &mut p,
                 rid.to_owned(),
                 RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
             );
@@ -3094,7 +3871,8 @@ mod tests {
     #[test]
     fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
         let mut p = processor(Some(3));
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
         );

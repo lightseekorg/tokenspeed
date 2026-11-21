@@ -425,20 +425,22 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
 
 
 @pytest.mark.parametrize(
-    "algorithm,all2all_backend,built",
+    "algorithm,all2all_backend,attn_dp_size,built",
     [
-        ("static", "deepep", True),
-        ("static_with_zero_expert", "deepep", True),
-        ("static", "none", False),
-        ("dynamic", "deepep", False),
+        ("static", "deepep", 1, True),
+        ("static_with_zero_expert", "deepep", 1, True),
+        ("static", "none", 1, False),
+        ("static", "none", 2, True),
+        ("dynamic", "deepep", 1, False),
     ],
 )
 def test_build_expert_placement_owns_the_all_to_all_static_dispatch_map(
-    algorithm, all2all_backend, built
+    algorithm, all2all_backend, attn_dp_size, built
 ):
     # All-to-all EP slices this map while the model is built, inside the
     # weight region a memory-saver discard releases; the placement must hold
-    # it before then. Replicated-input EP still never builds it.
+    # it before then. Attention-DP ranks route only their own tokens even with
+    # no all-to-all backend. Replicated-input EP still never builds it.
     from tokenspeed.runtime.layers.moe.topk import ExpertLocationDispatchInfo
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
@@ -458,7 +460,7 @@ def test_build_expert_placement_owns_the_all_to_all_static_dispatch_map(
         ep_dispatch_algorithm=algorithm,
         all2all_backend=all2all_backend,
         enable_eplb=False,
-        mapping=_mapping(),
+        mapping=Mapping(rank=0, world_size=2, attn_dp_size=attn_dp_size, moe_ep_size=2),
     )
     with (
         mock.patch.object(

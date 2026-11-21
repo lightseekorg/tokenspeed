@@ -200,6 +200,10 @@ class GemmInputGenerator(InputGenerator):
                 rows, row_group = (M, 1) if role == "a" else (N, block_n)
                 return self._generate_packed_block_scales(rows, k_tiles, row_group)
             if role == "a":
+                if self._trait_value("a_scales_layout", "k_major") == "mn_major":
+                    return self._generate_block_scales(
+                        (*batch_shape, k_tiles, M), scale.storage_dtype
+                    ).transpose(-1, -2)
                 return self._generate_block_scales(
                     (*batch_shape, M, k_tiles), scale.storage_dtype
                 )
@@ -285,12 +289,15 @@ class GemmInputGenerator(InputGenerator):
             block_size=block_size,
         )
 
+        # A kernel that writes a single output dtype is verified in that dtype.
+        out_dtypes = self.traits.get("out_dtype", frozenset())
+        out_dtype = next(iter(out_dtypes)) if len(out_dtypes) == 1 else torch.bfloat16
         return {
             "A": A,
             "B": B,
             "A_scales": A_scales,
             "B_scales": B_scales,
-            "out_dtype": torch.bfloat16,
+            "out_dtype": out_dtype,
             "alpha": None,
             "block_size": block_size,
         }

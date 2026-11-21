@@ -20,6 +20,7 @@
 
 """Kimi-K3's prepared Iris fusions, shared by sequential decoder layers."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,8 +31,13 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 
+# Decode rows served by the fused replicated paths: the latent input gather,
+# the Lamport two-shot reduce and the gathered MoE tail. Above it, rows shard.
+# 192 covers 48 requests' 4-token verify; the model's gather-tail and SiTU
+# warp-decode bounds and the comm's sharded-prefix floor follow it.
+K3_FUSED_DECODE_MAX_ROWS = 192
 # Decode rows with a gathered column-parallel MoE up-projection; GEMV senders to 4 rows.
-_K3_GATHER_MAX_ROWS = 64
+_K3_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
 _K3_GATHER_GEMV_MAX_ROWS = 4
 _K3_GATHER_LATENT = 3584
 _K3_GATHER_LOCAL_WIDTH = 896
@@ -39,6 +45,8 @@ _K3_GATHER_NUM_WARPS = 8
 _K3_GATHER_WAVES_PER_OUTPUT = 2
 _K3_GATHER_BLOCK_K = 512
 _K3_GATHER_MFMA_CHUNK = 64
+# MFMA gathers that also mix the next attention input: the AttnRes fast path's rows.
+_K3_GATHER_MIX_MAX_ROWS = 32
 # The decode MoE input projection: [router; routed; shared gate; shared up].
 _K3_HIDDEN = 7168
 _K3_ROUTER = 896
@@ -48,10 +56,15 @@ _K3_PACKED_INPUT_ROWS = _K3_ROUTER + _K3_LATENT + 2 * _K3_SHARED
 _K3_LATENT_GEMM_NUM_WARPS = 2
 # One-shot Lamport window (it also sums MoE top-k slots) and latent gather row limits.
 _K3_LAMPORT_MAX_ROWS = 7
-_K3_LATENT_GATHER_MAX_ROWS = 64
+_K3_LATENT_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
+# The latent gather routes up to this many rows; wider batches take the separate
+# routing launch.
+_K3_LATENT_ROUTED_MAX_ROWS = 16
+# The FP8 scale rendezvous spans its slots with gl.arange, so a power of two.
+_K3_LATENT_SYNC_ROWS = 1 << (_K3_LATENT_GATHER_MAX_ROWS - 1).bit_length()
 # From 8 rows the Lamport two-shot all-reduce wins; 1024-element tiles need even rows.
 _K3_TWO_SHOT_MIN_ROWS = 8
-_K3_TWO_SHOT_MAX_ROWS = 64
+_K3_TWO_SHOT_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
 _K3_TWO_SHOT_ALIGN = 8 * 128
 
 
@@ -62,12 +75,13 @@ def _k3_lamport_numel(producer_direct_max_numel: int) -> int:
     rows = min(producer_direct_max_numel // (3584 + 7168), _K3_LAMPORT_MAX_ROWS)
     if not rows:
         return 0
+    gather = max(
+        _K3_LATENT_GATHER_MAX_ROWS * 1024,
+        -(-_K3_GATHER_MAX_ROWS // 16) * 16 * _K3_GATHER_LOCAL_WIDTH,
+    )
     return max(
         rows * (3584 + 7168),
-        min(
-            _K3_LATENT_GATHER_MAX_ROWS * 1024,
-            producer_direct_max_numel // 512 * 512,
-        ),
+        min(gather, producer_direct_max_numel // 512 * 512),
     )
 
 
@@ -85,6 +99,82 @@ def _k3_two_shot_heap_bytes(producer_direct_max_numel: int) -> int:
 
     numel = _k3_two_shot_numel(producer_direct_max_numel)
     return allocation_bytes((3, 2, 8, numel // 8), torch.bfloat16) if numel else 0
+
+
+def _k3_attnres_lamport_rows(world_size: int, enable_lamport: bool) -> int:
+    """Rows the fused AttnRes Lamport two-shot serves for this group."""
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
+        ATTNRES_LAMPORT_MAX_ROWS,
+        ATTNRES_WORLD_SIZE,
+    )
+
+    return (
+        ATTNRES_LAMPORT_MAX_ROWS
+        if enable_lamport and world_size == ATTNRES_WORLD_SIZE
+        else 0
+    )
+
+
+@dataclass(frozen=True)
+class K3AttentionMix:
+    """A layer's AttnRes attention-input mix as ``attnres_combine`` takes it.
+
+    ``weight`` holds the mix's per-column score weights, ``norm_weight`` the
+    following RMSNorm's, and ``scratch_*`` the ``(m, s, acc)`` block partial
+    by row.
+    """
+
+    weight: torch.Tensor
+    norm_weight: torch.Tensor
+    eps: float
+    scratch_m: torch.Tensor
+    scratch_s: torch.Tensor
+    scratch_acc: torch.Tensor
+
+    def supports(self, rows: int, width: int, device: torch.device) -> bool:
+        """Whether a fused mix reads these operands for ``rows`` rows of ``width``."""
+        return (
+            self.eps > 0.0
+            and all(
+                t.shape == (width,)
+                and t.dtype == torch.bfloat16
+                and t.is_contiguous()
+                and t.device == device
+                for t in (self.weight, self.norm_weight)
+            )
+            and all(
+                t.shape == shape
+                and t.dtype == torch.float32
+                and t.is_contiguous()
+                and t.device == device
+                for t, shape in (
+                    (self.scratch_m, (rows,)),
+                    (self.scratch_s, (rows,)),
+                    (self.scratch_acc, (rows, width)),
+                )
+            )
+        )
+
+    @classmethod
+    def unused(cls, like: torch.Tensor) -> "K3AttentionMix":
+        """Placeholder operands of a launch without a mix."""
+        return cls(like, like, 0.0, like, like, like)
+
+
+@dataclass(frozen=True)
+class K3MoeRouting:
+    """A layer's sorted MoE routing as ``kimi3_sigmoid_bias_topk_sorted`` takes it.
+
+    ``correction_bias`` is the FP32 ``[896]`` selection bias and ``scratch``
+    a ``kimi3_sorted_routing_scratch`` buffer, which launches of that kernel
+    and ``latent_input_gather_routed`` may share in stream order.
+    """
+
+    correction_bias: torch.Tensor
+    routed_scaling_factor: float
+    normalize_topk_weights: bool
+    block_size: int
+    scratch: torch.Tensor
 
 
 def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
@@ -108,6 +198,8 @@ class K3IrisState:
         attnres_max_rows: int,
         enable_lamport: bool,
         sharded_max_rows: int,
+        pull_exchange_max_bytes: int = 0,
+        word_max_rows: int = 0,
     ):
         from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
@@ -116,12 +208,32 @@ class K3IrisState:
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
             IrisAttnResState,
         )
+        from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+            IrisPullExchange,
+        )
+        from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
 
         self.all_reduce = all_reduce
+        # K3.1's KVP decode gathers and records exchange, pulled in place.
+        self.pull_exchange = (
+            IrisPullExchange(all_reduce.peers, pull_exchange_max_bytes)
+            if pull_exchange_max_bytes
+            else None
+        )
+        # The greedy argmax and DSpark walk's packed-key MAX.
+        self.word_max = (
+            LamportWordMax(all_reduce.peers, word_max_rows) if word_max_rows else None
+        )
         self.enable_lamport = enable_lamport
         self.attnres = (
             IrisAttnResState(
-                all_reduce.peers, attnres_max_numel, attnres_max_rows, all_reduce.dtype
+                all_reduce.peers,
+                attnres_max_numel,
+                attnres_max_rows,
+                all_reduce.dtype,
+                lamport_max_rows=_k3_attnres_lamport_rows(
+                    all_reduce.world_size, enable_lamport
+                ),
             )
             if attnres_max_numel
             else None
@@ -179,7 +291,7 @@ class K3IrisState:
             torch.cat(
                 (
                     torch.full(
-                        (_K3_LATENT_GATHER_MAX_ROWS,),
+                        (_K3_LATENT_SYNC_ROWS,),
                         -1,
                         dtype=torch.int32,
                         device=all_reduce.device,
@@ -187,6 +299,12 @@ class K3IrisState:
                     torch.zeros(1, dtype=torch.int32, device=all_reduce.device),
                 )
             )
+            if self.lamport is not None
+            else None
+        )
+        # Routed gather's SiTU arrival and down-projection departure counters.
+        self._latent_down_sync = (
+            torch.zeros(16, dtype=torch.int32, device=all_reduce.device)
             if self.lamport is not None
             else None
         )
@@ -266,6 +384,7 @@ class K3IrisState:
         tensors: tuple[torch.Tensor, ...],
         *,
         routed_partials: torch.Tensor | None = None,
+        shared_owned_columns: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Reduce owned producer outputs using K3's existing shape policy.
 
@@ -273,6 +392,12 @@ class K3IrisState:
         rows of the MoE's top-k slots, the routed output (``tensors[0]``) is
         their slot-order sum, as the MoE's own top-k reduce would have
         written it; ``tensors[0]`` itself is not read.
+
+        ``shared_owned_columns`` promises that the caller reads only this
+        rank's column block of the shared output, as ``moe_gather_tail``
+        does. The two-shot then reduce-scatters the shared rows instead of
+        all-reducing them and leaves the other columns undefined; every
+        element it writes has the full reduction's bits.
         """
         assert self.all_reduce.owns_outputs(tensors)
         shapes = tuple(tuple(tensor.shape) for tensor in tensors)
@@ -300,7 +425,9 @@ class K3IrisState:
             return self.all_reduce.producer.views(output, shapes)
         if self._two_shot_moe_shapes(shapes):
             numel = sum(t.numel() for t in tensors)
-            if routed_partials is None:
+            if shared_owned_columns and shapes[0][1] == _K3_LATENT:
+                output = self._run_two_shot_shared_rs(numel, shapes, routed_partials)
+            elif routed_partials is None:
                 output = self._run_two_shot(numel)
             else:
                 output = self._run_two_shot_topk(numel, routed_partials, rows, width)
@@ -340,6 +467,45 @@ class K3IrisState:
         )
         return output
 
+    def _run_two_shot_shared_rs(
+        self,
+        numel: int,
+        shapes: tuple[tuple[int, ...], ...],
+        partials: torch.Tensor | None,
+    ) -> torch.Tensor:
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_arch_policy,
+        )
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.moe_reduce import (
+            iris_k3moe_lamport_twoshot_shared_rs,
+        )
+
+        (rows, routed_width), (_, shared_width) = shapes
+        output = torch.empty(
+            numel, dtype=self.all_reduce.dtype, device=self.all_reduce.device
+        )
+        producer = self.all_reduce.producer.data
+        # One program a 128-element tile of every rank's routed shard or shared block.
+        iris_k3moe_lamport_twoshot_shared_rs[(numel // _K3_TWO_SHOT_ALIGN,)](
+            producer if partials is None else partials,
+            producer,
+            self.two_shot_region,
+            output,
+            self.two_shot_epochs,
+            self.two_shot_peer_addresses,
+            rows * routed_width,
+            RANK=self.all_reduce.rank_in_group,
+            WORLD_SIZE=8,
+            ROUTED_WIDTH=routed_width,
+            SHARED_WIDTH=shared_width,
+            TOPK=0 if partials is None else partials.shape[0] // rows,
+            MAX_SHARD_ELEMENTS=self.two_shot_max_numel // 8,
+            NUM_STAGES=3,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+            num_warps=1,
+        )
+        return output
+
     def _run_lamport_topk(
         self, output: torch.Tensor, partials: torch.Tensor, rows: int, width: int
     ) -> None:
@@ -351,6 +517,15 @@ class K3IrisState:
         )
 
         lamport = self.lamport
+        if (
+            rows < 1
+            or width % lamport.BLOCK_ELEMENTS
+            or output.numel() % lamport.BLOCK_ELEMENTS
+            or not rows * width < output.numel() <= lamport.max_numel
+        ):
+            raise ValueError(
+                "routed Lamport output must fit its mailbox in complete tiles"
+            )
         iris_k3moe_lamport_allreduce_topk[(output.numel() // lamport.BLOCK_ELEMENTS,)](
             partials,
             lamport.producer.data,
@@ -377,6 +552,7 @@ class K3IrisState:
         prefix: torch.Tensor,
         projection_weight: torch.Tensor,
         norm_weight: torch.Tensor | None,
+        attention_mix: K3AttentionMix | None = None,
     ) -> bool:
         """Whether ``moe_gather_tail`` serves these reduced decode rows."""
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.moetail_gather import (
@@ -415,6 +591,14 @@ class K3IrisState:
                     and norm_weight.is_contiguous()
                 )
             )
+            and (
+                attention_mix is None
+                or (
+                    _K3_GATHER_GEMV_MAX_ROWS < rows <= _K3_GATHER_MIX_MAX_ROWS
+                    and rows * K3_GATHER_ROW_STRIDE <= self.lamport.max_numel
+                    and attention_mix.supports(rows, width, self.all_reduce.device)
+                )
+            )
         )
 
     def moe_gather_tail(
@@ -426,7 +610,8 @@ class K3IrisState:
         *,
         norm_weight: torch.Tensor | None,
         eps: float | None,
-    ) -> torch.Tensor:
+        attention_mix: K3AttentionMix | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Return ``prefix + norm(routed) @ projection_weight.T + shared`` for decode rows.
 
         ``routed`` and ``shared`` are the reduced latent and shared-expert rows,
@@ -435,6 +620,10 @@ class K3IrisState:
         mailbox, so the call is collective. Rows match RMSNorm followed by
         the fused MFMA add3 epilogue up to FP32 summation order (the norm's
         sum of squares and the projection).
+
+        With ``attention_mix``, also return the rows' mix into the next
+        layer's attention input, bit-identical to ``attnres_combine`` on the
+        returned rows with its operands.
         """
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
             iris_arch_policy,
@@ -446,7 +635,7 @@ class K3IrisState:
         )
 
         assert self.can_moe_gather_tail(
-            routed, shared, prefix, projection_weight, norm_weight
+            routed, shared, prefix, projection_weight, norm_weight, attention_mix
         )
         if norm_weight is not None and (eps is None or eps <= 0.0):
             raise ValueError("the fused RMSNorm needs a positive epsilon")
@@ -496,10 +685,31 @@ class K3IrisState:
                 **constants,
             )
         else:
-            # Per 16-row tile: a sender per 16 columns, a reducer per 1024 slot items.
+            # Per 16-row tile: a sender per 16 columns, a reducer per 1024 slot
+            # items; a mix finishes each row in one program instead.
+            row_tiles = -(-rows // 16)
+            mixed = None if attention_mix is None else torch.empty_like(out)
+            mix = K3AttentionMix.unused(out) if mixed is None else attention_mix
+            finishers = (
+                row_tiles * (16 * local_width // 1024) if mixed is None else rows
+            )
             iris_k3moe_mfma_lamport_gather[
-                (-(-rows // 16) * (local_width // 16 + 16 * local_width // 1024),)
-            ](*args, CHUNK=_K3_GATHER_MFMA_CHUNK, **constants)
+                (row_tiles * (local_width // 16) + finishers,)
+            ](
+                *args,
+                mix.weight,
+                mix.norm_weight,
+                mix.scratch_m,
+                mix.scratch_s,
+                mix.scratch_acc,
+                out if mixed is None else mixed,
+                mix.eps,
+                CHUNK=_K3_GATHER_MFMA_CHUNK,
+                HAS_MIX=mixed is not None,
+                **constants,
+            )
+            if mixed is not None:
+                return out, mixed
         return out
 
     def can_latent_input_gather(
@@ -571,50 +781,10 @@ class K3IrisState:
         rank = self.all_reduce.rank_in_group
         device = hidden_states.device
         block = small_batch._BLOCK_N
-        router_local = _K3_ROUTER // world_size
-        latent_local = _K3_LATENT // world_size
-        latent_tiles = -(-latent_local // block)
+        latent_tiles = -(-(_K3_LATENT // world_size) // block)
         shared_tiles = 2 * _K3_SHARED // block
-        # The replicated launch's tiles and split, so every column keeps its bits.
-        block_m, warps_m = (
-            (small_batch._BLOCK_M, 1)
-            if rows <= small_batch._BLOCK_M
-            else (small_batch._LARGE_BLOCK_M, 2)
-        )
-        split_k = small_batch._split_k(rows, _K3_PACKED_INPUT_ROWS, _K3_HIDDEN, block_m)
-        partials = torch.empty(
-            (split_k, rows, _K3_PACKED_INPUT_ROWS), dtype=torch.float32, device=device
-        )
-        split_stride = rows * _K3_PACKED_INPUT_ROWS
-        # Narrow tiles spread a rank's columns; split-K sums do not depend on the tile.
-        gemm_block = 32 if rows <= small_batch._BLOCK_M else 64
-        gemm_router_tiles = -(-router_local // gemm_block)
-        gemm_latent_tiles = -(-latent_local // gemm_block)
-        gemm_shared_tiles = 2 * _K3_SHARED // gemm_block
-        gemm_tiles = gemm_router_tiles + gemm_latent_tiles + gemm_shared_tiles
-        small_batch.gluon_latent_input_small_batch_gfx950[
-            (-(-rows // block_m) * split_k * gemm_tiles,)
-        ](
-            hidden_states,
-            packed_weight,
-            partials,
-            rows,
-            split_stride,
-            HIDDEN=_K3_HIDDEN,
-            TOTAL_N=_K3_PACKED_INPUT_ROWS,
-            BLOCK_M=block_m,
-            BLOCK_N=gemm_block,
-            BLOCK_K=small_batch._BLOCK_K,
-            SPLIT_K=split_k,
-            NUM_WARPS=_K3_LATENT_GEMM_NUM_WARPS,
-            WARPS_M=warps_m,
-            REGION0_START=rank * router_local,
-            REGION0_TILES=gemm_router_tiles,
-            REGION1_START=_K3_ROUTER + rank * latent_local,
-            REGION1_TILES=gemm_latent_tiles,
-            REGION2_START=_K3_ROUTER + _K3_LATENT,
-            REGION2_TILES=gemm_shared_tiles,
-            num_warps=_K3_LATENT_GEMM_NUM_WARPS,
+        partials, split_k, split_stride = self._latent_input_partials(
+            hidden_states, packed_weight, all_router_columns=False
         )
         router_out = torch.empty((rows, _K3_ROUTER), dtype=torch.float32, device=device)
         routed_out = torch.empty(
@@ -662,12 +832,281 @@ class K3IrisState:
             QUANTIZE=quantize,
             MIN_AMAX=_DYNAMIC_FP8_MIN_AMAX,
             FP8_MAX=_DYNAMIC_FP8_E4M3_MAX,
-            MAX_ROWS=_K3_LATENT_GATHER_MAX_ROWS,
+            MAX_ROWS=_K3_LATENT_SYNC_ROWS,
             num_warps=4,
         )
         if quantize:
             return router_out, routed_out, shared_out, (routed_fp8, routed_scale)
         return router_out, routed_out, shared_out
+
+    def _latent_input_partials(
+        self,
+        hidden_states: torch.Tensor,
+        packed_weight: torch.Tensor,
+        *,
+        all_router_columns: bool,
+    ) -> tuple[torch.Tensor, int, int]:
+        """Project this rank's packed-input columns into FP32 split-K partials.
+
+        The rank's eighth of the routed columns and every shared column, plus
+        its eighth of the router columns or, with ``all_router_columns``, all
+        of them. Returns ``(partials, split_k, split_stride)``.
+        """
+        from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (
+            latent_input_small_batch as small_batch,
+        )
+
+        rows = hidden_states.shape[0]
+        world_size = self.all_reduce.world_size
+        rank = self.all_reduce.rank_in_group
+        router_local = _K3_ROUTER // world_size
+        latent_local = _K3_LATENT // world_size
+        # The replicated launch's tiles and split, so every column keeps its bits.
+        block_m, warps_m = (
+            (small_batch._BLOCK_M, 1)
+            if rows <= small_batch._BLOCK_M
+            else (small_batch._LARGE_BLOCK_M, 2)
+        )
+        split_k = small_batch._split_k(rows, _K3_PACKED_INPUT_ROWS, _K3_HIDDEN, block_m)
+        partials = torch.empty(
+            (split_k, rows, _K3_PACKED_INPUT_ROWS),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        split_stride = rows * _K3_PACKED_INPUT_ROWS
+        # Narrow tiles spread a rank's columns; split-K sums do not depend on the tile.
+        gemm_block = 32 if rows <= small_batch._BLOCK_M else 64
+        if all_router_columns:
+            router_start, gemm_router_tiles = 0, _K3_ROUTER // gemm_block
+        else:
+            router_start = rank * router_local
+            gemm_router_tiles = -(-router_local // gemm_block)
+        gemm_latent_tiles = -(-latent_local // gemm_block)
+        gemm_shared_tiles = 2 * _K3_SHARED // gemm_block
+        gemm_tiles = gemm_router_tiles + gemm_latent_tiles + gemm_shared_tiles
+        small_batch.gluon_latent_input_small_batch_gfx950[
+            (-(-rows // block_m) * split_k * gemm_tiles,)
+        ](
+            hidden_states,
+            packed_weight,
+            partials,
+            rows,
+            split_stride,
+            HIDDEN=_K3_HIDDEN,
+            TOTAL_N=_K3_PACKED_INPUT_ROWS,
+            BLOCK_M=block_m,
+            BLOCK_N=gemm_block,
+            BLOCK_K=small_batch._BLOCK_K,
+            SPLIT_K=split_k,
+            NUM_WARPS=_K3_LATENT_GEMM_NUM_WARPS,
+            WARPS_M=warps_m,
+            REGION0_START=router_start,
+            REGION0_TILES=gemm_router_tiles,
+            REGION1_START=_K3_ROUTER + rank * latent_local,
+            REGION1_TILES=gemm_latent_tiles,
+            REGION2_START=_K3_ROUTER + _K3_LATENT,
+            REGION2_TILES=gemm_shared_tiles,
+            num_warps=_K3_LATENT_GEMM_NUM_WARPS,
+        )
+        return partials, split_k, split_stride
+
+    def can_latent_input_gather_routed(
+        self,
+        hidden_states: torch.Tensor,
+        packed_weight: torch.Tensor,
+        routing: K3MoeRouting,
+        down_weight: torch.Tensor,
+        down_out: torch.Tensor | None,
+    ) -> bool:
+        """Whether ``latent_input_gather_routed`` serves these decode rows."""
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_route import (
+            K3_ROUTE_SCRATCH_WORDS,
+        )
+
+        if not self.can_latent_input_gather(hidden_states, packed_weight):
+            return False
+        rows = hidden_states.shape[0]
+        device = hidden_states.device
+        block_size = routing.block_size
+        return (
+            rows <= _K3_LATENT_ROUTED_MAX_ROWS
+            and block_size > 0
+            and not block_size & (block_size - 1)
+            and all(
+                t.shape == shape
+                and t.dtype == dtype
+                and t.is_contiguous()
+                and t.device == device
+                for t, shape, dtype in (
+                    (routing.correction_bias, (_K3_ROUTER,), torch.float32),
+                    (routing.scratch, (K3_ROUTE_SCRATCH_WORDS,), torch.int32),
+                    (down_weight, (_K3_HIDDEN, _K3_SHARED), torch.bfloat16),
+                )
+            )
+            and (
+                down_out is None
+                or (
+                    down_out.shape == (rows, _K3_HIDDEN)
+                    and down_out.dtype == torch.bfloat16
+                    and down_out.device == device
+                    and down_out.stride(1) == 1
+                    and down_out.stride(0) >= _K3_HIDDEN
+                )
+            )
+        )
+
+    def latent_input_gather_routed(
+        self,
+        hidden_states: torch.Tensor,
+        packed_weight: torch.Tensor,
+        *,
+        beta: float,
+        linear_beta: float | None,
+        routing: K3MoeRouting,
+        down_weight: torch.Tensor,
+        down_out: torch.Tensor | None = None,
+        quantize: bool = False,
+    ) -> tuple:
+        """``latent_input_gather`` with routing and the shared projection.
+
+        Every rank also projects all router columns, so each routes its
+        replicated rows while their latent is gathered, as
+        ``kimi3_sigmoid_bias_topk_sorted`` does with ``routing``, and the
+        same launch writes the shared SiTU input's down projection by
+        ``down_weight`` (``[7168, 768]``) into ``down_out`` or a new tensor.
+
+        Returns ``(router_logits, routed_input, routes, shared_partial,
+        routed_fp8)``: the logits and latent as ``latent_input_gather``,
+        ``routes`` as ``kimi3_sigmoid_bias_topk_sorted`` returns them, the
+        BF16 ``[rows, 7168]`` down projection, and with ``quantize`` the
+        latent's ``(fp8, scale)``, else None.
+        """
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_arch_policy,
+        )
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_gather import (
+            iris_k3moe_latent_input_gather_routed,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (
+            latent_input_small_batch as small_batch,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
+            _DYNAMIC_FP8_E4M3_MAX,
+            _DYNAMIC_FP8_MIN_AMAX,
+        )
+
+        assert self.can_latent_input_gather_routed(
+            hidden_states, packed_weight, routing, down_weight, down_out
+        )
+        if beta <= 0.0 or (linear_beta is not None and linear_beta <= 0.0):
+            raise ValueError("SiTU beta values must be positive")
+        rows = hidden_states.shape[0]
+        world_size = self.all_reduce.world_size
+        device = hidden_states.device
+        block = small_batch._BLOCK_N
+        latent_tiles = -(-(_K3_LATENT // world_size) // block)
+        situ_tiles = _K3_SHARED // block
+        down_tiles = _K3_HIDDEN // 64
+        partials, split_k, split_stride = self._latent_input_partials(
+            hidden_states, packed_weight, all_router_columns=True
+        )
+        router_out = torch.empty((rows, _K3_ROUTER), dtype=torch.float32, device=device)
+        routed_out = torch.empty(
+            (rows, _K3_LATENT), dtype=hidden_states.dtype, device=device
+        )
+        situ = torch.empty((rows, _K3_SHARED), dtype=hidden_states.dtype, device=device)
+        if down_out is None:
+            down_out = hidden_states.new_empty((rows, _K3_HIDDEN))
+        if quantize:
+            routed_fp8 = torch.empty(
+                (rows, _K3_LATENT), dtype=torch.float8_e4m3fn, device=device
+            )
+            routed_scale = torch.empty(1, dtype=torch.float32, device=device)
+        else:
+            routed_fp8, routed_scale = routed_out, router_out
+        block_size = routing.block_size
+        routes = rows * 16
+        # gluon_moe_sorting's capacity: every nonempty expert may add a partial block.
+        capacity = (
+            (routes + min(routes, _K3_ROUTER) * (block_size - 1))
+            // block_size
+            * block_size
+        )
+        topk_weights = torch.empty((rows, 16), dtype=torch.float32, device=device)
+        topk_ids = torch.empty((rows, 16), dtype=torch.int32, device=device)
+        sorted_ids = torch.empty((capacity,), dtype=torch.int32, device=device)
+        sorted_weights = torch.empty((capacity,), dtype=torch.float32, device=device)
+        sorted_expert_ids = torch.empty(
+            (-(-capacity // block_size),), dtype=torch.int32, device=device
+        )
+        num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
+        lamport = self.lamport
+        iris_k3moe_latent_input_gather_routed[
+            (rows * (1 + latent_tiles + situ_tiles) + down_tiles + rows,)
+        ](
+            partials,
+            situ,
+            router_out,
+            routed_out,
+            routed_fp8,
+            self._latent_fp8_sync,
+            routed_scale,
+            lamport.mailbox,
+            lamport.epochs,
+            lamport.peer_mailboxes,
+            float(beta),
+            1.0 if linear_beta is None else float(linear_beta),
+            rows,
+            split_stride,
+            routing.correction_bias,
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            routing.scratch,
+            down_weight,
+            down_out,
+            down_out.stride(0),
+            self._latent_down_sync,
+            RANK=self.all_reduce.rank_in_group,
+            WORLD_SIZE=world_size,
+            SPLIT_K=split_k,
+            TOTAL_N=_K3_PACKED_INPUT_ROWS,
+            ROUTER_N=_K3_ROUTER,
+            LATENT_N=_K3_LATENT,
+            SHARED_N=_K3_SHARED,
+            HAS_LINEAR_BETA=linear_beta is not None,
+            MAX_ELEMENTS=lamport.max_numel,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+            NUM_WARPS=4,
+            MAX_ROWS=_K3_LATENT_SYNC_ROWS,
+            ROUTED_SCALING_FACTOR=float(routing.routed_scaling_factor),
+            NORMALIZE_TOPK_WEIGHTS=routing.normalize_topk_weights,
+            BLOCK_SHIFT=block_size.bit_length() - 1,
+            DOWN_N=_K3_HIDDEN,
+            DOWN_BLOCK_M=_K3_LATENT_ROUTED_MAX_ROWS,
+            QUANTIZE=quantize,
+            MIN_AMAX=_DYNAMIC_FP8_MIN_AMAX,
+            FP8_MAX=_DYNAMIC_FP8_E4M3_MAX,
+            num_warps=4,
+        )
+        sorted_routes = (
+            topk_weights,
+            topk_ids,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+        )
+        return (
+            router_out,
+            routed_out,
+            sorted_routes,
+            down_out,
+            (routed_fp8, routed_scale) if quantize else None,
+        )
 
     def moe_row_sharded_inputs(
         self,
@@ -852,6 +1291,7 @@ class K3IrisState:
         if self.attnres is None or partial.ndim != 2:
             return False
         rows = partial.shape[0]
+        lamported = rows <= self.attnres.lamport_max_rows
         # Rows past the push one-shot's inbox reduce through the two-shot.
         pushed = (
             partial.numel() <= self.attnres.max_numel and rows <= self.attnres.max_rows
@@ -862,7 +1302,7 @@ class K3IrisState:
             and partial.numel() <= self.two_shot_max_numel
             and partial.is_contiguous()
         )
-        return (pushed or reduced) and attnres_supported(
+        return (lamported or pushed or reduced) and attnres_supported(
             partial,
             residual,
             score_weight,
@@ -885,11 +1325,17 @@ class K3IrisState:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return normalized AttnRes output and the accumulated residual.
 
-        The partial reduces through the Lamport one-shot (below 8 rows) or
-        two-shot mailboxes, in the fused kernel's ascending rank order, and
-        a row epilogue finishes it; the fused push one-shot serves the rest.
+        Within the state's Lamport window one fused Lamport two-shot reduces
+        and finishes the partial. Otherwise it reduces through the Lamport
+        one-shot (below 8 rows) or two-shot mailboxes, in the fused kernel's
+        ascending rank order, and a row epilogue finishes it; the fused push
+        one-shot serves the rest.
         """
         assert self.attnres is not None
+        if partial.shape[0] <= self.attnres.lamport_max_rows:
+            return self.attnres.lamport(
+                partial, residual, score_weight, output_weight, scratch, eps
+            )
         reduced = (
             self._reduce_attention_lamport(partial) if partial.is_contiguous() else None
         )
@@ -899,6 +1345,57 @@ class K3IrisState:
             )
         return self.attnres.run(
             partial, residual, score_weight, output_weight, scratch, eps
+        )
+
+    def attnres_projection_supported(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Whether ``attnres_projection_combine`` serves these rows."""
+        return self.attnres is not None and self.attnres.gated_projection_supported(
+            x, gate, norm_weight, weight, residual, score_weight, output_weight, scratch
+        )
+
+    def attnres_projection_combine(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        norm_eps: float,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``attnres_combine`` of ``mv_rmsnorm_gated_sigmoid(x, gate,
+        norm_weight, weight)``'s rows, projected and reduced in one launch.
+
+        The residual matches the Lamport window of ``attnres_combine`` bit for
+        bit; the hidden rows sum in another order, see
+        ``IrisAttnResState.gated_projection_lamport``.
+        """
+        assert self.attnres is not None
+        return self.attnres.gated_projection_lamport(
+            x,
+            gate,
+            norm_weight,
+            weight,
+            norm_eps,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            eps,
         )
 
     def _reduce_attention_lamport(self, partial: torch.Tensor) -> torch.Tensor | None:
@@ -955,12 +1452,15 @@ def prepare_k3_communication(
     dtype: torch.dtype,
     device: torch.device,
     all_reduce: "IrisAllReduce | None",
+    pull_exchange_max_bytes: int = 0,
+    word_max_rows: int = 0,
 ) -> K3IrisState:
     """Prepare a group's combined K3 buffers before graph capture.
 
-    Capacities are elements except the explicitly named row capacities. Zero
-    omits that path. ``all_reduce`` shares an already prepared generic operation,
-    or None creates it. The returned state owns all model-specific storage.
+    Capacities are elements except the explicitly named row and byte
+    capacities. Zero omits that path. ``all_reduce`` shares an already
+    prepared generic operation, or None creates it. The returned state owns
+    all model-specific storage.
     """
     from tokenspeed_kernel.ops.communication._iris import (
         HEAP_HEADROOM_BYTES,
@@ -975,6 +1475,10 @@ def prepare_k3_communication(
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
         IrisAttnResState,
     )
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
     world_size = group.size()
@@ -985,6 +1489,8 @@ def prepare_k3_communication(
             attnres_max_numel,
             attnres_max_rows,
             sharded_max_rows,
+            pull_exchange_max_bytes,
+            word_max_rows,
         )
         < 0
     ):
@@ -1017,10 +1523,16 @@ def prepare_k3_communication(
         if all_reduce is None
         else 0
     )
+    attnres_lamport_rows = _k3_attnres_lamport_rows(world_size, enable_lamport)
+    attnres_lamport_bytes = 0
     if attnres_max_numel:
         total_bytes += IrisAttnResState.heap_bytes(
             attnres_max_numel, attnres_max_rows, world_size, dtype
         )
+        if attnres_lamport_rows:
+            attnres_lamport_bytes = IrisAttnResState.lamport_heap_bytes(
+                attnres_lamport_rows, world_size, dtype
+            )
     if enable_lamport and ProducerLamport.supported(world_size, dtype):
         lamport_numel = _k3_lamport_numel(producer_direct_max_numel)
         if lamport_numel:
@@ -1032,10 +1544,21 @@ def prepare_k3_communication(
         if sharded_max_rows
         else 0
     )
+    pull_exchange_bytes = (
+        IrisPullExchange.heap_bytes(pull_exchange_max_bytes, world_size)
+        if pull_exchange_max_bytes
+        else 0
+    )
+    word_max_bytes = (
+        LamportWordMax.heap_bytes(word_max_rows, world_size) if word_max_rows else 0
+    )
     # Preserve the base heap's headroom for other collective operations.
     ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
-        + sharded_bytes,
+        + sharded_bytes
+        + pull_exchange_bytes
+        + attnres_lamport_bytes
+        + word_max_bytes,
     )
     if all_reduce is None:
         all_reduce = IrisAllReduce(
@@ -1050,6 +1573,8 @@ def prepare_k3_communication(
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
         sharded_max_rows=sharded_max_rows,
+        pull_exchange_max_bytes=pull_exchange_max_bytes,
+        word_max_rows=word_max_rows,
     )
     all_reduce.peers.finish_prepare()
     return state

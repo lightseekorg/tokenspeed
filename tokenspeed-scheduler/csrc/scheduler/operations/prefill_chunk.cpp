@@ -115,9 +115,11 @@ std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {
     // A hit chunk re-feeds up to one replay window and then still needs room
     // to carry the prompt's final window whole, or at least a prefix page of
     // new tokens when the window is smaller than a page.
+    // At most max_scheduled_tokens (SchedulerConfig::ValidateCapacityInputs).
     const std::int32_t window = coordinator.ReplayWindowTokens();
-    return std::max(coordinator.CheckpointGranularity() > 1 ? coordinator.CheckpointGranularity() : 0,
-                    window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0);
+    return std::max(
+        coordinator.CheckpointGranularity() > 1 ? coordinator.CheckpointGranularity() : 0,
+        window > 0 ? CheckedInt32(std::int64_t{window} + std::max(window, coordinator.PrefixGranularity())) : 0);
 }
 
 }  // namespace tokenspeed

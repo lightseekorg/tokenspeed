@@ -43,8 +43,9 @@ P2 runs one row per task (``mb`` is that row's view).
     feeds a SiLU.
   - The new stream is ``bf16(bf16(silu + gated) + h)``.
 
-  Each task also writes its channels' next conv state (taps 1-8, then
-  ``nrm``).
+  In decode each task writes its channels' next conv state (taps 1-8, then
+  ``nrm``). In verify it writes only ``nrm`` to the candidate's scratch row;
+  token zero also saves the input state in the preceding row.
 * :func:`write_context` stores the next context ``[t-1, t]``. The layer
   calls it after every P1 task reads the input page (which can be the
   output page).
@@ -265,14 +266,13 @@ def conv_stage(mb, task, tok, streams, weights, step, STAGE: gl.constexpr):
     """P2 task ``task`` of a row that is token ``tok`` of its request: stream
     ``b = task // 10``, channels ``256 (task % 10) ..`` in two passes.
 
-    The task loads all its inputs before it polls the key and value, the
-    next state's taps included.
+    The task loads the conv inputs before it polls the key and value.
 
     ``mb``, ``streams`` (the layer's global input :class:`hc.Streams`) and
-    ``step`` are the row's views. The state after the row's token goes to
-    row ``page_out[0]`` of ``conv_out`` (not positive: none). The state after
-    the request's token ``tok + d`` goes to ``page_out[d]``. These rows are
-    the output page in decode and the verify scratch rows in a verify.
+    ``step`` are the row's views. Decode writes the trailing state to the
+    output page. Verify stores the carried state immediately before the first
+    candidate row and this token's normalized input at the start of its own
+    scratch row. Nonpositive output rows suppress writes.
     """
     gk = weights.gk
     gq = weights.gq
@@ -329,17 +329,18 @@ def conv_stage(mb, task, tok, streams, weights, step, STAGE: gl.constexpr):
         )
     # The next state's taps from the input page, loaded before the poll.
     taps = ()
-    for k in gl.static_range(PASSES):
-        ch = first + cb0 + k * CHUNK + gl.arange(0, CHUNK, cl)
-        has_in = (ch >= 0) & (p_in > 0)
-        for j in gl.static_range(STATE - 1):
-            taps += (
-                gl.load(
-                    state_in + ch * STATE + tok + 1 + j,
-                    mask=has_in & (tok + 1 + j < STATE),
-                    other=0.0,
-                ),
-            )
+    if N == 1:
+        for k in gl.static_range(PASSES):
+            ch = first + cb0 + k * CHUNK + gl.arange(0, CHUNK, cl)
+            has_in = (ch >= 0) & (p_in > 0)
+            for j in gl.static_range(STATE - 1):
+                taps += (
+                    gl.load(
+                        state_in + ch * STATE + tok + 1 + j,
+                        mask=has_in & (tok + 1 + j < STATE),
+                        other=0.0,
+                    ),
+                )
     q0 = q
     if N > 3:
         q0 = gl.load(
@@ -375,21 +376,20 @@ def conv_stage(mb, task, tok, streams, weights, step, STAGE: gl.constexpr):
         if k == PASSES - 1:
             mb.stamp(STAGE, trace.COMPUTED)
         mx.put_bf16(mb, "ph", (first + cb) // 2, out)
-        # The state after this token is S[tok + 1 .. tok + 9]: the input
-        # page's taps tok + 1 .. 8, then nrm of the request's tokens 0 ..
-        # tok. This task writes the page's taps of its own row and its nrm
-        # into the rows of its token and the request's later tokens.
-        dst = conv_out + page.to(gl.int64) * out_stride + ch * STATE
+        page_offset = page.to(gl.int64) * out_stride
         write = (ch >= 0) & (page > 0)
-        for j in gl.static_range(STATE - 1):
-            from_page = tok + 1 + j < STATE
-            gl.store(dst + j, taps[k * (STATE - 1) + j], mask=write & from_page)
-        for d in gl.static_range(N):
-            later = gl.load(out_rows + d, mask=tok + d < N, other=0)
-            to = conv_out + later.to(gl.int64) * out_stride + ch * STATE + STATE - 1 - d
-            gl.store(
-                to, nrm_ch.to(gl.bfloat16), mask=(ch >= 0) & (later > 0) & (tok + d < N)
-            )
+        if N == 1:
+            dst = conv_out + page_offset + ch * STATE
+            for j in gl.static_range(STATE - 1):
+                gl.store(dst + j, taps[k * (STATE - 1) + j], mask=write)
+            gl.store(dst + STATE - 1, nrm_ch.to(gl.bfloat16), mask=write)
+        else:
+            gl.store(conv_out + page_offset + ch, nrm_ch.to(gl.bfloat16), mask=write)
+            if tok == 0:
+                carried = conv_out + page_offset - out_stride + ch * STATE
+                for j in gl.static_range(STATE):
+                    old = gl.load(state_in + ch * STATE + j, mask=has_in, other=0.0)
+                    gl.store(carried + j, old, mask=write)
     mb.stamp(STAGE, trace.END)
 
 
