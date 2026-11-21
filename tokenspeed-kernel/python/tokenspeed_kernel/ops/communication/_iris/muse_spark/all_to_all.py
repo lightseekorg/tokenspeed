@@ -117,6 +117,74 @@ def iris_a2a_transpose_qkvg(
 
 
 @gluon.jit(do_not_specialize=["rows"])
+def iris_a2a_heads_to_owners(
+    source,
+    output,
+    ready_flags,
+    heaps,
+    rows,
+    RANK: gl.constexpr,
+    WIDTH: gl.constexpr,
+    FLAG_ROWS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
+):
+    """Send every token owner its rows of each rank's attention heads.
+
+    source holds this rank's heads for all rows, [rows, WIDTH] BF16 in
+    symmetric memory, WIDTH the model's attention output width over
+    WORLD_SIZE. Owner RANK pulls its ceil(rows / WORLD_SIZE) rows from every
+    rank into output [ceil(rows / WORLD_SIZE), WIDTH * WORLD_SIZE], rank r's
+    heads at columns [r * WIDTH, (r + 1) * WIDTH),
+    the order of the full output projection's input. NUM_WARPS waves cover
+    one source row. Padding rows past rows are left unwritten. ready_flags
+    publish the source and hold its reuse until every peer has read it.
+    """
+    WORLD_SIZE: gl.constexpr = len(heaps)
+    program = gl.program_id(0)
+    peers = _iris_peer_pointers(source, heaps, RANK)
+    epoch = (
+        gl.atomic_add(
+            ready_flags + program * WORLD_SIZE + RANK, 1, sem="relaxed", scope="gpu"
+        )
+        + 1
+    )
+    # The source is written by ordinary write-back stores.
+    _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, True)
+    local_rows = gl.cdiv(rows, WORLD_SIZE)
+    first = gl.minimum(RANK * local_rows, rows)
+    owned = gl.minimum(rows - first, local_rows)
+    lanes = gl.arange(0, WIDTH, layout=gl.BlockedLayout([8], [64], [NUM_WARPS], [0]))
+    # One (row, source rank) pair a job. Row bases are int64, since row x
+    # width grows with the batch; lanes stay int32 within a row.
+    for job in range(program, owned * WORLD_SIZE, gl.num_programs(0)):
+        row = job // WORLD_SIZE
+        step = job - row * WORLD_SIZE
+        peer = peers[RANK]
+        for delta in gl.static_range(1, WORLD_SIZE):
+            peer = gl.where(step == delta, peers[(RANK + delta) % WORLD_SIZE], peer)
+        source_rank = (RANK + step) % WORLD_SIZE
+        source_row = peer + (first + row).to(gl.int64) * WIDTH
+        output_row = (
+            output + row.to(gl.int64) * (WIDTH * WORLD_SIZE) + source_rank * WIDTH
+        )
+        values = gl.amd.cdna4.buffer_load(source_row, lanes, cache=".cg")
+        gl.amd.cdna4.buffer_store(values, output_row, lanes)
+    # The source buffer is reused right after: every reader must finish first.
+    WAIT_VMEM()
+    gl.barrier()
+    _iris_rendezvous(
+        ready_flags + FLAG_ROWS * WORLD_SIZE,
+        heaps,
+        program,
+        epoch,
+        RANK,
+        NUM_WARPS,
+        False,
+    )
+
+
+@gluon.jit(do_not_specialize=["rows"])
 def iris_fused_a2a_transpose_qkvg_norm_rope(
     source,
     source_scales,
