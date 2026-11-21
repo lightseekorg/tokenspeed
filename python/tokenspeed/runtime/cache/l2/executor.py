@@ -49,9 +49,11 @@ so under KVP each rank copies exactly the blocks it owns.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Iterable, Sequence
 from enum import Enum
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
@@ -108,6 +110,33 @@ logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
+
+
+def release_checkpoint_file_cache(
+    model_paths: Sequence[str], *, node_leader: bool, cpu_group
+) -> None:
+    """Offer this model's clean safetensors pages back before large pinned allocations."""
+    if cpu_group is not None:
+        torch.distributed.barrier(group=cpu_group)
+    if node_leader:
+        for directory in set(model_paths):
+            count = 0
+            try:
+                for shard in Path(directory).glob("*.safetensors"):
+                    with shard.open("rb") as file:
+                        os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    count += 1
+            except (AttributeError, OSError) as error:
+                logger.warning(
+                    "Could not release checkpoint file cache for %s: %s",
+                    directory,
+                    error,
+                )
+            logger.info(
+                "Advised release of %d safetensors shards in %s", count, directory
+            )
+    if cpu_group is not None:
+        torch.distributed.barrier(group=cpu_group)
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
@@ -176,6 +205,7 @@ class HostCacheExecutor:
         l2_tier: bool,
         host_ratio: float,
         host_size_gb: float,
+        host_headroom_bytes: int | None = None,
         snapshot_pool: RetractionPoolRequest,
         slot_state_exporters: Sequence[SlotStateExporter] | None,
         io_backend: str,
@@ -298,8 +328,12 @@ class HostCacheExecutor:
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
+        if host_headroom_bytes is None:
+            host_headroom_bytes = _HOST_MEM_HEADROOM_BYTES
+        if host_headroom_bytes < 0:
+            raise ValueError("Host memory headroom must be nonnegative")
         share_bytes, share_source = host_memory_share(
-            nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
+            nprocs_per_node=nprocs_per_node, headroom_bytes=host_headroom_bytes
         )
         # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
@@ -328,7 +362,7 @@ class HostCacheExecutor:
                 "under the pinned allocator settings; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
                 f"memory, from {share_source}, over its ranks, less "
-                f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
+                f"{host_headroom_bytes / 1e9:.2f} GB headroom each)"
             )
             host_lcm_blocks = fitting_l2_blocks
         # The ranks' mirrored schedulers share one page count per Host tier,

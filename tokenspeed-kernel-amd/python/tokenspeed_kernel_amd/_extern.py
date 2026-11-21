@@ -89,6 +89,21 @@ def arithmetic_fence(value, _semantic):
     )
 
 
+@tl.core.extern
+def hw_rcp(value, _semantic):
+    """``v_rcp_f32`` of FP32 ``value`` (``llvm.amdgcn.rcp``): the approximate
+    reciprocal. Launch with :func:`extern_compile_options`."""
+    return _call(
+        "arith",
+        "rcp_f32",
+        [value],
+        (tl.float32,),
+        tl.float32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
 # Instruction scheduling (_isched.ll).
 
 # Instruction classes of ``llvm.amdgcn.sched.group.barrier`` masks.

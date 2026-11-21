@@ -224,11 +224,41 @@ def test_full_layer_projects_its_conv_taps_from_the_k_and_v_sources() -> None:
         torch.randn((8, 32), dtype=torch.bfloat16, device="cuda") for _ in range(3)
     )
     projections = attn._project_full(sources)
-    for part, conv, slot in ((1, attn.k_sconv, 6), (2, attn.v_sconv, 7)):
+    for part, conv in ((1, attn.k_sconv), (2, attn.v_sconv)):
         want = sources[part].float() @ conv.weight_proj.float().T
         torch.testing.assert_close(
-            projections[part][slot].float(), want, atol=0.02, rtol=2**-7
+            projections[part][1].float(), want, atol=0.02, rtol=2**-7
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")
+@pytest.mark.parametrize("layer", [0, 1])
+@pytest.mark.parametrize("tokens", [8, 129, 600])
+def test_separate_sources_project_the_rows_their_streams_read(
+    layer: int, tokens: int
+) -> None:
+    """Above the stacked range the K and V sources project only their
+    segment (and taps); every range returns the whole projections' parts."""
+    attn = _model().model.layers[layer].attn.cuda()
+    torch.manual_seed(47)
+    attn.qkvr.weight.data.normal_()
+    sources = tuple(
+        torch.randn((tokens, 32), dtype=torch.bfloat16, device="cuda") for _ in range(3)
+    )
+    q_projection, k_parts, v_parts = attn._project_full(sources)
+    whole = [attn._project(source) for source in sources]
+    want = (
+        whole[0],
+        attn._source_parts(whole[1], 0),
+        attn._source_parts(whole[2], 1),
+    )
+    assert len(k_parts) == len(v_parts) == (1 if attn.is_local else 2)
+    for got_parts, want_parts in zip(
+        (q_projection, k_parts, v_parts), want, strict=True
+    ):
+        for got, expected in zip(got_parts, want_parts, strict=True):
+            assert got.shape == expected.shape
+            torch.testing.assert_close(got, expected, atol=0.02, rtol=2**-7)
 
 
 def test_logits_width_matches_sampling_vocabulary_not_stored_head_rows() -> None:
@@ -288,6 +318,51 @@ def test_gpu_softcap_matches_the_fp32_statement_byte_for_byte() -> None:
     uncapped = processor._get_logits(hidden, head, metadata, require_full_vocab=True)
     assert logits.is_contiguous() and logits.shape[1] < head.weight.shape[0]
     assert torch.equal(logits, uncapped.div_(30.0).tanh_().mul_(30.0))
+
+
+def test_sampled_rows_stay_fp32_shards_capped_as_the_gathered_rows() -> None:
+    """Under TP the sampler selects from the FP32 head shards; the last shard
+    holds the vocabulary's end before the head's padding rows, and the cap is
+    ``tanh_softcap``'s."""
+    config = _tiny_config()
+    mapping = Mapping(
+        rank=1,
+        world_size=2,
+        attn_tp_size=2,
+        attn_dp_size=1,
+        dense_tp_size=2,
+        dense_dp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+        moe_dp_size=1,
+        nprocs_per_node=2,
+        nnodes=1,
+    )
+    processor = Inkling2LogitsProcessor(config.text_config, mapping)
+    head = ParallelLMHead(
+        config.text_config.padded_vocab_size,
+        config.text_config.hidden_size,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=None,
+        prefix="model.llm.unembed",
+        tp_rank=1,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    head.quant_method = Inkling2LMHeadMethod()
+    asked = []
+
+    def supports(dtype, columns, tp_size):
+        asked.append((dtype, columns, tp_size))
+        return True
+
+    assert processor.keep_sampled_logits_vocab_sharded(head, supports)
+    # 60 of 64 head rows: the second shard's 28 real columns.
+    assert asked == [(torch.float32, 28, 2)]
+    shard = processor.sampled_vocab_shard(torch.zeros(3, 32), head)
+    assert (shard.columns, shard.vocab_start) == (28, 32)
+    assert (shard.softcap, shard.softcap_form) == (30.0, "tanh")
 
 
 def test_logits_processor_uses_common_sampled_row_selection() -> None:

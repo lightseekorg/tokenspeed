@@ -29,7 +29,13 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from utils import is_amd, move_pages_past_int32
+from utils import assert_no_triton_compile, is_amd, is_cdna4, move_pages_past_int32
+
+if is_amd():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_split_gfx950,
+    )
 
 
 @pytest.fixture
@@ -765,7 +771,12 @@ def test_fp8_eight_wave_reads_pages_past_int32_range():
     expected = case.invoke("gluon", return_lse=False)
     (k_far, v_far), far_table = move_pages_past_int32((case.k, case.v), case.table)
     far_case = dataclasses.replace(case, k=k_far, v=v_far, table=far_table)
-    actual = far_case.invoke("gluon", return_lse=False)
+    # The arena pointers are not specialized (serving sizes the arena after
+    # startup's warm-up), so the small pool's binaries serve the large one.
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950, gluon_mha_extend_split_gfx950
+    ):
+        actual = far_case.invoke("gluon", return_lse=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -920,7 +931,12 @@ def test_extend_reads_pages_past_int32_range(queries, prefixes, window, head_dim
     expected = case.invoke("gluon", return_lse=False)
     (k_far, v_far), far_table = move_pages_past_int32((case.k, case.v), case.table)
     far_case = dataclasses.replace(case, k=k_far, v=v_far, table=far_table)
-    actual = far_case.invoke("gluon", return_lse=False)
+    # The arena pointers are not specialized (serving sizes the arena after
+    # startup's warm-up), so the small pool's binaries serve the large one.
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950, gluon_mha_extend_split_gfx950
+    ):
+        actual = far_case.invoke("gluon", return_lse=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -1042,3 +1058,126 @@ def test_work_group_placement_does_not_recompile():
         for queries in ([1056], [1040] * 2, [1040] * 3, [640, 1500], [900, 33, 1200]):
             for prefix in (300, 9000):
                 run(queries, prefix)
+
+
+def test_extend_refuses_an_arena_off_16_bytes(require_gfx950):
+    """The kernels state the arena's 16-byte alignment instead of specializing
+    its pointers; the direct-to-LDS page copy has no lowering without it, so
+    the launcher refuses an unaligned arena rather than failing to compile."""
+    case = make_case(
+        [16, 40], [48, 100], heads=8, kv_heads=1, window=-1, causal=True, sinks=None
+    )
+
+    def shifted(cache):
+        flat = torch.empty(cache.numel() + 1, dtype=cache.dtype, device=cache.device)
+        flat[1:].copy_(cache.flatten())
+        return flat[1:].view_as(cache)
+
+    off = dataclasses.replace(case, k=shifted(case.k), v=shifted(case.v))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        off.invoke("gluon", return_lse=False)
+
+
+if is_cdna4():
+    from tokenspeed_kernel_amd._triton import gl, gluon
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        _remap_extend_program,
+    )
+
+    @gluon.jit
+    def _remap_probe(out, RAGGED: gl.constexpr, N_KV_HEADS: gl.constexpr):
+        """Stores the (query block, batch, KV head) that _remap_extend_program
+        gives each program, at the program's index in launch order."""
+        # Program ids as the unsplit extend kernel reads them.
+        pid_q = gl.program_id(0)
+        if RAGGED:
+            kv_head = gl.program_id(1)
+            launch = pid_q + gl.num_programs(0) * kv_head
+        else:
+            kv_head = gl.program_id(2)
+            launch = pid_q + gl.num_programs(0) * (
+                gl.program_id(1) + gl.num_programs(1) * kv_head
+            )
+        pid_batch = 0 if RAGGED else gl.program_id(1)
+        pid_q, pid_batch, kv_head = _remap_extend_program(
+            pid_q, pid_batch, kv_head, RAGGED, N_KV_HEADS
+        )
+        gl.store(out + launch * 3, pid_q)
+        if not RAGGED:
+            # A ragged launch has one batch: its slot keeps the host's zero.
+            gl.store(out + (launch * 3 + 1), pid_batch)
+        gl.store(out + (launch * 3 + 2), kv_head)
+
+
+# Launch shapes without the KV-head dimension: ragged (blocks,) and rectangular
+# (blocks_per_req, batch). With 8 XCDs and 1, 2, 4 or 8 heads they cover one
+# block, launches below, at and at multiples of one round of XCDs, and
+# remainders below and above one round.
+_REMAP_RAGGED_GRIDS = [(blocks,) for blocks in (1, 3, 4, 7, 8, 9, 16, 21)]
+_REMAP_RECTANGULAR_GRIDS = [
+    (blocks_per_req, batch) for batch in (1, 2, 5) for blocks_per_req in (1, 3, 7)
+] + [(4, 2), (8, 3)]
+_REMAP_GRIDS = _REMAP_RAGGED_GRIDS + _REMAP_RECTANGULAR_GRIDS
+
+
+def _remapped_programs(grid, kv_heads):
+    """Launches the probe over ``grid + (kv_heads,)``; returns an int64
+    [programs, 3] tensor of (query block, batch, KV head) in launch order."""
+    programs = math.prod(grid) * kv_heads
+    out = torch.zeros(programs * 3, device="cuda", dtype=torch.int32)
+    _remap_probe[(*grid, kv_heads)](out, len(grid) == 1, kv_heads, num_warps=1)
+    return out.view(programs, 3).cpu().long()
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4, 8])
+@pytest.mark.parametrize("grid", _REMAP_GRIDS, ids=lambda g: "x".join(map(str, g)))
+@pytest.mark.usefixtures("require_gfx950")
+def test_work_group_placement_runs_every_block_and_head_once(grid, kv_heads):
+    """The remap is one to one for every launch shape, and each full round of
+    XCDs gives every XCD a work-group of the KV head that owns it."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    num_xcds = extend._NUM_XCDS.value
+    # The extend kernel remaps only these head counts.
+    assert num_xcds % kv_heads == 0
+    blocks_per_req = grid[0]
+    batch = 1 if len(grid) == 1 else grid[1]
+    blocks = blocks_per_req * batch
+    programs = blocks * kv_heads
+
+    pid_q, pid_batch, kv_head = _remapped_programs(grid, kv_heads).unbind(1)
+    assert pid_q.min() >= 0 and pid_q.max() < blocks_per_req
+    assert pid_batch.min() >= 0 and pid_batch.max() < batch
+    assert kv_head.min() >= 0 and kv_head.max() < kv_heads
+    block = pid_batch * blocks_per_req + pid_q
+    visits = torch.bincount(block * kv_heads + kv_head, minlength=programs)
+    assert torch.equal(visits, torch.ones(programs, dtype=torch.long))
+
+    # Work-group i of the launch runs on XCD i % num_xcds; the work-groups
+    # past the last full round are not placed by head.
+    placed = programs - programs % num_xcds
+    owners = []
+    for xcd in range(num_xcds if placed else 0):
+        on_xcd = slice(xcd, placed, num_xcds)
+        owner = kv_head[on_xcd].unique()
+        assert owner.numel() == 1, f"XCD {xcd} runs KV heads {owner.tolist()}"
+        owners.append(owner.item())
+        # Last block first, so the longest causal work starts the launch.
+        assert (block[on_xcd].diff() < 0).all()
+    if placed:
+        owned = torch.bincount(torch.tensor(owners), minlength=kv_heads)
+        assert (owned == num_xcds // kv_heads).all()
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4, 8])
+@pytest.mark.parametrize("grids", [_REMAP_RAGGED_GRIDS, _REMAP_RECTANGULAR_GRIDS])
+@pytest.mark.usefixtures("require_gfx950")
+def test_remap_reads_the_grid_at_run_time(grids, kv_heads):
+    """For one head count and grid layout, no launch size compiles the remap
+    again."""
+    from utils import assert_no_triton_compile
+
+    _remapped_programs(grids[0], kv_heads)
+    with assert_no_triton_compile(_remap_probe):
+        for grid in grids:
+            _remapped_programs(grid, kv_heads)

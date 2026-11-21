@@ -62,9 +62,10 @@ engines.
 
 Holder and reader must share the cache namespace: the same deployment
 identity (checkpoint, layout, attention TP, KV parallelism, backends,
-quantization, compatibility epoch) and weight version, as the L3 key prefix
-already defines it. Same namespace implies the same per-rank layout, so rank
-*i* of the reader reads only from rank *i* of the holder. Replicas in
+quantization, compatibility epoch) and weight version. Under `numerics=auto`,
+the live peer identity allows different MoE expert-parallel sizes. Other
+numerical policies and persistent L3 keys retain the expert-parallel size.
+Same namespace implies the same per-rank layout, so rank *i* of the reader reads only from rank *i* of the holder. Replicas in
 different namespaces never share: the two compare identities when they first
 connect and before every read (Faults, below).
 
@@ -232,9 +233,8 @@ or a lease the holder kept for the old one.
 **Different models or weights:** every answer carries the holder's namespace
 identity; a reader reads only from a holder whose identity equals its own.
 Equal token hashes under different weights would otherwise land wrong KV. The
-identity is the L3 deployment id (checkpoints, cache layout, numerics,
-parallel layout) and the weight version. A weight update must flush and name
-its `weight_version`, as with L3; once every rank holds the new weights the
+identity includes the deployment facts described above and the weight version. A weight update
+must flush and name its `weight_version`, as with L3; once every rank holds the new weights the
 replica serves and reads under the new identity and forgets the layouts it
 knew, so replicas mid-rollout never read each other.
 

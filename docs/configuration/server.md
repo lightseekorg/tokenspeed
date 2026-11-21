@@ -84,7 +84,8 @@ its request partition is invalidated before another PD owner uses it.
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 | `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
-| `--prefill-collective-payload {bf16,int8-block16}` | Muse Spark: the payload encoding of the owned-row prefill collectives (the QKVG all-to-all and the attention and expert reduce-scatters) in extend forwards. `bf16` (the default) transfers the rows as produced; `int8-block16` transfers INT8 codes with an FP32 scale per 16 elements (a payload of 1.25 bytes an element) and decodes them to BF16 before the collective's arithmetic. A numerics change; decode and verify forwards stay BF16. Refused for other checkpoints, under `--numerics rl-bitwise`, and at startup when the server prepares no Iris owned-row layout for it (Iris needs gfx950 and attention TP 4 or 8; the layout needs forwards large enough for its row boundary). |
+| `--prefill-collective-payload {bf16,int8-block16}` | Muse Spark: the payload encoding of the owned-row prefill collectives (the QKVG all-to-all and the attention and expert reduce-scatters) in extend forwards. `bf16` (the default) transfers the rows as produced; `int8-block16` transfers INT8 codes with an FP32 scale per 16 elements (a payload of 1.25 bytes an element) and decodes them to BF16 before the collective's arithmetic. A numerics change; decode and verify forwards stay BF16, and with `--owned-attention-output all-to-all` the attention heads travel as BF16. Refused for other checkpoints, under `--numerics rl-bitwise`, and at startup when the server prepares no Iris owned-row layout for it (Iris needs gfx950 and attention TP 4 or 8; the layout needs forwards large enough for its row boundary). |
+| `--owned-attention-output {reduce-scatter,all-to-all}` | Muse Spark: how owned-row prefill (extend) forwards return attention outputs to the token owners. `reduce-scatter` (the default) reduce-scatters every rank's partial projection; `all-to-all` sends each owner its rows of every rank's heads and projects them through the whole output projection, gathered on every rank after loading: 128 MiB (8192 × 8192 BF16) a layer, about 7.75 GiB a rank over 62 layers, taken from the KV pool. Fewer bytes; a numerics change. Decode forwards keep the reduce-scatter. Refused for other checkpoints, under `--numerics rl-bitwise`, and at startup when the server prepares no Iris owned-row layout for it (Iris needs gfx950 and attention TP 4 or 8; the layout needs forwards large enough for its row boundary); live weight updates are refused with `all-to-all`. |
 
 ### Qwen FP8 attention projections
 
@@ -506,7 +507,7 @@ Trainer-side contract:
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
-| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
+| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. On Muse Spark with Iris owned-row prefill (gfx950, attention TP 4 or 8), chunks above 8192 tokens stay on the owned-row layout instead of replicated rows: their attention-output and expert sums are then taken in another order, and the owned-row buffers grow with the chunk size (three per-rank buffers of that many 8192-wide BF16 rows), up to 24576 rows: larger chunks replicate their rows; `--numerics rl-bitwise` keeps 8192. |
 | `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off: no chunk gives way; at most half of `--chunked-prefill-size`; a decode server ignores it. Whatever N, a prefill server fills the budget a chunk leaves on its own with bootstrapped prompts that fit whole in it; [scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue) describes both. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--enable-short-prefill-first` | Prefill and aggregated servers: rank new local prefills by remaining work after Device/Host prefix reuse, including replay work, with stable ties and oldest-request protection after eight successful bypasses. Resident chunks keep priority. Off by default, preserving submission order ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
@@ -520,8 +521,10 @@ Trainer-side contract:
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
-| `--decode-monokernel` | Run each decoder layer's small decode steps as one persistent monokernel launch on gfx950 ([decode monokernel design](../design/monokernel.md)). Off by default. Models: Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration`) and Muse Spark (`MuseSparkForConditionalGeneration`, with its DFlash2 draft). Startup fails when a layer cannot be packed; larger steps keep the regular path. |
+| `--decode-monokernel` | Run each decoder layer's small decode steps as one persistent monokernel launch on gfx950 ([decode monokernel design](../design/monokernel.md)). Off by default. Models: Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration`), Muse Spark (`MuseSparkForConditionalGeneration`, with its DFlash2 draft), and Inkling 2 (`Inkling2ForConditionalGeneration`, and `Inkling2LoopForConditionalGeneration` for looped checkpoints). Startup fails when a layer cannot be packed; larger steps keep the regular path. |
 | `--monokernel-stuck-record-dir` | With `--decode-monokernel`: a directory on tmpfs (for example `/dev/shm`) where each rank keeps its stuck-poll record file; the file is GPU-registered host memory, and a disk filesystem's periodic writeback of it stalls decode. A launch poll that gives up writes what it waited for there before the launch traps, so the record outlives the process. Without it the records stay in pinned memory and are logged when the failure reaches Python. |
+| `--inkling2-loop-num-passes` | Looped Inkling 2 checkpoints with `loop_config.is_varloop=true`: run the looped core this many times (at least 1) instead of the checkpoint's `num_passes`. Each pass is 12 more layer visits, each with its own KV cache and convolution state unless `--inkling2-loop-share-cache` is set. DSpark drafts read hidden states at fixed visits, so with a draft model only the checkpoint's count is accepted; model-free `DUMMY` drafting serves any count. With `--decode-monokernel` each visit takes one of a step's 64 launch tags, so the 24-layer checkpoint serves at most 4 passes there. Unset by default; other checkpoints refuse it. |
+| `--inkling2-loop-share-cache` | Looped Inkling 2 checkpoints with `loop_config.is_varloop=true`: every pass of a core layer reads and writes that layer's one KV cache, so the KV pool holds one cache layer per decoder layer regardless of the pass count; each visit keeps its own convolution state. Off by default; other checkpoints refuse it. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
@@ -1804,8 +1807,9 @@ ratios and the derived retraction snapshot pool) pin that much more Host
 memory; the gigabyte sizes keep their byte budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
-equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Available means the smaller of the host's free memory and
+equal share of the Host memory its node has available, less
+`--kvstore-host-headroom-gib` per rank (10 GiB by default).
+Available means the smaller of the host's free memory and
 what the process's memory cgroup still allows (its limit, `memory.max` or
 `memory.high` on cgroup v2, less its usage with page cache counted as free;
 the tightest limit over its cgroup and the ones above it, found through
@@ -1827,6 +1831,9 @@ settings. A `pinned_max_cached_size_mb` limit also disables rounding above
 its threshold and releases those blocks when unused; it limits individual
 block size, not total cached bytes. Device backends without allocator
 snapshots retain the conservative power-of-two estimate.
+
+On Linux, enable `--kvstore-release-checkpoint-cache` to ask the kernel to
+reclaim clean checkpoint pages before allocating the Host cache.
 
 A ratio size larger than a rank's share is capped to the largest whole-LCM
 buffer that fits under those allocator settings beside its snapshot pool,
