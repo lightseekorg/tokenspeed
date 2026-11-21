@@ -106,23 +106,44 @@ def kernel_launcher(kernel: Any, grid: Any) -> Callable[..., Any]:
     launch = kernel[grid]
 
     def prepare(*args: Any, **kwargs: Any) -> Any:
-        names = kernel.arg_names
-        if len(args) > len(names):
-            raise TypeError(f"Too many arguments to {kernel.fn.__name__}")
-        bound = dict(zip(names, args))
-        duplicate = bound.keys() & kwargs.keys()
-        if duplicate:
-            raise TypeError(f"Arguments supplied twice: {sorted(duplicate)}")
-        bound.update(kwargs)
-        sets = variants(bound) if callable(variants) else variants
-        for choices in sets:
-            if any(not values for values in choices.values()):
-                raise ValueError("Warmup argument choices must not be empty")
-            for values in product(*choices.values()):
-                call = bound | dict(zip(choices, values, strict=True))
-                compiled = kernel.warmup(**call, grid=(1,))
-                if compiled is not None:
-                    compiled._init_handles()
+        compile_registered_variants(kernel, *args, **kwargs)
         return launch(*args, **kwargs)
 
     return prepare
+
+
+def compile_registered_variants(kernel: Any, *args: Any, **kwargs: Any) -> None:
+    """Compile, without launching, every variant registered for ``kernel``
+    around these ordinary launch arguments.
+
+    Unlike :func:`kernel_launcher`, this runs outside ``kernel_warmup`` too:
+    callers use it to prepare a launch that startup never reaches.
+
+    Args:
+        kernel: Triton or Gluon JIT function with registered variants.
+        *args: Its positional launch arguments.
+        **kwargs: Its keyword launch arguments and options.
+
+    Returns:
+        None.
+    """
+    variants = _warmup_variants.get(kernel)
+    if variants is None:
+        raise KeyError(f"No warmup variants are registered for {kernel.fn.__name__}")
+    names = kernel.arg_names
+    if len(args) > len(names):
+        raise TypeError(f"Too many arguments to {kernel.fn.__name__}")
+    bound = dict(zip(names, args))
+    duplicate = bound.keys() & kwargs.keys()
+    if duplicate:
+        raise TypeError(f"Arguments supplied twice: {sorted(duplicate)}")
+    bound.update(kwargs)
+    sets = variants(bound) if callable(variants) else variants
+    for choices in sets:
+        if any(not values for values in choices.values()):
+            raise ValueError("Warmup argument choices must not be empty")
+        for values in product(*choices.values()):
+            call = bound | dict(zip(choices, values, strict=True))
+            compiled = kernel.warmup(**call, grid=(1,))
+            if compiled is not None:
+                compiled._init_handles()
