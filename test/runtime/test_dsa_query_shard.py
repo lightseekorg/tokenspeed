@@ -1032,7 +1032,10 @@ def _router(leaf: dsa.DSABackend, *, is_draft: bool):
     return router
 
 
-def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
+@pytest.mark.parametrize("uses_paged_state_verify", [False, True])
+def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it(
+    uses_paged_state_verify,
+):
     """The serve path: ``_prepare_fixed_workspaces`` allocates the history
     gather workspace on the target tree against the recipe's plan and the
     draft tree gathers into the same buffers, so a sharded draft extend finds
@@ -1085,7 +1088,7 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
         config=config,
         backend=target_router,
         draft_backend=draft_router,
-        uses_paged_state_verify=False,
+        uses_paged_state_verify=uses_paged_state_verify,
         is_inkling=False,
         qsa_bf16_scratch=None,
     )
@@ -1100,7 +1103,9 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
         _init(leaf, _plan(0))
         assert leaf.require_query_shard_metadata().groups
     with pytest.raises(RuntimeError, match="does not match allocated"):
-        _prepare_fixed_workspaces(**kwargs, expected_bytes=planned + 1)
+        _prepare_fixed_workspaces(
+            **{**kwargs, "uses_paged_state_verify": False}, expected_bytes=planned + 1
+        )
     # Off: nothing is allocated and nothing is checked.
     fresh = _backend(0, workspace_rows=0, qcp=False, index_k_format="fp8_scaled")
     config.qcp_size = config.kvp_size = 1

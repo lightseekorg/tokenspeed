@@ -4763,9 +4763,10 @@ def test_model_qcp_prefill_config(kvp_size):
     args.speculative_num_draft_tokens = 5
     args.speculative_num_steps = 4
     assert DeepseekV41Config.generate(args, model, False).qcp_size == 4
-    args.disaggregation_mode = "decode"
-    with pytest.raises(ValueError, match="PD prefill role"):
-        DeepseekV41Config.generate(args, model, False)
+    for role in ("null", "decode"):
+        args.disaggregation_mode = role
+        with pytest.raises(ValueError, match="PD prefill role"):
+            DeepseekV41Config.generate(args, model, False)
 
 
 def test_v41_rejects_attention_head_tp():

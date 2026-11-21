@@ -262,12 +262,19 @@ class AttnConfig:
             # gathered projections and keeps full logical metadata.
             is_v41 = softmax.backend_name == "deepseek_v41"
             if not (
-                is_v41 or (softmax.is_dsa and softmax.backend_name in (None, "dsa"))
+                is_v41
+                or (
+                    softmax.is_dsa
+                    and softmax.backend_name in (None, "dsa", "hybrid_linear_attn")
+                )
             ):
                 raise ValueError(
                     "query context parallelism requires GPU DSA or V4.1 attention; "
                     f"got {softmax.backend_name!r}"
                 )
+            # A hybrid wrapper is resolved and this config rebuilt with the
+            # actual full-attention leaf before cache allocation. Permit the
+            # DSA wrapper here; the resolved leaf must pass the same check.
             if not is_v41 and self.qcp_size != self.kvp_size:
                 raise ValueError(
                     "DSA query context parallelism requires KVP equal to QCP"

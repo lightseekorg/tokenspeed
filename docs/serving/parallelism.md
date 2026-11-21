@@ -45,7 +45,7 @@ tokenspeed serve <model> \
 | `--data-parallel-size` | Replicated data-parallel groups. |
 | `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on an aggregated or PD engine (see "KV parallelism" below). |
 | `--decode-context-parallel-size` | Decode context parallelism in aggregated or PD decode engines; required with and equal to `--kv-parallel-size` there. |
-| `--query-context-parallel-size` | Query context parallelism: the prefill role's query-row sharding over the sharded pages; equal to `--kv-parallel-size` and `--attn-tp-size` (see "Query context parallelism" below). |
+| `--query-context-parallel-size` | Query context parallelism: Prefill query-row sharding over the sharded pages; equal to `--kv-parallel-size` and `--attn-tp-size` (see "Query context parallelism" below). |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
@@ -691,7 +691,7 @@ things:
 - **QCP** (query context parallelism) is the *prefill-side* sharding of the
   query rows over the attention TP group against the full, gathered KV
   history; there is no LSE merge. `--query-context-parallel-size` selects
-  it on the PD prefill role (next section).
+  it on PD prefill and aggregated DSA engines (next section).
 
 `--kv-parallel-size N` must divide `--attn-tp-size`; the KVP subgroups are
 aligned runs of `N` consecutive attention-TP ranks. It applies to the
@@ -702,7 +702,8 @@ attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime
 translates ownership where it reads, writes or copies them
 (`docs/design/cache-concepts.md`). An aggregated engine combines the existing
-sharded-history prefill with DCP decode, without a PD transfer or QCP. On PD,
+sharded-history prefill with DCP decode, without a PD transfer. DSA can
+add QCP to shard the Prefill query rows. On PD,
 a prefill engine (with or without a query shard) and a decode engine (with
 `--decode-context-parallel-size`) each shard their cache independently; a
 transfer edge copies the pages its prefill rank and decode rank both own.
@@ -757,10 +758,10 @@ before `--distributed-timeout-seconds` (at half of it when it is under 90 s).
 The group's first rank logs the choice: `KVP history group ... gathers through
 the fused all-gather`, or `... keeps its NCCL all-gather:` with the reason.
 
-## Query context parallelism on the prefill role
+## Query context parallelism for prefill
 
 `--query-context-parallel-size N` (QCP) splits every extend forward's rows
-over the attention TP group of a PD prefill engine, request by request in
+over the attention TP group, request by request in
 zigzag: every request's new rows are cut into `2N` near-equal segments and
 rank `r` computes segments `r` and `2N - 1 - r` of every request, against
 the full KV history of the request. For sufficiently long requests, each
@@ -791,7 +792,14 @@ without adding history gathers; latency still depends on query distribution
 and the selected kernels. A request whose history exceeds the workspace is
 rejected.
 
-Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
+Backend support is checked after the model's attention configuration resolves,
+including the full-attention leaf of a hybrid model. An explicit
+`--attention-backend dsa` is not required when the model selects DSA. Unsupported
+backends are rejected before cache allocation; V4.1 model QCP retains its
+prefill-role-only restriction.
+
+Requirements: `--disaggregation-mode prefill`, or `null` with
+`--decode-context-parallel-size N`, together with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
 Host KVStore, the retraction snapshot pool and L3 storage, as every
 KVP engine does, but not yet `--kvstore-write-policy write_back`),
@@ -802,8 +810,7 @@ each 1 or `N` (attention returns complete rows, so the drafter's replicated
 decode rows are never scattered and a narrower group would have nothing to
 gather). The prefill stays eager: the GPU DSA backend declares no prefill
 graph under a shard, so the launch need not say `--disable-prefill-graph`.
-The drafter's extend step is sharded like the target's; its decode steps run
-every row on every rank.
+Only pure extend forwards carry a query shard; mixed forwards are rejected.
 
 **Head TP over the query shards.** Without `--attn-head-tp-size` the shard
 group's ranks hold different rows and every rank holds every head of

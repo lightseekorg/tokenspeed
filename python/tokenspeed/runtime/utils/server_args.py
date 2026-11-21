@@ -295,7 +295,7 @@ def validate_context_parallel_roles(
     qcp_size: int,
     disaggregation_mode: str,
 ) -> None:
-    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
+    """Validate KVP/DCP roles and the Prefill query-sharding layout.
 
     Aggregated and PD decode engines require explicit DCP matching KVP.
     """
@@ -309,13 +309,11 @@ def validate_context_parallel_roles(
             f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
-        if disaggregation_mode != "prefill":
+        if disaggregation_mode not in ("null", "prefill"):
             raise ValueError(
                 "--query-context-parallel-size > 1 requires --disaggregation-mode "
-                f"prefill (got {disaggregation_mode!r}): the query shard is a "
-                "prefill-role layout whose decode arm runs every row on every "
-                "rank (the drafter's steps only), which no engine serving "
-                "steady-state decode should pay"
+                f"null or prefill (got {disaggregation_mode!r}): queries are "
+                "sharded only on extend forwards; Decode keeps replicated rows"
             )
         if kvp_size not in (1, qcp_size):
             raise ValueError(
@@ -715,7 +713,7 @@ class ServerArgs:
     # path on the mapping's kvp_size, which the drafter's steps on a sharded
     # prefill engine take as well.
     decode_context_parallel_size: int = 1
-    # Query context parallelism on the PD prefill role: shard every extend
+    # Query context parallelism in aggregated and PD prefill engines: shard every extend
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
@@ -1601,6 +1599,8 @@ class ServerArgs:
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
         )
+        # Backend compatibility is checked when the model's attention config
+        # is built, including the resolved full-attention leaf of hybrid models.
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
             attn_tp_size=self.mapping.attn.tp_size,
@@ -1632,7 +1632,7 @@ class ServerArgs:
         The structural rules (head TP needs attention TP 1 or a full-TP query
         shard, is the query-shard group under QCP, tiles the stage world; LM
         head TP under DP needs attention TP 1) live in ``Mapping``; the
-        prefill role's rules in ``validate_qcp``. This checks what only the
+        Prefill layout rules in ``validate_qcp``. This checks what only the
         server knows: the engine role and the batch-invariance selection. The
         weights' quantization is checked once the checkpoint's is resolved
         (:meth:`validate_tp_batch_invariant_weights`).
@@ -1646,8 +1646,7 @@ class ServerArgs:
             # cached prefix, which the head-sharded kv_b_proj cannot produce.
             # Over the query shards (attn.has_qcp) the extend rows run the
             # absorbed sparse prefill through the exchange;
-            # validate_context_parallel_roles pinned the prefill role and the
-            # GPU DSA backend declares its prefill eager under a shard.
+            # the GPU DSA backend declares its prefill eager under a shard.
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "--attn-head-tp-size > 1 serves decode rows only and "
@@ -5277,11 +5276,12 @@ class ServerArgs:
             "--query-context-parallel-size",
             type=int,
             default=ServerArgs.query_context_parallel_size,
-            help="Query context parallelism (QCP) on the PD prefill role: shard "
-            "every extend forward's query rows over the attention TP group, rank "
-            "r computing a contiguous slice of the chunk's rows against the "
+            help="Query context parallelism (QCP) for extend forwards: shard "
+            "query rows over the attention TP group, each rank computing its "
+            "assigned original query positions against the "
             "gathered KV history of its requests. Requires --disaggregation-mode "
-            "prefill, must equal --attn-tp-size and keeps the prefill eager. "
+            "null or prefill, must equal --attn-tp-size and keeps the prefill eager. "
+            "Aggregated engines need DCP matching KVP for subsequent Decode. "
             "--kv-parallel-size must be 1 or equal to it. GPU DSA attention "
             "needs it equal to --kv-parallel-size and a bf16 KV cache; its "
             "attention weights are head-replicated unless --attn-head-tp-size "
