@@ -1481,6 +1481,19 @@ aborts the victim, see "does not fit" above). It runs at the start of the D
 and fused grammars, before the restore phase, so the freed pages are granted
 by the ordinary phases.
 
+`debug_force_retraction_max_per_request` optionally limits successful forced
+retractions of each live request. Omission keeps unlimited forcing; an explicit
+value must be positive and requires a nonzero interval. The count lives on
+`Request`, so reusing an external RID starts a new budget. Waiting for a forward
+or a store, and refusing an image that does not fit, consume none. Once capped,
+a request is no longer armed and the debug entry considers later candidates.
+The ordinary capacity path neither reads nor increments this counter; its
+headroom escalation and reserve exemption are unchanged. With sufficient
+capacity, the finite injection leaves a continuation tail for recovery tests.
+Capacity recovery can still retract the request, so a scored-output test must
+measure its tail after the last actual restore, not just after spending the
+forced budget.
+
 The P role never retracts: `buildPrefillWorkerPlan` does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
 grammars). See §3.1 for why.

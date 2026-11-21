@@ -206,6 +206,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.snapshot_allocator.total_pages = v; })
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
+        .def_rw("debug_force_retraction_max_per_request",
+                &tokenspeed::SchedulerConfig::debug_force_retraction_max_per_request)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)

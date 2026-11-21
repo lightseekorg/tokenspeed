@@ -90,6 +90,15 @@ public:
         }
     }
 
+    // Only successful retractions by the debug entry consume its optional
+    // budget. Capacity retractions keep using the separate counter above.
+    std::int32_t ForcedRetractions() const { return forced_retraction_count_; }
+    void NoteForcedRetracted() {
+        if (forced_retraction_count_ < std::numeric_limits<std::int32_t>::max()) {
+            ++forced_retraction_count_;
+        }
+    }
+
     // Decode rounds in which the prefill/decode interval held this prompt
     // back (Submitted or Prefilling). Never reset, so the interval's bound
     // on it spans every chunk.
@@ -408,6 +417,7 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    std::int32_t forced_retraction_count_{0};
     std::int32_t prefill_deferred_rounds_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};

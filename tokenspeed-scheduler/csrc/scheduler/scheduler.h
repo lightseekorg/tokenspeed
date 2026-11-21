@@ -784,7 +784,8 @@ private:
     // publication is aborted here too.
     void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
-    // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
+    // (N > 0) or Prefilling (N < 0) request with forced budget remaining
+    // every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it. A victim whose image
     // does not fit (imageShortfall) runs on with nothing published; one
     // refused only after its publication is aborted.

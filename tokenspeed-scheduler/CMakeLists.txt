@@ -188,6 +188,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_pending_prefix_store.cpp
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_cache_event_ownership.cpp
+        tests/cpp/test_forced_retraction_limit.cpp
         tests/cpp/test_capacity_model.cpp
         tests/cpp/test_shadow_occupancy.cpp
         tests/cpp/test_cache_data_flow.cpp

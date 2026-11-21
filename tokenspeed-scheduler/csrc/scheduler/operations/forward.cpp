@@ -1653,12 +1653,13 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     if (interval == 0) {
         return;
     }
-    const auto is_kind = [interval](const Request& request) {
-        return interval > 0 ? request.Is<fsm::Decoding>() : request.Is<fsm::Prefilling>();
+    const auto eligible = [interval, limit = config_.debug_force_retraction_max_per_request](const Request& request) {
+        const bool is_kind = interval > 0 ? request.Is<fsm::Decoding>() : request.Is<fsm::Prefilling>();
+        return is_kind && (!limit || request.ForcedRetractions() < *limit);
     };
     Request* armed = forced_victim_id_.empty() ? nullptr : findRequest(forced_victim_id_);
-    if (armed != nullptr && !is_kind(*armed)) {
-        armed = nullptr;  // finished, aborted, or moved on since it was armed
+    if (armed != nullptr && !eligible(*armed)) {
+        armed = nullptr;  // finished, moved on, or exhausted its forced budget
     }
     if (armed == nullptr) {
         forced_victim_id_.clear();
@@ -1666,7 +1667,7 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
             return;
         }
         const auto candidate = std::ranges::find_if(candidates, [&](Request* request) {
-            return is_kind(*request) && !pdTransferInFlight(*request) && !build.Scheduled(*request);
+            return eligible(*request) && !pdTransferInFlight(*request) && !build.Scheduled(*request);
         });
         if (candidate == candidates.end()) {
             return;
@@ -1688,6 +1689,8 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     }
     if (const std::optional<ImageShortfall> shortfall = retractVictim(*armed, build, write_back_operations)) {
         onImageDoesNotFit(*armed, *shortfall, build);
+    } else {
+        armed->NoteForcedRetracted();
     }
 }
 
