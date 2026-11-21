@@ -140,6 +140,52 @@ def test_remote_landing_relies_on_the_receive_time_reset():
     assert torch.equal(probs[:, -1], torch.zeros(5, 32))
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mark_spec_candidates_drafted_sets_only_listed_rows(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    states = RuntimeStates(4, 32, 32, 3, device)
+    states.spec_candidates_ready.fill_(False)
+
+    # Repeated indices write their row once, as ``index_fill_`` did.
+    states.mark_spec_candidates_drafted(
+        torch.tensor([1, 3, 3], dtype=torch.int64, device=device)
+    )
+
+    assert states.spec_candidates_ready.tolist() == [i in (1, 3) for i in range(5)]
+
+
+def test_mark_spec_candidates_drafted_is_capturable_on_npu():
+    """The drafter's write lands inside a captured decode graph.
+
+    ``index_fill_`` synchronizes the Ascend stream, which a capture cannot
+    carry; this call is on the in-graph path, so it must not.
+    """
+    npu = pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    states = RuntimeStates(4, 32, 32, 3, "npu")
+    indices = torch.tensor([1, 3], dtype=torch.int64, device="npu")
+    states.spec_candidates_ready.fill_(False)
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        states.mark_spec_candidates_drafted(indices)
+    torch.npu.synchronize()
+
+    states.spec_candidates_ready.fill_(False)
+    for rows in ([1, 3], [0, 4]):
+        indices.copy_(torch.tensor(rows, dtype=torch.int64, device="npu"))
+        states.spec_candidates_ready.fill_(False)
+        torch.npu.synchronize()
+        graph.replay()
+        torch.npu.synchronize()
+        assert states.spec_candidates_ready.tolist() == [i in rows for i in range(5)]
+
+    del npu
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reset_states_does_not_synchronize_cuda():
     states = RuntimeStates(4, 32, 32, 2, "cuda")
