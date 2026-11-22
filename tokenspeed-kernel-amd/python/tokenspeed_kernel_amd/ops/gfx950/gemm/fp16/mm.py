@@ -2021,8 +2021,11 @@ def compile_gluon_mm_a16w16_decode_gfx950(B: torch.Tensor) -> None:
 
     That is one binary per distinct config measured for the weight's
     ``[N, K]``, for an output in the weight's dtype. The binaries do not depend
-    on the row count (``M`` is not specialized), so after this no launch on
-    such a weight with that output dtype compiles, whatever its row count.
+    on the row count (``M`` is not specialized), but Triton still keys them on
+    the 16-byte alignment of the pointers and strides. They are compiled from
+    fresh contiguous tensors, so they serve any row count of launches whose
+    operands and output rows are 16-byte aligned, as contiguous row slices of
+    these weights' shapes are; a launch with other alignment compiles its own.
 
     Args:
         B: Contiguous ``[N, K]`` fp16/bf16 weight on a GPU with a measured
