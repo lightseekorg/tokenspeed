@@ -62,6 +62,7 @@ cute_dsl_fused_fp8_dp_row_linear = error_fn
 cute_dsl_gemm_reduce_scatter = error_fn
 cute_dsl_paged_row_all_gather = error_fn
 cute_dsl_ll_all_gather = error_fn
+cute_dsl_ll_all_gather_floats = error_fn
 cute_dsl_ll_all_to_all = error_fn
 
 # The paged-row all-gather's modes, in the order a mode code numbers them.
@@ -395,12 +396,12 @@ def create_paged_row_all_gather_state(
 
 
 def _check_ll_tensors(
-    state, input: torch.Tensor, out: torch.Tensor, gather: bool
+    state, input: torch.Tensor, out: torch.Tensor, gather: bool, floats: bool
 ) -> None:
     """Raise ValueError unless this state's LL exchange serves the operands.
 
     ``input`` and ``out`` must be contiguous, 16-byte aligned payloads of the
-    sizes it serves.
+    sizes it serves; ``floats`` checks a float-word gather's size.
     """
     payload = input.numel() * input.element_size()
     if not gather:
@@ -412,7 +413,7 @@ def _check_ll_tensors(
         or not out.is_contiguous()
         or input.data_ptr() % 16
         or out.data_ptr() % 16
-        or not state.serves(payload)
+        or not state.serves(payload, floats=floats)
         or (
             not gather and payload * state.ranks != input.numel() * input.element_size()
         )
@@ -426,6 +427,7 @@ def create_ll_exchange_state(
     device: torch.device,
     *,
     cap_bytes: int,
+    float_cap_bytes: int,
     timeout_ns: int,
     eligible: bool,
 ) -> "LLExchangeState | None":
@@ -444,6 +446,10 @@ def create_ll_exchange_state(
         device: This rank's CUDA device, with its index.
         cap_bytes: Largest per-rank payload, a positive multiple of 16; equal
             on every rank. The workspace holds ``4 * ranks * cap_bytes``.
+        float_cap_bytes: Largest per-rank payload of a float-word gather
+            (``cute_dsl_ll_all_gather_floats``), a multiple of 16, or 0 for
+            none; equal on every rank. Its workspace holds ``2 * ranks *
+            float_cap_bytes``.
         timeout_ns: Bound of every in-kernel wait; a peer that does not reach
             the same call within it fails the kernel with a trap.
         eligible: The caller's own verdict for this rank, voted on with the
@@ -464,6 +470,9 @@ def create_ll_exchange_state(
         and cap_bytes > 0
         and cap_bytes % 16 == 0
         and 4 * degree * cap_bytes < 2**31
+        and float_cap_bytes >= 0
+        and float_cap_bytes % 16 == 0
+        and 2 * degree * float_cap_bytes < 2**31
         and timeout_ns > 0
     )
     if local_ok:
@@ -483,21 +492,28 @@ def create_ll_exchange_state(
             local_ok = False
     # MIN over the group; a negated value gives its MAX.
     votes = torch.tensor(
-        [int(local_ok), int(multicast), cap_bytes, -cap_bytes], dtype=torch.int64
+        [int(local_ok), int(multicast), cap_bytes, -cap_bytes]
+        + [float_cap_bytes, -float_cap_bytes],
+        dtype=torch.int64,
     )
     dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
-    ok, all_multicast, low, high = votes.tolist()
-    if ok and low != -high:
-        raise ValueError(
-            f"ll_exchange: cap_bytes differs across ranks "
-            f"{dist.get_process_group_ranks(group)}"
-        )
+    ok, all_multicast, low, high, float_low, float_high = votes.tolist()
+    for name, least, most in (
+        ("cap_bytes", low, -high),
+        ("float_cap_bytes", float_low, -float_high),
+    ):
+        if ok and least != most:
+            raise ValueError(
+                f"ll_exchange: {name} differs across ranks "
+                f"{dist.get_process_group_ranks(group)}: {least} to {most}"
+            )
     if not ok:
         return None
     return build_ll_exchange_state(
         group,
         device,
         cap_bytes=cap_bytes,
+        float_cap_bytes=float_cap_bytes,
         multicast=bool(all_multicast),
         timeout_ns=timeout_ns,
     )
@@ -746,8 +762,47 @@ if current_platform().is_nvidia:
         Returns:
             ``out``, bit for bit what an all-gather of ``input`` gives.
         """
-        _check_ll_tensors(state, input, out, gather=True)
-        state.launch(input, out, gather=True)
+        _check_ll_tensors(state, input, out, gather=True, floats=False)
+        state.launch(input, out, gather=True, floats=False)
+        return out
+
+    @register_kernel(
+        "communication",
+        "ll_all_gather_floats",
+        name="cute_dsl_ll_all_gather_floats",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("input",), "dense", {torch.uint8}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_ll_all_gather_floats(
+        state: "LLExchangeState", input: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Gather every rank's float words into ``out`` in rank order.
+
+        The words travel as themselves rather than as LL elements, half the
+        bytes: an armed slot holds ``0xFFFFFFFF``, which a sender stores as
+        ``0x7FFFFFFF``. Both are NaN as one FP32, as two BF16 halves' high
+        half, and as four E4M3 bytes' top byte, so a payload of FP32, BF16, or
+        FP8 words comes back with only that NaN's bits changed.
+
+        Args:
+            state: From ``create_ll_exchange_state``.
+            input: Contiguous 16-byte aligned float words on the state's
+                device; ``state.serves`` its byte size with ``floats``, equal
+                on every rank.
+            out: Contiguous 16-byte aligned destination of ``ranks`` times
+                the payload; rank ``r``'s words land at offset ``r`` times it.
+
+        Returns:
+            ``out``.
+        """
+        _check_ll_tensors(state, input, out, gather=True, floats=True)
+        state.launch(input, out, gather=True, floats=True)
         return out
 
     @register_kernel(
@@ -778,6 +833,6 @@ if current_platform().is_nvidia:
         Returns:
             ``out``, bit for bit what an equal-split all-to-all gives.
         """
-        _check_ll_tensors(state, input, out, gather=False)
-        state.launch(input, out, gather=False)
+        _check_ll_tensors(state, input, out, gather=False, floats=False)
+        state.launch(input, out, gather=False, floats=False)
         return out
