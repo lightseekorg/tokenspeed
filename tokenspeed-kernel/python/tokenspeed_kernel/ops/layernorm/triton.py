@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 import os
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32, rcp_approx_ftz_f32
 from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import (
+    GATED_RMSNORM_ROW_BLOCKS,
     gated_rmsnorm_kernel,
 )
 from tokenspeed_kernel.ops.quantization.triton import (
@@ -1469,11 +1471,26 @@ def triton_gemma_rmsnorm(
     return x_rows.view(x.shape), residual_rows.view(residual.shape)
 
 
-# Rows each gated RMSNorm program normalizes when one warp covers a row.
+# Rows each gated RMSNorm row block normalizes when one warp covers a row.
 GATED_RMSNORM_ROWS_PER_PROGRAM = 8
-# From this many rows a program loops over row blocks to keep more loads in flight.
-GATED_RMSNORM_ROW_LOOP_MIN_ROWS = 2048
-GATED_RMSNORM_ROW_BLOCKS = 8
+# Loop over row blocks only while the looped grid keeps this many programs per SM.
+GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM = 3
+
+
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _gated_rmsnorm_row_blocks(
+    rows: int, block_m: int, ngroups: int, device: torch.device
+) -> int:
+    """Row blocks per program: loop when the looped grid still fills the GPU."""
+    looped = triton.cdiv(rows, block_m * GATED_RMSNORM_ROW_BLOCKS) * ngroups
+    floor = GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM * _sm_count(device.index)
+    if block_m > 1 and looped >= floor:
+        return GATED_RMSNORM_ROW_BLOCKS
+    return 1
 
 
 @register_kernel(
@@ -1527,11 +1544,7 @@ def triton_gated_rmsnorm(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
-    row_blocks = (
-        GATED_RMSNORM_ROW_BLOCKS
-        if block_m > 1 and M >= GATED_RMSNORM_ROW_LOOP_MIN_ROWS
-        else 1
-    )
+    row_blocks = _gated_rmsnorm_row_blocks(M, block_m, ngroups, x.device)
     grid = (triton.cdiv(M, block_m * row_blocks), ngroups)
     with torch.cuda.device(x.device.index):
         # Pass the heuristic explicitly so startup can retain and load each

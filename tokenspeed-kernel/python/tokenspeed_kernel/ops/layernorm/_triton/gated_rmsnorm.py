@@ -28,10 +28,16 @@
 ``sigmoid`` as the gate. Inference only (no backward). Launched by
 ``tokenspeed_kernel.ops.layernorm.triton.triton_gated_rmsnorm``."""
 
+from collections.abc import Mapping
+from typing import Any
+
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.warmup import register_triton_warmup
 
-__all__ = ["gated_rmsnorm_kernel"]
+__all__ = ["GATED_RMSNORM_ROW_BLOCKS", "gated_rmsnorm_kernel"]
+
+# Row blocks a looping program covers, keeping more loads in flight.
+GATED_RMSNORM_ROW_BLOCKS = 8
 
 
 @triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
@@ -59,7 +65,7 @@ def gated_rmsnorm_kernel(
     OUT_FP8: tl.constexpr,
     SHARED_WEIGHT: tl.constexpr,
 ):
-    # Each program normalizes BLOCK_M rows of one group, one warp per row.
+    # Each program normalizes ROW_BLOCKS x BLOCK_M rows of one group, one warp per row.
     group = tl.program_id(1)
     cols = tl.arange(0, BLOCK_N)
     col_mask = cols < N
@@ -105,4 +111,11 @@ def gated_rmsnorm_kernel(
         )
 
 
-register_triton_warmup(gated_rmsnorm_kernel.fn, variants=({"M": (1, 16, 17)},))
+def _warmup_variants(args: Mapping[str, Any]) -> tuple[dict[str, tuple[int, ...]], ...]:
+    # A one-warp-per-row launch prepares the looping and the single-block binaries.
+    if args["BLOCK_M"] > 1:
+        return ({"M": (1, 16, 17), "ROW_BLOCKS": (1, GATED_RMSNORM_ROW_BLOCKS)},)
+    return ({"M": (1, 16, 17)},)
+
+
+register_triton_warmup(gated_rmsnorm_kernel.fn, variants=_warmup_variants)
