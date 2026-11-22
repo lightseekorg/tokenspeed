@@ -1,0 +1,131 @@
+name: Publish nightly
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      version_date:
+        description: "YYYYMMDD; blank uses the UTC date this run was created."
+        type: string
+      replace_nightly:
+        description: "Replace this date's existing wheels and refresh index hashes for every package."
+        type: boolean
+        default: false
+      release_candidate:
+        description: "Optional CUDA-only candidate number (N or rcN); blank publishes both backends."
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: coordinated-nightly-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version_date: ${{ steps.plan.outputs.version_date }}
+      release_candidate: ${{ steps.plan.outputs.release_candidate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Freeze date and check existing releases
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_DATE: ${{ inputs.version_date }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
+        run: |
+          test "$GITHUB_REPOSITORY" = lightseekorg/tokenspeed
+          test "$GITHUB_REF" = refs/heads/main
+          date="$VERSION_DATE"
+          if [ -z "$date" ]; then
+            created=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+            date=$(date -u -d "$created" +%Y%m%d)
+          fi
+          gh api --paginate --slurp 'repos/lightseekorg/whl/releases?per_page=100' > releases.json
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = true ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/nightly-release.py --source-sha "$GITHUB_SHA" "${replace_args[@]}" \
+            plan --date "$date" --release-candidate "$RELEASE_CANDIDATE" --releases releases.json . > plan.json
+          jq -r '"version_date=\(.version_date)", "release_candidate=\(.release_candidate)"' plan.json >> "$GITHUB_OUTPUT"
+          cat plan.json >> "$GITHUB_STEP_SUMMARY"
+
+  amd:
+    needs: prepare
+    if: needs.prepare.outputs.release_candidate == ''
+    uses: ./.github/workflows/release-tokenspeed-kernel-amd-nightly.yml
+    with:
+      version_date: ${{ needs.prepare.outputs.version_date }}
+      publish_github: true
+      replace_nightly: ${{ inputs.replace_nightly == true }}
+    secrets: inherit
+
+  cuda:
+    needs: [prepare, amd]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.amd.result == 'success' || needs.prepare.outputs.release_candidate != '') }}
+    uses: ./.github/workflows/release-tokenspeed-kernel.yml
+    with:
+      nightly: true
+      version_date: ${{ needs.prepare.outputs.version_date }}
+      release_candidate: ${{ needs.prepare.outputs.release_candidate }}
+      publish_github: true
+      replace_nightly: ${{ inputs.replace_nightly == true }}
+    secrets: inherit
+
+  rocm:
+    needs: [prepare, cuda]
+    if: needs.prepare.outputs.release_candidate == ''
+    uses: ./.github/workflows/release-tokenspeed-kernel-rocm.yml
+    with:
+      nightly: true
+      version_date: ${{ needs.prepare.outputs.version_date }}
+      publish_github: true
+      replace_nightly: ${{ inputs.replace_nightly == true }}
+    secrets: inherit
+
+  tokenspeed:
+    needs: [prepare, cuda, rocm]
+    if: ${{ !cancelled() && needs.cuda.result == 'success' && (needs.rocm.result == 'success' || needs.prepare.outputs.release_candidate != '') }}
+    uses: ./.github/workflows/release-pypi.yml
+    with:
+      nightly: true
+      version_date: ${{ needs.prepare.outputs.version_date }}
+      release_candidate: ${{ needs.prepare.outputs.release_candidate }}
+      publish_github: true
+      replace_nightly: ${{ inputs.replace_nightly == true }}
+    secrets: inherit
+
+  result:
+    if: always()
+    needs: [prepare, amd, cuda, rocm, tokenspeed]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report publication result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          results = json.loads(os.environ['RESULTS'])
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              for name, job in results.items():
+                  print(f"- {name}: {job['result']}", file=summary)
+              print('Publication is not atomic. After a failure, rerun all jobs in this run '
+                    'to retain its source and date and repair downstream packages and indexes.', file=summary)
+          if results['tokenspeed']['result'] != 'success':
+              raise SystemExit('Nightly publication incomplete')
+          PY

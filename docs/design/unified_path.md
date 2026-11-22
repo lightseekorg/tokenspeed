@@ -816,7 +816,8 @@ express.
 `init_forward_metadata_capture_cuda_graph` has a base default — run the
 idle-refresh arm (`actual_bs=0`, `for_graph_replay=True`) over the same
 persistent buffers replay refreshes — at both tiers: `AttentionBackend`
-(runner-facing; the router's version idle-fills its table stacks, republishes
+(runner-facing; the router's version runs the refresh's idle stack fill, the
+same `fill_decode` kernel replay launches, republishes
 the decode write-location views, then runs each leaf's capture hook) and
 `PagedAttentionBackend` (kernel-facing leaves). That default IS the capture
 for every backend except a closed list of sanctioned overrides, each tied to
@@ -2115,6 +2116,11 @@ The same extend/mixed metadata owns a device int64 mirror of the int32
 query boundaries. KDA layers share it for scan ABIs instead of casting
 per layer; the host int64 mirror still supplies launch planning without
 D2H. Decode refresh/capture does not allocate this prefill-only mirror.
+
+CuTe KDA may select an ordinary or persistent scan internally. Both consume
+the live device boundaries and zero-padded inputs supplied by the runtime;
+the persistent scan may load whole tail tiles. Scheduling scratch belongs to
+the invocation or captured graph, and replay rebuilds it from the live bounds.
 
 Each metadata build allocates fresh index storage, including when two
 forwards have the same total token count but different request partitions.

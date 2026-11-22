@@ -315,6 +315,9 @@ class _AutotuneExecutor:
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
 
+    # autotune() and warm_kernels() both run the real traversal.
+    _warm_kernels = ModelExecutor._warm_kernels
+
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
 
@@ -491,6 +494,72 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     assert not tuning_module.is_autotuning()
     for tensor in metadata:
         tensor.fill_(1)  # Capture must be able to mutate warmup metadata later.
+
+
+def test_rewarm_after_a_rebind_compiles_but_tunes_nothing(monkeypatch, tmp_path):
+    # The post-rebind warm-up runs the same forwards under kernel warmup, but
+    # with profiling off and no cache load or save, so it allocates no tuning
+    # workspace outside the rebind's reserve.
+    events = []
+
+    def forward(**kwargs):
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append(("target", kwargs["input_ids"].numel()))
+
+    def draft(*, batch_sizes, graph_phase):
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append("draft")
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(
+            chunked_prefill_size=16,
+            attention_tp_size=1,
+            autotune_cache_key={},
+            disable_autotune=False,
+            prefill_only=False,
+        ),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **_: events.append("scrub"),
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(warmup_decode_path=draft, max_decode_bs=8),
+        drafter=_DrafterDouble(events),
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=events,
+    )
+    monkeypatch.setattr(
+        executor_module, "autotune_cache_path", lambda key: str(tmp_path / "cache.json")
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "load_autotune_cache",
+        lambda *args: events.append("load"),
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "save_autotune_cache",
+        lambda *args: events.append("save"),
+    )
+    ModelExecutor.warm_kernels(executor)
+    assert events == [
+        "scrub",
+        ("target", 16),
+        ("draft_extend", 16),
+        ("draft_experts", 16),
+        "draft",
+    ]
+    assert not tuning_module.is_warming_up()
 
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):

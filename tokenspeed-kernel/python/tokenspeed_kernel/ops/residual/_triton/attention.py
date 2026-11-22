@@ -23,10 +23,14 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.activation.triton import (
     _attnres_combine_kernel,
     _attnres_partial_kernel,
+)
+from tokenspeed_kernel.ops.layernorm._triton.precision import (
+    _rms_normalized,
+    _torch_rsqrt,
 )
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -108,6 +112,290 @@ def triton_residual_weighted_sum(
             enable_fp_fusion=False,
         )
     return output
+
+
+@triton.jit
+def _message_gate_kernel(
+    Destination,
+    Message,
+    Gates,
+    Output,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < WIDTH
+    row = token * WIDTH
+    destination = tl.load(Destination + row + col, mask, 0)
+    message = tl.load(Message + row + col, mask, 0)
+    # Gates hold the gain logits, then the forget logits, of each token.
+    gate_row = token * (2 * WIDTH)
+    gain = libdevice.tanh(tl.load(Gates + gate_row + col, mask, 0))
+    forget = libdevice.tanh(tl.load(Gates + gate_row + WIDTH + col, mask, 0))
+    tl.store(Output + row + col, (1.0 - forget) * destination + gain * message, mask)
+
+
+@register_kernel(
+    "residual",
+    "message_gate_fp32",
+    name="triton_residual_message_gate",
+    solution="triton",
+    signatures=format_signatures(("destination",), "dense", {torch.float32}),
+    priority=Priority.PORTABLE,
+)
+def triton_residual_message_gate(
+    destination: torch.Tensor, message: torch.Tensor, gates: torch.Tensor
+) -> torch.Tensor:
+    """``(1 - tanh(forget)) * destination + tanh(gain) * message`` in FP32,
+    each product and sum rounded separately (no FMA contraction)."""
+    tokens, width = destination.shape
+    output = torch.empty_like(destination)
+    if tokens:
+        _message_gate_kernel[(tokens, triton.cdiv(width, 1024))](
+            destination,
+            message,
+            gates,
+            output,
+            WIDTH=width,
+            BLOCK=1024,
+            enable_fp_fusion=False,
+        )
+    return output
+
+
+@triton.jit
+def _pick3(index, a, b, c):
+    """``(a, b, c)[index]`` of three pointers."""
+    picked = a
+    if index == 1:
+        picked = b
+    if index == 2:
+        picked = c
+    return picked
+
+
+@triton.jit(do_not_specialize=["tokens"])
+def _controller_down_kernel(
+    Destination0,
+    Destination1,
+    Destination2,
+    Messages,
+    Down0,
+    Down1,
+    Down2,
+    Partials,
+    tokens,
+    WIDTH: tl.constexpr,
+    RANK: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    """One group of ``GROUP`` consecutive ``BLOCK_K`` tiles' FP32 share of
+    ``[bf16(rmsnorm(d)), bf16(rmsnorm(m))] @ down.T`` for a block of rows of
+    one input: the groups cover the destination's columns, then the
+    message's, and a group's dot walks its tiles in order. Each row's mean
+    square sums its tiles in order."""
+    input_index = tl.program_id(0)
+    rows = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    group = tl.program_id(2)
+    GROUPS: tl.constexpr = WIDTH // (BLOCK_K * GROUP)
+    row_mask = rows < tokens
+    row_offsets = rows.to(tl.int64)[:, None] * WIDTH
+    if group < GROUPS:
+        source = _pick3(input_index, Destination0, Destination1, Destination2)
+        k0 = group * (BLOCK_K * GROUP)
+    else:
+        source = Messages + input_index.to(tl.int64) * tokens * WIDTH
+        k0 = (group - GROUPS) * (BLOCK_K * GROUP)
+    squares = tl.zeros([BLOCK_M], tl.float32)
+    for c0 in tl.static_range(0, WIDTH, BLOCK_K):
+        cols = c0 + tl.arange(0, BLOCK_K)
+        x = tl.load(source + row_offsets + cols[None, :], row_mask[:, None], 0)
+        squares += tl.sum(x * x, 1)
+    rsig = _torch_rsqrt(tl.div_rn(squares, WIDTH) + EPS)
+    down = _pick3(input_index, Down0, Down1, Down2)
+    ranks = tl.arange(0, RANK)
+    weight = (
+        down + ranks.to(tl.int64)[None, :] * (2 * WIDTH) + group * (BLOCK_K * GROUP)
+    )
+    partial = tl.zeros([BLOCK_M, RANK], tl.float32)
+    for g in tl.static_range(GROUP):
+        cols = k0 + g * BLOCK_K + tl.arange(0, BLOCK_K)
+        x = tl.load(source + row_offsets + cols[None, :], row_mask[:, None], 0)
+        x = (x * rsig[:, None]).to(tl.bfloat16)
+        w = tl.load(weight + g * BLOCK_K + tl.arange(0, BLOCK_K)[:, None])
+        partial = tl.dot(x, w, partial)
+    plane = (input_index * (2 * GROUPS) + group).to(tl.int64) * tokens
+    tl.store(
+        Partials + (plane + rows.to(tl.int64))[:, None] * RANK + ranks[None, :],
+        partial,
+        row_mask[:, None],
+    )
+
+
+@triton.jit(do_not_specialize=["tokens"])
+def _controller_gate_kernel(
+    Destination0,
+    Destination1,
+    Destination2,
+    Messages,
+    Gate0,
+    Gate1,
+    Gate2,
+    Partials,
+    Gated,
+    tokens,
+    WIDTH: tl.constexpr,
+    RANK: tl.constexpr,
+    TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """``(1 - tanh(forget)) * d + tanh(gain) * m`` in FP32 for a block of
+    rows and columns of one input, with ``[gain, forget] = hidden @ gate.T``
+    (one ``RANK``-deep dot each) and ``hidden`` the BF16 sum of the down
+    projection's ``TILES`` partials in order."""
+    input_index = tl.program_id(0)
+    rows = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_mask = rows < tokens
+    col_mask = cols < WIDTH
+    destination = _pick3(input_index, Destination0, Destination1, Destination2)
+    gate = _pick3(input_index, Gate0, Gate1, Gate2)
+    plane = input_index.to(tl.int64) * tokens
+    ranks = tl.arange(0, RANK)
+    hidden = tl.zeros([BLOCK_M, RANK], tl.float32)
+    for tile in tl.static_range(TILES):
+        hidden += tl.load(
+            Partials
+            + ((input_index * TILES + tile).to(tl.int64) * tokens + rows.to(tl.int64))[
+                :, None
+            ]
+            * RANK
+            + ranks[None, :],
+            row_mask[:, None],
+            0,
+        )
+    hidden = hidden.to(tl.bfloat16)
+    gate_cols = cols.to(tl.int64)[None, :] * RANK + ranks[:, None]
+    gain = tl.dot(hidden, tl.load(gate + gate_cols, col_mask[None, :], 0))
+    forget = tl.dot(
+        hidden, tl.load(gate + WIDTH * RANK + gate_cols, col_mask[None, :], 0)
+    )
+    mask = row_mask[:, None] & col_mask[None, :]
+    offsets = rows.to(tl.int64)[:, None] * WIDTH + cols[None, :]
+    d = tl.load(destination + offsets, mask, 0)
+    m = tl.load(Messages + plane * WIDTH + offsets, mask, 0)
+    gated = (1.0 - libdevice.tanh(forget)) * d + libdevice.tanh(gain) * m
+    tl.store(Gated + plane * WIDTH + offsets, gated, mask)
+
+
+@triton.jit(do_not_specialize=["tokens"])
+def _grouped_rmsnorm_kernel(
+    X,
+    Weight0,
+    Weight1,
+    Weight2,
+    Out,
+    tokens,
+    WIDTH: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``_rmsnorm_precision_kernel`` of each row with its input's gain: rows
+    ``[i * tokens, (i + 1) * tokens)`` take ``Weight<i>``."""
+    row = tl.program_id(0).to(tl.int64)
+    weight = _pick3((row // tokens).to(tl.int32), Weight0, Weight1, Weight2)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < WIDTH
+    value = tl.load(X + row * WIDTH + cols, mask, 0).to(tl.float32)
+    value = _rms_normalized(value, WIDTH, EPS, False)
+    value = value * tl.load(weight + cols, mask, 0).to(tl.float32)
+    tl.store(Out + row * WIDTH + cols, value, mask)
+
+
+def message_controller_inputs(
+    destinations: tuple[torch.Tensor, ...],
+    messages: torch.Tensor,
+    down_weights: tuple[torch.Tensor, ...],
+    gate_weights: tuple[torch.Tensor, ...],
+    norm_weights: tuple[torch.Tensor, ...],
+    eps: float,
+    norm_eps: float,
+) -> torch.Tensor:
+    """Gate each message into its destination and normalize the result, three
+    launches for up to three inputs. See
+    :func:`tokenspeed_kernel.ops.residual.attention.message_controller_inputs`.
+    """
+    count = len(destinations)
+    tokens, width = destinations[0].shape
+    rank = down_weights[0].shape[0]
+    device = destinations[0].device
+    out = torch.empty((count, tokens, width), dtype=torch.bfloat16, device=device)
+    if tokens == 0:
+        return out
+
+    def three(values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        return (*values, *(values[0],) * (3 - len(values)))
+
+    block_m, block_k, group = 16, 256, 3
+    if width % (block_k * group):
+        raise ValueError(
+            f"message controller width must be a multiple of {block_k * group}"
+        )
+    tiles = 2 * width // (block_k * group)
+    partials = torch.empty(
+        (count, tiles, tokens, rank), dtype=torch.float32, device=device
+    )
+    gated = torch.empty((count, tokens, width), dtype=torch.float32, device=device)
+    row_blocks = triton.cdiv(tokens, block_m)
+    _controller_down_kernel[(count, row_blocks, tiles)](
+        *three(destinations),
+        messages,
+        *three(down_weights),
+        partials,
+        tokens,
+        WIDTH=width,
+        RANK=rank,
+        EPS=eps,
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        GROUP=group,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    block_n = 64
+    _controller_gate_kernel[(count, row_blocks, triton.cdiv(width, block_n))](
+        *three(destinations),
+        messages,
+        *three(gate_weights),
+        partials,
+        gated,
+        tokens,
+        WIDTH=width,
+        RANK=rank,
+        TILES=tiles,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    # The launch geometry of triton_rmsnorm_precision, so rows reduce alike.
+    _grouped_rmsnorm_kernel[(count * tokens,)](
+        gated,
+        *three(norm_weights),
+        out,
+        tokens,
+        WIDTH=width,
+        EPS=norm_eps,
+        BLOCK=triton.next_power_of_2(width),
+        num_warps=4 if width < 4096 else 8,
+        enable_fp_fusion=False,
+    )
+    return out
 
 
 def _attnres_block(width: int) -> int:

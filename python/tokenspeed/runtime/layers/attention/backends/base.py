@@ -218,6 +218,13 @@ class CachePoolBinding:
         was written at (``PagedAttention.fp8_kv_scales``)."""
         return False
 
+    def gates_decode_output(self, layer: PagedAttention) -> bool:
+        """Whether ``forward_decode`` for ``layer`` takes
+        ``rmsnorm_output_gate`` and returns the gated output: from the store
+        of a kernel that can gate, else by running the separate op itself
+        (:meth:`PagedAttention.attend`)."""
+        return False
+
     def query_dtype(
         self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
     ) -> torch.dtype:

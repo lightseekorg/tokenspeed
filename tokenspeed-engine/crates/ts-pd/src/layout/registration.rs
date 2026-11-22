@@ -59,7 +59,8 @@ pub struct RegistrationInfo {
 }
 
 impl RegistrationInfo {
-    /// Parse a registration's nine frames (`KVArgsRegisterInfo.from_zmq`).
+    /// Parse a registration's nine frames, or ten with the id it is
+    /// acknowledged by (`wire::registration_id`) (`KVArgsRegisterInfo.from_zmq`).
     pub fn from_frames(frames: &[Bytes]) -> Result<Self, LayoutError> {
         let (endpoint, port, cache_id) =
             wire::registration_route(frames).map_err(|error| LayoutError::new(error.0))?;

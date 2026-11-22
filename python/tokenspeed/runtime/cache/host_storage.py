@@ -105,8 +105,13 @@ def _host_parent_bytes(groups: Sequence[tuple[CacheGroupSpec, int]]) -> int:
 
 
 def _compute_host_layout(
-    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+    layout: CacheTransferLayout,
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    block_alignment: int,
 ) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], int, tuple[int, ...]]:
+    if block_alignment <= 0:
+        raise ValueError(f"block_alignment must be positive, got {block_alignment}")
     specs = {spec.group_id: spec for spec in group_specs}
     host_cache_block_bytes = []
     host_field_offsets = []
@@ -116,7 +121,10 @@ def _compute_host_layout(
         for field in group.fields:
             offsets.append(cursor)
             cursor += field.payload_bytes
-        host_cache_block_bytes.append(cursor)
+        # The Disk tier moves each block with one direct I/O, which needs
+        # every block (and so every parent) aligned; the padding follows the
+        # fields.
+        host_cache_block_bytes.append(-(-cursor // block_alignment) * block_alignment)
         host_field_offsets.append(tuple(offsets))
     # Device packing satisfies model/kernel strides. Host bytes have no such
     # stride constraint: one shared parent fits the largest compact payload,
@@ -140,7 +148,10 @@ def _compute_host_layout(
 
 
 def compute_host_lcm_block_bytes(
-    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+    layout: CacheTransferLayout,
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    block_alignment: int,
 ) -> int:
     """Return compact Host bytes required by one LCMBlock.
 
@@ -149,13 +160,20 @@ def compute_host_lcm_block_bytes(
         group_specs: The scheduler's group specs. Their kinds, page sizes,
             shard counts and replay flags decide whether the parent rounds
             up from the largest payload to whole KV pages.
+        block_alignment: Every packed block's size is a multiple of this:
+            the Disk tier's direct-I/O alignment with it, 1 without.
     """
 
-    return _compute_host_layout(layout, group_specs=group_specs)[2]
+    return _compute_host_layout(
+        layout, group_specs=group_specs, block_alignment=block_alignment
+    )[2]
 
 
 def compute_host_group_packing(
-    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+    layout: CacheTransferLayout,
+    *,
+    group_specs: Sequence[CacheGroupSpec],
+    block_alignment: int,
 ) -> tuple[int, ...]:
     """Return physical children per shared Host parent in layout group order.
 
@@ -163,9 +181,31 @@ def compute_host_group_packing(
         layout: The transfer layout whose payloads the Host packs.
         group_specs: The scheduler's group specs, as for
             ``compute_host_lcm_block_bytes``.
+        block_alignment: As for ``compute_host_lcm_block_bytes``.
     """
 
-    return _compute_host_layout(layout, group_specs=group_specs)[3]
+    return _compute_host_layout(
+        layout, group_specs=group_specs, block_alignment=block_alignment
+    )[3]
+
+
+def host_block_capacity(storage: HostCacheStorage, shard_counts: Sequence[int]) -> int:
+    """The Host pool's blocks in its densest group, as the scheduler counts
+    them: its parents times the largest packing times owners
+    (``SchedulerConfig::HostBlockCapacity``). The Host credits of L3, the Disk
+    tier and peer Host landings are shares of it, counted in blocks of any
+    group: a hybrid model's read holds every KV page under the State
+    checkpoint it reaches.
+
+    Args:
+        storage: The Host pool.
+        shard_counts: Each group's owner count, in the pool's group order.
+    """
+    densest = max(
+        int(packing) * int(shards)
+        for packing, shards in zip(storage.group_packing, shard_counts, strict=True)
+    )
+    return storage.num_host_lcm_blocks * densest
 
 
 def validate_host_group_packing(packing: tuple[int, ...], *, cpu_group) -> None:
@@ -206,6 +246,7 @@ class HostCacheStorage:
         *,
         group_specs: Sequence[CacheGroupSpec],
         num_host_lcm_blocks: int,
+        block_alignment: int,
         host_register_threads: int | None,
     ):
         """
@@ -215,6 +256,8 @@ class HostCacheStorage:
                 parent (``compute_host_lcm_block_bytes``).
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
             host_register_threads: Startup-only registration override, or None.
+            block_alignment: Every packed block's size is a multiple of this
+                (``compute_host_lcm_block_bytes``).
         """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -224,7 +267,9 @@ class HostCacheStorage:
             self.host_field_offsets,
             self.host_lcm_block_bytes,
             self.group_packing,
-        ) = _compute_host_layout(layout, group_specs=group_specs)
+        ) = _compute_host_layout(
+            layout, group_specs=group_specs, block_alignment=block_alignment
+        )
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
         from tokenspeed.runtime.cache.host_allocation import allocate_host_buffer
@@ -232,6 +277,11 @@ class HostCacheStorage:
         self.host_buffer = allocate_host_buffer(
             self.host_buffer_bytes, register_threads=host_register_threads
         )
+        if self.host_buffer.data_ptr() == 0 or not self.host_buffer.is_pinned():
+            raise RuntimeError(
+                f"Failed to allocate {self.host_buffer_bytes} pinned CPU bytes "
+                f"for Host cache (address={self.host_buffer.data_ptr()})"
+            )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:
         """Return the packed byte offset for one non-null CacheBlock."""

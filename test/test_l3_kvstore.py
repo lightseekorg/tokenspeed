@@ -78,6 +78,35 @@ def _deployment_facts():
 
 
 class TestStorageKeyTest:
+    @pytest.mark.parametrize(
+        ("for_peer", "numerics", "compatible"),
+        [(True, "auto", True), (True, "rl-bitwise", False), (False, "auto", False)],
+    )
+    def test_expert_placement_for_peer_and_persistent_kv(
+        self, for_peer, numerics, compatible
+    ):
+        facts = _deployment_facts()
+
+        def identity(ep, **overrides):
+            return storage_deployment_id(
+                **{
+                    **facts,
+                    "for_peer": for_peer,
+                    "kv_producer": {"numerics": numerics, "moe_ep_size": ep},
+                    **overrides,
+                }
+            )
+
+        assert (identity(16) == identity(32)) is compatible
+        for change in (
+            {"attn_tp_size": 2},
+            {"cache_signature": "other-layout"},
+            {"group_shard_counts": (2,)},
+            {"revision": "other-weights"},
+            {"cache_quantization": "other-quantization"},
+        ):
+            assert identity(16) != identity(32, **change)
+
     def test_cp_group_layouts_do_not_share_replica_keys(self):
         facts = _deployment_facts()
         facts.update(
@@ -1476,6 +1505,33 @@ class TestMooncakeConfigTest:
 
 
 class TestStorageRuntimeConfigTest:
+    def test_clear_cache_drain_uses_the_existing_500_ms_default(self):
+        config = StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=32, prefix_granularity=2
+        )
+        assert config.clear_cache_drain_timeout_ms == 500
+
+    @pytest.mark.parametrize("timeout_ms", [123, 0, (2**63 - 1) // 1000])
+    def test_clear_cache_drain_accepts_custom_budget_or_no_wait(self, timeout_ms):
+        config = StorageRuntimeConfig.from_extra_config(
+            json.dumps({"async": {"clear_cache_drain_timeout_ms": timeout_ms}}),
+            host_blocks=32,
+            prefix_granularity=2,
+        )
+        assert config.clear_cache_drain_timeout_ms == timeout_ms
+
+    @pytest.mark.parametrize(
+        "timeout_ms",
+        [True, False, -1, 1.5, 0.0, "123", None, [], {}, (2**63 - 1) // 1000 + 1],
+    )
+    def test_clear_cache_drain_rejects_invalid_budget(self, timeout_ms):
+        with pytest.raises(ValueError, match="clear_cache_drain_timeout_ms"):
+            StorageRuntimeConfig.from_extra_config(
+                json.dumps({"async": {"clear_cache_drain_timeout_ms": timeout_ms}}),
+                host_blocks=32,
+                prefix_granularity=2,
+            )
+
     @pytest.mark.parametrize(
         "name",
         [

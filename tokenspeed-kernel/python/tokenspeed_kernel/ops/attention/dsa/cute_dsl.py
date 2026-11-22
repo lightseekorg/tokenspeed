@@ -332,6 +332,8 @@ def fused_decode_topk_scores(
         index_k_cache,
         block_table,
         seq_lens,
+        seq_lens,  # row ends: the decode window's, from the request length
+        seq_lens,  # global ends: read under KVP only
         logits,
         tops,
     )
@@ -908,3 +910,148 @@ if _fused_indexer is not None:
             out=out,
             lens_out=lens_out,
         )
+
+
+# KVP decode candidates: a rank's local index candidates in two launches.
+
+if _fused_indexer is not None:
+    from tokenspeed_kernel.ops.attention.dsa import DSAIndexCandidatePages
+
+    @register_kernel(
+        "attention",
+        "dsa_decode_index_candidates",
+        name="cute_dsl_dsa_decode_index_candidates",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            # The scorer's tile prefix sum holds this many requests.
+            "requests_max": frozenset({FUSED_DECODE_TOPK_MAX_REQUESTS}),
+            "index_heads": frozenset({_FUSED_HEADS}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({_FUSED_PAGE}),
+            "topk": frozenset({1024, 2048, 3072, 4096}),
+            "query_group_size": frozenset(range(1, 9)),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_dsa_decode_index_candidates(
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        pages: DSAIndexCandidatePages,
+        *,
+        row_lengths: torch.Tensor,
+        query_group_size: int,
+        page_size: int,
+        topk: int,
+        softmax_scale: float,
+        scores_out: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run ``dsa_decode_index_candidates`` in two launches.
+
+        The KVP scorer writes every row's FP32 logits over the request's
+        compact pages (its last row's, a prefix of which every earlier row
+        sees) to each row's own end; the candidates select writes each row's
+        exact local top-k as logical positions and the logits.
+
+        Args:
+            q: BF16 ``[rows, 32, 128]`` index queries, unit inner stride.
+            weights: ``[rows, 32]`` head weights.
+            index_k_cache: Contiguous packed ``fp8_scaled`` plane ``[slots,
+                132]`` of whole 64-slot pages.
+            pages: The rows' compact owned pages and local lengths.
+            row_lengths: Int32 ``[rows]`` keys each row sees over every rank.
+            query_group_size: Consecutive rows of one request (1-8).
+            page_size: Tokens per plane page (64).
+            topk: Candidates per row.
+            softmax_scale: Score scale folded into the head weights.
+            scores_out: Optional FP32 ``[rows, topk]`` storage with contiguous
+                rows for the scores.
+
+        Returns:
+            ``(positions, scores)``: int32 and FP32 ``[rows, topk]``, ``-1``
+            and ``-inf`` for invalid candidates.
+        """
+        rows, device = q.shape[0], q.device
+        group = int(query_group_size)
+        if (
+            int(page_size) != _FUSED_PAGE
+            or index_k_cache.dtype != torch.uint8
+            or index_k_cache.dim() != 2
+            or index_k_cache.shape[1] != _FUSED_ROW_BYTES
+            or index_k_cache.shape[0] % _FUSED_PAGE
+            or not index_k_cache.is_contiguous()
+            or index_k_cache.data_ptr() % 16
+        ):
+            raise ValueError(
+                "KVP decode candidates read a contiguous, 16-byte aligned packed "
+                "uint8 index-K plane [slots, 132] of whole 64-slot pages"
+            )
+        if rows % group or pages.lengths.shape != (rows, 1):
+            raise ValueError(
+                f"{rows} decode rows need {group}-row request groups and their "
+                "[rows, 1] local lengths"
+            )
+        if rows // group > FUSED_DECODE_TOPK_MAX_REQUESTS:
+            raise ValueError(
+                f"KVP decode candidates schedule at most "
+                f"{FUSED_DECODE_TOPK_MAX_REQUESTS} requests, got {rows // group}"
+            )
+        if scores_out is not None and (
+            scores_out.shape != (rows, topk)
+            or scores_out.dtype != torch.float32
+            or scores_out.stride(1) != 1
+        ):
+            raise ValueError(f"scores_out must be FP32 [{rows}, {topk}] rows")
+        positions = torch.empty((rows, topk), dtype=torch.int32, device=device)
+        scores = scores_out
+        if scores is None:
+            scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
+        if not rows:
+            return positions, scores
+        q_fp8, folded = quantize_index_query_weights(q, weights, softmax_scale)
+        # Every request's compact pages, logical columns and length: its last
+        # row's, a prefix of which every earlier row of it sees.
+        row_ends = pages.lengths.view(-1)
+        width = pages.pages.shape[1]
+        row_capacity = -(-width * _FUSED_PAGE // _FUSED_TILE) * _FUSED_TILE
+        elements = rows * row_capacity
+        if elements >= 1 << 31:
+            raise ValueError(
+                f"KVP decode candidates scratch of {elements} logits exceeds "
+                f"2**31 (rows={rows}, columns={width})"
+            )
+        logits = torch.empty(elements, dtype=torch.float32, device=device)
+        tops = torch.empty(elements // 8, dtype=torch.int32, device=device)
+        score, select = _fused_indexer.compile_candidates(
+            group, int(topk), current_platform().sm_count, pdl_enabled()
+        )
+        score(
+            q_fp8.view(torch.uint8).view(rows * _FUSED_HEADS, 128),
+            folded.view(-1),
+            index_k_cache,
+            pages.pages[group - 1 :: group],
+            row_ends[group - 1 :: group],
+            row_ends,
+            row_lengths,
+            logits,
+            tops,
+        )
+        select(
+            logits,
+            tops,
+            row_ends[group - 1 :: group],
+            row_ends,
+            row_lengths,
+            pages.positions[group - 1 :: group],
+            positions,
+            scores,
+        )
+        return positions, scores

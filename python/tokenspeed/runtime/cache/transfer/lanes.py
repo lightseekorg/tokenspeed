@@ -231,6 +231,18 @@ def host_memory_share(*, nprocs_per_node: int, headroom_bytes: int) -> tuple[int
 
 
 def _pinned_rounding_limit_bytes() -> int | None:
+    if device_module.__name__ in {"torch_npu.npu", "torch.npu"}:
+        getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+        if getter is None:
+            return None
+        config = getter().replace(" ", "")
+        if "pin_memory_expandable_segments:False" not in config.split(","):
+            return None
+        limits_mb = re.findall(
+            r"(?:^|,)pinned_max_(?:round_threshold|cached_size)_mb:(\d+)(?=,|$)",
+            config,
+        )
+        return min((int(mb) * 1024**2 for mb in limits_mb), default=None)
     if device_module.__name__ != "torch.cuda" or (
         torch.version.cuda is None and torch.version.hip is None
     ):

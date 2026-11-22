@@ -234,6 +234,7 @@ class TestGroupAwareWireTest:
         executor = executor_module.HostCacheExecutor.__new__(
             executor_module.HostCacheExecutor
         )
+        executor._cache_observations = executor_module.CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
         executor._ready_load_acks = []
@@ -441,6 +442,7 @@ class TestGroupAwareWireTest:
         HostCacheExecutor = executor_module.HostCacheExecutor
         lanes_module = _lanes_module()
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = executor_module.CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor.attn_tp_rank = 0
@@ -1012,6 +1014,7 @@ class TestGroupAwareWireTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
 
         build_geometry.assert_called_once_with(
@@ -1130,6 +1133,7 @@ class TestGroupAwareWireTest:
                         kvp_rank=0,
                         nprocs_per_node=1,
                         world_cpu_group=None,
+                        block_alignment=1,
                     )
                     assert (executor._transfer_geometry.device_rows) is None
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1478,6 +1482,7 @@ class TestHostMemoryShareTest:
                 kvp_rank=0,
                 nprocs_per_node=nprocs_per_node,
                 world_cpu_group=world_cpu_group,
+                block_alignment=1,
             )
         return executor, logger
 
@@ -1940,6 +1945,8 @@ class TestCompactHostParentTest:
                 if not is_nvidia:
                     kwargs["pin_memory"] = False
             result = allocate(*args, **kwargs)
+            if not is_nvidia:
+                monkeypatch.setattr(result, "is_pinned", lambda: True)
             if kwargs.get("pin_memory", False):
                 pinned_sizes.add(result.numel() * result.element_size())
             if settings is not None:
@@ -2043,6 +2050,7 @@ class TestCompactHostParentTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
 
         parent = 9 * 3_407_872
@@ -2102,6 +2110,9 @@ class TestL3FlatKvExecutorTest:
         try:
             from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+            from tokenspeed.runtime.cache.transfer.observations import (
+                CompletedObservations,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"needs runtime dependencies: {exc}")
 
@@ -2109,6 +2120,7 @@ class TestL3FlatKvExecutorTest:
         # layer fence and still acknowledges the op (the hooks' replica
         # intersection waits for the owners).
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor._load_poisoned = False
@@ -2173,6 +2185,7 @@ class TestCompactLayoutRoundTripTest:
                 kvp_rank=kvp_rank,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
         self.executor_cleanup.callback(executor.shutdown)
         return executor, pool, draft_pool

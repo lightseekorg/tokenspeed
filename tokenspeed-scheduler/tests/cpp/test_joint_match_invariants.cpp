@@ -125,11 +125,11 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64, {1, 1});
         {
-            CacheCoordinator coordinator =
-                MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                /*snapshot_pool=*/nullptr,
-                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
-                                /*checkpoint_retention_requests=*/0);
+            CacheCoordinator coordinator = MakeCoordinator(
+                specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                /*snapshot_pool=*/nullptr,
+                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                /*checkpoint_retention_requests=*/0);
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
             // sliding group's reclaim of slid-out blocks).
@@ -205,7 +205,7 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64, {1, 1});
         CacheCoordinator coordinator = MakeCoordinator(
-            specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+            specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
             /*snapshot_pool=*/nullptr,
             /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
         std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
@@ -291,7 +291,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
             BlockPool device(64, {4, 1, 1, 1});
             BlockPool host(64, {4, 1, 1, 1});
             CacheCoordinator coordinator =
-                MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host,
+                MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host, /*disk_pool=*/nullptr,
                                 /*snapshot_pool=*/nullptr,
                                 /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
                                 /*checkpoint_retention_requests=*/0);
@@ -492,7 +492,7 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
         BlockPool device(24, {4, 1, 1, 1});
         BlockPool host(1, {4, 1, 1, 1});
         CacheCoordinator coordinator =
-            MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/false, &host,
+            MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr,
                             /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                             /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
         TierTransferManager transfers{coordinator};
@@ -678,10 +678,10 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .block_granularity = kBlockTokens},
     };
     BlockPool pool(64, {1, 2, 1});
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the
@@ -709,9 +709,10 @@ TEST(JointMatchInvariantsTest, RejectedCheckpointsDoNotKeepHitsAtTheOlderBoundar
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
     BlockPool device(16, {1, 1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto hashes = MakeHashes(3);
     for (const auto& hash : hashes) {
         CacheBlockFor(coordinator, device, hash, 0);
@@ -745,7 +746,7 @@ TEST(JointMatchInvariantsTest, AvailabilitySeparatesStateMissingFromFullKvMissin
     };
     BlockPool device(64, {1, 1, 1});
     BlockPool host(64, {1, 1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host,
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr,
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const auto hashes = MakeHashes(3);
@@ -787,9 +788,10 @@ TEST(JointMatchInvariantsTest, AvailabilityChecksSlidingLookbackAndSkipsReplayab
          .block_granularity = 4},
     };
     BlockPool device(64, {1, 1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const auto hashes = MakeHashes(3);
     for (const auto& hash : hashes) {
         CacheBlockFor(coordinator, device, hash, 0);
@@ -811,7 +813,7 @@ TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnothe
     };
     BlockPool device(64, {1, 1});
     BlockPool host(64, {1, 1});
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host,
+    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr,
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6};
@@ -845,9 +847,10 @@ TEST(JointMatchInvariantsTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
-    auto coordinator = MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/&host,
-                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                                       /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
+    auto coordinator =
+        MakeCoordinator(specs, 4, device, /*enable_l3_storage=*/false, /*host_pool=*/&host, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const auto entries = [&](const BlockPool& pool) {
         return CacheCoordinatorTestAccess::NodeEntries(coordinator, pool, ContentHash{"page"});
     };

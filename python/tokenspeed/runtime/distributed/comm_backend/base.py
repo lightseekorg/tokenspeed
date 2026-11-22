@@ -174,6 +174,20 @@ class CommBackend(ABC):
 
         return projection_gather_mm(tensor, rows, weight, out, workspace, self)
 
+    def projection_mm_reduce_scatter(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> torch.Tensor:
+        """Project all rows through a weight shard and reduce them into owner rows."""
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_mm_reduce_scatter,
+        )
+
+        return projection_mm_reduce_scatter(tensor, rows, weight, workspace, self)
+
     def projection_all_to_all(
         self,
         tensor: torch.Tensor,

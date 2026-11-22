@@ -32,6 +32,7 @@ global_server_args_dict: dict = {
     "enable_memory_saver": ServerArgs.enable_memory_saver,
     "revision": None,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
+    "disaggregation_layerwise_interval": ServerArgs.disaggregation_layerwise_interval,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "enable_dsv41_adaptive_dspark": ServerArgs.enable_dsv41_adaptive_dspark,
@@ -57,6 +58,8 @@ global_server_args_dict: dict = {
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
     "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
     "numerics": ServerArgs.numerics,
+    "prefill_collective_payload": ServerArgs.prefill_collective_payload,
+    "owned_attention_output": ServerArgs.owned_attention_output,
     "speculative_rejection_sample_method": (
         ServerArgs.speculative_rejection_sample_method
     ),
@@ -116,6 +119,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_memory_saver": server_args.enable_memory_saver,
             "revision": server_args.revision,
             "disaggregation_mode": server_args.disaggregation_mode,
+            "disaggregation_layerwise_interval": server_args.disaggregation_layerwise_interval,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "enable_dsv41_adaptive_dspark": server_args.enable_dsv41_adaptive_dspark,
@@ -138,6 +142,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
+            "prefill_collective_payload": server_args.prefill_collective_payload,
+            "owned_attention_output": server_args.owned_attention_output,
             "speculative_rejection_sample_method": (
                 server_args.speculative_rejection_sample_method
             ),
@@ -306,6 +312,9 @@ class EnvFloat(EnvField):
 
 class Envs:
     # fmt: off
+
+    # PLE embedding lookup
+    TOKENSPEED_PLE_HOST_CACHE_SLOTS = EnvInt(524288)
 
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)

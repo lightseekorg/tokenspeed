@@ -691,6 +691,7 @@ def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
             enable_memory_saver=memory_saver,
             weight_memory_policy="cpu_backup" if memory_saver else None,
             peer_prefix_port=peer_prefix_port,
+            peer_prefix_landing_tier="device" if peer_prefix_port else None,
         )
         sender.send((args, None, None))
         call_args = (os.dup(receiver.fileno()), None)
