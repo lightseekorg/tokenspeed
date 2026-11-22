@@ -528,3 +528,255 @@ def retained_batched_publish_kernel(
         )
         # An ended request's records are folded into its live page.
         tl.store(length, tl.where(stopped, 0, old + take))
+
+
+# Readying retained history for a verify forward, every layer in one launch.
+# Shared by both vendors. The page tables' strides are scalars: Triton would
+# specialize the elements of a stride tuple, and a table's row stride follows
+# the padded batch size.
+_PREPARE_RUNTIME_ARGUMENTS = [
+    "batch",
+    "group_count",
+    "source_group_stride",
+    "source_row_stride",
+    "live_group_stride",
+    "live_row_stride",
+    "query_stride",
+    "record_slot_stride",
+    "record_slot_count",
+]
+
+
+@triton.jit
+def retained_prepare_rows(
+    descriptors,
+    groups,
+    sources,
+    lives,
+    starts,
+    record_slots,
+    layer,
+    row,
+    batch,
+    group_count,
+    source_group_stride,
+    source_row_stride,
+    live_group_stride,
+    live_row_stride,
+    query_stride,
+    record_slot_stride,
+    record_slot_count,
+    CAPACITY: tl.constexpr,
+):
+    """Read one layer's request rows (a scalar or a vector) and pick its folds.
+
+    A row takes part when its layer's group is listed, its source and live
+    pages lie inside the pool, its window is non-empty and its record slot is
+    resident. Its accepted count L and window T are valid when
+    0 <= L <= CAPACITY and 0 < T <= CAPACITY. A valid row folds when it moves
+    to a private live page or when L + T exceeds CAPACITY. The consolidation
+    and the length reset decide with this one rule over the same inputs.
+    """
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
+    lengths = tl.load(base + 2).to(tl.pointer_type(tl.int32))
+    pages = tl.load(base + 3).to(tl.int64)
+    length_stride = tl.load(base + 6).to(tl.int64)
+    group = tl.load(groups + layer).to(tl.int64)
+    active = (row < batch) & (group >= 0) & (group < group_count)
+    source = tl.load(
+        sources + group * source_group_stride + row * source_row_stride,
+        mask=active,
+        other=0,
+    ).to(tl.int64)
+    live = tl.load(
+        lives + group * live_group_stride + row * live_row_stride,
+        mask=active,
+        other=0,
+    ).to(tl.int64)
+    begin = tl.load(starts + row * query_stride, mask=active, other=0).to(tl.int64)
+    tokens = (
+        tl.load(starts + (row + 1) * query_stride, mask=active, other=0).to(tl.int64)
+        - begin
+    )
+    slot = tl.load(record_slots + row * record_slot_stride, mask=active, other=-1).to(
+        tl.int64
+    )
+    active = (
+        active
+        & (source > 0)
+        & (source < pages)
+        & (live > 0)
+        & (live < pages)
+        & (tokens != 0)
+        & (slot >= 0)
+        & (slot < record_slot_count)
+    )
+    # The accepted count belongs to the request slot, not to either page.
+    length = lengths + slot * length_stride
+    count = tl.load(length, mask=active, other=0)
+    valid = (count >= 0) & (count <= CAPACITY) & (tokens > 0) & (tokens <= CAPACITY)
+    fold = active & valid & ((source != live) | (count + tokens > CAPACITY))
+    return source, live, slot, length, count, active, valid, fold
+
+
+@triton.jit(
+    do_not_specialize=_PREPARE_RUNTIME_ARGUMENTS
+    + ["correction_strides", "key_strides", "decay_strides"]
+)
+def retained_batched_consolidate_kernel(
+    descriptors,
+    groups,
+    sources,
+    lives,
+    starts,
+    record_slots,
+    correction,
+    retained_key,
+    retained_decay,
+    batch,
+    group_count,
+    source_group_stride,
+    source_row_stride,
+    live_group_stride,
+    live_row_stride,
+    query_stride,
+    record_slot_stride,
+    record_slot_count,
+    correction_strides,
+    key_strides,
+    decay_strides,
+    CAPACITY: tl.constexpr,
+    STATE: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    KEYS: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    """Write source state plus records [0, L) into a folding row's live page.
+
+    Program (layer, row, split) handles every head h with h % splits == split,
+    in ROWS x KEYS tiles; KEYS is DIM rounded up to a power of two. Lengths
+    and records stay untouched: the reset launch clears L once every tile
+    has read it.
+    """
+    layer, row = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    source, live, slot, _, count, _, _, fold = retained_prepare_rows(
+        descriptors,
+        groups,
+        sources,
+        lives,
+        starts,
+        record_slots,
+        layer,
+        row,
+        batch,
+        group_count,
+        source_group_stride,
+        source_row_stride,
+        live_group_stride,
+        live_row_stride,
+        query_stride,
+        record_slot_stride,
+        record_slot_count,
+        CAPACITY,
+    )
+    if not fold:
+        return
+    base = descriptors + layer * _DESCRIPTOR_COLUMNS
+    state = tl.load(base + 9).to(tl.pointer_type(STATE))
+    page_stride = tl.load(base + 10).to(tl.int64)
+    head_stride = tl.load(base + 11).to(tl.int64)
+    value_stride = tl.load(base + 12).to(tl.int64)
+    key_stride = tl.load(base + 13).to(tl.int64)
+    source_page = state + source * page_stride
+    live_page = state + live * page_stride
+    u = correction + slot * correction_strides[0] + layer * correction_strides[1]
+    k = retained_key + slot * key_strides[0] + layer * key_strides[1]
+    d = retained_decay + slot * decay_strides[0] + layer * decay_strides[1]
+    keys = tl.arange(0, KEYS)
+    key_mask = keys < DIM
+    for head in range(tl.program_id(2), HEADS, tl.num_programs(2)):
+        for start in range(0, DIM, ROWS):
+            values = start + tl.arange(0, ROWS)
+            value_mask = values < DIM
+            mask = value_mask[:, None] & key_mask[None, :]
+            tile = (
+                head * head_stride
+                + values[:, None] * value_stride
+                + keys[None, :] * key_stride
+            )
+            running = tl.load(source_page + tile, mask=mask, other=0).to(tl.float32)
+            for position in range(count):
+                uv = tl.load(
+                    u
+                    + head * correction_strides[2]
+                    + position * correction_strides[3]
+                    + values * correction_strides[4],
+                    mask=value_mask,
+                    other=0,
+                )
+                kv = tl.load(
+                    k
+                    + head * key_strides[2]
+                    + position * key_strides[3]
+                    + keys * key_strides[4],
+                    mask=key_mask,
+                    other=0,
+                )
+                dv = tl.load(
+                    d
+                    + head * decay_strides[2]
+                    + position * decay_strides[3]
+                    + keys * decay_strides[4],
+                    mask=key_mask,
+                    other=0,
+                )
+                running = running * dv[None, :] + uv[:, None] * kv[None, :]
+            tl.store(live_page + tile, running.to(STATE), mask=mask)
+
+
+@triton.jit(do_not_specialize=_PREPARE_RUNTIME_ARGUMENTS)
+def retained_batched_reset_kernel(
+    descriptors,
+    groups,
+    sources,
+    lives,
+    starts,
+    record_slots,
+    batch,
+    group_count,
+    source_group_stride,
+    source_row_stride,
+    live_group_stride,
+    live_row_stride,
+    query_stride,
+    record_slot_stride,
+    record_slot_count,
+    CAPACITY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Clear the length of every row the consolidation folded, BLOCK rows a program."""
+    layer = tl.program_id(0).to(tl.int64)
+    row = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    _, _, _, length, _, active, valid, fold = retained_prepare_rows(
+        descriptors,
+        groups,
+        sources,
+        lives,
+        starts,
+        record_slots,
+        layer,
+        row,
+        batch,
+        group_count,
+        source_group_stride,
+        source_row_stride,
+        live_group_stride,
+        live_row_stride,
+        query_stride,
+        record_slot_stride,
+        record_slot_count,
+        CAPACITY,
+    )
+    tl.device_assert(valid | (active == 0), "invalid retained history interval")
+    tl.store(length, 0, mask=fold)

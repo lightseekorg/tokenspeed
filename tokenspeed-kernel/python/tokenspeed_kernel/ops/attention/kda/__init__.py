@@ -258,7 +258,8 @@ class KdaRetainedHistory:
 # All strides count elements. Per-layer values support different arena layouts.
 # Verify already stores U/K/decay records; commit reads them only to fold an
 # ended request's accepted records into its live page. Commit updates the
-# convolution state, then publishes the accepted history length.
+# convolution state, then publishes the accepted history length. The prepare
+# ahead of a verify forward reads the length and recurrent-state columns.
 KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 14
 
 
@@ -436,8 +437,11 @@ def kda_fused_paged_verify(
     mixed_qkv and convolution inputs describe packed pre-convolution rows.
     retained_records supplies request-owned history, private live destinations,
     packed request boundaries and candidate validity stamps. read_indices
-    identifies immutable source pages. Verify consolidates accepted history
-    when needed; commit subsequently publishes accepted candidate length.
+    identifies immutable source pages; convolution reads them. The round's
+    history must already be prepared (resolve_kda_batched_retained_prepare):
+    verify reads each row's live page as its dense base, applies its accepted
+    records, and writes candidates after them. Verify itself never writes a
+    page or a length; commit subsequently publishes accepted candidate length.
     f_a_out/f_b_weight project the gate when g_raw is omitted. NVIDIA split
     producers require both g_raw and conv_qkv. lower_bound selects bounded
     sigmoid decay, or None selects softplus decay. Unsupported geometry or
@@ -748,6 +752,48 @@ def resolve_kda_batched_retained_commit(
     records are folded into its live page and its length is cleared.
     Metadata and all pointers remain stable during CUDA graph capture.
     """
+    return _resolve_batched_retained(
+        "kda_retained_commit",
+        dtype,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        recurrent_layout=recurrent_layout,
+    )
+
+
+def resolve_kda_batched_retained_prepare(
+    dtype: torch.dtype, *, num_heads: int, head_dim: int, recurrent_layout: str
+):
+    """Resolve the cross-layer fold that readies retained history for verify.
+
+    Returns a callable or None for unsupported geometry/platform. It takes the
+    commit's descriptors, layer groups, record slots and FP32 records, plus
+    [groups, requests] source and live pages and the packed boundaries of the
+    verify that follows. A request whose live page differs from its source,
+    or whose accepted count L plus its window T exceeds the history capacity,
+    gets the source state with records [0, L) applied in its live page; a
+    second ordered launch then clears L. Every other row is left as it is.
+    Run it once per verify round, after the round's pages, boundaries and
+    record slots are refreshed and before any layer's verify: a second run
+    would copy the unchanged source over the fold.
+    """
+    return _resolve_batched_retained(
+        "kda_retained_prepare",
+        dtype,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        recurrent_layout=recurrent_layout,
+    )
+
+
+def _resolve_batched_retained(
+    op: str,
+    dtype: torch.dtype,
+    *,
+    num_heads: int,
+    head_dim: int,
+    recurrent_layout: str,
+):
     platform = current_platform()
     if (
         num_heads <= 0
@@ -760,7 +806,7 @@ def resolve_kda_batched_retained_commit(
     try:
         kernel = select_kernel(
             "attention",
-            "kda_retained_commit",
+            op,
             _attention_format_signature(q=probe, k=probe, v=probe),
             traits={
                 "batched_layers": True,
@@ -786,22 +832,22 @@ def kda_retained_supported(
     head_dim: int,
     conv_kernel_size: int,
 ) -> bool:
-    """Whether explicit retained verify and all-layer commit contracts are available.
+    """Whether retained verify and the all-layer prepare and commit are available.
 
     This initialization-time probe uses model geometry and activation dtype;
     it does not allocate GPU storage or execute kernels. Layout, convolution
-    width and both capability declarations must match before serving can omit
+    width and every capability declaration must match before serving can omit
     per-round raw correction/key-gate workspace.
     """
+    geometry = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "recurrent_layout": recurrent_layout,
+    }
     if (
         conv_kernel_size != 4
-        or resolve_kda_batched_retained_commit(
-            dtype,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            recurrent_layout=recurrent_layout,
-        )
-        is None
+        or resolve_kda_batched_retained_prepare(dtype, **geometry) is None
+        or resolve_kda_batched_retained_commit(dtype, **geometry) is None
     ):
         return False
     probe = torch.empty(0, dtype=dtype, device="meta")
@@ -852,6 +898,7 @@ __all__ = [
     "kda_materialize_retained_state",
     "kda_reset_retained_length",
     "resolve_kda_batched_retained_commit",
+    "resolve_kda_batched_retained_prepare",
     "kda_retained_supported",
     "kda_recurrent_layout",
     "kda_paged_prefill",

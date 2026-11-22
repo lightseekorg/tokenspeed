@@ -49,6 +49,7 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 if not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3):
     pytest.skip("requires SM100 or SM103", allow_module_level=True)
+from kda_retained_reference import prepare_history  # noqa: E402
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
     rmsnorm_gated_sigmoid,
 )
@@ -158,6 +159,10 @@ def _records(x, *, original, capacity=1, correction_stride=1):
 
 
 def _verify(x, records, output_norm, *, override=None, **producers):
+    # Serving readies the history before every verify round.
+    prepare_history(
+        x["state_pool"], records.history, x["state_indices"], x["query_start_loc"]
+    )
     return kda_fused_paged_verify(
         x["mixed_qkv"],
         x["conv_weights"],

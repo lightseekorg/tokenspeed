@@ -117,6 +117,57 @@ def make_case(
     )
 
 
+# One layer's (descriptor, group index) pair per layout, kept for graph capture.
+_PREPARED_LAYERS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def prepare_history(state_pool, history, read_indices, query_start_loc):
+    """Ready one layer's retained history for its verify, as serving does.
+
+    Serving prepares every layer in one launch pair before the forward; this
+    runs the same batched prepare over a single layer: rows that move to a
+    private live page or overflow the history capacity get their source state
+    with accepted records applied in their live page, and their lengths clear.
+    """
+    # Only the length and recurrent-state columns are read before verify.
+    row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
+    row[2], row[3], row[6] = (
+        history.length.data_ptr(),
+        state_pool.shape[0],
+        history.length.stride(0),
+    )
+    row[9:14] = state_pool.data_ptr(), *state_pool.stride()
+    # Uploaded on the first, eager call; a CUDA-graph capture reuses it.
+    key = (*row, str(state_pool.device))
+    if key not in _PREPARED_LAYERS:
+        _PREPARED_LAYERS[key] = (
+            torch.tensor([row], device=state_pool.device, dtype=torch.uint64),
+            torch.zeros(1, device=state_pool.device, dtype=torch.int32),
+        )
+    descriptors, group_indices = _PREPARED_LAYERS[key]
+    _, heads, dim, _ = state_pool.shape
+    prepare = kda.resolve_kda_batched_retained_prepare(
+        torch.bfloat16, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
+    )
+    prepare(
+        descriptors=descriptors,
+        group_indices=group_indices,
+        source_indices=read_indices[None],
+        live_indices=history.live_state_indices[None],
+        query_start_loc=query_start_loc,
+        record_slots=history.record_slots,
+        record_slot_count=history.length.shape[0],
+        # One layer: the records gain a unit layer axis.
+        retained_correction=history.correction[:, None],
+        retained_key=history.key[:, None],
+        retained_decay=history.decay[:, None],
+        history_capacity=history.correction.shape[2],
+        num_heads=heads,
+        head_dim=dim,
+        recurrent_state_dtype=state_pool.dtype,
+    )
+
+
 def endpoint(base, history, row):
     """Apply row's slot records, up to the slot's accepted count, to base."""
     slot = int(history.record_slots[row])
@@ -285,6 +336,10 @@ def reference(case):
 
 
 def verify(case):
+    records = case["records"]
+    prepare_history(
+        case["state"], records.history, case["reads"], records.query_start_loc
+    )
     producers = {}
     if current_platform().is_nvidia:
         producers["conv_qkv"] = kda.kda_verify_conv_update(

@@ -92,9 +92,6 @@ MAX_WINDOW = 16
 NORM_GROUPS = DIM // 32
 
 
-from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
-    consolidate_history,
-)
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     fake_retained_arguments,
     initialize_page_tile,
@@ -102,7 +99,6 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     retained_length,
     retained_row,
 )
-from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
 
 @dsl_user_op
@@ -1247,15 +1243,6 @@ def fused_verify_window(
         query_start_loc.dtype,
         state_indices.dtype,
         _smem_floor(ctas, mixed_qkv.device),
-    )
-    consolidate_history(
-        checkpoint_state, retained_history, state_indices, query_start_loc
-    )
-    reset_retained_history(
-        retained_history,
-        state_indices,
-        query_start_loc,
-        page_count=checkpoint_state.shape[0],
     )
     kernel(
         mixed_qkv,

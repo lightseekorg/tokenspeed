@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_retained_supported,
     kda_verify_conv_update,
     resolve_kda_batched_retained_commit,
+    resolve_kda_batched_retained_prepare,
 )
 from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
@@ -71,6 +72,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -162,8 +164,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
     their own request slots, outside the cache arena; cache pages hold only
     dense checkpoints. A decode commit only advances the count, except in the
     forward that ends a request, where it folds the records into the live
-    State block; a retraction folds them before imaging. Standard decode is a
-    one-token window with one accepted token.
+    State block; a retraction folds them before imaging. Before each verify
+    round, one launch pair over every layer folds the records of requests
+    that move to a private live block or would overflow the history capacity
+    (``_prepare_retained_history``). Standard decode is a one-token window
+    with one accepted token.
     KDA also replaces the scan seams: its decay gate is
     per-channel (a low-rank ``f_a``/``f_b`` projection plus raw beta logits)
     where GDN's is scalar per head, and its decode/verify kernels can fuse
@@ -213,6 +218,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             self.speculative_num_draft_tokens
         )
         self._batched_replay_kernel = None
+        self._batched_prepare_kernel = None
         self._verify_split_producers = False
         # RuntimeStates.stopped, bound by the executor (bind_request_stop_flags).
         self._request_stopped: torch.Tensor | None = None
@@ -252,8 +258,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # state of each request's page. _retained_lengths views it per layer.
         self._retained_length_storage: torch.Tensor | None = None
         self._record_slots: torch.Tensor | None = None
-        # INT32 [state groups, request slots]: the live State block each
-        # slot's last decode commit wrote, which a retraction folds into.
+        # The recurrent state dtype every layer shares (validate_cache_pool).
+        self._retained_state_dtype: torch.dtype | None = None
+        # Per-layer INT32 [request slots, 1] views of _retained_length_storage.
         self._retained_lengths: dict[int, torch.Tensor] = {}
         self._retained_histories: dict[tuple[int, int], KdaRetainedHistory] = {}
         self._replay_descriptors: torch.Tensor | None = None
@@ -347,6 +354,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
         self._batched_replay_kernel = resolve_kda_batched_retained_commit(
+            self.dtype, recurrent_layout=self.kda_recurrent_layout, **shape
+        )
+        self._batched_prepare_kernel = resolve_kda_batched_retained_prepare(
             self.dtype, recurrent_layout=self.kda_recurrent_layout, **shape
         )
         self._verify_split_producers = kda_fused_paged_verify_uses_split_producers(
@@ -534,6 +544,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
             first_conv, first_state = self._state_components(layer_ids[0])
             heads, dim = first_state.shape[1:3]
+            self._retained_state_dtype = first_state.dtype
             # Each request keeps its record row when the batch is reordered.
             self._retained_records = torch.zeros(
                 (
@@ -626,6 +637,21 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+            if first_state.is_cuda and not torch.cuda.is_current_stream_capturing():
+                # Compile the prepare launches before serving: one padding row
+                # takes the serving signature and changes nothing.
+                padding = torch.full(
+                    (len(self._replay_group_ids), 1),
+                    self.pad_slot_id,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self._prepare_retained_rows(
+                    padding,
+                    padding,
+                    torch.zeros(2, dtype=torch.int32, device=self.device),
+                    self._record_slots[:1],
+                )
 
         self._replay_workspace_ready = True
 
@@ -712,6 +738,84 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 generation=self._replay_record_generation,
                 draft_token_num=draft_token_num,
             )
+
+    @override
+    def refresh_decode_metadata(
+        self,
+        bs: int,
+        actual_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+        block_tables: Mapping[str, torch.Tensor],
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
+        **kwargs,
+    ) -> None:
+        super().refresh_decode_metadata(
+            bs,
+            actual_bs,
+            req_pool_indices,
+            seq_lens,
+            forward_mode=forward_mode,
+            block_tables=block_tables,
+            num_extends=num_extends,
+            for_graph_replay=for_graph_replay,
+            **kwargs,
+        )
+        # The refresh arms the commit exactly when it prepared a verify round
+        # over live rows: an eager or graph decode, or a mixed forward's
+        # decode rows. Each reaches its verify only after this point.
+        if self._verify_commit_ctx is not None:
+            self._prepare_retained_history(bs, actual_bs)
+
+    def _prepare_retained_history(self, bs: int, actual_bs: int) -> None:
+        """Ready every layer's retained history for this round's verify.
+
+        Two launches for all layers, ordered after the refresh wrote the
+        round's pages, boundaries and record slots and before the forward. A
+        request that moves to a private live block, or whose accepted count
+        plus its window exceeds the history capacity, gets its source state
+        with its records applied in its live block, and its count clears.
+        Verify then reads only live blocks, and never writes a block or count.
+        """
+        if not self._replay_descriptors.is_cuda:
+            # CPU-only metadata tests run no kernels, as in the record refresh.
+            return
+        self._prepare_retained_rows(
+            self.state_in_tables[bs - 1][:, :actual_bs],
+            self.state_out_tables[bs - 1][:, :actual_bs],
+            self.forward_metadata.query_start_loc[: actual_bs + 1],
+            self._record_slots[:actual_bs],
+        )
+
+    def _prepare_retained_rows(
+        self,
+        source_pages: torch.Tensor,
+        live_pages: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        record_slots: torch.Tensor,
+    ) -> None:
+        """Launch the batched prepare over [groups, rows] source and live pages."""
+        correction, key, decay = self._retained_records.unbind(2)
+        _, _, heads, capacity, dim = correction.shape
+        self._batched_prepare_kernel(
+            descriptors=self._replay_descriptors,
+            group_indices=self._replay_group_indices,
+            source_indices=source_pages,
+            live_indices=live_pages,
+            query_start_loc=query_start_loc,
+            record_slots=record_slots,
+            record_slot_count=self._record_slot_count,
+            retained_correction=correction,
+            retained_key=key,
+            retained_decay=decay,
+            history_capacity=capacity,
+            num_heads=heads,
+            head_dim=dim,
+            recurrent_state_dtype=self._retained_state_dtype,
+        )
 
     @override
     def _resolve_verify_commit_pages(

@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Retained serving contract: public verify, gathered endpoints, batched commit."""
+"""Retained serving contract: batched prepare, public verify, gathered endpoints,
+batched commit."""
 
 import pytest
 import torch
+from kda_retained_reference import prepare_history
 from tokenspeed_kernel.ops.attention import kda
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
@@ -443,6 +445,8 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
             )
             expected_out[token] = (running * q[:, None, :]).sum(-1)
         expected_final.append(running)
+    # Every row moves to a private live page, so the prepare copies them all.
+    prepare_history(state, history, reads, starts)
     out = kda.kda_fused_paged_verify(
         raw,
         weights,
@@ -615,7 +619,198 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
         commit(**shorter)
 
 
-def test_retained_capability_requires_both_explicit_contracts():
+def _prepare_case(window, *, state_dtype=torch.float32):
+    """Three layers in two State groups, each layer with its own arena strides.
+
+    Row 0 moves from a shared source page to its private live page. Row 1
+    continues its own page and overflows the capacity by one record. Row 2
+    continues its own page and fits exactly, except in layer 1, whose count
+    for its slot overflows. Rows 3-6 are padding -- an empty window, a source
+    one past the pool, a slot past the record slots, the null page -- and
+    keep their pages and counts.
+    """
+    heads, dim, layers, capacity, slots, pages, rows = 2, 128, 3, 8, 6, 10, 7
+    groups = torch.tensor([1, 0, 1], device="cuda", dtype=torch.int32)
+    # [groups, rows] views of 16-row tables, like serving's padded per-batch
+    # tables: every row starts on a 16-byte boundary.
+    tables = torch.full((2, 2, 16), -1, device="cuda", dtype=torch.int32)
+    sources, lives = tables[0, :, :rows], tables[1, :, :rows]
+    # Each group names its own pages; live pages are private within a group.
+    sources.copy_(torch.tensor([[1, 2, 3, 4, pages, 1, 0], [2, 6, 7, 4, pages, 2, 0]]))
+    lives.copy_(torch.tensor([[5, 2, 3, 6, 7, 8, 9], [9, 6, 7, 5, 8, 1, 3]]))
+    sizes = [window, window, window, 0, window, window, window]
+    starts = torch.tensor(
+        [0] + torch.tensor(sizes).cumsum(0).tolist(), device="cuda", dtype=torch.int32
+    )
+    record_slots = torch.tensor([2, 4, 0, 1, 3, slots, 5], device="cuda")
+    counts = {0: capacity - window, 1: 5, 2: 3, 3: 6, 4: capacity - window + 1, 5: 7}
+    shape = (slots, layers + 1, heads, capacity, dim * 2)
+    records = tuple(
+        field[:, :layers, ..., ::2]
+        for field in (
+            torch.randn(shape, device="cuda") * 0.03,
+            torch.randn(shape, device="cuda") * 0.03,
+            torch.rand(shape, device="cuda") * 0.2 + 0.7,
+        )
+    )
+    states, lengths, descriptors = [], [], []
+    expected_states, expected_lengths = [], []
+    for layer in range(layers):
+        state = (
+            torch.randn(pages, heads + 1 + layer, dim, dim, device="cuda") * 0.05
+        ).to(state_dtype)[:, :heads]
+        length = torch.zeros(slots, 5 + layer, device="cuda", dtype=torch.int32)[:, 1:2]
+        for slot, count in counts.items():
+            length[slot] = count + (layer == 1 and slot == 0)
+        expected_state = state.clone()
+        expected_length = length.clone()
+        group = int(groups[layer])
+        for row in range(rows):
+            source, live = int(sources[group, row]), int(lives[group, row])
+            slot, tokens = int(record_slots[row]), sizes[row]
+            if not (
+                0 < source < pages and 0 < live < pages and tokens and slot < slots
+            ):
+                continue
+            count = int(length[slot])
+            if source != live or count + tokens > capacity:
+                expected_state[live] = _fold(
+                    state[source], records, slot, layer, count
+                ).to(state_dtype)
+                expected_length[slot] = 0
+        row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
+        row[2], row[3], row[6] = length.data_ptr(), pages, length.stride(0)
+        row[9:14] = state.data_ptr(), *state.stride()
+        descriptors.append(row)
+        states.append(state)
+        lengths.append(length)
+        expected_states.append(expected_state)
+        expected_lengths.append(expected_length)
+    args = dict(
+        descriptors=torch.tensor(descriptors, device="cuda", dtype=torch.uint64),
+        group_indices=groups,
+        source_indices=sources,
+        live_indices=lives,
+        query_start_loc=starts,
+        record_slots=record_slots,
+        record_slot_count=slots,
+        retained_correction=records[0],
+        retained_key=records[1],
+        retained_decay=records[2],
+        history_capacity=capacity,
+        num_heads=heads,
+        head_dim=dim,
+        recurrent_state_dtype=state_dtype,
+    )
+    return args, (states, lengths), (expected_states, expected_lengths)
+
+
+def _resolve_prepare():
+    prepare = kda.resolve_kda_batched_retained_prepare(
+        torch.bfloat16, num_heads=2, head_dim=128, recurrent_layout="v_major"
+    )
+    assert prepare is not None
+    return prepare
+
+
+@pytest.mark.parametrize("window", [1, 4])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("captured", [False, True])
+def test_batched_retained_prepare_folds_private_and_overflowing_rows(
+    window, state_dtype, captured
+):
+    args, (states, lengths), (expected_states, expected_lengths) = _prepare_case(
+        window, state_dtype=state_dtype
+    )
+    fields = ("retained_correction", "retained_key", "retained_decay")
+    records = [args[name].clone() for name in fields]
+    initial = [x.clone() for x in (*states, *lengths)]
+    prepare = _resolve_prepare()
+    prepare(**args)
+    if captured:
+        for value, before in zip((*states, *lengths), initial):
+            value.copy_(before)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            prepare(**args)
+        for value, before in zip((*states, *lengths), initial):
+            value.copy_(before)
+        graph.replay()
+    tolerance = (
+        dict(atol=2e-6, rtol=2e-5)
+        if state_dtype == torch.float32
+        else dict(atol=2e-3, rtol=4e-3)
+    )
+    for state, expected, before in zip(states, expected_states, initial):
+        changed = (expected != before).flatten(1).any(1)
+        torch.testing.assert_close(state[changed], expected[changed], **tolerance)
+        torch.testing.assert_close(state[~changed], before[~changed], atol=0, rtol=0)
+    for length, expected in zip(lengths, expected_lengths):
+        torch.testing.assert_close(length, expected, atol=0, rtol=0)
+    # Layer 1 alone overflows row 2's slot: each layer decides on its own count.
+    assert [int(length[0]) for length in lengths] == [8 - window, 0, 8 - window]
+    for name, before in zip(fields, records):
+        torch.testing.assert_close(args[name], before, atol=0, rtol=0)
+
+
+def test_batched_retained_prepare_does_not_specialize_dynamic_metadata():
+    from tokenspeed_kernel.ops.attention.kda._triton.retained import (
+        retained_batched_consolidate_kernel,
+        retained_batched_reset_kernel,
+    )
+
+    args, _, _ = _prepare_case(4)
+    prepare = _resolve_prepare()
+    prepare(**args)
+    with assert_no_triton_compile(
+        retained_batched_consolidate_kernel, retained_batched_reset_kernel
+    ):
+        for batch, padded in ((1, 1), (2, 5), (5, 16), (17, 17), (33, 48)):
+            # Padding rows only: the launches still run with these strides. As
+            # in serving, each row of the padded tables starts on 128 bytes.
+            pitch = -(-padded // 32) * 32
+            tables = torch.full((2, 2, pitch), -1, device="cuda", dtype=torch.int32)
+            prepare(
+                **dict(
+                    args,
+                    source_indices=tables[0, :, :batch],
+                    live_indices=tables[1, :, :batch],
+                    query_start_loc=torch.arange(
+                        batch + 1, device="cuda", dtype=torch.int32
+                    ),
+                    record_slots=torch.zeros(batch, device="cuda", dtype=torch.int64),
+                )
+            )
+
+
+def test_far_pages_of_a_pool_past_int32_prepare_like_near_ones():
+    """A page whose element offset passes 2**31 folds like a near one."""
+    heads, dim, capacity = 2, 128, 8
+    page_stride = (1 << 30) + heads * dim * dim
+    if torch.cuda.mem_get_info()[0] < 6 << 30:
+        pytest.skip("a pool past 2**31 elements needs 6 GiB free")
+    storage = torch.empty(
+        2 * page_stride + heads * dim * dim, device="cuda", dtype=torch.bfloat16
+    )
+    state = storage.as_strided((3, heads, dim, dim), (page_stride, dim * dim, dim, 1))
+    state[1:].normal_(std=0.05)
+    history = _history(heads=heads, capacity=capacity)
+    history.length.fill_(3)
+    reads = torch.tensor([1, 0, 0, 0], device="cuda", dtype=torch.int32)
+    history.live_state_indices.copy_(
+        torch.tensor([2, 0, 0, 0], device="cuda", dtype=torch.int32)
+    )
+    starts = torch.tensor([0, 4, 4, 4, 4], device="cuda", dtype=torch.int32)
+    slot = int(history.record_slots[0])
+    expected = _endpoint(state[1].float(), history, slot, 3).to(torch.bfloat16)
+    source = state[1].clone()
+    prepare_history(state, history, reads, starts)
+    torch.testing.assert_close(state[2], expected, atol=2e-3, rtol=4e-3)
+    torch.testing.assert_close(state[1], source, atol=0, rtol=0)
+    assert int(history.length[slot]) == 0
+
+
+def test_retained_capability_requires_every_explicit_contract():
     assert kda.kda_retained_supported(
         torch.bfloat16,
         recurrent_layout="v_major",
@@ -623,6 +818,16 @@ def test_retained_capability_requires_both_explicit_contracts():
         head_dim=128,
         conv_kernel_size=4,
     )
+    for resolve in (
+        kda.resolve_kda_batched_retained_prepare,
+        kda.resolve_kda_batched_retained_commit,
+    ):
+        assert resolve(
+            torch.bfloat16, num_heads=2, head_dim=128, recurrent_layout="v_major"
+        )
+        assert not resolve(
+            torch.bfloat16, num_heads=2, head_dim=128, recurrent_layout="k_major"
+        )
     for dtype, layout, heads, dim, width in [
         (torch.float32, "v_major", 2, 128, 4),
         (torch.bfloat16, "k_major", 2, 128, 4),

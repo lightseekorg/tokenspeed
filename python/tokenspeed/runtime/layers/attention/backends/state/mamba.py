@@ -342,6 +342,11 @@ class MambaAttnBackend(AttentionBackend):
         # and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
+        # The same buffers as INT32 [state groups, bs] views, indexed by
+        # ``bs - 1``: row i is group ``_state_group_ids[i]``'s buffer, so one
+        # kernel can read every group's pages.
+        self.state_in_tables: list[torch.Tensor] = []
+        self.state_out_tables: list[torch.Tensor] = []
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -1265,24 +1270,21 @@ class MambaAttnBackend(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
-            # Keep one graph-stable (state_in, state_out) buffer pair per state group.
-            for gid in self._state_group_ids:
-                self.state_in_by_group.setdefault(gid, []).append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                )
-                self.state_out_by_group.setdefault(gid, []).append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                )
+            # Keep one graph-stable (state_in, state_out) buffer pair per state
+            # group: the rows of two [groups, bs] tables. Rows start on
+            # 128-byte boundaries, as separate allocations would.
+            pitch = -(-(i + 1) // 32) * 32
+            tables = torch.full(
+                (2, len(self._state_group_ids), pitch),
+                self.pad_slot_id,
+                dtype=torch.int32,
+                device=self.device,
+            )[..., : i + 1]
+            self.state_in_tables.append(tables[0])
+            self.state_out_tables.append(tables[1])
+            for row, gid in enumerate(self._state_group_ids):
+                self.state_in_by_group.setdefault(gid, []).append(tables[0, row])
+                self.state_out_by_group.setdefault(gid, []).append(tables[1, row])
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )

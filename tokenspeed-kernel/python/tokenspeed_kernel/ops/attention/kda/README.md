@@ -69,9 +69,25 @@ Each history warp computes both products for up to two keys. It combines
 the even and odd U contributions in FP32. Empty histories use only the
 checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
-The native tiled consolidation kernel runs only for source copies and capacity
-boundaries; convolution and accepted-length publication use the common
-retained commit ABI.
+Convolution and accepted-length publication use the common retained commit
+ABI.
+
+## Retained preparation
+
+Verify reads each request's live page as its dense base and never writes a
+page or an accepted length. Before a verify forward, the caller runs
+`resolve_kda_batched_retained_prepare` once for every layer: one launch
+folds, and a second, ordered launch clears the folded slots' lengths. A
+request folds when its live page differs from its source page, or when its
+accepted count L plus its window T exceeds the history capacity: its live page
+receives the source state with records [0, L) applied. Each layer decides on
+its own count. Padding rows keep their pages and lengths; an out-of-range L or
+T fails a device assertion. The launches take the commit's per-layer
+descriptors, the layer-to-group map and `[groups, requests]` source and live
+page tables. The fold splits a request's heads across programs only when few
+requests and layers would leave SMs idle. Both vendors share these Triton
+kernels. Running the prepare twice in one round would copy the unchanged
+source over the fold.
 
 The core CuTe window solver keeps main's chunked equations, compensated gate
 prefix sums, value tiles and clustered producer sharing. Bounded windows with
@@ -102,7 +118,7 @@ Retained numerical tests cover accepted-prefix rounds, boundary materialization,
 the fold at a request's end, private/shared pages, stale stamps, graph
 metadata refresh, strided arenas, FP32/BF16 base, norm fusion and scalar
 compile reuse. AMD uses the same retained
-contract through its registered Gluon kernels.
+contract through its registered Gluon kernels and the shared prepare.
 
 The `kda_fused_paged_verify` benchmark accepts `history_length`. It defaults to
 zero and can cover the accepted prefix up to `max(16, draft_token_num) -

@@ -28,7 +28,6 @@ from tokenspeed_kernel_amd.ops._kda_records import (
     kda_records_launch_metadata,
     kda_retained_panel,
     launch_kda_retained_commit,
-    prepare_kda_retained,
     validate_kda_retained_verify,
 )
 
@@ -847,21 +846,6 @@ def launch_gluon_kda_retained_verify_gfx1250(
         num_heads,
         head_dim,
         draft_token_num,
-    )
-    prepare_kda_retained(
-        state_pool,
-        correction,
-        retained_key,
-        retained_decay,
-        retained_length,
-        read_indices,
-        live_indices,
-        record_slots,
-        query_start_loc,
-        heads=num_heads,
-        dim=head_dim,
-        window=draft_token_num,
-        wave=32,
     )
     return _launch_kda_verify_gfx1250(
         mixed_qkv=mixed_qkv,

@@ -1841,9 +1841,9 @@ def test_materializing_a_checkpoint_rounds_only_after_all_accepted_updates(
     records = harness.backend._retained_records[slot, layer_row]
     harness.layer_ids = [layer]
     pages = {group: [page] for group in _STATE_GROUPS}
-    harness.prepare_metadata([slot], pages, [32])
-    # The normal verify path folds the old records before its four candidates
-    # overflow the 16-entry workspace. Only three old updates are nonzero.
+    # The prepare ahead of the verify folds the old records before its four
+    # candidates overflow the 16-entry workspace. Only three old updates are
+    # nonzero.
     length.fill_(13)
     records.fill_(float("nan"))
     correction, key, decay = records.unbind(0)
@@ -1852,6 +1852,10 @@ def test_materializing_a_checkpoint_rounds_only_after_all_accepted_updates(
     correction[:, :3].fill_(1 / 256)
     key[:, :13].fill_(1)
     decay[:, :13].fill_(1)
+    harness.prepare_metadata([slot], pages, [32])
+    assert torch.all(dense == expected)
+    assert length.item() == 0
+    # Verify reads the folded block and writes no block of its own.
     harness.forward(harness.inputs(1, 1311), 1)
     assert torch.all(dense == expected)
     assert length.item() == 0

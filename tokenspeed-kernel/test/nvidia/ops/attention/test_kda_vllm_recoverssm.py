@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kda_retained_reference import endpoint
+from kda_retained_reference import endpoint, prepare_history
 from utils import is_nvidia
 
 if not is_nvidia():
@@ -178,6 +178,8 @@ def test_vllm_retained_verify_and_publish(batch, width, dim, lower_bound):
     )
     source_before = state[reads.long()].clone()
     packed = [x.reshape(1, batch * width, heads, dim) for x in (q, k, v, raw_g)]
+    # Each request moves from its shared source to a private live page.
+    prepare_history(state, history, reads, starts)
     output = vllm_triton_kda_recoverssm_verify(
         *packed,
         raw_beta.reshape(1, batch * width, heads),

@@ -268,3 +268,24 @@ def triton_nvidia_kda_batched_retained_commit(**kwargs) -> None:
     from tokenspeed_kernel.ops.attention.kda._retained import batched_commit
 
     batched_commit(**kwargs)
+
+
+@register_kernel(
+    "attention",
+    "kda_retained_prepare",
+    name="triton_kda_batched_retained_prepare",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "batched_layers": frozenset({True}),
+        "retained_history": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+)
+def triton_kda_batched_retained_prepare(**kwargs) -> None:
+    """Fold accepted records into live pages across layers, then clear lengths."""
+    from tokenspeed_kernel.ops.attention.kda._retained import batched_prepare
+
+    batched_prepare(**kwargs)

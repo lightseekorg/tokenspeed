@@ -1925,12 +1925,13 @@ panels for a whole head. Its split programs prefetch the gate inputs for
 dense windows and reload them if the packed token boundaries differ. Both
 architectures use supplied raw gate inputs directly.
 
-Before verify, a source-to-live transition or L + T greater than capacity C
-consolidates the accepted endpoint into the live dense base. T is the actual
-packed request length. A separate, ordered kernel resets the slot's length
-after all state tiles finish; it skips rows whose page lies at or below 0 or
-at or past the pool's page count. L + T equal to C still fits. Empty requests
-and padding pages leave page storage and lengths unchanged.
+Before the verify forward, the caller runs the batched retained prepare that
+`tokenspeed-kernel` shares across vendors (`kda_retained_prepare`), once for
+every layer: a source-to-live transition or L + T greater than capacity C
+consolidates the accepted endpoint into the live dense base, and a second,
+ordered launch resets those slots' lengths. T is the actual packed request
+length. L + T equal to C still fits. Empty requests and padding pages leave
+page storage and lengths unchanged.
 
 Verify reconstructs the accepted endpoint from the live base and history, then
 writes candidate U, K and decay at L + token offset. It preserves L and the

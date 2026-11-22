@@ -343,3 +343,137 @@ def batched_commit(
         num_warps=4,
         **options,
     )
+
+
+def batched_prepare(
+    *,
+    descriptors,
+    group_indices,
+    source_indices,
+    live_indices,
+    query_start_loc,
+    record_slots,
+    record_slot_count,
+    retained_correction,
+    retained_key,
+    retained_decay,
+    history_capacity,
+    num_heads,
+    head_dim,
+    recurrent_state_dtype,
+):
+    """Ready every layer's retained history for a verify forward in two launches.
+
+    descriptors, group_indices, record_slots and the FP32 records
+    [record slots, layers, heads, history_capacity, head_dim] follow
+    batched_commit; the launch reads only the length and recurrent-state
+    columns of each descriptor. source_indices and live_indices are integer
+    [groups, requests] tables of the pages verify reads from and the private
+    pages it reads its dense base from; query_start_loc is the packed
+    [requests + 1] boundary vector.
+
+    A request folds when its live page differs from its source or when its
+    accepted count L plus its window T exceeds history_capacity: the first
+    launch writes the source state with records [0, L) applied into the live
+    page, and a second, ordered launch clears L once every tile has read it.
+    Padding rows (a page at or below 0 or at or past the pool, an empty
+    window or a slot outside the record slots) keep their pages and lengths;
+    an L or T out of range on any other row fails a device assertion.
+    """
+    if num_heads <= 0 or head_dim <= 0 or history_capacity <= 0:
+        raise ValueError(
+            "retained preparation requires positive heads, head_dim and capacity"
+        )
+    states = {torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
+    if recurrent_state_dtype not in states:
+        raise ValueError("unsupported retained recurrent state dtype")
+    if (
+        descriptors.ndim != 2
+        or descriptors.shape[1] != 14
+        or descriptors.dtype != torch.uint64
+        or not descriptors.is_contiguous()
+    ):
+        raise ValueError("retained descriptors must be contiguous UINT64 [layers, 14]")
+    layers = descriptors.shape[0]
+    batch = record_slots.numel()
+    if (
+        group_indices.shape != (layers,)
+        or not group_indices.is_contiguous()
+        or source_indices.ndim != 2
+        or source_indices.shape[1] != batch
+        or live_indices.shape != source_indices.shape
+        or query_start_loc.shape != (batch + 1,)
+        or record_slots.shape != (batch,)
+        or record_slot_count <= 0
+    ):
+        raise ValueError(
+            "retained preparation requires layer groups, [groups, batch] source "
+            "and live pages, packed boundaries and one record slot per request"
+        )
+    routing = (group_indices, source_indices, live_indices, query_start_loc)
+    if any(x.dtype not in (torch.int32, torch.int64) for x in (*routing, record_slots)):
+        raise ValueError("retained routing must be integer tensors")
+    records = (retained_correction, retained_key, retained_decay)
+    if any(
+        x.shape != (record_slot_count, layers, num_heads, history_capacity, head_dim)
+        or x.dtype != torch.float32
+        for x in records
+    ):
+        raise ValueError(
+            "retained records must be FP32 [record slots, layers, heads, "
+            "capacity, head_dim]"
+        )
+    if any(x.device != descriptors.device for x in (*routing, record_slots, *records)):
+        raise ValueError("retained preparation tensors must share a device")
+    if not layers or not batch:
+        return
+    # Both vendors share these Triton kernels.
+    from tokenspeed_kernel.ops.attention.kda._triton import retained
+
+    args = (
+        descriptors,
+        group_indices,
+        source_indices,
+        live_indices,
+        query_start_loc,
+        record_slots,
+    )
+    rows = (
+        batch,
+        source_indices.shape[0],
+        *source_indices.stride(),
+        *live_indices.stride(),
+        query_start_loc.stride(0),
+        record_slots.stride(0),
+        record_slot_count,
+    )
+    keys = triton.next_power_of_2(head_dim)
+    # Split a request's heads over enough programs to keep every SM streaming
+    # when few requests fold; a large batch keeps one program per request so
+    # rows that do not fold cost one early exit each.
+    splits = min(
+        num_heads,
+        max(1, triton.cdiv(2 * current_platform().sm_count, layers * batch)),
+    )
+    retained.retained_batched_consolidate_kernel[(layers, batch, splits)](
+        *args,
+        *records,
+        *rows,
+        *(x.stride() for x in records),
+        CAPACITY=history_capacity,
+        STATE=states[recurrent_state_dtype],
+        HEADS=num_heads,
+        DIM=head_dim,
+        KEYS=keys,
+        ROWS=min(triton.next_power_of_2(head_dim), max(1, 2048 // keys)),
+        num_warps=4,
+    )
+    retained.retained_batched_reset_kernel[(layers, triton.cdiv(batch, 128))](
+        *args,
+        *rows,
+        CAPACITY=history_capacity,
+        BLOCK=128,
+        num_warps=4,
+        # Keeps the interval assertion.
+        debug=True,
+    )

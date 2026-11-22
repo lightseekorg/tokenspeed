@@ -84,9 +84,6 @@ _DTYPES = {
 }
 
 
-from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
-    consolidate_history,
-)
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     fake_retained_arguments,
     initialize_page_tile,
@@ -94,7 +91,6 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     retained_length,
     retained_row,
 )
-from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import reset_retained_history
 
 
 def _asm(ret, args, text, constraints, side_effects, loc, ip):
@@ -1394,15 +1390,6 @@ def recoverssm_verify(
         dt_bias.dtype,
         query_start_loc.dtype,
         state_indices.dtype,
-    )
-    consolidate_history(
-        checkpoint_state, retained_history, state_indices, query_start_loc
-    )
-    reset_retained_history(
-        retained_history,
-        state_indices,
-        query_start_loc,
-        page_count=checkpoint_state.shape[0],
     )
     kernel(
         q[0],

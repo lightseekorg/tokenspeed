@@ -370,8 +370,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         not dense, strided indices or record channels, a strided one-element
         A_log, and positive lower bounds.
 
-        Returns out after writing candidates. Dense base changes only for a source
-        copy or capacity overflow; accepted history otherwise remains in place.
+        Returns out after writing candidates. Dense pages and accepted lengths
+        stay unchanged: the round's batched prepare readied the live bases.
         """
         from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
             recoverssm_verify,

@@ -30,6 +30,7 @@ if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 
 import tokenspeed_kernel.ops.attention.kda as kda_ops
+from kda_retained_reference import prepare_history
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
     vllm_triton_kda_recoverssm_commit,
     vllm_triton_kda_recoverssm_verify,
@@ -174,6 +175,8 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
                 base_before[1], u[0], key[0], decay[0], old_length
             )
             old_length = 0
+        # Serving readies the history before every verify round.
+        prepare_history(state, history, indices, starts)
         verify_kernel(
             q,
             k,
@@ -276,11 +279,13 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
 @pytest.mark.parametrize("captured", [False, True])
 def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     """Catch source mutation, writes by empty/null rows, and stale GPU metadata."""
+    from tokenspeed_kernel.ops.attention.kda._triton.retained import (
+        retained_batched_consolidate_kernel,
+        retained_batched_reset_kernel,
+    )
     from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
-        _consolidate_kda_history_kernel,
         _kda_recoverssm_verify_kernel,
         _publish_kda_history_kernel,
-        _reset_kda_history_kernel,
     )
     from utils import assert_no_triton_compile
 
@@ -319,6 +324,7 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     out = torch.full_like(v, float("nan"))
 
     def run():
+        prepare_history(state, history, sources, starts)
         vllm_triton_kda_recoverssm_verify(
             q,
             k,
@@ -405,8 +411,8 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
             graph.replay()
         else:
             with assert_no_triton_compile(
-                _consolidate_kda_history_kernel,
-                _reset_kda_history_kernel,
+                retained_batched_consolidate_kernel,
+                retained_batched_reset_kernel,
                 _publish_kda_history_kernel,
                 _kda_recoverssm_verify_kernel.fn,
             ):
@@ -509,6 +515,7 @@ def test_retained_history_large_value_tile_and_acceptance_clamping():
                 current = states[accepted[row] - 1]
         expected_endpoints.append(current)
     out = torch.empty_like(v)
+    prepare_history(state, history, indices, starts)
     vllm_triton_kda_recoverssm_verify(
         q,
         k,
@@ -591,6 +598,7 @@ def test_rows_outside_the_page_pool_are_skipped_by_verify_and_commit():
     beta = torch.randn(1, 4, heads, device="cuda").bfloat16()
     out = torch.full_like(v, float("nan"))
     saved = state.clone()
+    prepare_history(state, history, sources, starts)
     vllm_triton_kda_recoverssm_verify(
         q,
         k,

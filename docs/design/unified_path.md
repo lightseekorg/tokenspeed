@@ -595,8 +595,14 @@ groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the
 captured `state_in` buffers and its live blocks into `state_out`, every group
 and the graph padding rows in one launch (`verify_state_groups`, up to four
-groups). The commit enqueued after the replay reads those buffers before the
-next refresh rewrites them.
+groups). Each batch size's buffers are the rows of one `[groups, bs]` table
+(`state_in_tables`, `state_out_tables`). The commit enqueued after the replay
+reads those buffers before the next refresh rewrites them. KDA's refresh then
+readies every layer's retained history in two launches, outside the graph and
+ahead of the replay, the eager forward or a mixed forward's decode rows: a
+request that moves to its live block, or would overflow the history capacity,
+folds its accepted records into that block, so verify only reads live blocks
+(`KdaAttnBackend._prepare_retained_history`).
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:

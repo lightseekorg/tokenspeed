@@ -26,6 +26,7 @@ import importlib
 
 import pytest
 import torch
+from kda_retained_reference import prepare_history
 from tokenspeed_kernel.ops.attention.kda import (
     KdaOutputNorm,
     KdaRetainedHistory,
@@ -43,12 +44,13 @@ ARCH = "gfx950" if is_cdna4() else "gfx1250"
 DECODE = importlib.import_module(
     f"tokenspeed_kernel_amd.ops.{ARCH}.attention.kda.decode"
 )
+from tokenspeed_kernel.ops.attention.kda._triton import retained as prepared
 from tokenspeed_kernel_amd.ops import _kda_records as records
 
 KERNELS = (
     getattr(DECODE, f"gluon_kda_fused_paged_verify_nostore_vmajor_{ARCH}"),
-    records.kda_retained_consolidate,
-    records.kda_retained_reset,
+    prepared.retained_batched_consolidate_kernel,
+    prepared.retained_batched_reset_kernel,
     records.kda_retained_conv_commit,
     records.kda_retained_publish,
 )
@@ -294,9 +296,20 @@ def _case(
                     solution=None,
                 )
 
-            verify = verify_with_norm
+            verified = verify_with_norm
         else:
-            verify = VERIFY
+            verified = VERIFY
+
+        def verify(**inputs):
+            # Serving readies the history before every verify round.
+            prepare_history(
+                inputs["state_pool"],
+                inputs["retained_history"],
+                inputs["read_indices"],
+                inputs["query_start_loc"],
+            )
+            return verified(**inputs)
+
         if gate_error:
             if gate_error == "both":
                 kwargs.update(raw_g=gate, f_a_out=f_a, f_b_weight=f_b)
