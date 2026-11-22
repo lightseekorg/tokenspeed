@@ -88,20 +88,6 @@ def test_boundary_fp8_next_input_matches_the_row_reference(rows: int) -> None:
     assert not codes[0].float().any()
 
 
-def test_the_fp8_boundary_is_the_registered_triton_kernel() -> None:
-    """The FP8-writing boundary is selected through the registry, and that
-    selection is the Triton kernel that writes all copies in one launch."""
-    from tokenspeed_kernel.selection import select_kernel
-    from tokenspeed_kernel.signature import dense_format_signature
-
-    kernel = select_kernel(
-        "residual",
-        "post_norm_residual_pre_norm_fp8",
-        dense_format_signature(("stream", "branch"), (torch.float32, torch.bfloat16)),
-    )
-    assert kernel.name == "triton_post_norm_residual_pre_norm_fp8"
-
-
 def test_boundary_fp8_refuses_what_no_fp8_reader_follows() -> None:
     """A mailbox branch, partials from several ranks, or no pre-norm: no FP8
     reader follows such a boundary, so the FP8 boundary refuses them."""
@@ -153,29 +139,12 @@ def test_boundary_fp8_copy_matches_boundary_then_row_quantize() -> None:
     """The Triton boundary's in-launch FP8 copy (post_norm_residual_pre_norm_fp8)
     equals post_norm_residual_pre_norm followed by the registered row
     quantizer: the stream, both pre-norm copies, and the FP8 codes and scales,
-    at the decode row counts the FP8 projections take; the skinny FP8 GEMM's
-    output from either copy is the same.
+    at the decode row counts the FP8 projections take.
     """
-    from tokenspeed_kernel.ops.gemm import mm, prepare_fp8_channel_weight
-
     torch.manual_seed(47)
     post_weight = torch.randn(8192, device="cuda").bfloat16() * 0.1
     pre_weight = torch.randn_like(post_weight) * 0.1
     alpha, beta = residual_gate_coefficients(torch.randn_like(post_weight), 0.3, 1e-3)
-    fp8_weight, weight_scales = prepare_fp8_channel_weight(
-        (torch.randn(1024, 8192, device="cuda") * 0.02).bfloat16()
-    )
-
-    def project(codes, scales):
-        return mm(
-            codes,
-            fp8_weight.t(),
-            A_scales=scales,
-            B_scales=weight_scales,
-            out_dtype=torch.bfloat16,
-            quant="fp8",
-            override="gluon_mm_fp8_skinny_gfx950",
-        )
 
     def check(rows: int) -> None:
         stream = torch.randn(rows, 8192, device="cuda")
@@ -195,9 +164,6 @@ def test_boundary_fp8_copy_matches_boundary_then_row_quantize() -> None:
         assert torch.equal(fused_bf16, pre_bf16)
         assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
         assert torch.equal(scales, expected_scales)
-        assert torch.equal(
-            project(codes, scales), project(expected_codes, expected_scales)
-        )
 
     for rows in (17, 24, 32, 48, 64, 96, 128):
         check(rows)

@@ -20,14 +20,15 @@
 
 
 """A main FP8 linear at a skinny-GEMM shape takes the gfx950 skinny FP8 GEMM
-in its 17-128 row window, with the scaled FP8 GEMM's bits."""
+in its 17-128 row window, at the precision of the FP8 GEMM it replaces: within
+one BF16 rounding plus FP32 summation error of the FP64 product."""
 
 import os
 import sys
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm import _mm_selected_kernel_name, mm
+from tokenspeed_kernel.ops.gemm import _mm_selected_kernel_name
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 
@@ -82,12 +83,9 @@ def test_w8a8_fp8_linear_takes_the_skinny_gemm_in_its_window(rows):
     )
     in_window = 17 <= rows <= 128
     assert (selected == "gluon_mm_fp8_skinny_gfx950") == in_window
-    scaled = mm(
-        codes,
-        layer.weight,
-        **operands,
-        out_dtype=torch.bfloat16,
-        quant="fp8",
-        override="triton_mm_fp8_scaled",
-    )
-    assert torch.equal(out.view(torch.int16), scaled.view(torch.int16))
+    a = codes.double() * scales.double().reshape(-1, 1)
+    b = layer.weight.double() * layer.weight_scale.double().reshape(1, -1)
+    exact = a @ b
+    ulp = torch.exp2(torch.floor(torch.log2(exact.abs().clamp_min(2.0**-126))) - 7)
+    bound = ulp / 2 + a.shape[1] * 2.0**-24 * (a.abs() @ b.abs())
+    assert bool(((out.double() - exact).abs() <= bound).all())

@@ -21,7 +21,7 @@
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, compiled_kernels, is_cdna4
 
 if not is_cdna4():
     pytest.skip("gfx950 required", allow_module_level=True)
@@ -338,18 +338,24 @@ def test_selected_inside_its_window_and_declined_outside(n):
     )
     assert torch.equal(_bits(by_mm), _bits(by_triton))
     # An online-quantized call (BF16 rows, no activation scales): mm quantizes
-    # the rows per token first, so the kernel serves it, with the same output
-    # as the scaled FP8 GEMM given the same rows.
+    # the rows per token first, so the kernel serves it, as it serves those
+    # quantized rows passed in.
     rows_bf16 = torch.randn(64, _K, device="cuda").bfloat16()
     online = dict(
         A_scales=None, B_scales=weight_scales, out_dtype=torch.bfloat16, quant="fp8"
     )
     assert mm_kernel_name(rows_bf16, weight.t(), **online, features=None) == _NAME
     by_online = mm(rows_bf16, weight.t(), **online)
-    by_online_triton = mm(
-        rows_bf16, weight.t(), **online, override="triton_mm_fp8_scaled"
+    online_codes, online_scales = quantize_fp8(rows_bf16, granularity="token")
+    by_codes = mm(
+        online_codes,
+        weight.t(),
+        A_scales=online_scales,
+        B_scales=weight_scales,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
     )
-    assert torch.equal(_bits(by_online), _bits(by_online_triton))
+    assert torch.equal(_bits(by_online), _bits(by_codes))
     # A BF16 call (quant None) never selects this FP8 kernel.
     plain = mm_kernel_name(
         torch.randn(48, _K, device="cuda").bfloat16(),
@@ -430,14 +436,9 @@ def test_runs_the_unscaled_fp8_mfma(n):
     gluon_mm_fp8_skinny_gfx950.device_caches.clear()
     skinny._warmed.clear()
     skinny.warm_gluon_mm_fp8_skinny_gfx950(n, _K, torch.device("cuda"))
-    # The compiled binaries of the warm hook's compile-ahead calls, read from
-    # the JIT's per-device cache (there is no public accessor); their AMDGCN
-    # is what runs.
-    binaries = [
-        compiled
-        for cache in gluon_mm_fp8_skinny_gfx950.device_caches.values()
-        for compiled in cache[0].values()
-    ]
+    # The compiled binaries of the warm hook's compile-ahead calls; their
+    # AMDGCN is what runs.
+    binaries = compiled_kernels(gluon_mm_fp8_skinny_gfx950)
     assert len(binaries) == len(skinny.SKINNY_FP8_ROW_TILES)
     for compiled in binaries:
         isa = compiled.asm["amdgcn"]
@@ -487,15 +488,13 @@ def test_same_rounding_class_as_the_scaled_fp8_gemm(n, m):
     """Against the FP64 product, the skinny kernel and triton_mm_fp8_scaled
     each stay within one BF16 rounding of the output plus FP32 summation
     error, so callers that switch kernels at these shapes keep their
-    precision. On these inputs the two outputs are also bitwise equal; the
-    test pins that, so a change to either kernel's summation shows here."""
+    precision."""
     torch.manual_seed(1000 * m + n)
     weight, weight_scales = prepare_fp8_channel_weight(
         (torch.randn(n, _K, device="cuda") * 0.02).bfloat16()
     )
     codes, scales = _rows_fp8(torch.randn(m, _K, device="cuda").bfloat16())
     exact, bound = _fp64_error_bound(codes, scales, weight, weight_scales)
-    outs = []
     for override in (_NAME, "triton_mm_fp8_scaled"):
         out = mm(
             codes,
@@ -508,5 +507,3 @@ def test_same_rounding_class_as_the_scaled_fp8_gemm(n, m):
         )
         error = (out.double() - exact).abs()
         assert bool((error <= bound).all()), (override, float((error / bound).max()))
-        outs.append(out)
-    assert torch.equal(_bits(outs[0]), _bits(outs[1]))

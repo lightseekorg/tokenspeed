@@ -1543,10 +1543,24 @@ def test_dense_fp8_boundary_warmup_runs_on_a_real_model(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The warm-up compiles both boundaries' FP8-copy kernels from a real
-    model's norms (the post-attention norm is weightless): two binaries, one
-    per variant, which every row count then uses; it skips a model without
-    layers."""
+    model's norms (the post-attention norm is weightless): after it, either
+    boundary at any row count compiles nothing. A model without layers warms
+    nothing."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel.ops.residual import (
+        post_norm_residual_pre_norm_bf16_fp8,
+        post_norm_residual_pre_norm_fp8,
+    )
     from tokenspeed_kernel.ops.residual._triton import gated_boundary_fp8
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
 
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
     with torch.device("cuda"):
@@ -1561,14 +1575,46 @@ def test_dense_fp8_boundary_warmup_runs_on_a_real_model(
         if isinstance(norm, module.MuseSparkRMSNorm) and norm.weight is not None:
             norm.weight.data.fill_(0.5)
     kernel = gated_boundary_fp8._post_norm_residual_pre_norm_fp8_kernel
-    kernel.device_caches.clear()
-    model._warm_dense_fp8_boundaries(qkv=True, pre_expert=True)
-    # The JIT's per-device cache holds the compiled binaries (no public accessor).
-    assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 2
+    layer, following = model.model.layers[0], model.model.layers[1]
+
+    def boundaries(rows: int) -> None:
+        # The two serving boundaries, with the norms the warm-up reads.
+        stream = torch.randn(
+            rows, model.config.hidden_size, dtype=torch.float32, device="cuda"
+        )
+        branch = torch.randn_like(stream).bfloat16()
+        pre = layer.pre_feedforward_layernorm
+        for op, post, gate, nxt in (
+            (
+                post_norm_residual_pre_norm_fp8,
+                layer.post_attention_layernorm,
+                layer.post_attention_residual_gate,
+                pre,
+            ),
+            (
+                post_norm_residual_pre_norm_bf16_fp8,
+                layer.post_feedforward_layernorm,
+                layer.post_feedforward_residual_gate,
+                following.input_layernorm,
+            ),
+        ):
+            op(
+                stream, branch, post.weight, post.eps, post.weight_offset,
+                *gate._gate_coefficients(), nxt.weight, nxt.eps,
+                nxt.weight_offset, False, None, 1,
+            )  # fmt: skip
+
+    helpers.assert_warmup_covers(
+        (kernel,),
+        lambda: model._warm_dense_fp8_boundaries(qkv=True, pre_expert=True),
+        boundaries,
+        (17, 33, 64, 65, 128),
+    )
     model.model.layers = torch.nn.ModuleList()
+    # From an empty JIT cache, so a binary from above cannot hide a compile.
     kernel.device_caches.clear()
-    model._warm_dense_fp8_boundaries(qkv=True, pre_expert=True)
-    assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 0
+    with helpers.assert_no_triton_compile(kernel):
+        model._warm_dense_fp8_boundaries(qkv=True, pre_expert=True)
 
 
 def _enabled_copy(name: str) -> "module._DenseFp8Weight":
