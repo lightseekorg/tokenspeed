@@ -2248,5 +2248,135 @@ def test_prefill_collective_payload_is_validated_in_server_args() -> None:
         )
 
 
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny BF16 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("ranks", [4, 8])
+def test_gathered_projection_warmup_covers_its_gemms(
+    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype, ranks: int
+) -> None:
+    """A gathered projection's warm-up leaves none of its GEMMs to compile.
+
+    After its local-GEMM warm-up, its GEMM at any row count compiles no decode
+    or skinny GEMM binary: the pre-expert projection's [1024, 8192] columns at
+    TP4 (the decode GEMM at 9-32 rows, with another config from 17 rows, and
+    the skinny GEMM at 33-128) and [512, 8192] at TP8 (the decode GEMM
+    only)."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm, skinny
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: group
+    )
+    monkeypatch.setattr(module.KimiK3LatentDownOp, "initialize", lambda **kwargs: None)
+    hidden, latent = 8192, 4096
+    with torch.device("cuda"):
+        linear = module._MuseGatheredLinear(
+            input_size=hidden,
+            output_size=latent,
+            prefix="model.layers.0.mlp.pre_expert_proj",
+            tp_rank=1,
+            tp_size=ranks,
+            tp_group=tuple(range(ranks)),
+            layer_id=0,
+            layer_count=2,
+            replicate_for_owned_rows=True,
+            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
+        )
+    with torch.no_grad():
+        linear.weight.normal_(std=hidden**-0.5)
+    weight = linear._local_weight()
+    assert tuple(weight.shape) == (latent // ranks, hidden)
+
+    def project(rows: int) -> None:
+        linear._project(torch.randn(rows, hidden, device="cuda"), weight, None)
+
+    helpers.assert_warmup_covers(
+        (
+            mm.gluon_mm_a16w16_medium_gfx950,
+            skinny.gluon_mm_a16w16_skinny_gfx950,
+            skinny.gluon_mm_a16w16_skinny_reduce_gfx950,
+        ),
+        linear.warm_local_gemm,
+        project,
+        range(2, 129),
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="the router + decode GEMM launch is gfx950-only",
+)
+@pytest.mark.parametrize("width", [512, 1024])
+def test_router_with_mm_warmup_covers_every_shared_row_count(
+    monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    """The router's warm-up covers every row count of the shared launch.
+
+    After it, with this rank's pre-expert columns, the shared launch at any
+    row count it serves compiles nothing, including rows past 16, which a
+    large warm-up extend does not run through it."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32 import router_gemv
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setitem(module.global_server_args_dict, "numerics", "auto")
+    hidden, experts = 8192, 256
+    with torch.device("cuda"):
+        router = module.MuseSparkRouter(
+            hidden_size=hidden, num_experts=experts, multiplier=1.0, solution=None
+        )
+    router.weight.data.normal_(0.0, hidden**-0.5)
+    router.process_weights_after_loading(router)
+    columns = torch.randn(width, hidden, dtype=torch.bfloat16, device="cuda")
+    served = []
+
+    def launch(rows: int) -> None:
+        x = torch.randn(rows, hidden, dtype=torch.float32, device="cuda")
+        a = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+        if router.supports_with_mm(x, a, columns):
+            served.append(rows)
+            router.forward_with_mm(x, a, columns, a.new_empty((rows, width)))
+
+    helpers.assert_warmup_covers(
+        (router_gemv.gluon_fp32_router_gemv_mm_a16w16_gfx950,),
+        lambda: router.warm_with_mm(columns, 128),
+        launch,
+        range(1, 129),
+    )
+    # The sweep reached the launch past its first 16-row bucket.
+    assert max(served) > 16
+
+
+def test_router_with_mm_warmup_refuses_an_unprepared_weight() -> None:
+    """The router's warm-up raises before its weight is prepared.
+
+    Its forward raises too. Skipping instead would skip the shared launch at
+    every row count and leave those compiles to serving."""
+    router = module.MuseSparkRouter(
+        hidden_size=256, num_experts=16, multiplier=1.0, solution=None
+    )
+    columns = torch.zeros(64, 256, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        router.warm_with_mm(columns, 128)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

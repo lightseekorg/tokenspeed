@@ -85,6 +85,25 @@ than one row only for measured shapes, through its `mnk_problem_filter`.
 
 On CDNA4, ordinary GEMM dispatch admits the measured single-row
 `[1,8192] @ [4608,8192].T` projection alongside the existing multirow cases.
+The gfx950 skinny GEMM, `gluon_mm_a16w16_skinny_gfx950`, is an `mv` kernel
+too: its `mnk_problem_filter` admits only the weight shapes and row counts it
+was measured on, and a row's bits there do not depend on the other rows of the
+batch. It needs 16-byte-aligned operands and output and declares the
+`operands_aligned_16` and `out_aligned_16` traits, which `mv` and `mm`'s `mv`
+branch supply: an offset view selects what it would without this kernel.
+Supplying them reads tensor addresses only on a platform that registers a
+kernel declaring them; other CUDA platforms and CPU read none.
+Like every `mv` kernel it is selected by the row count alone, in any forward.
+Startup kernel warmup compiles its binaries from any `mm` call that meets
+such a weight (`warm_gluon_mm_a16w16_skinny`, beside the TGV warm hook), so
+the row counts it takes need not run before serving; outside warmup the
+hooks cost `mm` one `is_warming_up()` check. `warm_gluon_mm_a16w16_decode`
+does the same for the gfx950 decode GEMM: it compiles every config measured
+for the weight, whose row buckets a startup may not all reach. Both hooks
+fire on `mm`'s plain BF16 path only: a startup that reaches the weight no
+other way than through a direct `mv`, a `plan`, `solution`, or `override`, or
+a GEMM outside `mm` compiles the missed binaries at their first launch,
+unless it runs a row count that selects them. The AMD ops README records the kernel's contract.
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
