@@ -37,8 +37,8 @@ it, not the GPU model, and some drivers report a generic device name (such as
   solution's bits and not be slower.
 * ``configs/device_name=<torch.cuda.get_device_name()>.csv``, spaces replaced
   by underscores (``device_name=AMD_Instinct_MI355X.csv``), adds rows for one
-  GPU model, which may be chosen for speed alone. It never lists a GEMM the
-  architecture file lists.
+  GPU model. The solutions in these rows may be chosen for speed alone. It
+  never lists a GEMM the architecture file lists.
 
 Serving loads the architecture file and then the device file, read-only:
 
@@ -207,6 +207,10 @@ def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
         warning, and the others still load. False when this is not a ROCm
         build, the GPU has no tuned file, a file cannot be read, or no file
         matches the stack (logged); TunableOp then stays disabled.
+
+    Raises:
+        ValueError: ``path`` is omitted and several committed ``gcn_arch=``
+            files carry the current GPU's architecture stamp.
     """
     tunable = torch.cuda.tunable
     if torch.version.hip is None:
@@ -406,21 +410,27 @@ def tune_hipblaslt_solutions(
             os.path.realpath(other) == os.path.realpath(path)
         ):
             continue
-        if hipblaslt_file_validators(other) != _current_validators():
-            logger.warning(
-                f"{other} was made for another stack: its GEMMs are tuned "
-                f"and written to {path} too; regenerate it by its own rule"
-            )
-            continue
-        if not tunable.read_file(other):
+        try:
+            stamp = hipblaslt_file_validators(other)
+            if stamp != _current_validators():
+                logger.warning(
+                    f"{other} was made for another stack: its GEMMs are tuned "
+                    f"and written to {path} too; regenerate it by its own rule"
+                )
+                continue
+            readable = tunable.read_file(other)
+            with open(other) as f:
+                architecture_keys |= {
+                    tuple(line.split(",")[:2])
+                    for line in f
+                    if not line.startswith("Validator")
+                }
+        except OSError as e:
+            tunable.enable(False)
+            raise ValueError(f"Could not read tuned BLAS solutions {other}") from e
+        if not readable:
             tunable.enable(False)
             raise ValueError(f"Could not read tuned BLAS solutions {other}")
-        with open(other) as f:
-            architecture_keys |= {
-                tuple(line.split(",")[:2])
-                for line in f
-                if not line.startswith("Validator")
-            }
     # Everything to keep is read; from here TunableOp writes nowhere on its
     # own, so the architecture rows it holds cannot reach ``path`` at exit.
     # The file is written below, without them.

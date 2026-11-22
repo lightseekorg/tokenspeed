@@ -225,9 +225,9 @@ and some drivers report a generic device name such as `AMD Radeon Graphics`:
   file's `GCN_ARCH_NAME` stamp. It holds only rows verified on every GPU model
   of that architecture to write the default solution's bits and not be slower.
 - `device_name=<name>.csv`, named after `torch.cuda.get_device_name()` with
-  spaces replaced by underscores, adds rows for one GPU model, which may be
-  chosen for speed alone and change bits. It never lists a GEMM its
-  architecture file lists.
+  spaces replaced by underscores, adds rows for one GPU model. Its solutions
+  may be chosen for speed alone and change result bits. It never lists a GEMM
+  its architecture file lists.
 
 Serving loads the architecture file and then the device file of its GPU
 (`find_hipblaslt_tuned_files`) automatically, through `hipblaslt.py`, once per
