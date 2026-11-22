@@ -165,13 +165,16 @@ def MegaMoe(
     input_topk_ids=None,
     input_topk_weights=None,
     compile_only=False,
+    stage1_n128=None,
 ):
     """Launch MegaMoE; return reduced rows or, without reduction, the routes.
 
     If ``reduce_routes`` is false, ``out`` holds ``[num_tokens, topk, hidden]``
     routes, each scaled by its expert weight. With ``compile_only`` the same
     checks run and the kernels this launch needs are compiled, but nothing is
-    launched (no collective) and ``out`` is left unwritten.
+    launched (no collective) and ``out`` is left unwritten. ``stage1_n128``
+    (C5's received-experts selector) is the call-wide stage-1 tile choice;
+    None keeps the per-rank row rule.
     """
     info = LookupSolution(heap, solution_id)
     device = heap.device_index
@@ -280,6 +283,7 @@ def MegaMoe(
             heap.rank,
             reduce_routes,
             torch.cuda.current_stream(device),
+            stage1_n128,
         )
         CheckKernelStatus(MegaMoECompute(params, solution_id, compile_only), "MegaMoE")
     return out

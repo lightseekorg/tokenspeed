@@ -227,3 +227,33 @@ class MegaMoEStage1M64W8Config(DeviceTemplate):
             if Base.kSolution.stage1_buffering == FusedMoEStage1Buffering.kDoubleBuffer
             else OnestageFusedMoEStage1SingleBufferOp
         )(self.Stage1Tiles)
+
+
+class MegaMoEStage1N128Config(DeviceTemplate):
+    """Stage-1 tile of 32 rows x 128 intermediate columns (C5, decode counts).
+
+    Each tile streams half the W13 bytes of the 256-column tile, so a call
+    that touches few experts spreads them over twice the CTAs. The weight
+    layout is the same repacked native MXFP4 layout (kN128 addresses it as the
+    W2 kN128 tile does); stage 2 and the combine keep the base config.
+    """
+
+    def __init__(self, Base):
+        self.__dict__.update(Base.__dict__)
+        self._key = Base.cache_key
+        assert Base.kGroupM == 32 and Base.kNumWarps == 4
+        self.kStage1GroupN = 128
+        self.kW13TileShape = MxFp4TileShape.kN128
+        self.Input, self.Weight = MxFp4InputPacked(self), MxFp4Weights(self)
+        self.W13Weights, self.W13 = self.Weight.W13Weights, self.Weight.W13
+        self.Bias = (
+            NoopBiasLayout(4, 128)
+            if Base.kSolution.bias_dtype == FusedMoEDataType.kNone
+            else Bf16BiasLayout(4, 128, MxFp4BiasLayout(32, 128), 2)
+        )
+        self.Stage1Tiles = W13TileSchedule(NativeMxFp4TileOps(self, self.W13))
+        self.Stage1Op = (
+            OnestageFusedMoEStage1DoubleBufferOp
+            if Base.kSolution.stage1_buffering == FusedMoEStage1Buffering.kDoubleBuffer
+            else OnestageFusedMoEStage1SingleBufferOp
+        )(self.Stage1Tiles)

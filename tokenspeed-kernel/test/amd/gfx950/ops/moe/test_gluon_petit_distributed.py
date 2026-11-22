@@ -746,6 +746,246 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
         petit._PETIT_FUSE_PREP = initial
 
 
+def _petit_launch_module():
+    """The module whose globals Petit's launches and C5 threshold live in."""
+    import sys
+
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    package = petit._import_petit_kernel()
+    del package
+    import lib.moe.rocm.mega_moe as forwarding
+
+    return sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_stage1_n128_bit_exact(profile_name):
+    """C5 (TOKENSPEED_PETIT_STAGE1_N128): the 32x128 stage-1 tile.
+
+    Ranks at or below the threshold launch the N=128 tile; the output must
+    equal the 256-column tile's bit for bit and pass the reference, for
+    zero-row ranks, the tp4ep4 2/2/2/0 split, one busy DP4 rank, mixed tiles
+    across ranks (threshold between the ranks' counts), deferred routes and
+    CUDA graph replay.
+    """
+    module = _petit_launch_module()
+    profile = _PROFILES[profile_name]
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    kernel_moe_process_weights(plan, layer)
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    initial = module.kStage1N128MaxTokens
+
+    def call(x, ids, weights, counts, do_finalize=True):
+        return kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            x.new_empty((x.shape[0], 0)),
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=sum(counts),
+            max_num_tokens_per_gpu=max(counts),
+            do_finalize=do_finalize,
+            low_latency=None,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+
+    try:
+        for counts, threshold in (
+            ([0] * ws, 8),
+            ([2, 2, 2, 0], 8),
+            ([6, 0, 0, 0], 8),
+            ([1, 8, 9, 40], 8),
+            ([24, 3, 0, 64], 64),
+        ):
+            count = counts[rank]
+            values = torch.arange(count * profile.hidden, device=device)
+            x = (
+                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
+                .reshape(count, profile.hidden)
+                .to(torch.bfloat16)
+            )
+            ids, weights = _routing(count, rank, profile, ws, device)
+            outputs = {}
+            for max_rows in (-1, threshold):
+                module.kStage1N128MaxTokens = max_rows
+                eager = call(x, ids, weights, counts).clone()
+                routes = call(x, ids, weights, counts, do_finalize=False)[0].clone()
+                torch.cuda.synchronize()
+                dist.barrier()
+                graph = torch.cuda.CUDAGraph()
+                graph_ids, graph_weights = ids.clone(), weights.clone()
+                with torch.cuda.graph(graph):
+                    captured = call(x, graph_ids, graph_weights, counts)
+                replays = []
+                for step in (0, 1):
+                    new_ids, new_weights = _routing(
+                        count, rank + step, profile, ws, device
+                    )
+                    graph_ids.copy_(new_ids)
+                    graph_weights.copy_(new_weights)
+                    graph.replay()
+                    replays.append(captured.clone())
+                torch.cuda.synchronize()
+                dist.barrier()
+                outputs[max_rows] = (eager, routes, replays)
+                del graph
+                dist.barrier()
+            off, on = outputs[-1], outputs[threshold]
+
+            def check():
+                torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
+                torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
+                for a, b in zip(on[2], off[2]):
+                    torch.testing.assert_close(a, b, atol=0, rtol=0)
+                torch.testing.assert_close(on[2][0], on[0], atol=0, rtol=0)
+                if count:
+                    expected = _reference(x, ids, weights, profile)
+                    torch.testing.assert_close(on[0], expected, atol=2e-6, rtol=8e-3)
+
+            _collective_check(device, check)
+            dist.barrier()
+    finally:
+        module.kStage1N128MaxTokens = initial
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
+    """C5's received-experts selector (TOKENSPEED_PETIT_STAGE1_N128_SELECT=experts).
+
+    Every rank takes the same tile, chosen from the call's total row count,
+    including zero-row ranks; the output equals the 256-column tile's bit for
+    bit (eager, deferred routes, graph replay) for DP4 batch 1/2/4 with one
+    busy rank, the tp4ep4 2/2/2/0 and 3/3/3/3 splits and 6 rows on every rank.
+    """
+    module = _petit_launch_module()
+    profile = _PROFILES[profile_name]
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    kernel_moe_process_weights(plan, layer)
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    initial = (module.kStage1N128MaxTokens, module.kStage1N128ByExperts)
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    config = petit._get_workspace(
+        device,
+        layer._moe_backend_state.profile,
+        layer._moe_backend_state.max_tokens_per_rank,
+    ).config
+
+    def call(x, ids, weights, counts, do_finalize=True):
+        return kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            x.new_empty((x.shape[0], 0)),
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=sum(counts),
+            max_num_tokens_per_gpu=max(counts),
+            do_finalize=do_finalize,
+            low_latency=None,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+
+    try:
+        module.kStage1N128MaxTokens = -1
+        for counts in (
+            [6, 0, 0, 0],
+            [12, 0, 0, 0],
+            [24, 0, 0, 0],
+            [2, 2, 2, 0],
+            [3, 3, 3, 3],
+            [6, 6, 6, 6],
+        ):
+            count = counts[rank]
+            values = torch.arange(count * profile.hidden, device=device)
+            x = (
+                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
+                .reshape(count, profile.hidden)
+                .to(torch.bfloat16)
+            )
+            ids, weights = _routing(count, rank, profile, ws, device)
+            outputs = {}
+            for by_experts in (False, True):
+                module.kStage1N128ByExperts = by_experts
+                eager = call(x, ids, weights, counts).clone()
+                routes = call(x, ids, weights, counts, do_finalize=False)[0].clone()
+                torch.cuda.synchronize()
+                dist.barrier()
+                graph = torch.cuda.CUDAGraph()
+                graph_ids, graph_weights = ids.clone(), weights.clone()
+                with torch.cuda.graph(graph):
+                    captured = call(x, graph_ids, graph_weights, counts)
+                replays = []
+                for step in (0, 1):
+                    new_ids, new_weights = _routing(
+                        count, rank + step, profile, ws, device
+                    )
+                    graph_ids.copy_(new_ids)
+                    graph_weights.copy_(new_weights)
+                    graph.replay()
+                    replays.append(captured.clone())
+                torch.cuda.synchronize()
+                dist.barrier()
+                outputs[by_experts] = (eager, routes, replays)
+                del graph
+                dist.barrier()
+            decisions = [None] * ws
+            module.kStage1N128ByExperts = True
+            dist.all_gather_object(
+                decisions, config.stage1_n128_for_global_rows(sum(counts))
+            )
+            off, on = outputs[False], outputs[True]
+
+            def check():
+                assert len(set(decisions)) == 1 and decisions[0] is not None
+                torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
+                torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
+                for a, b in zip(on[2], off[2]):
+                    torch.testing.assert_close(a, b, atol=0, rtol=0)
+                if count:
+                    expected = _reference(x, ids, weights, profile)
+                    torch.testing.assert_close(on[0], expected, atol=2e-6, rtol=8e-3)
+
+            _collective_check(device, check)
+            dist.barrier()
+    finally:
+        module.kStage1N128MaxTokens, module.kStage1N128ByExperts = initial
+
+
 _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})
 
 
@@ -838,7 +1078,15 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
             + ((1025,) if capacity > 1024 else ()),
         },
     }
-    assert counts == expected[ws][profile_name]
+    expected = expected[ws][profile_name]
+    n128_max = _petit_launch_module().kStage1N128MaxTokens
+    if n128_max >= 0:
+        # C5 on: counts up to the threshold take the N=128 stage-1 tile, so the
+        # first count above it in each integer class (plain, multiple of 16)
+        # starts another variant.
+        first_div16 = (n128_max // 16 + 1) * 16
+        expected = tuple(sorted({*expected, n128_max + 1, first_div16}))
+    assert counts == expected
 
     compiled = []
     previous = triton.knobs.runtime.jit_cache_hook
@@ -858,8 +1106,11 @@ def test_distributed_petit_startup_warmup_compiles_every_variant(
         ):
             for do_finalize in (True, False):
                 run([count] * ws, do_finalize)
-        # Uneven ranks, as data-parallel attention produces them.
+        # Uneven ranks, as data-parallel attention produces them; one busy
+        # rank at decode counts (C5's received-experts selector gives the
+        # idle ranks the N=128 tile too).
         run(([848, 0, 1, capacity] + [tail, 16, 0, 1])[:ws])
+        run([6] + [0] * (ws - 1))
         run(([3, 848, 1009, 0] + [257, 0, 24, 2])[:ws], do_finalize=False)
     finally:
         triton.knobs.runtime.jit_cache_hook = previous

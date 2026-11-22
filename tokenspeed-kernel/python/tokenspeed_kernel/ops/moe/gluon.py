@@ -3766,7 +3766,10 @@ def gluon_petit_mxfp4_megamoe_apply(
         router_logits: Unused raw routing logits.
         topk_weights: Precomputed route weights for every local token.
         topk_ids: Precomputed global expert ids for every local token.
-        num_tokens_global: Unused global token-count hint.
+        num_tokens_global: Rows routed by the whole collective (DP: the sum
+            over ranks; attention TP: the replicated row count). With C5's
+            received-experts selector it picks the stage-1 tile for every
+            rank alike; otherwise unused.
         max_num_tokens_per_gpu: Largest local token count in this collective.
         do_finalize: Whether to produce the combined output. If ``False``,
             every local token's routes return to this rank unweighted and
@@ -3782,7 +3785,7 @@ def gluon_petit_mxfp4_megamoe_apply(
         ``[local_tokens, top_k, model_dim]`` in ``topk_ids`` order, so no
         permute map is returned.
     """
-    del plan, router_logits, num_tokens_global, enable_pdl, low_latency
+    del plan, router_logits, enable_pdl, low_latency
     if topk_weights is None or topk_ids is None:
         raise ValueError(
             "Gluon Petit MegaMoE requires precomputed top-k ids and weights"
@@ -3833,6 +3836,14 @@ def gluon_petit_mxfp4_megamoe_apply(
                 # Unit weights keep each route unscaled; the caller applies
                 # topk_weights after its per-route norm.
                 inputs.expert_weights.fill_(1.0)
+    # C5's received-experts selector (opt-in): one call-wide tile choice from
+    # the collective's row count, the same on every rank; None keeps the
+    # per-rank row rule.
+    stage1_n128 = (
+        None
+        if num_tokens_global is None
+        else workspace.config.stage1_n128_for_global_rows(num_tokens_global)
+    )
     if overlap_fn is not None:
         overlap_fn()
     if not do_finalize:
@@ -3846,6 +3857,7 @@ def gluon_petit_mxfp4_megamoe_apply(
             w13_bias=state.w13_bias,
             w2_bias=state.w2_bias,
             inputs=inputs,
+            stage1_n128=stage1_n128,
         )
         return routes, topk_weights, None
     output = x.new_empty((num_tokens, profile.model_dim))
@@ -3860,6 +3872,7 @@ def gluon_petit_mxfp4_megamoe_apply(
         w2_bias=state.w2_bias,
         out=output,
         inputs=inputs,
+        stage1_n128=stage1_n128,
     )
 
 

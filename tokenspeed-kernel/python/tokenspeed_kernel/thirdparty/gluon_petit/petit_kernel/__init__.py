@@ -442,6 +442,15 @@ class MegaMoeConfig:
             ops.mega_moe_stage1_tile(solution_id, num_tokens),
         )
 
+    def stage1_n128_for_global_rows(self, num_rows_global: int) -> bool | None:
+        """C5's received-experts selector: whether a call routing
+        ``num_rows_global`` rows in total takes the N=128 stage-1 tile on every
+        rank (where the rank's count admits it), or None when the selector
+        (``TOKENSPEED_PETIT_STAGE1_N128_SELECT=experts``) is off."""
+        return ops.mega_moe_stage1_n128_for_global_rows(
+            self._solution_id, int(num_rows_global)
+        )
+
     def variant_key(self, num_tokens: int) -> tuple[str, str, str]:
         """Return ``(producer geometry, stage-1 tile, num_tokens class)``.
 
@@ -487,6 +496,11 @@ class MegaMoeConfig:
         cache after the first process. Returns the counts compiled.
         """
         counts = self.variant_token_counts() if token_counts is None else token_counts
+        # C5's received-experts selector can give any 32-row-tile count the
+        # N=128 tile (a 0-row rank too), so those counts compile it as well.
+        n128_choices = (
+            (None, True) if self.stage1_n128_for_global_rows(1) is not None else (None,)
+        )
         for num_tokens in counts:
             views = MegaMoeInputViews(
                 inputs.tokens[:num_tokens],
@@ -494,6 +508,7 @@ class MegaMoeConfig:
                 inputs.expert_ids[:num_tokens],
                 inputs.expert_weights[:num_tokens],
             )
+            tile = self.launch_choice(num_tokens)[1]
             for reduce in reduce_routes:
                 # A reduced launch writes [num_tokens, model_dim] rows, as
                 # TokenSpeed's adapter allocates them; routes allocate their own.
@@ -506,20 +521,24 @@ class MegaMoeConfig:
                     if reduce
                     else None
                 )
-                self._launch(
-                    heap,
-                    w13,
-                    w2,
-                    fc1_scale,
-                    fc2_scale,
-                    num_tokens,
-                    reduce_routes=reduce,
-                    w13_bias=w13_bias,
-                    w2_bias=w2_bias,
-                    out=out,
-                    inputs=views,
-                    compile_only=True,
-                )
+                for stage1_n128 in n128_choices:
+                    if stage1_n128 and tile != "m32":
+                        continue
+                    self._launch(
+                        heap,
+                        w13,
+                        w2,
+                        fc1_scale,
+                        fc2_scale,
+                        num_tokens,
+                        reduce_routes=reduce,
+                        w13_bias=w13_bias,
+                        w2_bias=w2_bias,
+                        out=out,
+                        inputs=views,
+                        compile_only=True,
+                        stage1_n128=stage1_n128,
+                    )
         return tuple(counts)
 
     @property
@@ -579,6 +598,7 @@ class MegaMoeConfig:
         w2_bias: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
         inputs: MegaMoeInputViews | None = None,
+        stage1_n128: bool | None = None,
     ) -> torch.Tensor:
         return self._launch(
             heap,
@@ -592,6 +612,7 @@ class MegaMoeConfig:
             w2_bias=w2_bias,
             out=out,
             inputs=inputs,
+            stage1_n128=stage1_n128,
         )
 
     def run_routes(
@@ -606,6 +627,7 @@ class MegaMoeConfig:
         w13_bias: torch.Tensor | None,
         w2_bias: torch.Tensor | None,
         inputs: MegaMoeInputViews,
+        stage1_n128: bool | None = None,
     ) -> torch.Tensor:
         """Run dispatch and both stages, returning each token's routes unsummed.
 
@@ -624,6 +646,7 @@ class MegaMoeConfig:
             w2_bias=w2_bias,
             out=None,
             inputs=inputs,
+            stage1_n128=stage1_n128,
         )
 
     def _launch(
@@ -641,6 +664,7 @@ class MegaMoeConfig:
         out: torch.Tensor | None,
         inputs: MegaMoeInputViews | None,
         compile_only: bool = False,
+        stage1_n128: bool | None = None,
     ) -> torch.Tensor:
         num_tokens = int(num_tokens)
         if num_tokens < 0 or num_tokens > self.max_tokens_per_rank:
@@ -693,4 +717,5 @@ class MegaMoeConfig:
             input_topk_ids,
             input_topk_weights,
             compile_only=compile_only,
+            stage1_n128=stage1_n128,
         )
