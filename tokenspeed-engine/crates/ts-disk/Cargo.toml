@@ -1,0 +1,22 @@
+[package]
+name = "tokenspeed-disk"
+description = "Block I/O between registered memory and a local file for the Disk cache tier: io_uring or a thread pool, explicitly chosen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ts_disk"
+
+[dependencies]
+io-uring = "0.7"
+libc = "0.2"
+parking_lot = "0.12"
+thiserror.workspace = true
+tracing = "0.1"
+
+[lints]
+workspace = true

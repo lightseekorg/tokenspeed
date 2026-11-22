@@ -859,8 +859,7 @@ def test_mha_decode_and_extend_table_width():
     kv_lens = [64, 130, 17, 191]
     k_cache, v_cache, table = _paged_kv(kv_lens, 2, 64, 64)
     seqlens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
-    # 8 query heads over 2 KV heads take the grouped decode kernel, 2 over 2
-    # the per-head one.
+    # 8 query heads over 2 KV heads fold 4 heads into a program, 2 over 2 one.
     q_grouped = torch.randn(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
     q_per_head = torch.randn(4, 2, 64, device=DEVICE, dtype=torch.bfloat16)
     q_lens = torch.tensor([1, 3, 2, 4], dtype=torch.int32, device=DEVICE)
@@ -901,8 +900,8 @@ def test_mha_decode_and_extend_table_width():
     expected = run(table.shape[1])
     run(16)
     with assert_no_triton_compile(
-        decode._fwd_kernel_stage1,
-        decode._fwd_grouped_kernel_stage1,
+        decode._fwd_folded_kernel_stage1,
+        decode._fwd_folded_kernel_stage2,
         prefill._fwd_kernel,
     ):
         for cols in (5, 7, 19, 40):

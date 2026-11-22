@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 # A region starts on its own 256-byte line, so producers of different regions
 # never write the same cache line.
@@ -121,6 +122,9 @@ class Plan:
             ``POLL_TIMEOUT_MANTISSA << shift``.
             Omission selects the production bound (29, about 59 seconds).
             Both bounds are compile-time choices included in the plan key.
+        dims: The model's dimensions that the stages read at compile time
+            (``schedule.dims``), a frozen dataclass that is part of the plan
+            key; None for a model whose stages hold them as constants.
     """
 
     grid: int
@@ -134,6 +138,7 @@ class Plan:
     flags: tuple[str, ...] = ()
     poll_check: int = DEFAULT_POLL_CHECK
     poll_timeout_shift: int = DEFAULT_POLL_TIMEOUT_SHIFT
+    dims: Any = None
     # __post_init__ derives these fields: the pairs of one row of every
     # region, and the pair offset of each region in row 0.
     row_pairs: int = field(init=False)
@@ -219,6 +224,7 @@ class Plan:
             flags=self.flags,
             poll_check=self.poll_check,
             poll_timeout_shift=self.poll_timeout_shift,
+            dims=self.dims,
         )
 
     def stage(self, name: str) -> Stage:
@@ -273,6 +279,8 @@ class Plan:
             "poll_check": self.poll_check,
             "poll_timeout_shift": self.poll_timeout_shift,
         }
+        if self.dims is not None:
+            fields["dims"] = asdict(self.dims)
         return PlanKey(json.dumps(fields, separators=(",", ":")), self)
 
 

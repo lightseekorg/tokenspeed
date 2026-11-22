@@ -116,7 +116,36 @@ def _communication_worker(rank, world_size, port, check, backend, error_dict):
             dist.destroy_process_group()
 
 
-def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
+def _muse_boundary_norms(device):
+    """A Muse layer's post-attention norm (no weight) and pre-feedforward norm,
+    with the model's zero-centered gain, on device in BF16."""
+    from tokenspeed.runtime.models.muse_spark import (
+        ZERO_CENTERED_GAIN_OFFSET,
+        MuseSparkRMSNorm,
+    )
+
+    post_norm = MuseSparkRMSNorm(
+        hidden_size=8192,
+        eps=1e-6,
+        has_weight=False,
+        weight_offset=ZERO_CENTERED_GAIN_OFFSET,
+    )
+    pre_norm = MuseSparkRMSNorm(
+        hidden_size=8192,
+        eps=1e-6,
+        has_weight=True,
+        weight_offset=ZERO_CENTERED_GAIN_OFFSET,
+    ).to(device=device, dtype=torch.bfloat16)
+    # Equal on every rank, without moving the caller's random stream.
+    generator = torch.Generator(device=device).manual_seed(7)
+    with torch.no_grad():
+        pre_norm.weight.copy_(torch.randn(8192, device=device, generator=generator) / 8)
+    return post_norm, pre_norm
+
+
+def _prepare_muse_backend(
+    world_size, projection, moe, *, expert_tp_size, max_num_tokens=8192
+):
     from tokenspeed.runtime.distributed import process_group_manager as pgm
     from tokenspeed.runtime.distributed.comm_backend.registry import (
         initialize_comm_backend,
@@ -135,10 +164,18 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             post_expert_proj=None,
             down_columns=None,
         )
+    # Preparation warms the attention boundary with the first layer's norms.
+    post_norm, pre_norm = _muse_boundary_norms(
+        torch.device("cuda", torch.cuda.current_device())
+    )
     layer = SimpleNamespace(
         iris_state=None,
-        self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
+        self_attn=SimpleNamespace(
+            iris_state=None, qkv_proj=projection, owned_heads_to_owners=False
+        ),
         mlp=moe,
+        post_attention_layernorm=post_norm,
+        pre_feedforward_layernorm=pre_norm,
     )
     owner = SimpleNamespace(
         mapping=SimpleNamespace(
@@ -160,9 +197,10 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
             owned_projections=None,
         ),
     )
-    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+    prepare = MuseSparkForConditionalGeneration.prepare_communication_runtime
+    assert prepare(owner, max_num_tokens)
     state = owner.model.iris_state
-    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
+    assert prepare(owner, max_num_tokens)
     assert owner.model.iris_state is state
     assert projection.iris_state is state and moe.iris_state is state
     assert backend.get_prepared_all_gather(group, torch.bfloat16) is state.gather
@@ -180,6 +218,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         gqa_prologue,
     )
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_heads_to_owners,
         iris_a2a_transpose_qkvg,
         iris_fused_a2a_transpose_qkvg_norm_rope,
     )
@@ -261,21 +300,47 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             None,
             torch.arange(rows, device=device, dtype=torch.int64),
         )
-        return full, local, poison, positions, cache
+        # This rank's attention heads of every row, distinct per rank.
+        heads = (
+            (
+                torch.arange(rows, device=device)[:, None] % 11
+                + torch.arange(8192 // world_size, device=device)[None, :] % 5
+                + rank * 3
+            )
+            / 8
+        ).bfloat16()
+        return full, local, poison, positions, cache, heads
+
+    def check_owned_heads(heads, owned_heads):
+        """The owner's rows of every rank's heads match an all-gather."""
+        rows = heads.shape[0]
+        everyone = [torch.empty_like(heads) for _ in range(world_size)]
+        dist.all_gather(everyone, heads)
+        first = rank * owned_heads.shape[0]
+        valid = max(0, min(owned_heads.shape[0], rows - first))
+        expected = torch.zeros_like(owned_heads)
+        expected[:valid] = torch.cat(
+            [peer[first : first + valid] for peer in everyone], dim=1
+        )
+        torch.testing.assert_close(
+            owned_heads.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+        )
 
     inputs = [make_inputs(rows) for rows in (2047, 2048, 8191)]
 
     def run(item):
-        full, local, poison, positions, cache = item
+        full, local, poison, positions, cache, heads = item
         generic = state.all_reduce.acquire_outputs(
             ((state.reduction.push_max_numel + 8192,),)
         )[0]
         generic.fill_(rank + 1)
         previous = state.reduce_outputs((generic,))[0]
-        fused = reference = None
+        fused = reference = owned_heads = None
         if full.shape[0] >= MUSE_OWNED_QKVG_MIN_TOKENS:
             projected = projection.project_owned_rows(local, full.shape[0])
-            output = state.all_to_all_transpose_qkvg(projected, full.shape[0])
+            output = state.all_to_all_transpose_qkvg(
+                projected, full.shape[0], payload="bf16"
+            )
             table = rope if full.shape[0] < 4096 else nope
             q, k, v, gate = output.split(
                 tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
@@ -301,15 +366,24 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             if rank == full.shape[0] % world_size:
                 torch.cuda._sleep(20000)
             fused = state.all_to_all_transpose_qkvg_norm_rope(
-                projected, full.shape[0], positions, table, eps, q_scale
+                projected,
+                full.shape[0],
+                positions,
+                table,
+                eps,
+                q_scale,
+                payload="bf16",
             )
+            if rank == (full.shape[0] + 1) % world_size:
+                torch.cuda._sleep(20000)
+            owned_heads = state.all_to_all_heads_to_owners(heads, full.shape[0])
         else:
             normalized = state.all_gather_owned_rows(local, full.shape[0], True)
             output, _ = projection(normalized)
         # O's next producer can overwrite every old QKVG source address.
-        reduced = state.reduce_scatter_owned_rows(poison)
+        reduced = state.reduce_scatter_owned_rows(poison, payload="bf16")
         gathered = state.all_gather_owned_rows(reduced, full.shape[0], True)
-        return output, gathered, previous, fused, reference
+        return output, gathered, previous, fused, reference, owned_heads
 
     def sequence():
         return [run(item) for item in inputs]
@@ -328,7 +402,8 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             projection.weight_loader(projection.weight, weight, name)
         assert projection.weight.data_ptr() == parameter_pointer
         assert projection._local_weight().data_ptr() == local_pointer
-        for full, local, _, positions, _ in inputs:
+        for full, local, _, positions, _, heads in inputs:
+            heads.add_(1 / 8)
             positions.add_(97).remainder_(16384)
             full.add_(1 / 16)
             first = rank * local.shape[0]
@@ -337,9 +412,16 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         if rank == replay:
             torch.cuda._sleep(10000)
         graph.replay()
-        for (full, *_), (output, gathered, previous, fused, reference) in zip(
-            inputs, outputs
-        ):
+        for (full, *_, heads), (
+            output,
+            gathered,
+            previous,
+            fused,
+            reference,
+            owned_heads,
+        ) in zip(inputs, outputs):
+            if owned_heads is not None:
+                check_owned_heads(heads, owned_heads)
             if fused is not None:
                 for actual, expected in zip(fused, reference):
                     assert actual.is_contiguous() and bool(torch.isfinite(actual).all())
@@ -371,15 +453,87 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
             rtol=0,
             atol=0,
         )
+    # The largest owned-row round the producer holds: its last rows sit at
+    # the far end of the heads all-to-all's source and output.
+    capacity = state.all_reduce.producer_direct_max_numel // 8192
+    while not state.can_use_owned_rows(capacity):
+        capacity -= 1
     with assert_no_triton_compile(
-        iris_a2a_transpose_qkvg, iris_fused_a2a_transpose_qkvg_norm_rope
+        iris_a2a_heads_to_owners,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
     ):
         for rows in (2051, 8190):
-            output, _, _, fused, reference = run(make_inputs(rows))
+            item = make_inputs(rows)
+            output, _, _, fused, reference, owned_heads = run(item)
             for actual, expected in zip(fused, reference):
                 torch.testing.assert_close(
                     actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
                 )
+            check_owned_heads(item[-1], owned_heads)
+        heads = make_inputs(capacity)[-1]
+        check_owned_heads(heads, state.all_to_all_heads_to_owners(heads, capacity))
+        # Rows past the layout, or heads of the wrong width or dtype, are refused.
+        with pytest.raises(ValueError, match="outside the owned-row layout"):
+            state.all_to_all_heads_to_owners(
+                make_inputs(capacity + 1)[-1], capacity + 1
+            )
+        with pytest.raises(ValueError, match="heads must be BF16"):
+            state.all_to_all_heads_to_owners(heads.float(), capacity)
+        with pytest.raises(ValueError, match="heads must be BF16"):
+            state.all_to_all_heads_to_owners(heads[:, :-8], capacity)
+
+    # The token owners' whole output projection equals the per-rank partials
+    # reduce-scattered to them. Sparse +-1 weights over small integer heads
+    # keep every sum exact, so the column order is checked bit for bit.
+    from tokenspeed.runtime.layers.linear import RowParallelLinear
+    from tokenspeed.runtime.models.muse_spark import MuseSparkAttention
+
+    attention = MuseSparkAttention.__new__(MuseSparkAttention)
+    torch.nn.Module.__init__(attention)
+    with torch.device(device):
+        attention.o_proj = RowParallelLinear(
+            input_size=8192,
+            output_size=8192,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=None,
+            reduce_results=False,
+            quant_config=None,
+            prefix="model.layers.1.self_attn.o_proj",
+            tp_rank=rank,
+            tp_size=world_size,
+            tp_group=tuple(range(world_size)),
+            use_presharded_weights=False,
+            override_kernel_name=None,
+        )
+    attention.owned_heads_to_owners = True
+    attention.owned_output_proj = None
+    attention.iris_state = state
+    weight = torch.zeros(8192, 8192, device=device)
+    outputs = torch.arange(8192, device=device)
+    for term in range(4):
+        weight[outputs, (outputs * 13 + term * 2053) % 8192] = (-1) ** term
+    attention.o_proj.weight_loader(attention.o_proj.weight, weight)
+    attention.prepare_owned_output_weight()
+    for rows in (2047, 4100):
+        heads = (
+            (torch.arange(rows, device=device)[:, None] * 7 + rank)
+            + torch.arange(8192 // world_size, device=device)[None, :]
+        ) % 5 - 2
+        heads = heads.bfloat16()
+        partial = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        torch.mm(heads, attention.o_proj.weight.T, out=partial)
+        expected = state.reduce_scatter_owned_rows(partial, payload="bf16").clone()
+        actual = attention.project_owned_heads(heads, rows)
+        valid = max(0, min(actual.shape[0], rows - rank * actual.shape[0]))
+        torch.testing.assert_close(
+            actual[:valid].view(torch.int16),
+            expected[:valid].view(torch.int16),
+            rtol=0,
+            atol=0,
+        )
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -489,6 +643,7 @@ def _muse_tp_routes_worker(rank, world_size, device):
                 tokens,
                 weights,
                 owned_rows=owned,
+                payload="bf16",
             )
 
         if scattered:
@@ -676,12 +831,14 @@ def _muse_tp_owned_forward_worker(
             full = torch.randn(rows, 8192, device=device)
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
-            expected_rows, _, _ = moe(
-                full, full.float(), rows, rows, None, project=True
+            expected_rows, _ = moe(
+                full, full.float(), rows, rows, None, project=True, payload="bf16"
             )
             expected_rows = expected_rows.clone()
             expected = expected_rows[first : first + valid]
-            actual, _, _ = moe(local, local.float(), rows, rows, rows, project=True)
+            actual, _ = moe(
+                local, local.float(), rows, rows, rows, project=True, payload="bf16"
+            )
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
             state.all_reduce.producer.data.fill_(torch.nan)
@@ -698,11 +855,286 @@ def _muse_tp_owned_forward_worker(
                     assert (
                         moe._route_and_quantize_inputs(rows_in, router_in) is not None
                     )
-                    decode, _, _ = moe(rows_in, router_in, small, small, None, True)
+                    decode, _ = moe(
+                        rows_in, router_in, small, small, None, True, payload="bf16"
+                    )
                     torch.testing.assert_close(
                         decode, expected_rows[:small], atol=2**-7, rtol=2**-7
                     )
         dist.barrier()
+
+
+def _int8_block16_round_trip(x):
+    """decode(encode(x)) of the int8-block16 payload, by its definition."""
+    blocks = x.float().reshape(-1, 16)
+    amax = torch.clamp(blocks.abs().amax(1), min=1e-30)
+    # The encoder divides by 127 correctly rounded. On the GPU torch divides
+    # a tensor by a Python scalar as a multiply by its reciprocal, which
+    # differs in the last bit for some blocks, so the scales divide on the
+    # host (as the encoder test's reference does).
+    scale = (amax.cpu() / 127.0).to(x.device)
+    # INT8 codes have no negative zero.
+    codes = torch.round(blocks / scale[:, None]).clamp(-127.0, 127.0).to(torch.int8)
+    return (codes.float() * scale[:, None]).to(torch.bfloat16).reshape(x.shape)
+
+
+def _muse_owned_rows_default_cap_worker(rank, world_size, device):
+    """At the default prefill chunk size the owned-row buffers hold 8192 rows
+    whatever the largest forward, and 8192 rows take owned rows, 8193 not."""
+    torch.set_grad_enabled(False)
+    _, state = _prepare_muse_backend(
+        world_size, None, None, expert_tp_size=1, max_num_tokens=24577
+    )
+    assert state.all_reduce.producer.data.numel() == 8192 * 8192
+    assert (
+        state.all_reduce.producer_pull.scratch.numel()
+        == (8192 * 8192 + world_size - 1) // world_size
+    )
+    assert state.can_use_owned_rows(8192) and not state.can_use_owned_rows(8193)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def _muse_owned_far_rows_worker(rank, world_size, device):
+    """Owned rows at a 24576-token prefill chunk use the last element of the
+    producer buffer and of pull scratch bit for bit (reduce-scatter in BF16 and
+    int8-block16, row gathers, both QKVG all-to-alls, the heads all-to-all and
+    the MoE-input gather), and row counts up to the cap compile nothing new."""
+    torch.set_grad_enabled(False)
+    torch.set_default_dtype(torch.bfloat16)
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_pull_allgather_rows,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        prepare_muse_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
+        iris_a2a_heads_to_owners,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+    )
+    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
+        iris_pull_reduce_scatter,
+    )
+
+    from tokenspeed.runtime.models.muse_spark import QKVOGateParallelLinear
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    cap = 24576
+    # A 24576-token prefill chunk, with int8-block16 payloads prepared too.
+    # This worker runs in its own spawned process.
+    global_server_args_dict["chunked_prefill_size"] = cap
+    global_server_args_dict["prefill_collective_payload"] = "int8-block16"
+    with torch.device(device):
+        projection = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="model.layers.1.self_attn.qkv_proj",
+            tp_rank=rank,
+            tp_size=world_size,
+            tp_group=tuple(range(world_size)),
+            replicate_for_owned_rows=True,
+        )
+    # Forwards past the cap must not grow the buffers past it.
+    _, state = _prepare_muse_backend(
+        world_size, projection, None, expert_tp_size=1, max_num_tokens=cap + 1
+    )
+    producer = state.all_reduce.producer.data
+    scratch = state.all_reduce.producer_pull.scratch
+    assert producer.numel() == cap * 8192
+    assert scratch.numel() == (cap * 8192 + world_size - 1) // world_size
+    assert state.can_use_owned_rows(cap) and not state.can_use_owned_rows(cap + 1)
+    with pytest.raises(ValueError, match="32-bit buffer offsets"):
+        prepare_muse_communication(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=0,
+            producer_direct_max_numel=2**30,
+            enable_lamport=False,
+            owned_route_max_rows=0,
+            intermediate_gather_max_rows=0,
+            all_reduce=None,
+            int8_payloads=False,
+            device=device,
+        )
+    # One-hot rows make the owned QKVG projection exact.
+    columns = []
+    for index, (name, width) in enumerate(
+        (("q", 8192), ("k", 1024), ("v", 1024), ("g", 8192))
+    ):
+        weight = torch.zeros(width, 8192, device=device)
+        sources = (torch.arange(width, device=device) * 13 + index * 17) % 8192
+        weight[torch.arange(width, device=device), sources] = 1
+        projection.weight_loader(projection.weight, weight, name)
+        shard = width // world_size
+        columns.append(sources[rank * shard : (rank + 1) * shard])
+    columns = torch.cat(columns)
+
+    def bits(tensor):
+        return tensor.view(torch.int16)
+
+    def run(rows):
+        local_rows = (rows + world_size - 1) // world_size
+        first = rank * local_rows
+        valid = max(0, min(local_rows, rows - first))
+        contributions = [
+            torch.randn(
+                (rows, 8192),
+                device=device,
+                dtype=torch.float32,
+                generator=torch.Generator(device=device).manual_seed(rows * 8 + peer),
+            ).bfloat16()
+            for peer in range(world_size)
+        ]
+        # The reduce-scatter adds rank 0's partial first, then ranks 1, 2, ...
+        total = contributions[0].float()
+        for contribution in contributions[1:]:
+            total += contribution.float()
+        reduced_rows = total.bfloat16()
+        del total
+        int8_parts = [_int8_block16_round_trip(c) for c in contributions]
+        total8 = int8_parts[0].float()
+        for part in int8_parts[1:]:
+            total8 += part.float()
+        int8_rows = total8.bfloat16()
+        del total8, int8_parts
+        own_contribution = contributions[rank].clone()
+        stream = torch.randn(
+            (world_size * local_rows, 8192),
+            device=device,
+            dtype=torch.float32,
+            generator=torch.Generator(device=device).manual_seed(rows * 8 + 7),
+        )
+        hidden = (
+            (
+                torch.arange(rows, device=device)[:, None] % 13
+                + torch.arange(8192, device=device)[None, :] % 7
+            )
+            / 16
+        ).bfloat16()
+        local_hidden = torch.full((local_rows, 8192), float("nan"), device=device)
+        local_hidden[:valid].copy_(hidden[first : first + valid])
+
+        scratch.fill_(float("nan"))
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.copy_(contributions[rank])
+        del contributions
+        torch.cuda.synchronize()
+        dist.barrier()
+        reduced = state.reduce_scatter_owned_rows(branch, payload="bf16")
+        reduced_copy = reduced.clone()
+        gathered = state.all_gather_owned_rows(reduced, rows, True)
+        tap = state.all_gather_owned_stream_bf16(
+            stream[first : first + local_rows].contiguous(), rows
+        )
+        projected = projection.project_owned_rows(local_hidden, rows)
+        qkvg = state.all_to_all_transpose_qkvg(projected, rows, payload="bf16")
+        torch.cuda.synchronize()
+        if rows == cap:
+            # The reduce-scatter reads every rank's producer buffer up to its
+            # last element and, at an even split, fills pull scratch.
+            end = producer.data_ptr() + producer.numel() * producer.element_size()
+            assert branch.data_ptr() + branch.numel() * 2 == end
+            if cap % world_size == 0:
+                assert reduced.data_ptr() == scratch.data_ptr()
+                assert reduced.numel() == scratch.numel()
+        expected = torch.zeros_like(reduced_copy)
+        expected[:valid] = reduced_rows[first : first + valid]
+        torch.testing.assert_close(bits(reduced_copy), bits(expected), atol=0, rtol=0)
+        # The far rows explicitly, for a readable failure.
+        torch.testing.assert_close(
+            bits(gathered[-8:]), bits(reduced_rows[-8:]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(bits(gathered), bits(reduced_rows), atol=0, rtol=0)
+        torch.testing.assert_close(
+            bits(tap), bits(stream[:rows].bfloat16()), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            bits(qkvg), bits(hidden.index_select(1, columns)), atol=0, rtol=0
+        )
+        # The fused QKVG all-to-all copies V and the gate unchanged: they equal
+        # the plain all-to-all's V and gate columns bit for bit.
+        projected = projection.project_owned_rows(local_hidden, rows)
+        empty_cache = torch.empty((1, 0), device=device, dtype=torch.float32)
+        positions = torch.arange(rows, device=device, dtype=torch.int64)
+        _, _, fused_v, fused_gate = state.all_to_all_transpose_qkvg_norm_rope(
+            projected, rows, positions, empty_cache, 1e-6, 0.125, payload="bf16"
+        )
+        _, _, plain_v, plain_gate = qkvg.split(
+            tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
+        )
+        torch.testing.assert_close(bits(fused_v), bits(plain_v), atol=0, rtol=0)
+        torch.testing.assert_close(bits(fused_gate), bits(plain_gate), atol=0, rtol=0)
+        # int8-block16 reduce-scatter: the sum of each rank's round-tripped
+        # contribution in rank order, rounded once.
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.copy_(own_contribution)
+        torch.cuda.synchronize()
+        dist.barrier()
+        reduced8 = state.reduce_scatter_owned_rows(branch, payload="int8-block16")
+        expected8 = torch.zeros_like(reduced8)
+        expected8[:valid] = int8_rows[first : first + valid]
+        torch.testing.assert_close(bits(reduced8), bits(expected8), atol=0, rtol=0)
+        # The heads all-to-all: the owner's rows of every rank's heads.
+        heads = (
+            (
+                torch.arange(rows, device=device)[:, None] % 11
+                + torch.arange(8192 // world_size, device=device)[None, :] % 5
+                + rank * 3
+            )
+            / 8
+        ).bfloat16()
+        owned_heads = state.all_to_all_heads_to_owners(heads, rows)
+        everyone = [torch.empty_like(heads) for _ in range(world_size)]
+        dist.all_gather(everyone, heads)
+        expected_heads = torch.zeros_like(owned_heads)
+        expected_heads[:valid] = torch.cat(
+            [peer[first : first + valid] for peer in everyone], dim=1
+        )
+        torch.testing.assert_close(
+            bits(owned_heads), bits(expected_heads), atol=0, rtol=0
+        )
+        # The MoE-input gather: every rank receives all rows, ids and weights.
+        moe_rows = hidden[first : first + local_rows, :4096].contiguous()
+        if moe_rows.shape[0] < local_rows:
+            moe_rows = torch.cat(
+                [moe_rows, moe_rows.new_zeros(local_rows - moe_rows.shape[0], 4096)]
+            )
+        ids = (
+            torch.arange(local_rows * 8, device=device, dtype=torch.int32).view(-1, 8)
+            + first * 8
+        ) % 256
+        weights = ids.float() / 256
+        packet, all_ids, all_weights = state.gather_owned_moe_inputs(
+            moe_rows, ids, weights, rows, valid
+        )
+        torch.testing.assert_close(
+            bits(packet), bits(hidden[:, :4096].contiguous()), atol=0, rtol=0
+        )
+        expected_ids = (
+            torch.arange(rows * 8, device=device, dtype=torch.int32).view(-1, 8) % 256
+        )
+        assert torch.equal(all_ids, expected_ids)
+        assert torch.equal(all_weights, expected_ids.float() / 256)
+
+    # Uneven (padded) and full splits at the cap check every element.
+    for rows in (cap - 1, cap):
+        run(rows)
+    # Serving round sizes between 16384 rows and the cap reuse the kernels.
+    with assert_no_triton_compile(
+        iris_pull_reduce_scatter,
+        iris_pull_allgather_rows,
+        iris_a2a_transpose_qkvg,
+        iris_fused_a2a_transpose_qkvg_norm_rope,
+        iris_a2a_heads_to_owners,
+    ):
+        for rows in (16384, 16385, 20483, cap - 16):
+            run(rows)
+    torch.cuda.synchronize()
+    dist.barrier()
 
 
 def _muse_owned_routed_wt_worker(rank, world_size, device):
@@ -734,7 +1166,15 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     moe.tp_size = 1
     moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
     moe.post_expert_norm.weight = torch.nn.Parameter(norm)
-    group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    # Prepare int8-block16 payloads too; each call names its payload. Restored
+    # once the state is prepared (it reads the flag only there).
+    global_server_args_dict["prefill_collective_payload"] = "int8-block16"
+    try:
+        group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
+    finally:
+        global_server_args_dict["prefill_collective_payload"] = "bf16"
 
     def inputs(rows):
         torch.manual_seed(rows + rank * 17)
@@ -766,7 +1206,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         case["packet"].fill_((rank + 1) * (step + 1) / 8)
         case["attention"].fill_((rank + 1) * (step + 1) / 16)
 
-    def reference(routes, mapping, rows, weights):
+    def reference(routes, mapping, rows, weights, payload):
         norm = moe.post_expert_norm
         if mapping is None:
             combined = routed_input_scale_rmsnorm_sum(
@@ -795,14 +1235,16 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 output,
                 None,
             )
-        return state.reduce_scatter_owned_rows(output).clone()
+        return state.reduce_scatter_owned_rows(output, payload=payload).clone()
 
     def run(case):
         rows = case["rows"]
-        expected = reference(case["routes"], case["mapping"], rows, case["weights"])
+        expected = reference(
+            case["routes"], case["mapping"], rows, case["weights"], "bf16"
+        )
         producer = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
         producer.copy_(case["attention"])
-        state.reduce_scatter_owned_rows(producer)
+        state.reduce_scatter_owned_rows(producer, payload="bf16")
         local_rows = (rows + world_size - 1) // world_size
         valid = max(0, min(local_rows, rows - rank * local_rows))
         packet, _, _ = state.gather_owned_moe_inputs(
@@ -811,7 +1253,12 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         if rank == rows % world_size:
             torch.cuda._sleep(20000)
         actual = moe._reduce_expert_routes(
-            case["routes"], case["mapping"], rows, case["weights"], owned_rows=True
+            case["routes"],
+            case["mapping"],
+            rows,
+            case["weights"],
+            owned_rows=True,
+            payload="bf16",
         ).clone()
         upper = state.acquire_owned_post_expert_output(rows, 8192)
         upper[:, :4096].copy_(actual)
@@ -880,13 +1327,40 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     )
     # The unmapped BF16 layer retains the portable producer and release path.
     dense = cases[1]["original"].view(193, 8, 4096)
-    expected = reference(dense, None, 193, cases[1]["weights"])
+    expected = reference(dense, None, 193, cases[1]["weights"], "bf16")
     actual = moe._reduce_expert_routes(
-        dense, None, 193, cases[1]["weights"], owned_rows=True
+        dense, None, 193, cases[1]["weights"], owned_rows=True, payload="bf16"
     )
     torch.testing.assert_close(
         actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
     )
+    # int8-block16: the routed sum writes the payload codes and scales itself;
+    # the owners' rows must equal the separate sum, encode and pull.
+    for case in cases:
+        for step in range(3):
+            update(case, step)
+            expected = reference(
+                case["routes"],
+                case["mapping"],
+                case["rows"],
+                case["weights"],
+                "int8-block16",
+            )
+            actual = moe._reduce_expert_routes(
+                case["routes"],
+                case["mapping"],
+                case["rows"],
+                case["weights"],
+                owned_rows=True,
+                payload="int8-block16",
+            )
+            torch.testing.assert_close(
+                actual.view(torch.int16),
+                expected.view(torch.int16),
+                rtol=0,
+                atol=0,
+                msg=lambda m: f"int8-block16 rows {case['rows']} step {step}: {m}",
+            )
     torch.cuda.synchronize()
     dist.barrier()
 
@@ -976,7 +1450,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
     # A reduce-scatter result lives in pull scratch; reducing it in place
     # through the pull would overwrite it, so the policy declines it.
     full, _ = operands(192)
-    owned = state.reduce_scatter_owned_rows(full)
+    owned = state.reduce_scatter_owned_rows(full, payload="bf16")
     # Refill the view with small integers so the reduction stays exact.
     values, expected = operands(owned.shape[0])
     owned.copy_(values)
@@ -1093,11 +1567,91 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _muse_boundary_warmup_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_lamport_allreduce_muse_attntail,
+    )
+    from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
+        triton_post_norm_residual_pre_norm,
+    )
+
+    # Startup preparation alone must compile the attention boundary's Lamport
+    # push for every row count it serves: rows pick its peer order, staggered
+    # from 5 rows, so batches on both sides of that bound reuse the warmup.
+    _, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
+    post_norm, pre_norm = _muse_boundary_norms(device)
+    torch.manual_seed(11)
+    beta = torch.sigmoid(torch.randn(8192, device=device))
+    alpha = torch.sqrt(1 - beta.square())
+    row_counts = (1, 4, 5, 8, state.boundary_max_rows)
+    bases = [torch.randn(rows, 8192, device=device) for rows in row_counts]
+    streams = [torch.randn_like(base) for base in bases]
+
+    def contribution(base, peer):
+        return (base + (peer + 1) / 8).bfloat16()
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    outputs = []
+    with assert_no_triton_compile(iris_fused_lamport_allreduce_muse_attntail):
+        for base, stream in zip(bases, streams):
+            branch = state.all_reduce.acquire_outputs((tuple(base.shape),))[0]
+            branch.copy_(contribution(base, rank))
+            assert state.can_all_reduce_symmetric_boundary(
+                branch, stream, post_norm.weight, alpha, beta, pre_norm.weight
+            )
+            outputs.append(
+                state.all_reduce_symmetric_boundary(
+                    branch,
+                    stream,
+                    post_norm.weight,
+                    alpha,
+                    beta,
+                    pre_norm.weight,
+                    post_norm.eps,
+                    post_norm.weight_offset,
+                    pre_norm.eps,
+                    pre_norm.weight_offset,
+                )
+            )
+    for base, stream, actual in zip(bases, streams, outputs):
+        reduced = sum(contribution(base, peer).float() for peer in range(world_size))
+        expected = triton_post_norm_residual_pre_norm(
+            stream,
+            reduced.bfloat16(),
+            post_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            alpha,
+            beta,
+            pre_norm.weight,
+            pre_norm.eps,
+            pre_norm.weight_offset,
+            False,
+            None,
+            1,
+        )
+        for got, reference in zip(actual, expected):
+            torch.testing.assert_close(
+                got,
+                reference,
+                atol=1e-5 if got.dtype == torch.float32 else 0.015625,
+                rtol=2e-5 if got.dtype == torch.float32 else 0.008,
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 @pytest.mark.parametrize(
     "check,backend",
     [
+        pytest.param(_muse_boundary_warmup_worker, "nccl", id="boundary_warmup"),
         pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
+        pytest.param(_muse_owned_far_rows_worker, "nccl", id="owned_far_rows"),
+        pytest.param(
+            _muse_owned_rows_default_cap_worker, "nccl", id="owned_rows_default_cap"
+        ),
         pytest.param(
             _muse_ordinary_all_reduce_worker, "nccl", id="ordinary_all_reduce"
         ),

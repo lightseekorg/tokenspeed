@@ -41,7 +41,12 @@
 namespace tokenspeed {
 
 struct StorageReservation {
+    // The boundary the reservation resumes the prompt at; 0 when empty.
+    std::int32_t num_tokens{0};
     std::vector<CacheKey> keys;
+    // Each key's block index in its group's request table, parallel to
+    // `keys` (holes before a sliding window included).
+    std::vector<std::int32_t> logical_blocks;
     std::vector<CacheBlockRef> blocks;
     ContentHash tail_prior;
     std::optional<TailPublication> tail;
@@ -80,6 +85,13 @@ public:
     // (warm Host hits counted). Empty when no boundary fits.
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
+    // Peer sharing with a Disk tier (docs/rfcs/0006-disk-tier.md): what a
+    // holder lists when `disk_hits`, keys its Disk holds, extend its local
+    // hit -- the longest boundary the Device, the Host and the Disk resume
+    // together under the Host-suffix rule, each page from the fastest tier
+    // holding it, at the slots PrefixProber::ListPrefix uses. Reads only;
+    // num_tokens is 0 when the Disk adds nothing to the Device's hit.
+    PrefixProber::PrefixListing ListWithDisk(const PromptPrefix& prompt, std::span<const CacheKey> disk_hits) const;
 
 private:
     // The complete dependency set selected by a matcher, with each key's

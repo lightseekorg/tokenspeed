@@ -5896,8 +5896,8 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .block_granularity = 2},
             {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .replayable = true, .block_granularity = 2},
         };
-        auto coordinator =
-            MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
+        auto coordinator = MakeCoordinator(specs, 4, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, true,
+                                           /*checkpoint_retention_requests=*/0);
         const std::vector<std::string> hashes{"first", "second"};
         const std::vector<CacheKey> keys{
             {.group_id = 1, .content_hash = ContentHash{hashes[1]}},
@@ -5959,8 +5959,8 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
         {.attn_kind = AttnKind::kState},
         {.attn_kind = AttnKind::kState},
     };
-    auto coordinator =
-        MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, true,
+                                       /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     const std::vector<GroupDemand> demands{
         {.table = &tables[0], .extent = StateStep{StateStep::Kind::kRotate}},

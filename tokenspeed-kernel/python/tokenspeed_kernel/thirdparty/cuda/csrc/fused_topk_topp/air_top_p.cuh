@@ -281,6 +281,9 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
 template <typename T>
 __global__ void AirTopPRadixKernel(Counter<T>* counters, HisT<T>* histograms,
                                    IdxT* countHistograms, int const pass, T* buf1, T* buf2) {
+    // No-op unless launched with PDL; then the input and the preceding
+    // kernel's counters, histograms and survivor buffers must be visible first.
+    cudaGridDependencySynchronize();
     using HisT_ = HisT<T>;
     int const batchId = blockIdx.y;
     auto counter = counters + batchId;
@@ -404,6 +407,8 @@ __global__ void AirTopPInitKernel(Counter<T>* counters, int len, T const* in,
                                   float const* top_p_arr, int32_t const* top_k_arr,
                                   int32_t maxTopK, HisT<T>* histograms,
                                   IdxT* countHistograms) {
+    // No-op unless launched with PDL; then the per-row knobs must be visible first.
+    cudaGridDependencySynchronize();
     int const batchIdx = blockIdx.x;
     Counter<T>* counter = counters + batchIdx;
     int32_t k = top_k_arr[batchIdx];

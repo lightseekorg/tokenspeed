@@ -220,20 +220,15 @@ if platform.is_amd:
         fold_into: MailboxTarget | None,
     ) -> torch.Tensor | None:
         """Apply NVFP4 or MXFP8 experts with shared routing and BF16 rounding
-        boundaries. MXFP8 runs the same kernel about 1.9x faster than the
-        portable Triton GEMM at the C1 shape (w13 103 -> 54 us on MI350X)."""
+        boundaries. On gfx950 this kernel is faster than the portable
+        Triton GEMM for both formats at decode sizes, and its LDS ring
+        shortens the w13 stage further."""
         del experts  # per-expert tiles need no global count
         # Keep small batches narrow. Prefill reuses each weight tile across more
         # rows. At decode, 64-wide output tiles give more tiles than the 2-per-CU
-        # persistent programs (C1 on MI350X, 7 experts: w13 168 -> 137 us).
-        # NVFP4 prefill upcasts each weight tile once per 64 rows (a 2048-token
-        # chunk routes about 43 rows to an expert): w13 1.69 -> 0.86 ms.
-        if x.shape[0] < 1024:
-            tiles = (16, 64, 256)
-        elif formats == ("nvfp4", "nvfp4"):
-            tiles = (64, 128, 128)
-        else:
-            tiles = (32, 128, 128)
+        # persistent programs. Prefill upcasts each weight tile once per 64
+        # rows, which halves the w13 time of a 2048-token chunk.
+        tiles = (16, 64, 256) if x.shape[0] < 1024 else (64, 128, 128)
         return _block_scaled_moe_routes(
             x,
             w13,
@@ -255,10 +250,10 @@ if platform.is_amd:
             fold_into=fold_into,
             matmul=gluon_block_scaled_moe_routes_mm_gfx950,
             tiles=tiles,
-            # The kernel reads BF16 activations instead of decoding NVFP4 codes
-            # for every output tile (C1 w13: 82 -> 61 us). MXFP8 codes decode
-            # cheaply in the kernel.
-            bf16_activations=formats == ("nvfp4", "nvfp4"),
+            # The kernel reads BF16 activations instead of decoding the codes
+            # for every output tile, and streams
+            # whole tiles of either format through its LDS ring.
+            bf16_activations=True,
         )
 
 

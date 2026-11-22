@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     _index_k_layernorm_fp8_scatter_kernel,
     _index_k_layernorm_scatter_kernel,
     _state_verify_commit_rows_kernel,
+    _store_kv_cache_kernel,
     _store_state_rows_kernel,
     _zero_page_fields_kernel,
     copy_page_fields,
@@ -44,6 +45,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_layernorm_fp8_scatter,
     index_k_layernorm_scatter,
     state_verify_commit_rows,
+    store_kv_cache,
     store_state_rows,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
@@ -62,7 +64,19 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     split_slots_by_owner,
 )
 from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
+from utils import (
+    ARENA_DIM,
+    ARENA_HKV,
+    ARENA_HQ,
+    ARENA_LARGE_SLOTS,
+    ARENA_SMALL_SLOTS,
+    ARENA_TOKENS,
+    arena_caches,
+    arena_slots,
+    assert_no_triton_compile,
+    needs_amd_arena_key,
+    skip_without_arena_memory,
+)
 
 
 def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
@@ -1683,3 +1697,61 @@ def test_index_k_layernorm_fp8_scatter_reuses_compile_across_token_counts(
     with assert_no_triton_compile(_index_k_layernorm_fp8_scatter_kernel):
         for tokens in (4, 7, 64, 300, 2048):
             run(tokens)
+
+
+# A small KV arena and one past 2 GiB: serving sizes the arena after startup's
+# warm-up (a small probe arena, then the full one), and on AMD Triton keys a
+# binary on whether a tensor's storage fits in 2 GiB, so the kernels that write
+# the arena do not specialize its pointers.
+@needs_amd_arena_key
+def test_store_kv_cache_serves_a_large_arena_with_the_small_arenas_binary():
+    skip_without_arena_memory()
+    _, k, v = (
+        torch.randn(ARENA_TOKENS, (ARENA_HQ + 2 * ARENA_HKV) * ARENA_DIM, device="cuda")
+        .bfloat16()
+        .split(
+            [ARENA_HQ * ARENA_DIM, ARENA_HKV * ARENA_DIM, ARENA_HKV * ARENA_DIM],
+            dim=-1,
+        )
+    )
+
+    def write(slots: int, first: int):
+        k_cache, v_cache = arena_caches(slots)
+        loc = arena_slots(first)
+        store_kv_cache(
+            k.view(ARENA_TOKENS, ARENA_HKV, ARENA_DIM),
+            v.view(ARENA_TOKENS, ARENA_HKV, ARENA_DIM),
+            k_cache,
+            v_cache,
+            loc,
+        )
+        return k_cache[loc].clone(), v_cache[loc].clone()
+
+    small = write(ARENA_SMALL_SLOTS, 0)
+    with assert_no_triton_compile(_store_kv_cache_kernel):
+        large = write(ARENA_LARGE_SLOTS, ARENA_LARGE_SLOTS - ARENA_SMALL_SLOTS)
+    torch.cuda.synchronize()
+    assert torch.equal(small[0], large[0]) and torch.equal(small[1], large[1])
+
+
+def test_store_kv_cache_writes_an_unaligned_cache():
+    """A cache whose base is not 16-byte aligned (here one element in) takes
+    the unaligned stores and holds the same rows."""
+    k = torch.randn(ARENA_TOKENS, ARENA_HKV, ARENA_DIM, device="cuda").bfloat16()
+    v = torch.randn_like(k)
+    loc = arena_slots(0)
+    rows = []
+    for offset in (0, 1):
+        width = ARENA_HKV * ARENA_DIM
+        k_cache, v_cache = (
+            torch.zeros(
+                ARENA_SMALL_SLOTS * width + 1, dtype=torch.bfloat16, device="cuda"
+            )[offset : offset + ARENA_SMALL_SLOTS * width].view(
+                ARENA_SMALL_SLOTS, ARENA_HKV, ARENA_DIM
+            )
+            for _ in range(2)
+        )
+        store_kv_cache(k, v, k_cache, v_cache, loc)
+        rows.append((k_cache[loc].clone(), v_cache[loc].clone()))
+    assert torch.equal(rows[0][0], k) and torch.equal(rows[0][1], v)
+    assert torch.equal(rows[0][0], rows[1][0]) and torch.equal(rows[0][1], rows[1][1])

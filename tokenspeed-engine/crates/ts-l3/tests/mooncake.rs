@@ -191,6 +191,7 @@ const CONFIG: ExecutorConfig = ExecutorConfig {
     write_workers: 1,
     failure_threshold: 1,
     recovery_interval: Duration::from_secs(30),
+    clear_cache_drain_timeout: Duration::from_millis(500),
 };
 
 /// 64-byte blocks, one per LCM block, in a 4 KiB pool; with `shard_count`
