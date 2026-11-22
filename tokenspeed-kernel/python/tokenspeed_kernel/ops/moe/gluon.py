@@ -220,20 +220,15 @@ if platform.is_amd:
         fold_into: MailboxTarget | None,
     ) -> torch.Tensor | None:
         """Apply NVFP4 or MXFP8 experts with shared routing and BF16 rounding
-        boundaries. MXFP8 runs the same kernel about 1.9x faster than the
-        portable Triton GEMM at the C1 shape (w13 103 -> 54 us on MI350X)."""
+        boundaries. On gfx950 this kernel is faster than the portable
+        Triton GEMM for both formats at decode sizes, and its LDS ring
+        shortens the w13 stage further."""
         del experts  # per-expert tiles need no global count
         # Keep small batches narrow. Prefill reuses each weight tile across more
         # rows. At decode, 64-wide output tiles give more tiles than the 2-per-CU
-        # persistent programs (C1 on MI350X, 7 experts: w13 168 -> 137 us).
-        # NVFP4 prefill upcasts each weight tile once per 64 rows (a 2048-token
-        # chunk routes about 43 rows to an expert): w13 1.69 -> 0.86 ms.
-        if x.shape[0] < 1024:
-            tiles = (16, 64, 256)
-        elif formats == ("nvfp4", "nvfp4"):
-            tiles = (64, 128, 128)
-        else:
-            tiles = (32, 128, 128)
+        # persistent programs. Prefill upcasts each weight tile once per 64
+        # rows, which halves the w13 time of a 2048-token chunk.
+        tiles = (16, 64, 256) if x.shape[0] < 1024 else (64, 128, 128)
         return _block_scaled_moe_routes(
             x,
             w13,
@@ -255,10 +250,10 @@ if platform.is_amd:
             fold_into=fold_into,
             matmul=gluon_block_scaled_moe_routes_mm_gfx950,
             tiles=tiles,
-            # The kernel reads BF16 activations instead of decoding NVFP4 codes
-            # for every output tile (C1 w13: 82 -> 61 us). MXFP8 codes decode
-            # cheaply in the kernel.
-            bf16_activations=formats == ("nvfp4", "nvfp4"),
+            # The kernel reads BF16 activations instead of decoding the codes
+            # for every output tile, and streams
+            # whole tiles of either format through its LDS ring.
+            bf16_activations=True,
         )
 
 
@@ -1536,6 +1531,10 @@ if platform.is_amd:
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
 
+    def gluon_mxfp4_gfx950_n16_moe_weights(plan: dict, w: torch.nn.Module) -> None:
+        del plan
+        preprocess_n16_mxfp4_weights(w)
+
     def gluon_mxfp4_gfx950_a8w4_situ_ep_weights(plan: dict, w: torch.nn.Module) -> None:
         if hasattr(w, "w13_weight") and w.w13_weight.ndim == 6:
             raise ValueError("N16 MXFP4 weights were already prepared")
@@ -2063,6 +2062,75 @@ if platform.is_amd:
         _warmup_sorted_prefill_gfx950
     )
 
+    def _a8w4_situ_precomputed_apply(
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        w: torch.nn.Module,
+        topk_weights: torch.Tensor | None,
+        topk_ids: torch.Tensor | None,
+        do_finalize: bool,
+        shared_input: torch.Tensor | None,
+        shared_weight: torch.Tensor | None,
+        shared_out: torch.Tensor | None,
+        *,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        w13_mx_scale: torch.Tensor,
+        w2_mx_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """The A8W4 SiTU apply on the routed-expert banks the caller passes,
+        in the layout its registration declares."""
+        if not do_finalize:
+            raise ValueError("gfx950 A8W4 SiTU MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx950 A8W4 SiTU MoE requires precomputed top-k")
+
+        situ_beta = float(getattr(w, "activation_situ_beta", 1.0))
+        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+        # A producer that already quantized ``x`` leaves it for this call only.
+        x_quantized = getattr(w, "_situ_input_fp8", None)
+        w._situ_input_fp8 = None
+        # A router that also sorted these routes by expert leaves the sort too.
+        sorted_routes = getattr(w, "_situ_sorted_routes", None)
+        w._situ_sorted_routes = None
+        rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
+        if situ_linear_beta is not None and is_warming_up():
+            # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
+            warm_gluon_mxfp4_situ_prefill_rows(
+                w13,
+                w2,
+                w13_mx_scale=w13_mx_scale,
+                w2_mx_scale=w2_mx_scale,
+                top_k=int(topk_ids.shape[1]),
+                situ_beta=situ_beta,
+                situ_linear_beta=float(situ_linear_beta),
+                max_rows=rows,
+            )
+        if situ_linear_beta is not None:
+            out = gluon_mxfp4_fp8_precomputed_situ(
+                x,
+                topk_weights,
+                topk_ids,
+                w13,
+                w2,
+                w13_mx_scale=w13_mx_scale,
+                w2_mx_scale=w2_mx_scale,
+                situ_beta=situ_beta,
+                situ_linear_beta=float(situ_linear_beta),
+                out=getattr(w, "_situ_output_buffer", None),
+                shared_input=shared_input,
+                shared_weight=shared_weight,
+                shared_out=shared_out,
+                # The caller reduces [M * top_k, N] slot rows itself.
+                defer_topk_reduce=getattr(w, "_situ_defer_topk_reduce", False),
+                x_quantized=x_quantized,
+                sorted_routes=sorted_routes,
+            )
+            if out is not None:
+                return out
+        raise ValueError(
+            "gfx950 A8W4 SiTU MoE does not support this activation or weight shape"
+        )
+
     @register_kernel(
         "moe",
         "apply",
@@ -2095,6 +2163,7 @@ if platform.is_amd:
             # in gluon_moe_sorting's layout at this block size instead.
             "sorted_route_rows": frozenset(A8W4_SORTED_DECODE_ROWS),
             "sorted_route_block_size": frozenset({A8W4_SORT_BLOCK_SIZE}),
+            "expert_layout": frozenset({"gdot128"}),
         },
         priority=Priority.SPECIALIZED,
     )
@@ -2115,56 +2184,90 @@ if platform.is_amd:
     ):
         del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
         del enable_pdl
-        if not do_finalize:
-            raise ValueError("gfx950 A8W4 SiTU MoE cannot defer finalization")
-        if topk_weights is None or topk_ids is None:
-            raise ValueError("gfx950 A8W4 SiTU MoE requires precomputed top-k")
+        return _a8w4_situ_precomputed_apply(
+            x,
+            w,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            shared_input,
+            shared_weight,
+            shared_out,
+            w13=w.w13_weight_triton_tensor,
+            w2=w.w2_weight_triton_tensor,
+            w13_mx_scale=w.w13_precision_config.b_mx_scale,
+            w2_mx_scale=w.w2_precision_config.b_mx_scale,
+        )
 
-        situ_beta = float(getattr(w, "activation_situ_beta", 1.0))
-        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
-        # A producer that already quantized ``x`` leaves it for this call only.
-        x_quantized = getattr(w, "_situ_input_fp8", None)
-        w._situ_input_fp8 = None
-        # A router that also sorted these routes by expert leaves the sort too.
-        sorted_routes = getattr(w, "_situ_sorted_routes", None)
-        w._situ_sorted_routes = None
-        rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
-        if situ_linear_beta is not None and is_warming_up():
-            # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
-            warm_gluon_mxfp4_situ_prefill_rows(
-                w.w13_weight_triton_tensor,
-                w.w2_weight_triton_tensor,
-                w13_mx_scale=w.w13_precision_config.b_mx_scale,
-                w2_mx_scale=w.w2_precision_config.b_mx_scale,
-                top_k=int(topk_ids.shape[1]),
-                situ_beta=situ_beta,
-                situ_linear_beta=float(situ_linear_beta),
-                max_rows=rows,
-            )
-        if situ_linear_beta is not None:
-            out = gluon_mxfp4_fp8_precomputed_situ(
-                x,
-                topk_weights,
-                topk_ids,
-                w.w13_weight_triton_tensor,
-                w.w2_weight_triton_tensor,
-                w13_mx_scale=w.w13_precision_config.b_mx_scale,
-                w2_mx_scale=w.w2_precision_config.b_mx_scale,
-                situ_beta=situ_beta,
-                situ_linear_beta=float(situ_linear_beta),
-                out=getattr(w, "_situ_output_buffer", None),
-                shared_input=shared_input,
-                shared_weight=shared_weight,
-                shared_out=shared_out,
-                # The caller reduces [M * top_k, N] slot rows itself.
-                defer_topk_reduce=getattr(w, "_situ_defer_topk_reduce", False),
-                x_quantized=x_quantized,
-                sorted_routes=sorted_routes,
-            )
-            if out is not None:
-                return out
-        raise ValueError(
-            "gfx950 A8W4 SiTU MoE does not support this activation or weight shape"
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_a8w4_situ_precomputed_n16_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_gfx950_n16_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp": frozenset({384}),
+            "ispp_alignment": frozenset({128}),
+            "internal_activation_dtype": frozenset({"input"}),
+            # Prefill rows may arrive as packed E2M1 data with CDNA4 scales.
+            "supports_prequantized_input": frozenset({True}),
+            # Decode rows may arrive as an FP8 E4M3 copy with one per-tensor
+            # scale, as _dynamic_fp8_quantize returns them, in _situ_input_fp8.
+            "supports_fp8_per_tensor_input": frozenset({True}),
+            # Both bank layouts read the same expert-sorted routes.
+            "sorted_route_rows": frozenset(A8W4_SORTED_DECODE_ROWS),
+            "sorted_route_block_size": frozenset({A8W4_SORT_BLOCK_SIZE}),
+            "expert_layout": frozenset({"n16"}),
+        },
+        # Selected only when a plan asks for N16 banks, since the gdot128 apply
+        # declares the other layout; below it, so plans that leave the layout
+        # open keep gdot128.
+        priority=Priority.PERFORMANT + 3,
+    )
+    def gluon_mxfp4_a8w4_situ_precomputed_n16_moe_apply(
+        plan: dict,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+        shared_input: torch.Tensor | None = None,
+        shared_weight: torch.Tensor | None = None,
+        shared_out: torch.Tensor | None = None,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        # The N16 bank and its scale cells, as preprocess_n16_mxfp4_weights
+        # left them on the module.
+        return _a8w4_situ_precomputed_apply(
+            x,
+            w,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            shared_input,
+            shared_weight,
+            shared_out,
+            w13=w.w13_weight,
+            w2=w.w2_weight,
+            w13_mx_scale=w.w13_weight_scale,
+            w2_mx_scale=w.w2_weight_scale,
         )
 
     @register_kernel(

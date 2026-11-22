@@ -41,6 +41,11 @@ namespace fused_topk_topp {
 // fetch args) in parallel with the previous kernel's epilogue. Saves a
 // fraction of each launch's overhead. Used for every kernel in this pipeline
 // when the runtime PDL toggle is enabled.
+//
+// A kernel launched this way may start before the preceding kernel's stores
+// are visible, and a producer such as softmax signals launch completion while
+// some of its threads are still storing. Every kernel launched here therefore
+// calls cudaGridDependencySynchronize() before it touches global memory.
 template <typename KernelFunc, typename... Args>
 static inline void launchKernel(bool enable_pdl, KernelFunc kernel, dim3 grid, dim3 block,
                                 size_t smem, cudaStream_t stream, Args... args) {
@@ -71,6 +76,7 @@ __global__ void initTopKSkipKernel(nv::air_topk_stable::Counter<T, IdxT>* counte
                                    int batch_size,
                                    int32_t const* __restrict__ top_k_arr,
                                    int max_topk) {
+    cudaGridDependencySynchronize();
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch_size) return;
     counters[b].skip = (top_k_arr[b] > max_topk) ? 1 : 0;
@@ -95,6 +101,9 @@ __launch_bounds__(256) __global__ void unifiedInitKernel(
     int32_t const* __restrict__ top_k_arr,
     int32_t max_topk,
     bool in_place_skip) {
+    // The per-row knobs come from preceding kernels, and the radix passes
+    // behind this kernel read probabilities the producer may still be storing.
+    cudaGridDependencySynchronize();
     int const b = blockIdx.x;
     if (b >= batch_size) return;
     int32_t const k = top_k_arr[b];

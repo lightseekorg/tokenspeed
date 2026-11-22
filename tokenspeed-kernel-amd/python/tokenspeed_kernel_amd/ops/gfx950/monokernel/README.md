@@ -123,6 +123,10 @@ A `Plan` lists the stages in execution order and the mailbox regions.
 - **The key.** `Plan.key` is the plan's canonical JSON. It is a `str`, so
   Triton can hash and serialize it as a compile-time argument. It also
   carries the `Plan` object for the compile-time helpers.
+- **Model dimensions.** `Plan.dims` (optional) holds a model's dimensions
+  as a frozen dataclass, part of the key. Stages read them at compile time
+  (`schedule.dims(plan)`), so one stage source serves every geometry of a
+  model and each geometry compiles its own launches.
 - **Placement.** A stage module's `stages(bases, ...)` takes the base of each
   stage from a table that the layer gives. `placement(bases, names)` checks
   that the table names exactly those stages, in that order.

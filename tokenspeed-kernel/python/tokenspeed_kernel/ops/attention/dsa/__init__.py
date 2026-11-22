@@ -1685,6 +1685,151 @@ def dsa_select_owned_candidates(
         )
 
 
+def _decode_candidate_traits(
+    *,
+    requests: int,
+    index_heads: int,
+    head_dim: int,
+    page_size: int,
+    topk: int,
+    query_group_size: int,
+    index_k_format: str,
+) -> dict:
+    """:func:`dsa_decode_index_candidates`' selection traits."""
+    return {
+        "requests": int(requests),
+        "index_heads": int(index_heads),
+        "head_dim": int(head_dim),
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "query_group_size": int(query_group_size),
+        "index_k_format": index_k_format,
+        "index_k_layout": "packed",
+    }
+
+
+def dsa_decode_index_candidates_supported(
+    *,
+    requests: int,
+    index_heads: int,
+    head_dim: int,
+    page_size: int,
+    topk: int,
+    query_group_size: int,
+    index_k_format: str,
+    solution: str | None,
+) -> bool:
+    """Return whether the KVP decode candidates op serves these sizes.
+
+    That is :func:`dsa_decode_index_candidates` over BF16 index queries of
+    ``requests`` requests, ``query_group_size`` rows each. Host values only,
+    so every rank of a KVP group decides alike; sizes no leaf takes keep
+    :func:`dsa_index_candidates`.
+    """
+    return _selects(
+        "dsa_decode_index_candidates",
+        format_signature(q=dense_tensor_format(torch.bfloat16)),
+        _decode_candidate_traits(
+            requests=requests,
+            index_heads=index_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            topk=topk,
+            query_group_size=query_group_size,
+            index_k_format=index_k_format,
+        ),
+        solution,
+    )
+
+
+def dsa_decode_index_candidates(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    pages: DSAIndexCandidatePages,
+    *,
+    row_lengths: torch.Tensor,
+    query_group_size: int,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    index_k_format: str,
+    solution: str | None,
+    scores_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score and select a KVP decode's local index candidates of every row.
+
+    The rows are scored over this rank's compact owned pages. It serves the
+    decode rows :func:`dsa_index_candidates` serves without mandatory windows
+    (no initial or local tokens), each request's rows consecutive.
+
+    Args:
+        q: BF16 index queries ``[rows, index_heads, head_dim]``, unit inner
+            stride (rows may be strided).
+        weights: Head weights ``[rows, index_heads]``.
+        index_k_cache: This rank's packed ``fp8_scaled`` Index-K plane.
+        pages: The rows' compact owned pages (``plan_dsa_index_candidates``).
+        row_lengths: Int32 ``[rows]`` keys each row sees over every rank.
+        query_group_size: Consecutive rows of one request.
+        page_size: Tokens per Index-K page.
+        topk: Candidates per row.
+        softmax_scale: Score scale.
+        index_k_format: The plane's format.
+        solution: None selects the best supported kernel; a name forces one.
+        scores_out: Optional FP32 ``[rows, topk]`` storage with contiguous
+            rows (a collective's send buffer) for the scores.
+
+    Returns:
+        Int32 ``[rows, topk]`` logical positions and FP32 ``[rows, topk]``
+        scores (``scores_out`` when given), ``-1`` and ``-inf`` for invalid
+        candidates, in an unspecified order: each row's exact local top-k of
+        the FP32 logits ``dsa_index_candidates`` scores. A row whose
+        ``row_lengths`` fit ``topk`` keeps every local key, in key order,
+        scored 0 and unscored: the merged selection takes all of them.
+    """
+    rows = q.shape[0]
+    if (
+        rows % query_group_size
+        or pages.lengths.shape[0] != rows
+        or row_lengths.shape != (rows,)
+        or row_lengths.dtype != torch.int32
+    ):
+        raise ValueError(
+            f"{rows} decode rows do not group by {query_group_size} or do not "
+            "match their pages and int32 lengths"
+        )
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode_index_candidates",
+        _attention_format_signature(q=q),
+        traits=_decode_candidate_traits(
+            requests=rows // query_group_size,
+            index_heads=q.shape[1],
+            head_dim=q.shape[2],
+            page_size=page_size,
+            topk=topk,
+            query_group_size=query_group_size,
+            index_k_format=index_k_format,
+        ),
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention", "dsa_decode_index_candidates", q.dtype, kernel_name=kernel.name
+    ):
+        return kernel(
+            q,
+            weights,
+            index_k_cache,
+            pages,
+            row_lengths=row_lengths,
+            query_group_size=query_group_size,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            scores_out=scores_out,
+        )
+
+
 def plan_dsa_topk(
     *,
     mode: str,
@@ -2365,6 +2510,8 @@ __all__ = [
     "dsa_decode_dcp_records",
     "dsa_decode_dcp_records_supported",
     "dsa_decode_dcp_records_workspace_bytes",
+    "dsa_decode_index_candidates",
+    "dsa_decode_index_candidates_supported",
     "dsa_index_candidates_accepts_pages",
     "dsa_interleave_rope",
     "dsa_prefill",

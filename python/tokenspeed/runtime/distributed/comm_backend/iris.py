@@ -231,6 +231,13 @@ class IrisBackend(CommBackend):
             )
         return state
 
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        """Create the ordinary state without replacing model-prepared capacities."""
+        if len(group) <= 1 or not current_platform().is_amd or dtype != torch.bfloat16:
+            return False
+        self._get_or_create(group, dtype)
+        return True
+
     def prepare_all_reduce_buffers(
         self,
         group: Group,
@@ -434,6 +441,22 @@ class IrisBackend(CommBackend):
             if gather is not None and gather.can_run(tensor):
                 return gather.run(tensor)
         return self._fallback.all_gather(tensor, group, dim)
+
+    def gathers_in_one_launch(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Whether the column all-gather of ``tensor`` fits the group's
+        symmetric buffer: larger ones run a launch, each with its own peer
+        handshake, a chunk of the buffer's rows."""
+        gather = self.get_prepared_all_gather(group, tensor.dtype)
+        if gather is not None:
+            capacity = gather.producer.data.numel()
+        else:
+            state = self.state(group, tensor.dtype)
+            capacity = (
+                state.producer_direct_max_numel
+                if state is not None
+                else self._producer_direct_max_bytes // tensor.element_size()
+            )
+        return tensor.numel() * len(group) <= capacity
 
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group

@@ -209,6 +209,7 @@ def _cache_storage_report(
     configured_cache_bytes: int,
     pool,
     fixed_workspace_bytes: int = 0,
+    prefill_kv_capacity: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
     arena = pool.arena
@@ -243,6 +244,7 @@ def _cache_storage_report(
             f"{planned_peak_bytes} > {configured_cache_bytes}"
         )
     return {
+        "prefill_kv_capacity": prefill_kv_capacity,
         "configured_cache_bytes": int(configured_cache_bytes),
         "allocated_cache_bytes": allocated_cache_bytes,
         "planned_peak_cache_bytes": planned_peak_bytes,
@@ -337,6 +339,7 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
     "Inkling2ForConditionalGeneration",
+    "Inkling2LoopForConditionalGeneration",
 }
 
 _DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
@@ -599,7 +602,15 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
         return "mha"
 
 
-def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
+def _get_backend_cls(
+    name: str | None,
+    arch: AttentionArch,
+    config: AttnConfig | None = None,
+) -> type[AttentionBackend]:
+    if config is not None and name in (None, _get_default_backend_name(arch)):
+        spec = config.component(SoftmaxAttnConfig)
+        if spec.paged_backend_cls is not None:
+            return spec.paged_backend_cls
     if name is None:
         entry = _BACKEND_REGISTRY.get(_get_default_backend_name(arch))
         if entry is not None and arch in entry[0]:
@@ -654,7 +665,7 @@ def create_paged_router(
         # server_args (and MHAConfig.generate copies into the spec). It
         # names the WRAPPER; the leaf under it auto-resolves from the arch.
         name = None
-    leaf_cls = _get_backend_cls(name, arch)
+    leaf_cls = _get_backend_cls(name, arch, config)
 
     def leaf_factory(group_id: str, block_granularity: int):
         del group_id
@@ -698,7 +709,7 @@ def _pin_fixed_kernel_page(
         config.component(SoftmaxAttnConfig), MSAConfig
     ):
         return config
-    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch)
+    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch, config)
     if (
         not issubclass(leaf_cls, PagedAttentionBackend)
         or leaf_cls.default_kernel_page_size is None
@@ -852,7 +863,7 @@ def _create_attn_backend_with_name(
         PagedAttentionBackend,
     )
 
-    cls = _get_backend_cls(name, arch)
+    cls = _get_backend_cls(name, arch, config)
     if issubclass(cls, PagedAttentionBackend):
         # Paged leaves are served through the cache-group router: one leaf
         # per history group, blocks -> kernel pages mapped in one place.
@@ -1087,7 +1098,7 @@ def _create_target_components(
             backend,
             text_config,
             config,
-            num_layers=text_config.num_hidden_layers,
+            num_layers=text_config.num_conv_layers,
             is_draft=False,
             enable_layerwise_cache_ready=(
                 server_args.disaggregation_mode == "prefill"
@@ -1182,6 +1193,8 @@ def _prepare_fixed_workspaces(
     is_inkling: bool,
     qsa_bf16_scratch: QSABf16ScratchPlan | None,
     expected_bytes: int,
+    pool_options: object | None = None,
+    draft_pool_options: object | None = None,
 ) -> None:
     """Allocate the fixed workspaces the recipe reserved from the cache budget
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
@@ -1193,6 +1206,10 @@ def _prepare_fixed_workspaces(
     once and a query-context-parallel draft tree gathers into the same
     buffers (the draft's extend step follows the target's forward on the
     same stream), so the plan budgets one workspace.
+
+    Ascend prefill workspaces belong to each target/draft backend and are
+    reused by its layers. Their Torch-managed storage is included in this check
+    and in allocator statistics.
     """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
@@ -1200,8 +1217,11 @@ def _prepare_fixed_workspaces(
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
-    allocated = False
-    actual_bytes = 0
+    prefill_bytes = backend.preallocate_prefill_workspace(pool_options)
+    if draft_backend is not None:
+        prefill_bytes += draft_backend.preallocate_prefill_workspace(draft_pool_options)
+    allocated = bool(prefill_bytes)
+    actual_bytes = prefill_bytes
     if dsa_kvp_history_prefill(config):
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
@@ -1267,8 +1287,10 @@ def _narrow_spec_for_pp(
     )
 
 
-def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
-    backend_cls = _get_backend_cls(name, arch)
+def _validate_mla_dcp_backend(
+    name: str | None, arch: AttentionArch, config: AttnConfig | None = None
+) -> None:
+    backend_cls = _get_backend_cls(name, arch, config)
     if not backend_cls.supports_mla_dcp:
         raise ValueError(
             f"Attention backend {name or _get_default_backend_name(arch)!r} "
@@ -1397,11 +1419,12 @@ def create_attn_components(
         # V4.1 validates KVP in its config and specialized recipe.
         and softmax_attn.backend_name != "deepseek_v41"
         and (
-            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+            model_config.attention_arch in (AttentionArch.MLA, AttentionArch.DSA)
+            or target.is_hybrid_linear
         )
     ):
         _validate_mla_dcp_backend(
-            target_full_attn_backend_name, model_config.attention_arch
+            target_full_attn_backend_name, model_config.attention_arch, config
         )
     if config.kvp_size > 1 and target.is_hybrid_linear:
         resolved_softmax = dataclasses.replace(
@@ -1669,12 +1692,17 @@ def create_attn_components(
             is_inkling=cache_family == "inkling",
             qsa_bf16_scratch=qsa_bf16_scratch,
             expected_bytes=fixed_workspace_bytes,
+            pool_options=target_spec.pool_options,
+            draft_pool_options=(
+                draft_view_spec.pool_options if draft_view_spec is not None else None
+            ),
         )
 
     cache_storage = _cache_storage_report(
         configured_cache_bytes=cache_budget_bytes,
         pool=pool,
         fixed_workspace_bytes=fixed_workspace_bytes,
+        prefill_kv_capacity=backend.prefill_kv_capacity,
     )
 
     return AttentionBuild(

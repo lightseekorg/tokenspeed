@@ -58,9 +58,11 @@ class KVCacheEvent(
 
 
 # ``medium`` is the memory an event concerns, as vLLM's events name it: None
-# for the GPU cache, ``"CPU_PINNED"`` for the pinned Host cache. ``lora_id``
-# keeps its place in the array before it and is always None.
+# for the GPU cache, ``"CPU_PINNED"`` for the pinned Host cache, ``"DISK"`` for
+# the Disk tier. ``lora_id`` keeps its place in the array before it and is
+# always None.
 MEDIUM_HOST = "CPU_PINNED"
+MEDIUM_DISK = "DISK"
 
 
 class BlockStored(KVCacheEvent):

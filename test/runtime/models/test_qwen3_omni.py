@@ -73,6 +73,8 @@ class TestQwen3OmniConfig:
             language_model_only=False,
             disaggregation_mode="encode",
             speculative_algorithm=None,
+            inkling2_loop_num_passes=None,
+            inkling2_loop_share_cache=False,
         )
         with (
             patch(

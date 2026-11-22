@@ -48,7 +48,7 @@ def test_capped_logit_sum_matches_the_torch_statement_bitwise(cap):
         torch.randn((rows, cols), generator=generator, device="cuda") * 3
     ).bfloat16()
     out = torch.empty((rows, width), dtype=torch.bfloat16, device="cuda")
-    capped_logit_sum(base, correction, cap, valid, out)
+    capped_logit_sum(base, correction, cap, valid, out, keys_out=None, key_offset=0)
     expected = base + correction
     if cap is not None:
         expected = (cap * torch.tanh(expected.float() / cap)).to(torch.bfloat16)
@@ -82,11 +82,13 @@ def test_capped_logit_sum_graph_replay_reads_updated_inputs():
     base = torch.randn((rows, cols), generator=generator, device="cuda").bfloat16()
     correction = torch.randn_like(base)
     out = torch.empty((rows, width), dtype=torch.bfloat16, device="cuda")
-    capped_logit_sum(base, correction, 30.0, valid, out)
+    capped_logit_sum(base, correction, 30.0, valid, out, keys_out=None, key_offset=0)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        capped_logit_sum(base, correction, 30.0, valid, out)
+        capped_logit_sum(
+            base, correction, 30.0, valid, out, keys_out=None, key_offset=0
+        )
     for scale in (3.0, 40.0):
         base.normal_(mean=0.0, std=scale, generator=generator)
         correction.normal_(mean=0.0, std=3.0, generator=generator)
@@ -150,3 +152,53 @@ def test_projected_gated_tanh_recurrence_rounds_the_whole_projection_once(
             )
             assert torch.equal(partial[0], new_state[:count])
             assert torch.equal(partial[1], output[:count])
+
+
+@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize("rows", [1, 8, 64])
+def test_block_keys_merge_to_the_whole_row_argmax(rows, ties):
+    """Each shard's capped logits leave block argmax keys; merged across the
+    shards they give the gathered row's argmax: the largest logit, the lowest
+    vocabulary id among equal ones (a tie straddling shards and blocks, and
+    signed zeros, included), as torch.max over each shard and then over the
+    shards picks it."""
+    from tokenspeed_kernel.ops.activation._triton.gated_recurrence import (
+        capped_logit_sum_key_blocks,
+    )
+    from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
+        merge_argmax_keys,
+    )
+
+    ranks, shard, valid_last, width = 4, 5000, 4100, 5024
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    base = torch.randn((ranks, rows, shard), generator=generator, device="cuda") * 8
+    if ties:
+        # Few distinct values: the row maximum repeats across blocks and
+        # shards, and zeros of both signs tie.
+        base = torch.round(base / 8)
+        base[:, :, ::7] = -0.0
+    base = base.bfloat16()
+    correction = torch.zeros_like(base)
+    outs, keys = [], []
+    for r in range(ranks):
+        out = torch.empty((rows, width), dtype=torch.bfloat16, device="cuda")
+        key = torch.empty(
+            (rows, capped_logit_sum_key_blocks(width)),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        valid = valid_last if r == ranks - 1 else shard
+        capped_logit_sum(
+            base[r], correction[r], 30.0, valid, out, keys_out=key, key_offset=r * shard
+        )
+        outs.append(out)
+        keys.append(key)
+    ids = merge_argmax_keys(
+        torch.stack(keys), out=torch.empty(rows, dtype=torch.int32, device="cuda")
+    )
+    # The drafter's former path: each shard's torch.max, then the first rank
+    # holding the largest maximum.
+    local_max, local_arg = torch.stack([o[:, :shard] for o in outs]).max(dim=-1)
+    best = local_max.float().argmax(dim=0)
+    expected = local_arg.gather(0, best[None])[0] + best * shard
+    assert torch.equal(ids.long(), expected)

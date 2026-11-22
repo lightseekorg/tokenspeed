@@ -27,7 +27,9 @@ normal exit each leave nothing running behind it.
 """
 
 import contextlib
+import io
 import json
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -90,7 +92,26 @@ def _fail_after_ready(signals, peer_ready, writer):
     threading.Event().wait(_TIMEOUT_S * 10)
 
 
-def _run_launcher(workers, server_args, path, writer):
+class _SignalOnWrite(io.RawIOBase):
+    """Deliver a real signal while BufferedWriter holds its non-reentrant lock."""
+
+    def __init__(self, signum):
+        super().__init__()
+        self.signum = signum
+        self.armed = False
+        self.delivered = False
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        if self.armed and not self.delivered:
+            self.delivered = True
+            os.kill(os.getpid(), self.signum)
+        return len(data)
+
+
+def _run_launcher(workers, server_args, path, logging_signal, writer):
     """Run the headless launcher with its ranks replaced by ``workers``
     (``(target, args)`` each), with ``path`` first on ``sys.path``, and
     report how it ended and what of them it left running."""
@@ -100,6 +121,7 @@ def _run_launcher(workers, server_args, path, writer):
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     started = []
+    log_output = _SignalOnWrite(logging_signal) if logging_signal is not None else None
 
     def start_without_model(server_args, port_args, metrics_relay, parent_death_signal):
         # Replace GPU/model loading only: the launcher's supervision, signal
@@ -108,10 +130,23 @@ def _run_launcher(workers, server_args, path, writer):
             started.append(
                 start_process_with_ready_pipe(target, args, contextlib.nullcontext())
             )
+        if log_output is not None:
+            # Logger setup and signal registration are complete; interrupt the
+            # next launcher log, while it reports its workers' readiness.
+            log_output.armed = True
         return [proc for proc, _ in started], [reader for _, reader in started]
 
     try:
-        with pytest.MonkeyPatch.context() as patch:
+        with contextlib.ExitStack() as resources, pytest.MonkeyPatch.context() as patch:
+            if log_output is not None:
+                stream = resources.enter_context(
+                    io.TextIOWrapper(io.BufferedWriter(log_output), line_buffering=True)
+                )
+                patch.setattr(sys, "stderr", stream)
+                for handler in engine_module.logger.handlers:
+                    if isinstance(handler, logging.StreamHandler):
+                        previous_stream = handler.setStream(stream)
+                        resources.callback(handler.setStream, previous_stream)
             patch.setattr(engine_module, "_start_ranks", start_without_model)
             status = 0
             try:
@@ -138,6 +173,9 @@ def _run_launcher(workers, server_args, path, writer):
                 "status": status,
                 "alive": [proc.is_alive() for proc, _ in started],
                 "exitcodes": [proc.exitcode for proc, _ in started],
+                "logging_signal_delivered": (
+                    log_output is not None and log_output.delivered
+                ),
             }
         )
     finally:
@@ -149,11 +187,11 @@ def _run_launcher(workers, server_args, path, writer):
         writer.close()
 
 
-def _launch(workers, server_args=None, path=()):
+def _launch(workers, server_args=None, path=(), *, logging_signal=None):
     """The launcher's report, from a child process that runs it."""
     proc, reader = start_process_with_ready_pipe(
         _run_launcher,
-        (workers, server_args or {}, list(path)),
+        (workers, server_args or {}, list(path), logging_signal),
         contextlib.nullcontext(),
     )
     try:
@@ -195,6 +233,13 @@ def test_a_rank_failure_signal_takes_every_rank_down(sig):
     )
     assert result["status"] == 1
     assert result["alive"] == [False, False]
+
+
+def test_a_failure_signal_during_logging_still_reports_failure():
+    result = _launch([(_report_and_exit, ())], logging_signal=signal.SIGUSR1)
+    assert result["logging_signal_delivered"]
+    assert result["status"] == 1
+    assert result["alive"] == [False]
 
 
 def test_repeated_failure_signals_cannot_interrupt_cleanup():

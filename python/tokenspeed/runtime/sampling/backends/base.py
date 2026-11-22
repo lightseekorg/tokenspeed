@@ -433,7 +433,9 @@ class SamplingBackend(ABC):
 
         Args:
             dtype: The shard logits' dtype, as the processor hands them over.
-            columns: Vocabulary columns per shard.
+            columns: Real vocabulary columns of the narrowest shard: every
+                shard's, or the last one's where the vocabulary ends inside
+                the padded head.
             tp_size: Ranks the vocabulary is sharded over.
         """
         from tokenspeed_kernel.ops.sampling import (

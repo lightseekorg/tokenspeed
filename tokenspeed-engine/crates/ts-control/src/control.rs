@@ -265,6 +265,31 @@ fn resume_memory_reply(success: bool, message: &str) -> ControlOutput {
     })
 }
 
+/// A checked metadata update. Dropping it changes no namespace; the control
+/// gate publishes it only after every owner prepared its storage namespace.
+#[derive(Debug)]
+pub struct PreparedSharedWeightVersion {
+    expected: Option<String>,
+    target: Option<String>,
+    changed: bool,
+}
+
+impl PreparedSharedWeightVersion {
+    /// The shared identity after publication, or None without shared caching.
+    pub fn target_version(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// The new identity only when this member needs to change it.
+    pub fn changed_version(&self) -> Option<&str> {
+        if self.changed {
+            self.target.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// Pause, memory and weight-operation state of one loop.
 #[derive(Debug)]
 pub struct Controls {
@@ -370,28 +395,50 @@ impl Controls {
         }
     }
 
-    /// After a weight load succeeded on every rank, the shared namespace new
-    /// pages publish under: `Ok(None)` keeps the current one, `Err` refuses
-    /// the load. Re-sending the current version keeps it too: the namespace
-    /// already names it, and the storage executor refuses a namespace change
-    /// while it has unretired operations.
-    pub fn commit_shared_weight_version(
-        &mut self,
+    /// Check the requested shared identity without publishing it. All fallible
+    /// isolation preparation must finish before this metadata becomes visible.
+    pub fn prepare_shared_weight_version(
+        &self,
         op: &ControlRequest,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<PreparedSharedWeightVersion, String> {
         if self.shared_weight_version.is_none() {
-            return Ok(None);
+            return Ok(PreparedSharedWeightVersion {
+                expected: None,
+                target: None,
+                changed: false,
+            });
         }
         if let Some(refusal) = self.shared_version_refusal(op) {
             return Err(refusal);
         }
-        match requested_weight_version(op) {
-            Some(version) if self.shared_weight_version.as_ref() != Some(&version) => {
-                self.shared_weight_version = Some(version.clone());
-                Ok(Some(version))
-            }
-            _ => Ok(None),
-        }
+        let target = requested_weight_version(op).or_else(|| self.shared_weight_version.clone());
+        Ok(PreparedSharedWeightVersion {
+            expected: self.shared_weight_version.clone(),
+            changed: target != self.shared_weight_version,
+            target,
+        })
+    }
+
+    /// Publish a prepared identity on the same exclusive control gate. The
+    /// gate must not alter the identity between preparation and publication.
+    pub fn commit_prepared_shared_weight_version(&mut self, prepared: PreparedSharedWeightVersion) {
+        assert_eq!(
+            self.shared_weight_version, prepared.expected,
+            "prepared weight metadata remains current"
+        );
+        self.shared_weight_version = prepared.target;
+    }
+
+    /// Apply the control metadata alone, for callers with no fallible storage
+    /// preparation left. Returns a version only when its identity changes.
+    pub fn commit_shared_weight_version(
+        &mut self,
+        op: &ControlRequest,
+    ) -> Result<Option<String>, String> {
+        let prepared = self.prepare_shared_weight_version(op)?;
+        let changed = prepared.changed_version().map(str::to_owned);
+        self.commit_prepared_shared_weight_version(prepared);
+        Ok(changed)
     }
 
     /// New requests are withheld from the scheduler.
@@ -450,6 +497,12 @@ impl Controls {
     /// Pop the head once every rank holds one.
     pub fn pop_weight_op(&mut self) -> Option<ControlRequest> {
         self.weight_ops.pop_front()
+    }
+
+    /// Return the gated head when cache clearing yields to I/O completions.
+    /// The next round must see the same operation before any later arrivals.
+    pub fn defer_weight_op(&mut self, op: ControlRequest) {
+        self.weight_ops.push_front(op);
     }
 
     /// Gated operations still queued, frontend or internal: either may
@@ -1261,6 +1314,37 @@ mod tests {
             plain.commit_shared_weight_version(&mooncake_load(false, Some("x"))),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn preparing_or_abandoning_a_shared_version_does_not_publish_it() {
+        let mut controls = Controls::new(ControlConfig {
+            memory_saver: false,
+            memory_regions: Vec::new(),
+            shared_weight_version: Some("B".to_owned()),
+            allow_reload_forward: false,
+        });
+        let change = mooncake_load(true, Some("A"));
+        let prepared = controls.prepare_shared_weight_version(&change).unwrap();
+        assert_eq!(prepared.target_version(), Some("A"));
+        assert_eq!(prepared.changed_version(), Some("A"));
+        assert_eq!(controls.shared_weight_version.as_deref(), Some("B"));
+        drop(prepared); // A later nonce/storage preparation failed.
+        controls.handle(mooncake_load(false, Some("A")), None);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("UpdateWeightsFromMooncakeReqOutput", false)]
+        );
+        assert_eq!(controls.shared_weight_version.as_deref(), Some("B"));
+        let retry = controls.prepare_shared_weight_version(&change).unwrap();
+        assert_eq!(retry.changed_version(), Some("A"));
+        controls.commit_prepared_shared_weight_version(retry);
+        assert_eq!(controls.shared_weight_version.as_deref(), Some("A"));
+        assert!(controls
+            .prepare_shared_weight_version(&change)
+            .unwrap()
+            .changed_version()
+            .is_none());
     }
 
     #[test]

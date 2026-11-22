@@ -89,6 +89,17 @@ class CommBackend(ABC):
         ``try_shard_exchange``); False keeps the generic all-to-all."""
         return False
 
+    def prepare_small_exchange(
+        self, group: Group, cap_bytes: int, timeout_ns: int
+    ) -> bool:
+        """Collectively prepare a one-hop exchange for small payloads.
+
+        It serves ``all_gather_single``, ``all_gather`` and equal-split
+        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank; False
+        keeps the generic collectives.
+        """
+        return False
+
     def try_shard_exchange(
         self, tensor: torch.Tensor, group: Group, inverse: bool
     ) -> torch.Tensor | None:
@@ -147,6 +158,35 @@ class CommBackend(ABC):
         )
 
         return projection_all_gather(tensor, rows, quantize, workspace, self)
+
+    def projection_gather_mm(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> torch.Tensor:
+        """Gather owner rows and project them through a weight shard into out."""
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_gather_mm,
+        )
+
+        return projection_gather_mm(tensor, rows, weight, out, workspace, self)
+
+    def projection_mm_reduce_scatter(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> torch.Tensor:
+        """Project all rows through a weight shard and reduce them into owner rows."""
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_mm_reduce_scatter,
+        )
+
+        return projection_mm_reduce_scatter(tensor, rows, weight, workspace, self)
 
     def projection_all_to_all(
         self,
@@ -266,6 +306,10 @@ class CommBackend(ABC):
     ) -> bool:
         """Return false when the backend has no persistent buffers to prepare."""
 
+        return False
+
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        """Prepare ordinary reductions that may first be selected by a small batch."""
         return False
 
     def can_acquire_all_reduce_outputs(

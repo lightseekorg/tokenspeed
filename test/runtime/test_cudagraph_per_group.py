@@ -34,12 +34,30 @@ G0, G1, G2 = "grain_equal", "grain_half", "grain_quarter"
 
 def _odd_specs():
     """Three groups sharing block granularity 4 at different kernel pages:
-    ratio 1 (exact width), ratio 2 (width overshoots the raw span -> zero
-    tail), ratio 4 (width undershoots -> truncation)."""
+    ratio 1 (exact width), ratio 2 with FlatKV gaps (width overshoots the raw
+    span -> zero tail), ratio 4 (width undershoots -> truncation)."""
     return [
-        GroupTableSpec(G0, block_granularity=4, kernel_page_size=4, max_num_pages=7),
-        GroupTableSpec(G1, block_granularity=4, kernel_page_size=2, max_num_pages=13),
-        GroupTableSpec(G2, block_granularity=4, kernel_page_size=1, max_num_pages=5),
+        GroupTableSpec(
+            G0,
+            block_granularity=4,
+            kernel_page_size=4,
+            max_num_pages=7,
+            atom_pages_per_block=1,
+        ),
+        GroupTableSpec(
+            G1,
+            block_granularity=4,
+            kernel_page_size=2,
+            max_num_pages=13,
+            atom_pages_per_block=4,
+        ),
+        GroupTableSpec(
+            G2,
+            block_granularity=4,
+            kernel_page_size=1,
+            max_num_pages=5,
+            atom_pages_per_block=4,
+        ),
     ]
 
 
@@ -72,6 +90,9 @@ class TestUnpackKernelParityTest:
                 for c in cols:
                     srcs.append(packed[off : off + rows * c].view(rows, c))
                     off += rows * c
+                # All subpages of the null block collapse to page 0 even
+                # when physical atom pages are spaced wider than the ratio.
+                srcs[1][0, 0] = 0
                 stacks_cuda = _stacks("cuda")
                 stacks_ref = _stacks("cuda")
                 # Sentinel residue: both paths must overwrite/zero the same cells.
@@ -87,7 +108,9 @@ class TestUnpackKernelParityTest:
     def test_separate_storages_take_the_same_kernel(self):
         stacks = _stacks("cuda")
         srcs = [torch.ones((2, 3), dtype=torch.int32, device="cuda") for _ in range(3)]
+        srcs[1][0, 0] = 0
         stacks.fill(2, 2, dict(zip((G0, G1, G2), srcs)))
+        assert stacks.table(G1, 2)[0].tolist() == [0, 0, 4, 5, 4, 5] + [0] * 7
         # Ratio 4 group: raw page 1 -> kernel pages 4..7, truncated to width 5.
         assert (stacks.table(G2, 2)[0].tolist()) == ([4, 5, 6, 7, 4])
 
@@ -108,8 +131,8 @@ class TestPaddingContractTest:
         stacks.fill(bs=1, actual_bs=1, block_tables=raw)
         # ratio 1, width 7: 2 live columns then 5 zeros.
         assert (stacks.table(G0, 1)[0].tolist()) == ([5, 6, 0, 0, 0, 0, 0])
-        # ratio 2, width 13: 4 live kernel pages then 9 zeros.
-        assert (stacks.table(G1, 1)[0].tolist()) == ([10, 11, 12, 13] + [0] * 9)
+        # ratio 2, multiplier 4: preserve the gaps between physical pages.
+        assert (stacks.table(G1, 1)[0].tolist()) == ([20, 21, 24, 25] + [0] * 9)
         # ratio 4, width 5: truncated inside page 5's expansion — no tail.
         assert (stacks.table(G2, 1)[0].tolist()) == ([20, 21, 22, 23, 24])
 
@@ -132,7 +155,7 @@ class TestPaddingContractTest:
         assert (stacks.table(G0, 3).tolist()) == (
             [[5, 0, 0, 0, 0, 0, 0]] + [[0] * 7] * 2
         )
-        assert (stacks.table(G1, 3)[0, :2].tolist()) == ([10, 11])
+        assert (stacks.table(G1, 3)[0, :2].tolist()) == ([20, 21])
         assert (int(stacks.table(G1, 3)[0, 2:].abs().sum())) == (0)
         assert (int(stacks.table(G1, 3)[1:].abs().sum())) == (0)
 

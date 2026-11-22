@@ -1985,6 +1985,8 @@ class DeepseekV3Model(nn.Module):
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
     supports_aux_capture = True
+    # Whether the checkpoint carries routed experts for this model's MoE layers.
+    has_routed_experts = True
 
     def post_init(self) -> None:
         self._routed_experts_weights_of_layer = LazyValue(
@@ -2079,10 +2081,14 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         # by the checkpoint loader.
         moe_loader = build_moe_checkpoint_loader(
             params_dict=moe_params_dict,
-            expert_schema=ExpertCheckpointSchema(
-                gate_proj_name="gate_proj",
-                down_proj_name="down_proj",
-                up_proj_name="up_proj",
+            expert_schema=(
+                ExpertCheckpointSchema(
+                    gate_proj_name="gate_proj",
+                    down_proj_name="down_proj",
+                    up_proj_name="up_proj",
+                )
+                if self.has_routed_experts
+                else None
             ),
             num_experts=self.config.n_routed_experts,
             ep_rank=self.mapping.moe.ep_rank,
@@ -2543,6 +2549,9 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
     Eagle3MlaModel internally with a single MLA decoder layer that accepts
     concatenated [embeds || hidden_states] as input.
     """
+
+    # One dense decoder layer; the config's MoE fields describe the target model.
+    has_routed_experts = False
 
     def __init__(
         self,
