@@ -71,8 +71,8 @@ def update_index(
 ) -> list[str]:
     nightly = wheelhouse / "nightly"
     if package == "tokenspeed-engine":
-        if replace:
-            raise ValueError("Engine release assets must not be replaced")
+        if replace and variant != "engine-nightly":
+            raise ValueError("Stable engine release assets must not be replaced")
         if variant == "engine-release":
             roots = [wheelhouse]
         elif variant == "engine-nightly":

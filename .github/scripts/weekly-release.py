@@ -1077,7 +1077,6 @@ class Release:
                 sha,
                 ref,
                 {
-                    "nightly": False,
                     "cuda_variant": "all",
                     "pypi_cuda_variant": "cu130",
                     "publish_github": True,
@@ -1091,7 +1090,7 @@ class Release:
                 "release-tokenspeed-kernel-rocm.yml",
                 sha,
                 ref,
-                {"nightly": False, "publish_github": True, "prerelease": False},
+                {"publish_github": True, "prerelease": False},
                 event="workflow_dispatch",
             )
             for variant, count in (("cu129", 6), ("cu130", 6), ("rocm72", 3)):

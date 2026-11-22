@@ -1,38 +1,37 @@
 name: Build and Release TokenSpeed
 on:
-  schedule:
-    - cron: "0 3 * * *"
   push:
     branches:
       - main
     paths:
       - "python/tokenspeed/version.py"
   workflow_dispatch:
+  workflow_call:
     inputs:
       nightly:
-        description: "Build a dated nightly with the same-date tokenspeed-kernel dependency."
         type: boolean
-        default: false
+        required: true
       replace_nightly:
-        description: "Replace existing nightly assets and refresh their pip index hashes (main only)."
         type: boolean
-        default: false
+        required: true
       publish_github:
-        description: "Publish nightly distributions and the pip index from main."
         type: boolean
-        default: true
+        required: true
       version_date:
-        description: "Nightly version date override, formatted as YYYYMMDD."
         type: string
+        required: true
       release_candidate:
-        description: "Nightly only: the release_candidate of the manual kernel nightly to pair with (1 -> 0.1.1rc1.post20261108, pinning tokenspeed-kernel 0.1.4rc1.post20261108)."
         type: string
+        required: false
+    secrets:
+      LIGHTSEEK_BOT_TOKEN:
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: release-pypi-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -58,9 +57,9 @@ jobs:
         id: metadata
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+          NIGHTLY: ${{ inputs.nightly }}
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
-          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
+          PUBLISH_GITHUB: ${{ inputs.publish_github }}
           VERSION_DATE: ${{ inputs.version_date }}
           RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
         run: |
@@ -96,7 +95,7 @@ jobs:
           kernel_version=$(kernel_version_here)
           echo "TokenSpeed nightly ${version_date} requires tokenspeed-kernel==${kernel_version}"
 
-          # The one-hour schedule offset is not a publication-order guarantee.
+          # Allow time for the newly published wheel index to propagate.
           for attempt in $(seq 1 60); do
             if python -m pip download --no-deps --only-binary=:all: \
               --index-url https://lightseek.org/whl/nightly \
@@ -110,12 +109,7 @@ jobs:
             sleep 60
           done
 
-          # The kernel nightly checks out main at 02:00 UTC and this workflow at
-          # 03:00 UTC. A commit that lands in between can move a kernel module the
-          # runtime imports, and the runtime wheel then pins a kernel wheel that
-          # predates it (2026-10-15: tokenspeed_kernel.ops.gemm._cute_dsl). Build
-          # the runtime from the commit the kernel wheel was built from, which its
-          # release notes record.
+          # Verify provenance even after the upstream publication succeeded.
           source_sha=$(gh release view "tokenspeed-kernel-nightly-v${kernel_version}-cu130" \
             --repo lightseekorg/whl --json body --jq .body \
             | grep -oE 'lightseekorg/tokenspeed@[0-9a-f]{40}' | tail -n 1 | cut -d@ -f2 || true)
@@ -124,18 +118,8 @@ jobs:
             exit 1
           fi
           if [ "$source_sha" != "$GITHUB_SHA" ]; then
-            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-              echo "Building ${GITHUB_REF} as checked out; the kernel nightly was built from ${source_sha}."
-              source_sha="$GITHUB_SHA"
-            else
-              echo "Building from ${source_sha}, the commit the kernel nightly was built from; main is at ${GITHUB_SHA}."
-              git fetch --depth 1 origin "$source_sha"
-              git checkout --detach "$source_sha"
-              if [ "$(kernel_version_here)" != "$kernel_version" ]; then
-                echo "tokenspeed-kernel at ${source_sha} is not ${kernel_version}; refusing to release TokenSpeed." >&2
-                exit 1
-              fi
-            fi
+            echo "The kernel nightly must come from this run source; rerun the unified nightly workflow." >&2
+            exit 1
           fi
           echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
           echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
@@ -148,8 +132,10 @@ jobs:
       contents: read
       id-token: write
     with:
-      mode: ${{ needs.metadata.outputs.nightly == 'true' && github.event_name != 'schedule' && !inputs.publish_github && 'dry-run' || 'publish' }}
-      release_type: post
+      mode: ${{ needs.metadata.outputs.nightly == 'true' && !inputs.publish_github && 'dry-run' || 'publish' }}
+      release_type: ${{ needs.metadata.outputs.nightly == 'true' && 'nightly' || 'post' }}
+      replace_nightly: ${{ inputs.replace_nightly == true }}
+      release_candidate: ${{ inputs.release_candidate }}
       version_date: ${{ needs.metadata.outputs.version_date }}
       source_sha: ${{ needs.metadata.outputs.source_sha }}
     secrets:
@@ -235,7 +221,7 @@ jobs:
           packages-dir: dist
 
   publish-nightly:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    if: needs.build.outputs.nightly == 'true' && (inputs.publish_github)
     needs: build
     runs-on: ubuntu-latest
     concurrency:
@@ -267,6 +253,11 @@ jobs:
           notes="${title} built from lightseekorg/tokenspeed@${SOURCE_SHA}"
           assets=(dist/tokenspeed-dist/*.whl dist/tokenspeed-dist/*.tar.gz)
           if gh release view "$tag" --repo lightseekorg/whl >/dev/null 2>&1; then
+            replace_args=()
+            if [ "$REPLACE_NIGHTLY" = true ]; then
+              replace_args+=(--replace)
+            fi
+            python .github/scripts/nightly-release.py --source-sha "$SOURCE_SHA" "${replace_args[@]}" check "$tag"
             if [ "$REPLACE_NIGHTLY" = "true" ]; then
               gh release upload "$tag" "${assets[@]}" --repo lightseekorg/whl --clobber
               printf '%s\n\n%s\n' "$notes" \
@@ -276,11 +267,6 @@ jobs:
               existing_assets=$(gh release view "$tag" --repo lightseekorg/whl --json assets --jq '.assets[].name')
               for asset in "${assets[@]}"; do
                 if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
-                  existing_notes=$(gh release view "$tag" --repo lightseekorg/whl --json body --jq .body)
-                  if [ "$existing_notes" != "$notes" ]; then
-                    echo "Cannot complete a nightly release from a different source commit." >&2
-                    exit 1
-                  fi
                   gh release upload "$tag" "$asset" --repo lightseekorg/whl
                 fi
               done
@@ -338,7 +324,7 @@ jobs:
   check-nightly-rocm:
     # A manual release-candidate nightly has no ROCm kernel of the same version;
     # the scheduled nightly of its date indexes ROCm.
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github) && !inputs.release_candidate
+    if: needs.build.outputs.nightly == 'true' && (inputs.publish_github) && !inputs.release_candidate
     needs: [build, publish-nightly]
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -394,7 +380,7 @@ jobs:
           fi
 
   publish-nightly-rocm:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    if: needs.build.outputs.nightly == 'true' && (inputs.publish_github)
     needs: [build, check-nightly-rocm]
     runs-on: ubuntu-latest
     concurrency:
