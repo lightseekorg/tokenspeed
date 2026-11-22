@@ -734,9 +734,9 @@ class PleStep:
     context: torch.Tensor  # int64 context pool [pages, 2] (oldest first)
     conv_state: torch.Tensor  # conv state pool [pages, 4 * HIDDEN, 9]
     page_in: torch.Tensor  # int32 [requests]: each request's input page
-    # int32 [rows]: where the state after each row's token goes, a row of
-    # context_out and conv_out (the output page in decode, the verify
-    # scratch row in a verify). A value that is not positive means none.
+    # int32 [rows]: decode cache pages or verify scratch rows. Verify uses
+    # r * (chain + 1) + 1 + t for request r and token t, leaving the first
+    # row of each request for the carried conv state. Nonpositive means skip.
     page_out: torch.Tensor
     context_out: torch.Tensor  # int64 [*, 2]: the context pool or scratch
     conv_out: torch.Tensor  # [*, 4 * HIDDEN, 9]: the conv pool or scratch

@@ -478,6 +478,7 @@ def gdn_decode_step(
         "padding_safe": _requires_padding_safe_decode(
             initial_state.dtype, output_only=False, solution=solution
         ),
+        "strided_state": not initial_state.is_contiguous(),
     }
     if solution != "flashinfer":
         # Only the legacy FlashInfer solution retains its old padding contract.
@@ -639,7 +640,9 @@ def gdn_decode_mtp(
         v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``.
         A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
             Backends that require FP32 normalize it internally.
-        a: Input-dependent decay shaped ``[B, T, num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``. Its rows may
+            be spaced wider (views into a projection row); every solution reads
+            a and b by stride.
         dt_bias: Floating-point decay bias shaped ``[num_v_heads]``. Backends
             that require FP32 normalize it internally.
         b: Update-gate (beta) input shaped ``[B, T, num_v_heads]``.
@@ -783,6 +786,8 @@ def gdn_decode_mtp(
         )
         and _chain_rows_dense(q, k, v, a, b),
         "replay_payload": replay_payload is not None,
+        "strided_state": not initial_state.is_contiguous()
+        or (output_state is not None and not output_state.is_contiguous()),
     }
     if solution != "flashinfer" and not output_only:
         # Only the legacy FlashInfer solution retains its old padding contract;
@@ -889,7 +894,10 @@ def gdn_chain_verify(
         "attention",
         "gdn_chain_verify",
         signature,
-        traits={"head_dim": head_dim},
+        traits={
+            "head_dim": head_dim,
+            "strided_state": not initial_state.is_contiguous(),
+        },
         solution=solution,
         override=override,
     )
@@ -995,7 +1003,8 @@ def gdn_decode_supports(
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
             ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
             ``q | k | v`` row, with contiguous heads; such kernels read a/b by
-            stride too).
+            stride too), or ``"strided_state"`` (dense K-last pages separated
+            by a physical row stride).
         solution: The solution the caller forces, or ``None``.
 
     Returns:

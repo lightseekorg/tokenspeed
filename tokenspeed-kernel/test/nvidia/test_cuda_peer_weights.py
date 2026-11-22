@@ -20,18 +20,27 @@
 
 from __future__ import annotations
 
-"""Run with torchrun --nproc-per-node=2 -m pytest <this file> on a fabric host."""
+"""Run with torchrun --nproc-per-node=2 -m pytest <this file>.
+
+Each test runs once per shareable handle type. Fabric handles need an IMEX
+channel; without one the fabric cases skip and POSIX descriptors still run.
+"""
 import os
+import socket
 from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
+
+pytest.importorskip("cuda.bindings.driver")
+
 from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertPartition,
     ExpertWeightShard,
     create_peer_weight_store,
 )
+from tokenspeed_kernel.thirdparty.cuda.dwdp import vmm
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +58,24 @@ def peers():
     dist.destroy_process_group()
 
 
-def _store(partition, device):
+@pytest.fixture(scope="module", params=["fabric", "posix_fd"])
+def handle_type(request, peers):
+    _, device = peers
+    try:
+        size = vmm.granularity(device.index, handle_type=request.param)
+        vmm.release_handle(vmm.allocate(size, device.index, handle_type=request.param))
+    except RuntimeError as error:
+        # A device may report fabric support without an IMEX channel.
+        pytest.skip(f"{request.param} handles are unavailable: {error}")
+    return request.param
+
+
+@pytest.fixture
+def make_store(peers, handle_type):
+    return lambda: _store(*peers, handle_type)
+
+
+def _store(partition, device, handle_type):
     return create_peer_weight_store(
         partition=partition,
         group=dist.group.WORLD,
@@ -57,6 +83,7 @@ def _store(partition, device):
         model_identity="peer-weights-test",
         pool_page_bytes=16 * 1024**2,
         copy_implementation="simple",
+        handle_type=handle_type,
         solution="cuda",
     )
 
@@ -67,10 +94,72 @@ def _values(first, count, width, layer, dtype, device):
     return ((ids * 17 + columns + layer * 13) % 113).to(dtype)
 
 
-@pytest.mark.parametrize("layers", [2, 3])
-def test_composite_weights_and_queued_forward_lifetime(peers, layers):
+def test_failed_import_closes_all_received_fds(
+    peers, make_store, handle_type, monkeypatch
+):
+    if handle_type != "posix_fd":
+        pytest.skip("Descriptor cleanup is specific to POSIX handles")
     partition, device = peers
-    store = _store(partition, device)
+    store = make_store()
+    received = []
+    recv_fds = socket.recv_fds
+    import_handle = vmm.import_handle
+    imports = 0
+
+    def receive(*args, **kwargs):
+        result = recv_fds(*args, **kwargs)
+        received.extend(result[1])
+        return result
+
+    def fail_second_import(shared, *, handle_type):
+        nonlocal imports
+        imports += 1
+        # The first receiving owner fails before it broadcasts its own FDs;
+        # other owners must report peer loss instead of a local CUDA error.
+        if partition.rank == 1 and imports == 2:
+            raise RuntimeError("injected CUDA import failure")
+        return import_handle(shared, handle_type=handle_type)
+
+    monkeypatch.setattr(socket, "recv_fds", receive)
+    monkeypatch.setattr(vmm, "import_handle", fail_second_import)
+    try:
+        store.publish_layer(
+            0,
+            tuple(
+                ExpertWeightShard(
+                    f"weight_{index}",
+                    _values(
+                        partition.first,
+                        partition.count,
+                        128,
+                        index,
+                        torch.uint8,
+                        device,
+                    ),
+                    False,
+                )
+                for index in range(3)
+            ),
+            layout="import-failure-test",
+        )
+        if partition.rank == 1:
+            with pytest.raises(RuntimeError, match="injected CUDA import failure"):
+                store.finalize()
+            assert received
+        else:
+            with pytest.raises(ConnectionError):
+                store.finalize()
+        for fd in received:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("layers", [2, 3])
+def test_composite_weights_and_queued_forward_lifetime(peers, make_store, layers):
+    partition, device = peers
+    store = make_store()
     fields = (
         ("weight", 1048585, torch.uint8),
         ("scale", 524291, torch.float32),
@@ -190,9 +279,9 @@ def test_composite_weights_and_queued_forward_lifetime(peers, layers):
         store.acquire(0)
 
 
-def test_reader_must_be_released_before_slot_reuse(peers):
+def test_reader_must_be_released_before_slot_reuse(peers, make_store):
     partition, device = peers
-    store = _store(partition, device)
+    store = make_store()
     try:
         for layer in range(3):
             store.publish_layer(
@@ -223,9 +312,9 @@ def test_reader_must_be_released_before_slot_reuse(peers):
         store.close()
 
 
-def test_full_model_mapping_count(peers):
+def test_full_model_mapping_count(peers, make_store):
     partition, device = peers
-    store = _store(partition, device)
+    store = make_store()
     try:
         for layer in range(92):
             store.publish_layer(
@@ -270,9 +359,9 @@ def test_full_model_mapping_count(peers):
 
 
 @pytest.mark.parametrize("switch_stream", [False, True])
-def test_slot_reuse_waits_for_readers_across_streams(peers, switch_stream):
+def test_slot_reuse_waits_for_readers_across_streams(peers, make_store, switch_stream):
     partition, device = peers
-    store = _store(partition, device)
+    store = make_store()
     width = 1048585
     try:
         for layer in range(3):

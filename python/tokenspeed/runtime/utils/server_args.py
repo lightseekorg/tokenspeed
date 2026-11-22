@@ -214,6 +214,8 @@ def _checkpoint_architectures(
 # Checkpoint architectures with decode monokernels (--decode-monokernel). A
 # model adds its architecture here with its monokernel seam.
 DECODE_MONOKERNEL_ARCHITECTURES = (
+    "Inkling2ForConditionalGeneration",
+    "Inkling2LoopForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
@@ -342,6 +344,13 @@ def validate_context_parallel_roles(
             f"--decode-context-parallel-size {kvp_size}: decode over sharded "
             "pages is DCP, and the launch names it explicitly"
         )
+
+
+# Muse Spark's --owned-attention-output choices.
+OWNED_ATTENTION_OUTPUTS = ("reduce-scatter", "all-to-all")
+# Muse Spark's --prefill-collective-payload choices (the Iris state's
+# MUSE_PAYLOADS; a test checks they match).
+PREFILL_COLLECTIVE_PAYLOADS = ("bf16", "int8-block16")
 
 
 def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
@@ -473,6 +482,9 @@ class ServerArgs:
     prefill_decode_interval: int = 0
     # The same, owed even while an overdue prompt suspends the interval.
     prefill_decode_min_interval: int = 0
+    # The most back-to-back prefill rounds an overdue prompt may suspend the
+    # interval for; 0 keeps the unbounded suspension.
+    max_consecutive_prefill_rounds: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -620,12 +632,35 @@ class ServerArgs:
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
+    kvstore_host_headroom_gib: int = 10
+    kvstore_release_checkpoint_cache: bool = False
     kvstore_io_backend: str = "kernel"
     # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
     kvstore_write_policy: str = "write_through"
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
+    # this replica's endpoint binds (attention-DP rank r binds port + r);
+    # None turns it off.
+    peer_prefix_port: int | None = None
+    # The host other replicas and the router reach this replica's endpoint at;
+    # its name is host:port. None takes this host's detected address.
+    peer_prefix_host: str | None = None
+    peer_prefix_answer_timeout_ms: int = 50
+    peer_prefix_min_fetch_tokens: int = 256
+    # Where a peer prefix lands: "device" (the request's admitted Device
+    # pages) or "host" (Host blocks before its admission). Required with
+    # peer sharing; no default.
+    peer_prefix_landing_tier: str | None = None
+    # The Disk tier: the node's local SSD below Host L2
+    # (docs/rfcs/0006-disk-tier.md). One directory per drive; None turns it
+    # off. The I/O backend and the write budget have no default.
+    disk_tier_paths: list[str] | None = None
+    disk_tier_size_gb: float = 0.0
+    disk_tier_io: str | None = None
+    disk_tier_write_mbps: int | None = None
+    disk_tier_config: str | None = None
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -643,6 +678,9 @@ class ServerArgs:
     # Decoding (N > 0) or Prefilling (N < 0) request without capacity
     # pressure, to exercise the suspend/restore path. 0 (off) in serving.
     debug_force_retraction_interval: int = 0
+    # None preserves unlimited debug injection; a supplied cap is positive.
+    # Capacity-triggered retractions do not consume this per-admission budget.
+    debug_force_retraction_max_per_request: int | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -664,11 +702,15 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    enable_ple_hot_cache: bool = False
+    # Pack Qwen4-Exp target and draft cache fields into one physical plane.
+    qwen4_exp_flat_kv: bool = True
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
     # draw depends on its co-batch; "per-request" keys it by (request seed,
-    # position) through the Gumbel-max pool kernels. See
+    # position) through the Gumbel-max pool kernels and keys chain verify
+    # coins by the request seed and verify round's first position. See
     # docs/design/numerics.md, sampling.deterministic.
     sampling_stream: str = "batch"
     dp_sampling: bool = False
@@ -708,6 +750,11 @@ class ServerArgs:
     # A directory for each rank's decode monokernel stuck-poll record file
     # (None: the records stay in pinned memory).
     monokernel_stuck_record_dir: str | None = None
+    # A variable-loop Inkling2 checkpoint's loop passes (None: the
+    # checkpoint's num_passes), and whether all passes of a core layer share
+    # one KV cache (False: one per pass, the checkpoint's layout).
+    inkling2_loop_num_passes: int | None = None
+    inkling2_loop_share_cache: bool = False
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -799,6 +846,23 @@ class ServerArgs:
     # switches below (resolve_numerics). Each folded switch can still be set
     # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Muse Spark: the payload encoding of the owned-row prefill collectives
+    # (the QKVG all-to-all and the attention and expert reduce-scatters) in
+    # extend forwards. "bf16" transfers the rows as produced. "int8-block16"
+    # transfers INT8 codes with an FP32 scale per 16 elements, decoded to BF16
+    # by the receiver before the collective's arithmetic: 1.25 bytes an
+    # element instead of 2, and a numerics change. Decode and verify forwards
+    # stay BF16.
+    prefill_collective_payload: str = "bf16"
+    # Muse Spark: how owned-row prefill (extend) forwards return attention
+    # outputs to the token owners. "reduce-scatter": every rank projects its
+    # heads of all rows and the partial sums are reduce-scattered.
+    # "all-to-all": each owner receives its rows of every rank's heads and
+    # projects them through the whole output projection, gathered on every
+    # rank after loading (128 MiB a layer, about 7.75 GiB a rank over 62
+    # layers); fewer bytes, a different summation order. Refused where Iris
+    # owned rows do not run.
+    owned_attention_output: str = "reduce-scatter"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -882,6 +946,8 @@ class ServerArgs:
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     enable_external_encoder: bool = False
     disaggregation_mode: str = "null"
+    # Prefill role only; None resolves to "early" there (resolve_disaggregation).
+    disaggregation_decode_allocation_policy: str | None = None
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
@@ -1034,18 +1100,20 @@ class ServerArgs:
             raise ValueError(
                 "adaptive DSpark requires head and vocabulary groups to follow attention TP"
             )
+        if self.enable_output_cumulative_probs:
+            raise ValueError(
+                "V4.1 adaptive verification does not support "
+                "--enable-output-cumulative-probs"
+            )
         if (
-            self.grammar_backend != "none"
-            or self.enable_output_logprobs
-            or self.enable_output_cumulative_probs
-            or (self.enable_speculative_sampling and self.sampling_backend == "greedy")
+            (self.enable_speculative_sampling and self.sampling_backend == "greedy")
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires chain sampling, "
-                "grammar none, and TP synchronization"
+                "V4.1 adaptive verification requires chain sampling "
+                "and TP synchronization"
             )
 
     def validate_output_cumulative_probs(self):
@@ -1115,6 +1183,19 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if (
+            (
+                self.owned_attention_output != "reduce-scatter"
+                or self.prefill_collective_payload != "bf16"
+            )
+            and architectures is not None
+            and "MuseSparkForConditionalGeneration" not in architectures
+        ):
+            raise ValueError(
+                "--prefill-collective-payload and --owned-attention-output apply "
+                "to Muse Spark's owned-row prefill only; this checkpoint is "
+                f"{architectures}"
+            )
         if self.decode_monokernel and architectures is not None:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
@@ -1352,15 +1433,7 @@ class ServerArgs:
         ):
             _require_choice(flag, value, choices)
         if self.sampling_backend is None:
-            # ``flashinfer`` is the only built-in backend that respects per-request
-            # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
-            # (see ``GreedySamplingBackend.sample``: *"sampling_info is ignored
-            # for single-step (always argmax)"*) — fast for hand-tuned greedy
-            # decoding but silently wrong for any serving deployment where
-            # requests carry sampling params, since the model collapses into
-            # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA and Ascend; users can
-            # still opt into greedy explicitly via ``--sampling-backend greedy``.
+            # Choose the platform sampler that respects request-level parameters.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
@@ -1519,10 +1592,6 @@ class ServerArgs:
             if self.disaggregation_mode != "prefill":
                 raise ValueError(
                     "Peer expert weights currently require a prefill instance"
-                )
-            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
-                raise ValueError(
-                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
                 )
             if self.mapping.requires_forward_coordination:
                 raise ValueError(
@@ -1782,6 +1851,21 @@ class ServerArgs:
         to no pool here with a log, as the KVStore's are off on the encode
         role.
         """
+        forced_cap = self.debug_force_retraction_max_per_request
+        if forced_cap is not None:
+            if type(forced_cap) is not int or not 1 <= forced_cap <= 2**31 - 1:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request must be an integer in [1, INT32_MAX]"
+                )
+            if self.debug_force_retraction_interval == 0:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request requires a nonzero "
+                    "--debug-force-retraction-interval"
+                )
+            if not self.retracting_role:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request requires a role that can retract"
+                )
         host_gb = self.retraction_snapshot_host_gb
         ratio = self.retraction_snapshot_ratio
         max_requests = self.retraction_snapshot_max_requests
@@ -2325,6 +2409,33 @@ class ServerArgs:
 
         ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice(
+            "--owned-attention-output",
+            self.owned_attention_output,
+            OWNED_ATTENTION_OUTPUTS,
+        )
+        if (
+            self.numerics == "rl-bitwise"
+            and self.owned_attention_output != "reduce-scatter"
+        ):
+            # It moves the attention output's sum to another order; the
+            # envelope promises the trainer's bits.
+            raise ValueError(
+                "--owned-attention-output all-to-all changes prefill numerics; "
+                "--numerics rl-bitwise needs reduce-scatter"
+            )
+        _require_choice(
+            "--prefill-collective-payload",
+            self.prefill_collective_payload,
+            PREFILL_COLLECTIVE_PAYLOADS,
+        )
+        if self.numerics == "rl-bitwise" and self.prefill_collective_payload != "bf16":
+            # The envelope promises the trainer's bits; the INT8 payload rounds
+            # every prefill collective's inputs.
+            raise ValueError(
+                "--prefill-collective-payload int8-block16 changes prefill "
+                "numerics; --numerics rl-bitwise needs bf16"
+            )
         resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
@@ -2376,16 +2487,17 @@ class ServerArgs:
         self.moe_cutlass_fused_finalize = False
         # MoE keeps auto or the user's provider restriction. The expert
         # plan checks the batch_invariant feature against actual layer geometry.
-        # Sampling: greedy rows must break exact logit ties canonically, and
-        # sampled rows must draw from a stream the co-batch cannot move.
-        if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
-            raise ValueError(
-                f"--numerics {self.numerics} needs a sampling backend with "
-                "canonical greedy tie-breaking "
-                f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
-                f"{self.sampling_backend} resolves exact ties in reduction order"
-            )
-        self.sampling_stream = "per-request"
+        # The NPU alignment contract compares model logits for the same history.
+        # Serving keeps its configured sampler and random stream.
+        if self.device != "npu":
+            if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
+                raise ValueError(
+                    f"--numerics {self.numerics} needs a sampling backend with "
+                    "canonical greedy tie-breaking "
+                    f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
+                    f"{self.sampling_backend} resolves exact ties in reduction order"
+                )
+            self.sampling_stream = "per-request"
         # Keep the trainer's selection order. The envelope still requires
         # batch-invariant top-k and attention leaves.
         self.dsa_slot_order = "selection"
@@ -2510,6 +2622,47 @@ class ServerArgs:
             raise ValueError(
                 "--enable-external-encoder requires aggregated or prefill serving"
             )
+        # Only the prefill role has a decode allocation policy. Omitted, it is
+        # early: a prompt waits for its Decode destination before it is
+        # admitted, as every prefill server did before the flag existed.
+        if self.disaggregation_mode == "prefill":
+            if self.disaggregation_decode_allocation_policy is None:
+                self.disaggregation_decode_allocation_policy = "early"
+            _require_choice(
+                "--disaggregation-decode-allocation-policy",
+                self.disaggregation_decode_allocation_policy,
+                ("early", "deferred"),
+            )
+        elif self.disaggregation_decode_allocation_policy is not None:
+            raise ValueError(
+                "--disaggregation-decode-allocation-policy requires "
+                "--disaggregation-mode prefill"
+            )
+        if self.disaggregation_decode_allocation_policy == "deferred":
+            # Experimental: one attention rank per prompt, no external
+            # encoder, and the KV sent from the computed prompt rather than
+            # streamed during its forward. Refused, never rewritten; a
+            # multimodal model is refused by the rank, which reads the model
+            # (HostBootstrap).
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("attention TP > 1", self.mapping.attn.tp_size > 1),
+                    ("--kv-parallel-size > 1", self.mapping.attn.kvp_size > 1),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                    ("--enable-external-encoder", self.enable_external_encoder),
+                    (
+                        "--disaggregation-layerwise-interval other than 0",
+                        self.disaggregation_layerwise_interval != 0,
+                    ),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--disaggregation-decode-allocation-policy deferred does "
+                    f"not support {', '.join(unsupported)}"
+                )
         # PD disaggregation. The prefill role keeps the ordinary graph flags:
         # it never runs a decode step, so the decode graph has nothing to
         # capture (ModelExecutorConfig.prefill_only), while its extend
@@ -2554,8 +2707,7 @@ class ServerArgs:
         # startup prefixes would delete an L3 store's shared namespace.
         if self.disaggregation_mode != "null":
             raise ValueError(
-                "--enable-startup-requests is not supported with "
-                "--disaggregation-mode"
+                "--enable-startup-requests is not supported with --disaggregation-mode"
             )
         if self.kvstore_storage_backend is not None:
             raise ValueError(
@@ -2563,7 +2715,105 @@ class ServerArgs:
                 "--kvstore-storage-backend"
             )
 
+    def validate_peer_prefix_options(self):
+        """``--peer-prefix-port`` and its settings: what peer prefix sharing
+        runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
+        if self.peer_prefix_port is None:
+            if self.peer_prefix_landing_tier is not None:
+                raise ValueError(
+                    "--peer-prefix-landing-tier requires --peer-prefix-port"
+                )
+            return
+        _require_choice(
+            "--peer-prefix-landing-tier",
+            self.peer_prefix_landing_tier,
+            ("device", "host"),
+        )
+        unsupported = [
+            setting
+            for setting, refused in (
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+                (
+                    "--query-context-parallel-size > 1",
+                    self.query_context_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--peer-prefix-port is not supported with " + ", ".join(unsupported)
+            )
+        last_port = self.peer_prefix_port + self.mapping.attn.dp_size - 1
+        if self.peer_prefix_port < 1 or last_port > 65535:
+            raise ValueError(
+                "--peer-prefix-port and one port per attention-DP rank after "
+                f"it must be valid ports; got {self.peer_prefix_port}"
+            )
+        if self.peer_prefix_answer_timeout_ms <= 0:
+            raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
+        if self.peer_prefix_min_fetch_tokens <= 0:
+            raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
+
+    def validate_disk_tier_options(self):
+        """``--disk-tier-paths`` and its settings: what the Disk tier runs
+        with (``docs/rfcs/0006-disk-tier.md``)."""
+        if self.disk_tier_paths is None:
+            for flag, value in (
+                ("--disk-tier-io", self.disk_tier_io),
+                ("--disk-tier-write-mbps", self.disk_tier_write_mbps),
+                ("--disk-tier-config", self.disk_tier_config),
+            ):
+                if value is not None:
+                    raise ValueError(f"{flag} requires --disk-tier-paths")
+            return
+        unsupported = [
+            setting
+            for setting, refused in (
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                (
+                    "--kvstore-write-policy other than write_back",
+                    self.kvstore_write_policy != "write_back",
+                ),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--disk-tier-paths is not supported with " + ", ".join(unsupported)
+            )
+        if not self.disk_tier_paths:
+            raise ValueError("--disk-tier-paths needs at least one directory")
+        if self.disk_tier_size_gb <= 0:
+            raise ValueError("--disk-tier-size-gb must be positive")
+        _require_choice("--disk-tier-io", self.disk_tier_io, ("io_uring", "psync"))
+        if self.disk_tier_write_mbps is None or self.disk_tier_write_mbps <= 0:
+            raise ValueError("--disk-tier-write-mbps must be a positive budget")
+        from tokenspeed.runtime.cache.disk import DiskTierTuning
+
+        DiskTierTuning.from_json(self.disk_tier_config)
+
     def validate_cache_options(self):
+        self.validate_peer_prefix_options()
+        self.validate_disk_tier_options()
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -2596,8 +2846,7 @@ class ServerArgs:
             ("write_through", "write_back"),
         )
         if self.kvstore_write_policy == "write_back":
-            # Decode's Host holds retraction images only, and L3 staging would
-            # split what is written back; pipeline stages and query context
+            # L3 staging would split what is written back; pipeline stages and query context
             # parallelism have not run write-back. Attention TP and
             # --kv-parallel-size need no refusal: a written-back segment
             # publishes once every rank of the replica has acknowledged it
@@ -2608,10 +2857,6 @@ class ServerArgs:
                 setting
                 for setting, refused in (
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
-                    (
-                        "--disaggregation-mode decode",
-                        self.disaggregation_mode == "decode",
-                    ),
                     (
                         "--kvstore-storage-backend",
                         self.kvstore_storage_backend is not None,
@@ -2969,6 +3214,13 @@ class ServerArgs:
                 "a prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.max_consecutive_prefill_rounds < 0:
+            raise ValueError("--max-consecutive-prefill-rounds must be non-negative")
+        if self.max_consecutive_prefill_rounds and not self.prefill_decode_interval:
+            raise ValueError(
+                "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
+                "it bounds how long an overdue prompt suspends the interval"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -2985,6 +3237,13 @@ class ServerArgs:
             raise ValueError(
                 "--monokernel-stuck-record-dir needs --decode-monokernel: only "
                 "the monokernel launches write stuck-poll records"
+            )
+        if self.inkling2_loop_num_passes is not None and (
+            self.inkling2_loop_num_passes < 1
+        ):
+            raise ValueError(
+                "--inkling2-loop-num-passes must be at least 1, got "
+                f"{self.inkling2_loop_num_passes}"
             )
         if self.device == "npu":
             if not self.disable_prefill_graph:
@@ -3360,8 +3619,10 @@ class ServerArgs:
             "run complete in the same forward instead of waiting for the long "
             "prompt's chunk to pass. The chunk ends on an earlier page and gives "
             "up fewer than N plus one page, only while such prompts wait and "
-            "only what they take. 0 (default) is off; at most half of "
-            "--chunked-prefill-size. A decode server ignores it. See "
+            "only what they take. 0 (default) is off: no chunk gives way; at "
+            "most half of --chunked-prefill-size. A decode server ignores it. "
+            "Whatever N, a prefill server fills the budget a chunk leaves on "
+            "its own with bootstrapped prompts that fit whole in it. See "
             "docs/design/scheduler.md section 1.1.",
         )
         parser.add_argument(
@@ -3401,6 +3662,17 @@ class ServerArgs:
             "for a prompt it has held back in full. A long prompt's chunks "
             "then alternate with decode rounds instead of stalling the decodes "
             "back to back. Aggregated serving only. 0 (the default) is off.",
+        )
+        parser.add_argument(
+            "--max-consecutive-prefill-rounds",
+            type=int,
+            default=ServerArgs.max_consecutive_prefill_rounds,
+            help="With --prefill-decode-interval: the most back-to-back prefill "
+            "rounds that hold a decode back while an overdue prompt suspends "
+            "the interval; the round that reaches it owes the decodes the whole "
+            "interval again, and a prompt's held-back count restarts whenever "
+            "one of its chunks runs. 0 (the default) keeps the unbounded "
+            "suspension.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
@@ -3501,6 +3773,17 @@ class ServerArgs:
             help="The IO backend for KVStore transfer between CPU and GPU.",
         )
         parser.add_argument(
+            "--kvstore-release-checkpoint-cache",
+            action="store_true",
+            help="Advise Linux to evict local safetensors checkpoint pages after loading, before pinning the Host cache.",
+        )
+        parser.add_argument(
+            "--kvstore-host-headroom-gib",
+            type=int,
+            default=ServerArgs.kvstore_host_headroom_gib,
+            help="GiB of available Host memory per local rank to reserve outside the pinned cache and retraction pools.",
+        )
+        parser.add_argument(
             "--kvstore-write-policy",
             type=str,
             choices=["write_through", "write_back"],
@@ -3510,8 +3793,10 @@ class ServerArgs:
             "prefill role caches. "
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
-            "the copy), so the two tiers hold mostly different pages. "
-            "write_back is refused with --disaggregation-mode decode, "
+            "the copy), so the two tiers hold mostly different pages; on "
+            "--disaggregation-mode decode a remote admission then loads its "
+            "Host hit and the prefill node sends only the rest. "
+            "write_back is refused with "
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with more than 64 cache groups; see "
@@ -3534,6 +3819,103 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--peer-prefix-port",
+            type=int,
+            default=ServerArgs.peer_prefix_port,
+            help="Share prefix caches with other replicas: a request the router "
+            "sends with a peer holder reads the prefix that replica caches, in "
+            "its Device or Host cache, over RDMA, instead of computing it, and "
+            "this replica serves its own cache the same way. Its endpoint binds "
+            "this port (attention-DP rank r binds this port + r). Needs the Host "
+            "tier (--enable-kvstore) and prefix caching; refused with "
+            "--kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
+            "A --disaggregation-mode decode replica serves the history it "
+            "decoded but never reads: its prefill node sends what it lacks. "
+            "Replicas share only with replicas of "
+            "the same model, cache layout, weights and parallel layout. RDMA "
+            "devices come from --disaggregation-ib-device. See "
+            "docs/rfcs/0004-peer-prefix-sharing.md.",
+        )
+        parser.add_argument(
+            "--peer-prefix-host",
+            type=str,
+            default=ServerArgs.peer_prefix_host,
+            help="The host other replicas and the router reach this replica's peer "
+            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "must name it exactly so. Defaults to this host's detected address.",
+        )
+        parser.add_argument(
+            "--peer-prefix-answer-timeout-ms",
+            type=int,
+            default=ServerArgs.peer_prefix_answer_timeout_ms,
+            help="How long a request waits for the peer holder's answer to each "
+            "step (lookup, pin, release) before it computes the prefix itself.",
+        )
+        parser.add_argument(
+            "--peer-prefix-min-fetch-tokens",
+            type=int,
+            default=ServerArgs.peer_prefix_min_fetch_tokens,
+            help="The fewest tokens past the local prefix hit worth reading from "
+            "a peer holder; a shorter peer hit is computed instead.",
+        )
+        parser.add_argument(
+            "--peer-prefix-landing-tier",
+            type=str,
+            choices=["device", "host"],
+            default=ServerArgs.peer_prefix_landing_tier,
+            help="Where a peer prefix lands: 'device' reads it into the Device "
+            "pages the request's admission allocates, which wait out the "
+            "transfer; 'host' reads it into Host blocks before the admission, "
+            "which then takes it as a Host hit at the cost of Host capacity and "
+            "one host-to-device copy. Required with --peer-prefix-port.",
+        )
+        parser.add_argument(
+            "--disk-tier-paths",
+            type=str,
+            nargs="+",
+            default=ServerArgs.disk_tier_paths,
+            help="Cache prefixes on the node's local SSD below Host L2: one "
+            "directory per drive, on a file system that supports O_DIRECT "
+            "(XFS or ext4, not tmpfs); each rank keeps one file in one of them. "
+            "Host L2 writes its entries back to the file in the background and "
+            "a request whose prefix only the file holds reads it into Host "
+            "before its admission. The file's contents never outlive the "
+            "process. Needs --kvstore-write-policy write_back and prefix "
+            "caching; refused with --kvstore-storage-backend and "
+            "--pipeline-parallel-size > 1. See docs/rfcs/0006-disk-tier.md.",
+        )
+        parser.add_argument(
+            "--disk-tier-size-gb",
+            type=float,
+            default=ServerArgs.disk_tier_size_gb,
+            help="The Disk tier's size per rank, in gigabytes.",
+        )
+        parser.add_argument(
+            "--disk-tier-io",
+            type=str,
+            choices=["io_uring", "psync"],
+            default=ServerArgs.disk_tier_io,
+            help="How the Disk tier reaches its file: 'io_uring' (needs a "
+            "kernel and seccomp policy that allow it) or 'psync', a pool of "
+            "threads calling pread/pwrite. Required with --disk-tier-paths.",
+        )
+        parser.add_argument(
+            "--disk-tier-write-mbps",
+            type=int,
+            default=ServerArgs.disk_tier_write_mbps,
+            help="The bytes per second, in MB, each rank may write to its Disk "
+            "tier file: the SSD's endurance budget. Required with "
+            "--disk-tier-paths.",
+        )
+        parser.add_argument(
+            "--disk-tier-config",
+            type=str,
+            default=ServerArgs.disk_tier_config,
+            help="JSON object of Disk tier tuning settings; see "
+            "docs/configuration/server.md for the keys and their defaults.",
         )
         # Retraction snapshot pool
         parser.add_argument(
@@ -3593,6 +3975,16 @@ class ServerArgs:
             "path runs on every request of a test run. Refused with "
             "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
             "in serving.",
+        )
+        parser.add_argument(
+            "--debug-force-retraction-max-per-request",
+            type=int,
+            default=ServerArgs.debug_force_retraction_max_per_request,
+            help="TEST ONLY. Bound successfully imaged forced retractions per "
+            "request admission. Omission preserves unlimited forcing. An explicit "
+            "value must be positive and requires a nonzero "
+            "--debug-force-retraction-interval. Failed attempts and waits do not "
+            "consume it; ordinary capacity retractions are unaffected.",
         )
         # Mamba Cache
         parser.add_argument(
@@ -4078,7 +4470,7 @@ class ServerArgs:
             "(cutedsl_kda > flashkda > fla). Named backends are NVIDIA-specific: "
             "'fla' uses the portable FLA scan, 'flashkda' uses the optional "
             "FlashKDA library (source build, SM90+), and 'cutedsl_kda' uses the "
-            "CuteDSL KDA AOT kernel (prebuilt, sm_103a). 'cudnn' uses FlashInfer's "
+            "FlashInfer CuTe DSL KDA prefill kernel on SM100/SM103. 'cudnn' uses FlashInfer's "
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(
@@ -4130,6 +4522,27 @@ class ServerArgs:
             "which runs no prefill, reserves no scratch.",
         )
         parser.add_argument(
+            "--enable-ple-hot-cache",
+            action="store_true",
+            default=ServerArgs.enable_ple_hot_cache,
+            help="Cache frequently read rows of eligible offloaded Qwen4-Exp PLE "
+            "tables in GPU memory. Disabled by default. "
+            "Requires PLE offloading and a supported table format and CUDA kernel. "
+            "Small lookups and CUDA graphs use regular host gather. "
+            "TOKENSPEED_PLE_HOST_CACHE_SLOTS must be a power of two greater than one.",
+        )
+        parser.add_argument(
+            "--qwen4-exp-flat-kv",
+            action=argparse.BooleanOptionalAction,
+            dest="qwen4_exp_flat_kv",
+            default=ServerArgs.qwen4_exp_flat_kv,
+            help="Qwen4-Exp layout (on by default): target/draft KV, recurrent, PLE "
+            "and QSA caches share one plane, preserving logical groups. "
+            "Full-history block IDs translate to contiguous atom pages; state "
+            "and recent windows use explicit strides. Requires PP=1 and non-MXFP8 KV. "
+            "Use --no-qwen4-exp-flat-kv for the plane-based layout.",
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=[
@@ -4178,9 +4591,9 @@ class ServerArgs:
             "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
             "by the batch row, so a request's draw depends on its co-batch. "
             "'per-request': the Gumbel-max pool kernels keyed by the request's "
-            "seed and position, so a request samples the same tokens alone and "
-            "inside any batch (finite top_k is capped at 128). Folded to "
-            "per-request by --numerics rl-bitwise.",
+            "seed and position (finite top_k is capped at 128). Chain verify "
+            "coins are keyed by the request's seed and the round's first "
+            "target position. Folded to per-request by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--dp-sampling",
@@ -4336,6 +4749,30 @@ class ServerArgs:
                 "outlives the process; a run without a stuck poll removes the "
                 "files at exit. Without it the records stay in pinned memory "
                 "and are logged when the failure reaches Python."
+            ),
+        )
+        parser.add_argument(
+            "--inkling2-loop-num-passes",
+            type=int,
+            default=ServerArgs.inkling2_loop_num_passes,
+            help=(
+                "Loop passes per token for an inkling2_loop checkpoint with "
+                "loop_config.is_varloop=true (at least 1); each pass runs "
+                "the loop core's layers once more. Default: the "
+                "checkpoint's num_passes. A draft model needs the "
+                "checkpoint's count: it reads fixed layer visits."
+            ),
+        )
+        parser.add_argument(
+            "--inkling2-loop-share-cache",
+            action="store_true",
+            default=ServerArgs.inkling2_loop_share_cache,
+            help=(
+                "For an inkling2_loop checkpoint with loop_config.is_varloop="
+                "true: every loop pass of a core layer reads and writes that "
+                "layer's one KV cache, so later tokens attend to the last "
+                "pass's K/V, instead of one cache per pass. Cuts the loop "
+                "core's KV memory; convolution state stays one per pass."
             ),
         )
         parser.add_argument(
@@ -5051,6 +5488,29 @@ class ServerArgs:
             "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
+            "--owned-attention-output",
+            type=str,
+            default=ServerArgs.owned_attention_output,
+            choices=list(OWNED_ATTENTION_OUTPUTS),
+            help="Muse Spark: how owned-row prefill (extend) forwards return "
+            "attention outputs to the token owners. all-to-all sends each owner "
+            "its rows of every rank's heads and projects them through the whole "
+            "output projection, gathered on every rank after loading: 128 MiB "
+            "(8192 x 8192 BF16) a layer, about 7.75 GiB a rank over 62 layers, "
+            "taken from the KV pool. A numerics change. Refused where Iris owned "
+            "rows do not run.",
+        )
+        parser.add_argument(
+            "--prefill-collective-payload",
+            type=str,
+            default=ServerArgs.prefill_collective_payload,
+            choices=list(PREFILL_COLLECTIVE_PAYLOADS),
+            help="Muse Spark: the payload encoding of the owned-row prefill "
+            "collectives in extend forwards. int8-block16 sends INT8 codes with "
+            "an FP32 scale per 16 elements (a numerics change); decode stays "
+            "BF16, and so do the heads of --owned-attention-output all-to-all.",
+        )
+        parser.add_argument(
             "--numerics",
             type=str,
             choices=list(NUMERICS_ENVELOPES),
@@ -5244,6 +5704,25 @@ class ServerArgs:
             default="null",
             choices=["null", "prefill", "decode", "encode"],
             help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
+        )
+        parser.add_argument(
+            "--disaggregation-decode-allocation-policy",
+            type=str,
+            choices=["early", "deferred"],
+            default=ServerArgs.disaggregation_decode_allocation_policy,
+            help="Prefill servers only: what a request's Decode allocation "
+            "gates. 'early' (the default) starts the prefill once every Decode "
+            "rank has allocated the destination; it is deprecated and will be "
+            "removed once 'deferred' supports the layouts that still need it. "
+            "'deferred' (experimental) starts the prefill without waiting for "
+            "the allocation, which the Decode server makes once the prefill "
+            "server holds every page of the prompt, and holds only its KV "
+            "transfer until then. deferred requires attention TP 1, "
+            "--kv-parallel-size 1, --pipeline-parallel-size 1, no "
+            "--enable-external-encoder, --disaggregation-layerwise-interval 0 "
+            "and a model without multimodal input (or --language-model-only). "
+            "Refused with any other --disaggregation-mode; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",

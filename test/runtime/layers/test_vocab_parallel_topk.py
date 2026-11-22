@@ -326,7 +326,8 @@ def test_a_later_rank_packs_global_ids_beside_its_values(monkeypatch) -> None:
     )
     selector(hidden_states)
 
-    values, ids = torch.topk(hidden_states @ weight.T, top_k, dim=-1, sorted=False)
+    order = torch.sort(hidden_states @ weight.T, dim=-1, descending=True, stable=True)
+    values, ids = order.values[:, :top_k], order.indices[:, :top_k]
     assert torch.equal(sent[0][:, :top_k], values)
     assert torch.equal(sent[0][:, top_k:], (ids + shard).float())
 

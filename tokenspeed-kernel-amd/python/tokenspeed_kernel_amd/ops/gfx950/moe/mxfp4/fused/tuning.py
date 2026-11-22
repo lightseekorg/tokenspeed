@@ -34,15 +34,73 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _SWIZZLE_K_S_INNER,
     _TCP_INFLIGHT_CAP_BYTES,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import B_LAYOUT_GDOT128
 
 
 class _GroupedMoEConfig(NamedTuple):
-    """Sorting and stage-1 settings; both GEMMs share ``block_m``."""
+    """Sorting and stage-1 settings; both GEMMs share ``block_m``.
+
+    ``wide_tiles`` runs E2M1 package prefill on the wide tiles: stage 1's
+    64- or 128-row x 128-output tile and, in reduce mode on 64-row sort
+    blocks, stage 2's 64 x 256 x 256 tile. Both keep every output element's
+    K order, so they write the bits the general kernels write; only shapes
+    whose table rows set it take them (``_stage1_wide_tile``,
+    ``_stage2_wide_tile``).
+    """
 
     block_m: int
     stage1_num_warps: int
     use_minimum_route_chunks: bool
     runtime_rows: bool
+    wide_tiles: bool
+
+
+def _stage1_wide_tile(
+    wide_tiles: bool,
+    block_m: int,
+    hidden_dim: int,
+    inter_dim: int,
+    activation_format: str,
+    b_layout: int,
+    input_sorted: bool,
+) -> bool:
+    """Whether stage 1 takes its wide tile: the configuration asks for it and
+    the call fits the tile (E2M1 rows from token order, GDOT128 weights, the
+    sort block and shape). Other calls keep the general kernel."""
+    return (
+        wide_tiles
+        and activation_format == "e2m1"
+        and b_layout == B_LAYOUT_GDOT128.value
+        and not input_sorted
+        and block_m in (64, 128)
+        and hidden_dim % 256 == 0
+        and hidden_dim >= 512
+        and inter_dim % 128 == 0
+    )
+
+
+def _stage2_wide_tile(
+    wide_tiles: bool,
+    block_m: int,
+    out_dim: int,
+    k: int,
+    activation_format: str,
+    b_layout: int,
+    reduces: bool,
+) -> bool:
+    """Whether stage 2 (``out_dim`` columns, ``k``-wide rows) takes its wide
+    tile: the configuration asks for it, in reduce mode on 64-row sort
+    blocks over GDOT128 weights. Other calls keep the general kernel."""
+    return (
+        wide_tiles
+        and reduces
+        and block_m == 64
+        and activation_format == "e2m1"
+        and b_layout == B_LAYOUT_GDOT128.value
+        and out_dim % 256 == 0
+        and k % 256 == 0
+        and k >= 512
+    )
 
 
 # Key: hidden width, intermediate width, padded W2 K, local/global experts, top-k.
@@ -52,18 +110,40 @@ _GROUPED_MOE_CONFIGS = {
         (
             49,
             128,
-            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=True, runtime_rows=False),
+            _GroupedMoEConfig(
+                32,
+                4,
+                use_minimum_route_chunks=True,
+                runtime_rows=False,
+                wide_tiles=False,
+            ),
         ),
         (
             129,
             191,
-            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=False, runtime_rows=True),
+            _GroupedMoEConfig(
+                32,
+                4,
+                use_minimum_route_chunks=False,
+                runtime_rows=True,
+                wide_tiles=False,
+            ),
         ),
+        # 64-row blocks on the wide tiles. Measured faster than the general
+        # tiles from 3k to 24k rows (one EP rank, served facade) and checked
+        # at 192-2k and 32k-64k rows (see the MoE README). Deferred calls of
+        # at most 256 rows take the route tiles before this table. The upper
+        # bound is the stage-1 launcher's: token-order E2M1 rows of 2,048
+        # bytes must span less than 2^31 bytes.
         (
             192,
-            8192,
+            (1 << 31) // (4096 // 2) - 1,
             _GroupedMoEConfig(
-                64, 2, use_minimum_route_chunks=False, runtime_rows=False
+                64,
+                2,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+                wide_tiles=True,
             ),
         ),
     )
@@ -81,14 +161,22 @@ _GROUPED_SITU_MOE_CONFIGS = {
             449,
             1792,
             _GroupedMoEConfig(
-                32, 4, use_minimum_route_chunks=False, runtime_rows=False
+                32,
+                4,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+                wide_tiles=False,
             ),
         ),
         (
             1793,
             16384,
             _GroupedMoEConfig(
-                64, 4, use_minimum_route_chunks=False, runtime_rows=False
+                64,
+                4,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
+                wide_tiles=False,
             ),
         ),
     ),
@@ -113,13 +201,11 @@ class _RouteTileStage(NamedTuple):
 class _RouteTileConfig(NamedTuple):
     """Route-tiled A4W4 expert schedule (deferred, token/slot-order outputs).
 
-    ``route_capacity`` is the per-expert route-list length. 16 groups at
-    most 16 tokens' routes by expert inside each GEMM, straight from the
-    top-k IDs (a token's top-k expert IDs are distinct, so an expert gets at
-    most one route per row and one 16-row tile per expert). Larger values
-    select the per-expert pack plus tile split and must be at least the
-    call's row count. It is a compile-time bound, so it is bucketed to powers
-    of two.
+    ``route_capacity`` bounds the call's row count. Stage 1 groups the routes
+    by expert straight from the top-k IDs, in tiles of at most 16 routes (a
+    token's top-k expert IDs are distinct, so an expert gets at most one route
+    per row, and at most ``route_capacity / 16`` tiles). It is a compile-time
+    bound that sizes the grouping, so it is bucketed to powers of two.
     """
 
     route_capacity: int
@@ -127,7 +213,6 @@ class _RouteTileConfig(NamedTuple):
     stage2: _RouteTileStage
 
 
-_DECODE_STAGE1 = _RouteTileStage(64, 128, 0, 4)
 _WIDE_STAGE1 = _RouteTileStage(128, 256, 1, 4)
 # At EP1, overlapping the next K tile's loads did not help at 17-128 rows,
 # so pipelining is off.
@@ -156,28 +241,62 @@ _EP1_ID_STAGE2 = _RouteTileStage(128, 128, 8, 4)
 # recorded in serving (speculative verify and plain decode, busiest EP8 rank)
 # and uniform routing, three samples each.
 #
-# EP8 (32 local experts), 4-16 rows: faster than the route-descriptor kernel
-# plus route tiles it replaces, with verify and with plain decode routing. The
+# EP8 (32 local experts), 4-16 rows: faster than the separate route grouping
+# kernels it replaced, with verify and with plain decode routing. The
 # EP4 4-16 row entries were not re-measured.
 _ID_ROUTE_TILES = ((4, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _ID_GROUPS_STAGE)),)
-_DECODE_ROUTE_TILES = _ID_ROUTE_TILES + (
-    (17, 48, _RouteTileConfig(64, _DECODE_STAGE1, _RouteTileStage(16, 128, 0, 1))),
-)
 # EP8 (32 local experts), 49-256 rows: faster than the staged package with
 # uniform and Zipf routing, except one very skewed 224-row sample. Zipf
 # samples are slower from 384 rows, so the bound is 256. EP8 17-64 rows:
-# faster than the _DECODE_ROUTE_TILES schedule over four samples; in the down
-# projection (stage 2), a 256-wide K tile is about as fast as a 128-wide one
-# at 49-64 rows.
-_EP8_ROUTE_TILES = _ID_ROUTE_TILES + (
+# faster than a 64-column stage 1 / 16-column stage 2 schedule over four
+# samples; in the down projection (stage 2), a 256-wide K tile is about as
+# fast as a 128-wide one at 49-64 rows.
+_EP_ROUTE_TILES = _ID_ROUTE_TILES + (
     (17, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
     (65, 128, _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, 1, 1))),
     # More routes per expert favor the longer down-projection K tile.
     (129, 256, _RouteTileConfig(256, _WIDE_STAGE1, _RouteTileStage(64, 256, 1, 1))),
 )
+# EP4 (64 local experts), 17-256 rows: wider output tiles in both stages. Each
+# program streams one K-tiled weight slice per job and keeps only one or two K
+# tiles of loads in flight, so a call's time follows its job count (16-route
+# groups x output tiles) more than the bytes of the experts it reads; wider
+# tiles mean fewer jobs with more bytes in flight each. Measured on MI355X
+# against the entries above at every eighth row count from 17 to 256: one MoE
+# layer per call in graph replay over three cold weight copies, with
+# served-like (a Zipf(0.75) subset of experts, the busiest rank's share),
+# uniform and Zipf(1.0) routing, three samples each. Each entry is the fastest
+# candidate on average over the three routings that is no slower on any of
+# them, except at 17-23 rows, where the previous schedule was slightly faster;
+# one entry per route capacity, as above, keeps the number of compiled
+# variants unchanged. The tile shapes do not change any row's K order, so
+# results are bitwise identical to the entries above.
+_EP4_ROUTE_TILES = _ID_ROUTE_TILES + (
+    (
+        17,
+        64,
+        _RouteTileConfig(
+            64, _RouteTileStage(256, 256, 1, 4), _RouteTileStage(128, 128, 1, 1)
+        ),
+    ),
+    (
+        65,
+        128,
+        _RouteTileConfig(
+            128, _RouteTileStage(256, 256, 1, 4), _RouteTileStage(64, 128, 1, 1)
+        ),
+    ),
+    (
+        129,
+        256,
+        _RouteTileConfig(
+            256, _RouteTileStage(256, 128, 2, 4), _RouteTileStage(128, 256, 0, 1)
+        ),
+    ),
+)
 _ROUTE_TILE_CONFIGS = {
-    (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
-    (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
+    (4096, 4096, 32, 256, 8): _EP_ROUTE_TILES,
+    (4096, 4096, 64, 256, 8): _EP4_ROUTE_TILES,
     # EP1 (TP8 intermediate shard), 10-16 rows: grouping the routes from the
     # top-k IDs beats the direct decode on recorded verify and plain decode
     # routing, except a few plain decode samples with many distinct experts.
@@ -186,14 +305,17 @@ _ROUTE_TILE_CONFIGS = {
     # Zipf routing it breaks even at 160 rows.
     (4096, 512, 256, 256, 8): (
         (10, 16, _RouteTileConfig(16, _ID_GROUPS_STAGE, _EP1_ID_STAGE2)),
-        (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
+        # Stage 1's grouping cost grows with the route capacity, so 17-32
+        # rows take a 32-route capacity.
+        (17, 32, _RouteTileConfig(32, _EP1_STAGE, _EP1_STAGE2)),
+        (33, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE2)),
         (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE2)),
     ),
 }
 assert all(
     config.route_capacity & (config.route_capacity - 1) == 0
-    and (config.route_capacity == 16 or config.route_capacity >= max_rows)
-    and (config.route_capacity != 16 or max_rows <= 16)
+    and 16 <= config.route_capacity
+    and config.route_capacity >= max_rows
     for entries in _ROUTE_TILE_CONFIGS.values()
     for _, max_rows, config in entries
 )
@@ -261,6 +383,37 @@ def _select_direct_stage2_deferred_block_n(
 _ROUTE_TILE_MAX_M = max(
     max_rows for entries in _ROUTE_TILE_CONFIGS.values() for _, max_rows, _ in entries
 )
+
+
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# Entries: inclusive row bounds and how many route-tile stage-2 jobs (16-route
+# groups x output tiles) still get one program each; past it, the persistent
+# programs loop over the jobs. Rows outside every entry keep the persistent
+# programs. One program a job removes the tail where a few persistent programs
+# run a second job alone after the rest finish.
+_ROUTE_TILE_STAGE2_SINGLE_ROUND_JOBS = {
+    # EP4, 65-128 rows, measured on MI350X and MI355X with uniform, Zipf and
+    # served-like routing: one program a job won from 33 to 41 groups (2112-2624
+    # jobs) and was slower past 41.
+    (4096, 4096, 64, 256, 8): ((65, 128, 2624),),
+}
+
+
+def _select_route_tile_stage2_single_round_jobs(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+) -> int:
+    """Return the route-tile stage 2's one-program-a-job bound in jobs, or 0."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    for min_rows, max_rows, jobs in _ROUTE_TILE_STAGE2_SINGLE_ROUND_JOBS.get(shape, ()):
+        if min_rows <= num_tokens <= max_rows:
+            return jobs
+    return 0
 
 
 def _select_route_tile_config(
@@ -342,6 +495,7 @@ def _select_grouped_moe_config(
             8,
             use_minimum_route_chunks=False,
             runtime_rows=False,
+            wide_tiles=False,
         )
     block_m = _select_grouped_moe_block_m(num_tokens, top_k, num_experts)
     return _GroupedMoEConfig(
@@ -349,6 +503,7 @@ def _select_grouped_moe_config(
         max(1, block_m // 32),
         use_minimum_route_chunks=False,
         runtime_rows=False,
+        wide_tiles=False,
     )
 
 
@@ -367,7 +522,8 @@ def package_prefill_row_families(
     Covers all-local experts with precomputed routes and E2M1 activations, as
     the sorted gate/up and down halves run them. Compile-time values follow
     the grouped configuration, the sort's route tile width, and the divisibility
-    by 16 that Triton keys on for the runtime token and route counts.
+    by 16 that Triton keys on for the runtime route count. The token count
+    is not specialized on, so it does not split the families.
     """
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import route_chunks
 
@@ -393,7 +549,7 @@ def package_prefill_row_families(
             use_minimum_route_chunks=config.use_minimum_route_chunks,
             runtime_rows=config.runtime_rows,
         )
-        key = (config, route_tile, rows % 16 == 0, rows * top_k % 16 == 0)
+        key = (config, route_tile, rows * top_k % 16 == 0)
         first_rows.setdefault(key, rows)
     return sorted(first_rows.values())
 

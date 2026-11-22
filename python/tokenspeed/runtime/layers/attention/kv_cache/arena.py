@@ -33,7 +33,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.offload import SparseKVOffload
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheMemoryPlan,
+    is_flat_kv_plane,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
@@ -146,33 +149,33 @@ class CacheArena:
         # once here.
         # A group may have no fields on this rank: pipeline parallelism keeps
         # every group but drops the fields of layers another stage owns.
-        self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
-        for group in plan.groups:
-            page_count, fields = plan.page_field_layout(group.group_id)
-            for base, stride, size in fields:
-                if base + (page_count - 1) * stride + size > plan.arena_bytes:
-                    raise ValueError(
-                        f"cache group {group.group_id!r} field geometry reaches "
-                        f"past the {plan.arena_bytes}-byte arena"
-                    )
-            self._zero_field_tables[group.group_id] = (
-                page_count,
-                torch.tensor(fields, dtype=torch.int64, device=device).reshape(
-                    len(fields), 3
-                ),
-                max((size for _, _, size in fields), default=0),
-            )
-        self._cache_group_specs_by_id = {
-            spec.group_id: spec for spec in cache_group_specs
-        }
-        # One adapter for the whole arena. The allocation happens inside its
-        # region, so the sleep/wake lifetime is a property of the arena.
-        # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
-        # sleep and rebuilt after wake (paging overwrites; clear() zeros the
-        # remapped pages).
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
+        with self.memory_saver_adapter.named_region("attention_state"):
+            for group in plan.groups:
+                page_count, fields = plan.page_field_layout(group.group_id)
+                for base, stride, size in fields:
+                    if base + (page_count - 1) * stride + size > plan.arena_bytes:
+                        raise ValueError(
+                            f"cache group {group.group_id!r} field geometry reaches "
+                            f"past the {plan.arena_bytes}-byte arena"
+                        )
+                self._zero_field_tables[group.group_id] = (
+                    page_count,
+                    torch.tensor(fields, dtype=torch.int64, device=device).reshape(
+                        len(fields), 3
+                    ),
+                    max((size for _, _, size in fields), default=0),
+                )
+        self._cache_group_specs_by_id = {
+            spec.group_id: spec for spec in cache_group_specs
+        }
+        # The payload and geometry share an adapter but have distinct lifetimes.
+        # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
+        # sleep and rebuilt after wake (paging overwrites; clear() zeros the
+        # remapped pages).
         self.storage_plan = storage_plan or plan_cache_storage(
             plan,
             cache_group_specs,
@@ -329,6 +332,33 @@ class CacheArena:
         ):
             token_rows = spec.rows_per_page
         if (
+            is_flat_kv_plane(field.plane_id)
+            and spec.attn_kind == "full_history"
+            and field.shape[0] == spec.rows_per_page
+        ):
+            # History readers use translated atom-page IDs. State and recent
+            # windows retain scheduler IDs and their explicit physical stride.
+            row_bytes = field.payload_bytes // field.shape[0]
+            if field.page_stride_bytes % row_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r} stride does not cover "
+                    "a whole number of atom rows"
+                )
+            if field.page_stride_bytes % field.payload_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r} stride does not cover "
+                    "a whole number of atom pages"
+                )
+            span_bytes = (
+                group.page_count - 1
+            ) * field.page_stride_bytes + field.payload_bytes
+            pages = pages.as_strided(
+                (span_bytes // field.payload_bytes, *field.shape),
+                (field.payload_bytes // field.element_size, *reversed(element_strides)),
+            )
+            if field.shape[0] != token_rows:
+                return pages
+        elif (
             spec.attn_kind == "state"
             or field.shape[0] != token_rows
             or field.page_stride_bytes != field.payload_bytes
@@ -341,8 +371,9 @@ class CacheArena:
 
         The view is shaped the way the field is addressed. A history field whose
         planned shape leads with the prefix grain stores an entry per token,
-        so its page axis is folded away when pages are contiguous. Padded pages
-        retain the page axis and consumers honor its explicit stride.
+        so its page axis is folded away when pages are contiguous. FlatKV
+        fields expose contiguous atom rows with translated page IDs; other
+        padded pages retain the page axis and its explicit stride.
         Offloaded fields use their group's physical row grain for this fold.
         Other fields (recurrent state, compressor state, block-scaled scale
         planes, V4's byte-shaped planes) retain page-indexed views.

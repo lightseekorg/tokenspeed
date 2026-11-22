@@ -25,6 +25,11 @@ Larger forwards mix each query in one launch, `attention.attention_residual_mix`
 It computes the same equations with another FP32 summation order.
 With a token range and a destination it mixes only those rows: a sequence-parallel rank (`ResidualShare` in the runtime state) mixes its share of the tokens into a multicast buffer, and after a barrier every rank holds the whole mix.
 This state does not add a per-request cache group.
+A looped stack runs a core of its layers several times per forward: the state records where the core starts (`loop_entry`), copies out the blocks each pass wrote (`loop_bank`), and restarts the next pass from the recorded entry (`rewind_loop`), reusing the entry's stored partial and its block-set statistics.
+The `attention_mixtures` and `mlp_mixture` methods return the FP32 mixtures before their norms, for inputs that are changed before they are normalized.
+
+`attention.message_gate` gates a message into a row per channel, `(1 - tanh(forget)) * x + tanh(gain) * message`, in FP32 with every operation rounded separately (no FMA contraction), from `[tokens, 2 * width]` gain-then-forget logits.
+A looped Inkling2 core uses it for the messages its later passes read from the previous pass.
 
 Token counts are runtime scalars of the kernels.
 Source count, hidden width, query count, and normalization policy are model properties.

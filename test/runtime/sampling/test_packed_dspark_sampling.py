@@ -43,6 +43,9 @@ from tokenspeed_kernel.ops.sampling.packed_verify import (  # noqa: E402
 )
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
+from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
+    get_apply_vocab_mask_func,
+)
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessorOutput,
 )
@@ -84,7 +87,11 @@ def _params(seed: int, temperature: float, top_k: int, top_p: float) -> Sampling
 
 
 def _backend(
-    monkeypatch, max_bs: int = 4, *, reject_threshold: float = 2.0
+    monkeypatch,
+    max_bs: int = 4,
+    *,
+    reject_threshold: float = 2.0,
+    output_logprobs: bool = False,
 ) -> FlashInferSamplingBackend:
     monkeypatch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
     monkeypatch.setitem(
@@ -96,6 +103,7 @@ def _backend(
             enable_speculative_sampling=True,
             sampling_stream="per-request",
             logprob_order="torch",
+            enable_output_logprobs=output_logprobs,
             max_bs=max_bs,
             max_draft_tokens_per_req=WIDTH,
             max_req_pool_size=POOL,
@@ -104,6 +112,70 @@ def _backend(
             spec_reject_draft_prob_threshold=reject_threshold,
         )
     )
+
+
+def _allow_tokens(allowed: torch.Tensor) -> torch.Tensor:
+    mask = torch.zeros(
+        (allowed.shape[0], (VOCAB + 31) // 32),
+        dtype=torch.int32,
+        device=allowed.device,
+    )
+    rows = torch.arange(allowed.shape[0], device=allowed.device)
+    for choice in range(allowed.shape[1]):
+        tokens = allowed[:, choice].long()
+        bits = (torch.ones_like(tokens) << (tokens % 32)).to(torch.int32)
+        mask[rows, tokens // 32] |= bits
+    return mask
+
+
+def _apply_vocab_mask_torch(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    bits = torch.arange(32, device=logits.device)
+    allowed = (vocab_mask.long().unsqueeze(-1) >> bits) & 1
+    allowed = allowed.flatten(1).bool()[:, : logits.shape[1]]
+    logits.masked_fill_(~allowed, float("-inf"))
+
+
+def _vocab_mask_applier():
+    return get_apply_vocab_mask_func("xgrammar")
+
+
+def _masked_reference(logits: torch.Tensor, vocab_mask: torch.Tensor) -> torch.Tensor:
+    reference = logits.clone()
+    _apply_vocab_mask_torch(reference, vocab_mask)
+    return reference
+
+
+def _assert_packed_logprobs(
+    actual: torch.Tensor,
+    logits: torch.Tensor,
+    vocab_mask: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Independently map flat request/column indices through the packed CSR."""
+    starts = query_start_loc.tolist()
+    rows = []
+    for request, indices in enumerate(accept_index.tolist()):
+        for index in indices:
+            column = index - request * WIDTH if index >= 0 else 0
+            rows.append(starts[request] + column)
+    row_indices = torch.tensor(rows, dtype=torch.int64, device=logits.device)
+    reference = _masked_reference(logits, vocab_mask).index_select(0, row_indices)
+    expected = torch.log_softmax(reference, dim=-1, dtype=torch.float32).gather(
+        1, predict.long().unsqueeze(1)
+    )
+    torch.testing.assert_close(actual, expected.squeeze(1), atol=1e-6, rtol=1e-6)
+
+
+def _grammar_rows(rows: int) -> torch.Tensor:
+    requests = torch.arange(rows, device="cuda")
+    first = (requests * 5 + 3) % VOCAB
+    second = (first + 1 + requests % 7) % VOCAB
+    # Include a high vocabulary lane while retaining at least two allowed IDs
+    # per row, so selected-token logprobs remain sensitive to row alignment.
+    allowed = torch.stack((first, second, torch.full_like(first, VOCAB - 1)), dim=1)
+    return _allow_tokens(allowed)
 
 
 def _prepare(backend, rids, slots, params) -> torch.Tensor:
@@ -180,22 +252,28 @@ def _verify(
     draft_probs: torch.Tensor,
     query_start_loc: torch.Tensor,
     frontiers: torch.Tensor,
+    vocab_mask: torch.Tensor | None = None,
 ):
     info = SamplingBatchInfo(
         req_pool_indices=slots,
         valid_cache_lengths=frontiers,
         draft_probs=draft_probs,
         vocab_size=VOCAB,
+        vocab_mask=vocab_mask,
+        apply_vocab_mask=_vocab_mask_applier() if vocab_mask is not None else None,
         device="cuda",
     )
+    output = LogitsProcessorOutput(next_token_logits=logits)
     predict, lengths = backend.verify(
-        LogitsProcessorOutput(next_token_logits=logits),
+        output,
         info,
         candidates,
         tree=None,
         query_start_loc=query_start_loc,
     )
     indices = backend._accept_index_buf[: candidates.numel()].view_as(candidates)
+    if output.next_token_logprobs is not None:
+        return predict, lengths, indices, output.next_token_logprobs
     return predict, lengths, indices
 
 
@@ -407,6 +485,98 @@ def test_dspark_verify_fullwidth_matches_explicit_csr(monkeypatch):
     )
     for got, ref in zip(packed, fullwidth, strict=True):
         torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+def test_dspark_logprobs_match_fullwidth_and_follow_grammar_csr(monkeypatch):
+    backend = _backend(monkeypatch, output_logprobs=True)
+    slots, _, logits, candidates, draft, starts, frontiers = _make_verify_case(
+        backend, starts=[0, WIDTH, 2 * WIDTH, 3 * WIDTH]
+    )
+    vocab_mask = _grammar_rows(logits.shape[0])
+    common = dict(
+        slots=slots,
+        candidates=candidates,
+        draft_probs=draft,
+        frontiers=frontiers,
+        vocab_mask=vocab_mask,
+    )
+    fullwidth = _verify(
+        backend,
+        logits=logits.clone(),
+        query_start_loc=None,
+        **common,
+    )
+    fullwidth = tuple(value.clone() for value in fullwidth)
+    packed = _verify(
+        backend,
+        logits=logits.clone(),
+        query_start_loc=starts,
+        **common,
+    )
+    for got, reference in zip(packed, fullwidth, strict=True):
+        torch.testing.assert_close(got, reference, atol=0, rtol=0)
+    _assert_packed_logprobs(
+        fullwidth[3], logits, vocab_mask, fullwidth[0], fullwidth[2], starts
+    )
+
+    # Shorten to four, two and one rows. The flat acceptance indices still use
+    # request*WIDTH+column, while their target rows follow this different CSR.
+    short_starts = torch.tensor([0, 4, 6, 7], device="cuda", dtype=torch.int64)
+    selected = torch.tensor([0, 1, 2, 3, 4, 5, 8], device="cuda")
+    short_logits = logits.index_select(0, selected)
+    short_mask = vocab_mask.index_select(0, selected)
+    shortened = _verify(
+        backend,
+        slots=slots,
+        logits=short_logits.clone(),
+        candidates=candidates,
+        draft_probs=draft,
+        query_start_loc=short_starts,
+        frontiers=frontiers,
+        vocab_mask=short_mask,
+    )
+    _assert_packed_logprobs(
+        shortened[3],
+        short_logits,
+        short_mask,
+        shortened[0],
+        shortened[2],
+        short_starts,
+    )
+
+
+def test_dspark_prefill_sample_applies_grammar_and_reports_logprobs(monkeypatch):
+    backend = _backend(monkeypatch, max_bs=3, output_logprobs=True)
+    params = [
+        _params(3101, 0.8, 8, 0.9),
+        _params(3202, 1.1, 8, 0.9),
+        _params(3303, 0.9, 8, 0.9),
+    ]
+    slots = _prepare(backend, [201, 202, 203], [5, 2, 7], params)
+    frontiers = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
+    frontiers[slots] = torch.tensor([30, 50, 90], device="cuda", dtype=torch.int32)
+    logits = _logits(3)
+    allowed = torch.tensor([[3], [17], [VOCAB - 1]], device="cuda")
+    vocab_mask = _allow_tokens(allowed)
+    info = SamplingBatchInfo(
+        req_pool_indices=slots,
+        valid_cache_lengths=frontiers,
+        vocab_size=VOCAB,
+        vocab_mask=vocab_mask,
+        apply_vocab_mask=_vocab_mask_applier(),
+        device="cuda",
+    )
+    output = LogitsProcessorOutput(next_token_logits=logits.clone())
+    sampled, lengths = backend.sample(output, info)
+    assert sampled.tolist() == allowed.squeeze(1).tolist()
+    assert lengths.tolist() == [1, 1, 1]
+    reference = torch.log_softmax(
+        _masked_reference(logits, vocab_mask), dim=-1, dtype=torch.float32
+    )
+    expected = reference.gather(1, sampled.long().unsqueeze(1)).squeeze(1)
+    torch.testing.assert_close(
+        output.next_token_logprobs, expected, atol=1e-6, rtol=1e-6
+    )
 
 
 def test_dspark_verify_is_stable_under_request_reordering(monkeypatch):

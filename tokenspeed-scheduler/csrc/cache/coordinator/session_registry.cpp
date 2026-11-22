@@ -57,7 +57,7 @@ void SessionRegistry::Access::release() noexcept {
     }
 }
 
-SessionCacheOwner SessionRegistry::ownerTag(const std::string& id, OwnerTags& tags) {
+SessionCacheOwner SessionRegistry::acquireOwnerTag(const std::string& id, OwnerTags& tags) {
     auto& weak = tags[id];
     if (auto tag = weak.lock(); tag && !tag->ended) {
         tag->demoted = false;

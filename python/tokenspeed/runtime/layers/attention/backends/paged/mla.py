@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -44,11 +43,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
-    PagedAttentionBackend,
+    PagedMLABackend,
 )
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.chunk import (
@@ -138,8 +134,8 @@ class MLADecodeMetadata:
         return self.seq_lens
 
 
-class MLAAttnBackend(PagedAttentionBackend):
-    """Unified MLA leaf routed through tokenspeed_kernel MLA APIs."""
+class MLAMetadataBackend(PagedMLABackend):
+    """Prepare MLA cache and graph metadata for a backend that supplies attention."""
 
     supports_mla_projected_value_decode = True
     supports_mla_dcp = True
@@ -192,58 +188,9 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         self.extend_kernel_plan = None
         self.decode_kernel_plan = None
-        if self.batch_invariant:
-            if spec.sliding_window_tokens is not None:
-                raise ValueError(
-                    "Absorbed MLA extend does not yet carry a sliding-window mask"
-                )
-            signature = format_signature(
-                q=dense_tensor_format(self.q_data_type),
-                kv_cache=dense_tensor_format(self.data_type),
-            )
-            traits = {
-                "num_q_heads": self.num_local_heads,
-                "qk_nope_head_dim": self.qk_nope_head_dim,
-                "kv_lora_rank": self.kv_lora_rank,
-                "qk_rope_head_dim": self.qk_rope_head_dim,
-                "page_size": self.kernel_page_size,
-                "logit_cap": False,
-                "return_lse": False,
-            }
-            variable_traits = frozenset({"batch_size", "max_seqlen_q", "max_seqlen_k"})
-            self.extend_kernel_plan = KernelPlan.select(
-                "attention",
-                "mla_extend_with_kvcache",
-                signature,
-                features=frozenset({"batch_invariant"}),
-                static_traits={**traits, "is_causal": True},
-                variable_traits=variable_traits,
-                solution=self.kernel_solution,
-                declared_traits=frozenset(),
-                ignore_layout=False,
-            )
-            self.decode_kernel_plan = KernelPlan.select(
-                "attention",
-                "mla_decode_with_kvcache",
-                signature,
-                features=frozenset({"batch_invariant"}),
-                static_traits={
-                    **traits,
-                    "q_len": 1,
-                    "sliding_window": False,
-                    "noncausal_block_size": 1,
-                },
-                variable_traits=variable_traits,
-                solution=self.kernel_solution,
-                declared_traits=frozenset(),
-                ignore_layout=False,
-            )
         # The strict arithmetic materializes latent output before value projection.
         self.supports_mla_projected_value_decode = not self.batch_invariant
         self.supports_layer_sliding_window = not self.batch_invariant
-        self.cuda_graph_support = CudaGraphSupport.from_plans(
-            prefill=self.extend_kernel_plan, decode=self.decode_kernel_plan
-        )
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -508,60 +455,6 @@ class MLAAttnBackend(PagedAttentionBackend):
     # Metadata
     # ------------------------------------------------------------------
 
-    def init_forward_metadata(
-        self,
-        bs: int,
-        num_extends: int,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        forward_mode: ForwardMode,
-        *,
-        extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
-        **kwargs,
-    ) -> None:
-        reject_query_shard(query_shard, "MLAAttnBackend")
-        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
-            raise RuntimeError(
-                "MLA decode metadata goes through refresh_decode_metadata; "
-                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
-            )
-        if forward_mode.is_extend_or_mixed():
-            self._init_prefill_metadata(
-                seq_lens=seq_lens[:num_extends],
-                extend_prefix_lens=extend_prefix_lens[:num_extends],
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
-                extend_seq_lens=extend_seq_lens[:num_extends],
-                extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
-                page_table=page_table[:num_extends],
-                page_table_cpu=page_table_cpu,
-            )
-
-        # Target mixed/idle batches carry decode requests whose metadata this
-        # init must cover (verify decodes q_len tokens per request); the same
-        # in-place refresh serves them. A draft's decode metadata instead
-        # comes from the wrapper's refresh after this init (the unified draft
-        # contract).
-        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
-            self.refresh_decode_metadata(
-                bs, bs, seq_lens, page_table, num_extends=num_extends
-            )
-
-    @contextmanager
-    def override_num_extends(self, num_extends: int):
-        assert self.forward_decode_metadata is not None
-        prev = self.forward_decode_metadata.num_extends
-        self.forward_decode_metadata.num_extends = num_extends
-        try:
-            yield
-        finally:
-            self.forward_decode_metadata.num_extends = prev
-
     def _init_prefill_metadata(
         self,
         seq_lens: torch.Tensor,
@@ -571,7 +464,10 @@ class MLAAttnBackend(PagedAttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         page_table: torch.Tensor,
         page_table_cpu: torch.Tensor | None,
+        *,
+        extend_with_prefix: bool,
     ):
+        del extend_with_prefix  # Unused: the prefix lengths pick the prefill path.
         extend_seq_lens_cpu_list = [int(x) for x in extend_seq_lens_cpu.tolist()]
         cum_extend_seq_lens = torch.zeros(
             extend_seq_lens.shape[0] + 1,
@@ -765,6 +661,68 @@ class MLAAttnBackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
+    def forward_decode(self, *args, **kwargs):
+        raise NotImplementedError("MLA metadata delegates cannot compute attention")
+
+    def forward_extend(self, *args, **kwargs):
+        raise NotImplementedError("MLA metadata delegates cannot compute attention")
+
+
+class MLAAttnBackend(MLAMetadataBackend):
+    """Run MLA attention with the provider selected for this numerical policy."""
+
+    def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
+        super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        if self.batch_invariant:
+            if spec.sliding_window_tokens is not None:
+                raise ValueError(
+                    "Absorbed MLA extend does not yet carry a sliding-window mask"
+                )
+            signature = format_signature(
+                q=dense_tensor_format(self.q_data_type),
+                kv_cache=dense_tensor_format(self.data_type),
+            )
+            traits = {
+                "num_q_heads": self.num_local_heads,
+                "qk_nope_head_dim": self.qk_nope_head_dim,
+                "kv_lora_rank": self.kv_lora_rank,
+                "qk_rope_head_dim": self.qk_rope_head_dim,
+                "page_size": self.kernel_page_size,
+                "logit_cap": False,
+                "return_lse": False,
+            }
+            variable_traits = frozenset({"batch_size", "max_seqlen_q", "max_seqlen_k"})
+            self.extend_kernel_plan = KernelPlan.select(
+                "attention",
+                "mla_extend_with_kvcache",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={**traits, "is_causal": True},
+                variable_traits=variable_traits,
+                solution=self.kernel_solution,
+                declared_traits=frozenset(),
+                ignore_layout=False,
+            )
+            self.decode_kernel_plan = KernelPlan.select(
+                "attention",
+                "mla_decode_with_kvcache",
+                signature,
+                features=frozenset({"batch_invariant"}),
+                static_traits={
+                    **traits,
+                    "q_len": 1,
+                    "sliding_window": False,
+                    "noncausal_block_size": 1,
+                },
+                variable_traits=variable_traits,
+                solution=self.kernel_solution,
+                declared_traits=frozenset(),
+                ignore_layout=False,
+            )
+        self.cuda_graph_support = CudaGraphSupport.from_plans(
+            prefill=self.extend_kernel_plan, decode=self.decode_kernel_plan
+        )
 
     def forward_decode(
         self,

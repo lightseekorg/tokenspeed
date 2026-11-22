@@ -119,6 +119,7 @@ def create_peer_weight_store(
     model_identity: str,
     pool_page_bytes: int,
     copy_implementation: str,
+    handle_type: str,
     solution: str,
 ) -> PeerWeightStore:
     """Create immutable peer storage before loading processed expert weights.
@@ -131,6 +132,9 @@ def create_peer_weight_store(
         pool_page_bytes: Physical staging-page size, fixed for the store lifetime.
         copy_implementation: Currently only ``simple`` is supported. It submits
             each layer as one batch of copy-engine copies from a worker thread.
+        handle_type: How owners share storage: ``fabric`` (needs an IMEX channel;
+            works within and across nodes of an NVLink domain) or ``posix_fd``
+            (one node; descriptors pass over a local Unix socket).
         solution: Registered storage implementation, currently ``cuda``.
 
     Returns:
@@ -158,4 +162,5 @@ def create_peer_weight_store(
         model_identity=model_identity,
         pool_page_bytes=pool_page_bytes,
         copy_implementation=copy_implementation,
+        handle_type=handle_type,
     )

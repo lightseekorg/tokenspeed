@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -194,6 +194,30 @@ def test_plan_flags_are_peer_regions_and_part_of_the_key():
     assert flagged.only(("sum",)).flags == ("part",)
     with pytest.raises(ValueError, match="not peer regions"):
         replace(plain, flags=("local",))
+
+
+@dataclass(frozen=True)
+class _Dims:
+    width: int
+
+
+def test_plan_dims_are_part_of_the_key_and_kept_by_slices():
+    """A model's dimensions (Plan.dims) select its geometry's compiled
+    launches: they tell keys apart, reach the compile-time helpers, and a
+    test's slice keeps them."""
+    plain = Plan(
+        grid=2,
+        stages=(Stage("a", 1, 0, writes=("x",)), Stage("b", 1, 1, reads=("x",))),
+        regions=(("x", 8),),
+        rows=1,
+        chain=1,
+    )
+    narrow, wide = replace(plain, dims=_Dims(8)), replace(plain, dims=_Dims(16))
+    assert "dims" not in json.loads(plain.key)
+    assert json.loads(narrow.key)["dims"] == {"width": 8}
+    assert len({plain.key, narrow.key, wide.key}) == 3
+    assert narrow.key.plan.dims == _Dims(8)
+    assert narrow.only(("b",)).dims == _Dims(8)
 
 
 @pytest.mark.parametrize(

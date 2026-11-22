@@ -206,6 +206,16 @@ def norm_gains(norms: tuple[PrecisionRMSNorm, ...]) -> torch.Tensor | None:
 
 
 @dataclass(frozen=True)
+class ResidualLoopEntry:
+    """Where a looped core enters the residual state: the completed blocks
+    before the core and the cached block-set partials over them."""
+
+    num_blocks: int
+    set_blocks: int
+    set_partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+
+
+@dataclass(frozen=True)
 class ResidualShare:
     """This rank's tokens of a sequence-parallel forward and where its mixes go.
 
@@ -233,7 +243,11 @@ class AttentionResidualState:
     running sum of the current block stays as pending terms until a mix needs
     it: the next attention-side mix rounds the sum once, as ``residual_sum``
     would, stores it, and mixes the stored value. Each mix finishes with the
-    RMSNorm that consumes it.
+    RMSNorm that consumes it, unless the caller asks for the FP32 mixtures.
+
+    A looped core runs through the state several times per forward: every
+    pass after the first restarts from the core's entry (``loop_entry``,
+    ``rewind_loop``), so it overwrites the blocks the previous pass stored.
     """
 
     eps = 1e-6
@@ -311,7 +325,8 @@ class AttentionResidualState:
         shared: MulticastRows | None,
     ) -> tuple[torch.Tensor, ...]:
         """Mix query rows ``rows``; in a sequence-parallel forward ``shared``
-        is the multicast buffer this use stores its share of the mix into."""
+        is the multicast buffer this use stores its share of the mix into.
+        Without ``norms`` the FP32 mixtures are returned unnormalized."""
         row, count = rows
         weights = self.attn_res.score_weights[row : row + count]
         mix_args = dict(
@@ -319,7 +334,7 @@ class AttentionResidualState:
             normalize_values=self.attn_res.normalize_values,
             eps=self.eps,
             norm_weights=norm_gains,
-            norm_eps=norms[0].eps,
+            norm_eps=self.eps if norms is None else norms[0].eps,
             output_dtype=torch.float32 if norm_gains is None else torch.bfloat16,
         )
         if self.sweep_sets:
@@ -358,7 +373,7 @@ class AttentionResidualState:
             )
             shared.barrier()
             mixed = shared.local(shape)
-        if norm_gains is None:
+        if norm_gains is None and norms is not None:
             return tuple(norm(x) for norm, x in zip(norms, mixed.unbind(0)))
         return tuple(mixed.unbind(0))
 
@@ -377,16 +392,35 @@ class AttentionResidualState:
                 they stack once after loading; local layers compute it every
                 forward, which only views the one norm's weight.
         """
+        return self._attention_mix(layer_idx, norms, norm_gains)
+
+    def attention_mixtures(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        """The FP32 attention-input mixtures before the input norms, one per
+        attention query of the layer (1 local, 3 full-layer); the state
+        advances as :meth:`attention_input` advances it."""
+        return self._attention_mix(layer_idx, None, None)
+
+    def _attention_mix(
+        self,
+        layer_idx: int,
+        norms: tuple[PrecisionRMSNorm, ...] | None,
+        norm_gains: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
         boundary = self.attn_res.is_block_boundary(layer_idx)
         if self.num_blocks == 0:
             partial = self.partial
             if boundary:
-                self.blocks[0].copy_(partial)
-                self.block_stored = True
+                if not self.block_stored:
+                    self.blocks[0].copy_(partial)
+                    self.block_stored = True
                 self._start_set(1)
+            if norms is None:
+                count = 1 if layer_idx in self.attn_res.local_layer_ids else 3
+                return (partial.float(),) * count
             return tuple(norm(partial) for norm in norms)
         if boundary:
-            candidate_out = self.blocks[self.num_blocks]
+            # A rewound loop entry already stored the block (rewind_loop).
+            candidate_out = None if self.block_stored else self.blocks[self.num_blocks]
         elif len(self.terms) > 1:
             candidate_out = torch.empty_like(self.terms[0])
         else:
@@ -412,6 +446,19 @@ class AttentionResidualState:
         self, layer_idx: int, attn_output: torch.Tensor, norm: PrecisionRMSNorm
     ) -> torch.Tensor:
         """The normalized MLP input: the partial plus ``attn_output``, unrounded."""
+        return self._mlp_mix(layer_idx, attn_output, norm)
+
+    def mlp_mixture(self, layer_idx: int, attn_output: torch.Tensor) -> torch.Tensor:
+        """The FP32 MLP-input mixture before the MLP norm; the state advances
+        as :meth:`mlp_input` advances it."""
+        return self._mlp_mix(layer_idx, attn_output, None)
+
+    def _mlp_mix(
+        self,
+        layer_idx: int,
+        attn_output: torch.Tensor,
+        norm: PrecisionRMSNorm | None,
+    ) -> torch.Tensor:
         boundary = self.attn_res.is_block_boundary(layer_idx)
         if boundary and not self.block_stored:
             self.blocks[self.num_blocks].copy_(self.partial)
@@ -422,8 +469,8 @@ class AttentionResidualState:
             self.num_blocks + int(boundary),
             terms,
             None,
-            (norm,),
-            norm_gains((norm,)),
+            None if norm is None else (norm,),
+            None if norm is None else norm_gains((norm,)),
             None if self.share is None else self.share.mlp,
         )[0]
 
@@ -438,6 +485,43 @@ class AttentionResidualState:
             self.terms = (attn_output, mlp_output)
         else:
             self.terms = (self.partial, attn_output, mlp_output)
+
+    def loop_entry(self, layer_idx: int) -> ResidualLoopEntry:
+        """Record the state entering the first pass of a looped core at
+        ``layer_idx``, a block boundary whose attention input is next.
+
+        Later passes start again from here (:meth:`rewind_loop`); the
+        blocks the passes write follow ``ResidualLoopEntry.num_blocks``.
+        """
+        if self.share is not None:
+            raise ValueError("a looped core does not run sequence parallel")
+        if not self.attn_res.is_block_boundary(layer_idx) or self.block_stored:
+            raise ValueError("a looped core starts at a block boundary")
+        return ResidualLoopEntry(self.num_blocks, self.set_blocks, self.set_partials)
+
+    def loop_bank(self, entry: ResidualLoopEntry) -> tuple[torch.Tensor, torch.Tensor]:
+        """The residual blocks the finished pass wrote: its stored blocks,
+        copied out since the next pass overwrites them, and its rounded
+        partial."""
+        stored = self.blocks[entry.num_blocks + 1 : self.num_blocks].clone()
+        return stored, self.partial
+
+    def rewind_loop(self, entry: ResidualLoopEntry) -> None:
+        """Return to ``entry`` before another pass of the core.
+
+        The first pass stored the entry's rounded partial as block
+        ``entry.num_blocks``, which no pass overwrites, so the core's first
+        attention input mixes that stored block as its one term. The set
+        partials over the entry's blocks are reused.
+        """
+        if self.partials_ready is not None:
+            # Join the aux stream before its partials are dropped.
+            torch.cuda.current_stream().wait_event(self.partials_ready)
+            self.partials_ready = None
+        self.num_blocks = entry.num_blocks
+        self.terms = (self.blocks[entry.num_blocks],)
+        self.block_stored = True
+        self.set_blocks, self.set_partials = entry.set_blocks, entry.set_partials
 
     def compute_output(self, norm: PrecisionRMSNorm) -> torch.Tensor:
         """The normalized output mixture of all blocks and the final partial."""

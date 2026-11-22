@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import os
 import sys
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,9 +78,6 @@ class TestRouterOverMhaLeavesTest:
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 
     def _router(self, group_ids=(FULL, SWA), draft_tokens=1):
-        from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-            CacheGroupGeometry,
-        )
         from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
@@ -85,21 +85,20 @@ class TestRouterOverMhaLeavesTest:
         page_sizes = {FULL: 4, SWA: 2}
         leaves = {gid: self._leaf(page_sizes[gid], draft_tokens) for gid in group_ids}
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaves[gid],
             is_draft=False,
             spec_num_tokens=draft_tokens,
             device="cpu",
             consumed_group_ids=None,
         )
-        router.bind(
-            CacheGroupGeometry(
-                granularities={gid: 4 for gid in group_ids},
-                attn_kinds={gid: "full_history" for gid in group_ids},
-                full_history_group_id=FULL,
-                row_geometry={gid: (4, 1) for gid in group_ids},
-                windows={gid: None for gid in group_ids},
-            ),
-            leaves,
+        router.set_cache_pool(
+            make_mha_pool_for_groups(
+                tuple(
+                    CacheGroupSpec(gid, "full_history", 4, 1, replayable=False)
+                    for gid in group_ids
+                ),
+                device="cpu",
+            )
         )
         router.init_cuda_graph_state(4)
         return router, leaves

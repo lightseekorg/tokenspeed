@@ -27,6 +27,7 @@ import functools
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops._triton_l2 import prefetch_l2
+from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
@@ -2011,14 +2012,18 @@ def _mul_rn_f32(left, right):
     if _IS_HIP:
         # HIP launches disable FP contraction; use the portable FP32 multiply.
         return left * right
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[left, right],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    return mul_rn_f32(left, right)
+
+
+@triton.jit
+def tanh_softcap_value(x, inv_cap, cap):
+    """:func:`tanh_softcap` of FP32 ``x`` in registers, the kernel's steps:
+    ``inv_cap`` and ``cap`` are :func:`tanh_softcap_scalars`."""
+    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
+    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
+    y = _mul_rn_f32(x, inv_cap)
+    y = libdevice.tanh(y)
+    return _mul_rn_f32(y, cap)
 
 
 @triton.jit
@@ -2035,11 +2040,7 @@ def _tanh_softcap_kernel(
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < n_cols
     x = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
-    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
-    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
-    y = _mul_rn_f32(x, inv_cap)
-    y = libdevice.tanh(y)
-    y = _mul_rn_f32(y, cap)
+    y = tanh_softcap_value(x, inv_cap, cap)
     tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
 
 

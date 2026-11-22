@@ -34,6 +34,33 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class TestNumericsMode:
+    @pytest.mark.parametrize(
+        "numerics,backend", [("rl-bitwise", "ascend_full"), ("auto", "ascend_full")]
+    )
+    def test_ascend_default_sampling_backend(self, monkeypatch, numerics, backend):
+        from dataclasses import replace
+
+        from tokenspeed_kernel.platform import current_platform
+
+        from tokenspeed.runtime.utils import server_args
+
+        args = ServerArgs(model="x")
+        platform = replace(current_platform(), vendor="ascend")
+        monkeypatch.setattr(server_args, "current_platform", lambda: platform)
+        args.sampling_backend = None
+        args.numerics = numerics
+        args.resolve_kernel_backends()
+        assert args.sampling_backend == backend
+        if numerics == "rl-bitwise":
+            args.device = "npu"
+            stream = args.sampling_stream
+            args._resolve_rl_bitwise()
+            assert (args.sampling_backend, args.sampling_stream) == (backend, stream)
+            args.sampling_backend = "greedy"
+            args.resolve_kernel_backends()
+            args._resolve_rl_bitwise()
+            assert args.sampling_backend == "greedy"
+
     def test_moe_cutlass_fused_finalize_defaults_on(self):
         from tokenspeed.runtime.utils.server_args import prepare_server_args
 

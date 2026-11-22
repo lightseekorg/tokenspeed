@@ -37,7 +37,8 @@ if current_platform().is_nvidia:
         solution="cuda",
         signatures={FormatSignature(())},
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            # Only driver VMM and copy-engine calls: any Hopper or newer GPU.
+            min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         priority=Priority.SPECIALIZED,

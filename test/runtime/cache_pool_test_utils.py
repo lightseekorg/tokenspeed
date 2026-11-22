@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import inspect
+import math
 from collections.abc import Iterator
 
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+    QWEN4_EXP_QSA_CACHE_GROUP,
+    QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+    qsa_compressed_field,
+    qsa_raw_key_field,
+    qsa_rope_position_field,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -136,6 +145,126 @@ def make_pool(pool_cls, plan, *, device="cpu", arena=None, **kwargs):
     elif arena_kwargs:
         raise TypeError("arena parameters cannot be passed alongside a shared arena")
     return arena, pool_cls(arena=arena, **kwargs)
+
+
+def make_mha_pool_for_groups(
+    cache_group_specs: tuple[spec.CacheGroupSpec, ...], *, device: str
+) -> MHATokenToKVPool:
+    """Build a small real MHA pool publishing the supplied group contracts.
+
+    Each history group gets one layer's K/V fields; state groups get a state
+    field. Thirty-two parents cover the page IDs used by metadata tests.
+    """
+    grain = math.lcm(
+        *(
+            group.block_granularity
+            for group in cache_group_specs
+            if group.attn_kind != "state"
+        )
+    )
+    groups = []
+    for layer, group in enumerate(cache_group_specs):
+        if group.attn_kind == "state":
+            fields = (
+                CacheFieldSpec(
+                    f"layer.{layer}.state", f"state.{layer}", (1,), "float16"
+                ),
+            )
+        else:
+            fields = tuple(
+                CacheFieldSpec(
+                    f"layer.{layer}.{name}",
+                    f"unit.{layer}.{name}",
+                    (group.rows_per_page, 1, 1),
+                    "float16",
+                )
+                for name in ("k", "v")
+            )
+        groups.append((group, fields))
+    layout = pack(
+        groups,
+        prefix_granularity=grain,
+        cache_blocks_per_lcm_block={
+            group.group_id: (
+                1 if group.attn_kind == "state" else grain // group.block_granularity
+            )
+            for group in cache_group_specs
+        },
+        alignment=1,
+        max_padding_fraction=float("inf"),
+    )
+    arena = CacheArena(layout.bind(32), device, cache_group_specs=cache_group_specs)
+    return MHATokenToKVPool(arena, torch.float16, 1, 1, len(cache_group_specs), 0)
+
+
+def make_qsa_pool_for_layers(
+    *,
+    device: str,
+    layer_ids: tuple[int, ...],
+    field_layer_offset: int,
+    num_layers: int,
+    num_lcm_blocks: int,
+    kv_head_dim: int,
+) -> MHATokenToKVPool:
+    """Build a real pool with tiny QSA fields for the specified global layers.
+
+    The pool's layer window can exclude an adjacent draft layer's fields.
+    QSA keys have eight columns, four recent rows and 64 compressed rows;
+    K/V geometry is independent and uses ``kv_head_dim`` columns.
+    """
+    specs = (
+        spec.CacheGroupSpec("full_attention", "full_history", 256, 1, replayable=False),
+        spec.CacheGroupSpec(
+            QWEN4_EXP_QSA_CACHE_GROUP, "full_history", 64, 4, replayable=False
+        ),
+        spec.CacheGroupSpec(
+            QWEN4_EXP_QSA_RECENT_CACHE_GROUP, "full_history", 64, 1, replayable=False
+        ),
+    )
+    kv_fields = tuple(
+        CacheFieldSpec(
+            f"layer.{layer}.{name}",
+            f"layer.{layer}.{name}",
+            (256, 1, kv_head_dim),
+            "bfloat16",
+        )
+        for layer in range(field_layer_offset, field_layer_offset + num_layers)
+        for name in ("k", "v")
+    )
+    compressed = tuple(
+        CacheFieldSpec(
+            qsa_compressed_field(layer),
+            qsa_compressed_field(layer),
+            (64, 1, 8),
+            "bfloat16",
+        )
+        for layer in layer_ids
+    )
+    recent = tuple(
+        CacheFieldSpec(field_id, field_id, shape, dtype)
+        for layer in layer_ids
+        for field_id, shape, dtype in (
+            (qsa_raw_key_field(layer), (4, 1, 8), "bfloat16"),
+            (qsa_rope_position_field(layer), (3,), "int64"),
+        )
+    )
+    layout = pack(
+        tuple(zip(specs, (kv_fields, compressed, recent))),
+        prefix_granularity=256,
+        cache_blocks_per_lcm_block={group.group_id: 1 for group in specs},
+        alignment=1,
+        max_padding_fraction=float("inf"),
+    )
+    arena = CacheArena(layout.bind(num_lcm_blocks), device, cache_group_specs=specs)
+    return MHATokenToKVPool(
+        arena,
+        torch.bfloat16,
+        1,
+        kv_head_dim,
+        num_layers,
+        0,
+        field_layer_offset=field_layer_offset,
+    )
 
 
 def plan_fields(

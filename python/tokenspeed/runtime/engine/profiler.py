@@ -89,6 +89,9 @@ def _profile_rank_tag(attn_mapping) -> str:
 _TRACE_HEAD = re.compile(rb'"baseTimeNanoseconds":\s*(\d+),\s*"traceEvents":\s*\[\s*')
 # Bytes searched for that head: the device and distributed metadata before it.
 _TRACE_HEAD_BYTES = 1 << 20
+# Host span thread ids from here up are lane rows, not threads
+# (ts_scheduler::profile::LANE_TID_BASE).
+_LANE_TID_BASE = 1 << 40
 
 
 def _export_with_host_spans(
@@ -163,7 +166,8 @@ def _merge_host_spans(
         ]
         # Named as torch names the threads it saw (by the kernel's thread
         # name); the control thread runs no torch op, so only this names
-        # its lane.
+        # its lane. A lane row (ts_scheduler::profile::Lanes), no thread,
+        # goes by its name alone.
         recorded = {tid for _, _, tid, _, _ in spans}
         events += [
             {
@@ -171,7 +175,11 @@ def _merge_host_spans(
                 "name": "thread_name",
                 "pid": pid,
                 "tid": tid,
-                "args": {"name": f"thread {tid} ({thread})"},
+                "args": {
+                    "name": (
+                        thread if tid >= _LANE_TID_BASE else f"thread {tid} ({thread})"
+                    )
+                },
             }
             for tid, thread in threads
             if tid in recorded

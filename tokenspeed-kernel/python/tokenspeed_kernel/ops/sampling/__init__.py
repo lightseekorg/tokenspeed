@@ -25,6 +25,8 @@ from __future__ import annotations
 # ``tokenspeed_kernel.ops.sampling.torch`` (the portable leaves) is imported
 # below for registration and would rebind the bare name ``torch`` in this
 # package namespace, hence the alias.
+import functools
+
 import torch as _torch
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
@@ -34,17 +36,23 @@ from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "SELECTED_LOGPROBS_BLOCK",
     "argmax",
     "eagle4_candidate_supports",
     "eagle4_candidate_tail",
     "eagle4_shard_topk",
     "blockwise_logprobs",
+    "chain_verify_coins",
     "prepare_sampling_offsets",
     "VOCAB_SHARD_DRAFT_BLOCK",
     "VOCAB_SHARD_DRAFT_FIELDS",
     "vocab_shard_draft_record",
     "vocab_shard_draft_stats",
     "vocab_shard_draft_stats_width",
+    "vocab_shard_logprob_blocks",
+    "vocab_shard_logprob_layout",
+    "vocab_shard_logprobs",
+    "vocab_shard_logprobs_supports",
     "vocab_shard_topk",
     "vocab_shard_topk_chunks",
     "vocab_shard_topk_supports",
@@ -55,6 +63,66 @@ __all__ = [
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
 _SUPPORTED_OUT_DTYPES = (_torch.int32, _torch.int64)
+
+
+def chain_verify_coins(
+    slots: _torch.Tensor,
+    seed_pool: _torch.Tensor,
+    offsets_pool: _torch.Tensor,
+    *,
+    coins: _torch.Tensor,
+    final_coins: _torch.Tensor,
+) -> None:
+    """Fill the verifier's accept and residual/bonus coins in (0, 1).
+
+    Args:
+        slots: Int32 or int64 [B] pool indices in verify row order.
+        seed_pool: Contiguous int64 request seeds, indexed by slot.
+        offsets_pool: Contiguous int64 first target positions, indexed by slot.
+            Positions must be in ``[0, 2**31)`` for the Philox counter layout.
+            Runtime requests are bounded by the scheduler's
+            ``CapacityModel::MaxRequestTokenLimit``, which reserves headroom
+            for verify windows, overlapping steps, and block rounding.
+        coins: Contiguous fp32 [B, N] accept coin output.
+        final_coins: Contiguous fp32 [B] residual/bonus coin output.
+
+    Returns:
+        None. Both output buffers are written in place.
+    """
+    if coins.ndim != 2 or coins.dtype != _torch.float32 or not coins.is_contiguous():
+        raise ValueError("chain verify needs contiguous fp32 [B, N] accept coins")
+    rows, width = coins.shape
+    if not 0 < width < 2**32:
+        raise ValueError("chain verify width must fit a positive uint32")
+    if (
+        final_coins.shape != (rows,)
+        or final_coins.dtype != _torch.float32
+        or not final_coins.is_contiguous()
+    ):
+        raise ValueError("chain verify needs contiguous fp32 [B] final coins")
+    if slots.shape != (rows,) or slots.dtype not in (_torch.int32, _torch.int64):
+        raise ValueError("chain verify needs int32/int64 [B] request slots")
+    if (
+        seed_pool.ndim != 1
+        or offsets_pool.shape != seed_pool.shape
+        or any(
+            t.dtype != _torch.int64 or not t.is_contiguous()
+            for t in (seed_pool, offsets_pool)
+        )
+    ):
+        raise ValueError("chain verify needs contiguous int64 seed and position pools")
+    if any(
+        t.device != coins.device for t in (slots, seed_pool, offsets_pool, final_coins)
+    ):
+        raise ValueError("chain verify coin tensors must share a device")
+    if rows == 0:
+        return
+    kernel = select_kernel(
+        "sampling",
+        "chain_verify_coins",
+        format_signature(coins=dense_tensor_format(coins.dtype)),
+    )
+    kernel(slots, seed_pool, offsets_pool, coins=coins, final_coins=final_coins)
 
 
 def _validate_argmax_out(logits: _torch.Tensor, out: _torch.Tensor) -> None:
@@ -242,8 +310,9 @@ def eagle4_candidate_tail(
     )
 
 
-# A column rides in the low 15 bits of a 32-bit selection key next to its
-# 16-bit value key, so one selection program takes at most this many columns.
+# A column rides in the low 15 bits of a selection key next to its value key
+# (16 bits for 16-bit logits, 32 for fp32), so one selection program takes at
+# most this many columns.
 _VOCAB_TOPK_MAX_PROGRAM_COLUMNS = 1 << 15
 # The merge holds every candidate of a row in one program, its rank-major
 # slot in 16 bits next to a 32-bit value key.
@@ -263,7 +332,7 @@ def vocab_shard_topk_supports(dtype: _torch.dtype, shard_columns: int, k: int) -
         k: Candidates kept per row.
     """
     return (
-        dtype in (_torch.bfloat16, _torch.float16)
+        dtype in (_torch.bfloat16, _torch.float16, _torch.float32)
         and 1 <= k <= shard_columns
         and (
             shard_columns <= _VOCAB_TOPK_MAX_PROGRAM_COLUMNS
@@ -302,14 +371,17 @@ def vocab_shard_topk(
     out: _torch.Tensor,
     *,
     softcap: float | None,
+    softcap_form: str | None,
     vocab_mask: _torch.Tensor | None,
+    values_out: _torch.Tensor | None,
+    halo_out: _torch.Tensor | None,
 ) -> None:
     """One vocab shard's ``k`` best logits and their global ids, packed for
     the all-gather ``vocab_topk_merge`` reads.
 
     Args:
-        logits: ``[M, N]`` 16-bit logits of the shard, unit column stride;
-            ``vocab_shard_topk_supports`` must hold.
+        logits: ``[M, N]`` 16-bit or fp32 logits of the shard, unit column
+            stride; ``vocab_shard_topk_supports`` must hold.
         k: Candidates kept per row.
         logit_scale: Multiplier applied to every logit (rounded to the logits'
             dtype) before the selection, or None.
@@ -321,10 +393,22 @@ def vocab_shard_topk(
             after the scale and rounded to the logits' dtype before the
             selection (as the logits processor writes softcapped logits), or
             None. ``vocab_topk_merge`` can instead cap the kept values.
+        softcap_form: How the softcap computes, matching the logits
+            processor: ``"sigmoid"`` (``c * (2 * sigmoid(2 x / c) - 1)``, its
+            fused softcap) or ``"tanh"`` (``activation.triton.tanh_softcap``);
+            None without a softcap.
         vocab_mask: Contiguous int32 ``[M, ceil(V / 32)]`` whole-vocabulary
             token bitmask (bit ``t % 32`` of word ``t // 32`` set when token
             ``t`` is allowed, the xgrammar layout); disallowed logits become
             ``-inf`` before the selection. None for no mask.
+        values_out: ``[M, >= vocab_start + N]`` tensor of the logits' dtype,
+            unit column stride, receiving the final (scaled, capped, masked)
+            logits at their global columns for
+            :func:`vocab_shard_logprob_blocks`, or None.
+        halo_out: fp32 ``[M, H]``, unit column stride, receiving the final
+            logits of the shard's first ``H`` columns (the halo of
+            :func:`vocab_shard_logprob_layout`), or None. Given with
+            ``values_out``.
     """
     kernel = select_kernel(
         "sampling",
@@ -332,7 +416,16 @@ def vocab_shard_topk(
         format_signature(logits=dense_tensor_format(logits.dtype)),
     )
     kernel(
-        logits, k, logit_scale, vocab_start, out, softcap=softcap, vocab_mask=vocab_mask
+        logits,
+        k,
+        logit_scale,
+        vocab_start,
+        out,
+        softcap=softcap,
+        softcap_form=softcap_form,
+        vocab_mask=vocab_mask,
+        values_out=values_out,
+        halo_out=halo_out,
     )
 
 
@@ -501,10 +594,135 @@ def vocab_shard_draft_record(
     )
 
 
+# Columns of one block of ``selected_token_logprobs``'s softmax denominator:
+# a row's denominator adds its block sums in order, which the shard form
+# (:func:`vocab_shard_logprob_blocks`) keeps.
+SELECTED_LOGPROBS_BLOCK = 1024
+# The row's block sums sit in one program's registers.
+_VOCAB_LOGPROBS_MAX_BLOCKS = 1 << 12
+
+
+def _logprob_owned_blocks(
+    vocab_start: int, shard_columns: int, vocab_size: int
+) -> tuple[int, int]:
+    """``[first, end)`` denominator blocks whose first column lies in the
+    shard starting at ``vocab_start`` (its real columns only)."""
+    stop = min(vocab_start + shard_columns, vocab_size)
+    first = -(-vocab_start // SELECTED_LOGPROBS_BLOCK)
+    if vocab_start >= stop:
+        return first, first
+    return first, max(-(-stop // SELECTED_LOGPROBS_BLOCK), first)
+
+
+@functools.lru_cache(maxsize=16)
+def vocab_shard_logprob_layout(shard_columns: int, vocab_size: int) -> tuple[int, int]:
+    """The shard logprob parts' sizes: ``(halo, width)``.
+
+    Every shard starts ``shard_columns`` after the previous one; the
+    vocabulary's real ``vocab_size`` columns may end inside the last ones.
+
+    Returns:
+        ``halo``: the leading columns of each shard the previous shard's
+        last denominator block reads (gathered with the top-k candidates);
+        ``width``: the slots of a row's ``vocab_shard_logprob_blocks``
+        output (the selected value, then the most blocks one shard holds).
+    """
+    halo, blocks = 0, 0
+    for start in range(0, vocab_size, shard_columns):
+        first, end = _logprob_owned_blocks(start, shard_columns, vocab_size)
+        blocks = max(blocks, end - first)
+        if end > first:
+            reach = min(end * SELECTED_LOGPROBS_BLOCK, vocab_size)
+            halo = max(halo, reach - (start + shard_columns))
+    return halo, 1 + blocks
+
+
+def vocab_shard_logprobs_supports(shard_columns: int, vocab_size: int) -> bool:
+    """Whether the shard logprobs take this geometry: a denominator block
+    spans at most two shards, and a row's blocks fit one program."""
+    return (
+        shard_columns >= SELECTED_LOGPROBS_BLOCK
+        and -(-vocab_size // SELECTED_LOGPROBS_BLOCK) <= _VOCAB_LOGPROBS_MAX_BLOCKS
+    )
+
+
+def vocab_shard_logprob_blocks(
+    values: _torch.Tensor,
+    rows: _torch.Tensor,
+    tokens: _torch.Tensor,
+    row_max: _torch.Tensor,
+    vocab_start: int,
+    shard_columns: int,
+    out: _torch.Tensor,
+) -> None:
+    """One shard's part of each output row's selected-token logprob:
+    ``selected_token_logprobs``'s block sums for the blocks starting in the
+    shard, and the selected token's logit when the shard holds it.
+
+    Args:
+        values: Contiguous ``[S, V]`` rows of the logits' dtype holding the
+            final (scaled, capped, masked) logits of the shard's real columns
+            and of the next shard's first ``halo`` columns
+            (:func:`vocab_shard_logprob_layout`), as ``vocab_shard_topk``
+            writes them and the gather brings them; other columns are not
+            read. The rows' stride must be that of the whole rows
+            ``selected_token_logprobs`` would read, ``V``.
+        rows: ``[M]`` int32 or int64 source row in ``values`` of each output
+            row.
+        tokens: ``[M]`` int32 or int64 selected token of each output row.
+        row_max: fp32 ``[S]`` maximum final logit of each source row (the
+            merged top-1), any stride.
+        vocab_start: Global id of the shard's column 0.
+        shard_columns: Columns per shard.
+        out: fp32 ``[M, width]``, unit column stride: slot 0 the selected
+            token's logit when the shard holds it (else left as is), then the
+            block sums.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "vocab_shard_logprob_blocks",
+        format_signature(values=dense_tensor_format(values.dtype)),
+    )
+    kernel(values, rows, tokens, row_max, vocab_start, shard_columns, out)
+
+
+def vocab_shard_logprobs(
+    partials: _torch.Tensor,
+    rows: _torch.Tensor,
+    tokens: _torch.Tensor,
+    row_max: _torch.Tensor,
+    shard_columns: int,
+    vocab_size: int,
+    out: _torch.Tensor,
+) -> None:
+    """Each output row's selected-token logprob from every shard's
+    :func:`vocab_shard_logprob_blocks` part, bit for bit
+    ``selected_token_logprobs`` on the gathered whole rows.
+
+    Args:
+        partials: ``[R, M, width]`` fp32 view of the gathered parts,
+            rank-major, any rank and row strides, unit column stride.
+        rows: ``[M]`` source row of each output row (indexes ``row_max``).
+        tokens: ``[M]`` selected token of each output row.
+        row_max: fp32 ``[S]`` maximum of each source row, any stride.
+        shard_columns: Columns per shard.
+        vocab_size: Real vocabulary size.
+        out: fp32 ``[>= M]`` logprobs.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "vocab_shard_logprobs",
+        format_signature(partials=dense_tensor_format(partials.dtype)),
+    )
+    kernel(partials, rows, tokens, row_max, shard_columns, vocab_size, out)
+
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401

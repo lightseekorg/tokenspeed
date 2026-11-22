@@ -83,7 +83,20 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from utils import assert_no_triton_compile, assert_warmup_covers
+from utils import (
+    ARENA_DIM,
+    ARENA_HKV,
+    ARENA_HQ,
+    ARENA_LARGE_SLOTS,
+    ARENA_SMALL_SLOTS,
+    ARENA_TOKENS,
+    arena_caches,
+    arena_slots,
+    assert_no_triton_compile,
+    assert_warmup_covers,
+    needs_amd_arena_key,
+    skip_without_arena_memory,
+)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -3185,3 +3198,42 @@ def test_relative_kv_convolution_of_extend_batches_takes_the_composite():
     assert bytes_equal(extend.q, run(True, "composite_gqa_prologue").q)
     with pytest.raises(ValueError):
         run(True, "triton_relative_gqa_prologue")
+
+
+# A small KV arena and one past 2 GiB: serving sizes the arena after startup's
+# warm-up (a small probe arena, then the full one), and on AMD Triton keys a
+# binary on whether a tensor's storage fits in 2 GiB, so the kernels that write
+# the arena do not specialize its pointers.
+@needs_amd_arena_key
+def test_gqa_prologue_serves_a_large_arena_with_the_small_arenas_binary():
+    skip_without_arena_memory()
+    q, k, v = split(
+        qkv(ARENA_TOKENS, ARENA_HQ, ARENA_HKV, ARENA_DIM, seed=3),
+        ARENA_HQ,
+        ARENA_HKV,
+        ARENA_DIM,
+    )
+
+    def write(slots: int, first: int):
+        k_cache, v_cache = arena_caches(slots)
+        loc = arena_slots(first)
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=None,
+            rotary=None,
+            cache=HeadKVCache(k_cache, v_cache, None, loc),
+            query_dtype=q.dtype,
+            return_kv=False,
+            solution="triton",
+            override=None,
+        )
+        return k_cache[loc].clone(), v_cache[loc].clone()
+
+    small = write(ARENA_SMALL_SLOTS, 0)
+    # The large arena's rows sit past 2 GiB, at its far end.
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        large = write(ARENA_LARGE_SLOTS, ARENA_LARGE_SLOTS - ARENA_SMALL_SLOTS)
+    torch.cuda.synchronize()
+    assert bytes_equal(small[0], large[0]) and bytes_equal(small[1], large[1])

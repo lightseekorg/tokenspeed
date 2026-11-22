@@ -29,7 +29,7 @@ if not is_cdna4():
 
 from block_quantize_helpers import (  # noqa: E402
     triton_block_quantize,
-    triton_block_quantize_nvfp4_values,
+    triton_block_quantize_values,
 )
 from tokenspeed_kernel.ops.moe._triton.block_scaled import _expert_mm  # noqa: E402
 from tokenspeed_kernel.ops.moe._triton.common import _routing  # noqa: E402
@@ -66,15 +66,24 @@ def _nvfp4_values(packed, scales):
     return (value * scales.float().repeat_interleave(16, dim=1)).bfloat16()
 
 
+def _mxfp8_values(codes, exponents):
+    """BF16 values of MXFP8 codes: each E4M3 value times ``2^(e - 127)`` of
+    its group's UE8M0 exponent ``e``."""
+    scale = torch.exp2(exponents.float() - 127).repeat_interleave(32, dim=1)
+    return (codes.float() * scale).bfloat16()
+
+
 @pytest.mark.parametrize(
-    "fmt,bf16_x", [("nvfp4", False), ("nvfp4", True), ("mxfp8", False)]
+    "fmt,bf16_x",
+    [("nvfp4", False), ("nvfp4", True), ("mxfp8", False), ("mxfp8", True)],
 )
 @pytest.mark.parametrize("per_token", [True, False])
 @pytest.mark.parametrize(
     "tiles", [(16, 128, 256), (16, 64, 256), (32, 128, 128), (64, 128, 128)]
 )
-# Ragged shapes take the masked loop. Whole tiles of NVFP4 weights and BF16
-# activations take the LDS ring; 3 programs run several tiles each through it.
+# Ragged shapes take the masked loop. Whole tiles of NVFP4 or MXFP8 weights
+# with BF16 activations take the LDS ring; 3 programs run several tiles each
+# through it.
 @pytest.mark.parametrize(
     "n,k,few_programs", [(96, 160, False), (128, 768, False), (128, 768, True)]
 )
@@ -97,9 +106,10 @@ def test_expert_mm_masking_and_runtime_rows(
             dtype=torch.bfloat16,
         )
         if bf16_x:
-            q, qs, qa, xb = triton_block_quantize_nvfp4_values(x)
+            q, qs, qa, xb = triton_block_quantize_values(x, fmt)
             # The quantizer's BF16 values are exactly what its codes encode.
-            assert torch.equal(xb, _nvfp4_values(q, qs))
+            decode = _nvfp4_values if fmt == "nvfp4" else _mxfp8_values
+            assert torch.equal(xb, decode(q, qs))
         else:
             q, qs, qa = triton_block_quantize(x, fmt)
         # Expert 12 is always empty. Expert 13 belongs to the next EP shard.
@@ -163,10 +173,13 @@ def test_expert_mm_masking_and_runtime_rows(
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tokens", [0, 1, 8, 17, 128, 1023, 1024, 1025])
-def test_registered_routes_preserve_bf16_boundaries(fmt, tokens):
+# Ragged widths take the masked loop; 256-wide ones whole ring tiles.
+@pytest.mark.parametrize("hidden,intermediate", [(160, 96), (256, 256)])
+def test_registered_routes_preserve_bf16_boundaries(fmt, tokens, hidden, intermediate):
     torch.manual_seed(7)
-    x = torch.randn((tokens, 160), device="cuda", dtype=torch.bfloat16)
-    w13, w2 = _weights(3, 192, 160, fmt), _weights(3, 160, 96, fmt)
+    x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    w13 = _weights(3, 2 * intermediate, hidden, fmt)
+    w2 = _weights(3, hidden, intermediate, fmt)
     weights = torch.rand((tokens, 2), device="cuda", dtype=torch.float32)
     ids = torch.tensor([[10, 13], [11, 10]], device="cuda", dtype=torch.int32)
     ids = ids.repeat((tokens + 1) // 2, 1)[:tokens].contiguous()
@@ -185,8 +198,8 @@ def test_registered_routes_preserve_bf16_boundaries(fmt, tokens):
         # Both solutions read the experts in their loaded layout.
         plan = block_scaled_moe_routes_plan(
             formats=(fmt, fmt),
-            hidden=160,
-            intermediate=96,
+            hidden=hidden,
+            intermediate=intermediate,
             device=x.device,
             solution=solution,
         )
