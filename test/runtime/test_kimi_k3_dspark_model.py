@@ -32,8 +32,12 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.configs.base import block_draft_is_causal
 from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
+from tokenspeed.runtime.models import dflash as dflash_module
 from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
-from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
+from tokenspeed.runtime.models.kimi_k3_dspark import (
+    K3DSparkDecoderLayer,
+    K3DSparkModel,
+)
 
 # The published Inferact/Kimi-K3-DSpark config.json.
 INFERACT_CONFIG = dict(
@@ -371,29 +375,133 @@ def test_idle_forward_with_no_rows_skips_dense_draft_layers() -> None:
     model.final_norm.assert_not_called()
 
 
-def test_final_norm_reduces_the_last_row_parallel_mlp_output() -> None:
+_GROUP = tuple(range(8))
+
+
+def _tp(group: tuple[int, ...] = _GROUP) -> SimpleNamespace:
+    return SimpleNamespace(tp_group=group, tp_rank=3, tp_size=len(group))
+
+
+class _Norm(torch.nn.Module):
+    """Doubles the residual sum; its fused form sums the 8 ranks' rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fused: list[tuple] = []
+
+    def forward(self, hidden_states, residual):
+        total = hidden_states + residual
+        return total * 2, total
+
+    def forward_with_allreduce_fusion(self, rank, group, hidden_states, residual):
+        self.fused.append((rank, group))
+        total = hidden_states * 8 + residual
+        return total * 2, total, None
+
+
+def _fusion_patches(rows_cap: int):
+    return (
+        mock.patch.dict(
+            dflash_module.global_server_args_dict,
+            {"comm_fusion_max_num_tokens": rows_cap},
+        ),
+        mock.patch.object(
+            dflash_module,
+            "draft_all_reduce",
+            side_effect=lambda hidden, group: hidden * 8,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "armed,rows,fused", [(False, 2, False), (True, 2, True), (True, 5, False)]
+)
+def test_final_norm_reduces_the_last_row_parallel_mlp_output(armed, rows, fused):
+    """An armed draft fuses the reduce into the final norm up to the cap."""
     model = K3DSparkModel.__new__(K3DSparkModel)
     torch.nn.Module.__init__(model)
-    tp_group = object()
-    model.mapping = SimpleNamespace(dense=SimpleNamespace(tp_group=tp_group))
+    model.mapping = SimpleNamespace(dense=_tp())
+    model.allreduce_fusion = armed
+    model.final_norm = _Norm()
+    hidden = torch.arange(rows * 2, dtype=torch.float32).view(rows, 2)
+    residual = torch.full((rows, 2), 10.0)
+    cap, reduce = _fusion_patches(4)
 
-    class _FinalNorm(torch.nn.Module):
-        def forward(self, hidden_states, residual):
-            return hidden_states + residual, residual
+    with cap, reduce as all_reduce:
+        out = model._finalize_hidden(
+            hidden, residual, SimpleNamespace(input_num_tokens=rows)
+        )
 
-    model.final_norm = _FinalNorm()
-    local_hidden = torch.tensor([[1.0, 2.0]])
-    residual = torch.tensor([[10.0, 20.0]])
+    torch.testing.assert_close(out, (hidden * 8 + residual) * 2)
+    assert model.final_norm.fused == ([(3, _GROUP)] if fused else [])
+    assert all_reduce.call_count == (0 if fused else 1)
 
-    with mock.patch.object(
-        dspark_model_module,
-        "draft_all_reduce",
-        side_effect=lambda hidden, group: hidden * 8,
-    ) as reduce:
-        out = model._finalize_hidden(local_hidden, residual)
 
-    reduce.assert_called_once_with(local_hidden, tp_group)
-    torch.testing.assert_close(out, local_hidden * 8 + residual)
+@pytest.mark.parametrize(
+    "armed,rows,fused", [(False, 2, False), (True, 2, True), (True, 5, False)]
+)
+def test_both_layer_boundaries_fuse_the_reduce_into_the_norm(armed, rows, fused):
+    """A layer's input and post-attention norms take the fusion together."""
+    layer = K3DSparkDecoderLayer.__new__(K3DSparkDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.mapping = SimpleNamespace(dense=_tp(), attn=_tp())
+    layer.input_layernorm = _Norm()
+    layer.post_attention_layernorm = _Norm()
+    layer.self_attn = lambda positions, hidden_states, ctx, comm_manager: (
+        hidden_states + 1
+    )
+    layer.comm_manager = None
+    layer.mlp = lambda hidden_states: hidden_states * 3
+    layer.fused_reduce_norm = None
+    layer.allreduce_fusion = armed
+    hidden = torch.arange(rows * 2, dtype=torch.float32).view(rows, 2)
+    residual = torch.full((rows, 2), 10.0)
+    cap, reduce = _fusion_patches(4)
+
+    with cap, reduce as all_reduce:
+        out, out_residual = layer(
+            positions=None,
+            hidden_states=hidden,
+            ctx=SimpleNamespace(input_num_tokens=rows),
+            residual=residual,
+        )
+
+    first = hidden * 8 + residual
+    second = (first * 2 + 1) * 8 + first
+    torch.testing.assert_close(out_residual, second)
+    torch.testing.assert_close(out, second * 2 * 3)
+    for norm in (layer.input_layernorm, layer.post_attention_layernorm):
+        assert norm.fused == ([(3, _GROUP)] if fused else [])
+    assert all_reduce.call_count == (0 if fused else 2)
+
+
+@pytest.mark.parametrize("ranks,prepared", [(8, True), (8, False), (1, True)])
+def test_the_draft_arms_the_fused_all_reduce_norm_once_per_group(ranks, prepared):
+    """The shared dense and attention group arms once; a lone rank never does."""
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    group = tuple(range(ranks))
+    model.mapping = SimpleNamespace(dense=_tp(group), attn=_tp(group))
+    model.config = SimpleNamespace(hidden_size=7168)
+    model.layers = [SimpleNamespace(allreduce_fusion=False) for _ in range(2)]
+    armed = ranks > 1 and prepared
+
+    with (
+        mock.patch.dict(
+            dflash_module.global_server_args_dict,
+            {"comm_fusion_max_num_tokens": 2048},
+        ),
+        mock.patch.object(
+            dflash_module, "prepare_all_reduce_fusion", return_value=prepared
+        ) as prepare,
+    ):
+        assert model.prepare_communication_runtime(512) is armed
+
+    assert prepare.call_args_list == (
+        [mock.call(group, 7168, 2048)] if ranks > 1 else []
+    )
+    assert model.allreduce_fusion is armed
+    assert [layer.allreduce_fusion for layer in model.layers] == [armed, armed]
 
 
 def test_every_remaining_checkpoint_key_has_a_destination() -> None:

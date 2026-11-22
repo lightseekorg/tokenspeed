@@ -74,9 +74,12 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     absorb_mla_kv_b_proj,
 )
-from tokenspeed.runtime.models.dflash import DFlashDecoderLayer
+from tokenspeed.runtime.models.dflash import (
+    DFlashDecoderLayer,
+    prepare_reduce_norm_fusion,
+    reduce_norm,
+)
 from tokenspeed.runtime.models.dspark import VanillaMarkov
-from tokenspeed.runtime.models.kimi_k3_comm import draft_all_reduce
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 
@@ -284,12 +287,14 @@ class K3DSparkDecoderLayer(DFlashDecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self._norm_with_allreduce(
+            hidden_states, residual = reduce_norm(
                 self.input_layernorm,
                 hidden_states,
                 residual,
                 ctx,
                 self.mapping.dense,
+                self.fused_reduce_norm,
+                self.allreduce_fusion,
             )
 
         hidden_states = self.self_attn(
@@ -298,28 +303,17 @@ class K3DSparkDecoderLayer(DFlashDecoderLayer):
             ctx=ctx,
             comm_manager=self.comm_manager,
         )
-        hidden_states, residual = self._norm_with_allreduce(
+        hidden_states, residual = reduce_norm(
             self.post_attention_layernorm,
             hidden_states,
             residual,
             ctx,
             self.mapping.attn,
+            self.fused_reduce_norm,
+            self.allreduce_fusion,
         )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
-
-    @staticmethod
-    def _norm_with_allreduce(
-        norm: RMSNorm,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        ctx: ForwardContext,
-        group,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reduce the preceding row-parallel output, then norm."""
-        del ctx
-        hidden_states = draft_all_reduce(hidden_states, group.tp_group)
-        return norm(hidden_states, residual)
 
 
 class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
@@ -455,6 +449,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # Names the DFlash drafter reads off the draft model.
         self.block_size = None
         self.hidden_size = hidden_size
+        # Whether the layer boundaries fuse the all-reduce into the norm.
+        self.allreduce_fusion = False
 
     def configure_target(self, target_model, target_config) -> None:
         """Bind trained tap indices and stream semantics on every owning stage."""
@@ -556,12 +552,43 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         return self.context_norm(columns)
 
     def _finalize_hidden(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         """Reduce the last row-parallel MLP output before final normalization."""
-        hidden_states = draft_all_reduce(hidden_states, self.mapping.dense.tp_group)
-        hidden_states, _ = self.final_norm(hidden_states, residual)
+        hidden_states, _ = reduce_norm(
+            self.final_norm,
+            hidden_states,
+            residual,
+            ctx,
+            self.mapping.dense,
+            fused=None,
+            allreduce_fusion=self.allreduce_fusion,
+        )
         return hidden_states
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Arm the fused all-reduce + norm of the draft's layer boundaries.
+
+        Collective, before cache sizing and graph capture. A group without
+        it, or rows past ``comm_fusion_max_num_tokens``, reduce through the
+        draft all-reduce and norm unfused.
+
+        Args:
+            max_num_tokens: Most rows a forward carries; unused.
+
+        Returns:
+            Whether the draft armed the fusion.
+        """
+        del max_num_tokens
+        self.allreduce_fusion = prepare_reduce_norm_fusion(
+            self.mapping, int(self.config.hidden_size)
+        )
+        for layer in self.layers:
+            layer.allreduce_fusion = self.allreduce_fusion
+        return self.allreduce_fusion
 
     # ------------------------------------------------------------------
     # Context-injection contract (see DFlashDraftModel for the GQA counterpart)
@@ -705,7 +732,7 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         if residual is None:
             hidden_states = self.final_norm(hidden_states)
         else:
-            hidden_states = self._finalize_hidden(hidden_states, residual)
+            hidden_states = self._finalize_hidden(hidden_states, residual, ctx)
 
         return LogitsProcessorOutput(
             next_token_logits=None, hidden_states=hidden_states
