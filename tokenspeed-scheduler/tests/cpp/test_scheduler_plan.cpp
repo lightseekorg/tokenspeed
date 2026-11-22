@@ -1558,19 +1558,22 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesTheLeastWorkFirstWhenShortPrefillsGoF
 }
 
 // The fill takes a protected prompt first, protection reevaluated after each
-// admission: seven 4-token prompts filling a 7-row batch pass "ahead" over
-// seven times, and their transfers then hold the request slots for a round.
-// The holder ranks first as above, and its own admission is the eighth
-// bypass: protected, ahead fills 10 of the 28 tokens left before the three
-// 9-token prompts that rank ahead of it by work, two of which fill the rest.
-// After six passes in a 6-row batch, f1's admission is the eighth: ahead
-// follows it, then f2. A protected prompt the budget left cannot take is
-// passed over, not a stop: at 30 tokens, ahead leaves the 28 to the three
-// 9-token prompts and starts next round.
+// admission. "ahead" (10 tokens) ages once twice its work went ahead of it:
+// seven 2-token prompts filling a 7-row batch take 14, and their transfers
+// then hold the request slots for a round. The holder ranks first as above,
+// and its own admission (8 tokens past its checkpoint) brings the work to 22:
+// protected, ahead fills 10 of the 28 tokens left before the three 9-token
+// prompts that rank ahead of it by work, two of which fill the rest.
+// After seven 1-token passes the holder brings it to 15 and f1's admission to
+// 24: ahead follows f1, then f2. A protected prompt the budget left cannot
+// take is passed over, not a stop: at 30 tokens, ahead ages after two rounds
+// of seven 4-token passes and the holder (64 of 60), leaves the 28 to the
+// three 9-token prompts and starts next round.
 TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
-    const auto run = [this](int passes, std::int32_t ahead_tokens) {
+    const auto run = [this](int pass_rounds, std::int32_t pass_tokens, std::int32_t ahead_tokens) {
+        constexpr int kPasses = 7;
         hybrid_ = true;
-        batch_ = passes;
+        batch_ = kPasses;
         Restart(16);
         config_.enable_short_prefill_first = true;
         scheduler_ = std::make_unique<Scheduler>(config_);
@@ -1578,24 +1581,27 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
         Publish("checkpoint", MakeTokens(8, 5000));
         Publish("earlier", Extending(shared, {5200, 5201, 5202}));
         SubmitPrompt("ahead", MakeTokens(ahead_tokens, 4000));
-        for (int i = 0; i < passes; ++i) {
-            SubmitPrompt("b" + std::to_string(i), MakeTokens(4, 6000 + 100 * i));
+        for (int round = 0; round < pass_rounds; ++round) {
+            for (int i = 0; i < kPasses; ++i) {
+                SubmitPrompt("b" + std::to_string(round) + "_" + std::to_string(i),
+                             MakeTokens(pass_tokens, 6000 + 1000 * round + 100 * i));
+            }
+            EXPECT_EQ(Round().size(), static_cast<std::size_t>(kPasses));
+            EXPECT_EQ(Round(), PrefillRows{});
         }
-        EXPECT_EQ(Round().size(), static_cast<std::size_t>(passes));
-        EXPECT_EQ(Round(), PrefillRows{});
         SubmitPrompt("holder", Extending(shared, MakeTokens(4, 8000)));
         for (int i = 1; i <= 3; ++i) {
             SubmitPrompt("f" + std::to_string(i), MakeTokens(9, 2000 + 100 * i));
         }
         return std::vector<PrefillRows>{Round(), Round()};
     };
-    EXPECT_EQ(run(7, 10),
+    EXPECT_EQ(run(1, 2, 10),
               (std::vector<PrefillRows>{{{"ahead", 0, 10, 10}, {"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
-    EXPECT_EQ(run(6, 10),
+    EXPECT_EQ(run(1, 1, 10),
               (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"ahead", 0, 10, 10}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
-    EXPECT_EQ(run(7, 30),
+    EXPECT_EQ(run(2, 4, 30),
               (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"ahead", 0, 28, 30}}}));
 }
