@@ -877,12 +877,7 @@ class ServerArgs:
     # layers); fewer bytes, a different summation order. Refused where Iris
     # owned rows do not run.
     owned_attention_output: str = "reduce-scatter"
-    # Muse Spark small-M dense GEMMs in FP8 on gfx950 (a numerics change):
-    # "qkv" projects decode and verify forwards' QKV (+ output gate) rows at
-    # 33-128 rows, and "qkv-down" also this rank's pre-expert latent
-    # columns at 17-128 rows, through FP8
-    # E4M3 weights (per-channel scales, converted after loading) and per-row
-    # FP8 activations, with the skinny FP8 GEMM. "none" keeps BF16.
+    # Muse Spark's dense FP8 projections on gfx950 (docs/configuration/server.md).
     dense_fp8_small_m: str = "none"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
@@ -5577,14 +5572,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dense_fp8_small_m,
             choices=["none", "qkv", "qkv-down"],
-            help="Muse Spark on gfx950: run decode forwards' QKV projection "
-            "at 33-128 rows (qkv), and also the pre-expert latent projection "
-            "at 17-128 rows (qkv-down), as FP8 GEMMs (per-row FP8 activations x "
-            "per-channel FP8 weights). The pre-expert FP8 projection needs "
-            "TP > 1 without attention DP (its fused gather); startup refuses "
-            "a configuration it cannot serve (TP8 shapes, other GPUs). The FP8 "
-            "weight copies' memory is logged at startup. A numerics change, not batch-invariant (refused under bitwise --numerics and "
-            "--batch-invariant-collectives); none keeps BF16.",
+            help="Muse Spark on gfx950: run decode and verify forwards' QKV "
+            "projection at 33-128 rows (qkv), and also the pre-expert latent "
+            "projection at 17-128 rows (qkv-down), as FP8 GEMMs; prompt K / V "
+            "stays BF16. Startup refuses what it cannot serve. A numerics "
+            "change, refused under --numerics rl-bitwise and "
+            "--batch-invariant-collectives. none keeps BF16.",
         )
         parser.add_argument(
             "--numerics",

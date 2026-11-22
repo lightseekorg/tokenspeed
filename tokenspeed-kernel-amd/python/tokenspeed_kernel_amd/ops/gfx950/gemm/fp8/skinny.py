@@ -117,9 +117,7 @@ def _w_shared_layout():
     # transposed. The swizzle XORs each row's sixteen 16-byte vectors by a
     # phase that changes every row, so the transposed reads spread over the
     # banks while each row's 16-byte runs stay whole for the direct-to-LDS
-    # loads. A padded [K, N] tile with padding after each wave's 1024-byte
-    # load span (as for A) also lowers and gives the same bits (ops/README.md
-    # compares the two); a per-row padding interval does not lower.
+    # loads.
     runs = SKINNY_FP8_BLOCK_K // 16
     return gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=runs, order=[1, 0])
 
@@ -229,8 +227,7 @@ def gluon_mm_fp8_skinny_gfx950(
     if BLOCK_M == 128:
         # 128 rows: issue tile t + 2 before reading tile t from LDS, and wait
         # for tile t + 1 at the end of the iteration, so two tiles stay in
-        # flight through the MFMAs. 64 rows take the wait-first order below;
-        # ops/README.md says why each tile takes its order.
+        # flight through the MFMAs. 64 rows take the wait-first order below.
         # Tiles 0 and 1 go out first, A then B (two commit groups a tile); each
         # iteration issues tile t + 2 into the buffer tile t - 1 left, multiplies
         # tile t, then waits for tile t + 1.
@@ -386,9 +383,10 @@ def gluon_mm_fp8_skinny_reduce_gfx950(
     )
 
 
-# (SPLIT_K, last row count) by (N, K), from SKINNY_FP8_MIN_M rows: one split
-# count per weight, whatever the row tile, so a row's bits do not depend on M.
-# Measured on MI355X for these two weight shapes.
+# (SPLIT_K, last row count) by (N, K), from SKINNY_FP8_MIN_M rows: the weight
+# shapes this kernel serves (Muse Spark's TP4 QKV and pre-expert slices); every
+# other shape keeps the existing FP8 GEMMs. One split count per weight, whatever
+# the row tile, so a row's bits do not depend on M.
 _SKINNY_FP8_CONFIGS: dict[tuple[int, int], tuple[int, int]] = {
     (4608, 8192): (2, 128),
     (1024, 8192): (8, 128),

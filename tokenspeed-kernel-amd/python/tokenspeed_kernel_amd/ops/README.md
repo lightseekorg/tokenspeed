@@ -357,8 +357,7 @@ FP8.
   both by IEEE FP32 division. The token quantizer, the weight conversion
   (`prepare_fp8_channel_weight`) and the layer boundary's FP8 copy share it.
 - Configs exist for `[4608, 8192]` and `[1024, 8192]` at 17-128 rows; they
-  are its problem filter. In that window it measured faster than the BF16
-  hipBLASLt projection of the same weight. It offers the `weight_streaming`
+  are its problem filter. It offers the `weight_streaming`
   feature. Offset, strided or unaligned operands decline it through the
   traits. One split count per weight shape, so a row's bits do not depend on
   `M` or on the other rows; results are deterministic.
@@ -376,22 +375,15 @@ FP8.
   take 144 KB of LDS at 128 rows, 96 KB at 64 (checked at import). With
   128-144 programs on 256 CUs the launch is bound by the loads in flight: at
   128 rows each iteration issues tile t + 2 before it reads tile t and waits
-  for tile t + 1 at its end; at 64 rows the wait comes first. Each order is
-  the one that measured faster at its tile on MI355X (HIP-graph replay, cold
-  weights): about 2 us faster at 128 rows for `[4608, 8192]`, and the
-  wait-first order up to 0.4 us faster at 17-48 rows.
-- Programs run in the hardware's launch order, with no XCD remap: inside a
-  decoder layer on MI355X that measured faster at both shapes than a remap
-  that spreads a split's programs over the XCDs.
+  for tile t + 1 at its end; at 64 rows the wait comes first, the faster
+  order at that tile.
 - Each split stores an FP32 partial; a second launch sums them in split order
   and only then applies `A_scales[row] * B_scales[column]`.
 - The A tile's load layout lists its row lane bases in the order of the
   padded LDS layout's row bases, so each wave writes contiguous padded runs.
-  Direct-to-LDS loads refuse other orders. B tiles are swizzled `[N, K]`. A
-  padded `[K, N]` B with padding after each wave's 1024-byte span gives the
-  same bits but measured slower on MI355X: 1.5-2 us at 128 rows for
-  `[4608, 8192]`, 0.6-0.8 us for `[1024, 8192]`, and within 0.1 us at 64 rows.
-  A per-row padding interval (256 bytes) has no direct-to-LDS lowering.
+  Direct-to-LDS loads refuse other orders. B tiles are swizzled `[N, K]`, so
+  the transposed reads spread over the LDS banks while each row's 16-byte
+  runs stay whole for the direct-to-LDS loads.
 
 ### gfx950 MXFP8 projection
 
