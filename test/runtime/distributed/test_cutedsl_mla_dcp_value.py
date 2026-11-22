@@ -110,7 +110,9 @@ def _prepare_value_tail(group: tuple[int, ...], rows: int) -> None:
     process_group_manager.register_process_group(
         "gloo", group, dist.new_group(backend="gloo")
     )
-    comm.prepare_decode_exchange(group, 120, value_heads=_HEADS, decode_rows=rows)
+    comm.prepare_decode_exchange(
+        group, 120, value_heads=_HEADS, decode_rows=rows, float_words=False
+    )
 
 
 def _case(rank: int, dtype, queries: int, draft: bool, value_tail: bool):
@@ -166,7 +168,7 @@ def _case(rank: int, dtype, queries: int, draft: bool, value_tail: bool):
             tuple(global_server_args_dict["mapping"].attn.kvp_group), rows
         )
     latent = forward().view(rows, _HEADS, _LATENT)
-    # The tail reads the latent axis contiguous; a value-major weight it declines.
+    # A value-major weight: the tail needs a contiguous latent axis.
     k_major = torch.randn(
         _HEADS,
         _VALUE,
@@ -257,7 +259,7 @@ def _worker(rank: int, rendezvous: str, *case_args):
     global_server_args_dict.update(mapping=mapping, chunked_prefill_size=8192)
     initialize_comm_backend(use_pynccl=False)
     _case(rank, *case_args)
-    # Clean runs only: after a failure a pending collective would make teardown wait.
+    # Clean runs only: a failed run's pending collective would hang teardown.
     dist.destroy_process_group()
 
 
