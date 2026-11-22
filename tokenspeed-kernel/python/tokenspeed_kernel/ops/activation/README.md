@@ -15,8 +15,9 @@ or fallback path.
 
 `moe_finalize_gate_add` gathers each token's top-k expert rows, sums them in
 FP32 in k order, rounds once to BF16 and adds the sigmoid-gated shared-expert
-output. Below 512 tokens every row is split into 1024-column programs, so a
-decode-size call has enough CTAs. From 512 tokens on, one program covers a
-row: the gate input is loaded and the gate computed once per token, not once
-per column program. Each column's arithmetic is the same in both layouts, so
-the output is bitwise identical across the switch.
+output. Rows wider than 1024 columns are split into 1024-column programs, so a
+decode-size call has enough CTAs; each program loads the token's gate input
+and computes the gate again. Once a row spans several such programs and the
+column grid would fill the GPU several times over, one program covers the row:
+the gate is computed once per token. Each column's arithmetic is the same in
+both layouts, so the output is bitwise identical across the switch.
