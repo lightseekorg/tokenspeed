@@ -27,7 +27,6 @@ if not is_cdna4():
     pytest.skip("gfx950 required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.residual import (  # noqa: E402
-    post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
     post_norm_residual_pre_norm_bf16_fp8,
     residual_gate_coefficients,

@@ -1136,8 +1136,6 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
 ) -> None:
     """The layer hands raw q/k/v of its QKV projection and the positions to
     PagedAttention, whose prologue normalizes, rotates and writes K/V."""
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-
     heads, kv_heads, head_dim = 4, 2, 8
     attention = _stub(MuseSparkAttention)
     attention.hidden_size, attention.head_dim = heads * head_dim, head_dim
@@ -2349,7 +2347,6 @@ def test_gathered_projection_stores_its_block_into_a_rank_major_mailbox(
             layer_count=2,
             replicate_for_owned_rows=True,
             workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
-            fp8_small_m=False,
         )
     assert bound["rank_major"] is True
     with torch.no_grad():
@@ -2800,7 +2797,6 @@ def test_dense_fp8_check_refuses_where_no_fp8_gemm_serves() -> None:
         True,
         module._DENSE_FP8_QKV_MIN_ROWS,
         module._DENSE_FP8_MAX_ROWS,
-        None,
     )
     with pytest.raises(
         ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
