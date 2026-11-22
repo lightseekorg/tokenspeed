@@ -570,8 +570,9 @@ if platform.is_amd:
     def gluon_mm_a16w16_skinny_gfx950(
         x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """``x @ weight.T`` for the skinny GEMM's measured shapes and row
-        counts; a row's bits do not depend on the other rows of the batch.
+        """``x @ weight.T`` for the skinny GEMM's measured shapes and rows.
+
+        A row's bits do not depend on the other rows of the batch.
 
         Args:
             x: ``[M, K]`` contiguous bf16 activation, 16-byte aligned.

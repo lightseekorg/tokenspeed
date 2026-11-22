@@ -363,10 +363,11 @@ def gluon_mm_a16w16_skinny_reduce_gfx950(
     REDUCE_M: gl.constexpr,
     REDUCE_N: gl.constexpr,
 ):
-    """Sum the skinny GEMM's ``[SPLIT_K, PARTIAL_M, N]`` partials in split order
-    (``((p0 + p1) + p2) + ...`` in FP32), round once and store the contiguous
-    ``[M, N]`` C; each program reduces ``REDUCE_M`` rows of ``REDUCE_N``
-    columns."""
+    """Sum the skinny GEMM's split-K partials, round once and store C.
+
+    The ``[SPLIT_K, PARTIAL_M, N]`` partials add in split order
+    (``((p0 + p1) + p2) + ...`` in FP32) into the contiguous ``[M, N]`` C;
+    each program reduces ``REDUCE_M`` rows of ``REDUCE_N`` columns."""
     gl.static_assert(N % REDUCE_N == 0, "skinny reduce needs N divisible by REDUCE_N")
     # Every offset below is int32 except the bases: a program's own tile
     # offsets, and a split's distance from the first split's partial. The
@@ -442,8 +443,7 @@ def supports_gluon_mm_a16w16_skinny_gfx950(M: int, N: int, K: int) -> bool:
 
 
 def supports_gluon_mm_a16w16_skinny_weight_gfx950(N: int, K: int) -> bool:
-    """Whether the skinny GEMM has a measured config for some row count of an
-    ``[N, K]`` weight.
+    """Whether the skinny GEMM has measured rows for an ``[N, K]`` weight.
 
     Args:
         N: Weight rows (output columns).
@@ -501,8 +501,9 @@ def _check_aligned(**tensors: torch.Tensor) -> None:
 
 
 def compile_gluon_mm_a16w16_skinny_gfx950(B: torch.Tensor) -> None:
-    """Compile, without launching, every binary the skinny GEMM runs for a
-    weight: one per row tile and the reduce.
+    """Compile, without launching, every skinny GEMM binary for a weight.
+
+    That is one binary per row tile, and the reduce.
 
     The binaries depend on the weight's shape and on nothing a launch varies:
     not the row count, and not where the activation, the weight or the output

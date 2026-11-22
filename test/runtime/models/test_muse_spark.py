@@ -2255,10 +2255,12 @@ def test_prefill_collective_payload_is_validated_in_server_args() -> None:
 def test_gathered_projection_warmup_covers_its_skinny_gemm(
     monkeypatch: pytest.MonkeyPatch, bf16_default_dtype, ranks: int
 ) -> None:
-    """After a gathered projection's local-GEMM warm-up, its GEMM at any row
-    count compiles no skinny GEMM binary: the pre-expert projection's
-    [1024, 8192] columns at TP4 (which the skinny GEMM serves) and
-    [512, 8192] at TP8 (which it does not, so nothing compiles either way)."""
+    """A gathered projection's warm-up leaves no skinny GEMM to compile.
+
+    After its local-GEMM warm-up, its GEMM at any row count compiles no skinny
+    GEMM binary: the pre-expert projection's [1024, 8192] columns at TP4
+    (which the skinny GEMM serves) and [512, 8192] at TP8 (which it does not,
+    so nothing compiles either way)."""
     import importlib.util
     from pathlib import Path
 
@@ -2316,9 +2318,11 @@ def test_gathered_projection_warmup_covers_its_skinny_gemm(
 def test_router_with_mm_warmup_covers_every_shared_row_count(
     monkeypatch: pytest.MonkeyPatch, width: int
 ) -> None:
-    """After the router's warm-up with this rank's pre-expert columns, the
-    shared launch at any row count it serves compiles nothing, including
-    rows past 16, which a large warm-up extend does not run through it."""
+    """The router's warm-up covers every row count of the shared launch.
+
+    After it, with this rank's pre-expert columns, the shared launch at any
+    row count it serves compiles nothing, including rows past 16, which a
+    large warm-up extend does not run through it."""
     import importlib.util
     from pathlib import Path
 
@@ -2360,9 +2364,10 @@ def test_router_with_mm_warmup_covers_every_shared_row_count(
 
 
 def test_router_with_mm_warmup_refuses_an_unprepared_weight() -> None:
-    """The router's warm-up raises before its weight is prepared, as its
-    forward does, instead of skipping the shared launch at every row count
-    and leaving those compiles to serving."""
+    """The router's warm-up raises before its weight is prepared.
+
+    Its forward raises too. Skipping instead would skip the shared launch at
+    every row count and leave those compiles to serving."""
     router = module.MuseSparkRouter(
         hidden_size=256, num_experts=16, multiplier=1.0, solution=None
     )

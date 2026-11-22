@@ -60,8 +60,9 @@ def test_registry_fallback_selection():
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 def test_mv_off_cuda_takes_torch(device):
-    """mv on CPU and meta tensors does not raise and selects Torch, with or
-    without a destination."""
+    """mv on CPU and meta tensors selects Torch without raising.
+
+    This holds with or without a destination."""
     x = torch.empty(4, 256, device=device, dtype=torch.bfloat16)
     weight = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
     out = torch.empty(4, 8, device=device, dtype=torch.bfloat16)

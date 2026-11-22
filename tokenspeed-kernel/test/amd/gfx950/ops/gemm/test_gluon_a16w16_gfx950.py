@@ -1086,8 +1086,9 @@ def _skinny(a, weight, out=None):
 
 
 def _off_by_one(rows: int, columns: int) -> torch.Tensor:
-    """A contiguous BF16 ``[rows, columns]`` view one element into a buffer:
-    legal GEMM input that is not 16-byte aligned."""
+    """A contiguous BF16 ``[rows, columns]`` view one element into a buffer.
+
+    Legal GEMM input that is not 16-byte aligned."""
     flat = torch.zeros(rows * columns + 8, dtype=torch.bfloat16, device="cuda")
     view = flat[1 : 1 + rows * columns].view(rows, columns)
     assert view.is_contiguous() and view.data_ptr() % 16
@@ -1096,9 +1097,10 @@ def _off_by_one(rows: int, columns: int) -> torch.Tensor:
 
 @pytest.mark.parametrize("m", _SKINNY_ROWS)
 def test_skinny_gemm_rounds_the_exact_product_once(m: int):
-    """With small integer inputs every FP32 partial sum is exact (at most
-    8192 * 64 < 2**24), so the only rounding is the final one to BF16 and the
-    result is the FP64 product rounded to BF16, bit for bit."""
+    """With small integer inputs the result is the BF16-rounded FP64 product.
+
+    Every FP32 partial sum is exact (at most 8192 * 64 < 2**24), so the only
+    rounding is the final one to BF16, and the bits match exactly."""
     generator = torch.Generator(device="cuda").manual_seed(0)
     a = torch.randint(-8, 9, (m, _SKINNY_K), device="cuda", generator=generator)
     weight = torch.randint(
@@ -1125,8 +1127,9 @@ def test_skinny_gemm_matches_fp64_reference(m: int):
 
 
 def test_skinny_gemm_rows_do_not_depend_on_the_batch():
-    """A row has the same bits with any other rows and in either row tile: the
-    K split and summation order never depend on M."""
+    """A row has the same bits with any other rows and in either row tile.
+
+    The K split and summation order never depend on M."""
     a, weight = _skinny_problem()
 
     def run(rows: torch.Tensor) -> torch.Tensor:
@@ -1143,8 +1146,9 @@ def test_skinny_gemm_rows_do_not_depend_on_the_batch():
 
 @pytest.mark.parametrize("m", [33, 63, 127])
 def test_skinny_gemm_writes_only_its_rows(m: int):
-    """The row tile and the reduce programs are taller than M: the rows of
-    the destination's buffer below row M keep their bits."""
+    """Rows of the destination's buffer below row M keep their bits.
+
+    The row tile and the reduce programs are taller than M."""
     a, weight = _skinny_problem(rows=m)
     guard = 0x7FC1  # a NaN no product yields
     buffer = torch.full(
@@ -1176,9 +1180,10 @@ def test_skinny_gemm_refuses_strided_and_unaligned_tensors():
 
 @pytest.mark.parametrize("m", [33, 48, 128])
 def test_mm_declines_the_skinny_gemm_for_offset_views(m: int):
-    """An activation or an output that is not 16-byte aligned is legal mm
-    input: selection declines the skinny GEMM through its alignment traits
-    and mm takes the path it takes without that kernel, here Torch's GEMM."""
+    """An activation or output that is not 16-byte aligned is legal mm input.
+
+    Selection declines the skinny GEMM through its alignment traits, and mm
+    takes the path it takes without that kernel, here Torch's GEMM."""
     a, weight = _skinny_problem(rows=m)
     kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
     shifted = _off_by_one(m, _SKINNY_K)
@@ -1221,10 +1226,11 @@ def test_mm_declines_the_skinny_gemm_for_offset_views(m: int):
 
 
 def test_skinny_reduce_loads_every_split_sixteen_bytes_wide():
-    """The reduce states the alignment of the first split's base; the other
-    splits sit at constant offsets from it. Every buffer load of the binary
-    is still 16 bytes a lane (four FP32 partials): none is split into
-    narrower loads."""
+    """Each reduce buffer load is 16 bytes a lane (four FP32 partials).
+
+    The reduce states the alignment of the first split's base; the other
+    splits sit at constant offsets from it, so no load of the binary is split
+    into narrower loads."""
     a, weight = _skinny_problem(rows=_SKINNY_FIRST_M)
     gluon_mm_a16w16_skinny_reduce_gfx950.device_caches.clear()
     _skinny(a, weight)
@@ -1234,9 +1240,11 @@ def test_skinny_reduce_loads_every_split_sixteen_bytes_wide():
 
 
 def test_skinny_gemm_warmup_compiles_every_binary_from_any_row_count():
-    """Startup warmup need not run a row count the skinny GEMM takes: a GEMM
-    on the weight inside kernel_warmup compiles both row tiles and the reduce,
-    and then no row count of the measured range compiles either kernel."""
+    """A GEMM on the weight inside kernel_warmup compiles every skinny binary.
+
+    Startup warmup need not run a row count the skinny GEMM takes: that GEMM
+    compiles both row tiles and the reduce, and then no row count of the
+    measured range compiles either kernel."""
     a, weight = _skinny_problem()
     kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
     below = a[: _SKINNY_FIRST_M - 1].contiguous()
@@ -1274,10 +1282,12 @@ def test_skinny_gemm_warmup_compiles_every_binary_from_any_row_count():
 
 
 def test_skinny_gemm_binaries_do_not_depend_on_where_the_tensors_live():
-    """Triton keys a binary on a tensor's 16-byte alignment and, on AMD, on
+    """Startup's binaries serve views deep into storages over 2 GB.
+
+    Triton keys a binary on a tensor's 16-byte alignment and, on AMD, on
     whether its storage fits in 2 GB. The skinny GEMM specializes no pointer,
     so the binaries startup compiled from small fresh tensors serve an
-    activation and an output that are views deep into storages over 2 GB."""
+    activation and an output that are views deep into such storages."""
     a, weight = _skinny_problem()
     kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
     below = a[: _SKINNY_FIRST_M - 1].contiguous()
@@ -1372,9 +1382,10 @@ def test_mm_selects_the_skinny_gemm_in_its_measured_row_range(m: int, selected: 
     ],
 )
 def test_tp4_pre_expert_projection_selects_by_row_count(m: int, kernel: str | None):
-    """The Muse TP4 pre-expert projection takes the decode GEMM at 9-32 rows
-    and the skinny GEMM at 33-128 rows in any mm call; outside those rows mm
-    selects neither."""
+    """The Muse TP4 pre-expert projection's kernels by row count.
+
+    In any mm call it takes the decode GEMM at 9-32 rows and the skinny GEMM
+    at 33-128 rows; outside those rows mm selects neither."""
     name = _select_mv(
         m, _SKINNY_N, _SKINNY_K, True, torch.bfloat16, torch.bfloat16, False, True, True
     ).__name__

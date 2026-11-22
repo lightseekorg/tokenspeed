@@ -640,9 +640,11 @@ def supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(
 
 
 def _router_programs_with_mm(rows: int, n: int) -> int:
-    """Router programs of a router + decode GEMM launch: sized for the largest
-    row count of ``rows``' decode bucket, a compile-time value fixed per bucket
-    (the kernel idles the programs past the batch's tiles)."""
+    """Router programs of a router + decode GEMM launch for ``rows``.
+
+    Sized for the largest row count of ``rows``' decode bucket, a compile-time
+    value fixed per bucket (the kernel idles the programs past the batch's
+    tiles)."""
     bucket = next(bound for bound in DECODE_M_BUCKETS if rows <= bound)
     block_m, block_n, split_k = _WITH_MM_ROUTER_CONFIG[:3]
     return triton.cdiv(bucket, block_m) * (n // block_n) * split_k

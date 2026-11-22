@@ -79,7 +79,9 @@ def _launch(x: torch.Tensor, prepared: torch.Tensor, multiplier: float):
 
 
 def _execute_plan(plan, x: torch.Tensor, prepared: torch.Tensor) -> torch.Tensor:
-    """The router through its own plan, as serving runs it when the router does not share its launch."""
+    """The router through its own plan.
+
+    Serving runs it this way when the router does not share its launch."""
     counters = fp32_router_gemv_counters(prepared.shape[0], x.device)
     return fp32_router_gemv_execute(plan, x, prepared, MULTIPLIER, counters, False)
 
@@ -324,9 +326,10 @@ def test_registered_router_with_mm_warms_every_decode_bucket() -> None:
 
 
 def test_tp4_router_with_mm_warms_two_binaries_and_reuses_them() -> None:
-    """For TP4's 1024 x 8192 pre-expert projection, warmup compiles one shared
-    launch binary per decode GEMM bucket it serves (16 and 32 rows), and row
-    counts inside those buckets reuse them."""
+    """Warmup compiles one shared launch binary per decode GEMM bucket served.
+
+    For TP4's 1024 x 8192 pre-expert projection those buckets are 16 and 32
+    rows, and row counts inside them reuse the binaries."""
     plan = _router_plan()
     x, weight = _problem(32, 8192, 256, 7)
     prepared = fp32_router_gemv_process_weight(plan, weight)
@@ -518,9 +521,10 @@ def test_tp4_pre_expert_shares_the_router_launch_at_9_to_32_rows(
 
 
 def test_router_with_mm_takes_larger_rows_only_where_the_plan_takes_its_tile() -> None:
-    """Past 16 rows the shared launch serves only row counts at which the
-    router's standalone plan takes the shared launch's split-K tile, so the
-    router keeps its plan's bits."""
+    """Past 16 rows the router keeps its standalone plan's bits.
+
+    The shared launch serves only row counts at which the router's standalone
+    plan takes the shared launch's split-K tile."""
     # The 8192 x 256 router's plan takes that tile at 9-64 rows.
     assert _shares_launch(256, 64, 512)
     assert not _shares_launch(256, 65, 512)

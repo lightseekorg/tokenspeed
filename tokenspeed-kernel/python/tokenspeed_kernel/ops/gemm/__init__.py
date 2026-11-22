@@ -1957,9 +1957,10 @@ _MV_SIGNATURES = {
 
 @lru_cache(maxsize=16)
 def _mv_declares_alignment(x_dtype: torch.dtype, weight_dtype: torch.dtype) -> bool:
-    """Whether a registered mv kernel for the dtypes declares a 16-byte
-    alignment trait. Registered in this process, whatever architecture it
-    takes: a vendor's other architectures then read addresses they need not."""
+    """Whether a registered mv kernel for the dtypes declares 16-byte alignment.
+
+    Registered in this process, whatever architecture it takes: a vendor's
+    other architectures then read addresses they need not."""
     signature = _MV_SIGNATURES.get((x_dtype, weight_dtype))
     return signature is not None and any(
         "operands_aligned_16" in spec.traits or "out_aligned_16" in spec.traits
