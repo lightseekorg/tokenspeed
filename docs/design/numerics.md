@@ -428,15 +428,17 @@ A dense GEMM call may state `decode_forward`: its rows are the decode or
 verify rows of the step. Kernels registered with the trait
 `decode_forward={True}` serve only such calls; every other call (prefill,
 extend, and any caller that does not state it) selects as if those kernels
-did not exist. The trait describes the rows, not a second execution path: a
-given decode row reaches the same kernel in every step, and a prompt row
-reaches main's kernel whatever its row count. A model that sets the trait
-must therefore not run decode rows inside a mixed prefill / decode forward;
-Muse Spark rejects mixed rounds.
+did not exist. Selection is then a function of the forward's mode and the
+step's row count only: decode rows at a given row count reach the same kernel
+in every step, and prompt rows never reach a decode-only kernel, whatever
+their count. The decode-side kernel still changes with the row count, as it
+does without the trait. A model that sets the trait must therefore not run
+decode rows inside a mixed prefill / decode forward; Muse Spark rejects mixed
+rounds.
 
 The alternative, selecting by row count in every forward, puts a prompt's
 short prefill tail (a few dozen rows) on a decode-tuned kernel, so a single
-request's output stops being bitwise main's for no measured gain. Decode-only
+request's output changes for no measured gain. Decode-only
 selection keeps prefill and single-request output unchanged.
 
 ### Initialization-time kernel plans

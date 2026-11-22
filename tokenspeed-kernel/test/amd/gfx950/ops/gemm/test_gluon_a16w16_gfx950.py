@@ -63,6 +63,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _DECODE_ONLY_CONFIGS,
+    DECODE_M_BUCKETS,
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
     _supports_mfma_lds_smallm,
@@ -538,7 +539,7 @@ def test_decode_only_shapes_have_no_entry_for_every_forward() -> None:
     """The decode GEMM's lookup takes the first table that has a shape, so a
     shape in both tables would lose its decode-only entries without notice."""
     for n, k in _DECODE_ONLY_CONFIGS:
-        for rows in range(1, 257):
+        for rows in range(1, DECODE_M_BUCKETS[-1] + 1):
             assert not supports_gluon_mm_a16w16_decode_gfx950(rows, n, k), (
                 rows,
                 n,
