@@ -216,6 +216,23 @@ def _as_2d_tensor_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
     return scale
 
 
+def _online_fp8_rows(
+    A: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    quant: str | None,
+) -> bool:
+    """Whether mm quantizes ``A`` per token before the FP8 launch (16-bit A,
+    no A scales): the kernel then reads fresh contiguous, aligned codes and
+    one scale per row."""
+    return (
+        quant == "fp8"
+        and A_scales is None
+        and A.dtype != _fp8_dtype
+        and B_scales is not None
+    )
+
+
 def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
@@ -602,7 +619,7 @@ def _mm_traits(
                 and A.stride(-1) == 1
             )
         )
-    )
+    ) or _online_fp8_rows(A, A_scales, B_scales, quant)
     traits: dict[str, object] = {
         "m": M,
         "n": N,
@@ -638,7 +655,12 @@ def _mm_traits(
         ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
         # The scale granularity says only "not both per-tensor"; these say
         # which side has one scale per row (A) or per output channel (B).
-        traits["a_scales_per_row"] = A_scales is not None and A_scales.numel() == M
+        # An online-quantized call gets per-token scales from mm.
+        traits["a_scales_per_row"] = (
+            _online_fp8_rows(A, A_scales, B_scales, quant)
+            or A_scales is not None
+            and A_scales.numel() == M
+        )
         traits["b_scales_per_channel"] = B_scales is not None and B_scales.numel() == N
 
     if A.dtype == B.dtype == torch.bfloat16:

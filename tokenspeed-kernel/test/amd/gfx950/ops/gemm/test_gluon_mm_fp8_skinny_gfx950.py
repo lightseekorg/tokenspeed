@@ -253,8 +253,8 @@ def test_selected_inside_its_window_and_declined_outside(n):
     """An FP8 call with row and channel scales selects this kernel at the
     configured shape and 17-128 rows; outside that window, for another shape,
     for a per-tensor activation scale, or for an offset or strided operand it
-    declines (no raise) to the scaled FP8 GEMM; a BF16 call never selects
-    it."""
+    declines (no raise) to the scaled FP8 GEMM. An online-quantized call
+    (BF16 rows, no activation scales) takes it; a BF16 call never does."""
     from tokenspeed_kernel.ops.gemm import _mm_selected_kernel_name as mm_kernel_name
 
     torch.manual_seed(n)
@@ -328,6 +328,19 @@ def test_selected_inside_its_window_and_declined_outside(n):
         override="triton_mm_fp8_scaled",
     )
     assert torch.equal(_bits(by_mm), _bits(by_triton))
+    # An online-quantized call (BF16 rows, no activation scales): mm quantizes
+    # the rows per token first, so the kernel serves it, with the same output
+    # as the scaled FP8 GEMM given the same rows.
+    rows_bf16 = torch.randn(64, _K, device="cuda").bfloat16()
+    online = dict(
+        A_scales=None, B_scales=weight_scales, out_dtype=torch.bfloat16, quant="fp8"
+    )
+    assert mm_kernel_name(rows_bf16, weight.t(), **online, features=None) == _NAME
+    by_online = mm(rows_bf16, weight.t(), **online)
+    by_online_triton = mm(
+        rows_bf16, weight.t(), **online, override="triton_mm_fp8_scaled"
+    )
+    assert torch.equal(_bits(by_online), _bits(by_online_triton))
     # A BF16 call (quant None) never selects this FP8 kernel.
     plain = mm_kernel_name(
         torch.randn(48, _K, device="cuda").bfloat16(),
