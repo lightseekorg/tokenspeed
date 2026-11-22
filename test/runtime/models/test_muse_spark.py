@@ -2359,5 +2359,17 @@ def test_router_with_mm_warmup_covers_every_shared_row_count(
     assert max(served) > 16
 
 
+def test_router_with_mm_warmup_refuses_an_unprepared_weight() -> None:
+    """The router's warm-up raises before its weight is prepared, as its
+    forward does, instead of skipping the shared launch at every row count
+    and leaving those compiles to serving."""
+    router = module.MuseSparkRouter(
+        hidden_size=256, num_experts=16, multiplier=1.0, solution=None
+    )
+    columns = torch.zeros(64, 256, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        router.warm_with_mm(columns, 128)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

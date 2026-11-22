@@ -219,7 +219,7 @@ a few BF16 rows against a cold `[N, K]` weight whose read dominates.
   stated for the first split's base only; the other splits sit at constant
   offsets from it, and a test asserts that every buffer load of the compiled
   reduce is `buffer_load_dwordx4`, 16 bytes a lane.
-- The K split, the MFMA order inside a split and the split summation order
+- The K split, the MFMA order inside a split, and the split summation order
   depend only on `K` and `SPLIT_K`, which gives the row invariance above.
 
 ### gfx950 single- and few-row BF16 GEMV

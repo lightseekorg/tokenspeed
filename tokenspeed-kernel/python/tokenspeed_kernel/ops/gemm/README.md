@@ -99,7 +99,7 @@ such a weight (`warm_gluon_mm_a16w16_skinny`, beside the TGV warm hook), so
 the row counts it takes need not run before serving; outside warmup the two
 hooks cost `mm` one `is_warming_up()` check. The hook fires on `mm`'s plain
 BF16 path only: a startup that reaches the weight no other way than
-through a direct `mv`, a `plan`, `solution` or `override`, or a GEMM outside
+through a direct `mv`, a `plan`, `solution`, or `override`, or a GEMM outside
 `mm` compiles each row tile at its first launch, unless it runs a row count
 the kernel takes. The AMD ops README records the kernel's contract.
 Callers that publish directly into a collective buffer pass that buffer as

@@ -1475,8 +1475,11 @@ class PreparedFP32RouterGEMV(nn.Module):
         launch inside the warm-up scope, at the first of up to ``max_rows``
         row counts it serves, makes the selected kernel compile its binary for
         every row count it serves; does nothing when none of them shares the
-        launch.
+        launch. Raises if the weight was not prepared, which would otherwise
+        make every row count skip the launch and leave its compiles to serving.
         """
+        if self.prepared_weight is None:
+            raise RuntimeError("router weight was not prepared after loading")
         hidden = self.weight.shape[0]
         for rows in range(1, max_rows + 1):
             x = self.weight.new_zeros((rows, hidden))
