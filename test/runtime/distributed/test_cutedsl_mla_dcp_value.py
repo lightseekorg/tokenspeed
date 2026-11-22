@@ -224,6 +224,11 @@ def _case(rank: int, dtype, queries: int, draft: bool, value_tail: bool):
             output_gate=None,
             projected_output=out,
         )
+    # A draft tree's attention, through either dispatch, projects none either.
+    for dispatch in ("_tree_lane_rows", "_tree_verify_rows"):
+        with mock.patch.object(leaf, dispatch, return_value=object()):
+            with pytest.raises(ValueError, match="projects no values"):
+                forward(value_weight=k_major, output_gate=None, projected_output=out)
 
 
 def _worker(rank: int, rendezvous: str, *case_args):

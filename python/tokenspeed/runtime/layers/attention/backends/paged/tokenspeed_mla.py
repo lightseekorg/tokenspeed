@@ -718,7 +718,7 @@ class CuteDSLMLABackend(PagedMLABackend):
             raise ValueError("CuTe MLA projects values only in a KVP merge")
         lanes = self._tree_lane_rows(bs)
         if lanes is not None:
-            return self._tree_cascade(q, layer, token_to_kv_pool, lanes)
+            return self._tree_cascade(q, layer, token_to_kv_pool, lanes, value_weight)
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
         tree = self._tree_verify_rows(
@@ -728,7 +728,7 @@ class CuteDSLMLABackend(PagedMLABackend):
             metadata.seq_lens_k[num_extends:],
         )
         if tree is not None:
-            return self._tree_cascade(q, layer, token_to_kv_pool, tree)
+            return self._tree_cascade(q, layer, token_to_kv_pool, tree, value_weight)
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
         causal_mask = True
         if self.block_decode_active:
@@ -877,10 +877,15 @@ class CuteDSLMLABackend(PagedMLABackend):
         layer: PagedAttention,
         token_to_kv_pool,
         tree: TreeCascadeRows,
+        value_weight: torch.Tensor | None,
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): the CuTe
         causal ``rows``-token MLA decode over the committed prefix, with its
-        base-2 log-sum-exp, then the tree window merged in (``finish_mla_tree``)."""
+        base-2 log-sum-exp, then the tree window merged in
+        (``finish_mla_tree``). It projects no values, so it refuses a
+        ``value_weight``."""
+        if value_weight is not None:
+            raise ValueError("a draft tree's attention projects no values")
         if layer.sliding_window_size >= 0:
             raise NotImplementedError("draft trees have no sliding-window path yet")
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
