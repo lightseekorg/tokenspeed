@@ -24,7 +24,12 @@
 //! release's answer. The members step it alike; the first member sends what
 //! a step asks for, and each member reads its own shard.
 
-use ts_scheduler::{PeerAnswerView, PeerFetchView, PeerLeaseView};
+use std::sync::Arc;
+
+use ts_scheduler::{
+    profile::{self, Lane, Lanes},
+    PeerAnswerView, PeerFetchView, PeerLeaseView,
+};
 
 /// How long each wait may last, in the agreed peer clock's microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +40,9 @@ pub struct Timeouts {
     /// read the transfer engine gave up on may still have writes queued at
     /// the NIC.
     pub quarantine_us: i64,
+    /// How long a holder may take to push its Disk pages
+    /// (`docs/rfcs/0006-disk-tier.md`); it posts no write past it.
+    pub push_us: i64,
 }
 
 /// Where a landing stands.
@@ -68,10 +76,32 @@ pub enum Action {
     },
 }
 
+/// A landing's row on a profile timeline: each phase, then the whole.
+#[derive(Clone)]
+struct Timeline {
+    lane: Arc<Lane>,
+    started_ns: i64,
+    phase_ns: i64,
+}
+
+impl std::fmt::Debug for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timeline")
+            .field("started_ns", &self.started_ns)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One landing.
 #[derive(Debug, Clone)]
 pub struct Landing {
     fetch: PeerFetchView,
+    metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    /// None unless a profile records.
+    timeline: Option<Timeline>,
+    started_us: i64,
+    failure: Option<&'static str>,
+    phase_us: i64,
     phase: Phase,
     deadline_us: i64,
     timeouts: Timeouts,
@@ -90,6 +120,7 @@ impl Landing {
         now_us: i64,
         timeouts: Timeouts,
     ) -> (Self, Action) {
+        static LANDINGS: Lanes = Lanes::new("Peer landing");
         let (phase, action) = if layout_known {
             (Phase::Pin, Action::SendPin)
         } else {
@@ -98,6 +129,18 @@ impl Landing {
         (
             Self {
                 fetch,
+                metrics: None,
+                timeline: LANDINGS.hold().map(|lane| {
+                    let now_ns = profile::now_ns();
+                    Timeline {
+                        lane: Arc::new(lane),
+                        started_ns: now_ns,
+                        phase_ns: now_ns,
+                    }
+                }),
+                started_us: now_us,
+                failure: None,
+                phase_us: now_us,
                 phase,
                 deadline_us: deadline(now_us, timeouts.answer_us),
                 timeouts,
@@ -106,6 +149,70 @@ impl Landing {
             },
             action,
         )
+    }
+
+    pub(super) fn observe_with(
+        &mut self,
+        metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    ) {
+        self.metrics = metrics;
+    }
+
+    fn transition(&mut self, next: Phase, outcome: &str, now_us: i64) {
+        let stage = match self.phase {
+            Phase::Layout => "layout",
+            Phase::Pin => "pin",
+            Phase::Read => "read_agreement",
+            Phase::Release { .. } => "release",
+            Phase::Quarantine { .. } => "quarantine",
+            Phase::Done(_) => return,
+        };
+        if let Some(timeline) = &mut self.timeline {
+            let now_ns = profile::now_ns();
+            let lane = &timeline.lane;
+            lane.record(profile::HOST, stage.into(), timeline.phase_ns, now_ns);
+            if let Phase::Done(end) = next {
+                let fetch = &self.fetch;
+                lane.record(
+                    profile::HOST,
+                    format!(
+                        "Peer landing {}: tokens {}..{end} of {} from {}",
+                        fetch.request_id, fetch.begin_tokens, fetch.end_tokens, fetch.holder
+                    )
+                    .into(),
+                    timeline.started_ns,
+                    now_ns,
+                );
+            }
+            timeline.phase_ns = now_ns;
+        }
+        if let Some(metrics) = &self.metrics {
+            if outcome != "ok" && self.failure.is_none() {
+                self.failure = Some(stage);
+            }
+            metrics.stage(stage, outcome, (now_us - self.phase_us) as f64 / 1e6);
+            if let Phase::Done(end) = next {
+                metrics.stage(
+                    "landing",
+                    if end == self.fetch.end_tokens {
+                        "ok"
+                    } else {
+                        "fallback"
+                    },
+                    (now_us - self.started_us) as f64 / 1e6,
+                );
+            }
+        }
+        self.phase_us = now_us;
+        self.phase = next;
+    }
+
+    pub(super) fn failure(&self) -> Option<&'static str> {
+        self.failure
+    }
+
+    pub(super) fn phase_started_us(&self) -> i64 {
+        self.phase_us
     }
 
     /// The fetch.
@@ -123,7 +230,7 @@ impl Landing {
         if self.phase != Phase::Layout {
             return None;
         }
-        self.phase = Phase::Pin;
+        self.transition(Phase::Pin, "ok", now_us);
         self.deadline_us = deadline(now_us, self.timeouts.answer_us);
         Some(Action::SendPin)
     }
@@ -141,7 +248,7 @@ impl Landing {
                 .any(|page| page.group_id == destination.group_id && page.slot == destination.slot)
         });
         if trusted && answer.held && answer.num_tokens == self.fetch.end_tokens && covers {
-            self.phase = Phase::Read;
+            self.transition(Phase::Read, "ok", now_us);
             self.pinned = Some(answer);
             None
         } else {
@@ -174,7 +281,16 @@ impl Landing {
     /// The release's answer.
     pub fn released(&mut self, answer: &PeerAnswerView, trusted: bool, now_us: i64) {
         if let Phase::Release { read } = self.phase {
-            self.settle(read, trusted && answer.held, now_us);
+            self.settle(
+                read,
+                trusted && answer.held,
+                if trusted && answer.held {
+                    "ok"
+                } else {
+                    "rejected"
+                },
+                now_us,
+            );
         }
     }
 
@@ -183,14 +299,14 @@ impl Landing {
         match self.phase {
             // No read started: nothing can still write the destinations.
             Phase::Layout | Phase::Pin if now_us >= self.deadline_us => {
-                self.phase = Phase::Done(self.fetch.begin_tokens);
+                self.transition(Phase::Done(self.fetch.begin_tokens), "timeout", now_us);
             }
             // An unanswered release vouches for nothing.
             Phase::Release { read } if now_us >= self.deadline_us => {
-                self.settle(read, false, now_us)
+                self.settle(read, false, "timeout", now_us)
             }
             Phase::Quarantine { until_us } if now_us >= until_us => {
-                self.phase = Phase::Done(self.fetch.begin_tokens);
+                self.transition(Phase::Done(self.fetch.begin_tokens), "ok", now_us);
             }
             _ => {}
         }
@@ -205,14 +321,18 @@ impl Landing {
     }
 
     fn release(&mut self, read: bool, now_us: i64) -> Option<Action> {
-        self.phase = Phase::Release { read };
+        self.transition(
+            Phase::Release { read },
+            if read { "ok" } else { "failed" },
+            now_us,
+        );
         self.deadline_us = deadline(now_us, self.timeouts.answer_us);
         Some(Action::SendRelease { demote: read })
     }
 
-    fn settle(&mut self, read: bool, vouched: bool, now_us: i64) {
+    fn settle(&mut self, read: bool, vouched: bool, outcome: &str, now_us: i64) {
         let failed_read = self.pinned.is_some() && !read;
-        self.phase = if failed_read {
+        let next = if failed_read {
             Phase::Quarantine {
                 until_us: deadline(now_us, self.timeouts.quarantine_us),
             }
@@ -221,6 +341,7 @@ impl Landing {
         } else {
             Phase::Done(self.fetch.begin_tokens)
         };
+        self.transition(next, outcome, now_us);
     }
 }
 
@@ -230,20 +351,21 @@ fn deadline(now_us: i64, lifetime_us: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use ts_scheduler::{PeerAnswerKind, PeerPageView};
+    use ts_scheduler::{PeerAnswerKind, PeerPageView, PeerTier};
 
     use super::*;
 
     const TIMEOUTS: Timeouts = Timeouts {
         answer_us: 100,
         quarantine_us: 1000,
+        push_us: 500,
     };
 
     fn page(slot: i32) -> PeerPageView {
         PeerPageView {
             group_id: 0,
             slot,
-            host: false,
+            tier: PeerTier::Device,
             block_id: slot + 10,
         }
     }
@@ -302,6 +424,8 @@ mod tests {
         );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 7);
         assert_eq!(landing.done(), Some(8));
+        landing.transition(super::Phase::Layout, "ok", 8);
+        assert_eq!(landing.done(), Some(8), "a finished landing is terminal");
     }
 
     #[test]

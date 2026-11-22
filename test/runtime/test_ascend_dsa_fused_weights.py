@@ -24,13 +24,13 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.layers.attention.dsa.ascend import (
-    AscendDSAIndexer,
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
     pack_down_qa_panels,
     pack_dsa_qb,
     pack_qb_panels,
     pack_score_fp32,
 )
+from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAIndexer
 
 
 def test_compact_qb_preserves_heads_channels_and_k():
@@ -138,7 +138,7 @@ def test_indexer_keeps_fp32_score_weights():
         q_lora_rank=4,
     )
     assert indexer.weights_proj.weight.dtype == torch.float32
-    assert not indexer.use_rotary
+    assert indexer.rotary_emb is None
 
 
 @pytest.mark.parametrize("heads", [32, 64])

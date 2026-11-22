@@ -171,7 +171,11 @@ LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> 
     const std::uint32_t op_id = nextOpId();
     const bool inserted = load_backs_.emplace(op_id, std::move(block_transfers)).second;
     _assert(inserted, "duplicate loadback op id");
-    return LoadBackOperation{op_id, std::move(transfers)};
+    return LoadBackOperation{
+        .op_id = op_id,
+        .transfers = std::move(transfers),
+        .telemetry = PrefixLoadTelemetry{.op_generation = (next_op_id_ - 1) >> 32},
+    };
 }
 
 std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
@@ -647,6 +651,12 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
         .snapshot_slot = blob_slot->slot_,
         .transfers = resolveTransfers(load_pairs),
         .source_tier = std::vector<HostTier>(load_pairs.size(), HostTier::kL2),
+        .telemetry =
+            RestoreTelemetry{
+                .op_generation = (next_op_id_ - 1) >> 32,
+                .slot_generation = request_pool_index.generation(),
+                .slot_previous_admission_id = request_pool_index.previous_admission_id(),
+            },
     };
     // Only the L2 rows are Host L2 traffic; the snapshot-pool rows follow.
     if (!op.transfers.empty()) {

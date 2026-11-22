@@ -65,6 +65,68 @@ def _group(group_id: str, *fields, **spec_kwargs):
 
 
 class TestCacheMemoryPlanTest:
+    @pytest.mark.parametrize(
+        ("grain", "kernel_page_size", "parents", "packing", "error"),
+        [
+            (8192, 256, 262143, 1, None),
+            (8192, 1, 262143, 1, None),
+            (256, 256, 262143, 1, None),
+            (256, 256, 262143, 2, None),
+            (256, 256, 262144, 1, "kernel write slot 2147483903"),
+            (256, 256, 262144, 2, "kernel write slot 2147483903"),
+            (256, 1, 262144, 1, "atom page id"),
+            (256, 1, 262144, 2, "atom page id"),
+        ],
+    )
+    def test_bound_plan_checks_translated_int32_addresses(
+        self, grain, kernel_page_size, parents, packing, error
+    ):
+        field = self.plan_module.CacheFieldSpec
+        plan = self._plan_fields(
+            {
+                "history": (
+                    field(
+                        "layer.0.k",
+                        "flatkv",
+                        (grain, 128),
+                        "uint8",
+                        exact_page_stride=False,
+                    ),
+                ),
+                "state": (
+                    field(
+                        "layer.1.ssm",
+                        "flatkv",
+                        (1 << 20,),
+                        "uint8",
+                        exact_page_stride=False,
+                    ),
+                ),
+            },
+            prefix_granularity=grain,
+            num_lcm_blocks=parents,
+            cache_blocks_per_lcm_block={"history": packing, "state": 1},
+            max_padding_fraction=float("inf"),
+        )
+        # Binding this ~256 GiB geometry allocates metadata only.
+        history = plan.field("layer.0.k")
+        ratio = grain // kernel_page_size
+        multiplier = history.page_stride_bytes // (history.payload_bytes // ratio)
+
+        def validate():
+            plan.validate_kernel_page_range(
+                "history",
+                atom_pages_per_block=multiplier,
+                kernel_subpages=ratio,
+                kernel_page_size=kernel_page_size,
+            )
+
+        if error is None:
+            validate()
+        else:
+            with pytest.raises(ValueError, match=error):
+                validate()
+
     def _plan_fields(
         self,
         fields,

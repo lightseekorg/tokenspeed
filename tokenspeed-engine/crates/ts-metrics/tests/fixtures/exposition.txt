@@ -1,55 +1,74 @@
 # HELP tokenspeed:cache_hit_tokens_total Prompt tokens of finished requests served from the prefix cache.
 # HELP tokenspeed:completion_tokens_total Output tokens of requests that ended, including a prefill role's bootstrap token.
-# HELP tokenspeed:decode_time_seconds Wall time from the first token to the request's end.
+# HELP tokenspeed:decode_prefix_cache_hit_ratio Decode-local admission cache hits divided by prompt tokens, weighted by prompt tokens.
+# HELP tokenspeed:decode_prefix_hit_tokens_total Prompt tokens served by the decode-local prefix cache at admission.
+# HELP tokenspeed:decode_prefix_prompt_tokens_total Prompt tokens admitted by the decode-local scheduler.
+# HELP tokenspeed:decode_time_seconds Wall time from this role's first output token to the request's end. On a decode role this starts at the first local decode output.
+# HELP tokenspeed:e2e_time_per_output_token_seconds Time from first emitted chunk to request end divided by tokens after the first chunk.
 # HELP tokenspeed:generation_tokens_total Generated tokens committed by decode forwards.
 # HELP tokenspeed:grammar_queue_reqs Admissions waiting for their grammar to compile.
 # HELP tokenspeed:iteration_tokens_total Tokens scheduled in one scheduler forward step.
 # HELP tokenspeed:jit_serving_compile_seconds_total Wall time spent in Triton and CuTe DSL kernel compilations after startup.
 # HELP tokenspeed:jit_serving_compiles_total Triton and CuTe DSL kernel compilations after startup; each one stalls the forward thread.
+# HELP tokenspeed:kv_cache_resident_usage_perc Resident KV pages including reclaimable prefix entries divided by usable pages, 0-1.
 # HELP tokenspeed:kv_cache_usage_perc Fraction of device KV pages in use (0-1).
-# HELP tokenspeed:kv_token_usage_perc Fraction of usable KV pages resident (active plus reclaimable prefix-cache entries), 0-1.
+# HELP tokenspeed:kv_token_usage_perc Fraction of usable KV pages held by active requests (excludes reclaimable entries), 0-1.
 # HELP tokenspeed:kv_transfer_failures_total KV transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss on the decode node. Timeouts are counted separately.
 # HELP tokenspeed:kv_transfer_latency_seconds Wall time of one KV cache transfer send to a peer.
+# HELP tokenspeed:kv_transfer_request_size_bytes Bytes moved by one KV transfer send.
 # HELP tokenspeed:kv_transfer_size_bytes_total Bytes one KV cache transfer send moved to a peer.
 # HELP tokenspeed:kv_transfer_timeouts_total KV transfers that timed out, by transfer stage.
 # HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool, image rows or Host L2 exhausted), or because a lone request made no progress for 4096 consecutive scheduler plans; clients may resubmit them. Forced retractions from --debug-force-retraction-interval aborted the same way count too.
 # HELP tokenspeed:num_decode_kv_wait_reqs Decode requests waiting for the prefill peer's KV: admitted with destination pages held, with no schedulable work.
 # HELP tokenspeed:num_decode_prealloc_queue_reqs Decode requests waiting for their prefill peer to connect.
-# HELP tokenspeed:num_decode_transfer_queue_reqs Decode requests whose KV a transfer still pins.
+# HELP tokenspeed:num_decode_transfer_queue_reqs Decode requests waiting for remote prefill KV (alias of KV wait).
 # HELP tokenspeed:num_free_tokens KV tokens not held by active requests (empty plus evictable).
 # HELP tokenspeed:num_nan_aborted_requests_total Requests terminated by the NaN guard (NaN in logits or an out-of-vocab sampled token id).
 # HELP tokenspeed:num_preemptions_total Requests preempted by a capacity retraction: the scheduler suspended a resident request (its pages imaged to the Host snapshot pool; it later resumes by restore, nothing is recomputed) to free Device pages for a blocked admission. One increment per retraction victim per round, counted from the plan's snapshot-store ops; forced retractions from --debug-force-retraction-interval count too. A retraction whose victim cannot be imaged aborts it instead — see tokenspeed:num_capacity_aborted_requests.
-# HELP tokenspeed:num_prefill_inflight_queue_reqs Prefill requests whose KV a transfer still pins.
+# HELP tokenspeed:num_prefill_inflight_queue_reqs Prefill requests after their final forward result and before PD completion.
 # HELP tokenspeed:num_prefill_prealloc_queue_reqs Prefill requests waiting for their decode peer to connect.
 # HELP tokenspeed:num_requests_inflight Requests admitted and not finished, including PD transfer and waiting states.
-# HELP tokenspeed:num_requests_running Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.
-# HELP tokenspeed:num_requests_waiting Requests waiting in the C++ scheduler queue.
+# HELP tokenspeed:num_requests_running Requests in the dispatched forward batch, excluding idle padding and transfer waits.
+# HELP tokenspeed:num_requests_waiting Requests waiting for scheduler admission, restore, a decode execution permit, or pause resume.
+# HELP tokenspeed:num_resident_kv_tokens KV tokens held by resident pages including reclaimable prefix entries.
 # HELP tokenspeed:num_retracted_queue_reqs Requests suspended with a retraction image.
-# HELP tokenspeed:num_used_tokens KV tokens held by resident pages (active plus reclaimable).
+# HELP tokenspeed:num_used_tokens KV tokens held by active requests (excludes reclaimable entries).
+# HELP tokenspeed:prefix_cache_hit_ratio Admission cache hits divided by prompt tokens, weighted by prompt tokens.
+# HELP tokenspeed:prefix_device_hit_ratio Admission Device cache hits divided by prompt tokens, weighted by prompt tokens.
 # HELP tokenspeed:prefix_device_hit_tokens_total Admitted prompt tokens served from the Device prefix cache (L1).
+# HELP tokenspeed:prefix_host_hit_ratio Admission Host cache hits divided by prompt tokens, weighted by prompt tokens.
 # HELP tokenspeed:prefix_host_hit_tokens_total Admitted prompt tokens loaded from the Host cache (L2, including L3-supplied).
 # HELP tokenspeed:prefix_l3_hit_tokens_total Token spans of successful storage keys (L3), counted per cache group.
 # HELP tokenspeed:prefix_prompt_tokens_total Prompt tokens of admitted requests.
 # HELP tokenspeed:prompt_tokens_total Prompt tokens of requests that ended, including aborted requests.
+# HELP tokenspeed:request_completion_tokens Output tokens per ended request, including a prefill bootstrap token.
 # HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are frontend and IPC wait.
+# HELP tokenspeed:request_spec_decode_accept_length Mean output tokens per verify round, including bonus, per ended speculative request.
 # HELP tokenspeed:request_time_seconds Wall time from request creation to its end on this role (prefill: KV transfer done; decode: generation done).
+# HELP tokenspeed:spec_decode_accept_length Accepted tokens including bonus per verify request-slot.
 # HELP tokenspeed:spec_decode_num_accepted_tokens_total Accepted speculative draft tokens (excludes the bonus token sampled after verify).
 # HELP tokenspeed:spec_decode_num_draft_tokens_total Draft tokens proposed across verify steps.
 # HELP tokenspeed:spec_decode_num_drafts_total Number of speculative verify rounds (per request-slot).
-# HELP tokenspeed:time_per_output_token_seconds Decode time divided by generated tokens after the first one.
-# HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to its first output token, on this role.
+# HELP tokenspeed:time_per_output_token_seconds Time between nonempty emitted chunks divided by tokens in the later chunk.
+# HELP tokenspeed:time_to_first_token_seconds Wall time from request creation to this role's first output token. On a decode role this is the first local decode output; a remote prefill's bootstrap token alone does not end it, except when that token ends the request, so the wait for a decode execution permit is included.
 # TYPE tokenspeed:cache_hit_tokens_total counter
 # TYPE tokenspeed:completion_tokens_total counter
+# TYPE tokenspeed:decode_prefix_cache_hit_ratio histogram
+# TYPE tokenspeed:decode_prefix_hit_tokens_total counter
+# TYPE tokenspeed:decode_prefix_prompt_tokens_total counter
 # TYPE tokenspeed:decode_time_seconds histogram
+# TYPE tokenspeed:e2e_time_per_output_token_seconds histogram
 # TYPE tokenspeed:generation_tokens_total counter
 # TYPE tokenspeed:grammar_queue_reqs gauge
 # TYPE tokenspeed:iteration_tokens_total histogram
 # TYPE tokenspeed:jit_serving_compile_seconds_total counter
 # TYPE tokenspeed:jit_serving_compiles_total counter
+# TYPE tokenspeed:kv_cache_resident_usage_perc gauge
 # TYPE tokenspeed:kv_cache_usage_perc gauge
 # TYPE tokenspeed:kv_token_usage_perc gauge
 # TYPE tokenspeed:kv_transfer_failures_total counter
 # TYPE tokenspeed:kv_transfer_latency_seconds histogram
+# TYPE tokenspeed:kv_transfer_request_size_bytes histogram
 # TYPE tokenspeed:kv_transfer_size_bytes_total counter
 # TYPE tokenspeed:kv_transfer_timeouts_total counter
 # TYPE tokenspeed:num_capacity_aborted_requests_total counter
@@ -64,15 +83,22 @@
 # TYPE tokenspeed:num_requests_inflight gauge
 # TYPE tokenspeed:num_requests_running gauge
 # TYPE tokenspeed:num_requests_waiting gauge
+# TYPE tokenspeed:num_resident_kv_tokens gauge
 # TYPE tokenspeed:num_retracted_queue_reqs gauge
 # TYPE tokenspeed:num_used_tokens gauge
+# TYPE tokenspeed:prefix_cache_hit_ratio histogram
+# TYPE tokenspeed:prefix_device_hit_ratio histogram
 # TYPE tokenspeed:prefix_device_hit_tokens_total counter
+# TYPE tokenspeed:prefix_host_hit_ratio histogram
 # TYPE tokenspeed:prefix_host_hit_tokens_total counter
 # TYPE tokenspeed:prefix_l3_hit_tokens_total counter
 # TYPE tokenspeed:prefix_prompt_tokens_total counter
 # TYPE tokenspeed:prompt_tokens_total counter
+# TYPE tokenspeed:request_completion_tokens histogram
 # TYPE tokenspeed:request_queue_time_seconds histogram
+# TYPE tokenspeed:request_spec_decode_accept_length histogram
 # TYPE tokenspeed:request_time_seconds histogram
+# TYPE tokenspeed:spec_decode_accept_length histogram
 # TYPE tokenspeed:spec_decode_num_accepted_tokens_total counter
 # TYPE tokenspeed:spec_decode_num_draft_tokens_total counter
 # TYPE tokenspeed:spec_decode_num_drafts_total counter
@@ -80,6 +106,16 @@
 # TYPE tokenspeed:time_to_first_token_seconds histogram
 tokenspeed:cache_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 40.0
 tokenspeed:completion_tokens_total{app_key="",dp_rank="0",model_name="m"} 5.0
+tokenspeed:decode_prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 100.0
+tokenspeed:decode_prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
+tokenspeed:decode_prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.25",model_name="m"} 100.0
+tokenspeed:decode_prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 100.0
+tokenspeed:decode_prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.75",model_name="m"} 100.0
+tokenspeed:decode_prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 100.0
+tokenspeed:decode_prefix_cache_hit_ratio_count{app_key="",dp_rank="0",model_name="m"} 100.0
+tokenspeed:decode_prefix_cache_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 20.0
+tokenspeed:decode_prefix_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 20.0
+tokenspeed:decode_prefix_prompt_tokens_total{app_key="",dp_rank="0",model_name="m"} 100.0
 tokenspeed:decode_time_seconds_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 1.0
 tokenspeed:decode_time_seconds_bucket{app_key="",dp_rank="0",le="0.001",model_name="m"} 0.0
 tokenspeed:decode_time_seconds_bucket{app_key="",dp_rank="0",le="0.002",model_name="m"} 0.0
@@ -98,6 +134,21 @@ tokenspeed:decode_time_seconds_bucket{app_key="",dp_rank="0",le="5.0",model_name
 tokenspeed:decode_time_seconds_bucket{app_key="",dp_rank="0",le="60.0",model_name="m"} 1.0
 tokenspeed:decode_time_seconds_count{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:decode_time_seconds_sum{app_key="",dp_rank="0",model_name="m"} 1.2
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.001",model_name="m"} 0.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.002",model_name="m"} 0.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.005",model_name="m"} 0.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.01",model_name="m"} 0.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.02",model_name="m"} 0.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.05",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.1",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.2",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="2.0",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_bucket{app_key="",dp_rank="0",le="5.0",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_count{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:e2e_time_per_output_token_seconds_sum{app_key="",dp_rank="0",model_name="m"} 0.03
 tokenspeed:generation_tokens_total{app_key="",dp_rank="0",model_name="m"} 25.0
 tokenspeed:grammar_queue_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:iteration_tokens_total_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 1.0
@@ -120,8 +171,9 @@ tokenspeed:iteration_tokens_total_count{app_key="",dp_rank="0",model_name="m"} 1
 tokenspeed:iteration_tokens_total_sum{app_key="",dp_rank="0",model_name="m"} 17.0
 tokenspeed:jit_serving_compile_seconds_total{app_key="",dp_rank="0",model_name="m"} 0.5
 tokenspeed:jit_serving_compiles_total{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:kv_cache_resident_usage_perc{app_key="",dp_rank="0",model_name="m"} 0.3
 tokenspeed:kv_cache_usage_perc{app_key="",dp_rank="0",model_name="m"} 0.1
-tokenspeed:kv_token_usage_perc{app_key="",dp_rank="0",model_name="m"} 0.3
+tokenspeed:kv_token_usage_perc{app_key="",dp_rank="0",model_name="m"} 0.2
 tokenspeed:kv_transfer_failures_total{app_key="",model_name="m"} 1.0
 tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="+Inf",model_name="m"} 1.0
 tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="0.001",model_name="m"} 0.0
@@ -141,6 +193,13 @@ tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="5.0",model_name="m"
 tokenspeed:kv_transfer_latency_seconds_bucket{app_key="",le="60.0",model_name="m"} 1.0
 tokenspeed:kv_transfer_latency_seconds_count{app_key="",model_name="m"} 1.0
 tokenspeed:kv_transfer_latency_seconds_sum{app_key="",model_name="m"} 0.003
+tokenspeed:kv_transfer_request_size_bytes_bucket{app_key="",le="+Inf",model_name="m"} 1.0
+tokenspeed:kv_transfer_request_size_bytes_bucket{app_key="",le="0.0",model_name="m"} 0.0
+tokenspeed:kv_transfer_request_size_bytes_bucket{app_key="",le="1.048576e+06",model_name="m"} 1.0
+tokenspeed:kv_transfer_request_size_bytes_bucket{app_key="",le="1.073741824e+09",model_name="m"} 1.0
+tokenspeed:kv_transfer_request_size_bytes_bucket{app_key="",le="1024.0",model_name="m"} 0.0
+tokenspeed:kv_transfer_request_size_bytes_count{app_key="",model_name="m"} 1.0
+tokenspeed:kv_transfer_request_size_bytes_sum{app_key="",model_name="m"} 4096.0
 tokenspeed:kv_transfer_size_bytes_total{app_key="",model_name="m"} 4096.0
 tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="bootstrapping"} 1.0
 tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="waiting_for_input"} 1.0
@@ -148,7 +207,7 @@ tokenspeed:num_capacity_aborted_requests_total{app_key="",dp_rank="0",model_name
 tokenspeed:num_decode_kv_wait_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_decode_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"} 3.0
 tokenspeed:num_decode_transfer_queue_reqs{app_key="",dp_rank="0",model_name="m"} 4.0
-tokenspeed:num_free_tokens{app_key="",dp_rank="0",model_name="m"} 517.0
+tokenspeed:num_free_tokens{app_key="",dp_rank="0",model_name="m"} 518.0
 tokenspeed:num_nan_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_preemptions_total{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_prefill_inflight_queue_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
@@ -156,13 +215,49 @@ tokenspeed:num_prefill_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"
 tokenspeed:num_requests_inflight{app_key="",dp_rank="0",model_name="m"} 4.0
 tokenspeed:num_requests_running{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_requests_waiting{app_key="",dp_rank="0",model_name="m"} 0.0
+tokenspeed:num_resident_kv_tokens{app_key="",dp_rank="0",model_name="m"} 194.0
 tokenspeed:num_retracted_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
-tokenspeed:num_used_tokens{app_key="",dp_rank="0",model_name="m"} 194.0
+tokenspeed:num_used_tokens{app_key="",dp_rank="0",model_name="m"} 129.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 100.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.25",model_name="m"} 0.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 0.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="0.75",model_name="m"} 100.0
+tokenspeed:prefix_cache_hit_ratio_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 100.0
+tokenspeed:prefix_cache_hit_ratio_count{app_key="",dp_rank="0",model_name="m"} 100.0
+tokenspeed:prefix_cache_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 70.0
+tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 100.0
+tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
+tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="0.25",model_name="m"} 0.0
+tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 100.0
+tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="0.75",model_name="m"} 100.0
+tokenspeed:prefix_device_hit_ratio_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 100.0
+tokenspeed:prefix_device_hit_ratio_count{app_key="",dp_rank="0",model_name="m"} 100.0
+tokenspeed:prefix_device_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 40.0
 tokenspeed:prefix_device_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 40.0
+tokenspeed:prefix_host_hit_ratio_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 100.0
+tokenspeed:prefix_host_hit_ratio_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 0.0
+tokenspeed:prefix_host_hit_ratio_bucket{app_key="",dp_rank="0",le="0.25",model_name="m"} 0.0
+tokenspeed:prefix_host_hit_ratio_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 100.0
+tokenspeed:prefix_host_hit_ratio_bucket{app_key="",dp_rank="0",le="0.75",model_name="m"} 100.0
+tokenspeed:prefix_host_hit_ratio_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 100.0
+tokenspeed:prefix_host_hit_ratio_count{app_key="",dp_rank="0",model_name="m"} 100.0
+tokenspeed:prefix_host_hit_ratio_sum{app_key="",dp_rank="0",model_name="m"} 30.0
 tokenspeed:prefix_host_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 30.0
 tokenspeed:prefix_l3_hit_tokens_total{app_key="",dp_rank="0",model_name="m"} 10.0
 tokenspeed:prefix_prompt_tokens_total{app_key="",dp_rank="0",model_name="m"} 100.0
 tokenspeed:prompt_tokens_total{app_key="",dp_rank="0",model_name="m"} 100.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="0.0",model_name="m"} 1.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 1.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="128.0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="2048.0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="32.0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="512.0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="8.0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_bucket{app_key="",dp_rank="0",le="8192.0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_count{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:request_completion_tokens_sum{app_key="",dp_rank="0",model_name="m"} 5.0
 tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 2.0
 tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="0.3",model_name="m"} 0.0
 tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="0.5",model_name="m"} 1.0
@@ -187,6 +282,16 @@ tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="7680.0",
 tokenspeed:request_queue_time_seconds_bucket{app_key="",dp_rank="0",le="960.0",model_name="m"} 1.0
 tokenspeed:request_queue_time_seconds_count{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:request_queue_time_seconds_sum{app_key="",dp_rank="0",model_name="m"} 9000.4
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 0.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="16.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="2.0",model_name="m"} 1.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="32.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="4.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="64.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="8.0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_count{app_key="",dp_rank="0",model_name="m"} 2.0
+tokenspeed:request_spec_decode_accept_length_sum{app_key="",dp_rank="0",model_name="m"} 5.0
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 1.0
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="0.01",model_name="m"} 0.0
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="0.02",model_name="m"} 0.0
@@ -204,6 +309,16 @@ tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="5.0",model_nam
 tokenspeed:request_time_seconds_bucket{app_key="",dp_rank="0",le="60.0",model_name="m"} 1.0
 tokenspeed:request_time_seconds_count{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:request_time_seconds_sum{app_key="",dp_rank="0",model_name="m"} 1.5
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="+Inf",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="1.0",model_name="m"} 0.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="16.0",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="2.0",model_name="m"} 0.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="32.0",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="4.0",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="64.0",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_bucket{app_key="",dp_rank="0",le="8.0",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_count{app_key="",dp_rank="0",model_name="m"} 4.0
+tokenspeed:spec_decode_accept_length_sum{app_key="",dp_rank="0",model_name="m"} 9.0
 tokenspeed:spec_decode_num_accepted_tokens_total{app_key="",dp_rank="0",model_name="m"} 5.0
 tokenspeed:spec_decode_num_draft_tokens_total{app_key="",dp_rank="0",model_name="m"} 12.0
 tokenspeed:spec_decode_num_drafts_total{app_key="",dp_rank="0",model_name="m"} 4.0

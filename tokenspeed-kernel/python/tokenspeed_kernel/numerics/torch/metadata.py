@@ -89,6 +89,7 @@ def torch_prepare_decode_tables(
     actual_bs: int,
     tokens_per_req: int,
     ratios: tuple[int, ...],
+    atom_pages_per_block: tuple[int, ...],
     pages: tuple[int, ...],
     page_sizes: tuple[int, ...],
     targets: tuple[tuple[torch.Tensor, torch.Tensor, int] | None, ...],
@@ -104,11 +105,11 @@ def torch_prepare_decode_tables(
         dst = tables[g, :bs]
         if actual_bs:
             num_blocks = min(source.shape[1], -(-pages[g] // ratios[g]))
-            live = source[:actual_bs, :num_blocks].clamp_min(0)
-            if ratios[g] != 1:
-                offsets = torch.arange(ratios[g], dtype=live.dtype, device=live.device)
-                live = (live.unsqueeze(-1) * ratios[g] + offsets).reshape(actual_bs, -1)
-                live = torch.where(live >= ratios[g], live, torch.zeros_like(live))
+            blocks = source[:actual_bs, :num_blocks].to(torch.int64).unsqueeze(-1)
+            offsets = torch.arange(ratios[g], device=blocks.device)
+            live = torch.where(
+                blocks > 0, blocks * atom_pages_per_block[g] + offsets, 0
+            ).reshape(actual_bs, -1)
             num_pages = min(live.shape[1], pages[g])
             dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])
             dst[:actual_bs, num_pages:].zero_()

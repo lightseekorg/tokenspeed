@@ -23,23 +23,30 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
+
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.types import DpForwardMetadata
+from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
 from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 FULL = "full_attention"
 
 
-class _Leaf:
+class _Leaf(CachePoolBinding):
     """Metadata-only leaf stub (the scrub lives in the router's stack)."""
 
     kernel_page_size = 128
     max_num_pages = 4
     verify_floor = 1
+
+    def __init__(self):
+        self._init_pool_binding()
 
     def init_cuda_graph_state(self, max_bs):
         pass
@@ -70,6 +77,12 @@ def _draft_router(rows: int = 8, *, device: str) -> CacheGroupRouter:
             windows={FULL: None},
         ),
         {FULL: _Leaf()},
+    )
+    router.set_cache_pool(
+        make_mha_pool_for_groups(
+            (CacheGroupSpec(FULL, "full_history", 128, 1, replayable=False),),
+            device=device,
+        )
     )
     router.init_cuda_graph_state(rows)
     return router

@@ -2585,6 +2585,279 @@ TEST_F(L3LeaseLifetimeSuite, AnAbortReleasesTheReadyDataItHolds) {
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), static_cast<std::int32_t>(get.keys.size()));
 }
 
+TEST_F(L3LeaseLifetimeSuite, ClearPreparationDetachesAReadyLeaseSoHealthyStorageCanDrain) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(query.op_id, query.keys.size());
+    const auto get = std::get<StorageGetOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(get.op_id, get.keys.size());
+    Tick(2, /*allow_forward=*/false);
+    PlanOnce();
+    ASSERT_EQ(scheduler_->GetStorageStats().ready_requests, 1u);
+    ASSERT_TRUE(scheduler_->StorageCurrentPending());
+    ASSERT_TRUE(scheduler_->StorageProgressPending()) << "Ready can still advance through admission or expiry";
+    ASSERT_TRUE(scheduler_->StorageNonStorageClearable());
+
+    scheduler_->CancelStorageForClear();
+    EXPECT_FALSE(scheduler_->StorageCurrentPending());
+    EXPECT_FALSE(scheduler_->StorageProgressPending());
+    EXPECT_FALSE(scheduler_->StoragePending());
+    EXPECT_EQ(scheduler_->GetStorageStats().ready_requests, 0u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), 0u);
+    EXPECT_TRUE(scheduler_->CanClearCache());
+}
+
+TEST_F(L3LeaseLifetimeSuite, ClearPreparationDetachesAnAttachedQueryUntilItsRealRetirement) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    ASSERT_TRUE(scheduler_->StorageNonStorageClearable());
+    scheduler_->CancelStorageForClear();
+    EXPECT_TRUE(scheduler_->StorageCurrentPending());
+    EXPECT_EQ(scheduler_->GetStorageStats().waiting_requests, 0u);
+    Tick(2, /*allow_forward=*/false);
+    EXPECT_EQ(std::get<StorageCancelOperation>(OnlyStorageOp(PlanOnce())).op_id, query.op_id);
+    Retire(query.op_id, query.keys.size());
+    EXPECT_FALSE(scheduler_->StorageCurrentPending());
+    EXPECT_FALSE(scheduler_->StoragePending());
+}
+
+class L3BackupClearSuite : public L3LeaseLifetimeSuite {
+protected:
+    StoragePutOperation StartBackup() {
+        auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+        auto& storage = SchedulerTestAccess::Storage(*scheduler_);
+        // The final token is replayed, leaving one complete two-token prefix.
+        const auto hashes = scheduler_->PrefixHashesForTokens({1, 2, 3});
+        const auto keys = coordinator.Store().ExpandPrefixKeys(hashes);
+        for (const auto& key : keys) {
+            auto source = coordinator.Host().AcquireHostBlock(static_cast<std::int32_t>(key.group_id), 0);
+            coordinator.Host().CacheHostBlock(source, key, std::nullopt);
+        }
+        storage.QueueBackups(keys);
+        Tick(1, /*allow_forward=*/false);
+        return std::get<StoragePutOperation>(OnlyStorageOp(PlanOnce()));
+    }
+
+    void FreezeStorage(std::int64_t now_us) {
+        ExecutionEvent tick;
+        tick.With(cache::StorageTick{now_us, false, false, StoragePressure{0, 0, 0}});
+        scheduler_->Advance(std::move(tick));
+    }
+};
+
+TEST_F(SchedulerTestSuite, OrdinaryClearPreservesUnindexedOwnersWithoutRequiringRecoveryPreflight) {
+    ASSERT_FALSE(scheduler_->StoragePending());
+    auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    auto& device = SchedulerTestAccess::Pool(*scheduler_);
+    auto private_device = device.AcquireBlock(0);
+    auto private_host = coordinator.Host().AcquireHostBlock(0, 0);
+    ASSERT_TRUE(private_device && private_host);
+    const auto private_device_location = private_device->Location();
+    const auto private_host_location = private_host->Location();
+    const CacheKey key{.group_id = 0, .content_hash = ContentHash{"ordinary-clear"}};
+    auto indexed_device = device.AcquireBlock(0);
+    coordinator.GroupPrefixIndex(0).Register(device, indexed_device, key, 1, -1, CacheBoundaryKind::kChunk, nullptr,
+                                             {});
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "ordinary indexed Device pins remain protected";
+    EXPECT_FALSE(scheduler_->CanPrepareStorageClear());
+    indexed_device.reset();
+    auto indexed_host = coordinator.Host().AcquireHostBlock(0, 0);
+    coordinator.Host().CacheHostBlock(indexed_host, key, std::nullopt);
+    indexed_host.reset();
+
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(device), 0);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_TRUE(device.IsOccupied(private_device_location));
+    EXPECT_TRUE(private_host->IsOwnedBy(*coordinator.Store().HostPool()));
+    EXPECT_TRUE(coordinator.Store().HostPool()->IsOccupied(private_host_location));
+}
+
+TEST_F(L3BackupClearSuite, AHealthyPutCanDrainBesideAnUnindexedDeviceOwnerBeforeAnOrdinaryClear) {
+    const auto put = StartBackup();
+    auto& device = SchedulerTestAccess::Pool(*scheduler_);
+    auto private_device = device.AcquireBlock(0);
+    ASSERT_TRUE(private_device);
+    const auto location = private_device->Location();
+    const auto operations = scheduler_->GetStorageStats().operations;
+    const auto held_blocks = scheduler_->StorageHeldBlocks();
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_TRUE(scheduler_->StorageNonStorageClearable());
+    EXPECT_FALSE(scheduler_->CanClearCache());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    EXPECT_EQ(scheduler_->GetStorageStats().operations, operations);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), held_blocks);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+
+    Retire(put.op_id, put.keys.size());
+    EXPECT_FALSE(scheduler_->StoragePending());
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_TRUE(device.IsOccupied(location));
+    EXPECT_EQ(device.NumOccupiedSlots(), 1);
+}
+
+TEST_F(L3BackupClearSuite, UnsafeRecoveryStillRejectsAnUnindexedDeviceOwnerWithoutCancellingThePut) {
+    const auto put = StartBackup();
+    auto& device = SchedulerTestAccess::Pool(*scheduler_);
+    auto private_device = device.AcquireBlock(0);
+    ASSERT_TRUE(private_device);
+    ExecutionEvent unknown;
+    unknown.With(cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 0), false,
+                                    std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(unknown));
+
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+    EXPECT_EQ(scheduler_->StorageBlockingQuarantined(), 1u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    EXPECT_EQ(scheduler_->GetStorageStats().retained_operations, 0u);
+    EXPECT_TRUE(private_device->IsOwnedBy(device));
+}
+
+TEST_F(L3BackupClearSuite, FreezingStorageDoesNotCancelADispatchedPut) {
+    const auto put = StartBackup();
+    const auto held = scheduler_->StorageHeldBlocks();
+    ASSERT_GT(held, 0u);
+    FreezeStorage(2);
+    for (int round = 0; round < 3; ++round) {
+        EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+        EXPECT_EQ(scheduler_->StorageHeldBlocks(), held);
+    }
+    Retire(put.op_id, put.keys.size());
+    EXPECT_FALSE(scheduler_->StoragePending());
+    for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
+TEST_F(L3BackupClearSuite, RejectedRecoveryWithAPrivateHostOwnerDoesNotCancelADispatchedPut) {
+    const auto put = StartBackup();
+    auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    auto private_host = coordinator.Host().AcquireHostBlock(0, 0);
+    ASSERT_TRUE(private_host);
+    EXPECT_TRUE(scheduler_->CanPrepareStorageClear());
+    EXPECT_FALSE(scheduler_->CanClearCacheRetainingStorage());
+    EXPECT_FALSE(scheduler_->ClearCache());
+    EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    private_host.reset();
+    Retire(put.op_id, put.keys.size());
+    for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
+TEST_F(L3BackupClearSuite, RejectedClearWithAPeerExportDoesNotCancelADispatchedPut) {
+    const auto put = StartBackup();
+    auto& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    const auto hashes = scheduler_->PrefixHashesForTokens({1, 2, 3});
+    auto peer = coordinator.ExportPrefix(coordinator.Prober().ProbePrefix(hashes));
+    ASSERT_FALSE(peer.blocks.empty());
+    EXPECT_FALSE(scheduler_->StorageNonStorageClearable());
+    EXPECT_FALSE(scheduler_->ClearCache());
+    EXPECT_FALSE(scheduler_->ClearCacheRetainingStorage());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<StorageOperation>(PlanOnce()).empty());
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    peer.blocks.clear();
+    Retire(put.op_id, put.keys.size());
+    for (const auto& key : put.keys) EXPECT_TRUE(SchedulerTestAccess::Storage(*scheduler_).WasPublished(key));
+}
+
+class L3LoneNoProgressSuite : public L3BackupClearSuite {
+protected:
+    std::vector<CacheBlockRef> BlockDeviceAndSubmit() {
+        // These owners are outside every request, as external cache users can
+        // be. The lone prompt fits its configured limit, but no Device parent
+        // can be freed by eviction or compaction.
+        auto& pool = SchedulerTestAccess::Pool(*scheduler_);
+        auto held = pool.AcquireBlocks(0, scheduler_->AvailableLcmBlocks());
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+        ExecutionEvent tick;
+        tick.With(cache::StorageTick{2, true, false, StoragePressure{0, 0, 0}});
+        scheduler_->Advance(std::move(tick));
+        Submit(MakeRequestSpec("impossible", /*num_pages=*/2));
+        return held;
+    }
+
+    void ExpectLoneNoProgressAbort() {
+        for (std::int64_t stalled = 1; stalled < Scheduler::kNoProgressAbortPlans; ++stalled) {
+            const auto plan = PlanOnce();
+            ASSERT_TRUE(FindForwardBatch(plan)->request_ids.empty()) << stalled;
+            ASSERT_TRUE(plan.aborts.empty()) << stalled;
+        }
+        const auto plan = PlanOnce();
+        ASSERT_EQ(plan.aborts.size(), 1u);
+        EXPECT_EQ(plan.aborts.front().request_id, "impossible");
+        EXPECT_EQ(plan.aborts.front().reason, AbortReason::kNoProgress);
+        EXPECT_NE(plan.aborts.front().detail.find(
+                      "no progress for " + std::to_string(Scheduler::kNoProgressAbortPlans) + " consecutive plans"),
+                  std::string::npos);
+    }
+};
+
+TEST_F(L3LoneNoProgressSuite, RetainedUnknownIoDoesNotSuppressALoneImpossibleRequestsAbort) {
+    const auto put = StartBackup();
+    ExecutionEvent unknown;
+    unknown.With(cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 0), false,
+                                    std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(unknown));
+    ASSERT_TRUE(scheduler_->ClearCacheRetainingStorage());
+    ASSERT_TRUE(scheduler_->StoragePending());
+    ASSERT_FALSE(scheduler_->StorageCurrentPending());
+    ASSERT_FALSE(scheduler_->StorageProgressPending());
+    const auto held = BlockDeviceAndSubmit();
+    ExpectLoneNoProgressAbort();
+    EXPECT_TRUE(scheduler_->StoragePending());
+    EXPECT_EQ(scheduler_->GetStorageStats().retained_operations, 1u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "physical unknown ownership still prevents a strict clear";
+}
+
+TEST_F(L3LoneNoProgressSuite, CurrentTerminalUnknownIoDoesNotSuppressALoneImpossibleRequestsAbort) {
+    const auto put = StartBackup();
+    ExecutionEvent unknown;
+    unknown.With(cache::StorageDone{put.op_id, std::vector<std::uint8_t>(put.keys.size(), 0), false,
+                                    std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(unknown));
+    ASSERT_TRUE(scheduler_->StorageCurrentPending());
+    ASSERT_FALSE(scheduler_->StorageProgressPending());
+    const auto held = BlockDeviceAndSubmit();
+    ExpectLoneNoProgressAbort();
+    EXPECT_EQ(scheduler_->StorageBlockingQuarantined(), 1u);
+    EXPECT_EQ(scheduler_->StorageHeldBlocks(), put.keys.size());
+}
+
+TEST_F(L3LoneNoProgressSuite, AnActiveCurrentQuerySuppressesStallCountingUntilItsLeaseAndCompletionRetire) {
+    auto& storage = SchedulerTestAccess::Storage(*scheduler_);
+    const auto hashes = scheduler_->PrefixHashesForTokens({10, 11, 12});
+    const auto keys = scheduler_->ExpandPrefixKeys(hashes);
+    auto query = storage.StartQuery(keys, std::vector<std::int32_t>(keys.size(), 2));
+    ASSERT_TRUE(query);
+    // The real query has already left the scheduler's outbox. No synthetic
+    // storage command in a later plan can reset the diagnostic on its behalf.
+    ASSERT_EQ(storage.TakeCommands().size(), 1u);
+    const auto held = BlockDeviceAndSubmit();
+    for (std::int64_t round = 0; round < Scheduler::kNoProgressAbortPlans + 8; ++round) {
+        const auto plan = PlanOnce();
+        ASSERT_TRUE(plan.aborts.empty()) << round;
+        ASSERT_TRUE(scheduler_->StorageProgressPending()) << round;
+    }
+    ExecutionEvent done;
+    done.With(cache::StorageDone{query.OperationId(), std::vector<std::uint8_t>(keys.size(), 0), true,
+                                 std::vector<std::uint8_t>(keys.size(), 0)});
+    scheduler_->Advance(std::move(done));
+    ASSERT_TRUE(scheduler_->StorageProgressPending()) << "an attached completed query still has a state owner";
+    query.reset();
+    ASSERT_FALSE(scheduler_->StoragePending());
+    ASSERT_FALSE(scheduler_->StorageProgressPending());
+    ExpectLoneNoProgressAbort();
+}
+
 // With KV events on, an L3 read registers Host entries for a prefix this
 // engine never published: the boundary tree reports their Host residency,
 // and the scheduler, holding no descriptor for them, publishes nothing until
@@ -3798,10 +4071,11 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -3817,10 +4091,11 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
                                                       /*awaits_result=*/true});
     ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
 
-    request.Apply(fsm::ExtendResultEvent{{}});  // an older intermediate chunk's empty result
+    // An older intermediate chunk's empty result.
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});
     EXPECT_TRUE(request.Is<fsm::PrefillAwaitingResult>()) << "an empty result must not end the wait";
 
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});  // the final chunk's token
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.LastToken(), 42);
 }
@@ -3837,10 +4112,11 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -3863,12 +4139,13 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
     ASSERT_EQ(request.ResultsInFlight(), 2);
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token, ahead of chunk 1's result
+    // The final chunk's token, ahead of chunk 1's result.
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 1) << "chunk 1's forward is still out against these pages";
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // chunk 1's empty result, late
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});  // chunk 1's empty result, late
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 0);
 }
@@ -3886,7 +4163,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, &snapshot_pool,
+        specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, &snapshot_pool,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
     SnapshotSlotAllocator slots{4};
@@ -3904,7 +4181,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     request.TrackScheduledForward();
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // the first chunk landed
+    request.Apply(fsm::ExtendResultEvent{{}, /*await_destination=*/false});  // the first chunk landed
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     const auto* retracted = request.GetIf<fsm::Retracted>();
@@ -3973,7 +4250,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, &snapshot_pool,
+        specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, &snapshot_pool,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
     SnapshotSlotAllocator slots{4};
@@ -3989,9 +4266,9 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7), /*await_destination=*/false});
     ASSERT_EQ(request.GeneratedTokens(), 1000);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -4036,10 +4313,10 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
-                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -4053,9 +4330,9 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*copy_in_blocks=*/{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, DecodeSlotIndex{}});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7), /*await_destination=*/false});
     ASSERT_EQ(request.GeneratedTokens(), 4097);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -4269,6 +4546,24 @@ protected:
         return rows;
     }
 };
+
+TEST_F(PrefillChunkYieldCapacitySuite, InflightCountsOnlyFinalResultsAwaitingTransferCompletion) {
+    SubmitBootstrapped("prompt", MakeTokens(14, 1000));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 0, 8}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "intermediate prefill is still computation";
+    EXPECT_EQ(scheduler_->PdTransferSize(), 1u) << "page pinning already starts during prefill";
+    SendForwardDone("prompt");
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"prompt", 8, 14}}));
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u) << "the final forward result has not landed";
+    SendForwardDone("prompt", {900});
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "ready before remote dispatch";
+    PlanOnce();
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 1u) << "transfer dispatched, still awaiting ACK";
+    SendPdSucceeded("prompt");
+    EXPECT_EQ(scheduler_->PrefillInflightSize(), 0u);
+}
 
 TEST_F(PrefillChunkYieldCapacitySuite, AFailedCarriedPromptEndsTheFillAndTheChunkThatGaveWayIsAdmittedFirst) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 32);
@@ -4827,10 +5122,11 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 0},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
@@ -5481,10 +5777,11 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
@@ -5518,7 +5815,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false,
-                                                   /*host_pool=*/nullptr, &snapshot_pool,
+                                                   /*host_pool=*/nullptr, /*disk_pool=*/nullptr, &snapshot_pool,
                                                    /*stream_device_cache_to_host=*/false,
                                                    /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
@@ -5604,7 +5901,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
                        .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(
-        specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, &snapshot_pool,
+        specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, &snapshot_pool,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{4};
     SnapshotSlotAllocator slots{4};
@@ -5628,7 +5925,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
 
     // The last chunk's ExtendResult lands while still PrefillDone.
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, /*await_destination=*/false});
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     EXPECT_TRUE(request.Is<fsm::Retracted>());
@@ -5708,10 +6005,11 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     ReqPoolAllocator req_pool{1};
     ReqPoolIndex held = req_pool.Allocate();  // exhaust the single slot
     ASSERT_EQ(req_pool.AvailableSlots(), 0);
@@ -5752,10 +6050,11 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false,
-                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,

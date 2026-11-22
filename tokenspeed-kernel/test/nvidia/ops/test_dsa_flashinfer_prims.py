@@ -118,9 +118,9 @@ def _check_fp8_output(actual, reference, bound):
 @pytest.mark.parametrize("with_lengths", [False, True])
 def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_lengths):
     torch.manual_seed(7984)
-    # Three requests also exercise a partially filled power-of-two plan.
-    rows = 3 * width if mode == "decode" else 8
-    shape = (3, width, heads, 576) if mode == "decode" else (rows, heads, 576)
+    # Five requests also exercise a partially filled power-of-two plan.
+    rows = 5 * width if mode == "decode" else 8
+    shape = (5, width, heads, 576) if mode == "decode" else (rows, heads, 576)
     q = (torch.randn(shape, device="cuda") * 0.5).to(torch.float8_e4m3fn)
     kv = (torch.randn(4096, 576, device="cuda") * 0.25).to(torch.float8_e4m3fn)
     slots = torch.stack(
@@ -130,8 +130,12 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
     slots[0].fill_(-1)
     slots[1, :64] = -1
     lengths = torch.full((rows,), 2048, device="cuda", dtype=torch.int32)
-    if rows > 2:
-        lengths[2] = 65
+    lengths[2] = 65
+    empty = [0]
+    if with_lengths:
+        # A KVP rank's row owning no key: length 0.
+        lengths[3] = 0
+        empty.append(3)
     lengths = lengths if with_lengths else None
     out = torch.empty((*shape[:-1], 512), device="cuda", dtype=torch.bfloat16)
 
@@ -154,13 +158,9 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
         assert output is out
         _check_fp8_output(output.reshape(rows, heads, 512), reference, bound)
         torch.testing.assert_close(lse.double(), ref_lse, rtol=1e-4, atol=2e-4)
-        torch.testing.assert_close(
-            output.reshape(rows, heads, 512)[0],
-            torch.zeros_like(output.reshape(rows, heads, 512)[0]),
-            rtol=0,
-            atol=0,
-        )
-        assert torch.isneginf(lse[0]).all()
+        for row in empty:
+            assert not output.reshape(rows, heads, 512)[row].any()
+            assert torch.isneginf(lse.reshape(rows, heads)[row]).all()
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -174,7 +174,7 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
     q.copy_((torch.randn(shape, device="cuda") * 0.5).to(q.dtype))
     kv.copy_((torch.randn(kv.shape, device="cuda") * 0.25).to(kv.dtype))
     slots[1, 64:128] = -1
-    if lengths is not None and rows > 2:
+    if lengths is not None:
         lengths[2] = 127
     graph.replay()
     torch.cuda.synchronize()

@@ -24,7 +24,8 @@
 
 Each category is one library, ``_intrinsics/_<category>.ll``: ``arith``
 holds floating-point arithmetic controls, ``isched`` instruction scheduling
-hints, ``sync`` memory synchronization and ``wave`` wave-level operations.
+hints, ``sync`` memory synchronization, ``wave`` wave-level operations and
+``shared`` explicitly masked shared-memory (LDS) accesses.
 Kernels calling any function here launch
 with :func:`extern_compile_options`. For a plain scheduling barrier use
 ``gl.amd.hint.sched_barrier()``.
@@ -39,7 +40,7 @@ _INTRINSICS_DIRECTORY = Path(__file__).with_name("_intrinsics")
 # Library name -> LLVM IR file of one category.
 _LIBRARIES = {
     f"tokenspeed_{category}": str(_INTRINSICS_DIRECTORY / f"_{category}.ll")
-    for category in ("arith", "isched", "sync", "wave")
+    for category in ("arith", "isched", "sync", "wave", "shared")
 }
 
 
@@ -80,6 +81,21 @@ def arithmetic_fence(value, _semantic):
     return _call(
         "arith",
         "fence_f32",
+        [value],
+        (tl.float32,),
+        tl.float32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def hw_rcp(value, _semantic):
+    """``v_rcp_f32`` of FP32 ``value`` (``llvm.amdgcn.rcp``): the approximate
+    reciprocal. Launch with :func:`extern_compile_options`."""
+    return _call(
+        "arith",
+        "rcp_f32",
         [value],
         (tl.float32,),
         tl.float32,
@@ -153,6 +169,41 @@ def sched_group(mask, size, _semantic):
 
 
 # Memory synchronization (_sync.ll).
+
+
+@tl.core.extern
+def stop_on_fault(_semantic):
+    """Stop the launch with a memory fault: a volatile store to the null page.
+
+    For a wait that missed its deadline, so every rank stops instead of
+    hanging. Unlike a trap, the code after it stays reachable in the IR.
+    Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "sync", "stop_on_fault", [], (), tl.int32, is_pure=False, _semantic=_semantic
+    )
+
+
+@tl.core.extern
+def realtime_clock(_semantic):
+    """Read the constant 100 MHz device clock (``s_memrealtime``), as int64.
+
+    The read keeps its order with this wave's memory accesses. Launch with
+    :func:`extern_compile_options`.
+    """
+    return _call(
+        "sync", "realtime_clock", [], (), tl.int64, is_pure=False, _semantic=_semantic
+    )
+
+
+@tl.core.extern
+def sleep_one(_semantic):
+    """Pause this wave for one hardware sleep unit (``s_sleep 1``), between
+    the polls of a wait. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "sync", "sleep_one", [], (), tl.int32, is_pure=False, _semantic=_semantic
+    )
 
 
 def _wait(function, _semantic):
@@ -298,6 +349,77 @@ def wave_all_equal(a, b, _semantic):
         "all_equal_f32",
         [a, b],
         (tl.float32, tl.float32),
+        tl.int32,
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+# Masked shared-memory (LDS) accesses (_shared.ll). ``address`` is the byte
+# address of a shared-memory allocation in the LDS address space and
+# ``index`` an element index into it. Only lanes whose ``live`` is nonzero
+# access memory. None of these adds a workgroup barrier: the caller orders
+# them against other waves.
+
+
+@tl.core.extern
+def shared_load_i32_masked(address, index, live, _semantic):
+    """Load a 32-bit LDS element in live lanes; other lanes get 0. Launch
+    with :func:`extern_compile_options`.
+    """
+    return _call(
+        "shared",
+        "load_i32_masked",
+        [address, index, live],
+        (tl.int32, tl.int32, tl.int32),
+        tl.int32,
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def shared_store_i32_masked(address, index, value, live, _semantic):
+    """Store a 32-bit LDS element in live lanes. Launch with
+    :func:`extern_compile_options`.
+    """
+    return _call(
+        "shared",
+        "store_i32_masked",
+        [address, index, value, live],
+        (tl.int32, tl.int32, tl.int32, tl.int32),
+        tl.int32,
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def shared_load_i64_masked(address, index, live, _semantic):
+    """Load a 64-bit LDS element in live lanes; other lanes get 0. Launch
+    with :func:`extern_compile_options`.
+    """
+    return _call(
+        "shared",
+        "load_i64_masked",
+        [address, index, live],
+        (tl.int32, tl.int32, tl.int32),
+        tl.int64,
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def shared_store_i64_masked(address, index, value, live, _semantic):
+    """Store a 64-bit LDS element in live lanes. Launch with
+    :func:`extern_compile_options`.
+    """
+    return _call(
+        "shared",
+        "store_i64_masked",
+        [address, index, value, live],
+        (tl.int32, tl.int32, tl.int64, tl.int32),
         tl.int32,
         is_pure=False,
         _semantic=_semantic,

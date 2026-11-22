@@ -24,6 +24,9 @@ from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
 
 # Pure Python, no runtime dependencies: the knobs of an L2-only executor.
 from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
+    TorchMemorySaverAdapter,
+)
 
 NO_POOL = RetractionPoolRequest(
     host_gb=0.0, ratio=0.0, max_retracted_requests=0, tail_lcm_blocks_per_request=0
@@ -65,7 +68,9 @@ def _replicated_contract(layout, *, num_lcm_blocks=None):
 def _synthetic_arena(layout):
     contract = _replicated_contract(layout)
     return SimpleNamespace(
-        cache_group_specs=contract.group_specs, runtime_contract=contract
+        cache_group_specs=contract.group_specs,
+        runtime_contract=contract,
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
 
 
@@ -226,6 +231,7 @@ class TestGroupAwareWireTest:
         executor = executor_module.HostCacheExecutor.__new__(
             executor_module.HostCacheExecutor
         )
+        executor._cache_observations = executor_module.CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
         executor._ready_load_acks = []
@@ -233,6 +239,7 @@ class TestGroupAwareWireTest:
         executor._load_poisoned = False
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
+        executor._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(
             buffers=(SimpleNamespace(device=device),),
@@ -432,6 +439,7 @@ class TestGroupAwareWireTest:
         HostCacheExecutor = executor_module.HostCacheExecutor
         lanes_module = _lanes_module()
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = executor_module.CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor.attn_tp_rank = 0
@@ -446,7 +454,9 @@ class TestGroupAwareWireTest:
         # is the lane's, the executor only picks which lane an op rides.
         for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
             with patch.object(lanes_module, "HostTransferWorkspace", Mock):
-                lane = lanes_module.HostTransferLane()
+                lane = lanes_module.HostTransferLane(
+                    TorchMemorySaverAdapter.create(enable=False)
+                )
             lane.workspace.load_block_transfers.return_value = (1, (0, 1))
             lane.workspace.prepare_backend.return_value = SimpleNamespace(
                 uses_device_tables=True,
@@ -923,6 +933,9 @@ class TestGroupAwareWireTest:
         )
         draft_layout = SimpleNamespace(consumers=(("draft.0.k",),))
         target_pool = Mock()
+        target_pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False
+        )
         target_pool.cache_transfer_layout.return_value = target_layout
         target_pool.arena.runtime_contract = _replicated_contract(
             combined_layout, num_lcm_blocks=11
@@ -998,6 +1011,7 @@ class TestGroupAwareWireTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
 
         build_geometry.assert_called_once_with(
@@ -1024,6 +1038,7 @@ class TestGroupAwareWireTest:
         HostCacheExecutor = executor_module.HostCacheExecutor
 
         pool = Mock()
+        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pool.arena.runtime_contract = SimpleNamespace(
             group_specs=(
                 SimpleNamespace(
@@ -1115,6 +1130,7 @@ class TestGroupAwareWireTest:
                         kvp_rank=0,
                         nprocs_per_node=1,
                         world_cpu_group=None,
+                        block_alignment=1,
                     )
                     assert (executor._transfer_geometry.device_rows) is None
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1383,6 +1399,7 @@ class TestHostMemoryShareTest:
             payload_bytes=16,
         )
         pool = Mock()
+        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pool.cache_transfer_layout.return_value = SimpleNamespace(
             num_lcm_blocks=device_lcm_blocks,
             buffers=(SimpleNamespace(device=SimpleNamespace(type="cuda")),),
@@ -1455,6 +1472,7 @@ class TestHostMemoryShareTest:
                 kvp_rank=0,
                 nprocs_per_node=nprocs_per_node,
                 world_cpu_group=world_cpu_group,
+                block_alignment=1,
             )
         return executor, logger
 
@@ -1846,8 +1864,10 @@ class TestCompactHostParentTest:
 
         def empty(*args, **kwargs):
             # Pinned Host buffers need a GPU; plain CPU tensors stand in.
-            if kwargs.get("pin_memory", False):
-                kwargs["pin_memory"] = False
+            if kwargs.pop("pin_memory", False):
+                tensor = allocate(*args, **kwargs)
+                tensor.is_pinned = lambda: True
+                return tensor
             return allocate(*args, **kwargs)
 
         monkeypatch.setattr(torch, "empty", empty)
@@ -1901,7 +1921,11 @@ class TestCompactHostParentTest:
         )
         pool = _SyntheticPool(
             layout,
-            SimpleNamespace(cache_group_specs=specs, runtime_contract=contract),
+            SimpleNamespace(
+                cache_group_specs=specs,
+                runtime_contract=contract,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+            ),
         )
         tracker = Mock()
         tracker.event_sets = [object()]
@@ -1943,6 +1967,7 @@ class TestCompactHostParentTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
 
         parent = 9 * 3_407_872
@@ -1983,6 +2008,9 @@ class TestL3FlatKvExecutorTest:
         try:
             from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+            from tokenspeed.runtime.cache.transfer.observations import (
+                CompletedObservations,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"needs runtime dependencies: {exc}")
 
@@ -1990,6 +2018,7 @@ class TestL3FlatKvExecutorTest:
         # layer fence and still acknowledges the op (the hooks' replica
         # intersection waits for the owners).
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = CompletedObservations(0)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor._load_poisoned = False
@@ -2054,6 +2083,7 @@ class TestCompactLayoutRoundTripTest:
                 kvp_rank=kvp_rank,
                 nprocs_per_node=1,
                 world_cpu_group=None,
+                block_alignment=1,
             )
         self.executor_cleanup.callback(executor.shutdown)
         return executor, pool, draft_pool
@@ -2309,7 +2339,9 @@ class TestCompactLayoutRoundTripTest:
             token_capacity=4,
         )
         arena = SimpleNamespace(
-            cache_group_specs=contract.group_specs, runtime_contract=contract
+            cache_group_specs=contract.group_specs,
+            runtime_contract=contract,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
         )
 
         class WriteBackOp:

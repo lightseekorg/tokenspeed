@@ -412,10 +412,59 @@ bool CacheEvictor::EvictHostCachedBlock(std::uint32_t group_id, CacheBlockLocati
     return true;
 }
 
+bool CacheEvictor::EvictDiskCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
+                                        DiskEvictionCounts DiskEvictionStats::*reason) {
+    const BlockPool& pool = store_.TierPool<CacheTier::kDisk>();
+    const auto evict_entry = [&](std::uint32_t entry_group, CacheBlockLocation entry_location) {
+        std::optional<CacheKey> removed = store_.Groups()[entry_group].Index().Evict(pool, entry_location);
+        if (!removed) {
+            return removed;
+        }
+        DiskEvictionCounts& evicted = disk_evictions_.*reason;
+        ++evicted.blocks;
+        // Contains takes no reference, so it pins nothing on the Host tier.
+        if (store_.Groups()[entry_group].Index().Contains(*store_.HostPool(), *removed)) {
+            ++evicted.host_resident;
+        }
+        return removed;
+    };
+    const std::optional<CacheKey> removed = evict_entry(group_id, location);
+    if (!removed) {
+        return false;
+    }
+    if (store_.GroupIsState(group_id)) {
+        // A checkpoint resumes only with every State group's block at its hash.
+        store_.ForEachBoundaryKey(*removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+            if (!store_.GroupIsState(i)) {
+                return;
+            }
+            if (const std::optional<CacheBlockLocation> sibling = store_.LocationOf(pool, i, key)) {
+                evict_entry(store_.Groups()[i].Id(), *sibling);
+            }
+        });
+    }
+    return true;
+}
+
+void CacheEvictor::FlushDiskEntry(std::uint32_t group_id, CacheBlockLocation location) {
+    _assert(store_.Groups()[group_id].Index().Evict(store_.TierPool<CacheTier::kDisk>(), location).has_value(),
+            "clearable Disk cache entry disappeared");
+    ++disk_evictions_.flush.blocks;
+}
+
 void CacheEvictor::FlushHostEntry(std::uint32_t group_id, CacheBlockLocation location) {
     _assert(store_.Groups()[group_id].Index().Evict(*store_.HostPool(), location).has_value(),
             "clearable Host cache entry disappeared");
     ++host_evictions_.flush.blocks;
+}
+
+void CacheEvictor::InvalidateHostEntries() {
+    const BlockPool* pool = store_.HostPool();
+    if (pool == nullptr) return;
+    for (auto& group : store_.Groups()) {
+        host_evictions_.flush.blocks += group.Index().NumEntries(*pool);
+        group.Index().Invalidate(*pool);
+    }
 }
 
 void CacheEvictor::RecordTail(const ContentHash& prior, const TailPublication& tail) {
@@ -439,6 +488,12 @@ void CacheEvictor::RecordTail(const ContentHash& prior, const TailPublication& t
         CacheKey{.content_hash = dropped->hash}, dropped->tail_tokens, [&](std::size_t i, const CacheKey& key) {
             if (const std::optional<CacheBlockLocation> location = store_.LocationOf(*store_.HostPool(), i, key)) {
                 EvictHostCachedBlock(store_.Groups()[i].Id(), *location, &HostEvictionStats::tail_cap);
+            }
+            if (store_.DiskPool() == nullptr) {
+                return;
+            }
+            if (const std::optional<CacheBlockLocation> location = store_.LocationOf(*store_.DiskPool(), i, key)) {
+                EvictDiskCachedBlock(store_.Groups()[i].Id(), *location, &DiskEvictionStats::tail_cap);
             }
         });
     // What stayed in use on either tier goes once released.

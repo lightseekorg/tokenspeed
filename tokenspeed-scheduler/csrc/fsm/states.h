@@ -32,8 +32,8 @@
 namespace tokenspeed::fsm {
 
 using State = std::variant<Bootstrapping, Submitted, Prefetching, PeerLooking, Prefilling, RemotePrefilling,
-                           PeerLanding, PrefillAwaitingResult, PrefillDone, Decoding, PdTransferring, Retracted,
-                           Restoring, Finishing, Finished>;
+                           PeerLanding, PrefillAwaitingResult, PrefillAwaitingDestination, PrefillDone, Decoding,
+                           PdTransferring, Retracted, Restoring, Finishing, Finished>;
 
 inline State ToState(State state) {
     return state;
