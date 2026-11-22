@@ -352,15 +352,19 @@ def tune_hipblaslt_solutions(
         path: Output TunableOp results CSV. Defaults to the current GPU's
             device file, ``hipblaslt_tuned_file()``. An existing file must
             carry the running stack's stamp; its GEMMs are kept and not
-            re-timed, and the new ones are added. Delete it to re-tune all.
-            GEMMs the GPU's committed architecture file lists (when its
-            stamp matches) are neither re-timed nor written, also for a
-            scratch ``path``; they are logged.
+            re-timed, and the new ones are added. Deleting it re-tunes that
+            file's GEMMs only. Unless ``path`` is the architecture file
+            itself, GEMMs the GPU's committed architecture file lists (when
+            its stamp matches) are neither re-timed nor written, also for a
+            scratch ``path``; they are logged. Re-tuning the architecture
+            file's rows means regenerating that file as ``path``.
         cold_bytes: Rotating buffer size in bytes.
 
     Returns:
         Number of tuned GEMMs written to ``path``: those already in it and
-        the new ones, without the architecture file's.
+        the new ones. For any ``path`` but the architecture file this leaves
+        out the architecture file's GEMMs; regenerating the architecture
+        file keeps and counts its existing rows.
 
     Raises:
         ValueError: ``path`` exists and was made for another stack, ``path``

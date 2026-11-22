@@ -257,7 +257,10 @@ python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
     --rows 64,128,192,256,384,512
 ```
 
-Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
+Without `--out`, the tool writes this GPU's device file in
+`_hipblaslt/configs/`, except on a GPU whose driver reports a generic device
+name (`GENERIC_DEVICE_NAMES`): a file named after it would load on every model
+reporting that name, so the tool refuses and `--out` must be passed. If
 the file exists with the running stack's stamp, its GEMMs are kept and only
 new ones are timed, so one file can cover several models; on another stack
 the tool stops, and the file must be deleted to re-tune. Tuning rotates
