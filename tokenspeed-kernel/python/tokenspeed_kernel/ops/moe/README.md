@@ -325,7 +325,7 @@ whose routing already has both edits is used as is, so this module is no
 longer built once the minimum supported FlashInfer includes #5557; remove the
 adapter then.
 
-### Qwen3.8 low-batch tactic
+### Qwen3.8 decode tactic
 
 For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with
 TP4/EP4 and top-k 10, the private runner restricts inputs of at most 32 tokens
@@ -352,6 +352,12 @@ independent winners.
 This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
 When upstream tuning handles the full decode graph, remove it.
 
+The policy targets CUDA-graph latency across routing, shared experts, and MoE
+GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
+selected tile 8, leaving an idle interval before routing. This policy keeps
+tile 32 available for that shape while retaining upstream routing and GEMM
+implementations.
+
 With TP1 (all 512 experts local), the policy covers the 64- to 512-token
 buckets instead (33 to 512 rows: 9 to 128 requests with four MTP rows each).
 FlashInfer tunes on balanced routes, about 2.5 to 10 tokens per expert there,
@@ -371,12 +377,6 @@ tuner's pick vs the tile-32 pick it makes under this policy, us per MoE call:
 At 8 to 32 rows the tuner's tile-8 and tile-16 picks are as fast or faster
 (tile 32: +4% at 8 rows), and at 1024 rows the tuner already picks tile 32, so
 other buckets keep the full tuner.
-
-The policy targets CUDA-graph latency across routing, shared experts, and MoE
-GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
-selected tile 8, leaving an idle interval before routing. This policy keeps
-tile 32 available for that shape while retaining upstream routing and GEMM
-implementations.
 
 ### Kimi-K3 decode tactic
 
