@@ -99,6 +99,10 @@ def _prepare_causal_conv1d_prefill(
             for t, width in zip(outputs, widths, strict=True)
         ):
             raise ValueError("q, k and v outputs must be contiguous token rows")
+        if any(width % (config.block_n // config.threads) for width in widths):
+            raise ValueError(
+                "q, k and v widths must be multiples of the channels per thread"
+            )
     if weight.shape != (channels, 4):
         raise ValueError("convolution requires four taps per channel")
     if state.ndim != 3 or state.shape[1] != channels or state.shape[2] < 3:
@@ -411,6 +415,8 @@ if _AVAILABLE:
                 f"q/k/v widths {key_dim}, {key_dim}, {value_dim} must be positive "
                 f"multiples of {PREFILL_QKV_CHANNEL_MULTIPLE}"
             )
+        if pad_slot_id != -1:
+            raise ValueError("CuTe convolution requires padding slot -1")
         if activation not in (None, False, True, "silu", "swish"):
             raise ValueError("convolution activation must be SiLU or disabled")
         q = x.new_empty((tokens, key_dim))

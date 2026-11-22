@@ -217,3 +217,48 @@ def test_cute_qkv_conv_compiles_once_across_prefill_shapes():
     with assert_no_cute_compile():
         for lengths in ([1], [16], [17], [1, 1], [33, 15], [64] * 3, [5, 1, 300]):
             run(lengths)
+
+
+@_cute
+def test_cute_qkv_conv_rejects_a_padding_slot_other_than_minus_one():
+    x, weight, boundaries, metadata, slots, states, key_dim = _inputs(
+        [16], 2, 4, row_pad=0
+    )
+    with pytest.raises(ValueError, match="padding slot -1"):
+        conv_cute_dsl.cute_dsl_causal_conv1d_prefill_qkv(
+            x,
+            weight,
+            None,
+            states,
+            boundaries,
+            slots,
+            torch.ones(1, dtype=torch.bool, device="cuda"),
+            "silu",
+            -2,
+            prefill_metadata=metadata,
+            key_dim=key_dim,
+        )
+
+
+@_cute
+def test_cute_qkv_launch_rejects_widths_off_the_thread_vector():
+    """A q/k boundary inside one thread's channels would store k values as q."""
+    x, weight, boundaries, metadata, slots, states, _ = _inputs([16], 2, 4, row_pad=0)
+    tokens, key_dim = x.shape[1], 130
+    q, k, v = (x.new_empty((tokens, width)) for width in (key_dim, key_dim, 1024 - 260))
+    with pytest.raises(ValueError, match="channels per thread"):
+        conv_cute_dsl.launch_causal_conv1d_prefill(
+            x,
+            weight,
+            None,
+            states,
+            slots,
+            torch.ones(1, dtype=torch.bool, device="cuda"),
+            boundaries,
+            q,
+            metadata=metadata,
+            config=conv_cute_dsl._PARALLEL,
+            silu=True,
+            enable_pdl=False,
+            split_out=(k, v),
+        )
