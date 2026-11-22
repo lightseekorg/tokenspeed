@@ -614,11 +614,13 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     output, sentinel = module_(
         hidden,
         router_input,
+        None,
         hidden.shape[0],
         hidden.shape[0],
         None,
         project=True,
         payload="bf16",
+        decode_forward=False,
     )
     assert sentinel is None
 
@@ -1368,10 +1370,10 @@ def test_packed_qkv_gate_loader_replicates_kv_heads_across_ranks() -> None:
 def test_qkv_fp8_projection_takes_its_row_window_and_the_producer_copy(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--dense-fp8-small-m qkv runs the QKV projection in FP8 only inside
+    """--dense-fp8-small-m qkv-down runs the QKV projection in FP8 only inside
     its row window and in decode forwards, and a producer's FP8 copy gives the
     bits the layer's own quantization gives."""
-    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
     with torch.device("cuda"):
         # A TP4 rank's shape: Q 2048 + gate 2048 + K 256 + V 256 of 8192.
         layer = QKVOGateParallelLinear(
@@ -1420,7 +1422,7 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
     """With --dense-fp8-small-m, a decode forward's attention gets the FP8
     projection's q/k/v and an extend forward the BF16 projection's: an extend
     forward launches no FP8 GEMM, whatever its row count."""
-    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
     heads, kv_heads, head_dim, rows = 32, 4, 64, 48
     attention = _stub(MuseSparkAttention)
     attention.hidden_size, attention.head_dim = 8192, head_dim
@@ -1489,13 +1491,13 @@ def test_dense_fp8_refuses_a_projection_without_a_tuned_gemm_at_load() -> None:
     for (the TP8 pre-expert slice) fails at load, naming it, instead of
     running another FP8 kernel while serving."""
     fp8 = module._DenseFp8Weight(
-        "qkv_proj",
+        "pre_expert_proj",
         True,
-        module._DENSE_FP8_QKV_MIN_ROWS,
-        module._DENSE_FP8_MAX_ROWS,
+        module._DENSE_FP8_MIN_ROWS,
+        module._GATHER_MXFP4_FP8_MAX_ROWS,
     )
-    with pytest.raises(ValueError, match=r"qkv_proj projection \[2304, 8192\]"):
-        fp8.prepare(torch.zeros(2304, 8192, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match=r"pre_expert_proj projection \[512, 8192\]"):
+        fp8.prepare(torch.zeros(512, 8192, device="cuda", dtype=torch.bfloat16))
 
 
 def _loaded(model: MuseSparkForConditionalGeneration):
@@ -1517,14 +1519,16 @@ def _loaded(model: MuseSparkForConditionalGeneration):
 
 
 @requires_gpu
-@pytest.mark.parametrize("value", ["none", "qkv"])
+@pytest.mark.parametrize("value", ["none", "qkv", "qkv-down"])
 def test_post_quant_warmup_converts_or_refuses_by_the_flag(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
-    """At the default, loading a real model makes no FP8 copy. With the flag
-    on, loading converts the QKV weight and checks that a small-M FP8 GEMM
-    serves it: this model's [hidden 256] QKV has none, so loading refuses it
-    by name rather than serving another kernel."""
+    """At the default, loading a real model makes no FP8 copy. With qkv,
+    loading checks that a weight-streaming FP8 GEMM serves the QKV weight:
+    this model's [hidden 256] QKV has none, so loading refuses it by name
+    rather than serving another kernel. qkv-down on one rank is refused when
+    the model is built: its pre-expert copy's reader (the fused gather) needs
+    TP > 1."""
     if value != "none" and not current_platform().is_cdna4:
         pytest.skip("the skinny FP8 GEMM is gfx950-only")
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", value)
@@ -1535,11 +1539,16 @@ def test_post_quant_warmup_converts_or_refuses_by_the_flag(
         ("speculative_algorithm", None),
     ):
         monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    if value == "qkv-down":
+        with pytest.raises(ValueError, match="has no fused gather"):
+            _tiny_model()
+        return
     model = _loaded(_tiny_model())
     if value == "none":
         model.post_quant_warmup()
         for layer in model.model.layers:
             assert layer.self_attn.qkv_proj.dense_fp8.weight is None
+            assert layer.mlp.pre_expert_proj.dense_fp8.weight is None
         return
     with pytest.raises(
         ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
@@ -1554,9 +1563,10 @@ def test_post_quant_warmup_converts_or_refuses_by_the_flag(
 def test_dense_fp8_boundary_warmup_runs_on_a_real_model(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The warm-up compiles the MLP boundary's FP8-copy kernel from a real
-    model's norms (one binary, which every row count then uses) and skips a
-    model without layers."""
+    """The warm-up compiles both boundaries' FP8-copy kernels from a real
+    model's norms (the post-attention norm is weightless): two binaries, one
+    per variant, which every row count then uses; it skips a model without
+    layers."""
     from tokenspeed_kernel.ops.residual._triton import gated_boundary_fp8
 
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
@@ -1573,12 +1583,12 @@ def test_dense_fp8_boundary_warmup_runs_on_a_real_model(
             norm.weight.data.fill_(0.5)
     kernel = gated_boundary_fp8._post_norm_residual_pre_norm_fp8_kernel
     kernel.device_caches.clear()
-    model._warm_dense_fp8_boundaries()
+    model._warm_dense_fp8_boundaries(qkv=True, pre_expert=True)
     # The JIT's per-device cache holds the compiled binaries (no public accessor).
-    assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 1
+    assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 2
     model.model.layers = torch.nn.ModuleList()
     kernel.device_caches.clear()
-    model._warm_dense_fp8_boundaries()
+    model._warm_dense_fp8_boundaries(qkv=True, pre_expert=True)
     assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 0
 
 
@@ -1608,14 +1618,19 @@ def test_layer_boundaries_write_an_fp8_copy_only_where_it_is_read(
     bf16_default_dtype, rows, decode_forward, owned_rows, mailbox
 ) -> None:
     """The MLP boundary writes the next QKV's FP8 copy for a decode forward's
-    rows in the QKV window, not for owned rows or a mailbox branch."""
+    rows in the QKV window, not for owned rows or a mailbox branch. The
+    attention boundary writes none where the pre-expert projection has no
+    reader for it (TP1: no fused gather), even with an enabled copy."""
     layer = _tiny_model().model.layers[0]
     layer.self_attn.qkv_proj.dense_fp8 = _enabled_copy("qkv_proj")
+    layer.mlp.pre_expert_proj.dense_fp8 = _enabled_copy("pre_expert_proj")
     in_window = decode_forward and 33 <= rows <= 128
     kwargs = dict(decode_forward=decode_forward, owned_rows=owned_rows, mailbox=mailbox)
     assert layer.mlp_boundary_writes_fp8(rows, **kwargs) == (
         in_window and not owned_rows and not mailbox
     )
+    assert not layer.mlp.reads_fp8_input()
+    assert not layer.attention_boundary_writes_fp8(rows, **kwargs)
 
 
 def test_weight_update_is_refused_with_dense_fp8_copies(
@@ -2058,6 +2073,7 @@ def _shard_linear(
     linear.workspace = None
     linear.multicast = None
     linear.gather_column_view = False
+    linear.dense_fp8 = module._DenseFp8Weight("pre_expert_proj", False, 0, 0)
     return linear
 
 
@@ -2223,7 +2239,9 @@ def _gathered_mxfp4_workspace_worker(
             for tokens in (64, 65, 84, 85, fused_max, fused_max + 1):
                 x = torch.ones(tokens, 256, device=device)
                 x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
-                rows, packed = linear.forward_mxfp4(x, norm_weight, 1e-6, 1.0)
+                rows, packed = linear.forward_mxfp4(
+                    x, None, norm_weight, 1e-6, 1.0, decode_forward=False
+                )
                 assert rows.shape == (tokens, 4096)
                 expected_rows = x[:, :world_size].repeat_interleave(
                     4096 // world_size, dim=1
@@ -2250,8 +2268,56 @@ def _gathered_mxfp4_workspace_worker(
                 if not fused:
                     torch.testing.assert_close(rows, expected_rows, atol=0, rtol=0)
                 torch.cuda.synchronize()
+            if world_size == 4:
+                _check_gathered_fp8_projection(state, rank, world_size, device)
+            torch.cuda.synchronize()
     finally:
         dist.destroy_process_group()
+
+
+def _check_gathered_fp8_projection(state, rank, world_size, device) -> None:
+    """With an FP8 copy of its columns (a configured [1024, 8192] slice at TP4), a
+    gathered projection's decode forward projects in FP8 and any other forward
+    keeps the BF16 bits; a decode forward reads the producer's FP8 copy
+    instead of quantizing the rows again."""
+    with torch.device(device):
+        linear = _shard_linear(4096, 8192, tp_rank=rank, tp_size=world_size)
+    generator = torch.Generator(device=device).manual_seed(5)
+    linear.weight.data.copy_(
+        torch.randn(linear.weight.shape, device=device, generator=generator) * 0.02
+    )
+    linear.workspace = torch.zeros(module._GATHER_MXFP4_MAX_ROWS, 4096, device=device)
+    linear.iris_state = state
+    norm_weight = torch.ones(4096, device=device)
+    x = torch.randn(64, 8192, device=device, generator=generator).bfloat16()
+    _, bf16 = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, decode_forward=True)
+    bf16 = (bf16[0].clone(), bf16[1].clone())
+    linear.dense_fp8 = module._DenseFp8Weight(
+        "pre_expert_proj",
+        True,
+        module._DENSE_FP8_MIN_ROWS,
+        module._GATHER_MXFP4_FP8_MAX_ROWS,
+    )
+    linear.prepare_fp8_weight()
+    for decode_forward in (False, True):
+        _, packed = linear.forward_mxfp4(
+            x, None, norm_weight, 1e-6, 1.0, decode_forward=decode_forward
+        )
+        assert torch.equal(packed[0], bf16[0]) != decode_forward
+    _, own = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, decode_forward=True)
+    own = (own[0].clone(), own[1].clone())
+    given_rows = module._quantize_rows_fp8(x)
+    _, given = linear.forward_mxfp4(
+        x, given_rows, norm_weight, 1e-6, 1.0, decode_forward=True
+    )
+    assert torch.equal(given[0], own[0]) and torch.equal(given[1], own[1])
+    # The norm after the projection hides a row scale, so swap rows.
+    swapped_rows = module._quantize_rows_fp8(x.flip(0))
+    _, swapped = linear.forward_mxfp4(
+        x, swapped_rows, norm_weight, 1e-6, 1.0, decode_forward=True
+    )
+    assert not torch.equal(swapped[0], own[0])
+    torch.cuda.synchronize()
 
 
 @requires_gpu
@@ -2349,6 +2415,7 @@ def test_gathered_projection_stores_its_block_into_a_rank_major_mailbox(
             layer_count=2,
             replicate_for_owned_rows=True,
             workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
+            fp8_small_m=False,
         )
     assert bound["rank_major"] is True
     with torch.no_grad():
@@ -2713,6 +2780,50 @@ def test_a_decoder_layer_forward_runs_its_boundaries(
     assert stream.shape == (rows, hidden) and next_input.shape == (rows, hidden)
     assert torch.isfinite(stream).all() and torch.isfinite(next_input.float()).all()
     assert next_input_fp8 is None
+
+
+@requires_gpu
+def test_dense_fp8_qkv_down_refuses_a_model_without_its_reader(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-expert FP8 copy's only reader is the Iris fused gather with
+    MXFP4 experts. On one rank (built while the flag is off, so the TP1
+    refusal does not fire first), preparing the copies for qkv-down refuses
+    the model, and so does preparing its communication runtime: no Iris
+    collectives there."""
+    model = _loaded(_tiny_model())
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
+    with pytest.raises(ValueError, match="no layer has the fused gather"):
+        model._prepare_pre_expert_fp8()
+    with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        model.prepare_communication_runtime(256)
+    for layer in model.model.layers:
+        assert layer.mlp.pre_expert_proj.dense_fp8.weight is None
+
+
+@requires_gpu
+def test_dense_fp8_monokernel_refusal_takes_the_lowest_enabled_start(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 20-row monokernel limit is below qkv's window (from 33 rows) but
+    inside qkv-down's pre-expert window (from 17): qkv-down is refused there,
+    before any FP8 copy. The model is built with the flag off so the
+    one-rank build refusal does not fire first."""
+    for key, setting in (
+        ("chunked_prefill_size", 8192),
+        ("max_cudagraph_capture_size", 64),
+        ("max_num_seqs", 64),
+        ("speculative_algorithm", None),
+    ):
+        monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    monkeypatch.setattr(module, "MONOKERNEL_MAX_ROWS", 20)
+    model = _loaded(_tiny_model())
+    model.model.config.decode_monokernel = True
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
+    with pytest.raises(ValueError, match="which start at 17 rows"):
+        model.post_quant_warmup()
+    for layer in model.model.layers:
+        assert layer.self_attn.qkv_proj.dense_fp8.weight is None
 
 
 if __name__ == "__main__":

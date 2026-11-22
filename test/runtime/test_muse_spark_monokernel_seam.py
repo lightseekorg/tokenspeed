@@ -445,7 +445,19 @@ def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
     """The launches run every dense projection in BF16, so they must never
     take the rows that the regular layer projects in FP8: every decode or
     verify step that takes the kernels (at most 2 requests of at most 8
-    rows) is below the FP8 window, which starts at 33 rows."""
+    rows) is below every FP8 window: QKV's from 33 rows and the pre-expert
+    projection's from 17, the lowest start the load-time refusal compares
+    against."""
+    pre_expert = muse_spark._DenseFp8Weight(
+        "pre_expert_proj",
+        True,
+        muse_spark._DENSE_FP8_MIN_ROWS,
+        muse_spark._GATHER_MXFP4_FP8_MAX_ROWS,
+    )
+    pre_expert.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
+    assert muse_spark.MONOKERNEL_MAX_ROWS < min(
+        muse_spark._DENSE_FP8_FIRST_ROWS.values()
+    )
     fp8 = _fp8_projection(True)
     assert fp8.applies(33, decode_forward=True) and not fp8.applies(
         32, decode_forward=True
@@ -454,7 +466,11 @@ def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
         for rows in range(bs, 300, bs):
             ctx = _ctx(ForwardMode.DECODE, bs, rows)
             assert not (
-                takes_monokernels(rows, ctx) and fp8.applies(rows, decode_forward=True)
+                takes_monokernels(rows, ctx)
+                and (
+                    fp8.applies(rows, decode_forward=True)
+                    or pre_expert.applies(rows, decode_forward=True)
+                )
             ), (bs, rows)
 
 

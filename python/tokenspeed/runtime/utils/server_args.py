@@ -879,7 +879,8 @@ class ServerArgs:
     owned_attention_output: str = "reduce-scatter"
     # Muse Spark small-M dense GEMMs in FP8 on gfx950 (a numerics change):
     # "qkv" projects decode and verify forwards' QKV (+ output gate) rows at
-    # 33-128 rows through FP8
+    # 33-128 rows, and "qkv-down" also this rank's pre-expert latent
+    # columns at 17-128 rows, through FP8
     # E4M3 weights (per-channel scales, converted after loading) and per-row
     # FP8 activations, with the skinny FP8 GEMM. "none" keeps BF16.
     dense_fp8_small_m: str = "none"
@@ -2466,7 +2467,7 @@ class ServerArgs:
         _require_choice(
             "--dense-fp8-small-m",
             self.dense_fp8_small_m,
-            ("none", "qkv"),
+            ("none", "qkv", "qkv-down"),
         )
         if self.dense_fp8_small_m != "none" and (
             self.numerics in BITWISE_ENVELOPES or self.batch_invariant_collectives
@@ -5557,12 +5558,14 @@ class ServerArgs:
             "--dense-fp8-small-m",
             type=str,
             default=ServerArgs.dense_fp8_small_m,
-            choices=["none", "qkv"],
+            choices=["none", "qkv", "qkv-down"],
             help="Muse Spark on gfx950: run decode forwards' QKV projection "
-            "(qkv) at 33-128 rows as an FP8 GEMM (per-row FP8 activations x "
-            "per-channel FP8 weights). Startup refuses a configuration it "
-            "cannot serve (TP8 shapes, other GPUs). The FP8 weight copies' "
-            "memory is logged at startup. A numerics change, not batch-invariant (refused under bitwise --numerics and "
+            "at 33-128 rows (qkv), and also the pre-expert latent projection "
+            "at 17-128 rows (qkv-down), as FP8 GEMMs (per-row FP8 activations x "
+            "per-channel FP8 weights). The pre-expert FP8 projection needs "
+            "TP > 1 without attention DP (its fused gather); startup refuses "
+            "a configuration it cannot serve (TP8 shapes, other GPUs). The FP8 "
+            "weight copies' memory is logged at startup. A numerics change, not batch-invariant (refused under bitwise --numerics and "
             "--batch-invariant-collectives); none keeps BF16.",
         )
         parser.add_argument(
