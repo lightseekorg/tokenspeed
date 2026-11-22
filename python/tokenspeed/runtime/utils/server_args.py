@@ -2979,6 +2979,16 @@ class ServerArgs:
                 raise ValueError(
                     "Weight discard currently requires running without EPLB"
                 )
+            if self.dense_fp8_small_m != "none":
+                # The FP8 weight copies are made once, after loading, and a
+                # weight update refuses to start with them; discarding them
+                # would leave nothing that rebuilds them.
+                raise ValueError(
+                    f"--dense-fp8-small-m {self.dense_fp8_small_m} cannot run "
+                    "with --weight-memory-policy discard: its FP8 weight copies "
+                    "are made once after loading, and no weight update rebuilds "
+                    "them after a discard"
+                )
 
     def validate_model_update_options(self):
         """Require the Model Updater SDK flags together, or none of them.
@@ -3009,6 +3019,14 @@ class ServerArgs:
         if self.model_update_draft_weights not in ("retain", "refresh"):
             raise ValueError(
                 "--model-update-draft-weights must be 'retain' or 'refresh'"
+            )
+        if self.dense_fp8_small_m != "none":
+            # Every weight update refuses to start while the FP8 copies exist
+            # (MuseSparkForConditionalGeneration.begin_weight_update).
+            raise ValueError(
+                f"--dense-fp8-small-m {self.dense_fp8_small_m} cannot run with "
+                "--model-update-config: its FP8 weight copies are made once "
+                "after loading, and no weight update rebuilds them"
             )
 
     def validate_petit_moe_options(self):
