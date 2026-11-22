@@ -169,7 +169,10 @@ def _host_storage(monkeypatch) -> HostCacheStorage:
     def empty(*args, **kwargs):
         # Pinned allocation needs a CUDA device; the settings read only the
         # pool's address and geometry.
-        kwargs["pin_memory"] = False
+        if kwargs.pop("pin_memory", False):
+            tensor = allocate(*args, **kwargs)
+            tensor.is_pinned = lambda: True
+            return tensor
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
@@ -290,6 +293,7 @@ def _disk_scheduler():
             host_write_policy="write_back",
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
+            max_consecutive_prefill_rounds=0,
             cache_groups=[
                 ts.CacheGroupConfig(
                     group_id="full",

@@ -33,7 +33,10 @@
 // The crate is the FFI boundary to C++ and the interpreter.
 #![allow(unsafe_code)]
 
+pub mod cache_events;
 pub mod profile;
+
+pub use cache_events::{CacheEventObserver, CacheObservationLosses};
 
 use std::ptr::NonNull;
 
@@ -43,11 +46,57 @@ use crate::profile::record_scheduler_span;
 
 #[cxx::bridge(namespace = "ts_scheduler")]
 mod ffi {
+    /// Native scheduler observations, separate from scheduler feedback events.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CacheObservationKind {
+        /// A slot acquired a request admission owner.
+        SlotAssigned,
+        /// The owning request-slot handle released its row.
+        SlotReleased,
+        /// A request's image was scheduled for restoration.
+        RestoreScheduled,
+        /// A request's acquired Host prefix was scheduled for copying.
+        PrefixLoadScheduled,
+    }
+
+    /// Fixed-size metadata. Fields outside the selected kind are unused.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CacheObservation {
+        /// The owner transition or scheduled operation represented.
+        kind: CacheObservationKind,
+        /// Destination or owned request-pool row index.
+        slot: i32,
+        /// Allocation generation of the owned row.
+        slot_generation: u64,
+        /// The immutable admission identity allocated by the output processor.
+        admission_id: u64,
+        /// Prior owner of this row, zero before its first owner.
+        slot_previous_admission_id: u64,
+        /// Wire operation index, scoped by operation kind and wrap generation.
+        op_id: u32,
+        /// Generation across 32-bit operation-index wraparound.
+        op_generation: u64,
+        /// The request's row before its image was captured.
+        previous_slot: i32,
+        /// Allocation generation of that previous row.
+        previous_slot_generation: u64,
+        /// One-based restore sequence within the admission.
+        restore_sequence: u64,
+        /// Submitted prompt plus accepted generated tokens at the snapshot.
+        committed_tokens: i32,
+        /// Exclusive cache frontier at the same snapshot.
+        computed_tokens: i32,
+        /// Submitted prompt token count.
+        prompt_tokens: i32,
+    }
+
     /// A request to admit (`tokenspeed::RequestSpec`).
     #[derive(Debug, Clone, PartialEq)]
     struct RequestSpec {
         /// Request id.
         request_id: String,
+        /// The output processor's immutable identity for this admission.
+        admission_id: u64,
         /// Router-only cache retention identity, empty when untracked.
         session_id: String,
         /// Shared cache owner, empty to retain session ownership.
@@ -709,6 +758,13 @@ mod ffi {
         #[namespace = "tokenspeed"]
         type ExecutionPlan;
 
+        fn cache_event_protocol_version() -> u32;
+
+        fn install_cache_event_observer(
+            scheduler: Pin<&mut Scheduler>,
+            observer: Box<CacheEventObserver>,
+        ) -> Result<()>;
+
         fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]) -> Result<()>;
         fn next_execution_plan(
             scheduler: Pin<&mut Scheduler>,
@@ -819,20 +875,40 @@ mod ffi {
     }
 
     extern "Rust" {
+        type CacheEventObserver;
+        fn record_cache_observation(
+            observer: &CacheEventObserver,
+            value: CacheObservation,
+            request_id: &[u8],
+        );
         /// The C++ scheduler's finished spans, while the sink is installed.
         fn record_scheduler_span(name: &str, begin_ns: i64, end_ns: i64);
     }
 }
 
 pub use ffi::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    DiskDoneView, DiskOpKind, DiskOpView, DiskStatsView, ForwardBatchView, ForwardEvent,
-    ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView,
-    PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView, PeerStatsView, PeerTier,
-    PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheObservation,
+    CacheObservationKind, CacheOpKind, CacheOpView, DiskDoneView, DiskOpKind, DiskOpView,
+    DiskStatsView, ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind,
+    PeerAnswerView, PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView,
+    PeerPageView, PeerStatsView, PeerTier, PinSampleView, PrefillGateProbe, PrefixHitView,
+    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
+    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
+    TransferBatchView,
 };
+
+fn record_cache_observation(
+    observer: &CacheEventObserver,
+    value: CacheObservation,
+    request_id: &[u8],
+) {
+    observer.record(value, request_id);
+}
+
+/// Version implemented by the linked native ownership producer.
+pub fn cache_event_protocol_version() -> u32 {
+    ffi::cache_event_protocol_version()
+}
 
 /// What advances the scheduler at the head of a round: with L3 or the Disk
 /// tier, the agreed storage clock, the cancellations and the storage and
@@ -950,6 +1026,14 @@ impl Scheduler {
     fn get(&self) -> &ffi::Scheduler {
         // SAFETY: as in `pinned`.
         unsafe { self.raw.as_ref() }
+    }
+
+    /// Install diagnostics before any admission; native ownership retains the observer.
+    pub fn install_cache_event_observer(
+        &mut self,
+        observer: CacheEventObserver,
+    ) -> Result<(), cxx::Exception> {
+        ffi::install_cache_event_observer(self.pinned(), Box::new(observer))
     }
 
     /// Queue requests for admission. Validation errors reject the entire

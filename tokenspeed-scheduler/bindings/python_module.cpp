@@ -219,6 +219,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.snapshot_allocator.total_pages = v; })
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
+        .def_rw("debug_force_retraction_max_per_request",
+                &tokenspeed::SchedulerConfig::debug_force_retraction_max_per_request)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
@@ -228,6 +230,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("prefill_decode_min_interval", &tokenspeed::SchedulerConfig::prefill_decode_min_interval)
+        .def_rw("max_consecutive_prefill_rounds", &tokenspeed::SchedulerConfig::max_consecutive_prefill_rounds)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
@@ -237,9 +240,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
         .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
         // P role: the most tokens a prefill chunk that cannot finish gives up
-        // for whole prompts behind it; 0 is off, at most half of
-        // max_scheduled_tokens.
-        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens);
+        // for whole prompts behind it (0 is off, at most half of
+        // max_scheduled_tokens), and the most rounds one prompt gives way
+        // (unbounded by default; positive while the yield is on).
+        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens)
+        .def_rw("prefill_chunk_yield_max_rounds", &tokenspeed::SchedulerConfig::prefill_chunk_yield_max_rounds);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -263,6 +268,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
+        .def_rw("admission_id", &tokenspeed::RequestSpec::admission_id)
         .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
         .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
         .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
@@ -653,8 +659,28 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("num_extends", &tokenspeed::ForwardBatch::NumExtends);
 
     // ─── CacheOperation (attached to the Cache submodule) ──────────
+    nb::class_<tokenspeed::PrefixLoadTelemetry>(cache, "PrefixLoadTelemetry")
+        .def_ro("admission_id", &tokenspeed::PrefixLoadTelemetry::admission_id)
+        .def_ro("op_generation", &tokenspeed::PrefixLoadTelemetry::op_generation)
+        .def_ro("request_pool_index", &tokenspeed::PrefixLoadTelemetry::request_pool_index)
+        .def_ro("slot_generation", &tokenspeed::PrefixLoadTelemetry::slot_generation);
+
+    nb::class_<tokenspeed::RestoreTelemetry>(cache, "RestoreTelemetry")
+        .def_ro("admission_id", &tokenspeed::RestoreTelemetry::admission_id)
+        .def_ro("op_generation", &tokenspeed::RestoreTelemetry::op_generation)
+        .def_ro("previous_slot", &tokenspeed::RestoreTelemetry::previous_slot)
+        .def_ro("previous_slot_generation", &tokenspeed::RestoreTelemetry::previous_slot_generation)
+        .def_ro("slot_generation", &tokenspeed::RestoreTelemetry::slot_generation)
+        .def_ro("slot_previous_admission_id", &tokenspeed::RestoreTelemetry::slot_previous_admission_id)
+        .def_ro("restore_sequence", &tokenspeed::RestoreTelemetry::restore_sequence)
+        .def_ro("committed_tokens", &tokenspeed::RestoreTelemetry::committed_tokens)
+        .def_ro("computed_tokens", &tokenspeed::RestoreTelemetry::computed_tokens)
+        .def_ro("prompt_tokens", &tokenspeed::RestoreTelemetry::prompt_tokens);
+
     nb::class_<tokenspeed::LoadBackBatch>(cache, "LoadBackOp")
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
+        .def_ro("request_ids", &tokenspeed::LoadBackBatch::request_ids)
+        .def_ro("telemetry", &tokenspeed::LoadBackBatch::telemetry)
         .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
@@ -688,6 +714,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // request_pool_indices[i]. Runs after the plan's zeroing.
     nb::class_<tokenspeed::SnapshotRestoreBatch>(cache, "RestoreOp")
         .def_ro("op_ids", &tokenspeed::SnapshotRestoreBatch::op_ids)
+        .def_ro("telemetry", &tokenspeed::SnapshotRestoreBatch::telemetry)
         .def_ro("request_ids", &tokenspeed::SnapshotRestoreBatch::request_ids)
         .def_ro("request_pool_indices", &tokenspeed::SnapshotRestoreBatch::request_pool_indices)
         .def_ro("snapshot_slots", &tokenspeed::SnapshotRestoreBatch::snapshot_slots)

@@ -38,6 +38,7 @@
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/tier/disk_manager.h"
 #include "cache/tier/peer_exports.h"
+#include "cache_event_test_sink.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 
@@ -563,11 +564,12 @@ protected:
 
     // seed's second page ends on Host: pressure evicts it from the Device.
     void SeedOnHost() {
-        Submit(RequestSpec{.request_id = "seed", .tokens = MakeTokens(8), .max_new_tokens = 1});
+        Submit(RequestSpec{.request_id = "seed", .admission_id = 11, .tokens = MakeTokens(8), .max_new_tokens = 1});
         ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
         SendForwardDone("seed", {900});
         SendFinish("seed");
-        Submit(RequestSpec{.request_id = "pressure", .tokens = MakeTokens(23, 101), .max_new_tokens = 1});
+        Submit(RequestSpec{
+            .request_id = "pressure", .admission_id = 22, .tokens = MakeTokens(23, 101), .max_new_tokens = 1});
         const ExecutionPlan pressure = PlanOnce();
         ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(pressure).empty());
         SendForwardDone("pressure", {900});
@@ -658,6 +660,60 @@ TEST_F(DiskTierSchedulerTest, APrefetchPastItsDeadlineAdmitsFromTheLocalHit) {
     EXPECT_TRUE(scheduler_->StoragePending()) << "the read keeps its blocks until it retires";
     AckDisk(reads[0], /*success=*/true);
     EXPECT_FALSE(scheduler_->StoragePending());
+}
+
+TEST_F(DiskTierSchedulerTest, DiskPrefetchAcquiresNoSlotUntilItsHostLoadHasAnAdmission) {
+    auto sink = std::make_shared<RecordingCacheEventSink>();
+    scheduler_->SetCacheEventSink(sink);
+    Tick(1);
+    SeedOnHost();
+    const auto writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes.front(), /*success=*/true);
+    DropSeedFromHost();
+    const auto prior_ownership = sink->slots.size();
+    ASSERT_TRUE(sink->prefix_loads.empty());
+
+    Submit(RequestSpec{.request_id = "hit", .admission_id = 33, .tokens = MakeTokens(9), .max_new_tokens = 1});
+    const auto prefetch = PlanOnce();
+    ASSERT_TRUE(Idle(prefetch));
+    const auto reads = DiskOps(prefetch);
+    ASSERT_EQ(reads.size(), 1u);
+    EXPECT_EQ(reads.front().kind, DiskOpKind::kRead);
+    EXPECT_EQ(scheduler_->AllocatedRequestSlots(), 0);
+    EXPECT_EQ(sink->slots.size(), prior_ownership);
+    EXPECT_TRUE(sink->prefix_loads.empty()) << "Disk-to-Host is not a Device prefix load";
+
+    AckDisk(reads.front(), /*success=*/true);
+    EXPECT_EQ(sink->slots.size(), prior_ownership) << "Disk retirement alone assigns no request slot";
+    const auto admitted = PlanOnce();
+    const auto loads = ExtractCacheOpsOfKind<LoadBackBatch>(admitted);
+    ASSERT_EQ(loads.size(), 1u);
+    const auto& load = std::get<LoadBackBatch>(loads.front());
+    ASSERT_EQ(load.op_ids.size(), 1u);
+    ASSERT_EQ(sink->prefix_loads.size(), 1u);
+    const auto scheduled = sink->prefix_loads.front();
+    ASSERT_NE(FindForwardBatch(admitted), nullptr);
+    EXPECT_EQ(FindForwardBatch(admitted)->extend_prefix_lens, std::vector<std::int32_t>{8});
+    EXPECT_EQ(load.src_pages.front(), reads.front().host_blocks);
+    EXPECT_EQ(scheduled.op_id, load.op_ids.front());
+    EXPECT_EQ(scheduled.telemetry, load.telemetry.front());
+    EXPECT_EQ(scheduled.telemetry.admission_id, 33u);
+    EXPECT_EQ(scheduled.telemetry.request_pool_index, sink->slots.back().slot);
+    EXPECT_EQ(scheduled.telemetry.slot_generation, sink->slots.back().generation);
+
+    // A late Host-to-Device completion still belongs to this admission,
+    // even after the external request id is reused by another owner.
+    SendAbortEvent("hit");
+    DrainForwardResults("hit");
+    PlanOnce();
+    Submit(RequestSpec{.request_id = "hit", .admission_id = 44, .tokens = MakeTokens(2, 500), .max_new_tokens = 1});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    EXPECT_EQ(sink->slots.back().admission_id, 44u);
+    EXPECT_EQ(load.telemetry.front().admission_id, 33u);
+    SendLoadBackDone(scheduled.op_id);
+    EXPECT_EQ(scheduler_->AllocatedRequestSlots(), 1);
+    EXPECT_TRUE(sink->restores.empty());
 }
 
 // Routers credit Disk hits too: a cleaned boundary is out on the Disk stream.

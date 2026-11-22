@@ -83,7 +83,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
     let (mut mesh, group) = support::single_rank();
     let streams = Streams::Prefill(pair.prefill_outbox.clone());
     let (plane, _) = plane();
-    let mut data_plane = PythonDataPlane::start(plane, Some(streams.clone())).unwrap();
+    let mut data_plane = PythonDataPlane::start(plane, Some(streams.clone()), None).unwrap();
     let mut scheduler = Python::attach(|py| {
         let globals = PyDict::new(py);
         py.run(
@@ -133,6 +133,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
         pair.prefill.register(rid, &bootstrap).unwrap();
         scheduler
             .submit_requests(&[RequestSpec {
+                admission_id: 0,
                 session_id: String::new(),
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),

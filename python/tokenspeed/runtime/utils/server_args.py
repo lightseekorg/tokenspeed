@@ -482,6 +482,9 @@ class ServerArgs:
     prefill_decode_interval: int = 0
     # The same, owed even while an overdue prompt suspends the interval.
     prefill_decode_min_interval: int = 0
+    # The most back-to-back prefill rounds an overdue prompt may suspend the
+    # interval for; 0 keeps the unbounded suspension.
+    max_consecutive_prefill_rounds: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -675,6 +678,9 @@ class ServerArgs:
     # Decoding (N > 0) or Prefilling (N < 0) request without capacity
     # pressure, to exercise the suspend/restore path. 0 (off) in serving.
     debug_force_retraction_interval: int = 0
+    # None preserves unlimited debug injection; a supplied cap is positive.
+    # Capacity-triggered retractions do not consume this per-admission budget.
+    debug_force_retraction_max_per_request: int | None = None
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -1845,6 +1851,21 @@ class ServerArgs:
         to no pool here with a log, as the KVStore's are off on the encode
         role.
         """
+        forced_cap = self.debug_force_retraction_max_per_request
+        if forced_cap is not None:
+            if type(forced_cap) is not int or not 1 <= forced_cap <= 2**31 - 1:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request must be an integer in [1, INT32_MAX]"
+                )
+            if self.debug_force_retraction_interval == 0:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request requires a nonzero "
+                    "--debug-force-retraction-interval"
+                )
+            if not self.retracting_role:
+                raise ValueError(
+                    "--debug-force-retraction-max-per-request requires a role that can retract"
+                )
         host_gb = self.retraction_snapshot_host_gb
         ratio = self.retraction_snapshot_ratio
         max_requests = self.retraction_snapshot_max_requests
@@ -3193,6 +3214,13 @@ class ServerArgs:
                 "a prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.max_consecutive_prefill_rounds < 0:
+            raise ValueError("--max-consecutive-prefill-rounds must be non-negative")
+        if self.max_consecutive_prefill_rounds and not self.prefill_decode_interval:
+            raise ValueError(
+                "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
+                "it bounds how long an overdue prompt suspends the interval"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -3636,6 +3664,17 @@ class ServerArgs:
             "back to back. Aggregated serving only. 0 (the default) is off.",
         )
         parser.add_argument(
+            "--max-consecutive-prefill-rounds",
+            type=int,
+            default=ServerArgs.max_consecutive_prefill_rounds,
+            help="With --prefill-decode-interval: the most back-to-back prefill "
+            "rounds that hold a decode back while an overdue prompt suspends "
+            "the interval; the round that reaches it owes the decodes the whole "
+            "interval again, and a prompt's held-back count restarts whenever "
+            "one of its chunks runs. 0 (the default) keeps the unbounded "
+            "suspension.",
+        )
+        parser.add_argument(
             "--enable-state-checkpoint-in-forward",
             action="store_true",
             dest="enable_state_checkpoint_in_forward",
@@ -3936,6 +3975,16 @@ class ServerArgs:
             "path runs on every request of a test run. Refused with "
             "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
             "in serving.",
+        )
+        parser.add_argument(
+            "--debug-force-retraction-max-per-request",
+            type=int,
+            default=ServerArgs.debug_force_retraction_max_per_request,
+            help="TEST ONLY. Bound successfully imaged forced retractions per "
+            "request admission. Omission preserves unlimited forcing. An explicit "
+            "value must be positive and requires a nonzero "
+            "--debug-force-retraction-interval. Failed attempts and waits do not "
+            "consume it; ordinary capacity retractions are unaffected.",
         )
         # Mamba Cache
         parser.add_argument(

@@ -351,10 +351,10 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
             continue;
         }
         std::vector<BlockTransfer> load_pairs = outcome.event->TakeLoadPairs();
-        if (!load_pairs.empty()) {
-            build.load_backs.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
-        }
         request->Apply(std::move(*outcome.event));
+        if (!load_pairs.empty()) {
+            build.load_backs.push_back(startPrefixLoad(*request, std::move(load_pairs)));
+        }
         build.scheduled.insert(request);
 
         const auto& landing = *request->GetIf<fsm::PeerLanding>();

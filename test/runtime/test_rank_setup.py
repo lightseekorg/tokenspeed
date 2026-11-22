@@ -185,6 +185,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         disk_config=None,
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -227,10 +228,40 @@ def test_the_prefill_decode_min_interval_reaches_the_scheduler():
     assert cfg.prefill_decode_min_interval == 2
 
 
+def test_the_prefill_round_cap_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "64",
+            "--max-consecutive-prefill-rounds",
+            "2",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 64
+    assert cfg.max_consecutive_prefill_rounds == 2
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
         (["--prefill-decode-interval", "-1"], "must be non-negative"),
+        (["--max-consecutive-prefill-rounds", "2"], "needs --prefill-decode-interval"),
+        (
+            [
+                "--prefill-decode-interval",
+                "64",
+                "--max-consecutive-prefill-rounds",
+                "-1",
+            ],
+            "--max-consecutive-prefill-rounds must be non-negative",
+        ),
         (
             ["--prefill-decode-interval", "64", "--disaggregation-mode", "prefill"],
             "needs --disaggregation-mode null",
@@ -1086,6 +1117,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         host_write_policy="write_through",
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
+        max_consecutive_prefill_rounds=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
@@ -1233,3 +1265,23 @@ def test_prefill_page_budget_respects_reserved_workspace(explicit, workspace, ex
     cfg = _config(args, specs)
     assert cfg.max_kv_page_num == expected
     assert cfg.num_device_pages == specs.cache_geometry.num_device_pages
+
+
+@pytest.mark.parametrize("cap", [None, 1, 64, 2**31 - 1])
+def test_rank_setup_preserves_optional_forced_retraction_cap(cap):
+    args = ServerArgs(
+        model="fixture",
+        debug_force_retraction_interval=3,
+        debug_force_retraction_max_per_request=cap,
+    )
+    config = _config(
+        args, _specs(num_host_pages=0, num_snapshot_pages=17, max_retracted=8)
+    )
+    assert config.debug_force_retraction_max_per_request == cap
+    # Preserve raw optional semantics at the translation boundary too; the
+    # native validator rejects this invalid value, rather than seeing None.
+    args.debug_force_retraction_max_per_request = 0
+    config = _config(
+        args, _specs(num_host_pages=0, num_snapshot_pages=17, max_retracted=8)
+    )
+    assert config.debug_force_retraction_max_per_request == 0

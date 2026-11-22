@@ -44,6 +44,7 @@
 #include "fsm/peer_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/checkpoint_lineage.h"
+#include "scheduler/cache_event_sink.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
@@ -120,6 +121,9 @@ public:
     static constexpr std::int64_t kNoProgressAbortPlans{4096};
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
+    // Install before submission. The scheduler keeps the sink alive through
+    // destruction of every request and in-flight slot owner.
+    void SetCacheEventSink(std::shared_ptr<CacheEventSink> sink);
 
     // What one plan call may do, decided by the control plane's prefill-delay
     // vote (docs/design/prefill-delay.md).
@@ -390,6 +394,10 @@ private:
         // the blocker itself, the next of these, if any, is who its pages
         // serve first (maybeRetractForCapacity lists the rest).
         std::vector<Request*> capacity_blocked;
+        // Set by a local prefill admission whose chunk the yield
+        // (prefill_chunk_yield_tokens) cut shorter than the budget allowed;
+        // the phases clear it before each attempt.
+        bool chunk_gave_way{false};
 
         void NoteCapacityBlocked(Request* request) {
             if (capacity_blocker == nullptr) {
@@ -446,6 +454,7 @@ private:
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
+    LoadBackOperation startPrefixLoad(Request& request, std::vector<BlockTransfer> load_pairs);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                  std::vector<LoadBackOperation>& load_back_operations);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
@@ -648,6 +657,10 @@ private:
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
         std::int32_t pending_prefill_reserve{0};
+        // The requests whose prefill chunk this round runs. Unlike
+        // `scheduled`, a forced retraction victim sitting the round out is
+        // not among them.
+        std::unordered_set<const Request*> prefilled;
         bool pushed_prefill{false};
         bool pushed_decode{false};
         bool Full(std::int32_t max_batch_size) const {
@@ -679,6 +692,7 @@ private:
                     static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
             }
             build.pushed_prefill = true;
+            build.prefilled.insert(&request);
         } else if (config_.role != Role::kD) {
             build.token_budget -= operation.input_length;
         }
@@ -751,8 +765,9 @@ private:
     // round's FIFO order. With enable_short_prefill_first, a successful
     // carried first admission that overtakes the oldest waiting prompt
     // increments that prompt's bypass count.
-    void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                           std::span<const WholePrompt> carried, std::int32_t decode_reserve);
+    // Returns how many of `carried` it admitted.
+    std::int32_t carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                   std::span<const WholePrompt> carried, std::int32_t decode_reserve);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -810,7 +825,8 @@ private:
     // publication is aborted here too.
     void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
-    // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
+    // (N > 0) or Prefilling (N < 0) request with forced budget remaining
+    // every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it. A victim whose image
     // does not fit (imageShortfall) runs on with nothing published; one
     // refused only after its publication is aborted.
@@ -834,9 +850,14 @@ private:
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
     // True when a local-prefill candidate has been held back by the
-    // prefill/decode interval for prefill_decode_interval rounds in total
+    // prefill/decode interval for prefill_decode_interval rounds: in total,
+    // or since its last chunk ran under max_consecutive_prefill_rounds
     // (docs/design/scheduler.md §3.3).
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
+    // Whether an overdue prompt may suspend the interval this round:
+    // always without max_consecutive_prefill_rounds; with it, only until a
+    // run of back-to-back prefill rounds reaches the cap.
+    bool prefillSuspensionAllowed() const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
     // Admits the waiting prompts whose holder answered with more than their
@@ -851,6 +872,10 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    // Declared before the allocator, tickets and requests: they release their
+    // slots before the sink's last reference can be destroyed.
+    std::shared_ptr<CacheEventSink> cache_event_sink_;
+    bool submitted_requests_{false};
     ReqPoolAllocator req_pool_allocator_;
     DecodeSlotAllocator decode_slots_;
     // One slot per retracted request: the index of its slot-state blob in
@@ -907,6 +932,13 @@ private:
     // prefill_decode_min_interval: the same clock, but no overdue prompt
     // suspends it.
     std::int32_t prefill_min_rounds_left_{0};
+    // max_consecutive_prefill_rounds: back-to-back prefill rounds that held
+    // a decode back (saturating at the cap), and whether the current
+    // interval was owed by a run that reached the cap (no overdue prompt
+    // suspends it until it has been paid). Derived from the plans and the
+    // candidates, identical on every rank, like the interval.
+    std::int32_t consecutive_prefill_rounds_{0};
+    bool prefill_interval_held_{false};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work, leaves work in flight or aborts a request (the

@@ -327,6 +327,7 @@ def scheduler_config_from_args(
         host_write_policy=server_args.kvstore_write_policy,
         decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
+        debug_force_retraction_max_per_request=server_args.debug_force_retraction_max_per_request,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
@@ -336,6 +337,7 @@ def scheduler_config_from_args(
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         prefill_decode_interval=server_args.prefill_decode_interval,
         prefill_decode_min_interval=server_args.prefill_decode_min_interval,
+        max_consecutive_prefill_rounds=server_args.max_consecutive_prefill_rounds,
         enable_short_prefill_first=server_args.enable_short_prefill_first,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         demote_superseded_state_checkpoints=_implied_scheduler_policy(

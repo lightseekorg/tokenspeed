@@ -38,7 +38,7 @@ mod result_buffers;
 /// Start the interpreter once per test process, with the scheduler
 /// module loaded and the repository's `tokenspeed_scheduler` package
 /// importable.
-fn interpreter() {
+pub(crate) fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         // The test binary is not in a Python prefix; point at the one the
@@ -300,7 +300,7 @@ fn plane() -> (Py<PyAny>, Scheduler) {
 }
 
 fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, None).unwrap()
 }
 
 /// A one-row batch: the stand-in launches whatever it is handed.
@@ -352,6 +352,7 @@ fn admission_identity_and_stop_criteria_reach_python_together() {
     let request = Admission {
         rid: "reused".to_owned(),
         spec: ts_scheduler::RequestSpec {
+            admission_id: 42,
             request_id: "reused".to_owned(),
             session_id: String::new(),
             cache_group_id: String::new(),
@@ -571,7 +572,7 @@ fn a_failed_completion_notifies_the_launcher_before_logging() {
                 ..Dispatch::default()
             };
             LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
-            let mut data_plane = PythonDataPlane::start(plane, None).unwrap();
+            let mut data_plane = PythonDataPlane::start(plane, None, None).unwrap();
             let forward = data_plane
                 .execute(scheduler.next_execution_plan(true, false), &dispatch)
                 .unwrap()
