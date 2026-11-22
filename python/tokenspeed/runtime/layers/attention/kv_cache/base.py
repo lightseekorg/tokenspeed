@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.prologue import HeadKVCache, LatentKVCache
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_dtype_name,
     cache_field_layer_id,
     cache_field_plane,
     is_flat_kv_plane,
@@ -264,11 +265,15 @@ class CachePool(ABC):
             num_layers=self.layer_num,
         )
 
-    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+    def atom_pages_per_block(
+        self, group_id: str, kernel_page_size: int, *, write_slot_dtype: torch.dtype
+    ) -> int:
         """Return atom pages per scheduler block for a kernel page table.
 
         Full-history fields on the shared plane fold their physical stride
         into atom IDs. State and sliding-window groups retain scheduler IDs.
+        ``write_slot_dtype`` is the integer type the caller's token write
+        slots are stored in; the plan checks they fit it.
         """
         specs = {spec.group_id: spec for spec in self.arena.cache_group_specs}
         spec = specs[group_id]
@@ -318,6 +323,7 @@ class CachePool(ABC):
             atom_pages_per_block=multiplier,
             kernel_subpages=ratio,
             kernel_page_size=kernel_page_size,
+            write_slot_dtype=cache_dtype_name(write_slot_dtype),
         )
         return multiplier
 

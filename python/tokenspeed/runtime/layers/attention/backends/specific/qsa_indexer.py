@@ -108,6 +108,11 @@ class QSAIndexerBackend(AttentionBackend):
                 "QSA indexer cache view requires compressed and recent fields"
             )
         specs = {spec.group_id: spec for spec in cache_pool.arena.cache_group_specs}
+        # The write-slot types qwen4_exp_qsa_prepare_metadata emits per group.
+        slot_dtypes = {
+            QWEN4_EXP_QSA_CACHE_GROUP: torch.int64,
+            QWEN4_EXP_QSA_RECENT_CACHE_GROUP: torch.int32,
+        }
         return tuple(
             GroupTableSpec(
                 group_id=gid,
@@ -116,7 +121,9 @@ class QSAIndexerBackend(AttentionBackend):
                 max_num_pages=(self.max_context_len + specs[gid].block_granularity - 1)
                 // specs[gid].block_granularity,
                 atom_pages_per_block=cache_pool.atom_pages_per_block(
-                    gid, specs[gid].block_granularity
+                    gid,
+                    specs[gid].block_granularity,
+                    write_slot_dtype=slot_dtypes[gid],
                 ),
             )
             for gid in groups

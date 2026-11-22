@@ -100,6 +100,8 @@ class GroupTableSpec:
 
 # Groups one packed fill serves; a router with more launches once per group.
 _PACKED_MAX_GROUPS = 8
+# The integer type of the decode and extend write slots every group stack stores.
+GROUP_WRITE_SLOT_DTYPE = torch.int32
 
 
 @triton.jit
@@ -315,12 +317,16 @@ class GroupTableStacks:
             (g, self.max_bs, stack_max_num_pages), dtype=torch.int32, device=device
         )
         self.decode_locs = torch.zeros(
-            (g, self.max_bs * self.max_tokens_per_req), dtype=torch.int32, device=device
+            (g, self.max_bs * self.max_tokens_per_req),
+            dtype=GROUP_WRITE_SLOT_DTYPE,
+            device=device,
         )
         # Extend spans up to this many tokens live here, tail at the dummy slot 0,
         # so a prefill graph's padded prologue can record and replay the address.
         self.extend_locs = torch.zeros(
-            (g, max(int(max_extend_tokens), 0)), dtype=torch.int32, device=device
+            (g, max(int(max_extend_tokens), 0)),
+            dtype=GROUP_WRITE_SLOT_DTYPE,
+            device=device,
         )
         self._extend_total = 0
         self._extend_span: torch.Tensor | None = None

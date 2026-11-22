@@ -97,15 +97,19 @@ def test_legacy_flatkv_plane_keeps_native_padded_pages():
 
 
 @pytest.mark.parametrize(
-    ("parents", "kernel_page_size", "error"),
+    ("parents", "kernel_page_size", "write_slot_dtype", "error"),
     [
-        (262143, 256, None),
-        (262144, 256, "kernel write slot 2147483903"),
-        (262144, 1, "atom page id"),
+        (262143, 256, torch.int32, None),
+        (262144, 256, torch.int32, "kernel write slot 2147483903"),
+        (262144, 1, torch.int32, "atom page id"),
+        # Int64 slots lift the slot bound; the int32 atom page IDs still bind.
+        (262144, 256, torch.int64, None),
+        (262143, 1, torch.int64, None),
+        (262144, 1, torch.int64, "atom page id 2147483903"),
     ],
 )
 def test_flat_kv_pool_validates_atom_capacity_without_allocating(
-    parents, kernel_page_size, error
+    parents, kernel_page_size, write_slot_dtype, error
 ):
     history = CacheGroupSpec("history", "full_history", 256, 1, replayable=False)
     state = CacheGroupSpec("state", "state", None, None, replayable=False)
@@ -149,10 +153,17 @@ def test_flat_kv_pool_validates_atom_capacity_without_allocating(
         rank=0,
     )
     if error is None:
-        assert pool.atom_pages_per_block("history", kernel_page_size) == 32
+        assert (
+            pool.atom_pages_per_block(
+                "history", kernel_page_size, write_slot_dtype=write_slot_dtype
+            )
+            == 32 * 256 // kernel_page_size
+        )
     else:
         with pytest.raises(ValueError, match=error):
-            pool.atom_pages_per_block("history", kernel_page_size)
+            pool.atom_pages_per_block(
+                "history", kernel_page_size, write_slot_dtype=write_slot_dtype
+            )
 
 
 @requires_cuda
@@ -254,7 +265,9 @@ def test_flat_kv_gpu_store_reaches_original_field(dtype, kernel_page_size, graph
     )
     arena = CacheArena(layout.bind(8), "cuda", cache_group_specs=(spec,))
     pool = MHATokenToKVPool(arena, dtype, heads, dim, 2, 0)
-    multiplier = pool.atom_pages_per_block(spec.group_id, kernel_page_size)
+    multiplier = pool.atom_pages_per_block(
+        spec.group_id, kernel_page_size, write_slot_dtype=torch.int32
+    )
     tables = GroupTableStacks(
         [
             GroupTableSpec(
@@ -501,6 +514,8 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
     from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
     from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
         QWEN4_EXP_PLE_CACHE_GROUP,
+        QWEN4_EXP_QSA_CACHE_GROUP,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
         local_cache_capacity,
@@ -542,7 +557,8 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
         verify_width=4,
         max_bs=2,
         pp_size=1,
-        cache_budget_bytes=150 << 30,
+        # Large enough that the address bound, not the budget, sizes the pool.
+        cache_budget_bytes=1 << 40,
         device="meta",
     )
     recipe.server_args.qwen4_exp_flat_kv = True
@@ -592,6 +608,11 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
         max_padding_fraction=recipe.max_padding_fraction,
     )
 
+    qsa_slot_dtypes = {
+        QWEN4_EXP_QSA_CACHE_GROUP: torch.int64,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP: torch.int32,
+    }
+
     def validate_views(plan, owns_draft):
         arena = CacheArena(plan, "meta", cache_group_specs=setup.spec.cache_group_specs)
         sides = [(0, setup.num_target_layers, recipe.attn_config)]
@@ -613,8 +634,17 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
                 field_layer_offset=offset,
             )
             for spec in setup.spec.cache_group_specs:
-                if spec.attn_kind == "full_history":
-                    pool.atom_pages_per_block(spec.group_id, kernel_page_size)
+                if spec.group_id in qsa_slot_dtypes:
+                    # The QSA indexer's tables: one kernel page per block.
+                    pool.atom_pages_per_block(
+                        spec.group_id,
+                        spec.block_granularity,
+                        write_slot_dtype=qsa_slot_dtypes[spec.group_id],
+                    )
+                elif spec.attn_kind == "full_history":
+                    pool.atom_pages_per_block(
+                        spec.group_id, kernel_page_size, write_slot_dtype=torch.int32
+                    )
 
     # The CI TP2 geometry exceeded int32 after sizing to free GPU memory.
     # Meta views exercise every real pool's checks without allocating the arena.
@@ -635,7 +665,8 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
             for owner in owners
         ] == [28 << 20, 28 << 20]
     validate_stages(setup.spec.memory_plan)
-    with pytest.raises(ValueError, match="kernel write slot"):
+    # The binding term fails at arena construction (raw-ID slots) or in a view.
+    with pytest.raises(ValueError, match="kernel write slot|local cache slots"):
         validate_stages(layout.bind(setup.spec.memory_plan.num_lcm_blocks + 1))
 
 
@@ -684,6 +715,9 @@ def test_flat_kv_pipeline_stages_pack_local_fields(partition, device):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+        QWEN4_EXP_QSA_CACHE_GROUP,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
         local_cache_capacity,
@@ -782,7 +816,13 @@ def test_flat_kv_pipeline_stages_pack_local_fields(partition, device):
                     index = block
                     if spec_group.attn_kind == "full_history":
                         index *= pool.atom_pages_per_block(
-                            group.group_id, spec_group.block_granularity
+                            group.group_id,
+                            spec_group.block_granularity,
+                            write_slot_dtype=(
+                                torch.int64
+                                if group.group_id == QWEN4_EXP_QSA_CACHE_GROUP
+                                else torch.int32
+                            ),
                         )
                         if spec_group.rows_per_page == plan.prefix_granularity:
                             view = view.unflatten(0, (-1, spec_group.rows_per_page))
@@ -840,9 +880,24 @@ def test_flat_kv_groups_gdn_layers_on_one_plane(kv_dtype):
     } == {"linear_attention_0", "linear_attention_1"}
     for pool in (target, draft):
         assert pool.arena is arena
-        assert pool.atom_pages_per_block("full_attention", 64) > 1
-        assert pool.atom_pages_per_block(QWEN4_EXP_QSA_CACHE_GROUP, 256) > 1
-        assert pool.atom_pages_per_block(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64) == 1
+        assert (
+            pool.atom_pages_per_block(
+                "full_attention", 64, write_slot_dtype=torch.int32
+            )
+            > 1
+        )
+        assert (
+            pool.atom_pages_per_block(
+                QWEN4_EXP_QSA_CACHE_GROUP, 256, write_slot_dtype=torch.int64
+            )
+            > 1
+        )
+        assert (
+            pool.atom_pages_per_block(
+                QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64, write_slot_dtype=torch.int32
+            )
+            == 1
+        )
     kv_group = arena.plan.group("full_attention")
     kv_payload = sum(
         f.payload_bytes for f in arena.plan.fields if f.group_id == "full_attention"
@@ -913,10 +968,16 @@ def test_shared_plane_qsa_compression_and_recent_write(graph):
     cos_sin = torch.cat((torch.ones(8, 64), torch.zeros(8, 64)), dim=-1).cuda()
     stacks = GroupTableStacks(
         [
-            GroupTableSpec(gid, grain, grain, 1, pool.atom_pages_per_block(gid, grain))
-            for gid, grain in (
-                (QWEN4_EXP_QSA_CACHE_GROUP, 256),
-                (QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64),
+            GroupTableSpec(
+                gid,
+                grain,
+                grain,
+                1,
+                pool.atom_pages_per_block(gid, grain, write_slot_dtype=slot_dtype),
+            )
+            for gid, grain, slot_dtype in (
+                (QWEN4_EXP_QSA_CACHE_GROUP, 256, torch.int64),
+                (QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64, torch.int32),
             )
         ],
         max_bs=1,
@@ -935,8 +996,8 @@ def test_shared_plane_qsa_compression_and_recent_write(graph):
             (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
         )
     }
-    qsa_locs = torch.empty(4, device="cuda", dtype=torch.int32)
-    recent_locs = torch.empty_like(qsa_locs)
+    qsa_locs = torch.empty(4, device="cuda", dtype=torch.int64)
+    recent_locs = torch.empty(4, device="cuda", dtype=torch.int32)
 
     def run():
         stacks.fill(1, 1, raw_tables)

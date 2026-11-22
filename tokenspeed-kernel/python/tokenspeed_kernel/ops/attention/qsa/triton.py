@@ -125,11 +125,7 @@ def _qwen4_exp_qsa_prepare_metadata_kernel(
         ).to(tl.int64)
         qsa_values = qsa_pages * qsa_page_size + safe_logical % qsa_page_size
         qsa_valid = valid & (qsa_pages > 0)
-        tl.store(
-            qsa_locs + rows,
-            tl.where(qsa_valid, qsa_values, 0).to(tl.int32),
-            mask=mask,
-        )
+        tl.store(qsa_locs + rows, tl.where(qsa_valid, qsa_values, 0), mask=mask)
 
         recent_columns = safe_logical // recent_page_size
         recent_pages = tl.load(
@@ -198,7 +194,8 @@ def qwen4_exp_qsa_prepare_metadata(
     outputs = (
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
-        torch.empty((total_tokens,), dtype=torch.int32, device=device),
+        # Atom pages times the 256-token page pass int32 on large FlatKV pools.
+        torch.empty((total_tokens,), dtype=torch.int64, device=device),
         torch.empty((total_tokens,), dtype=torch.int32, device=device),
         torch.empty((total_tokens,), dtype=torch.int32, device=device),
     )

@@ -2239,13 +2239,16 @@ selected for padded state pages must declare
 `strided_state` support and address input and output pools with their own
 runtime page strides.
 
-Before building a group's kernel tables, the memory plan checks both its
-largest translated atom-page ID and its largest token write slot against
-signed int32. These bounds include the stride-derived multiplier, every
+Before building a group's kernel tables, the memory plan checks its largest
+translated atom-page ID against signed int32 and its largest token write slot
+against the integer type the table's consumer stores slots in: int32 for the
+router's group stacks, int64 for compressed QSA, whose metadata kernel emits
+int64 locations. These bounds include the stride-derived multiplier, every
 kernel subpage, and the null page in the group's capacity; overflowing
 geometry fails at startup before any table value is narrowed.
-The recipe also caps the agreed parent capacity at the largest count all
-target and draft full-history fields can address. This keeps a larger GPU
+The recipe also caps the agreed parent capacity at the largest count every
+target and draft field can address: K/V and recent-QSA write slots, and
+compressed-QSA atom-page IDs. This keeps a larger GPU
 memory budget from producing an unbindable pool; a smaller draft payload
 can set the limit. The bound is independent of the kernel page size and
 includes the final page's token span. The bind-time check remains in place
