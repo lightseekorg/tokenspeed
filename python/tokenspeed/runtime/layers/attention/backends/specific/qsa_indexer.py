@@ -89,7 +89,9 @@ def qsa_indexer_table_specs(
         and cache_field_layer_id(field.field_id) in cache_pool.field_layer_range
     }
     if local_groups != set(groups):
-        raise RuntimeError("QSA indexer cache view requires compressed and recent fields")
+        raise RuntimeError(
+            "QSA indexer cache view requires compressed and recent fields"
+        )
     specs = {spec.group_id: spec for spec in cache_pool.arena.cache_group_specs}
     slot_dtypes = {
         QWEN4_EXP_QSA_CACHE_GROUP: QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE,

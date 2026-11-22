@@ -509,15 +509,15 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
 
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
-    from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
-    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
     from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
         GROUP_WRITE_SLOT_DTYPE,
     )
     from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
         qsa_indexer_table_specs,
     )
+    from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
     from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
         QWEN4_EXP_PLE_CACHE_GROUP,
     )
@@ -635,7 +635,9 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
             # The real consumers: the QSA indexer's tables and the router's K/V stacks.
             qsa_indexer_table_specs(pool, recipe.attn_config.context_len)
             pool.atom_pages_per_block(
-                FULL_ATTENTION, kernel_page_size, write_slot_dtype=GROUP_WRITE_SLOT_DTYPE
+                FULL_ATTENTION,
+                kernel_page_size,
+                write_slot_dtype=GROUP_WRITE_SLOT_DTYPE,
             )
 
     # The CI TP2 geometry exceeded int32 after sizing to free GPU memory.
