@@ -23,6 +23,8 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from tokenizers import Tokenizer, models
+from transformers import PreTrainedTokenizerFast
 
 from tokenspeed.runtime.utils.hf_transformers_utils import reconcile_special_tokens
 
@@ -30,6 +32,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+
+def test_reconcile_registers_missing_specials_without_replacing_tokens():
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<existing>"]})
+    tokenizer.backend_tokenizer.add_special_tokens(["<missing>"])
+    existing = tokenizer.convert_tokens_to_ids("<existing>")
+    missing = tokenizer.convert_tokens_to_ids("<missing>")
+    before = tokenizer.get_vocab()
+    assert missing not in tokenizer.all_special_ids
+
+    reconcile_special_tokens(tokenizer)
+    reconcile_special_tokens(tokenizer)
+
+    assert {existing, missing} <= set(tokenizer.all_special_ids)
+    assert tokenizer.get_vocab() == before
+    assert tokenizer.decode([existing, 1, missing], skip_special_tokens=True) == "hello"
 
 
 @pytest.mark.parametrize(

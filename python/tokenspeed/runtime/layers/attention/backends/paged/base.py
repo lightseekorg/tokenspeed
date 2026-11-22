@@ -41,7 +41,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+from tokenspeed.runtime.layers.attention.backends.base import (
+    CachePoolBinding,
+    reject_query_shard,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeCascadeRows,
 )
@@ -597,3 +600,73 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             pool.get_mla_kv_buffer(layer, slots, dst_dtype)
             for slots in chunk_kv_indices_list
         )
+
+
+class PagedMLABackend(PagedAttentionBackend):
+    """An MLA leaf: extend requests lead, decode requests follow them."""
+
+    def init_forward_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
+        **kwargs,
+    ) -> None:
+        reject_query_shard(query_shard, type(self).__name__)
+        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
+            raise RuntimeError(
+                f"{type(self).__name__} decode metadata goes through "
+                "refresh_decode_metadata; init_forward_metadata only serves "
+                f"extend/mixed ({forward_mode})"
+            )
+        if forward_mode.is_extend_or_mixed():
+            self._init_prefill_metadata(
+                seq_lens=seq_lens[:num_extends],
+                extend_prefix_lens=extend_prefix_lens[:num_extends],
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
+                extend_seq_lens=extend_seq_lens[:num_extends],
+                extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
+                extend_with_prefix=extend_with_prefix,
+                page_table=page_table[:num_extends],
+                page_table_cpu=page_table_cpu,
+            )
+        # A target's mixed/idle decode requests refresh here; a draft's in its wrapper.
+        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
+            self.refresh_decode_metadata(
+                bs, bs, seq_lens, page_table, num_extends=num_extends
+            )
+
+    @abstractmethod
+    def _init_prefill_metadata(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
+        page_table: torch.Tensor,
+        page_table_cpu: torch.Tensor | None,
+    ) -> None:
+        """Build the prefill metadata of the leading extend requests."""
+
+    @contextmanager
+    def override_num_extends(self, num_extends: int):
+        assert self.forward_decode_metadata is not None
+        prev = self.forward_decode_metadata.num_extends
+        self.forward_decode_metadata.num_extends = num_extends
+        try:
+            yield
+        finally:
+            self.forward_decode_metadata.num_extends = prev

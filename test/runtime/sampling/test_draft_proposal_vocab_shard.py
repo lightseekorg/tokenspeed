@@ -128,6 +128,7 @@ def _sampler(
         runtime_states=states,
         input_buffers=buffers,
         spec_num_tokens=N,
+        sampling_stream="batch",
         vocab_map=vocab_map,
         device="cuda",
     )
@@ -163,9 +164,11 @@ def _answer_gather(monkeypatch, logits, rank, slots, pools, states) -> None:
 def _shard(logits: torch.Tensor, rank: int) -> SampledVocabShard:
     return SampledVocabShard(
         logits=logits[:, rank * COLUMNS : (rank + 1) * COLUMNS].contiguous(),
+        columns=COLUMNS,
         vocab_start=rank * COLUMNS,
         logit_scale=None,
         softcap=None,
+        softcap_form=None,
         tp_size=RANKS,
         tp_group=tuple(range(RANKS)),
         gather_full=None,

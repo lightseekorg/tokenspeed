@@ -94,6 +94,37 @@ def bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     )
 
 
+def _byte_mismatch_message(a: torch.Tensor, b: torch.Tensor, name: str) -> str:
+    """Describe the first 16 differences in flattened contiguous logical bytes."""
+    description = (
+        f"{name}: a(dtype={a.dtype}, shape={tuple(a.shape)}), "
+        f"b(dtype={b.dtype}, shape={tuple(b.shape)})"
+    )
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return (
+            f"{description}; shape/dtype mismatch; mismatch_byte_count=not comparable"
+        )
+    a_bytes = a.contiguous().view(torch.uint8).flatten()
+    b_bytes = b.contiguous().view(torch.uint8).flatten()
+    different = (a_bytes != b_bytes).nonzero().flatten()
+    first = different[:16]
+    return (
+        f"{description}; mismatch_byte_count={different.numel()}; "
+        f"byte_offsets={first.tolist()}; "
+        f"a_uint8={a_bytes[first].tolist()}; b_uint8={b_bytes[first].tolist()}"
+    )
+
+
+def assert_bytes_equal(a: torch.Tensor, b: torch.Tensor, *, name: str) -> None:
+    """Keep the byte predicate unchanged; gather diagnostics only on failure.
+
+    Offsets address flattened contiguous logical bytes, not gaps in a strided
+    tensor's storage. Incompatible shape/dtype metadata is reported without
+    trying to broadcast different byte layouts.
+    """
+    assert bytes_equal(a, b), _byte_mismatch_message(a, b, name)
+
+
 def assert_agree(a: torch.Tensor, b: torch.Tensor) -> None:
     """Byte-equal; on AMD two solutions' fp16 results are allowed one ulp apart."""
     if bytes_equal(a, b):

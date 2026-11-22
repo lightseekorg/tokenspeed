@@ -12,6 +12,7 @@ from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.dsa import (
     CANDIDATE_LENS_CPU_FEATURE,
     INDEX_CANDIDATE_PAGES_FEATURE,
+    INDEX_CANDIDATE_SCORES_OUT_FEATURE,
     INDEX_K_WORKSPACE_ROWS_FEATURE,
     DSAIndexCandidatePages,
 )
@@ -256,6 +257,7 @@ def _select_dcp_index_candidates(
     topk: int,
     initial_tokens: int,
     local_tokens: int,
+    scores_out: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Selector order: DeepSelect (Hopper), CUDA ragged top-k, full-width torch.topk.
     deep_select = _dcp_topk_supports_lengths(scores, topk)
@@ -309,6 +311,7 @@ def _select_dcp_index_candidates(
         page_size,
         lengths=lengths,
         selected_scores=values,
+        scores_out=scores_out,
     )
 
 
@@ -853,7 +856,7 @@ if _HAS_DEEP_GEMM:
         "dsa_index_candidates",
         name="deep_gemm_dsa_index_candidates",
         solution="deep_gemm",
-        features={INDEX_CANDIDATE_PAGES_FEATURE},
+        features={INDEX_CANDIDATE_PAGES_FEATURE, INDEX_CANDIDATE_SCORES_OUT_FEATURE},
         priority=Priority.PERFORMANT,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -890,6 +893,7 @@ if _HAS_DEEP_GEMM:
         initial_tokens: int,
         local_tokens: int,
         pages: DSAIndexCandidatePages | None = None,
+        scores_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if pages is None:
             pages, positions, lengths = index_candidates.compact_index_pages(
@@ -901,7 +905,10 @@ if _HAS_DEEP_GEMM:
         else:
             # Compacted once per forward, shared by every tile and layer.
             pages, positions, lengths = pages.pages, pages.positions, pages.lengths
-        q, weights = _pad_index_heads(q.contiguous(), weights)
+        # The quantizer reads strided rows, as a projection's column view.
+        if q.stride(-1) != 1:
+            q = q.contiguous()
+        q, weights = _pad_index_heads(q, weights)
         q_fp8, weights = quantize_index_query_weights(q, weights, softmax_scale)
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
@@ -933,4 +940,5 @@ if _HAS_DEEP_GEMM:
             topk=topk,
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
+            scores_out=scores_out,
         )

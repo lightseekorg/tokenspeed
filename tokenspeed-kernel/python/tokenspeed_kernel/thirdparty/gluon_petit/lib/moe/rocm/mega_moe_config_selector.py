@@ -98,6 +98,15 @@ class MegaMoEConfigSelector(DeviceTemplate):
             Solution.NumExperts(),
             Solution.TopK(),
         )
+        self.kM64MinTokens = 128 if self.kNumExperts == 256 else 256
+        self.kM64W8MinTokens = 1024 if self.kNumExperts == 128 else self.kM64MinTokens
+        # DSv4.1 Flash / DSpark at EP4: Since each expert gets half the rows it
+        # gets at EP8, it is retuned to pick a larger threshold for the two
+        # constants for transition point.
+        if self.kNumRanks == 4 and self.kNumExperts in (384, 128):
+            self.kM64MinTokens = 480 if self.kNumExperts == 384 else 352
+            self.kM64W8MinTokens = 1008 if self.kNumExperts == 384 else 704
+
         self.kHiddenSize = Solution.HiddenSizeDiv64() * 64
         self.kComputeHiddenSize = (self.kHiddenSize + 511) // 512 * 512
         self.kDim, self.kInterDim = (

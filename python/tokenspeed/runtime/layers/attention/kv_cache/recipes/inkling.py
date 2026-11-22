@@ -221,8 +221,10 @@ class InklingRecipe(CacheRecipe):
     def _conv_columns(
         self, attention: tuple[CacheGroupDeclaration, ...]
     ) -> dict[str, tuple[CacheFieldSpec, ...]]:
-        """The ShortConv checkpoint columns, one entry per attention layer.
+        """The ShortConv checkpoint columns, one entry per convolution layer.
 
+        Each convolution layer's checkpoints ride its cache layer's pages
+        (``conv_layers_of_cache_layer``; several under a shared loop cache).
         The checkpoints alias their layer's KV planes, so they reuse the plane
         ids -- which means reproducing the group's plane numbering here. It is
         the same rule the layer walk applies (a group's Nth layer takes plane
@@ -262,38 +264,45 @@ class InklingRecipe(CacheRecipe):
                 hiddenconv_dtype
             ) > min(plane_bytes[k_plane], plane_bytes[v_plane])
             hidden_group = f"{HIDDENCONV_GROUP_ID}_{group_id}"
-            columns[KVCONV_GROUP_ID] += (
-                CacheFieldSpec(
-                    f"layer.{layer_id}.kvconv_k",
-                    k_plane,
-                    (checkpoint_rows, kv_row),
-                    cache_dtype_name(torch.bfloat16),
-                    exact_page_stride=False,
-                ),
-                CacheFieldSpec(
-                    f"layer.{layer_id}.kvconv_v",
-                    v_plane,
-                    (checkpoint_rows, kv_row),
-                    cache_dtype_name(torch.bfloat16),
-                    exact_page_stride=False,
-                ),
+            conv_layers = (
+                text_config.conv_layers_of_cache_layer(layer_id)
+                if layer_id < self.num_target_layers
+                else (layer_id,)
             )
-            columns[hidden_group] = columns.get(hidden_group, ()) + (
-                CacheFieldSpec(
-                    f"layer.{layer_id}.attnconv",
-                    f"unit.{occurrence}.hidden_k" if wide_hidden else k_plane,
-                    (checkpoint_rows, text_config.hidden_size),
-                    hiddenconv_dtype,
-                    exact_page_stride=False,
-                ),
-                CacheFieldSpec(
-                    f"layer.{layer_id}.mlpconv",
-                    f"unit.{occurrence}.hidden_v" if wide_hidden else v_plane,
-                    (checkpoint_rows, text_config.hidden_size),
-                    hiddenconv_dtype,
-                    exact_page_stride=False,
-                ),
-            )
+            for conv_layer in conv_layers:
+                prefix = conv_checkpoint_field_prefix(layer_id, conv_layer)
+                columns[KVCONV_GROUP_ID] += (
+                    CacheFieldSpec(
+                        f"{prefix}.kvconv_k",
+                        k_plane,
+                        (checkpoint_rows, kv_row),
+                        cache_dtype_name(torch.bfloat16),
+                        exact_page_stride=False,
+                    ),
+                    CacheFieldSpec(
+                        f"{prefix}.kvconv_v",
+                        v_plane,
+                        (checkpoint_rows, kv_row),
+                        cache_dtype_name(torch.bfloat16),
+                        exact_page_stride=False,
+                    ),
+                )
+                columns[hidden_group] = columns.get(hidden_group, ()) + (
+                    CacheFieldSpec(
+                        f"{prefix}.attnconv",
+                        f"unit.{occurrence}.hidden_k" if wide_hidden else k_plane,
+                        (checkpoint_rows, text_config.hidden_size),
+                        hiddenconv_dtype,
+                        exact_page_stride=False,
+                    ),
+                    CacheFieldSpec(
+                        f"{prefix}.mlpconv",
+                        f"unit.{occurrence}.hidden_v" if wide_hidden else v_plane,
+                        (checkpoint_rows, text_config.hidden_size),
+                        hiddenconv_dtype,
+                        exact_page_stride=False,
+                    ),
+                )
         return columns
 
     def _layer_config(self, layer_id: int):
@@ -330,11 +339,13 @@ class InklingRecipe(CacheRecipe):
             else 0
         )
         text_config = self.model_config.hf_config.get_text_config()
+        # The target's rings take its verify rows (InklingAttnBackend.from_config),
+        # with or without a draft model (model-free DUMMY drafting has none).
         total = _conv_ring_bytes(
             text_config=text_config,
             attn_config=self.attn_config,
-            num_layers=text_config.num_hidden_layers,
-            spec_tokens=draft_tokens,
+            num_layers=text_config.num_conv_layers,
+            spec_tokens=self.attn_config.speculative_num_draft_tokens,
         )
         if self.draft_has_conv:
             total += _conv_ring_bytes(
@@ -350,26 +361,35 @@ class InklingRecipe(CacheRecipe):
         return total
 
 
+def conv_checkpoint_field_prefix(cache_layer: int, conv_layer: int) -> str:
+    """The field-id prefix of a convolution layer's checkpoints on a cache
+    layer's pages: the layer's own, or, for another convolution layer sharing
+    the cache layer (a later pass under a shared loop cache), one naming it."""
+    if conv_layer == cache_layer:
+        return f"layer.{cache_layer}"
+    return f"layer.{cache_layer}.conv{conv_layer}"
+
+
 def _fp8_sconv() -> bool:
     return os.environ.get("INKLING_FP8_SCONV", "0") != "0"
 
 
 def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
-    """Served KV heads per layer, before TP sharding.
+    """Served KV heads per cache layer, before TP sharding.
 
     Each kind's native checkpoint count (hetero byte-uniform slots, #647), so
     page sizes derive from these. Also read by the PD field-partition logic,
     which needs the global width.
     """
     text_config = model_config.hf_config.get_text_config()
-    local = set(text_config.local_layer_ids)
+    local = set(text_config.local_cache_layer_ids)
     return tuple(
         (
             text_config.swa_num_key_value_heads
             if layer_id in local
             else text_config.ckpt_num_key_value_heads
         )
-        for layer_id in range(text_config.num_hidden_layers)
+        for layer_id in range(text_config.num_cache_layers)
     )
 
 

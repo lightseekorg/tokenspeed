@@ -87,6 +87,37 @@ pub(super) fn run_in_child(test: &str, child: impl FnOnce()) {
     assert!(test_child(test).wait().success());
 }
 
+/// Capture a real process-exit path while keeping failure cleanup bounded.
+pub(super) fn captured_child(test: &str) -> std::process::Output {
+    let mut child = TestChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(CHILD, test)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = child.0.stdout.take().unwrap();
+    let mut stderr = child.0.stderr.take().unwrap();
+    let out = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let err = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let status = child.wait();
+    std::process::Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
+    }
+}
+
 #[derive(Clone)]
 struct LogWriter(Arc<Mutex<Vec<u8>>>);
 

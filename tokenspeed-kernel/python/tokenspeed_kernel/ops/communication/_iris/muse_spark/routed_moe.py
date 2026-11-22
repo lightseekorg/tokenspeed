@@ -26,7 +26,7 @@ sum the normalized routes. The Lamport and write-through variants specialize
 4096-feature outputs with eight routes per token; route maps mask nonlocal work.
 """
 
-from tokenspeed_kernel._triton import gl, gluon, tl
+from tokenspeed_kernel._triton import gl, gluon, libdevice, tl
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_group_heap_base,
     _iris_sanitize_lamport_bf16,
@@ -275,9 +275,12 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
     route_weights,
     norm_weight,
     output,
+    codes,
+    scales,
     row_stride,
     EPS: gl.constexpr,
     WEIGHT_OFFSET: gl.constexpr,
+    INT8_BLOCK16: gl.constexpr,
     WAIT_STORES: gl.constexpr,
 ):
     """Normalize and sum weighted expert routes using write-through output stores.
@@ -287,6 +290,12 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
     previous peer reads and flush earlier cached output writes before launch.
     Input row strides are divisible by eight. Stores finish before return so
     the following reduce-scatter can read output without a staging copy.
+
+    With INT8_BLOCK16 the BF16 rows are not stored; their int8-block16 payload
+    (payload.py: per 16 elements scale = max|x| / 127, code = rint(x / scale)
+    clamped to [-127, 127], each one correctly rounded FP32 operation) goes to
+    codes [rows * 4096] and scales [rows * 256] with ordinary stores, the same
+    bits encode_int8_block16 makes from the stored BF16 rows.
     """
     gl.static_assert(gl.num_warps() == 8)
     token = gl.program_id(0)
@@ -306,9 +315,31 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
             inverse = gl.rsqrt(variance + EPS)
             route_weight = gl.load(route_weights + route).to(gl.float32)
             combined = gl.fma(values * inverse, route_weight, combined)
-    gl.amd.cdna4.buffer_store(
-        combined.to(gl.bfloat16), output, token * 4096 + columns, cache=".wt"
-    )
+    if INT8_BLOCK16:
+        # A thread's 8 contiguous columns are half of one 16-element block, its
+        # lane pair holding the other half, so [256, 16] keeps the registers.
+        block_layout: gl.constexpr = gl.BlockedLayout([1, 8], [32, 2], [8, 1], [1, 0])
+        blocks = gl.convert_layout(
+            gl.reshape(combined.to(gl.bfloat16).to(gl.float32), [256, 16]),
+            block_layout,
+        )
+        amax = gl.max(gl.abs(blocks), axis=1)
+        scale = gl.div_rn(gl.maximum(amax, 1e-30), 127.0)
+        quantized = libdevice.rint(gl.div_rn(blocks, gl.expand_dims(scale, 1)))
+        quantized = gl.minimum(gl.maximum(quantized, -127.0), 127.0).to(gl.int8)
+        block_rows = gl.arange(0, 256, layout=gl.SliceLayout(1, block_layout))
+        block_columns = gl.arange(0, 16, layout=gl.SliceLayout(0, block_layout))
+        code_offsets = (
+            token * 4096
+            + gl.expand_dims(block_rows, 1) * 16
+            + gl.expand_dims(block_columns, 0)
+        )
+        gl.amd.cdna4.buffer_store(quantized, codes, code_offsets)
+        gl.amd.cdna4.buffer_store(scale, scales, token * 256 + block_rows)
+    else:
+        gl.amd.cdna4.buffer_store(
+            combined.to(gl.bfloat16), output, token * 4096 + columns, cache=".wt"
+        )
     # Finish every subgroup's write-through stores before returning.
     WAIT_STORES()
     gl.barrier()

@@ -83,6 +83,7 @@ def _medium_decode_moe_config(BLOCK_M, BLOCK_N, BLOCK_K):
         4,
         W_VIA_VGPR=False,
         W_PREFETCH=False,
+        W_SCALE_N16_GATE_UP=False,
     )
 
 

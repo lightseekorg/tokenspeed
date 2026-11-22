@@ -7,6 +7,14 @@ on:
         description: "tokenspeed-smg version pin, for example 1.4.1.post20260519."
         required: true
         type: string
+      smg_grpc_proto_version:
+        description: "tokenspeed-smg-grpc-proto version pin."
+        required: true
+        type: string
+      smg_grpc_servicer_version:
+        description: "tokenspeed-smg-grpc-servicer version pin."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -23,38 +31,56 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
 
       - name: Configure git author
         run: |
           git config user.name "lightseek-bot"
           git config user.email "243258330+lightseek-bot@users.noreply.github.com"
 
-      - name: Update the tokenspeed-smg pin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit
+        run: python -m pip install pre-commit
+
+      - name: Update the tokenspeed-smg dependency pins
         id: update
         env:
           SMG_VERSION: ${{ inputs.smg_version }}
+          SMG_GRPC_PROTO_VERSION: ${{ inputs.smg_grpc_proto_version }}
+          SMG_GRPC_SERVICER_VERSION: ${{ inputs.smg_grpc_servicer_version }}
         run: |
           set -euo pipefail
 
           pep440='^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?(\+[A-Za-z0-9.]+)?$'
-          if ! [[ "$SMG_VERSION" =~ $pep440 ]]; then
-            echo "Invalid tokenspeed-smg version: $SMG_VERSION" >&2
-            exit 1
-          fi
+          for version in "$SMG_VERSION" "$SMG_GRPC_PROTO_VERSION" "$SMG_GRPC_SERVICER_VERSION"; do
+            if ! [[ "$version" =~ $pep440 ]]; then
+              echo "Invalid dependency version: $version" >&2
+              exit 1
+            fi
+          done
 
           python - <<'PY'
           import os
           import re
           from pathlib import Path
 
-          version = os.environ["SMG_VERSION"]
+          versions = {
+              "tokenspeed-smg": os.environ["SMG_VERSION"],
+              "tokenspeed-smg-grpc-proto": os.environ["SMG_GRPC_PROTO_VERSION"],
+              "tokenspeed-smg-grpc-servicer": os.environ["SMG_GRPC_SERVICER_VERSION"],
+          }
           path = Path("python/pyproject.toml")
           text = path.read_text()
-          pattern = r'(?m)^(?P<lead>\s*")tokenspeed-smg==[^"]+(?P<tail>",?)\s*$'
-          text, count = re.subn(pattern, lambda m: f'{m["lead"]}tokenspeed-smg=={version}{m["tail"]}', text, count=1)
-          if count != 1:
-              raise SystemExit("pin for tokenspeed-smg not found in python/pyproject.toml")
+          for package, version in versions.items():
+              pattern = rf'(?m)^(?P<lead>[ \t]*"){re.escape(package)}==[^"]+(?P<tail>",?)[ \t]*$'
+              text, count = re.subn(pattern, lambda m: f'{m["lead"]}{package}=={version}{m["tail"]}', text)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one pin for {package} in {path}, found {count}")
           path.write_text(text)
           PY
 
@@ -65,31 +91,46 @@ jobs:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           SMG_VERSION: ${{ steps.update.outputs.smg_version }}
         run: |
+          set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then
             echo "LIGHTSEEK_BOT_TOKEN is required because this repository does not allow GITHUB_TOKEN to create pull requests." >&2
             exit 1
           fi
 
           if git diff --quiet; then
-            echo "The tokenspeed-smg pin already matches the requested version."
+            echo "The tokenspeed-smg dependency pins already match the requested versions."
             exit 0
           fi
 
+          gh auth status
+          [[ "$(gh api user --jq .login)" = lightseek-bot ]]
+          remote=$(git remote get-url --push origin)
+          repo=${remote#https://github.com/}
+          repo=${repo%.git}
+          [[ "$repo" = "$GITHUB_REPOSITORY" ]]
+          gh repo view "$repo" --json visibility --jq .visibility
+
           branch="bot/update-tokenspeed-smg-${SMG_VERSION//+/-}"
-          git checkout -b "$branch"
+          expected_head=$(git rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null || true)
+          git checkout -B "$branch"
+          SKIP=clang-format pre-commit run --all-files
           git add python/pyproject.toml
-          git commit -s -m "Update the tokenspeed-smg pin to ${SMG_VERSION}"
-          git push --force origin "HEAD:refs/heads/${branch}"
+          git commit -s -m "Update tokenspeed-smg and gRPC dependency pins"
+          previous_head=$(git rev-parse HEAD)
+          git fetch origin main
+          git rebase origin/main
+          if [[ "$(git rev-parse HEAD)" != "$previous_head" ]]; then
+            SKIP=clang-format pre-commit run --all-files
+          fi
+          git push --force-with-lease="refs/heads/$branch:$expected_head" origin "HEAD:refs/heads/$branch"
 
           cat > pr-body.md <<EOF
-          ## Summary
-          - update \`tokenspeed-smg\` to ${SMG_VERSION}
+          Keep the gateway and its gRPC packages on the same published release so their interfaces stay aligned.
 
-          ## Tests
-          - Not run (version-only workflow update)
+          Validation: \`pre-commit run --all-files\` (C++ formatting skipped; no C++ changes).
           EOF
 
-          title="Update the tokenspeed-smg pin to ${SMG_VERSION}"
+          title="Update tokenspeed-smg and gRPC dependency pins"
           if gh pr view "$branch" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh pr edit "$branch" \
               --repo "$GITHUB_REPOSITORY" \

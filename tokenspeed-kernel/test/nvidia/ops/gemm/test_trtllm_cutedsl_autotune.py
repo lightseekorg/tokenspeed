@@ -44,7 +44,8 @@ def _inputs(m, n, k):
     torch.manual_seed(1639)
     a = torch.randn((m, k), device="cuda").to(torch.float8_e4m3fn)
     b = torch.randn((n, k), device="cuda").to(torch.float8_e4m3fn)
-    sa = torch.rand((m, k // 128), device="cuda") * 0.03 + 0.01
+    # The CuTe-DSL kernel reads MN-major activation scales.
+    sa = (torch.rand((k // 128, m), device="cuda") * 0.03 + 0.01).t()
     sb = torch.rand((n // 128, k // 128), device="cuda") * 0.03 + 0.01
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     return [a, b, sa, sb, out]

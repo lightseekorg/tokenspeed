@@ -32,9 +32,6 @@ from tokenspeed_kernel.ops.communication import (
     allreduce_sandwich_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
-    allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
@@ -527,67 +524,6 @@ class FusedRMSNorm(nn.Module):
                 eps=self.q_a_norm.variance_epsilon,
             )
         return input_q_a, input_kv_a
-
-    def forward_with_allgather_fusion(
-        self,
-        rank: int,
-        group: tuple[int, ...],
-        qkv: torch.Tensor,
-        total_num_tokens: int,
-        fuse_block_quant_fp8: bool = False,
-        trigger_completion_at_end: bool = False,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        """
-        Forward method with allgather fusion, performing allgather + dual RMSNorm + optional FP8 block quantization.
-
-        This method fuses allgather communication with dual RMSNorm computation
-        and optional FP8 block-wise quantization in a single kernel launch.
-
-        Args:
-            qkv: Input tensor to allgather, shape [num_token_current_rank, q_lora_rank + kv_lora_rank + qk_rope_head_dim]
-            fuse_block_quant_fp8: Whether to perform FP8 block-wise quantization on the first norm output
-            trigger_completion_at_end: Whether to trigger completion event at the end of kernel
-
-        Returns:
-            Tuple of (allgather_out, quant_out, k_nope, block_scale):
-                - allgather_out: Gathered tensor, shape [num_token_all_group, hidden_dim]
-                - quant_out: FP8 quantized first norm output (q_contiguous), None if fuse_block_quant_fp8=False
-                - k_nope: Second norm output
-                - block_scale: Quantization scales, None if fuse_block_quant_fp8=False
-        """
-
-        if len(group) > 1:
-            fused_result = allgather_dual_rmsnorm(
-                qkv=qkv,
-                total_num_tokens=total_num_tokens,
-                rank=rank,
-                group=_get_process_group(group),
-                weight_q_a=self.weight_q_a,
-                weight_kv_a=self.weight_kv_a,
-                eps_q=self.q_a_norm.variance_epsilon,
-                eps_kv=self.kv_a_norm.variance_epsilon,
-                max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                block_quant_fp8=fuse_block_quant_fp8,
-                trigger_completion_at_end=trigger_completion_at_end,
-                fp32_acc=False,
-            )
-            if fused_result[0] is not None:
-                return fused_result
-
-        q_lora_rank = self.weight_q_a.shape[0]
-        kv_lora_rank = self.weight_kv_a.shape[0]
-        q = qkv[..., :q_lora_rank]
-        k_nope = qkv[..., q_lora_rank : q_lora_rank + kv_lora_rank]
-        q_contiguous = torch.empty_like(q)
-        if q.shape[0] > 0:
-            self.forward(input_q_a=q, input_kv_a=k_nope, output_q_a=q_contiguous)
-
-        return qkv, q_contiguous, k_nope, None
 
 
 def _check_plain_gamma(*norms: RMSNorm) -> None:

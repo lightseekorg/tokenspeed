@@ -33,10 +33,12 @@ runner:
     - amd-mi35x-8gpu-test
 env:
   CI: "true"
-  # main compiles kernels while serving under this recipe (gaps in the startup warmups); set this to error once those warmups cover them.
+  # Set this to error once a run of this recipe shows no compile while serving.
   TOKENSPEED_JIT_COMPILE_CHECK: warn
 install:
   - bash test/ci_system/install_deps_rocm.sh
+# Serve the engine's own startup requests before readiness, so the kernels only
+# a live request reaches compile before the first client request.
 server:
   command: >-
     ts serve
@@ -68,6 +70,7 @@ server:
     --host 127.0.0.1
     --port 8000
     --policy round_robin
+    --enable-startup-requests
     --engine-startup-timeout 3000
     --gateway-startup-timeout 600
   ready:

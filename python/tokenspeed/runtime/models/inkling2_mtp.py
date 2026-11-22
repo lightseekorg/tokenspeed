@@ -42,8 +42,10 @@ from tokenspeed_kernel.ops.activation._triton.gated_recurrence import (
 )
 from tokenspeed_kernel.ops.attention.prologue import HeadNorm
 from tokenspeed_kernel.ops.embedding import apply_k_rope
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 
-# skinny_mm is not a registered GEMM solution; skinny_mm_supported sends other inputs to rnn_step.
+# skinny_mm is not a registered GEMM solution; skinny_mm_supported sends other
+# CUDA inputs to the registry GEMM, and CPU inputs to rnn_step.
 from tokenspeed_kernel.ops.gemm.triton_skinny import (
     SKINNY_MM_MAX_ROWS,
     skinny_mm,
@@ -353,7 +355,8 @@ class Inkling2MTPHead(nn.Module):
         self, hidden_states: torch.Tensor, features: torch.Tensor
     ) -> torch.Tensor | None:
         """FP32 ``[rows, steps, 3 * rank]`` projection of every step's hidden
-        row and the features, bias included, or None where ``rnn_step`` runs.
+        row and the features, bias included, or None (CPU inputs) where
+        ``rnn_step`` runs.
 
         ``rnn_proj`` sums ``[state | previous | hidden | features]``; only the
         first two change between steps, so a step adds just their products
@@ -364,8 +367,14 @@ class Inkling2MTPHead(nn.Module):
             (hidden_states, features[:, None].expand(-1, steps, -1)), dim=-1
         ).reshape(rows * steps, -1)
         weight = self.rnn_proj.weight[:, 2 * self.markov_rank :]
-        if not skinny_mm_supported(inputs[:1], weight):
+        if not inputs.is_cuda:
             return None
+        if not skinny_mm_supported(inputs[:1], weight):
+            # The registry GEMM into FP32, the bias added in FP32.
+            projected = kernel_mm(
+                inputs, weight, bias=self.rnn_proj.bias, out_dtype=torch.float32
+            )
+            return projected.view(rows, steps, -1)
         chunks = [
             skinny_mm(
                 inputs[start : start + SKINNY_MM_MAX_ROWS],
@@ -380,7 +389,11 @@ class Inkling2MTPHead(nn.Module):
         return projected.view(rows, steps, -1)
 
     def step_logits(
-        self, base: torch.Tensor, latent: torch.Tensor, out: torch.Tensor
+        self,
+        base: torch.Tensor,
+        latent: torch.Tensor,
+        out: torch.Tensor,
+        keys_out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Corrected, soft-capped local logits written into ``out``.
 
@@ -389,6 +402,9 @@ class Inkling2MTPHead(nn.Module):
             latent: BF16 ``[rows, markov_rank]`` recurrent outputs.
             out: BF16 ``[rows, width]`` destination, ``width >= local_vocab``;
                 columns past the valid vocabulary are ``-inf``.
+            keys_out: CUDA int64 ``[rows, capped_logit_sum_key_blocks(width)]``
+                receiving ``out``'s block argmax keys over global vocabulary
+                ids (``capped_logit_sum``), or None.
 
         Returns:
             ``out``.
@@ -399,8 +415,16 @@ class Inkling2MTPHead(nn.Module):
         )
         if base.is_cuda:
             return capped_logit_sum(
-                base, correction, self.softcap or None, valid_cols, out
+                base,
+                correction,
+                self.softcap or None,
+                valid_cols,
+                out,
+                keys_out=keys_out,
+                key_offset=self.vocab_start,
             )
+        if keys_out is not None:
+            raise ValueError("argmax keys come from the CUDA step logits only")
         logits = base + correction
         if self.softcap:
             logits = (self.softcap * torch.tanh(logits.float() / self.softcap)).to(
@@ -418,6 +442,7 @@ class Inkling2MTPHead(nn.Module):
         hidden_states: torch.Tensor,
         f_rnn: torch.Tensor,
         logits_out: torch.Tensor,
+        keys_out: torch.Tensor | None,
         sampler: Callable[[torch.Tensor, int], torch.Tensor],
         shard_padding: tuple[int, int] | None,
     ) -> torch.Tensor:
@@ -429,8 +454,9 @@ class Inkling2MTPHead(nn.Module):
         returns global vocabulary IDs, or with ``shard_padding = (padded,
         shard)`` its ``rank * padded + column`` indices over the padded local
         rows: the steps then feed them back as they are and the returned
-        proposals are vocabulary IDs. No model-owned sampling state is
-        retained.
+        proposals are vocabulary IDs. With ``keys_out`` each step's logits
+        also leave their block argmax keys there (``step_logits``) for the
+        sampler. No model-owned sampling state is retained.
         """
         state = hidden_states.new_zeros(hidden_states.shape[0], self.markov_rank)
         tokens = []
@@ -462,7 +488,9 @@ class Inkling2MTPHead(nn.Module):
                     self.rnn_proj.weight[:, : 2 * self.markov_rank],
                     shard_padding=shard_padding if step else None,
                 )
-            logits = self.step_logits(base_logits[:, step], latent, logits_out)
+            logits = self.step_logits(
+                base_logits[:, step], latent, logits_out, keys_out
+            )
             previous = sampler(logits, step)
             tokens.append(previous)
         proposals = torch.stack(tokens, dim=1)

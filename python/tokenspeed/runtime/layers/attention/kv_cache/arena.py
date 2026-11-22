@@ -34,8 +34,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    FLAT_KV_PLANE,
     CacheMemoryPlan,
+    is_flat_kv_plane,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -149,33 +149,33 @@ class CacheArena:
         # once here.
         # A group may have no fields on this rank: pipeline parallelism keeps
         # every group but drops the fields of layers another stage owns.
-        self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
-        for group in plan.groups:
-            page_count, fields = plan.page_field_layout(group.group_id)
-            for base, stride, size in fields:
-                if base + (page_count - 1) * stride + size > plan.arena_bytes:
-                    raise ValueError(
-                        f"cache group {group.group_id!r} field geometry reaches "
-                        f"past the {plan.arena_bytes}-byte arena"
-                    )
-            self._zero_field_tables[group.group_id] = (
-                page_count,
-                torch.tensor(fields, dtype=torch.int64, device=device).reshape(
-                    len(fields), 3
-                ),
-                max((size for _, _, size in fields), default=0),
-            )
-        self._cache_group_specs_by_id = {
-            spec.group_id: spec for spec in cache_group_specs
-        }
-        # One adapter for the whole arena. The allocation happens inside its
-        # region, so the sleep/wake lifetime is a property of the arena.
-        # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
-        # sleep and rebuilt after wake (paging overwrites; clear() zeros the
-        # remapped pages).
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
+        with self.memory_saver_adapter.named_region("attention_state"):
+            for group in plan.groups:
+                page_count, fields = plan.page_field_layout(group.group_id)
+                for base, stride, size in fields:
+                    if base + (page_count - 1) * stride + size > plan.arena_bytes:
+                        raise ValueError(
+                            f"cache group {group.group_id!r} field geometry reaches "
+                            f"past the {plan.arena_bytes}-byte arena"
+                        )
+                self._zero_field_tables[group.group_id] = (
+                    page_count,
+                    torch.tensor(fields, dtype=torch.int64, device=device).reshape(
+                        len(fields), 3
+                    ),
+                    max((size for _, _, size in fields), default=0),
+                )
+        self._cache_group_specs_by_id = {
+            spec.group_id: spec for spec in cache_group_specs
+        }
+        # The payload and geometry share an adapter but have distinct lifetimes.
+        # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
+        # sleep and rebuilt after wake (paging overwrites; clear() zeros the
+        # remapped pages).
         self.storage_plan = storage_plan or plan_cache_storage(
             plan,
             cache_group_specs,
@@ -332,7 +332,7 @@ class CacheArena:
         ):
             token_rows = spec.rows_per_page
         if (
-            field.plane_id == FLAT_KV_PLANE
+            is_flat_kv_plane(field.plane_id)
             and spec.attn_kind == "full_history"
             and field.shape[0] == spec.rows_per_page
         ):

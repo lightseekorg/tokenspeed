@@ -289,7 +289,14 @@ if platform.is_amd:
             dtype=torch.int32,
             device=x.device,
         )
-        return _fp32_router_gemv_impl(x, weight, multiplier, tile_counters, enable_pdl)
+        return _fp32_router_gemv_impl(
+            x,
+            weight,
+            multiplier,
+            tile_counters,
+            enable_pdl,
+            warm_variants=is_warming_up(),
+        )
 
     def _supports_router_gemv_mm_problem(m: int, n: int, k: int) -> bool:
         # Any router shape the traits admit tiles the router half; the decode
@@ -350,6 +357,7 @@ if platform.is_amd:
             mm_b,
             mm_out,
             counters[router_counters:],
+            warm_variants=is_warming_up(),
         )
 
     try:
@@ -1741,6 +1749,8 @@ if platform.is_amd:
     # 5-16 tokens reuse the decode GEMV tiles, matching the GEMV and the
     # standalone partials bit for bit. The MLA projection's unfused path runs
     # hipBLASLt instead, which the fusion beats by dropping the partials launch.
+    # 3808 is K3.1's DSA decode projection, the MLA one with the indexer's key
+    # and head-weight rows stacked below it.
     @register_kernel(
         "gemm",
         "linear_attnres_partials",
@@ -1763,7 +1773,7 @@ if platform.is_amd:
         traits={
             "tokens": frozenset(range(5, 17)),
             "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
-            "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
+            "output_size": frozenset({3648, 3808, KIMI3_QKVFAB_SIZE}),
             "num_blocks": frozenset(range(1, 12)),
             "inputs_contiguous": frozenset({True}),
         },
