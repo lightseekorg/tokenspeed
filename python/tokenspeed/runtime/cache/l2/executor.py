@@ -351,10 +351,14 @@ class HostCacheExecutor:
         )
         aligned_l2_blocks = host_lcm_blocks
         if l2_tier and alignment_padding:
-            l2_bytes = host_lcm_blocks * host_lcm_block_bytes
-            reservation = pinned_host_bytes(l2_bytes)
-            padded_reservation = pinned_host_bytes(l2_bytes + alignment_padding)
-            if padded_reservation > max(reservation, l2_bytes + alignment_padding):
+            requested_l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+            reservation = pinned_host_bytes(requested_l2_bytes)
+            padded_reservation = pinned_host_bytes(
+                requested_l2_bytes + alignment_padding
+            )
+            if padded_reservation > max(
+                reservation, requested_l2_bytes + alignment_padding
+            ):
                 aligned_blocks = (
                     largest_pinned_fit(
                         reservation,
@@ -369,7 +373,7 @@ class HostCacheExecutor:
                         logger.warning(
                             f"Reduced Host L2 from {host_lcm_blocks} to "
                             f"{aligned_blocks} LCM blocks to keep alignment padding "
-                            f"within its {reservation} byte pinned reservation"
+                            f"within its {reservation / 1e9:.2f} GB pinned reservation"
                         )
                         host_lcm_blocks = aligned_blocks
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
