@@ -90,6 +90,8 @@ def test_native_capture_selects_raw_entries_then_final_norm(
         tau: torch.Tensor | None,
         mailbox: object,
         share: SequenceShare | None,
+        pass_idx: int,
+        messages: object,
     ) -> None:
         # Replace only GPU decoder work. The actual loop and residual owner run.
         attention = torch.full_like(

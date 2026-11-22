@@ -20,15 +20,12 @@
 
 """Native KDA prefill state layouts and preparation contracts."""
 
-import math
-
 import pytest
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity, kda_paged_prefill
-from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import KernelRegistry
-from utils import assert_no_cute_compile
+from tokenspeed_kernel.thirdparty.flashinfer.kda_plan import _persistent_kda_plan
+from utils import assert_no_cute_compile, assert_no_triton_compile
 
 HEADS, DIM = 12, 128
 
@@ -66,111 +63,68 @@ def _actual(inputs, state, bounds, cpu, layout):
     )
 
 
-@pytest.mark.parametrize("layout", ["v_major", "k_major"])
-def test_dispatch_native_state_and_shared_boundaries(
-    monkeypatch, layout, b300_platform
-):
-    """Exercise NVIDIA layout dispatch on CPU tensors on any host platform."""
-    inputs, native_state, bounds, cpu = _inputs("cpu", [17, 15])
-    state = (
-        native_state
-        if layout == "v_major"
-        else native_state.transpose(-1, -2).contiguous()
-    )
-    seen = []
-    final = native_state + 1
-
-    def forward(q, k, v, g, a_log, dt_bias, beta, boundaries, initial, **kwargs):
-        assert "out" not in kwargs
-        assert boundaries is bounds
-        assert torch.equal(initial, native_state)
-        if layout == "v_major":
-            assert initial is state
-        assert g.dtype == torch.float32 and g.is_contiguous()
-        assert beta.is_contiguous()
-        assert torch.equal(g, inputs[3].float())
-        assert torch.equal(beta, inputs[4])
-        seen.append(initial)
-        return v, final
-
-    monkeypatch.setattr(
-        cutedsl_op, "cutedsl_kda_check_config", lambda bound: None, raising=False
-    )
-    monkeypatch.setattr(
-        cutedsl_op,
-        "cutedsl_kda_workspace_size",
-        lambda *a, **k: 0,
-        raising=False,
-    )
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", forward, raising=False)
-    registry = KernelRegistry.get()
-    real_platform = Platform.get()
-    try:
-        # CPU tensors still go through platform-based kernel selection.
-        Platform.override(b300_platform)
-        registry.clear_cache()
-        for _ in range(2):
-            result = _actual(inputs, state, bounds, cpu, layout)
-            expected = final if layout == "v_major" else final.transpose(-1, -2)
-            assert torch.equal(result.final_state, expected)
-            assert result.final_state.data_ptr() == final.data_ptr()
-    finally:
-        Platform.override(real_platform)
-        registry.clear_cache()
-    assert len(seen) == 2
-
-
 @pytest.fixture
 def native_cuda():
     if not torch.cuda.is_available() or not cutedsl_op.cutedsl_kda_supported():
-        pytest.skip("requires CUDA and the native CuteDSL KDA payload")
+        pytest.skip("requires FlashInfer CuTe KDA on SM100/SM103")
 
 
-def _former_preparation(inputs, state, bounds, cpu):
-    q, k, v, g, beta, a_log, dt_bias = inputs
-    # Former dispatcher: v_major cache -> k_major wrapper.
-    intermediate = state.transpose(-1, -2).contiguous()
-    # Former wrapper: int32 boundaries -> int64, gate cast, beta pack,
-    # then k_major -> v_major native input. No altered scan arithmetic.
-    bounds = bounds.to(torch.int32).to(torch.int64)
-    g = g.float().contiguous()
-    beta = beta.contiguous()
-    native_state = intermediate.transpose(-1, -2).contiguous()
-    workspace_bytes = cutedsl_op.cutedsl_kda_workspace_size(
-        bounds, HEADS, cu_seqlens_cpu=cpu
+def _dense_scan(inputs, state, bounds, cpu):
+    return _actual(tuple(t.contiguous() for t in inputs), state, bounds, cpu, "v_major")
+
+
+def test_prefill_reuses_compilation_across_shapes(native_cuda):
+    for heads in (12, 24, 96):
+        inputs, state, bounds, cpu = _inputs("cuda", [16], heads=heads)
+        _actual(inputs, state, bounds, cpu, "v_major")
+    with assert_no_cute_compile(), assert_no_triton_compile(_persistent_kda_plan):
+        for lengths, heads in (
+            ([1], 12),
+            ([17, 33], 12),
+            ([17, 19, 23, 31], 24),
+            ([1], 96),
+            ([31, 129, 7], 96),
+            ([3] * 16, 96),
+        ):
+            inputs, state, bounds, cpu = _inputs("cuda", lengths, heads=heads)
+            qkv = torch.stack(inputs[:3], dim=2).unbind(2)
+            actual = _actual((*qkv, *inputs[3:]), state, bounds, cpu, "v_major")
+            expected = _dense_scan(inputs, state, bounds, cpu)
+            torch.testing.assert_close(actual.out, expected.out, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual.final_state, expected.final_state, rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("layout", ["v_major", "k_major"])
+def test_prefill_preserves_state_layout(native_cuda, layout):
+    inputs, state, bounds, cpu = _inputs("cuda", [17, 33])
+    expected = _actual(inputs, state, bounds, cpu, "v_major")
+    if layout == "k_major":
+        state = state.transpose(-1, -2).contiguous()
+    actual = _actual(inputs, state, bounds, cpu, layout)
+    final = (
+        actual.final_state
+        if layout == "v_major"
+        else actual.final_state.transpose(-1, -2)
     )
-    workspace = (
-        torch.empty(workspace_bytes, device=q.device, dtype=torch.uint8)
-        if workspace_bytes
-        else None
-    )
-    return cutedsl_op.cutedsl_kda_forward(
-        q,
-        k,
-        v,
-        g,
-        a_log,
-        dt_bias,
-        beta,
-        bounds,
-        native_state,
-        scale=1.0 / math.sqrt(q.shape[-1]),
-        workspace=workspace,
-        cu_seqlens_cpu=cpu,
-    )
+    torch.testing.assert_close(actual.out, expected.out, rtol=0, atol=0)
+    torch.testing.assert_close(final, expected.final_state, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("lengths", [[16], [100], [768], [868], [33, 67]])
 @pytest.mark.parametrize("fresh", [False, True])
-def test_native_prefill_bitwise_parity(native_cuda, lengths, fresh):
-    inputs, state, bounds, cpu = _inputs("cuda", lengths)
+@pytest.mark.parametrize("heads", [12, 96])
+def test_strided_prefill_matches_dense(native_cuda, lengths, fresh, heads):
+    inputs, state, bounds, cpu = _inputs("cuda", lengths, heads=heads)
     if fresh:
         state.zero_()
     state_before = state.clone()
-    expected_out, expected_state = _former_preparation(inputs, state, bounds, cpu)
-    actual = _actual(inputs, state, bounds, cpu, "v_major")
-    assert torch.equal(actual.out, expected_out)
-    assert torch.equal(actual.final_state, expected_state)
+    expected = _dense_scan(inputs, state, bounds, cpu)
+    qkv = torch.stack(inputs[:3], dim=2).unbind(2)
+    actual = _actual((*qkv, *inputs[3:]), state, bounds, cpu, "v_major")
+    assert torch.equal(actual.out, expected.out)
+    assert torch.equal(actual.final_state, expected.final_state)
     assert torch.equal(state, state_before)
 
 
@@ -187,10 +141,12 @@ def test_bf16_initial_state_is_widened_before_the_native_scan(native_cuda, lengt
 
 
 @pytest.mark.parametrize(
-    ("lengths", "heads"), [([1], 12), ([1, 33], 12), ([17, 65], 96)]
+    ("lengths", "heads"),
+    [([1], 12), ([1, 33], 12), ([1], 96), ([17, 65], 96), ([17, 31, 7, 65], 24)],
 )
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_cudnn_strided_prefill_matches_recurrence(lengths, heads, state_dtype):
+@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+def test_strided_prefill_matches_recurrence(lengths, heads, state_dtype, backend_name):
     from tokenspeed_kernel.numerics.torch.attention.kda import torch_kda_recurrent
     from tokenspeed_kernel.ops.attention.kda.cudnn import cudnn_kda_supported
 
@@ -212,7 +168,7 @@ def test_cudnn_strided_prefill_matches_recurrence(lengths, heads, state_dtype):
         cu_seqlens_cpu=cpu,
         capacity=None,
         lower_bound=-5.0,
-        solution="cudnn",
+        solution=backend_name,
         recurrent_layout="v_major",
     )
     outputs, states = [], []
@@ -242,47 +198,21 @@ def test_cudnn_strided_prefill_matches_recurrence(lengths, heads, state_dtype):
     torch.testing.assert_close(state, seed, atol=0, rtol=0)
 
 
-def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
-    inputs, state, bounds, cpu = _inputs("cuda", [1, 67])
-    tensors = (
-        tuple(
-            torch.cat((tensor, torch.full_like(tensor[:, :32], float("nan"))), dim=1)
-            for tensor in inputs[:5]
-        )
-        + inputs[5:]
-    )
-    expected = _actual(inputs, state, bounds, cpu, "v_major")
-    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_supports_prepared_plan", lambda: False)
-    actual = kda_paged_prefill(
-        *tensors,
-        initial_state=state,
-        cu_seqlens=bounds,
-        cu_seqlens_cpu=cpu,
-        capacity=KdaPrefillCapacity(100, 2),
-        lower_bound=-5.0,
-        override=None,
-        solution="cutedsl_kda",
-        recurrent_layout="v_major",
-    )
-    torch.testing.assert_close(actual.out[:, :68], expected.out, rtol=0, atol=0)
-    torch.testing.assert_close(actual.final_state, expected.final_state, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("sequences", [1, 2, 4, 8])
 @pytest.mark.parametrize("capacity", [256, 2048, 8192])
-@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+@pytest.mark.parametrize(
+    ("backend_name", "heads"), [("cutedsl_kda", 12), ("cutedsl_kda", 96), ("cudnn", 12)]
+)
 def test_capacity_preparation_dynamic_replay(
-    native_cuda, sequences, capacity, backend_name
+    native_cuda, sequences, capacity, backend_name, heads
 ):
-    """Isolate device-plan replay with new GPU bounds and poisoned padding.
+    """Replay new GPU bounds with the runtime's zero-padded inputs.
 
     The captured call does not rerun Python admission against its CPU mirror.
     Production runtime must refresh both mirrors before replay.
     """
-    if backend_name == "cutedsl_kda":
-        assert cutedsl_op.cutedsl_kda_supports_prepared_plan()
     lengths = [capacity // sequences] * sequences
-    inputs, state, bounds, cpu = _inputs("cuda", lengths)
+    inputs, state, bounds, cpu = _inputs("cuda", lengths, heads=heads)
     state_before = state.clone()
 
     def run():
@@ -319,7 +249,7 @@ def test_capacity_preparation_dynamic_replay(
         bounds.copy_(new_cpu)
         for tensor in inputs[:5]:
             tensor.copy_(torch.randn_like(tensor) * 0.1)
-            tensor[:, live:].fill_(float("nan"))
+            tensor[:, live:].zero_()
         exact = tuple(t[:, :live] for t in inputs[:5]) + inputs[5:]
         expected = kda_paged_prefill(
             *exact,
@@ -366,7 +296,7 @@ def test_native_prefill_cuda_graph_replay(native_cuda):
     for _ in range(3):
         for tensor in (*inputs[:5], state):
             tensor.copy_(torch.randn_like(tensor) * 0.1)
-        expected_out, expected_state = _former_preparation(inputs, state, bounds, cpu)
+        expected = _dense_scan(inputs, state, bounds, cpu)
         graph.replay()
-        assert torch.equal(actual.out, expected_out)
-        assert torch.equal(actual.final_state, expected_state)
+        assert torch.equal(actual.out, expected.out)
+        assert torch.equal(actual.final_state, expected.final_state)

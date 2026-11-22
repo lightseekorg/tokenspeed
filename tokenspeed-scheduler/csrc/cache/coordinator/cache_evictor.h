@@ -20,9 +20,10 @@
 
 #pragma once
 
-// CacheEvictor: how an entry leaves either tier's index -- on the Device
+// CacheEvictor: how an entry leaves a tier's index -- on the Device
 // planned victims with their cascades, one entry alone, a tail's blocks
-// together; on the Host an entry with its State siblings -- and, under the
+// together; on the Host and the Disk an entry with its State siblings -- and,
+// under the
 // write-back policy, the records Device evictions leave for the plan's
 // write-back drain (the segments, the keys on their way to the Host), with
 // the eviction counters of both tiers. Choosing the victims stays with the
@@ -220,6 +221,28 @@ public:
         HostEvictionCounts duplicate_kv;
     };
 
+    // Disk entries evicted for one reason, each also counted as host_resident
+    // when the Host index still held its key (the Host copy is then dirty
+    // again).
+    struct DiskEvictionCounts {
+        std::uint64_t blocks{0};
+        std::uint64_t host_resident{0};
+    };
+    // Disk evictions over every cache group, by why the entry left.
+    struct DiskEvictionStats {
+        // A Disk placement (DiskCache::AcquireDiskBlocks) took it to make room.
+        DiskEvictionCounts lru;
+        // CollectDeadEntries evicted it: no probe can resume from it on any
+        // tier.
+        DiskEvictionCounts dead_entry;
+        // The per-prior tail cap dropped its tail.
+        DiskEvictionCounts tail_cap;
+        // A read of it failed: the drive no longer returns it.
+        DiskEvictionCounts read_failure;
+        // ClearCache.
+        DiskEvictionCounts flush;
+    };
+
     explicit CacheEvictor(CacheStore& store) : store_{store} {}
     // Pending stores and recorded segments point at the evictor.
     CacheEvictor(const CacheEvictor&) = delete;
@@ -310,10 +333,23 @@ public:
     // ClearCache's eviction of one Host entry, once the whole Host tier was
     // found clearable: no cascade, counted under flush.
     void FlushHostEntry(std::uint32_t group_id, CacheBlockLocation location);
+    // Recovery clear after the Device clear and exact-reference preflight.
+    // Drop every Host index entry, preserving external I/O references, and
+    // count the invalidated entries under flush.
+    void InvalidateHostEntries();
+    // Evicts an unpinned Disk entry and, for a State checkpoint, the other
+    // State groups' unpinned entries at its hash, as EvictHostCachedBlock does
+    // on the Host. False when the entry itself is pinned or gone.
+    bool EvictDiskCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
+                              DiskEvictionCounts DiskEvictionStats::*reason);
+    // ClearCache's eviction of one Disk entry, once the whole Disk tier was
+    // found clearable: no cascade, counted under flush.
+    void FlushDiskEntry(std::uint32_t group_id, CacheBlockLocation location);
 
     // Cumulative, never reset (accounting only).
     const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }
     const HostEvictionStats& HostEvictions() const { return host_evictions_; }
+    const DiskEvictionStats& DiskEvictions() const { return disk_evictions_; }
     std::uint64_t DeadEntriesNotWrittenBack() const { return dead_entries_not_written_back_; }
     std::uint64_t DemotedEntriesNotWrittenBack() const { return demoted_entries_not_written_back_; }
 
@@ -345,6 +381,7 @@ private:
     std::uint64_t demoted_entries_not_written_back_{0};
     DeviceEvictionStats device_evictions_;
     HostEvictionStats host_evictions_;
+    DiskEvictionStats disk_evictions_;
 };
 
 }  // namespace tokenspeed

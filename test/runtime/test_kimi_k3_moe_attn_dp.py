@@ -101,6 +101,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
         owns_ep_communication=mega_moe,
         use_native=False,
         use_trtllm=not mega_moe,
+        use_cutedsl=False,
         overlap_shared_experts=False,
         joint_moe_reduce=False,
         decode_chain=False,
@@ -374,12 +375,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
             received = latent.reshape(-1, width)
         torch.testing.assert_close(local_ids, ids[rank, :rows])
         torch.testing.assert_close(local_weights, weights[rank, :rows])
-        return received, ids.reshape(-1, 2), weights.reshape(-1, 2), 1234
+        return received, ids.reshape(-1, 2), weights.reshape(-1, 2)
 
-    def combine(partial, local_tokens, max_tokens, combine_offset):
+    def combine(partial):
         events.append("combine")
-        assert local_tokens == rows and max_tokens == capacity
-        assert combine_offset == 1234
         torch.testing.assert_close(partial, latent.reshape(-1, width) * (rank + 1))
         return latent[rank, :rows] * 3
 
@@ -418,6 +417,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         routed_hidden=width,
         top_k=2,
         topk=topk,
+        expert_dispatch_info=None,
         experts=SimpleNamespace(
             plan={"weight_dtype": "nvfp4" if nvfp4 else "unquant"},
             w13_input_scale_quant=quant_scale,
@@ -628,6 +628,7 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
         stream_fork=SimpleNamespace(scope=scope),
         topk=mock.Mock(return_value=StandardTopKOutput(weights, ids, None)),
+        expert_dispatch_info=None,
         gate=mock.Mock(return_value=torch.zeros(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
         experts=SimpleNamespace(

@@ -171,3 +171,74 @@ def test_mixed_field_alignment_preserves_bytes_and_layer_readiness(
     if layered:
         assert torch.equal(snapshots[-2].cpu(), expected_device[0])
         assert torch.equal(snapshots[-1].cpu(), expected_device[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_each_layers_transfer_reuses_one_binary():
+    """A transfer's first geometry row and row count follow the layers it
+    copies: one binary serves offsets and counts that are 1, a multiple of 16
+    or neither, and each transfer copies exactly its own fields."""
+    layers, width = 40, 64
+    stride = layers * width
+    # Field i: bytes [i * 64, i * 64 + 64) of each block, its own layer.
+    rows = tuple(
+        (0, 0, i * width, stride, stride, i * width, 1, width) for i in range(layers)
+    )
+    geometry = host_transfer.build_host_transfer_geometry(
+        rows=rows,
+        layer_slices=tuple((i, 1) for i in range(layers)),
+        group_packing=(1,),
+        host_group_packing=(1,),
+        host_lcm_block_bytes=stride,
+        num_host_lcm_blocks=4,
+        num_device_lcm_blocks=4,
+        num_device_buffers=1,
+    )
+    generator = torch.Generator().manual_seed(29)
+    device = torch.randint(
+        0, 256, (4 * stride,), dtype=torch.uint8, generator=generator
+    )
+    buffers = (device.cuda(),)
+    host = torch.zeros(4 * stride, dtype=torch.uint8, pin_memory=True)
+    workspace = host_transfer.HostTransferWorkspace()
+    bound = geometry.bind(buffers[0].device, non_blocking=False)
+    # Device block 2 goes to Host block 3 (1-based).
+    count, _ = workspace.load_block_transfers(((0, 2, 3),), geometry=geometry)
+    workspace.commit_block_transfers(count, buffers[0].device, non_blocking=False)
+
+    def copy_layers(first: int, rows: int) -> None:
+        host_transfer.transfer_cache_blocks(
+            "d2h",
+            buffers,
+            host,
+            bound,
+            workspace,
+            torch.cuda.current_stream(),
+            num_blocks=count,
+            geometry_offset=first,
+            num_geometry_rows=rows,
+            backend="triton",
+            grid_cap=2,
+            layer_ready_flags=None,
+        )
+
+    copy_layers(0, 1)
+    torch.cuda.synchronize()
+    # (first row, row count): offsets and counts of 1, a multiple of 16 and
+    # neither; fields 19, 33 and 37-39 are never copied.
+    transfers = ((1, 1), (16, 1), (17, 1), (18, 1), (20, 13), (34, 3))
+    with assert_no_triton_compile(_transfer_cache_blocks_kernel):
+        for first, rows in transfers:
+            copy_layers(first, rows)
+        torch.cuda.synchronize()
+    with assert_no_triton_compile(_transfer_cache_blocks_kernel):
+        # A count of 16 after the others: still the same binary.
+        copy_layers(2, 14)
+        copy_layers(1, 16)
+        torch.cuda.synchronize()
+    expected = torch.zeros_like(host)
+    copied = {0, 1, *range(2, 17), 16, 17, 18, *range(20, 33), *range(34, 37)}
+    for layer in copied:
+        span = slice(layer * width, (layer + 1) * width)
+        expected[2 * stride :][span] = device[2 * stride :][span]
+    assert torch.equal(host, expected)

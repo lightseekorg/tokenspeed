@@ -70,6 +70,8 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
+    from tokenspeed_kernel.platform import current_platform
+
     from tokenspeed.runtime.distributed.comm_backend import get_global_backend
     from tokenspeed.runtime.distributed.comm_backend.auto import (
         AutoBackend,
@@ -151,6 +153,23 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
             moved = torch.cat([payload[:shift].flip(0), payload[: rows - shift]])
             all_reduce(moved, group)
             assert torch.equal(moved[shift:], full[: rows - shift]), shift
+
+        # Rows past one Iris gather launch gather on NCCL: the same fold's bits.
+        many = 1024
+        large = ill_conditioned_payload(group.index(rank), len(group), many, device)
+        if current_platform().is_amd:
+            assert backend.iris.gathers_in_one_launch(large[:rows], group)
+            assert not backend.iris.gathers_in_one_launch(large, group)
+        parts = [torch.empty_like(large) for _ in mapping.world_group]
+        dist.all_gather(parts, large, group=world_pg)
+        folded = torch.zeros(many, HIDDEN, dtype=torch.float32, device=device)
+        for peer in group:
+            folded += parts[peer].float()
+        reduced = all_reduce(large.clone(), group)
+        assert torch.equal(reduced, folded.to(torch.bfloat16))
+        head = large[:rows].clone()
+        all_reduce(head, group)
+        assert torch.equal(head, reduced[:rows])
 
         # The armed workspace folds the same bits (-0.0 as +0.0), chunked past capacity.
         big, capacity = 512, 200

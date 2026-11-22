@@ -1,0 +1,72 @@
+api_version: ci.tokenspeed.io/v1
+# Kimi-K3.1 Pro + Kimi-K3.1 DSpark accuracy gate.
+name: eval-kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-aime26-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+  KIMI_K31_GATEWAY_TOKENIZER: /cache/huggingface/kimi-k3.1-gateway-tokenizer
+  GPU_MAX_HW_QUEUES: "2"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+  # The general kernel suite has one GPU; exercise TP8 attention and tail before serving.
+  - python3 -m pytest tokenspeed-kernel/test/amd/gfx950/ops/test_iris_moe_tail.py tokenspeed-kernel/test/amd/gfx950/ops/test_iris_attention.py -v
+# The server flags are the Kimi-K3.1 AMD recipe in docs/recipes/models.md plus
+# the CI-only flags listed in test_eval_configs.py; that test checks the match.
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3.1-Pro
+    --tokenizer ${KIMI_K31_GATEWAY_TOKENIZER:?K3.1_gateway_tokenizer_not_staged}
+    --served-model-name kimi-k3.1
+    --trust-remote-code
+    --max-model-len 131072
+    --kv-cache-dtype fp8
+    --dsa-index-k-format mxfp4
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --kv-parallel-size 8
+    --decode-context-parallel-size 8
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark
+    --speculative-num-steps 5
+    --drafter-attention-backend mha
+    --prefill-graph-max-tokens 3072
+    --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072
+    --disable-kvstore
+    --enable-startup-requests
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3.1
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --work-dir .ci-artifacts/published/kimi-k3.1-pro-dspark-aime26
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"seed":42,"max_tokens":63488,"extra_body":{"reasoning_effort":"high"}}'
+report:
+  github_step_summary: true
+# Match the existing K3 AIME26 correctness floor.
+score_threshold: 0.90

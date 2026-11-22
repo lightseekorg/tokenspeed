@@ -41,6 +41,7 @@
 #include "cache/coordinator/admission_types.h"
 #include "cache/coordinator/cache_evictor.h"
 #include "cache/coordinator/cache_store.h"
+#include "cache/coordinator/disk_cache.h"
 #include "cache/coordinator/host_cache.h"
 #include "cache/coordinator/prefix_prober.h"
 #include "cache/coordinator/storage_queries.h"
@@ -79,22 +80,25 @@ public:
     // write_back_evictions whether an admission or a restore evicts Device
     // cache by segments, the evictions of those and of a lone-request
     // compaction are recorded for the plan's write-back drain
-    // (TakeEvictedSegments), dead prefix entries are collected on both tiers,
+    // (TakeEvictedSegments), dead prefix entries are collected on every tier,
     // and a retraction image's Host leg takes room by whole segments first
     // (the Host write-back policy; it needs a Host pool and excludes
     // streaming). The snapshot pool holds retracted requests' private KV
     // images (Snapshot / Restore); nullptr means the engine never retracts.
+    // The Disk pool is the local SSD tier below Host
+    // (docs/rfcs/0006-disk-tier.md); it needs the Host write-back policy, and
+    // nullptr means no Disk tier.
     // checkpoint_retention_requests and checkpoint_retention_leaf_distance are
     // SchedulerConfig's: a State checkpoint more than the leaf distance from a
     // leaf ranks, under pressure, as if last used that many new requests ago
     // (0 requests ranks every entry by its own use).
-    // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host,
+    // enable_l3_storage, host_pool, disk_pool, snapshot_pool, stream_device_cache_to_host,
     // write_back_evictions and checkpoint_retention_requests have no defaults:
     // a shorter call would convert a pool pointer to bool and silently disable
     // a tier instead of failing to compile. A leaf distance of 0 ranks only
     // the newest checkpoint on a branch as a leaf.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
+                     bool enable_l3_storage, BlockPool* host_pool, BlockPool* disk_pool, BlockPool* snapshot_pool,
                      bool stream_device_cache_to_host, bool write_back_evictions,
                      std::int64_t checkpoint_retention_requests, std::int32_t checkpoint_retention_leaf_distance = 0);
     // Index entries and recorded write-backs point at the store's boundary
@@ -151,7 +155,7 @@ public:
     bool GroupHasReclaimableBlocksAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens) const {
         const CacheGroup& group = store_.Groups()[static_cast<std::size_t>(i)];
         return !group.Allocator()
-                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens))
+                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlockEndAt(i, num_computed_tokens))
                     .empty();
     }
     // Drops every State table's slot 0 (a decode step that writes slot 1 in
@@ -170,9 +174,41 @@ public:
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = store_.Groups()[static_cast<std::size_t>(i)];
-        return group.Allocator().BlocksReclaimableAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens),
-                                                     count_uncached);
+        return group.Allocator().BlocksReclaimableAt(group.Index(), table,
+                                                     groupExpiredBlockEndAt(i, num_computed_tokens), count_uncached);
     }
+
+    // A prefix this replica holds, as a peer reads it
+    // (docs/rfcs/0004-peer-prefix-sharing.md): the probe's hit acquired on
+    // both tiers as an admission's first step acquires it, every hit dated
+    // with a new access epoch, each block at the slot a reader's table gives
+    // it (PeerPage::slot): the Device's hits from slot 0, the Host suffix's
+    // after them, a State group's checkpoint at the live slot. Dropping the
+    // blocks right away only refreshes the entries.
+    struct ExportedBlock {
+        CacheKey key;
+        std::int32_t slot{0};
+        CacheTier tier{CacheTier::kDevice};
+        CacheBlockRef block;
+    };
+    struct PrefixExport {
+        std::int32_t num_tokens{0};
+        std::vector<ExportedBlock> blocks;
+        // The access epoch the hits were dated with.
+        std::uint64_t access_epoch{0};
+    };
+    PrefixExport ExportPrefix(PrefixProbe&& probe);
+    // The pages of a listing that names a holder's Disk pages too
+    // (StorageQueries::ListWithDisk), held and refreshed as ExportPrefix
+    // holds and refreshes a probe's: each from the tier the listing names.
+    PrefixExport ExportListing(const PrefixProber::PrefixListing& listing);
+    // After a peer read in full the prefix an export dated `access_epoch`,
+    // whose entries are `keys`: demotes its leaf chain as DemoteEntries does.
+    // From the deepest boundary toward the root, a boundary joins the chain
+    // while it has no child off the chain and none of its entries was
+    // accessed since, so the chain leaves first and its leaving opens no gap
+    // under another branch. Returns the entries demoted.
+    std::int32_t DemoteExportedChain(std::span<const CacheKey> keys, std::uint64_t access_epoch);
 
     // Admit consumes the probe (PrefixProber) whether or not it admits; a
     // caller that retries after a failure keeps a copy. A missing epoch
@@ -262,8 +298,8 @@ public:
     // Slots covering [0, num_tokens) of a table and the capacity left inside
     // the last of them.
     struct DataSpan {
-        std::int32_t blocks{0};
-        std::int32_t tail_tokens{0};
+        std::int32_t num_blocks{0};
+        std::int32_t available_tokens{0};
     };
     // Rebuilds every group's table from its image -- identical block count,
     // null holes, tail capacity and reclaimed prefix, one fresh Device block
@@ -310,6 +346,8 @@ public:
     const AdmissionHistory& History() const { return history_; }
     HostCache& Host() { return host_; }
     const HostCache& Host() const { return host_; }
+    DiskCache& Disk() { return disk_; }
+    const DiskCache& Disk() const { return disk_; }
     // Whether Device eviction writes back by segments (the Host write-back
     // policy).
     bool WritesBackEvictions() const { return write_back_evictions_; }
@@ -335,16 +373,18 @@ public:
     // own ParentRefs as they change, so reading it walks nothing.
     std::int32_t NumActiveLcmBlocks() const noexcept { return store_.ActiveParentGauge().Count(); }
     // The same count taken by walking the given per-request table sets:
-    // the reference debug builds check NumActiveLcmBlocks against.
+    // the reference debug builds check NumActiveLcmBlocks against, and the
+    // count for a subset of the requests.
     std::int32_t CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
 
     // Registers an exact range, used for transferred prefix blocks and tests.
+    // first_prefix_page is the logical prefix-page index of content_hashes[0].
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
+                         std::uint64_t access_epoch, std::int32_t first_prefix_page, CacheBoundaryKind boundary_kind);
     // Publication without admission, for finish, retraction and remote
     // completion. progress.completed_pages must be present.
     void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
@@ -370,13 +410,23 @@ public:
     // Same pin checks as ClearDeviceCache / ClearCache, with no mutation.
     // include_host selects both tiers (Host is a no-op without a host pool).
     bool CacheIsClearable(bool include_host) const;
-    // Evicts, on both tiers, the prefix entries no probe can resume from any
+    // Ordinary clear preparation: indexed pins must be clearable after the
+    // supplied storage references retire. Unindexed owners keep their blocks
+    // and do not participate in an index-only clear, as in CacheIsClearable.
+    bool CacheIsClearableAfterStorageDrain(std::span<const CacheBlockRef* const> storage_refs) const;
+    // Recovery preflight: all remaining Host owners must be exactly these
+    // borrowed storage refs. No inspection may acquire an extra owning ref.
+    bool CacheIsClearableRetainingStorage(std::span<const CacheBlockRef* const> storage_refs) const;
+    // Requires a successful retaining-storage preflight on the control thread.
+    // Removes cache indexes; external refs keep their physical slots occupied.
+    void ClearCacheRetainingStorage();
+    // Evicts, on every tier, the prefix entries no probe can resume from any
     // more (write_back_evictions only; nothing is queued otherwise). A node no
     // eviction write-back is bringing to the Host is dead when no checkpoint
-    // boundary is left in its subtree on either tier (with State groups), when
+    // boundary is left in its subtree on any tier (with State groups), when
     // it is a tail no probe enumerates (its hint is gone), or when it is a gap
     // a prefix-closed group cannot cross: no prefix-closed group holds it on
-    // either tier, whatever State entries or children it keeps. The boundary
+    // any tier, whatever State entries or children it keeps. The boundary
     // tree queues candidates as holders leave it (the node a removal stops at
     // once no checkpoint boundary is left under it, a gap); a tail the cap
     // left behind and a boundary a settlement did not publish are queued too.
@@ -461,16 +511,21 @@ public:
     void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
                           CacheBoundaryKind boundary_kind, std::uint64_t access_epoch);
 
-    // Reports real device-cache entry insertions and removals. The scheduler
-    // folds the per-group mutations into one externally visible prefix event.
+    // Reports real Device cache entry insertions and removals, and changes of
+    // a boundary's Host entries (CacheMutation). The scheduler folds the
+    // per-group mutations into one externally visible prefix event per medium.
     void SetCacheMutationSink(CacheMutationSink sink) { store_.SetMutationSink(std::move(sink)); }
     struct BoundaryEventStatus {
-        bool publishable;
-        bool has_device_entries;
+        bool device_publishable;
+        bool host_publishable;
+        bool disk_publishable;
+        bool retains_descriptor;
     };
-    // Routing requires every continuous-history group on Device; auxiliary
-    // windows and State do not gate publication. Without continuous history,
-    // no boundary is publishable. Any Device entry retains the descriptor.
+    // Routing requires every continuous-history group on the medium (the
+    // Device, or the Host); auxiliary windows and State do not gate
+    // publication. Without continuous history, no boundary is publishable.
+    // Any Device entry, Host entry or pending Host store retains the
+    // descriptor: a write-back store follows the Device eviction.
     BoundaryEventStatus GetBoundaryEventStatus(const CacheKey& boundary, std::int32_t tail_tokens) const;
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes
@@ -563,8 +618,8 @@ private:
     // its tail, none otherwise.
     void validateCopyInBlocks(const RequestProgress& progress,
                               std::span<const std::vector<CacheBlockRef>> copy_in_blocks) const;
-    std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
-        return store_.Geometry()[static_cast<std::size_t>(i)].ExpiredBlocksAt(
+    std::int32_t groupExpiredBlockEndAt(std::int32_t i, std::int32_t num_computed_tokens) const {
+        return store_.Geometry()[static_cast<std::size_t>(i)].ExpiredBlockEndAt(
             store_.Groups()[static_cast<std::size_t>(i)].Spec(), num_computed_tokens);
     }
     // The cache's groups, geometry, pools and boundary tree.
@@ -586,6 +641,8 @@ private:
     AdmissionHistory history_;
     // Host L2: allocation and placement, publication, write-back settlement.
     HostCache host_{store_, evictor_, history_, write_back_evictions_};
+    // The local SSD tier below Host: placement, publication, a prompt's hits.
+    DiskCache disk_{store_, evictor_, history_, prober_};
     // What L3 storage is asked for a prompt's prefix, and the Host blocks a
     // read lands in.
     StorageQueries storage_;
@@ -602,7 +659,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
-                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
+                                 BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool, BlockPool* disk_pool,
                                  BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions,
                                  std::int64_t checkpoint_retention_requests,
                                  std::int32_t checkpoint_retention_leaf_distance = 0);

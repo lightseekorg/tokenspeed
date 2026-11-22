@@ -188,7 +188,9 @@ def _latest_ancestor(ancestors_row, step, valid):
     return 63 - libdevice.clz(above)
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(
+    do_not_specialize=["T", "h0_row_stride", "ht_row_stride", "intermediate_row_stride"]
+)
 def _fused_gdn_decode_update_kernel(
     A_log,
     a,
@@ -202,9 +204,12 @@ def _fused_gdn_decode_update_kernel(
     o,
     h0_source,
     ht_dest,
+    h0_row_stride,
+    ht_row_stride,
     h0_indices,
     output_state_indices,
     intermediate_states_buffer,
+    intermediate_row_stride,
     per_token_output_state_indices,
     tree_ancestors,
     scale,
@@ -239,7 +244,9 @@ def _fused_gdn_decode_update_kernel(
     skipped (state contribution treated as zero -- mirrors flashinfer's
     float32 legacy decode path; output for that batch entry is undefined).
     ``ht_dest`` is the K-last pool both output-state index forms address; it
-    may be ``h0_source`` itself.
+    may be ``h0_source`` itself. All state row strides, including the dense
+    intermediate buffer's, stay runtime so both tree-output forms keep the
+    same layout and rounding of their reductions.
 
     T=1 is a plain decode step; T>1 is an MTP verify step. Three independent,
     mutually-exclusive-by-convention state-output mechanisms:
@@ -298,7 +305,7 @@ def _fused_gdn_decode_update_kernel(
         # is K-last.
         p_h0 = (
             h0_source
-            + idx * HV * V * K
+            + idx * h0_row_stride
             + i_hv * V * K
             + o_v[None, :] * K
             + o_k[:, None]
@@ -345,7 +352,7 @@ def _fused_gdn_decode_update_kernel(
                     if parent < 0:
                         p_parent = (
                             h0_source
-                            + idx * HV * V * K
+                            + idx * h0_row_stride
                             + i_hv * V * K
                             + o_v[None, :] * K
                             + o_k[:, None]
@@ -356,7 +363,8 @@ def _fused_gdn_decode_update_kernel(
                     else:
                         p_parent = (
                             intermediate_states_buffer
-                            + ((i_n * T + parent).to(tl.int64) * HV + i_hv) * V * K
+                            + (i_n.to(tl.int64) * T + parent) * intermediate_row_stride
+                            + i_hv * V * K
                             + o_v[None, :] * K
                             + o_k[:, None]
                         )
@@ -364,7 +372,7 @@ def _fused_gdn_decode_update_kernel(
                 elif parent < 0:
                     p_parent = (
                         h0_source
-                        + idx * HV * V * K
+                        + idx * h0_row_stride
                         + i_hv * V * K
                         + o_v[None, :] * K
                         + o_k[:, None]
@@ -379,7 +387,7 @@ def _fused_gdn_decode_update_kernel(
                     )
                     p_parent = (
                         ht_dest
-                        + row * HV * V * K
+                        + row * ht_row_stride
                         + i_hv * V * K
                         + o_v[None, :] * K
                         + o_k[:, None]
@@ -413,7 +421,8 @@ def _fused_gdn_decode_update_kernel(
         if CACHE_INTERMEDIATE_STATES:
             cache_ptr = (
                 intermediate_states_buffer
-                + ((i_n * T + step_idx).to(tl.int64) * HV + i_hv) * V * K
+                + (i_n.to(tl.int64) * T + step_idx) * intermediate_row_stride
+                + i_hv * V * K
                 + o_v[None, :] * K
                 + o_k[:, None]
             )
@@ -431,7 +440,7 @@ def _fused_gdn_decode_update_kernel(
             if out_idx >= 0:
                 p_step_out = (
                     ht_dest
-                    + out_idx * HV * V * K
+                    + out_idx * ht_row_stride
                     + i_hv * V * K
                     + o_v[None, :] * K
                     + o_k[:, None]
@@ -454,7 +463,7 @@ def _fused_gdn_decode_update_kernel(
         if out_idx >= 0:
             p_out = (
                 ht_dest
-                + out_idx * HV * V * K
+                + out_idx * ht_row_stride
                 + i_hv * V * K
                 + o_v[None, :] * K
                 + o_k[:, None]
@@ -464,7 +473,7 @@ def _fused_gdn_decode_update_kernel(
         if idx >= 0:
             p_out = (
                 h0_source
-                + idx * HV * V * K
+                + idx * h0_row_stride
                 + i_hv * V * K
                 + o_v[None, :] * K
                 + o_k[:, None]
@@ -506,12 +515,16 @@ def _launch_fused_gdn_decode_update(
     V = v.shape[3]
     if scale is None:
         scale = K**-0.5
-    # The kernel addresses output rows densely (row * HV * V * K).
-    if output_state is not None and not output_state.is_contiguous():
-        raise ValueError(
-            "Triton GDN decode requires a contiguous output_state, got strides "
-            f"{output_state.stride()}"
-        )
+    for state in (initial_state, output_state):
+        if state is not None and (
+            state.shape[1:] != (HV, V, K)
+            or state.stride()[1:] != (V * K, K, 1)
+            or state.stride(0) < HV * V * K
+        ):
+            raise ValueError(
+                "Triton GDN decode requires dense K-last state pages, got "
+                f"shape {tuple(state.shape)} and strides {state.stride()}"
+            )
 
     o = q.new_empty(B, T, HV, V)
 
@@ -536,9 +549,14 @@ def _launch_fused_gdn_decode_update(
         o=o,
         h0_source=initial_state,
         ht_dest=initial_state if output_state is None else output_state,
+        h0_row_stride=initial_state.stride(0),
+        ht_row_stride=(initial_state if output_state is None else output_state).stride(
+            0
+        ),
         h0_indices=initial_state_indices,
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_row_stride=HV * V * K,
         per_token_output_state_indices=per_token_output_state_indices,
         tree_ancestors=tree_ancestors,
         scale=scale,
@@ -585,6 +603,7 @@ def _launch_fused_gdn_decode_update(
     priority=Priority.PORTABLE,
     traits={
         "strided_qkv": frozenset({False, True}),
+        "strided_state": frozenset({False, True}),
         "padding_safe": frozenset({False, True}),
     },
 )
@@ -630,7 +649,7 @@ def triton_gdn_decode_step(
     )
 
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "h0_row_stride"])
 def _gdn_tree_verify_chunked_kernel(
     A_log,
     a,
@@ -643,6 +662,7 @@ def _gdn_tree_verify_chunked_kernel(
     b,
     o,
     h0_source,
+    h0_row_stride,
     h0_indices,
     tree_ancestors,
     replay,
@@ -698,7 +718,7 @@ def _gdn_tree_verify_chunked_kernel(
     p_q = q + i_n * Q_STRIDES[0] + nodes[:, None] * Q_STRIDES[1] + i_h * Q_STRIDES[2]
     p_k = k + i_n * K_STRIDES[0] + nodes[:, None] * K_STRIDES[1] + i_h * K_STRIDES[2]
     idx = tl.load(h0_indices + i_n).to(tl.int64)
-    p_h0 = h0_source + idx * HV * V * K + i_hv * V * K + o_v[:, None] * K
+    p_h0 = h0_source + idx * h0_row_stride + i_hv * V * K + o_v[:, None] * K
 
     b_v = tl.load(
         v
@@ -876,6 +896,7 @@ def _launch_gdn_tree_verify_chunked(
         b=b,
         o=o,
         h0_source=initial_state,
+        h0_row_stride=initial_state.stride(0),
         h0_indices=initial_state_indices,
         tree_ancestors=tree_ancestors,
         replay=o if replay_payload is None else replay_payload,
@@ -936,6 +957,7 @@ def _launch_gdn_tree_verify_chunked(
         "padding_safe": frozenset({False, True}),
         "separate_output_state": frozenset({False, True}),
         "strided_qkv": frozenset({False, True}),
+        "strided_state": frozenset({False, True}),
     },
 )
 def triton_gdn_decode_mtp(
@@ -1093,6 +1115,7 @@ def triton_gdn_decode_mtp(
         "tree": frozenset({False}),
         "replay_payload": frozenset({False}),
         "strided_qkv": frozenset({False, True}),
+        "strided_state": frozenset({False, True}),
         "separate_output_state": frozenset({False}),
     },
 )
@@ -1160,6 +1183,7 @@ def triton_gdn_decode_mtp_chain(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
+    traits={"strided_state": frozenset({False, True})},
 )
 def triton_gdn_chain_verify(
     q: torch.Tensor,

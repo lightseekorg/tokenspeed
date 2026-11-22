@@ -23,11 +23,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -55,6 +58,8 @@ enum class ImageShortfall : std::uint8_t { kNoPool, kBlobSlot, kSnapshotPool, kH
 // Host cache tiers. Scheduling policy and request state transitions stay in
 // Scheduler.
 class TierTransferManager {
+    friend struct TierTransferManagerTestAccess;
+
 public:
     explicit TierTransferManager(CacheCoordinator& coordinator);
 
@@ -201,6 +206,9 @@ public:
     RestoredSlots CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
+    // Device block ids still being filled by prefix loads, by cache group.
+    // Derived from the owning transfers; an all-rank ACK removes their rows.
+    std::vector<std::unordered_set<std::int32_t>> LoadBackDestinations() const;
     // Pinned stores hold Device capacity that returns by itself at the ACK;
     // the scheduler defers retraction while any is in flight rather than
     // sacrificing a request for capacity that is about to free.
@@ -304,7 +312,12 @@ private:
     };
     // Wraps by design: an id only tells in-flight ops apart, and none stays in
     // flight across 2^32 later ops. The width is the wire format's.
-    std::uint32_t nextOpId() { return next_op_id_++; }
+    std::uint32_t nextOpId() {
+        if (next_op_id_ == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::overflow_error("cache operation generation exhausted");
+        }
+        return static_cast<std::uint32_t>(next_op_id_++);
+    }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
     // The Host block an unacknowledged store already carries for each key, with
@@ -329,7 +342,7 @@ private:
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
-    std::uint32_t next_op_id_{0};
+    std::uint64_t next_op_id_{0};
     // Indexed by HostStoreCause; every per-group vector is sized at construction.
     std::array<WriteBackStats, 4> write_back_stats_;
     LoadBackStats prefix_load_stats_;

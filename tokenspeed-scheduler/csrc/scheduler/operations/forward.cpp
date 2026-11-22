@@ -70,9 +70,11 @@ constexpr std::int32_t kRetractionSafeSteps = 4096;
 // scan is bounded.
 constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 
-// Waiting prompts a round probes for whole prompts a chunk that cannot finish
-// may carry (SchedulerConfig::prefill_chunk_yield_tokens): each probe walks
-// the prompt's prefix pages, so the scan is bounded.
+// Waiting prompts a P-role round probes for whole prompts to run beside a
+// chunk that cannot finish -- those it gives way to
+// (SchedulerConfig::prefill_chunk_yield_tokens) and those filling the budget
+// it leaves: each probe walks the prompt's prefix pages, so the scan is
+// bounded.
 constexpr std::int32_t kMaxYieldProbesPerRound = 8;
 
 constexpr std::int32_t kMaxPrefillBypasses = 8;
@@ -343,13 +345,17 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 }  // namespace
 
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
+    return matchPrefixAtAdmission(request, std::numeric_limits<std::int32_t>::max());
+}
+
+Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens) {
     ProfileSpan profile_span{"Scheduler::matchPrefixAtAdmission"};
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
     _assert(request->Is<fsm::Submitted>(), "the admission probe is for a Submitted request");
     const auto probe = [this, request](const PromptPrefix& prompt) {
         if (config_.role == Role::kD) {
-            return coordinator_.Prober().ProbeDecodeDevicePrefix(prompt, request->PrefillSize());
+            return coordinator_.Prober().ProbeDecodePrefix(prompt, request->PrefillSize());
         }
         return coordinator_.Prober().ProbePromptPrefix(prompt);
     };
@@ -369,8 +375,8 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // the positions it needs logits for are recomputed rather than matched.
     // The bound is in tokens: a hit may end at it exactly.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
+    const std::int32_t max_cacheable_tokens = std::max(
+        std::min({request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens(), max_probe_tokens}), 0);
     // The last token is recomputed, so a page the prompt fills exactly can
     // never be hit -- except on the D role, whose prompt-end state check
     // needs the prompt's last page hashed when the prompt ends on it.
@@ -392,6 +398,8 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         .prepared_keys = prepared_keys,
     };
     match.probe = probe(prompt);
+    request->GetIf<fsm::Submitted>()->admission.cached_prefix_tokens =
+        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     if (config_.role != Role::kD && coordinator_.Prober().EvictionStoresExtendPrefix(prompt, match.probe)) {
         match.waits_for_eviction_store = true;
         return match;
@@ -506,26 +514,50 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens,
                                                                   std::int64_t kv_token_limit,
-                                                                  std::int32_t yield_tokens, bool must_complete) {
+                                                                  std::int32_t yield_tokens, bool must_complete,
+                                                                  std::int32_t peer_landing_tokens) {
     ProfileSpan profile_span{"Scheduler::schedulePrefillFirstChunk"};
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
+    // The D role's prompts are the peer's work, a peer landing's prefix the
+    // holder's; every other first chunk is local.
+    const fsm::PrefillSource source = config_.role == Role::kD  ? fsm::PrefillSource::kRemote
+                                      : peer_landing_tokens > 0 ? fsm::PrefillSource::kPeer
+                                                                : fsm::PrefillSource::kLocal;
+    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     AdmissionMatch match = matchPrefixAtAdmission(request);
+    // A peer landing resumes its local hit only at a page boundary, a block
+    // boundary of every group: the block holding a tail hit's end would be
+    // filled by the admission's copy or load as well as by the landing, and
+    // the device's writes are not ordered with the reads'. A shorter probe
+    // cuts the hit to the page boundary below, or further.
+    if (source == fsm::PrefillSource::kPeer) {
+        for (std::int32_t hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+             hit % prefix_granularity != 0 && !match.waits_for_eviction_store;
+             hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens)) {
+            match = matchPrefixAtAdmission(request, hit / prefix_granularity * prefix_granularity);
+        }
+    }
     if (match.waits_for_eviction_store) {
         // The ACK makes the segment visible. Re-probe then, without taking
         // pages or reporting a capacity failure while the copy is pending.
         return FirstChunkOutcome{};
     }
 
-    // The D role's prompts are the peer's work; every other first chunk is local.
-    const fsm::PrefillSource source =
-        config_.role == Role::kD ? fsm::PrefillSource::kRemote : fsm::PrefillSource::kLocal;
-    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
-
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    // Where a landing ends: the whole prompt from the PD peer, a prefix from
+    // a holder. A local hit that already reaches the holder's leaves nothing
+    // to land.
+    const std::int32_t landing_end = source == fsm::PrefillSource::kRemote ? request->PrefillSize()
+                                     : source == fsm::PrefillSource::kPeer ? peer_landing_tokens
+                                                                           : 0;
+    if (source == fsm::PrefillSource::kPeer &&
+        (landing_end - hit_tokens < config_.peer_config->min_fetch_tokens || landing_end > kv_token_limit)) {
+        return FirstChunkOutcome{};
+    }
     // KV coverage beyond the state checkpoint the hit resumes from is the
     // junction: the first chunk is cut there so its natural checkpoint lands
     // where the KV is already cached.
@@ -538,18 +570,29 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // A first chunk that cannot finish its prompt gives way to the whole
     // prompts carried behind it (prefill_chunk_yield_tokens); unchanged
     // without them.
+    const auto local_chunk = [&](std::int32_t budget) {
+        budget = static_cast<std::int32_t>(
+            std::min<std::int64_t>(budget, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
+        return PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, budget, junction_tokens);
+    };
+    const std::int32_t unyielded_budget = remaining;
     if (source == fsm::PrefillSource::kLocal) {
         remaining =
             YieldingChunkBudget(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining, yield_tokens);
     }
     remaining = static_cast<std::int32_t>(
         std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - hit_tokens)));
-    // A remote landing completes the prompt in one transfer; no junction cut
-    // can shorten it.
-    std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                         ? unscheduled
+    // A landing fills its span in one transfer; no junction cut can shorten
+    // it.
+    std::int32_t tokens_this_round = source != fsm::PrefillSource::kLocal
+                                         ? landing_end - hit_tokens
                                          : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
                                                               unscheduled, remaining, junction_tokens);
+    // The chunk gave way only if it ends before the one the whole budget
+    // allowed: a junction or the KV limit may end both at the same place.
+    if (source == fsm::PrefillSource::kLocal && remaining < unyielded_budget) {
+        feedback.chunk_gave_way = tokens_this_round < local_chunk(unyielded_budget);
+    }
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -571,7 +614,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const auto chunk_demands = [&](std::int32_t tokens, bool checkpoint) {
         // Sliding-window prepay (docs/design/scheduler.md §1). A remote
         // landing has no later local chunk: the peer fills the whole prompt.
-        const std::int32_t later_chunk_tokens = source == fsm::PrefillSource::kLocal ? unscheduled - tokens : 0;
+        const std::int32_t later_chunk_tokens = source != fsm::PrefillSource::kRemote ? unscheduled - tokens : 0;
         // Only beside another page holder. Any holder, not only one sharing
         // the hit: hit pages may become shared after this admission.
         const bool prepays = (hit_tokens > 0 || later_chunk_tokens > 0) && others_hold_pages;
@@ -584,32 +627,33 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             .swa_prompt_after_hit_tokens = unscheduled,
         };
         // Every State table starts as [checkpoint or zero state, fresh] for a
-        // local chunk, which reads slot 0 and writes slot 1; the peer's
+        // local chunk, which reads slot 0 and writes slot 1; the PD peer's
         // landing fills slot 1 and reads nothing, so it leaves slot 0 null
-        // unless the prompt-end checkpoint was claimed.
+        // unless the prompt-end checkpoint was claimed. A holder's landing
+        // fills slot 1 as a local chunk's forward would, and the next chunk
+        // rotates it in.
         std::vector<GroupDemand> demands = MakeGroupDemands(
             tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{tokens}},
             StateStep{.kind = source == fsm::PrefillSource::kRemote ? StateStep::Kind::kLand : StateStep::Kind::kRotate,
                       .checkpoint = checkpoint});
         ReservePrefillDemands(demands, config_.cache_groups, reserve);
-        if (source == fsm::PrefillSource::kRemote) {
-            // A full-history group's blocks up to the prompt end land whole
-            // and are not zeroed (GroupDemand::landed_tokens). Cached windows
-            // already own the hit's blocks, including a fresh partial tail
-            // block. Replayable windows own no hit blocks: the peer must fill
-            // their whole retained suffix.
+        if (source != fsm::PrefillSource::kLocal) {
+            // A full-history group's blocks up to the landing's end land
+            // whole and are not zeroed (GroupDemand::landed_tokens). Cached
+            // windows already own the hit's blocks, including a fresh partial
+            // tail block. Replayable windows own no hit blocks: the peer must
+            // fill their whole retained suffix.
             for (std::size_t i = 0; i < demands.size(); ++i) {
                 const CacheGroupConfig& group = config_.cache_groups[i];
                 if (group.attn_kind == AttnKind::kFull) {
-                    demands[i].landed_tokens = request->PrefillSize();
+                    demands[i].landed_tokens = landing_end;
                 } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
                     const std::int32_t hit_blocks = group.replayable ? 0 : CeilDiv(hit_tokens, block_granularity);
-                    const std::int32_t retained_begin =
-                        std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
+                    const std::int32_t retained_begin = std::max(0, landing_end - *group.sliding_window_tokens + 1);
                     demands[i].extent = SparseSuffix{
-                        .extent_tokens = request->PrefillSize(),
+                        .extent_tokens = landing_end,
                         .first_block = std::max(hit_blocks, retained_begin / block_granularity),
                         .head_blocks =
                             group.sink_tokens / block_granularity + (group.sink_tokens % block_granularity != 0),
@@ -643,11 +687,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // chunk's admission publishes its live slot there, at the cost of a
     // round (a cache this full keeps no spare block). That optional block
     // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
-    // A local prompt reserves the copy-in blocks of its prompt end with the
-    // blocks they serve, unless the prompt end is dead for a request resuming
-    // at the hit; a remote landing computes no prompt here.
+    // A prompt computed here reserves the copy-in blocks of its prompt end with
+    // the blocks they serve, unless the prompt end is dead for a request
+    // resuming at the hit. That includes a holder's landing: the rest of the
+    // prompt computes here and its first decode publishes the prompt end, and
+    // the landing's admission may prepay the tail's block. The PD peer's
+    // landing computes no prompt here.
     const std::optional<CopyInPoint> copy_in_point =
-        source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
+        source != fsm::PrefillSource::kRemote ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     // Read before the lone-request hand-over below may take the probe.
     const std::int32_t probed_device_full_page_tokens = match.probe.device.full_page_tokens;
     std::optional<AdmissionResult> admission;
@@ -690,6 +737,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
+    // A landing fills its destinations whole, unordered with the plan's
+    // device work: none is zeroed, and none is a copy or load destination.
+    std::vector<PeerPage> peer_destinations;
+    if (source == fsm::PrefillSource::kPeer) {
+        peer_destinations = peerLandingDestinations(tables, hit_tokens, landing_end);
+        excludeLandedPages(*admission, peer_destinations);
+    }
     recordAdmittedPages(plan, *admission);
     // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
     // the Device's prefix (0 when only checkpoints come from Host), and
@@ -710,11 +764,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         // already; publish them on the Device now (the layer-wise load makes
         // the bytes available before any forward reads them). A Host tail is
         // loaded into the hitter's private page and stays unpublished.
-        const std::int32_t first_extension_slot = probed_device_full_page_tokens / prefix_granularity;
+        const std::int32_t first_extension_prefix_page = probed_device_full_page_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
-            coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
-                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
-                                         CacheBoundaryKind::kChunk);
+            coordinator_.CacheFullBlocks(
+                tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1), admission->access_epoch,
+                first_extension_prefix_page + static_cast<std::int32_t>(i), CacheBoundaryKind::kChunk);
         }
     }
     fsm::CacheProgress cache_progress{
@@ -744,21 +798,23 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
     return FirstChunkOutcome{.state_prefix_cached = admission->state_prefix_cached,
-                             .event = fsm::SchedulePrefillFirstChunkEvent{
-                                 tokens_this_round,
-                                 decode_reserve,
-                                 &req_pool_allocator_,
-                                 source,
-                                 &coordinator_,
-                                 std::move(tables),
-                                 hit_tokens,
-                                 std::move(cache_progress),
-                                 std::move(admission->copy_in_blocks),
-                                 std::move(admission->load_pairs),
-                                 // The P role holds a completed prompt until its result lands: the
-                                 // remote decode that hands it off carries the bootstrap token.
-                                 config_.role == Role::kP,
-                             }};
+                             .event =
+                                 fsm::SchedulePrefillFirstChunkEvent{
+                                     tokens_this_round,
+                                     decode_reserve,
+                                     &req_pool_allocator_,
+                                     source,
+                                     &coordinator_,
+                                     std::move(tables),
+                                     hit_tokens,
+                                     std::move(cache_progress),
+                                     std::move(admission->copy_in_blocks),
+                                     std::move(admission->load_pairs),
+                                     // The P role holds a completed prompt until its result lands: the
+                                     // remote decode that hands it off carries the bootstrap token.
+                                     config_.role == Role::kP,
+                                 },
+                             .peer_destinations = std::move(peer_destinations)};
 }
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
@@ -769,20 +825,31 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     // As for a first chunk: a chunk that cannot finish gives way to the
     // whole prompts carried behind it.
-    remaining =
-        YieldingChunkBudget(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining, yield_tokens);
-    remaining = static_cast<std::int32_t>(
-        std::min<std::int64_t>(remaining, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
     fsm::CacheProgress& cache_progress = request->CacheProgressRef();
-    std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                     remaining, cache_progress.junction_tokens);
+    const std::int32_t state_checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
+    // The chunk a budget gives: cut at the KV limit, a junction, and toward
+    // an in-forward State checkpoint. 0 when no chunk fits.
+    const auto chunk = [&](std::int32_t budget) {
+        budget = static_cast<std::int32_t>(
+            std::min<std::int64_t>(budget, std::max<std::int64_t>(0, kv_token_limit - first_pos)));
+        const std::int32_t tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
+                                                       budget, cache_progress.junction_tokens);
+        return tokens == 0
+                   ? 0
+                   : chunkTowardInForwardCheckpoint(state_checkpoint, first_pos, tokens, cache_progress.junction_tokens,
+                                                    config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
+    };
+    const std::int32_t yielding =
+        YieldingChunkBudget(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining, yield_tokens);
+    std::int32_t prefill_tokens = chunk(yielding);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
-    const std::int32_t state_checkpoint = inForwardStateCheckpoint(config_, coordinator_, request->PrefillSize());
-    prefill_tokens =
-        chunkTowardInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, cache_progress.junction_tokens,
-                                       config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
+    // As for a first chunk: it gave way only if it ends before the chunk the
+    // whole budget allowed.
+    if (yielding < remaining) {
+        feedback.chunk_gave_way = prefill_tokens < chunk(remaining);
+    }
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, coordinator_.PrefixGranularity());
     // The chunk that ended at the junction publishes its natural checkpoint
@@ -957,6 +1024,21 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // The first decode spends the prompt end's copy-in blocks; a decode
     // reserves none.
     if (!admitStep(plan, feedback, *request, staged, demands, progress, /*copy_in_point=*/std::nullopt)) {
+        // Deferred decode allocation rests on a prompt's remote decode
+        // taking no block: the Decode node allocated because the prompt
+        // holds every page it needs. The prompt stays as it is and is tried
+        // again; its Decode node's waiting timeout ends it.
+        if (auto* done = request->GetIf<fsm::PrefillDone>();
+            done != nullptr && config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
+            !std::exchange(done->remote_decode_failure_logged, true)) {
+            spdlog::error(
+                "[Scheduler] deferred decode allocation: the remote decode of request {} ({} prompt tokens) was "
+                "not admitted: it asked for {} more tokens{}{} with {} of {} Device LCM blocks empty; the prompt "
+                "keeps its pages until its decode node gives up",
+                request->Id(), request->PrefillSize(), reserve_tokens,
+                completed_page ? ", a completed page's publication" : "",
+                completed_checkpoint ? ", a State checkpoint" : "", EmptyLcmBlocks(), TotalLcmBlocks());
+        }
         return std::nullopt;
     }
     staged.Commit();
@@ -975,6 +1057,19 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(decode_slot)};
 }
 
+LoadBackOperation Scheduler::startPrefixLoad(Request& request, std::vector<BlockTransfer> load_pairs) {
+    LoadBackOperation operation = tier_transfers_.StartPrefixLoad(std::move(load_pairs));
+    const ReqPoolIndex& slot = request.ForwardResourcesRef().req_pool_index;
+    operation.request_id = request.Id();
+    operation.telemetry.admission_id = request.AdmissionId();
+    operation.telemetry.request_pool_index = slot.slot_;
+    operation.telemetry.slot_generation = slot.generation();
+    if (cache_event_sink_) {
+        cache_event_sink_->OnPrefixLoadScheduled(operation);
+    }
+    return operation;
+}
+
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                         std::vector<LoadBackOperation>& load_back_operations) {
     // The event consumes the Submitted state and with it any L3 Ready hold:
@@ -983,7 +1078,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (!load_pairs.empty()) {
-        load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
+        load_back_operations.push_back(startPrefixLoad(*request, std::move(load_pairs)));
     }
     return operation;
 }
@@ -1036,7 +1131,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
         return std::nullopt;
     }
     FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve,
-                                                          kv_token_limit, yield_tokens, must_complete);
+                                                          kv_token_limit, yield_tokens, must_complete,
+                                                          /*peer_landing_tokens=*/0);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
@@ -1579,12 +1675,13 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     if (interval == 0) {
         return;
     }
-    const auto is_kind = [interval](const Request& request) {
-        return interval > 0 ? request.Is<fsm::Decoding>() : request.Is<fsm::Prefilling>();
+    const auto eligible = [interval, limit = config_.debug_force_retraction_max_per_request](const Request& request) {
+        const bool is_kind = interval > 0 ? request.Is<fsm::Decoding>() : request.Is<fsm::Prefilling>();
+        return is_kind && (!limit || request.ForcedRetractions() < *limit);
     };
     Request* armed = forced_victim_id_.empty() ? nullptr : findRequest(forced_victim_id_);
-    if (armed != nullptr && !is_kind(*armed)) {
-        armed = nullptr;  // finished, aborted, or moved on since it was armed
+    if (armed != nullptr && !eligible(*armed)) {
+        armed = nullptr;  // finished, moved on, or exhausted its forced budget
     }
     if (armed == nullptr) {
         forced_victim_id_.clear();
@@ -1592,7 +1689,7 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
             return;
         }
         const auto candidate = std::ranges::find_if(candidates, [&](Request* request) {
-            return is_kind(*request) && !pdTransferInFlight(*request) && !build.Scheduled(*request);
+            return eligible(*request) && !pdTransferInFlight(*request) && !build.Scheduled(*request);
         });
         if (candidate == candidates.end()) {
             return;
@@ -1614,6 +1711,8 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     }
     if (const std::optional<ImageShortfall> shortfall = retractVictim(*armed, build, write_back_operations)) {
         onImageDoesNotFit(*armed, *shortfall, build);
+    } else {
+        armed->NoteForcedRetracted();
     }
 }
 
@@ -1731,13 +1830,25 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     // The restore op owns the request-pool row it imports the blob into until
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.
+    ReqPoolIndex restore_slot = req_pool_allocator_.Allocate();
+    restore_slot.BindOwner(request->Id(), request->AdmissionId());
     SnapshotRestoreOperation op = tier_transfers_.StartSnapshotRestore(
-        request->Id(), req_pool_allocator_.Allocate(), std::move(decode_slot), retracted->blob_slot,
+        request->Id(), std::move(restore_slot), std::move(decode_slot), retracted->blob_slot,
         std::move(result->load_pairs), std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
+    op.telemetry.admission_id = request->AdmissionId();
+    op.telemetry.previous_slot = retracted->previous_slot;
+    op.telemetry.previous_slot_generation = retracted->previous_slot_generation;
+    op.telemetry.restore_sequence = request->NextRestoreSequence();
+    op.telemetry.committed_tokens = retracted->committed_tokens;
+    op.telemetry.computed_tokens = retracted->computed_tokens;
+    op.telemetry.prompt_tokens = request->PrefillSize();
     const std::uint32_t restore_op = op.op_id;
-    build.snapshot_restores.push_back(std::move(op));
     request->Apply(
         fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), std::move(result->copy_in_blocks), restore_op});
+    if (cache_event_sink_) {
+        cache_event_sink_->OnRestoreScheduled(op);
+    }
+    build.snapshot_restores.push_back(std::move(op));
     build.scheduled.insert(request);
     spdlog::info("[Scheduler] restore: request {} ({} tokens) copies its image back", request->Id(),
                  request->TokenSize());
@@ -1751,9 +1862,11 @@ struct PendingPrefill {
     std::int32_t remaining_tokens;
 };
 
-Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
+// The next prompt by rank, with the work it was ranked by; a null request once
+// none is left.
+PendingPrefill popShortPrefill(std::vector<PendingPrefill>& pending) {
     if (pending.empty()) {
-        return nullptr;
+        return PendingPrefill{nullptr, 0};
     }
     // Reevaluate age after every admission, including inside one batch.
     // min_element preserves submission order for equal work or protected requests.
@@ -1766,9 +1879,9 @@ Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
             }
             return !aged_a && a.remaining_tokens < b.remaining_tokens;
         });
-    Request* request = selected->request;
+    const PendingPrefill popped = *selected;
     pending.erase(selected);
-    return request;
+    return popped;
 }
 
 }  // namespace
@@ -1824,7 +1937,7 @@ std::vector<Scheduler::WholePrompt> Scheduler::wholePromptsAfter(std::span<Reque
         }
         ++probes;
         const std::optional<std::int32_t> tokens = wholePromptTokens(*request, resident_holder, has_state_group);
-        if (tokens && *tokens <= config_.prefill_chunk_yield_tokens) {
+        if (tokens && *tokens <= std::max(config_.prefill_chunk_yield_tokens, build.token_budget)) {
             whole_prompts.push_back(WholePrompt{
                 .index = index,
                 .request = request,
@@ -1847,7 +1960,10 @@ std::vector<Scheduler::WholePrompt> Scheduler::carriedPrompts(std::span<const Wh
     std::int64_t tokens = 0;
     std::int64_t pages = 0;
     for (const WholePrompt& prompt : whole_prompts) {
-        if (prompt.index < from || !prompt.request->Is<fsm::Submitted>() || build.Scheduled(*prompt.request)) {
+        // A prompt larger than the knob is never given way to; only the
+        // budget a chunk leaves on its own may take it (carryWholePrompts).
+        if (prompt.index < from || prompt.tokens > config_.prefill_chunk_yield_tokens ||
+            !prompt.request->Is<fsm::Submitted>() || build.Scheduled(*prompt.request)) {
             continue;
         }
         const std::size_t count = carried.size() + 1;
@@ -1864,11 +1980,13 @@ std::vector<Scheduler::WholePrompt> Scheduler::carriedPrompts(std::span<const Wh
     return carried;
 }
 
-void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                  std::span<const WholePrompt> carried, std::int32_t decode_reserve) {
+std::int32_t Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
+                                          std::span<Request* const> candidates, std::span<const WholePrompt> carried,
+                                          std::int32_t decode_reserve) {
     ProfileSpan profile_span{"Scheduler::carryWholePrompts"};
     _assert(!build.operations.empty(), "the holder's row is pushed before the prompts it carries");
     const auto holder_row = static_cast<std::ptrdiff_t>(build.operations.size()) - 1;
+    std::int32_t admitted_prompts = 0;
     for (const WholePrompt& prompt : carried) {
         if (build.Full(config_.max_batch_size) || lone_requests_.ActedInPlan()) {
             break;
@@ -1889,6 +2007,7 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
             }
             pushOperation(build, *request, std::move(*admitted));
             request->TrackScheduledForward();
+            ++admitted_prompts;
             _assert(!holdsHeadOfLine(*request), "a carried prompt completes in its round");
         } else if (feedback.admission_failed) {
             feedback.NoteCapacityBlocked(request);
@@ -1902,6 +2021,7 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
     // outputs"). Nothing carried, nothing moves.
     const auto holder = build.operations.begin() + holder_row;
     std::rotate(holder, holder + 1, build.operations.end());
+    return admitted_prompts;
 }
 
 bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) const {
@@ -1936,10 +2056,16 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // of the waiting prompts it can carry whole (carriedPrompts, from the round's
 // once-probed wholePromptsAfter list; for a new prompt only those behind it),
 // and after it keeps the head of line those prompts are admitted complete in
-// the same forward (carryWholePrompts), their rows ahead of its own. It is
-// still admitted first, and a resident's chunk that fails admission still
-// stops everything behind it. A chunk whose admission compacted carries none:
-// they would be later admissions in the compaction's plan.
+// the same forward (carryWholePrompts), their rows ahead of its own. On the P
+// role, with or without that option, any chunk that keeps the head of line
+// then fills the budget it leaves the same way: from the same list in
+// submission order or, with enable_short_prefill_first, from the new prompts
+// still ranked, in rank order (popShortPrefill; for a resident's chunk ranked
+// after its admission), so a protected prompt goes first. The carry keeps
+// submission order either way. The chunk is still admitted first, and a
+// resident's chunk that fails admission still stops everything behind it. A
+// chunk whose admission compacted carries and fills none: they would be later
+// admissions in the compaction's plan. The fused role does neither.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
@@ -1952,7 +2078,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
         }
         const bool short_work_first = !resident && config_.enable_short_prefill_first;
         std::vector<PendingPrefill> pending;
-        if (short_work_first) {
+        // Ranks the new prompts no phase scheduled yet; also for a resident
+        // chunk's fill, after its admission.
+        const auto rank_new_prompts = [&] {
             pending.reserve(candidates.size());
             for (Request* request : candidates) {
                 if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
@@ -1967,11 +2095,14 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                                                             coordinator_.ReplayTokens(hit_tokens);
                 pending.push_back(PendingPrefill{request, remaining});
             }
+        };
+        if (short_work_first) {
+            rank_new_prompts();
         }
         auto fifo = candidates;
         const auto next_request = [&]() -> Request* {
             if (short_work_first) {
-                return popShortPrefill(pending);
+                return popShortPrefill(pending).request;
             }
             if (fifo.empty()) {
                 return nullptr;
@@ -1993,10 +2124,21 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 build.Scheduled(*request)) {
                 continue;
             }
+            // A prompt whose peer landing waits for room is admitted only as one.
+            if (!resident && request->GetIf<fsm::Submitted>()->admission.peer_hit) {
+                continue;
+            }
             if (!prefillAllowed(*request, build)) {
                 // Recheck after every admission: a resident's final chunk or
                 // an earlier newcomer may have crossed the watermark.
                 return;
+            }
+            // The carry takes the prompts submitted after this one, in
+            // submission order, even when it was ranked; so does the fill
+            // when the prompts are not ranked.
+            std::size_t from = 0;
+            if (config_.role == Role::kP && !resident) {
+                from = static_cast<std::size_t>(std::ranges::find(candidates, request) - candidates.begin()) + 1;
             }
             // Whether this chunk may hold the head of line: a resident's rest
             // past the budget, or a new prompt that could not finish it even
@@ -2004,13 +2146,8 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             std::vector<WholePrompt> carried;
             std::int32_t yield_tokens = 0;
             if (config_.prefill_chunk_yield_tokens > 0 &&
+                request->PrefillRoundsGivenWay() < config_.prefill_chunk_yield_max_rounds &&
                 (resident ? request->UnscheduledPrefillSize() : request->PrefillSize()) > build.token_budget) {
-                // Carry selection keeps submission order, even when this holder was ranked.
-                std::size_t from = 0;
-                if (!resident) {
-                    const auto holder = std::ranges::find(candidates, request);
-                    from = static_cast<std::size_t>(holder - candidates.begin()) + 1;
-                }
                 if (!whole_prompts) {
                     whole_prompts = wholePromptsAfter(candidates, from, build, resident ? request : nullptr);
                 }
@@ -2028,6 +2165,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 }
             }
             feedback.admission_failed = false;
+            feedback.chunk_gave_way = false;
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                          decode_reserve, build.load_backs, build.kv_page_budget,
                                                          yield_tokens, /*must_complete=*/false)) {
@@ -2038,7 +2176,66 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
-                    carryWholePrompts(feedback, build, candidates, carried, decode_reserve);
+                    // A round counts toward prefill_chunk_yield_max_rounds
+                    // only when the chunk really gave way: it was cut shorter
+                    // for the carry, or a carried prompt ran beside it.
+                    const bool chunk_cut = feedback.chunk_gave_way;
+                    if (carryWholePrompts(feedback, build, candidates, carried, decode_reserve) > 0 || chunk_cut) {
+                        request->NotePrefillGaveWay();
+                    }
+                    // On the P role, whatever prefill_chunk_yield_tokens, the
+                    // budget the chunk still leaves -- a junction, say, ended
+                    // it short -- goes to other whole prompts, admitted the
+                    // same way, unless a carried one already failed for
+                    // capacity or the chunk's admission compacted.
+                    if (config_.role == Role::kP && !build.Full(config_.max_batch_size) && !feedback.admission_failed &&
+                        !lone_requests_.ActedInPlan()) {
+                        if (config_.enable_short_prefill_first) {
+                            // With the new prompts ranked, in rank order,
+                            // submitted before this prompt or not: a
+                            // protected one first, priority reevaluated after
+                            // each admission. A resident's chunk ranks them
+                            // after its admission, which published what its
+                            // last chunk completed.
+                            if (resident) {
+                                rank_new_prompts();
+                            }
+                            while (!build.Full(config_.max_batch_size) && build.token_budget > 0 &&
+                                   req_pool_allocator_.AvailableSlots() > 0 && !feedback.admission_failed) {
+                                // Drop those the carry admitted (the pop reads
+                                // a waiting prompt's bypasses) and those whose
+                                // ranked work exceeds the budget left: it only
+                                // shrinks, so popping them would only skip
+                                // them, at O(n) a pop.
+                                std::erase_if(pending, [&build](const PendingPrefill& prompt) {
+                                    return build.Scheduled(*prompt.request) ||
+                                           prompt.remaining_tokens > build.token_budget;
+                                });
+                                const PendingPrefill next = popShortPrefill(pending);
+                                if (next.request == nullptr) {
+                                    break;
+                                }
+                                // Admitted on the work it was ranked by; its
+                                // admission probes again.
+                                const WholePrompt prompt{.request = next.request, .tokens = next.remaining_tokens};
+                                carryWholePrompts(feedback, build, candidates, std::span<const WholePrompt>(&prompt, 1),
+                                                  decode_reserve);
+                            }
+                        } else {
+                            // Otherwise those behind it in the round's list.
+                            if (!whole_prompts) {
+                                // Probed after the admission, which published
+                                // what a resident's last chunk completed: none
+                                // is stale.
+                                whole_prompts = wholePromptsAfter(candidates, from, build, /*resident_holder=*/nullptr);
+                            }
+                            const auto behind = std::ranges::find_if(
+                                *whole_prompts, [from](const WholePrompt& prompt) { return prompt.index >= from; });
+                            carryWholePrompts(feedback, build, candidates,
+                                              std::span<const WholePrompt>(behind, whole_prompts->end()),
+                                              decode_reserve);
+                        }
+                    }
                     return;
                 }
             } else if (feedback.admission_failed) {
@@ -2107,6 +2304,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
+    schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
     scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
 }
 
@@ -2192,6 +2390,12 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // prefill_decode_min_interval M is owed the same way, but nothing suspends
 // it: an overdue prompt's chunks alternate with M decode rounds instead of
 // running back to back.
+// With max_consecutive_prefill_rounds K, the suspension is bounded instead:
+// an overdue prompt suspends the interval only until K prefill rounds have
+// run back to back; the round that reaches K owes the decodes the whole
+// interval again, which no overdue prompt can suspend. In exchange the
+// held-back count restarts whenever a prompt's chunk runs, so the N-round
+// bound applies to each chunk, not to the prompt in total.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     ProfileSpan profile_span{"Scheduler::buildFusedPlan"};
@@ -2199,7 +2403,21 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
     const bool interval_owes_decodes =
-        prefill_min_rounds_left_ > 0 || (prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates));
+        prefill_min_rounds_left_ > 0 ||
+        (prefill_deferral_rounds_left_ > 0 && !(prefillSuspensionAllowed() && prefillDeferralExhausted(candidates)));
+    // The prompts waiting for a prefill chunk before this round: the ones
+    // whose chunk the round runs restart their held-back count below.
+    std::vector<Request*> waiting_prefill;
+    // Whether a request was ready to decode before this round: a prefill
+    // round stalls a decode only then.
+    bool decodes_waiting = false;
+    if (config_.max_consecutive_prefill_rounds > 0) {
+        std::ranges::copy_if(candidates, std::back_inserter(waiting_prefill), [](const Request* request) {
+            return request->IsAnyOf<fsm::Submitted, fsm::Prefilling>();
+        });
+        decodes_waiting = std::ranges::any_of(
+            candidates, [](const Request* request) { return request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>(); });
+    }
     if (config_.enable_mixed_prefill_decode) {
         // The decode batch's prefill reserve exists to protect a prefill that
         // may ride beside it; with the delay gate closed no prefill can, so
@@ -2222,6 +2440,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         // the prefills into rounds is meant to avoid. The next open round
         // resumes it; a prompt's chunks therefore cluster instead of
         // scattering across rounds.
+        schedulePeerLandings(feedback, build, candidates, new_prompts_sealed);
         scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
     }
 
@@ -2247,6 +2466,11 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
             request->NotePrefillDeferred();
         }
     }
+    for (Request* request : waiting_prefill) {
+        if (build.prefilled.contains(request)) {
+            request->ResetPrefillDeferred();
+        }
+    }
     if (build.pushed_prefill) {
         prefill_deferral_rounds_left_ = config_.prefill_decode_interval;
         prefill_min_rounds_left_ = config_.prefill_decode_min_interval;
@@ -2254,6 +2478,29 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
         prefill_deferral_rounds_left_ = std::max(prefill_deferral_rounds_left_ - 1, 0);
         prefill_min_rounds_left_ = std::max(prefill_min_rounds_left_ - 1, 0);
     }
+    if (config_.max_consecutive_prefill_rounds > 0) {
+        // A round that decodes ends the run (in mixed mode, even beside a
+        // prefill chunk), and so does one with no decode to hold back: a run
+        // of prefill while nothing decodes stalls nothing. A run that
+        // reaches the cap holds the interval its last round started until
+        // the decodes have been paid.
+        if (build.pushed_decode || !decodes_waiting) {
+            consecutive_prefill_rounds_ = 0;
+        } else if (build.pushed_prefill) {
+            consecutive_prefill_rounds_ =
+                std::min(consecutive_prefill_rounds_ + 1, config_.max_consecutive_prefill_rounds);
+        }
+        if (build.pushed_prefill && consecutive_prefill_rounds_ >= config_.max_consecutive_prefill_rounds) {
+            prefill_interval_held_ = true;
+        } else if (prefill_deferral_rounds_left_ == 0) {
+            prefill_interval_held_ = false;
+        }
+    }
+}
+
+bool Scheduler::prefillSuspensionAllowed() const {
+    return config_.max_consecutive_prefill_rounds == 0 ||
+           (!prefill_interval_held_ && consecutive_prefill_rounds_ < config_.max_consecutive_prefill_rounds);
 }
 
 bool Scheduler::prefillDeferralExhausted(std::span<Request* const> candidates) const {

@@ -24,7 +24,7 @@ import contextlib
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -77,7 +77,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner, freeze_gc
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -111,7 +111,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     resolve_cuda_graph_support,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
-    CacheBatchMetadata,
+    build_managed_cache_metadata,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeVerifyInputs,
@@ -157,6 +157,7 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.moe.source_rows import MoESourceRows
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 logger = get_colorful_logger(__name__)
@@ -323,6 +324,12 @@ def select_dspark_context_producer(
             "pipeline stages."
         )
     return None
+
+
+@runtime_checkable
+class MoESourceRowsModel(Protocol):
+    @property
+    def moe_source_rows(self) -> MoESourceRows | None: ...
 
 
 @runtime_checkable
@@ -864,7 +871,10 @@ class ModelExecutor:
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
         self._prev_decode_bs: int = 0
-        self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self._sentinel_neg1 = torch.tensor(
+                -1, device=self.device, dtype=torch.int64
+            )
         self.mm_runtime = MultimodalRuntime(
             model_is_mrope=config.model_is_mrope,
             input_buffers=self.input_buffers,
@@ -1048,6 +1058,13 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            moe_source_rows=tuple(
+                rows
+                for runner in (self.model_runner, self._draft_model_runner)
+                if runner is not None
+                and isinstance(runner.model, MoESourceRowsModel)
+                and (rows := runner.model.moe_source_rows) is not None
+            ),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
@@ -1101,34 +1118,39 @@ class ModelExecutor:
         captures every graph.
         """
         workspace_pool(self.device).freeze()
+        # Enforce-eager boots capture nothing and skip freeze_gc's collections.
+        if self.forward_step.disable and self.prefill_graph.disable:
+            return
 
-        if not self.forward_step.disable:
-            self.forward_step.capture(entries=entries, observer=observer)
-        if not self.prefill_graph.disable:
-            self.prefill_graph.capture(
-                self.forward_step, entries=entries, observer=observer
-            )
-            # Only a drafter that declared the ladder gets a window to fill.
-            if self.captures_drafter_prefill_graph:
-                self.drafter.capture_prefill_graph(
-                    self.forward_step.stream, observer.measure("prefill:drafter")
+        # Freeze once for all captures; prefill and drafter captures collect on entry.
+        with freeze_gc(self.config.enable_cudagraph_gc):
+            if not self.forward_step.disable:
+                self.forward_step.capture(entries=entries, observer=observer)
+            if not self.prefill_graph.disable:
+                self.prefill_graph.capture(
+                    self.forward_step, entries=entries, observer=observer
                 )
-            # The drafter's extend graphs: the entries the projection prices.
-            plan = self._drafter_extend_plan()
-            if plan:
-                width, dtype = self.prefill_graph.captured_hidden_spec()
-                self.drafter.capture_extend_graphs(
-                    DrafterExtendCapture(
-                        plan=plan,
-                        ladders=self.drafter_extend_ladders(entries),
-                        stream=self.forward_step.stream,
-                        num_warmup=self.prefill_graph.num_warmup,
-                        target_hidden_width=width,
-                        target_hidden_dtype=dtype,
-                        prepare_batch=self._prepare_drafter_capture_batch,
-                    ),
-                    observer=observer,
-                )
+                # Only a drafter that declared the ladder gets a window to fill.
+                if self.captures_drafter_prefill_graph:
+                    self.drafter.capture_prefill_graph(
+                        self.forward_step.stream, observer.measure("prefill:drafter")
+                    )
+                # The drafter's extend graphs: the entries the projection prices.
+                plan = self._drafter_extend_plan()
+                if plan:
+                    width, dtype = self.prefill_graph.captured_hidden_spec()
+                    self.drafter.capture_extend_graphs(
+                        DrafterExtendCapture(
+                            plan=plan,
+                            ladders=self.drafter_extend_ladders(entries),
+                            stream=self.forward_step.stream,
+                            num_warmup=self.prefill_graph.num_warmup,
+                            target_hidden_width=width,
+                            target_hidden_dtype=dtype,
+                            prepare_batch=self._prepare_drafter_capture_batch,
+                        ),
+                        observer=observer,
+                    )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:
@@ -1184,7 +1206,18 @@ class ModelExecutor:
 
         A forward reload keeps the tactics already loaded by this process.
         """
+        self._warm_kernels(keep_loaded_tactics=keep_loaded_tactics, tune=True)
 
+    def warm_kernels(self) -> None:
+        """Warm kernels on the serving stream with the loaded tactics, tuning none.
+
+        For a warm-up after the pools are rebound: it compiles the kernel
+        variants the new pools select, but profiles no tactic, since tuning
+        workspaces would land outside the memory the rebind reserved.
+        """
+        self._warm_kernels(keep_loaded_tactics=True, tune=False)
+
+    def _warm_kernels(self, *, keep_loaded_tactics: bool, tune: bool) -> None:
         per_rank_max_batch = max(
             1,
             int(self.config.max_num_seqs)
@@ -1236,8 +1269,10 @@ class ModelExecutor:
             # These dummy forwards do not perform pipeline stage transfers.
             logger.info("Kernel warmup and tuning skipped under pipeline parallelism")
             return
-        tune_mode = not self.config.disable_autotune
-        if not tune_mode:
+        tune_mode = tune and not self.config.disable_autotune
+        if not self.config.disable_autotune and not tune:
+            logger.info("Kernel warmup with the loaded tactics, profiling none")
+        elif not tune_mode:
             logger.info("Kernel tactic profiling disabled (--disable-autotune)")
 
         # One traversal discovers each operator. Its dispatch warms finite
@@ -1330,7 +1365,11 @@ class ModelExecutor:
                             ),
                             graph_phase=False,
                         )
-                if hipblaslt_autotune_enabled() and not self.config.prefill_only:
+                if (
+                    tune
+                    and hipblaslt_autotune_enabled()
+                    and not self.config.prefill_only
+                ):
                     # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
                     # captured batch size tunes the dense GEMMs the tuned file
                     # does not list, so capture records the picks. Tuning ends
@@ -1364,7 +1403,7 @@ class ModelExecutor:
         num_tokens_per_req = self.config.output_length
         logits = torch.zeros(
             (num_tokens_per_req, lm_head.num_embeddings_per_partition),
-            dtype=lm_head.weight.dtype,
+            dtype=processor.sampled_shard_dtype(lm_head),
             device=self.device,
         )
         candidates = torch.zeros(
@@ -2027,6 +2066,17 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
 
+        if ctx.decode_query_indptr is not None and sampling_info.vocab_mask is not None:
+            if self.drafter is None:
+                raise ValueError("packed grammar masks require a drafter")
+            sampling_info = replace(
+                sampling_info,
+                vocab_mask=self.drafter.pack_grammar_vocab_mask(
+                    sampling_info.vocab_mask,
+                    num_tokens=logits_output.next_token_logits.shape[0],
+                ),
+            )
+
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
@@ -2593,6 +2643,7 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        """Execute one scheduled forward operation."""
         if self.forward_step.draft_overlap is not None:
             self.forward_step.draft_overlap.prepare_batch(
                 tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
@@ -2639,8 +2690,9 @@ class ModelExecutor:
             if bs > 0:
                 # Check the per-group tables' structure and pack them once for
                 # this batch; the page IDs only under the diagnostic.
-                cache_metadata = CacheBatchMetadata.from_forward_op(
+                cache_metadata = build_managed_cache_metadata(
                     forward_op,
+                    memory_saver_adapter=self.memory_saver_adapter,
                     device=self.device,
                     contract=self._cache_runtime_contract,
                     num_requests=bs,

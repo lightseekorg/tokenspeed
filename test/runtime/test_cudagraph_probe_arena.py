@@ -383,10 +383,17 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             free[0] -= init_keeps
 
         def autotune(self, *, keep_loaded_tactics):
-            assert not keep_loaded_tactics
+            # Only the probe boot tunes; the final pools are warmed by warm_kernels.
+            assert not keep_loaded_tactics and not charged
             # Tried tactics also raise the stack limit, which reserves local memory.
             free[0] -= tune_keeps + (1 << 30)
             stack[0] += 1 << 30
+
+        def warm_kernels(self):
+            # After the rebind: its transient memory comes from the utilization
+            # headroom, not the reserve the rebind was charged for.
+            assert charged
+            free[0] -= 1 << 20
 
         def capture_graphs(self, *, entries, observer):
             raise _ServingCapture
@@ -444,6 +451,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         lambda: SimpleNamespace(
             restore_stack_limit=restore_stack_limit,
             is_nvidia=is_nvidia,
+            is_amd=not is_nvidia,
             is_cdna4=False,
         ),
     )
@@ -486,6 +494,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             server_args=server_args,
             # Kimi-K3.1-like: the aggregated role agrees on its prefill plan.
             model_config=SimpleNamespace(
+                dtype=torch.bfloat16,
                 context_len=4096,
                 is_multimodal_active=False,
                 dsa_padded_prefill_replay=True,
@@ -500,6 +509,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             max_batch_size=8,
             max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
+            peer_outbox=None,
         )
     return charged, set(reads), stack[0]
 
@@ -552,6 +562,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "_cudagraph_probe_refusal",
         "build_components",
         "autotune",
+        "warm_kernels",
         "_rebind_under_reserve",
         "HostCacheExecutor",
         "_capture_serving_graphs",
@@ -567,10 +578,11 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "warm_kernels",
         "HostCacheExecutor",
         "_capture_serving_graphs",
     ]
-    refusal, probe_build, _, _, _, _ = calls
+    refusal, probe_build, _, _, _, _, _ = calls
     # The serving capture, which a forward reload repeats, then reseeds the generator.
     capture = _function("execution/device.py", "_capture_serving_graphs")
     serving, seed = sorted(

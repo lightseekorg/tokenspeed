@@ -113,6 +113,11 @@ def _page_table(placed: list[list[int]]) -> torch.Tensor:
 
 def _plane(keys, virtual_blocks, placement, device):
     """This rank's FP8 index-K plane of every virtual slot's key."""
+    from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+        encode_index_k_scale,
+        index_k_scale_ue8m0,
+        round_index_k_scale,
+    )
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
     from tokenspeed_kernel.ops.quantization import quantize_fp8
 
@@ -125,6 +130,12 @@ def _plane(keys, virtual_blocks, placement, device):
     values, scales = quantize_fp8(
         keys, granularity="token_group", group_size=128, scale_encoding="float32"
     )
+    if index_k_scale_ue8m0():
+        # A Blackwell plane's keys quantize with the power-of-two scale its
+        # UE8M0 word stores, as the index-K writes do.
+        scales = round_index_k_scale(scales)
+        values = (keys.float() / scales).clamp(-448, 448).to(values.dtype)
+        scales = encode_index_k_scale(scales)
     slots, owned = resolve_cache_slots(
         torch.arange(keys.shape[0], device=device), placement
     )
@@ -446,17 +457,25 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         dist.destroy_process_group()
 
 
-# NCCL and the pull exchange at two ranks; the pull exchange at K3.1's eight.
-@pytest.mark.parametrize("degree,pull_exchange", [(2, False), (2, True), (8, True)])
+# NCCL at two and four ranks, the pull exchange at two and at K3.1's eight.
+@pytest.mark.parametrize(
+    "degree,pull_exchange", [(2, False), (4, False), (2, True), (8, True)]
+)
 def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
     tmp_path, degree, pull_exchange
 ):
-    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
         pytest.skip(f"requires {degree} GPUs")
-    if not current_platform().is_cdna4:
-        pytest.skip("the owned selection and Iris pull exchanges run on CDNA4")
+    platform = current_platform()
+    if pull_exchange and not platform.is_cdna4:
+        pytest.skip("Iris pull exchanges run on CDNA4")
+    if not platform.is_cdna4 and not (
+        platform.is_nvidia
+        and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+    ):
+        pytest.skip("the owned selection runs on CDNA4, SM100, and SM103")
     mp.spawn(
         _worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.sampling import SELECTED_LOGPROBS_BLOCK
 
 
 @triton.jit
@@ -102,7 +103,7 @@ def selected_token_logprobs(
         out,
         vocab_size=vocab_size,
         logits_row_stride=logits.stride(0),
-        BLOCK_SIZE=1024,
+        BLOCK_SIZE=SELECTED_LOGPROBS_BLOCK,
         num_warps=4,
         num_stages=3,
     )

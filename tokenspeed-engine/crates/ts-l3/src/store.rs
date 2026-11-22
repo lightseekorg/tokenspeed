@@ -56,7 +56,9 @@ impl HostBuffer {
 /// to the Host bytes has ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoResult {
-    /// Per key: a full read, or a published (or already present) object.
+    /// Per key: a full read, or an acknowledged create-only PUT. Some SDKs
+    /// acknowledge an existing writer before its object becomes readable;
+    /// a later GET remains authoritative for cache reuse.
     pub success: Vec<bool>,
     /// Native retirement: nothing still touches the batch's Host bytes.
     pub retired: bool,

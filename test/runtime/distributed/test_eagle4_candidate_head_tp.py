@@ -32,13 +32,20 @@ Usage:
 import faulthandler
 import os
 import signal
+import subprocess
 import sys
 import time
+
+# Cover imports as well as the worker body. The timer also captures waits
+# where the main thread cannot handle the parent's diagnostic signal.
+_WORKER_MODE = __name__ == "__main__" and sys.argv[1:2] == ["--worker"]
+if _WORKER_MODE:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    faulthandler.dump_traceback_later(180)
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from transformers import LlamaConfig
 
 sys.path.insert(
@@ -157,29 +164,83 @@ def _check_greedy_candidate(rank, world_size, device):
     assert all(torch.equal(g, best) for g in gathered)
 
 
-def _worker(rank, world_size, rendezvous, error_dict):
+def _worker(rank, world_size, rendezvous):
     # The test asks a stuck rank for its stacks before killing it.
     faulthandler.register(signal.SIGUSR1, all_threads=True)
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
+    pg_manager.init_process_group(tuple(range(world_size)))
+    # A Torch NCCL group does not select TokenSpeed's collective backend.
+    # This candidate-head test exercises NCCL; Auto can lazily allocate RSAG.
+    set_global_backend(NcclBackend())
+    _check_greedy_candidate(rank, world_size, device)
+    dist.destroy_process_group()
+
+
+def _wait_for_workers(processes, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        exit_codes = [process.poll() for process in processes]
+        for rank, code in enumerate(exit_codes):
+            if code is not None and code != 0:
+                raise RuntimeError(
+                    f"rank {rank} exited with code {code}; see worker output"
+                )
+        if all(code is not None for code in exit_codes):
+            return
+        if time.monotonic() > deadline:
+            # One rank at a time, so the two dumps do not interleave.
+            for rank, process in enumerate(processes):
+                if process.poll() is None:
+                    print(f"rank {rank} stacks:", file=sys.stderr, flush=True)
+                    process.send_signal(signal.SIGUSR1)
+                    time.sleep(5)
+            raise RuntimeError(f"ranks still running after {timeout_seconds} s")
+        time.sleep(0.1)
+
+
+def _stop_workers(processes):
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+    for process in processes:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A driver wait can survive SIGKILL. Keep the original failure and
+            # still reap the other ranks before reporting this survivor.
+            print(
+                f"worker pid {process.pid} survived kill", file=sys.stderr, flush=True
+            )
+
+
+def test_worker_failure_does_not_wait_for_a_stuck_peer():
+    processes = []
     try:
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=rendezvous,
-            rank=rank,
-            world_size=world_size,
+        processes.append(
+            subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"])
         )
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg_manager,
+        processes.append(
+            subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
         )
-
-        pg_manager.init_process_group(tuple(range(world_size)))
-        _check_greedy_candidate(rank, world_size, device)
-        dist.destroy_process_group()
-    except Exception:
-        import traceback
-
-        error_dict[rank] = traceback.format_exc()
+        with pytest.raises(RuntimeError, match="rank 0 exited with code 7"):
+            _wait_for_workers(processes, 5)
+        assert processes[1].poll() is None
+    finally:
+        _stop_workers(processes)
 
 
 @pytest.mark.skipif(
@@ -187,34 +248,31 @@ def _worker(rank, world_size, rendezvous, error_dict):
     reason="needs 2 GPUs",
 )
 def test_two_ranks_pick_the_best_of_their_gathered_candidates(tmp_path):
-    error_dict = mp.Manager().dict()
-    # A file rendezvous: a probed free port can be taken before rank 0 binds it.
-    ranks = mp.spawn(
-        _worker,
-        args=(2, f"file://{tmp_path / 'rendezvous'}", error_dict),
-        nprocs=2,
-        join=False,
-    )
-    # A stuck rank prints its stacks and the test fails instead of hanging.
-    deadline = time.monotonic() + JOIN_SECONDS
-    while not ranks.join(timeout=5):
-        if time.monotonic() > deadline:
-            # One rank at a time, so the two dumps do not interleave.
-            for rank, process in enumerate(ranks.processes):
-                if process.is_alive():
-                    print(f"rank {rank} stacks:", file=sys.stderr, flush=True)
-                    os.kill(process.pid, signal.SIGUSR1)
-                    time.sleep(5)
-            for process in ranks.processes:
-                process.kill()
-            peer = torch.cuda.can_device_access_peer(0, 1)
-            raise RuntimeError(
-                f"ranks still running after {JOIN_SECONDS} s (peer access {peer}); "
-                f"reported: {dict(error_dict)}"
+    # An exec boundary lets the worker install diagnostics before importing
+    # Torch. No initialized parent state or Python worker objects cross it.
+    processes = []
+    try:
+        for rank in range(2):
+            processes.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        os.path.abspath(__file__),
+                        "--worker",
+                        str(rank),
+                        "2",
+                        f"file://{tmp_path / 'rendezvous'}",
+                    ],
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                )
             )
-    if error_dict:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in error_dict.items()))
+        _wait_for_workers(processes, JOIN_SECONDS)
+    finally:
+        _stop_workers(processes)
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    if _WORKER_MODE:
+        _worker(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+    else:
+        raise SystemExit(pytest.main([__file__, "-v"]))

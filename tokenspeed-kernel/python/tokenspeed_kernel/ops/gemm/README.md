@@ -50,13 +50,22 @@ a contiguous output; CuTe-DSL also requires 16-byte alignment. Triton writes
 using output strides; FlashInfer can copy a temporary result into a strided or
 unaligned output. The common `mm` API still requires
 the output's innermost stride to be one. DeepGEMM also requires contiguous
-weight scales; FlashInfer and CuTe-DSL normalize their scale layouts internally.
+weight scales; FlashInfer normalizes its scale layouts internally.
 For 128x128 block FP8, both CuTe-DSL and FlashInfer require 16-byte-aligned A/B
 pointers. A contiguous offset view that breaks this alignment falls back to
 Triton. CuTe-DSL selection also requires aligned scale pointers; an unaligned
 scale view falls back to FlashInfer where its M range permits, or Triton.
 This scale check is conservative even when a layout copy would align the view.
 Online quantization supplies freshly allocated, aligned activations and scales.
+
+Activation-scale storage is part of selection. CuTe-DSL reads MN-major scales
+(`stride(0) == 1`) in place and FlashInfer reads K-major ones; each registration
+declares this as `a_scales_layout`, and `mm` derives the trait from `A_scales`.
+A one-row or one-column tensor fits both. Callers that quantize first ask
+`mm_activation_scale_layout` which layout the selected kernel reads, so neither
+the quantizer nor the GEMM copies scales into another layout. Online
+quantization writes K-major scales and transposes them explicitly when the
+selected kernel reads MN-major.
 
 ## Dense FP32 output
 
@@ -109,21 +118,27 @@ reduction order can change rounding relative to the original GEMM.
 
 ## Decode GEMMs on small weights
 
-On SM100 and SM103, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV tile
-instead of cuBLASLt when all of these hold:
+On SM100, SM103 and SM107, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV
+tile instead of cuBLASLt when all of these hold:
 
 - No bias, BF16 output, and no plan, `solution`, override, scales, or `alpha`
 - `TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows
-  (`BF16_GEMM_MAX_M` on SM100 and SM103), `mm` takes FlashInfer's joint BF16
+  (`BF16_GEMM_MAX_M`), `mm` takes FlashInfer's joint BF16
   GEMM (`flashinfer_bf16_gemm`) instead, in which FlashInfer's tuner chooses
-  among its TGV and CuTe DSL tactics.
-- `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below)
-- This rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB).
-- One of the pinned tiles covers the GEMM in one wave (below).
+  among its TGV and CuTe DSL tactics (CuTe DSL only on SM107; above).
+- `TGV_DECODE_MIN_K <= K <=` the architecture's `max_k` in `TGV_DECODE_WINDOWS`
+  (2048 <= K <= 3072 on SM100 and SM103, up to 6144 on SM107; below)
+- This rank's weight takes at most the window's `max_weight_bytes` (16 MiB on
+  SM100 and SM103, 32 MiB on SM107).
+- On SM107, the weight has at least the window's `min_n` rows (512, the fewest
+  measured; below).
+- One of the pinned tiles covers the GEMM in one wave, or, on SM107, with at
+  most half as many CTAs as SMs (below).
 - PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
   off).
 - The operands meet the joint BF16 contract (`flashinfer_joint_bf16_supported`):
-  contiguous, 32-byte aligned, K a multiple of 8.
+  contiguous, 32-byte aligned, K a multiple of 8 (of 128 on SM107, where the
+  joint path pins CuTe DSL).
 - Serving has not started (`is_serving()`).
 
 Under PDL, TGV loads weight tiles while the producer kernel still runs and
@@ -132,15 +147,29 @@ producer finishes. FlashInfer's tactic profiling times each GEMM alone and
 cannot see that overlap, so `select_tgv_decode_tile` chooses the tile itself:
 of the 2-CTA tiles of 128 weight rows by 16, 32, or 64 activation rows, each
 with the most stages that fit in shared memory, the first whose grid has at
-most one CTA per SM. A GEMM for which none fits keeps cuBLASLt, and so does
+most one CTA per SM. SM107's larger shared memory fits more stages (18, 16 and
+13 against 12, 11 and 9), and there the first tile whose grid has at most one
+CTA per two SMs wins. A GEMM for which none fits keeps cuBLASLt, and so does
 every GEMM without PDL, which has no overlap to gain. The choice depends only
-on M, N, K, the weight size, the SM count, and the PDL setting.
+on the architecture, M, N, K, the weight size, the SM count, and the PDL
+setting.
 
 The K window is measured, not derived: on GB300, in a captured PDL chain of an
 RMSNorm and this GEMM on a weight cold in L2, TGV beat cuBLASLt on most shapes
 with K in the window, by up to 1.30x. Outside it TGV lost on many shapes, down
 to 0.73x cuBLASLt's speed, mainly at K of 512 to 1024 and at K >= 4096 with
 few weight rows; at K = 1536 it also lost on some shapes (down to 0.92x).
+
+SM107's window comes from the same chain on a 212-SM VR200, over M = 48 to 512,
+N = 512 to 8192 and K = 1536 to 8192. Below 512 weight rows TGV lost up to 26%
+at K = 5120 to 6144, so SM107 routes only measured row counts. With the SM107
+tiles and grids of at most half the SMs, TGV took 4.4% less time than cuBLASLt
+summed over the 96 shapes, up to 1.7x faster (2560 x 6144 at 96 rows), and lost
+at most 8% (1280 x 2560 at 192 rows). Grids of up to one wave instead lost up
+to 22% at many rows, and at K = 8192 with 512 weight rows TGV lost up to 28%.
+In the decode steps of a quantized model that keeps such projections in BF16,
+the routed GEMMs took 3.7% of the step less time at 64 rows and 1.9% at 128
+rows.
 
 The weight limit and the K window are bounds on shape, not a list of layers.
 On a quantized checkpoint, the BF16 GEMMs that reach them are the small
@@ -217,6 +246,13 @@ the tool stops, and the file must be deleted to re-tune. Tuning rotates
 weight copies through `--cold-bytes`, so each timing reads the weight from
 HBM as a serving step does. Another solution can sum K in another order, so
 results differ from the default within BF16 rounding.
+
+The MI355X file also lists Muse Spark TP4 decode and prefill GEMMs whose
+solution was chosen among those that give the default's bits, not only the
+fastest: the output projection (8192 x 2048) at 49-96 and 320 rows, the MoE
+unpooler (8192 x 4096) at 74-96 rows, and three prefill shapes at one row
+count each. Re-tuning the file should keep those rows, or re-pick them by
+the same rule.
 
 To cover GEMMs the file does not list without regenerating it, such as a new
 model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).

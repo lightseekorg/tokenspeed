@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/block_placement_demand.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/fixed_slot_resource.h"
 #include "cache/core/prefetch.h"
@@ -42,20 +43,20 @@
 
 namespace tokenspeed {
 
-// Empty parents a group must open to place need_by_bucket[b] blocks in each
-// bucket b plus dense_need blocks in any bucket, given holes_by_bucket[b] free
+// Empty parents a group must open to place blocks_by_bucket[b] blocks in each
+// bucket b plus any_bucket_blocks blocks in any bucket, given holes_by_bucket[b] free
 // slots already in its bound parents. An opened parent gives every bucket
 // packing / B slots at once, so the bucket demands share the opened parents
-// rather than summing; the dense blocks take whatever holes the bucket
+// rather than summing; the blocks without a fixed bucket take whatever holes the bucket
 // demands leave. The pool's exact acquire, the coordinator's snapshot probe
 // and the admission planner's shadow fit all answer with this one formula.
-inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_by_bucket,
-                                            std::span<const std::int64_t> holes_by_bucket, std::int64_t dense_need,
-                                            std::int64_t packing) {
-    _assert(!need_by_bucket.empty() && need_by_bucket.size() == holes_by_bucket.size(),
+inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> blocks_by_bucket,
+                                            std::span<const std::int64_t> holes_by_bucket,
+                                            std::int64_t any_bucket_blocks, std::int64_t packing) {
+    _assert(!blocks_by_bucket.empty() && blocks_by_bucket.size() == holes_by_bucket.size(),
             "bucket demand and holes must cover the same shard count");
-    const auto buckets = static_cast<std::int64_t>(need_by_bucket.size());
-    _assert(packing > 0 && (buckets == 1 || packing % buckets == 0) && dense_need >= 0,
+    const auto buckets = static_cast<std::int64_t>(blocks_by_bucket.size());
+    _assert(packing > 0 && (buckets == 1 || packing % buckets == 0) && any_bucket_blocks >= 0,
             "bucket count must divide the parent packing and dense demand must be non-negative");
     // Every eviction candidate asks again; one slot per parent or bucket, the
     // common geometry, skips the integer divisions.
@@ -64,13 +65,13 @@ inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_b
     };
     const std::int64_t per_parent = buckets == 1 ? packing : packing / buckets;
     std::int64_t parents = 0;
-    std::int64_t total_need = dense_need;
+    std::int64_t total_need = any_bucket_blocks;
     std::int64_t total_holes = 0;
-    for (std::size_t b = 0; b < need_by_bucket.size(); ++b) {
-        _assert(need_by_bucket[b] >= 0 && holes_by_bucket[b] >= 0, "bucket demand and holes must be non-negative");
-        const std::int64_t short_by = std::max<std::int64_t>(need_by_bucket[b] - holes_by_bucket[b], 0);
+    for (std::size_t b = 0; b < blocks_by_bucket.size(); ++b) {
+        _assert(blocks_by_bucket[b] >= 0 && holes_by_bucket[b] >= 0, "bucket demand and holes must be non-negative");
+        const std::int64_t short_by = std::max<std::int64_t>(blocks_by_bucket[b] - holes_by_bucket[b], 0);
         parents = std::max(parents, parents_for(short_by, per_parent));
-        total_need += need_by_bucket[b];
+        total_need += blocks_by_bucket[b];
         total_holes += holes_by_bucket[b];
     }
     const std::int64_t total_short = std::max<std::int64_t>(total_need - total_holes, 0);
@@ -80,56 +81,57 @@ inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_b
 // Where pairs of blocks go when a pair's two blocks must share a bucket but
 // which bucket is free to choose (a tail block an admission allocates beside
 // its copy-in block): one pair at a time, into the bucket with the most holes
-// left over after `demand` -- the blocks wanted per bucket so far, the pairs
+// left over after blocks_by_bucket -- the blocks wanted per bucket so far, the pairs
 // before it included -- the lowest such bucket on ties. Under
 // ParentsNeededForBuckets no other choice needs fewer parents: the pairs add
 // the same blocks to the total whatever buckets they take, and filling the
 // least short bucket first keeps the largest bucket shortfall as small as it
 // can be.
-inline std::size_t NextPairBucket(std::span<const std::int64_t> demand, std::span<const std::int64_t> holes_by_bucket) {
-    _assert(!demand.empty() && demand.size() == holes_by_bucket.size(),
+inline std::size_t NextPairBucket(std::span<const std::int64_t> blocks_by_bucket,
+                                  std::span<const std::int64_t> holes_by_bucket) {
+    _assert(!blocks_by_bucket.empty() && blocks_by_bucket.size() == holes_by_bucket.size(),
             "bucket demand and holes must cover the same shard count");
     std::size_t best = 0;
-    for (std::size_t b = 1; b < demand.size(); ++b) {
-        if (holes_by_bucket[b] - demand[b] > holes_by_bucket[best] - demand[best]) {
+    for (std::size_t b = 1; b < blocks_by_bucket.size(); ++b) {
+        if (holes_by_bucket[b] - blocks_by_bucket[b] > holes_by_bucket[best] - blocks_by_bucket[best]) {
             best = b;
         }
     }
     return best;
 }
 
-// The bucket each of `pairs` pairs takes (NextPairBucket).
-inline std::vector<std::int32_t> AssignPairBuckets(std::span<const std::int64_t> need_by_bucket,
-                                                   std::span<const std::int64_t> holes_by_bucket, std::int64_t pairs) {
-    _assert(pairs >= 0, "pair demand must be non-negative");
-    std::vector<std::int64_t> demand(need_by_bucket.begin(), need_by_bucket.end());
+// The bucket each pair in block_demand takes (NextPairBucket).
+inline std::vector<std::int32_t> AssignPairBuckets(const BlockPlacementDemand& block_demand,
+                                                   std::span<const std::int64_t> holes_by_bucket) {
+    _assert(block_demand.same_bucket_pairs >= 0, "pair demand must be non-negative");
+    std::vector<std::int64_t> blocks_with_pairs = block_demand.blocks_by_bucket;
     std::vector<std::int32_t> buckets;
-    buckets.reserve(static_cast<std::size_t>(pairs));
-    for (std::int64_t pair = 0; pair < pairs; ++pair) {
-        const std::size_t bucket = NextPairBucket(demand, holes_by_bucket);
-        demand[bucket] += 2;
+    buckets.reserve(static_cast<std::size_t>(block_demand.same_bucket_pairs));
+    for (std::int64_t pair = 0; pair < block_demand.same_bucket_pairs; ++pair) {
+        const std::size_t bucket = NextPairBucket(blocks_with_pairs, holes_by_bucket);
+        blocks_with_pairs[bucket] += 2;
         buckets.push_back(static_cast<std::int32_t>(bucket));
     }
     return buckets;
 }
 
-// ParentsNeededForBuckets once `pairs` pairs join need_by_bucket in the
-// buckets NextPairBucket gives them. `scratch`, one entry per bucket, holds
-// the demand with the pairs in place, so a fit tried for every eviction
-// candidate allocates nothing.
-inline std::int64_t ParentsNeededForBucketsAndPairs(std::span<const std::int64_t> need_by_bucket,
-                                                    std::span<const std::int64_t> holes_by_bucket,
-                                                    std::int64_t dense_need, std::int64_t pairs, std::int64_t packing,
+// ParentsNeededForBuckets once the demand's pairs join its fixed-bucket blocks
+// in the buckets NextPairBucket gives them. Scratch holds one count per bucket,
+// so checking each tentative eviction allocates nothing.
+inline std::int64_t ParentsNeededForBucketsAndPairs(const BlockPlacementDemand& block_demand,
+                                                    std::span<const std::int64_t> holes_by_bucket, std::int64_t packing,
                                                     std::span<std::int64_t> scratch) {
-    if (pairs == 0) {
-        return ParentsNeededForBuckets(need_by_bucket, holes_by_bucket, dense_need, packing);
+    if (block_demand.same_bucket_pairs == 0) {
+        return ParentsNeededForBuckets(block_demand.blocks_by_bucket, holes_by_bucket, block_demand.any_bucket_blocks,
+                                       packing);
     }
-    _assert(pairs > 0 && scratch.size() == need_by_bucket.size(), "pairs need one scratch entry per bucket");
-    std::ranges::copy(need_by_bucket, scratch.begin());
-    for (std::int64_t pair = 0; pair < pairs; ++pair) {
+    _assert(block_demand.same_bucket_pairs > 0 && scratch.size() == block_demand.blocks_by_bucket.size(),
+            "pairs need one scratch entry per bucket");
+    std::ranges::copy(block_demand.blocks_by_bucket, scratch.begin());
+    for (std::int64_t pair = 0; pair < block_demand.same_bucket_pairs; ++pair) {
         scratch[NextPairBucket(scratch, holes_by_bucket)] += 2;
     }
-    return ParentsNeededForBuckets(scratch, holes_by_bucket, dense_need, packing);
+    return ParentsNeededForBuckets(scratch, holes_by_bucket, block_demand.any_bucket_blocks, packing);
 }
 
 // Physical LCM placement only. It deliberately has no cache key, LRU node,
@@ -267,13 +269,13 @@ public:
             return {};
         }
         GroupAvailability& group = prepareAvailability(group_id, packing);
-        std::vector<std::int64_t> need(group.parents_by_bucket.size(), 0);
+        std::vector<std::int64_t> blocks_by_bucket(group.parents_by_bucket.size(), 0);
         for (const std::int32_t bucket : buckets) {
-            _assert(bucket >= 0 && static_cast<std::size_t>(bucket) < need.size(),
+            _assert(bucket >= 0 && static_cast<std::size_t>(bucket) < blocks_by_bucket.size(),
                     "requested bucket is outside the registered shard count");
-            ++need[static_cast<std::size_t>(bucket)];
+            ++blocks_by_bucket[static_cast<std::size_t>(bucket)];
         }
-        if (ParentsNeededForBuckets(need, group.free_slots_by_bucket, /*dense_need=*/0, packing) >
+        if (ParentsNeededForBuckets(blocks_by_bucket, group.free_slots_by_bucket, /*any_bucket_blocks=*/0, packing) >
             static_cast<std::int64_t>(free_parent_ids_.size())) {
             return {};
         }

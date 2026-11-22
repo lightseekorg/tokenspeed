@@ -674,6 +674,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1469,15 +1480,18 @@ dependencies = [
  "bytes",
  "crc32fast",
  "mimalloc",
+ "parking_lot",
  "pyo3",
  "rustix",
  "serde_json",
  "thiserror 2.0.21",
  "tokenspeed-client",
  "tokenspeed-collective",
+ "tokenspeed-disk",
  "tokenspeed-grammar",
  "tokenspeed-l3",
  "tokenspeed-metrics",
+ "tokenspeed-mooncake",
  "tokenspeed-pd",
  "tokenspeed-scheduler",
  "tokenspeed-wire",
@@ -1486,6 +1500,17 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "zeromq",
+]
+
+[[package]]
+name = "tokenspeed-disk"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "parking_lot",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -1505,12 +1530,14 @@ dependencies = [
  "chrono",
  "libc",
  "mimalloc",
+ "parking_lot",
  "pyo3",
  "rustix",
  "serde_json",
  "thiserror 2.0.21",
  "tokenspeed-collective",
  "tokenspeed-control",
+ "tokenspeed-disk",
  "tokenspeed-grammar",
  "tokenspeed-l3",
  "tokenspeed-metrics",

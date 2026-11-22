@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/tier/peer.h"
 #include "scheduler/operations/inc.h"
 
 namespace tokenspeed {
@@ -102,14 +103,22 @@ public:
     // on the D role: at most one remote admission per round, beside the
     // decode batch and a restore (see buildDecodeWorkerPlan).
     //
-    // P role: completed prefills whose final chunk's result has landed; each
-    // one's decode happens on the peer node, so its KV goes out. Rows are
-    // self-contained (bootstrap token + drafter candidates).
+    // P role: completed prefills whose final chunk's result has landed and
+    // whose Decode destination is allocated (under deferred decode
+    // allocation a computed prompt may wait for it); each one's decode
+    // happens on the peer node, so its KV goes out. Rows are self-contained
+    // (bootstrap token + drafter candidates).
     std::optional<ForwardBatch> remote_decode;
     // D role: admitted prompts whose prefill runs on the peer node; the
     // receive pulls their KV into the freshly admitted (and sanitized)
     // pages. The model sees the request only after RemotePrefillDone.
     std::optional<ForwardBatch> remote_prefill;
+    // Peer prefix landings admitted this round (fsm::PeerLanding): the
+    // runtime pins each prefix at its holder, reads it into the destination
+    // pages once this plan's page zeroing and copies have run, releases the
+    // pin and reports PeerFetchDone. Like the remote streams, they take no
+    // batch slot or token budget.
+    std::vector<PeerFetchOperation> peer_fetches;
 
     // Requests the scheduler aborted while building this plan (none on most
     // rounds): the last resort of a retraction whose victim could not be
