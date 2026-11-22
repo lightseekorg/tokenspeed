@@ -698,7 +698,10 @@ class CuteDSLMLABackend(PagedMLABackend):
 
     @property
     def supports_mla_projected_value_decode(self) -> bool:
-        # Only the KVP merge projects, as it combines the partials.
+        """Whether decode projects values, which only a KVP merge does.
+
+        The merge projects as it combines the partials.
+        """
         return self._dcp is not None
 
     def forward_decode(

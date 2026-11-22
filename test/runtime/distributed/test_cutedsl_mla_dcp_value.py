@@ -44,6 +44,12 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="runtime-2gpu")
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="requires SM100, SM103 or SM107",
+)
+
 _HEADS, _LATENT, _DIM, _VALUE, _PAGE, _GRANULARITY = 12, 512, 576, 128, 64, 128
 
 
@@ -116,6 +122,13 @@ def _prepare_value_tail(group: tuple[int, ...], rows: int) -> None:
 
 
 def _case(rank: int, dtype, queries: int, draft: bool, value_tail: bool):
+    """One rank's projected KVP decode against the latent decode projected.
+
+    Every weight layout and gate projects bit for bit as ``mla_project_value``
+    on the merged latent; the fused tail runs only when ``value_tail``
+    prepared it and the weight is k-major. ``queries`` rows per request, as a
+    draft step (``draft``) or a plain decode, over a ``dtype`` cache.
+    """
     from tokenspeed_kernel.ops.attention.mla import mla_project_value
     from tokenspeed_kernel.ops.attention.mla.cute_dsl import DcpValueTail
 
@@ -232,6 +245,11 @@ def _case(rank: int, dtype, queries: int, draft: bool, value_tail: bool):
 
 
 def _worker(rank: int, rendezvous: str, *case_args):
+    """Run :func:`_case` with ``case_args`` as one rank of a KVP 2 group.
+
+    It joins the process group at ``rendezvous``, prepares the communication
+    backend, and destroys the group only after a clean run.
+    """
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     # Runtime imports may initialize CUDA, so select the rank's device first.
