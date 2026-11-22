@@ -962,21 +962,23 @@ if platform.is_nvidia:
                 x.new_empty((0,), dtype=torch.int32),
             )
 
-        # Per-token group (block=128) FP8 quantization of activations.
-        # Convert canonical scales to the fused MoE kernel's group-major layout.
+        # The fused MoE reads contiguous [K/128, M] scales: MN-major as quantized.
         x_fp8, x_scale = quantize_fp8(
             x,
             granularity="token_group",
             group_size=_FP8_BLOCK,
-            solution="trtllm",
+            override="trtllm_quantize_fp8_mn_major",
         )
-        x_scale = x_scale.t().to(torch.float32).contiguous()
+        x_scale = x_scale.t()
         hidden_blocks = hidden_size // _FP8_BLOCK
-        if x_scale.shape != (hidden_blocks, x_fp8.shape[0]):
+        if (
+            x_scale.shape != (hidden_blocks, x_fp8.shape[0])
+            or not x_scale.is_contiguous()
+        ):
             raise RuntimeError(
-                "unexpected hidden_states_scale shape "
-                f"{tuple(x_scale.shape)}; expected "
-                f"{(hidden_blocks, x_fp8.shape[0])}"
+                "hidden_states_scale must be a contiguous "
+                f"{(hidden_blocks, x_fp8.shape[0])}, got {tuple(x_scale.shape)} "
+                f"with strides {x_scale.stride()}"
             )
 
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
