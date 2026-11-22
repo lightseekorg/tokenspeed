@@ -294,6 +294,35 @@ def projection_mm_reduce_scatter(
     return backend.projection_mm_reduce_scatter(tensor, rows, weight, workspace)
 
 
+def projection_mm_to_owners(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Project all rows through this rank's output shard and return this owner's
+    rows with every rank's shard.
+
+    Args:
+        tensor: All ``[rows_total, K]`` rows, the same on every rank,
+            ``rows_total <= TP * rows``; owner ``p`` owns rows
+            ``[p * rows, (p + 1) * rows)``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N / TP, K]`` output shard.
+        workspace: A collectively prepared ``transpose`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        This owner's ``[rows, N]`` rows with zero padding rows, borrowed until
+        the next projection.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_mm_to_owners(tensor, rows, weight, workspace)
+
+
 def projection_all_to_all(
     tensor: torch.Tensor,
     rows: int,
