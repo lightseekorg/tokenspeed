@@ -64,6 +64,7 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
     from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
     from tokenspeed.runtime.distributed.comm_ops import (
         all_gather,
+        all_gather_float_words_single,
         all_gather_single,
         all_to_all_single,
         prepare_small_exchange,
@@ -93,11 +94,11 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
         set_global_backend(backend)
         nccl = backend.nccl
         global_server_args_dict["force_deterministic_rsag"] = True
-        assert not prepare_small_exchange(group, _CAP, _TIMEOUT_NS)
+        assert not prepare_small_exchange(group, _CAP, _CAP, _TIMEOUT_NS)
         global_server_args_dict["force_deterministic_rsag"] = False
-        assert prepare_small_exchange(group, _CAP, _TIMEOUT_NS)
+        assert prepare_small_exchange(group, _CAP, _CAP, _TIMEOUT_NS)
         # A second caller of no larger capacity shares it.
-        assert prepare_small_exchange(group, _CAP // 2, _TIMEOUT_NS)
+        assert prepare_small_exchange(group, _CAP // 2, _CAP, _TIMEOUT_NS)
         state = backend._small_exchanges[group]
 
         def calls() -> int:
@@ -177,6 +178,26 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
             gathered = all_gather(rows, group, dim=dim)
             assert calls() == before + 1
             assert torch.equal(gathered, nccl.all_gather(rows, group, dim))
+
+        # Float words take the float exchange, the sentinel word coming back
+        # as another NaN; past its capacity they take the generic gather.
+        def float_calls() -> int:
+            torch.cuda.synchronize()
+            return int(state.float_ctrl[0])
+
+        for words, seed in ((4, 110), (_CAP // 4, 120), (_CAP // 4 + 4, 130)):
+            payload = _bits(words, seed + rank, device)
+            payload[::7] = -1
+            out = torch.empty(degree * words, dtype=torch.int32, device=device)
+            before, before_ll = float_calls(), calls()
+            all_gather_float_words_single(out, payload, group)
+            fits = words * 4 <= _CAP
+            assert float_calls() == before + fits and calls() == before_ll
+            expected = torch.empty_like(out)
+            nccl.all_gather_single(expected, payload, group)
+            if fits:
+                expected[expected == -1] = 0x7FFFFFFF
+            assert torch.equal(out, expected)
 
         # Graph replays of the exchange with new inputs.
         payload = _bits(1024, 80 + rank, device)
