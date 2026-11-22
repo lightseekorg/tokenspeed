@@ -56,14 +56,16 @@ def _quantize(m: int, mn_major: bool):
 
 
 @pytest.mark.parametrize("m", [1, 3, 17, 64, 257])
-def test_cutedsl_reads_padded_native_scales_like_dense_ones(m: int) -> None:
+def test_cutedsl_reads_padded_scales_like_dense_ones(m: int) -> None:
     b, sb = _weights()
-    a, native = _quantize(m, mn_major=True)
-    dense = native.t().contiguous().t()
-    assert native.stride(0) == dense.stride(0) == 1
+    a, dense = _quantize(m, mn_major=True)
+    assert dense.t().is_contiguous()
+    # Fused all-reduce quantization pads the token stride to four.
+    storage = torch.full((K // 128, (m + 3) // 4 * 4), float("nan"), device="cuda")
+    padded = storage[:, :m].copy_(dense.t()).t()
     kwargs = dict(B_scales=sb, quant="mxfp8", block_size=[128, 128], out_dtype=BF16)
     expected = mm(a, b, A_scales=dense, solution="trtllm_cutedsl", **kwargs)
-    actual = mm(a, b, A_scales=native, solution="trtllm_cutedsl", **kwargs)
+    actual = mm(a, b, A_scales=padded, solution="trtllm_cutedsl", **kwargs)
     assert torch.equal(actual, expected)
 
 
