@@ -813,7 +813,8 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
             :func:`transpose_fp32_router_weight_gfx950`.
         multiplier: Scale applied to every logit.
         counters: Zeroed int32 arrival counters for the router's tiles, at
-            least ``N // 16`` of them; the launch leaves them zeroed.
+            least ``gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(M, N)``
+            of them; the launch leaves them zeroed.
         mm_a: Contiguous BF16 ``[M, mm_k]`` rows.
         mm_b: Contiguous BF16 ``[mm_n, mm_k]`` weight.
         mm_out: ``[M, mm_n]`` BF16 destination with unit inner stride.
