@@ -20,9 +20,10 @@
 //   behind torch.ops.trtllm.fp8_quantize_1x128.
 // - dynamicQuantizeMatrixPerToken / invokeComputeScalesAndQuantizeMatrix (PER_TOKEN) from
 //   cpp/tensorrt_llm/common/cudaFp8Utils.cu, behind torch.ops.tensorrt_llm.quantize_e4m3_activation.
-// The math is unchanged. TensorRT-LLM builds these without --use_fast_math, so
-// the divisions use the correctly rounded __fdiv_rn/__frcp_rn intrinsics; the
-// results stay identical when this file is compiled with fast math.
+// The math is unchanged; the scale store takes its strides from the caller.
+// TensorRT-LLM builds these without --use_fast_math, so the divisions use the
+// correctly rounded __fdiv_rn/__frcp_rn intrinsics; the results stay identical
+// when this file is compiled with fast math.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -67,11 +68,11 @@ __forceinline__ __device__ T find_max_elem_in_warp(T value) {
 template <typename InputType, typename OutputType, typename ScaleType = float,
           bool USE_UE8M0 = false>
 __global__ void scale_1x128_kernel(OutputType* output, ScaleType* scales,
-                                   InputType const* const input, int dim_x, int dim_y) {
+                                   InputType const* const input, int dim_x, int dim_y,
+                                   int64_t group_stride, int64_t row_stride) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
   size_t scales_along_dim_x = div_up(dim_x, 128);
   size_t scales_along_dim_y = div_up(dim_y, 1);
-  size_t stride_scale_dim_y = div_up(dim_y, 4) * 4;
   using Input2Type = typename std::conditional<std::is_same<InputType, half>::value, half2,
                                                __nv_bfloat162>::type;
   for (size_t warp_idx = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -125,7 +126,8 @@ __global__ void scale_1x128_kernel(OutputType* output, ScaleType* scales,
     }
 
     if (lane_id == 0) {
-      scales[(size_t)scales_idx_x * stride_scale_dim_y + scales_idx_y] = dequant_scale;
+      scales[(size_t)scales_idx_x * group_stride + (size_t)scales_idx_y * row_stride] =
+          dequant_scale;
     }
 
     OutputType* output_line = output + (size_t)scales_idx_y * dim_x + scales_idx_x * 128;
@@ -163,14 +165,15 @@ static int multi_processor_count(int device) {
 }
 
 void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
-                  int shape_y, int device, cudaStream_t stream, bool use_ue8m0) {
+                  int shape_y, int64_t group_stride, int64_t row_stride, int device,
+                  cudaStream_t stream, bool use_ue8m0) {
   int const num_sms = multi_processor_count(device);
   if (use_ue8m0) {
-    scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, true>
-        <<<num_sms * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, true><<<num_sms * 8, 256, 0, stream>>>(
+        mat_quant, scales, mat, shape_x, shape_y, group_stride, row_stride);
   } else {
-    scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, false>
-        <<<num_sms * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, false><<<num_sms * 8, 256, 0, stream>>>(
+        mat_quant, scales, mat, shape_x, shape_y, group_stride, row_stride);
   }
 }
 
@@ -321,10 +324,11 @@ void invokeComputeScalesAndQuantizeMatrixPerToken(T_OUT* output, T_S* quant_ptr,
 using namespace tokenspeed_trtllm_fp8;
 
 // output: FP8 E4M3 [m_padded, n] with m_padded = ceil(m / 4) * 4 (rows >= m untouched).
-// scales: float32 flat buffer of at least ceil(n / 128) * m_padded elements, MN-major
-//         with a row stride of m_padded.
+// scales: float32 buffer; scale (row, group) lands at group * group_stride + row * row_stride.
+//         One stride must be 1 and the other must cover the opposite extent.
 // input:  contiguous BF16 [m, n], n % 16 == 0.
-void fp8_quantize_1x128(TensorView output, TensorView scales, TensorView input, bool use_ue8m0) {
+void fp8_quantize_1x128(TensorView output, TensorView scales, TensorView input, bool use_ue8m0,
+                        int64_t group_stride, int64_t row_stride) {
   CHECK_INPUT_AND_TYPE(input, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(output, dl_float8_e4m3fn);
   CHECK_INPUT_AND_TYPE(scales, dl_float32);
@@ -339,14 +343,22 @@ void fp8_quantize_1x128(TensorView output, TensorView scales, TensorView input, 
   int64_t const m_padded = (m + 3) / 4 * 4;
   TVM_FFI_ICHECK(output.ndim() == 2 && output.size(0) == m_padded && output.size(1) == n)
       << "output must be [ceil(m / 4) * 4, n]";
-  TVM_FFI_ICHECK_GE(scales.numel(), (n + 127) / 128 * m_padded) << "scales buffer too small";
+  int64_t const groups = (n + 127) / 128;
+  TVM_FFI_ICHECK((row_stride == 1 && group_stride >= m) ||
+                 (group_stride == 1 && row_stride >= groups))
+      << "scale strides must be MN-major (row_stride 1, group_stride >= M) or K-major "
+      << "(group_stride 1, row_stride >= ceil(N / 128)), got group_stride " << group_stride
+      << " and row_stride " << row_stride;
   if (m == 0) {
     return;
   }
+  TVM_FFI_ICHECK_GE(scales.numel(), (groups - 1) * group_stride + (m - 1) * row_stride + 1)
+      << "scales buffer too small";
   auto device = input.device();
   fp8_1x128_cs(static_cast<__nv_fp8_e4m3*>(output.data_ptr()), static_cast<float*>(scales.data_ptr()),
                static_cast<__nv_bfloat16 const*>(input.data_ptr()), static_cast<int>(n),
-               static_cast<int>(m), device.device_id, get_stream(device), use_ue8m0);
+               static_cast<int>(m), group_stride, row_stride, device.device_id, get_stream(device),
+               use_ue8m0);
 }
 
 // output: FP8 E4M3 with input's shape; scales: input dtype, [..., 1].

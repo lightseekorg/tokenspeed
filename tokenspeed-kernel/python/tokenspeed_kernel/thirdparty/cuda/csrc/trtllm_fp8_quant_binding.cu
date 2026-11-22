@@ -1,6 +1,7 @@
 #include "tvm_ffi_utils.h"
 
-void fp8_quantize_1x128(TensorView output, TensorView scales, TensorView input, bool use_ue8m0);
+void fp8_quantize_1x128(TensorView output, TensorView scales, TensorView input, bool use_ue8m0,
+                        int64_t group_stride, int64_t row_stride);
 
 void quantize_e4m3_per_token(TensorView output, TensorView scales, TensorView input);
 
