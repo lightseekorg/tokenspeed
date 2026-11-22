@@ -43,9 +43,11 @@ it, not the GPU model, and some drivers report a generic device name (such as
 Serving loads the architecture file and then the device file, read-only:
 
 * lookups only, so serving never tunes;
-* GEMM shapes the file does not list keep PyTorch's default solution;
-* no file for the GPU, or a file from a different PyTorch, HIP, hipBLASLt,
-  rocBLAS or GPU architecture, is skipped as a whole (logged once), and every
+* GEMM shapes the files do not list keep PyTorch's default solution;
+* a file from a different PyTorch, HIP, hipBLASLt or rocBLAS build, or an
+  unreadable one, is skipped as a whole with a warning; the GPU's other file
+  still loads;
+* with no file left to load, a warning says the GEMMs run untuned, and every
   GEMM keeps the defaults.
 
 Opt-in online tuning, ``hipblaslt_online_tuning``, times the GEMMs no loaded
@@ -71,6 +73,7 @@ from typing import Iterator
 import torch
 
 __all__ = [
+    "GENERIC_DEVICE_NAMES",
     "TUNED_CONFIG_DIR",
     "find_hipblaslt_tuned_files",
     "hipblaslt_file_validators",
@@ -83,6 +86,12 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 TUNED_CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
+
+# Device names drivers report for several GPU models of one architecture. A
+# device file named after one would load on all of them, although its rows
+# may be chosen for one model's speed, so none is committed (a test checks)
+# and the tuning tool does not write one by default.
+GENERIC_DEVICE_NAMES = frozenset({"AMD Radeon Graphics"})
 
 
 def hipblaslt_tuned_file(device_name: str | None = None) -> str:
@@ -135,12 +144,23 @@ def find_hipblaslt_tuned_files(device_name: str, arch_name: str) -> list[str]:
     Returns:
         The ``gcn_arch=`` file stamped with ``arch_name``, if one is
         committed, then the GPU's ``device_name=`` file, if one is committed
-        and stamped with ``arch_name``. Empty when neither is.
+        and stamped with ``arch_name``. Empty when neither is. A file that
+        cannot be read is left out with a warning.
+
+    Raises:
+        ValueError: Several committed ``gcn_arch=`` files are stamped with
+            ``arch_name``.
     """
+    stamps = {}
+    for path in sorted(glob.glob(os.path.join(TUNED_CONFIG_DIR, "*.csv"))):
+        try:
+            stamps[path] = hipblaslt_file_validators(path)
+        except OSError as e:
+            logger.warning(f"Ignoring tuned BLAS solutions {path}: {e}")
     stamped = [
         path
-        for path in sorted(glob.glob(os.path.join(TUNED_CONFIG_DIR, "*.csv")))
-        if hipblaslt_file_validators(path).get("GCN_ARCH_NAME") == arch_name
+        for path, stamp in stamps.items()
+        if stamp.get("GCN_ARCH_NAME") == arch_name
     ]
     architecture = [
         path for path in stamped if os.path.basename(path).startswith("gcn_arch=")
@@ -152,11 +172,11 @@ def find_hipblaslt_tuned_files(device_name: str, arch_name: str) -> list[str]:
     named = hipblaslt_tuned_file(device_name)
     if named in stamped:
         return architecture + [named]
-    if os.path.exists(named):
+    if named in stamps:
         logger.warning(
             f"Ignoring tuned BLAS solutions {named}: stamped for "
-            f"{hipblaslt_file_validators(named).get('GCN_ARCH_NAME')!r}, not this "
-            f"GPU's {arch_name!r}"
+            f"{stamps[named].get('GCN_ARCH_NAME')!r}, not this GPU's "
+            f"{arch_name!r}"
         )
     return architecture
 
@@ -339,10 +359,19 @@ def tune_hipblaslt_solutions(
         the new ones, without the architecture file's.
 
     Raises:
-        ValueError: ``path`` exists and was made for another stack.
+        ValueError: ``path`` exists and was made for another stack, ``path``
+            or the GPU's architecture file cannot be read, or ``path`` is
+            omitted on a GPU reporting a name in ``GENERIC_DEVICE_NAMES``.
     """
     if path is None:
-        path = hipblaslt_tuned_file()
+        device_name = torch.cuda.get_device_name()
+        if device_name in GENERIC_DEVICE_NAMES:
+            raise ValueError(
+                f"this GPU reports the generic device name {device_name!r}, "
+                "shared by several GPU models; pass path explicitly instead "
+                "of writing a device file for it"
+            )
+        path = hipblaslt_tuned_file(device_name)
     tunable = torch.cuda.tunable
     tunable.tuning_enable(False)
     tunable.record_untuned_enable(False)
@@ -374,7 +403,7 @@ def tune_hipblaslt_solutions(
         torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName,
     ):
         if not os.path.basename(other).startswith("gcn_arch=") or (
-            os.path.abspath(other) == os.path.abspath(path)
+            os.path.realpath(other) == os.path.realpath(path)
         ):
             continue
         if hipblaslt_file_validators(other) != _current_validators():
@@ -410,12 +439,12 @@ def tune_hipblaslt_solutions(
         if tuple(result[:2]) not in architecture_keys
     ]
     # TunableOp keys a TN GEMM ``tn_<n>_<m>_<k>_...``.
-    skipped = sorted(
-        f"{n}x{k} at {m} rows"
-        for _, params in architecture_keys
-        for n, m, k in [params.split("_")[1:4]]
-        if (int(n), int(k)) in shapes and int(m) in rows
-    )
+    skipped = []
+    for _, params in architecture_keys:
+        n, m, k = (int(field) for field in params.split("_")[1:4])
+        if (n, k) in shapes and m in rows:
+            skipped.append(f"{n}x{k} at {m} rows")
+    skipped.sort()
     if skipped:
         logger.info(
             f"Not re-timed or written to {path}, the architecture file lists "

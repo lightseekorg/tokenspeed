@@ -20,13 +20,14 @@
 
 """Offline-tuned BLAS solutions (TunableOp) for dense GEMMs on ROCm.
 
-The runtime entry point. The tuned files (one per GPU, in-repo, in
-``_hipblaslt/configs/``), loading, the stack check and the tuning tool live in
+The runtime entry point. The committed tuned files (in ``_hipblaslt/configs/``:
+one architecture file per GPU architecture, and device files that add rows
+for one GPU model), loading, the stack checks and the tuning tool live in
 ``tokenspeed_kernel.ops.gemm._hipblaslt.tuning``; this module makes the calls
 no-ops on non-ROCm builds.
 
 With ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1`` (off by default), serving also tunes
-the GEMMs of its warmup decode steps that the loaded file does not list,
+the GEMMs of its warmup decode steps that the loaded files do not list,
 before graph capture, and keeps the picks in the process
 (``hipblaslt_online_tuning``).
 """

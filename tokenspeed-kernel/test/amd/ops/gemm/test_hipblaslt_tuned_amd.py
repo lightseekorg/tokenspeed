@@ -26,6 +26,7 @@ import glob
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -192,9 +193,9 @@ def _committed_pair(tmp_path, tuned_file, device_file):
     ).gcnArchName
     configs = tmp_path / "configs"
     configs.mkdir()
-    (configs / "gcn_arch=test.csv").write_text(open(tuned_file).read())
+    (configs / "gcn_arch=test.csv").write_text(Path(tuned_file).read_text())
     name = torch.cuda.get_device_name().replace(" ", "_")
-    (configs / f"device_name={name}.csv").write_text(open(device_file).read())
+    (configs / f"device_name={name}.csv").write_text(Path(device_file).read_text())
     assert hipblaslt_file_validators(tuned_file)["GCN_ARCH_NAME"] == arch_name
     return configs
 
@@ -230,7 +231,9 @@ def test_architecture_and_device_files_load_together(tuned_file, tmp_path):
 
 def test_stale_device_file_leaves_the_architecture_file_loaded(tuned_file, tmp_path):
     stale = tmp_path / "stale-device.csv"
-    stale.write_text(open(tuned_file).read().replace(f"_{TUNED_M}_", f"_{UNTUNED_M}_"))
+    stale.write_text(
+        Path(tuned_file).read_text().replace(f"_{TUNED_M}_", f"_{UNTUNED_M}_")
+    )
     _restamp(str(stale), stale, "HIPBLASLT_VERSION", "0-0")
     configs = _committed_pair(tmp_path, tuned_file, str(stale))
     expected = sorted(_tuned_keys(tuned_file))
@@ -249,7 +252,7 @@ def test_stale_device_file_leaves_the_architecture_file_loaded(tuned_file, tmp_p
 def test_tuning_keeps_architecture_rows_out_of_the_device_file(tuned_file, tmp_path):
     configs = tmp_path / "configs"
     configs.mkdir()
-    (configs / "gcn_arch=test.csv").write_text(open(tuned_file).read())
+    (configs / "gcn_arch=test.csv").write_text(Path(tuned_file).read_text())
     device_file = tmp_path / "device.csv"
     # A fresh process, so TunableOp's own writes at exit are covered too.
     _run_fresh_process(
@@ -266,6 +269,32 @@ def test_tuning_keeps_architecture_rows_out_of_the_device_file(tuned_file, tmp_p
     written = _tuned_keys(str(device_file))
     assert len(written) == 1
     assert not written & _tuned_keys(tuned_file)
+
+
+def test_regenerating_the_architecture_file_through_a_symlink_keeps_its_rows(
+    tuned_file, tmp_path
+):
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    architecture_file = configs / "gcn_arch=test.csv"
+    architecture_file.write_text(Path(tuned_file).read_text())
+    link = tmp_path / "link.csv"
+    link.symlink_to(architecture_file)
+    # A fresh process: TunableOp results already in this one would be written too.
+    _run_fresh_process(
+        "import torch\n"
+        "from unittest.mock import patch\n"
+        "from tokenspeed_kernel.ops.gemm._hipblaslt import tuning\n"
+        f"with patch.object(tuning, 'TUNED_CONFIG_DIR', {str(configs)!r}):\n"
+        "    written = tuning.tune_hipblaslt_solutions(\n"
+        f"        shapes=[({N}, {K})], rows=[{TUNED_M}],\n"
+        f"        dtype=torch.bfloat16, path={str(link)!r},\n"
+        "        cold_bytes=64 * 2**20)\n"
+        # Its own rows are not filtered out as another architecture file's.
+        "assert written == 1, written\n",
+        tmp_path,
+    )
+    assert _tuned_keys(str(architecture_file)) == _tuned_keys(tuned_file)
 
 
 def test_missing_file_keeps_tunableop_disabled(tmp_path):

@@ -237,6 +237,7 @@ rewrites a file, and tunes only with the opt-in switch below. A GPU with
 neither file logs a warning that its GEMMs run untuned and keeps the defaults.
 Each file loads only when its own stamp matches the running stack; a stale
 device file is skipped with a warning and the architecture file still loads.
+
 The tuning tool below writes the device file of the GPU it runs on: it reads
 the architecture file first, so those GEMMs are not re-timed, and keeps them
 out of its output. A row moves to the architecture file only once it is

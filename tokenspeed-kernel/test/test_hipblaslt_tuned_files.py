@@ -52,6 +52,25 @@ def _committed_files() -> list[str]:
     return sorted(glob.glob(os.path.join(tuning.TUNED_CONFIG_DIR, "*.csv")))
 
 
+def test_no_committed_device_file_is_named_after_a_generic_device_name():
+    generic = {
+        tuning.hipblaslt_tuned_file(name) for name in tuning.GENERIC_DEVICE_NAMES
+    }
+    assert not generic & set(_committed_files())
+
+
+def test_tuning_refuses_a_default_device_file_for_a_generic_name():
+    name = next(iter(tuning.GENERIC_DEVICE_NAMES))
+    with (
+        patch.object(torch.cuda, "get_device_name", return_value=name),
+        pytest.raises(ValueError, match="generic device name"),
+    ):
+        # Raises before TunableOp or the GPU are touched.
+        tuning.tune_hipblaslt_solutions(
+            shapes=[(64, 64)], rows=[8], dtype=torch.bfloat16, cold_bytes=1
+        )
+
+
 def test_mi355x_file_is_committed():
     assert os.path.exists(tuning.hipblaslt_tuned_file("AMD Instinct MI355X"))
     assert os.path.exists(os.path.join(tuning.TUNED_CONFIG_DIR, "gcn_arch=gfx950.csv"))
@@ -134,6 +153,17 @@ def test_device_file_of_another_architecture_is_skipped_loudly(tmp_path, caplog)
     ):
         assert tuning.find_hipblaslt_tuned_files("AMD Instinct MI355X", _GFX950) == []
     assert "stamped for 'gfx942'" in caplog.text
+
+
+def test_unreadable_committed_file_is_skipped_loudly(tmp_path, caplog):
+    # A directory named like a tuned file cannot be read as one.
+    (tmp_path / "gcn_arch=broken.csv").mkdir()
+    with (
+        patch.object(tuning, "TUNED_CONFIG_DIR", str(tmp_path)),
+        caplog.at_level("WARNING", logger=tuning.logger.name),
+    ):
+        assert tuning.find_hipblaslt_tuned_files("AMD Instinct MI355X", _GFX950) == []
+    assert "gcn_arch=broken.csv" in caplog.text
 
 
 class _Properties:
