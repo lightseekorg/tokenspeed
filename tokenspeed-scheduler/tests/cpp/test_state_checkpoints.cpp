@@ -2362,7 +2362,7 @@ TEST_F(StateCheckpointInForwardMixedSuite, ChunksNearTheBoundaryEndOnAPageUnderA
 // cuts [14, 16), and the chunk [16, 22) writes the checkpoint.
 TEST_F(StateCheckpointInForwardMixedSuite, AJunctionBeforeTheBoundaryLeavesTheChunksBeforeItWhole) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
-    // Its chunk-end checkpoints, at 24 and 40, lie past the four pages the prompt below shares.
+    // 56 tokens, not 24, so its own chunk-end checkpoints (24, 40) lie past the shared pages and those keep no State.
     const std::vector<std::int32_t> cached = MakeTokens(56);
     Submit(RequestWithTokens("cached", cached));
     RunPrefill("cached", 56);
