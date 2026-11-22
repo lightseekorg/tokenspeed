@@ -39,6 +39,7 @@ import pytest
 import tokenspeed_kernel.ops.gemm as gemm_api
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import fma32, torch_simt_gemm_fp32
+from tokenspeed_kernel.ops.gemm import _mv_declares_alignment
 from tokenspeed_kernel.ops.gemm import _select_mv as _select
 from tokenspeed_kernel.ops.gemm import mv, mv_weight_split
 from tokenspeed_kernel.ops.gemm._gluon import gemv as gluon_gemv
@@ -145,8 +146,10 @@ def nvidia_platform(monkeypatch, b200_platform):
     # Swap the singleton itself: Platform.get() would detect the host device.
     monkeypatch.setattr(Platform, "_instance", b200_platform)
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     yield
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
 
 
 @pytest.mark.parametrize("dtypes", [_MIXED, _FP32])
@@ -177,11 +180,14 @@ def test_selection_keeps_the_traits(
     # kernel takes (here 256 outputs with K from 2048) goes to it; any other
     # split leaves the selection unchanged, since this kernel reads the weight.
     split_kernel = weight_split and dtypes == _MIXED and n == 256 and k >= 2048
-    impl = _select(m, n, k, True, *dtypes, weight_split)
+    impl = _select(m, n, k, True, *dtypes, weight_split, True, True, False)
     assert (impl is gluon_simt_gemm_fp32) is (
         selected and dtypes == _MIXED and not split_kernel
     )
-    assert _select(m, n, k, False, *dtypes, weight_split) is not gluon_simt_gemm_fp32
+    assert (
+        _select(m, n, k, False, *dtypes, weight_split, True, True, False)
+        is not gluon_simt_gemm_fp32
+    )
 
 
 @pytest.mark.parametrize(
@@ -189,18 +195,23 @@ def test_selection_keeps_the_traits(
     [(torch.bfloat16, torch.bfloat16), (torch.float16, torch.float16)],
 )
 def test_selection_ignores_other_dtypes(nvidia_platform, dtypes):
-    assert _select(64, 256, 7168, True, *dtypes, False) is not gluon_simt_gemm_fp32
+    assert (
+        _select(64, 256, 7168, True, *dtypes, False, True, True, False)
+        is not gluon_simt_gemm_fp32
+    )
 
 
 def test_selection_is_nvidia_only(monkeypatch, mi350_platform):
     monkeypatch.setattr(Platform, "_instance", mi350_platform)
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     try:
-        assert _select(64, 256, 7168, True, *_MIXED, False) is not (
+        assert _select(64, 256, 7168, True, *_MIXED, False, True, True, False) is not (
             gluon_simt_gemm_fp32
         )
     finally:
         _select.cache_clear()
+        _mv_declares_alignment.cache_clear()
 
 
 def test_band_start_fp32_kernel_keeps_the_other_rows(nvidia_platform, fresh_registry):
@@ -222,6 +233,7 @@ def test_band_start_fp32_kernel_keeps_the_other_rows(nvidia_platform, fresh_regi
 
     KernelRegistry.get().register(_SPEC, gluon_simt_gemm_fp32)
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     for m, expected in (
         (1, band_start_fp32_gemm),
         (16, band_start_fp32_gemm),
@@ -230,8 +242,13 @@ def test_band_start_fp32_kernel_keeps_the_other_rows(nvidia_platform, fresh_regi
         (97, band_start_fp32_gemm),
         (1024, band_start_fp32_gemm),
     ):
-        assert _select(m, 256, 7168, True, *_MIXED, False) is expected
-        assert _select(m, 256, 7168, True, *_FP32, False) is band_start_fp32_gemm
+        assert (
+            _select(m, 256, 7168, True, *_MIXED, False, True, True, False) is expected
+        )
+        assert (
+            _select(m, 256, 7168, True, *_FP32, False, True, True, False)
+            is band_start_fp32_gemm
+        )
 
 
 def _cuda_weight(n: int, k: int) -> Mock:
@@ -257,26 +274,39 @@ def test_a_split_weight_takes_the_split_kernel_from_17_rows(
         assert mv_weight_split(weight) is split.return_value
         split.assert_called_with(weight)
         for m in range(17, 97):
-            assert _select(m, 256, k, True, *_MIXED, True) is both[1]
-            assert _select(m, 256, k, True, *_MIXED, False) is both[0]
+            assert _select(m, 256, k, True, *_MIXED, True, True, True, False) is both[1]
+            assert (
+                _select(m, 256, k, True, *_MIXED, False, True, True, False) is both[0]
+            )
         for weight_split in (False, True):
             # Rows up to 16 are left to other kernels.
             for m in (1, 16):
-                assert _select(m, 256, k, True, *_MIXED, weight_split) not in both
+                assert (
+                    _select(m, 256, k, True, *_MIXED, weight_split, True, True, False)
+                    not in both
+                )
         for m in (97, 128, 1024, 8192):
-            assert _select(m, 256, k, True, *_MIXED, True) is both[1]
-            assert _select(m, 256, k, True, *_MIXED, False) is torch_decode_gemv
+            assert _select(m, 256, k, True, *_MIXED, True, True, True, False) is both[1]
+            assert (
+                _select(m, 256, k, True, *_MIXED, False, True, True, False)
+                is torch_decode_gemv
+            )
     assert split.call_count == len(shared)
     # A weight that only one of them takes: 128 rows get no split and Torch
     # from 97 rows; 384 rows get the split kernel from 17 rows.
     assert mv_weight_split(_cuda_weight(128, 4096)) is None
     assert split.call_count == len(shared)
     for m, expected in ((17, both[0]), (96, both[0]), (97, torch_decode_gemv)):
-        assert _select(m, 128, 4096, True, *_MIXED, False) is expected
+        assert (
+            _select(m, 128, 4096, True, *_MIXED, False, True, True, False) is expected
+        )
     assert mv_weight_split(_cuda_weight(384, 7168)) is split.return_value
     for m in (17, 96, 97):
-        assert _select(m, 384, 7168, True, *_MIXED, True) is both[1]
-        assert _select(m, 384, 7168, True, *_MIXED, False) is torch_decode_gemv
+        assert _select(m, 384, 7168, True, *_MIXED, True, True, True, False) is both[1]
+        assert (
+            _select(m, 384, 7168, True, *_MIXED, False, True, True, False)
+            is torch_decode_gemv
+        )
 
 
 def test_decode_gemv_hands_this_kernel_the_fp32_weight(monkeypatch):
@@ -420,6 +450,7 @@ def test_decode_gemv_routes_rows_17_to_96(m):
     weight = torch.randn(256, 7168, device="cuda") * 0.02
     out = torch.full((m, 256), float("nan"), device="cuda")
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     assert mv(x, weight, out) is out
     assert torch.equal(_bits(out), _bits(gluon_simt_gemm_fp32(x, weight)))
     # BF16 to FP32 is exact and the order does not depend on the tile, so the
@@ -439,6 +470,7 @@ def test_a_split_weight_runs_the_split_kernel(m):
     assert pieces is not None
     out = torch.full((m, 256), float("nan"), device="cuda")
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     assert mv(x, weight, out, weight_split=pieces) is out
     assert torch.equal(_bits(out), _bits(triton_bf16x3_gemm_fp32(x, pieces)))
 
@@ -526,7 +558,11 @@ def test_inputs_left_to_torch_take_torch(x_dtype, m, n, k):
     x = torch.randn(m, k, device="cuda").to(x_dtype)
     weight = torch.randn(n, k, device="cuda") * 0.02
     _select.cache_clear()
-    assert _select(m, n, k, True, x_dtype, weight.dtype, False) is torch_decode_gemv
+    _mv_declares_alignment.cache_clear()
+    assert (
+        _select(m, n, k, True, x_dtype, weight.dtype, False, True, True, False)
+        is torch_decode_gemv
+    )
     out = torch.full((m, n), float("nan"), device="cuda")
     assert mv(x, weight, out) is out
     expected = torch_decode_gemv(x, weight, torch.empty_like(out))

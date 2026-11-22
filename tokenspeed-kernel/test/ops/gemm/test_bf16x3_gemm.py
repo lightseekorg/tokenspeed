@@ -318,14 +318,16 @@ def select_on(monkeypatch):
     def use(platform):
         monkeypatch.setattr(gemm_api, "current_platform", lambda: platform)
         gemm_api._select_mv.cache_clear()
+        gemm_api._mv_declares_alignment.cache_clear()
 
     yield use
     gemm_api._select_mv.cache_clear()
+    gemm_api._mv_declares_alignment.cache_clear()
 
 
 def _selected(m, n, k, weight_split=True):
     return gemm_api._select_mv(
-        m, n, k, True, torch.bfloat16, torch.float32, weight_split
+        m, n, k, True, torch.bfloat16, torch.float32, weight_split, True, True, False
     )
 
 
@@ -476,7 +478,7 @@ def test_decode_gemv_hands_the_split_to_the_split_kernel(monkeypatch):
     pieces = torch.zeros(3, 128, 256, dtype=torch.bfloat16)
     assert gemm_api.mv(x, w, weight_split=pieces) is result
     kernel.assert_called_once_with(x, pieces, None)
-    assert select.call_args.args[-3:] == (torch.bfloat16, torch.float32, True)
+    assert select.call_args.args[4:7] == (torch.bfloat16, torch.float32, True)
 
 
 def test_decode_gemv_widens_bf16_rows_for_an_fp32_weight_on_torch():

@@ -26,8 +26,10 @@ import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import torch_mm
+from tokenspeed_kernel.ops.gemm import _mv_declares_alignment
 from tokenspeed_kernel.ops.gemm import _select_mv as _select
 from tokenspeed_kernel.ops.gemm import _use_mv, mv
+from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -43,16 +45,36 @@ def _is_joint_fi_arch() -> bool:
 
 def test_registry_fallback_selection():
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     bf16 = (torch.bfloat16, torch.bfloat16, False)
-    impl = _select(1, 999, 4096, True, *bf16)
+    impl = _select(1, 999, 4096, True, *bf16, True, True, False)
     assert "rowcta" in getattr(impl, "__name__", "")
-    impl = _select(4, 3217, 7168, True, *bf16)
+    impl = _select(4, 3217, 7168, True, *bf16, True, True, False)
     assert "torch" in getattr(impl, "__name__", "")
     # A width no call site produces.
-    impl = _select(3, 6289, 7168, True, *bf16)
+    impl = _select(3, 6289, 7168, True, *bf16, True, True, False)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(1, 2305, 1536, True, *bf16)
+    impl = _select(1, 2305, 1536, True, *bf16, True, True, False)
     assert "rowcta" in getattr(impl, "__name__", "")
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_mv_off_cuda_takes_torch(device):
+    """mv on CPU and meta tensors does not raise and selects Torch, with or
+    without a destination."""
+    x = torch.empty(4, 256, device=device, dtype=torch.bfloat16)
+    weight = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
+    out = torch.empty(4, 8, device=device, dtype=torch.bfloat16)
+    bf16 = (torch.bfloat16, torch.bfloat16, False)
+    assert _select(4, 8, 256, False, *bf16, True, True, False) is torch_decode_gemv
+    assert not _use_mv(x, weight, out, False)
+    result = mv(x, weight)
+    assert result.shape == (4, 8) and result.device.type == device
+    assert mv(x, weight, out=out) is out
+    if device == "cpu":
+        x.normal_()
+        weight.normal_()
+        assert torch.equal(mv(x, weight), x @ weight.t())
 
 
 @pytest.mark.parametrize("projection,n", [("kda", 3216), ("mla", 3648)])
@@ -139,7 +161,7 @@ def test_cdna5_route_admits_decode_shapes(m, n, k):
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
-    assert _use_mv(x, w)
+    assert _use_mv(x, w, None, False)
 
     got = mv(x, w).float()
     ref = (x @ w.t()).float()
@@ -157,37 +179,51 @@ def test_cdna5_route_declines_unregistered_calls():
     w_bf16 = torch.randn(7168, 1536, device="cuda", dtype=torch.bfloat16)
 
     x_fp16 = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
-    assert not _use_mv(x_fp16, w_bf16.half())
+    assert not _use_mv(x_fp16, w_bf16.half(), None, False)
 
     strided = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)[:, ::2]
-    assert not _use_mv(strided, w_bf16)
+    assert not _use_mv(strided, w_bf16, None, False)
 
     # K=128 is registered but measured slower than the vendor GEMM at wide N.
     thin = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
     thin_w = torch.randn(8448, 128, device="cuda", dtype=torch.bfloat16)
-    assert not _use_mv(thin, thin_w)
+    assert not _use_mv(thin, thin_w, None, False)
 
     # Past the WMMA band nothing is registered: the widest WMMA tile holds
     # 64 rows, and every further tile would re-read the whole weight.
     wide = torch.randn(65, 1536, device="cuda", dtype=torch.bfloat16)
-    assert not _use_mv(wide, w_bf16)
+    assert not _use_mv(wide, w_bf16, None, False)
 
     # From 17 rows the 64-row tile takes a shape only while its 32-column
     # blocks fit the CUs in one round; 16 rows stay on one 16-row tile.
     wide_n_w = torch.randn(8208, 1536, device="cuda", dtype=torch.bfloat16)
     assert not _use_mv(
-        torch.randn(17, 1536, device="cuda", dtype=torch.bfloat16), wide_n_w
+        torch.randn(17, 1536, device="cuda", dtype=torch.bfloat16),
+        wide_n_w,
+        None,
+        False,
     )
-    assert _use_mv(torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16), wide_n_w)
+    assert _use_mv(
+        torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16),
+        wide_n_w,
+        None,
+        False,
+    )
 
     # In-band M, but the WMMA kernel tiles K by 128 and N by its output tile.
     unaligned_k = torch.randn(16, 1600, device="cuda", dtype=torch.bfloat16)
     assert not _use_mv(
-        unaligned_k, torch.randn(7168, 1600, device="cuda", dtype=torch.bfloat16)
+        unaligned_k,
+        torch.randn(7168, 1600, device="cuda", dtype=torch.bfloat16),
+        None,
+        False,
     )
     unaligned_n = torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16)
     assert not _use_mv(
-        unaligned_n, torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16)
+        unaligned_n,
+        torch.randn(7000, 1536, device="cuda", dtype=torch.bfloat16),
+        None,
+        False,
     )
 
 
@@ -344,7 +380,7 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
     monkeypatch.setattr(tuner, "_profile_single_kernel", unexpected_profile)
     with torch.no_grad(), autotune(tune_mode=False, tuning_buckets=None, round_up=None):
         for m in range(1, 33):
-            assert _use_mv(x[:m], weight)
+            assert _use_mv(x[:m], weight, None, False)
             buffer = torch.full((m * n + 32,), 42, dtype=torch.bfloat16, device="cuda")
             out = buffer[: m * n].view(m, n)
             out.fill_(float("nan"))
@@ -384,7 +420,7 @@ def test_joint_fi_tuning_roundtrip_and_changed_input_replay(
 
         monkeypatch.setattr(fi_adapter._fi_gemm, "bf16_gemm_sm100", reject_fi)
         for m in (33, 48, 64, 128):
-            assert not _use_mv(x[:m], weight)
+            assert not _use_mv(x[:m], weight, None, False)
             out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
             assert mm(x[:m], weight, out=out).data_ptr() == out.data_ptr()
             # Small weights with K in the TGV window take a pinned TGV tile,
@@ -431,17 +467,27 @@ def test_fp32_selection_follows_dtype_and_rows(x_dtype):
 
     fp32 = (x_dtype, torch.float32, False)
     _select.cache_clear()
+    _mv_declares_alignment.cache_clear()
     for n, k in _ROUTER_SHAPES:
         for m in (1, 2, 9, 16):
-            assert _select(m, n, k, True, *fp32) is triton_rowcta_gemm_fp32
+            assert (
+                _select(m, n, k, True, *fp32, True, True, False)
+                is triton_rowcta_gemm_fp32
+            )
         for m in (17, 32):
-            assert _select(m, n, k, True, *fp32) is not triton_rowcta_gemm_fp32
-        assert _select(1, n, k, False, *fp32) is torch_decode_gemv
+            assert (
+                _select(m, n, k, True, *fp32, True, True, False)
+                is not triton_rowcta_gemm_fp32
+            )
+        assert _select(1, n, k, False, *fp32, True, True, False) is torch_decode_gemv
     # The multi-row kernel is FP32 only, and FP16 has no registered leaf.
     bf16 = (torch.bfloat16, torch.bfloat16, False)
-    assert _select(8, 256, 4096, True, *bf16) is not triton_rowcta_gemm_fp32
+    assert (
+        _select(8, 256, 4096, True, *bf16, True, True, False)
+        is not triton_rowcta_gemm_fp32
+    )
     fp16 = (torch.float16, torch.float16, False)
-    assert _select(1, 999, 4096, True, *fp16) is torch_decode_gemv
+    assert _select(1, 999, 4096, True, *fp16, True, True, False) is torch_decode_gemv
 
 
 @_requires_nvidia
@@ -466,7 +512,8 @@ def test_fp32_selection_keeps_the_measured_envelope(m, n, k, expected, x_dtype):
     from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
 
     _select.cache_clear()
-    selected = _select(m, n, k, True, x_dtype, torch.float32, False)
+    _mv_declares_alignment.cache_clear()
+    selected = _select(m, n, k, True, x_dtype, torch.float32, False, True, True, False)
     assert selected is (triton_rowcta_gemm_fp32 if expected else torch_decode_gemv)
 
 
@@ -497,10 +544,14 @@ def test_bf16_rows_with_fp32_weight_skip_the_widening_copy(m, n, k):
     # x.float(), and the FP32 call wherever one kernel serves both activation
     # dtypes. From 17 rows BF16 activations may take a kernel that FP32
     # activations do not; then the two calls share only the FP32 error bound.
-    bf16_kernel = _select(m, n, k, True, torch.bfloat16, torch.float32, False)
+    bf16_kernel = _select(
+        m, n, k, True, torch.bfloat16, torch.float32, False, True, True, False
+    )
     assert torch.equal(out, bf16_kernel(x.float(), weight))
     widened = mv(x.float(), weight)
-    if bf16_kernel is _select(m, n, k, True, torch.float32, torch.float32, False):
+    if bf16_kernel is _select(
+        m, n, k, True, torch.float32, torch.float32, False, True, True, False
+    ):
         assert torch.equal(out, widened)
     reference = _fp64_reference(x, weight)
     torch.testing.assert_close(out, reference, rtol=2e-5, atol=2e-4)

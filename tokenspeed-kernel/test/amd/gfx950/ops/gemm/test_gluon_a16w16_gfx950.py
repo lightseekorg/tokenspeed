@@ -21,11 +21,17 @@
 from __future__ import annotations
 
 import contextlib
+import re
 
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import torch_mm
-from utils import assert_no_triton_compile, assert_warmup_covers, is_cdna4
+from utils import (
+    assert_no_triton_compile,
+    assert_warmup_covers,
+    compiled_kernels,
+    is_cdna4,
+)
 
 if not is_cdna4():
     pytest.skip(
@@ -34,7 +40,20 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.gemm import bmm, kimi3_router_projection, mm  # noqa: E402
+from tokenspeed_kernel.ops.gemm import (  # noqa: E402
+    _select_mv,
+    _use_mv,
+    bmm,
+    kimi3_latent_projection,
+    kimi3_router_projection,
+    mm,
+    mv,
+    torch_decode_gemv,
+)
+from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
+    warm_gluon_mm_a16w16_skinny,
+)
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
@@ -59,6 +78,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (  # noqa: E402
+    gluon_mm_a16w16_skinny_gfx950,
+    gluon_mm_a16w16_skinny_reduce_gfx950,
+    launch_gluon_mm_a16w16_skinny_gfx950,
+    supports_gluon_mm_a16w16_skinny_gfx950,
 )
 
 # Kernels and references accumulate in FP32 and round once to BF16, so outputs
@@ -999,3 +1024,347 @@ def test_column_shard_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for m in range(9, 17):
             launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])
+
+
+# A shape the skinny GEMM takes, its measured row range, and rows on both
+# sides of the row-tile boundary and at the ends of each tile.
+_SKINNY_N, _SKINNY_K = 1024, 8192
+_SKINNY_FIRST_M, _SKINNY_LAST_M = 33, 128
+_SKINNY_ROWS = [33, 48, 63, 64, 65, 96, 127, 128]
+
+
+def _skinny_problem(rows: int = _SKINNY_LAST_M):
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(
+        (rows, _SKINNY_K), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    weight = 0.02 * torch.randn(
+        (_SKINNY_N, _SKINNY_K), device="cuda", generator=generator
+    )
+    return a, weight.to(torch.bfloat16)
+
+
+def _skinny(a, weight, out=None):
+    return launch_gluon_mm_a16w16_skinny_gfx950(a, weight, out=out)
+
+
+def _off_by_one(rows: int, columns: int) -> torch.Tensor:
+    """A contiguous BF16 ``[rows, columns]`` view one element into a buffer:
+    legal GEMM input that is not 16-byte aligned."""
+    flat = torch.zeros(rows * columns + 8, dtype=torch.bfloat16, device="cuda")
+    view = flat[1 : 1 + rows * columns].view(rows, columns)
+    assert view.is_contiguous() and view.data_ptr() % 16
+    return view
+
+
+@pytest.mark.parametrize("m", _SKINNY_ROWS)
+def test_skinny_gemm_rounds_the_exact_product_once(m: int):
+    """With small integer inputs every FP32 partial sum is exact (at most
+    8192 * 64 < 2**24), so the only rounding is the final one to BF16 and the
+    result is the FP64 product rounded to BF16, bit for bit."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randint(-8, 9, (m, _SKINNY_K), device="cuda", generator=generator)
+    weight = torch.randint(
+        -8, 9, (_SKINNY_N, _SKINNY_K), device="cuda", generator=generator
+    )
+    actual = _skinny(a.to(torch.bfloat16), weight.to(torch.bfloat16))
+    exact = a.double() @ weight.double().T
+    expected = exact.to(torch.bfloat16)
+    # Most outputs need the rounding: the check is not of representable sums.
+    assert int((expected.double() != exact).sum()) > exact.numel() // 2
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("m", _SKINNY_ROWS)
+def test_skinny_gemm_matches_fp64_reference(m: int):
+    a, weight = _skinny_problem()
+    a = a[:m].contiguous()
+    actual = _skinny(a, weight)
+    expected = a.double() @ weight.double().T
+    # One rounding to BF16, 8 significant bits: at most half a step, 2**-8
+    # relative. _ATOL only covers FP32 accumulation noise on near-zero
+    # outputs.
+    torch.testing.assert_close(actual.double(), expected, atol=_ATOL, rtol=2**-8)
+
+
+def test_skinny_gemm_rows_do_not_depend_on_the_batch():
+    """A row has the same bits with any other rows and in either row tile: the
+    K split and summation order never depend on M."""
+    a, weight = _skinny_problem()
+
+    def run(rows: torch.Tensor) -> torch.Tensor:
+        return _skinny(rows.contiguous(), weight).view(torch.int16)
+
+    full = run(a)
+    for m in _SKINNY_ROWS:
+        assert torch.equal(run(a[:m]), full[:m]), f"rows differ at M={m}"
+    # The first 33 rows at another position of a launch in the other tile.
+    shifted = run(torch.cat((a[60:100], a[:33])))
+    assert torch.equal(shifted[40:], full[:33])
+    assert torch.equal(run(a), full), "repeat launch differs"
+
+
+@pytest.mark.parametrize("m", [33, 63, 127])
+def test_skinny_gemm_writes_only_its_rows(m: int):
+    """The row tile and the reduce programs are taller than M: the rows of
+    the destination's buffer below row M keep their bits."""
+    a, weight = _skinny_problem(rows=m)
+    guard = 0x7FC1  # a NaN no product yields
+    buffer = torch.full(
+        (_SKINNY_LAST_M + 16, _SKINNY_N), guard, dtype=torch.int16, device="cuda"
+    ).view(torch.bfloat16)
+    result = _skinny(a, weight, out=buffer[:m])
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(
+        buffer[:m].view(torch.int16), _skinny(a, weight).view(torch.int16)
+    )
+    assert bool((buffer[m:].view(torch.int16) == guard).all())
+
+
+def test_skinny_gemm_refuses_strided_and_unaligned_tensors():
+    a, weight = _skinny_problem(rows=96)
+    wide = torch.empty((48, _SKINNY_N + 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="contiguous inputs"):
+        _skinny(a[::2], weight)
+    with pytest.raises(ValueError, match="contiguous"):
+        _skinny(a[:48].contiguous(), weight, out=wide[:, :_SKINNY_N])
+
+    # The direct-to-LDS loads and the kernels' stated alignment need 16
+    # bytes: a direct launch on an offset view is refused.
+    with pytest.raises(ValueError, match="aligned activation"):
+        _skinny(_off_by_one(48, _SKINNY_K), weight)
+    with pytest.raises(ValueError, match="aligned output"):
+        _skinny(a[:48].contiguous(), weight, out=_off_by_one(48, _SKINNY_N))
+
+
+@pytest.mark.parametrize("m", [33, 48, 128])
+def test_mm_declines_the_skinny_gemm_for_offset_views(m: int):
+    """An activation or an output that is not 16-byte aligned is legal mm
+    input: selection declines the skinny GEMM through its alignment traits
+    and mm takes the path it takes without that kernel, here Torch's GEMM."""
+    a, weight = _skinny_problem(rows=m)
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    shifted = _off_by_one(m, _SKINNY_K)
+    shifted.copy_(a)
+    shifted_out = _off_by_one(m, _SKINNY_N)
+    dtypes = (torch.bfloat16, torch.bfloat16)
+
+    def select(operands_aligned: bool, out_aligned: bool) -> str:
+        return _select_mv(
+            m,
+            _SKINNY_N,
+            _SKINNY_K,
+            True,
+            *dtypes,
+            False,
+            operands_aligned,
+            out_aligned,
+            True,
+        ).__name__
+
+    assert select(True, True) == "gluon_mm_a16w16_skinny_gfx950"
+    assert _use_mv(a, weight, None, True)
+    for operands_aligned, out_aligned in ((False, True), (True, False)):
+        assert select(operands_aligned, out_aligned) == "torch_decode_gemv"
+    assert not _use_mv(shifted, weight, None, True)
+    assert not _use_mv(a, weight, shifted_out, True)
+
+    expected = torch.mm(a, weight.T).view(torch.int16)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    assert torch.equal(
+        mm(shifted, weight, decode_forward=True).view(torch.int16), expected
+    )
+    mm(a, weight, out=shifted_out, decode_forward=True)
+    assert torch.equal(shifted_out.view(torch.int16), expected)
+    # A direct mv selects with the same traits.
+    assert torch.equal(
+        mv(shifted, weight, decode_forward=True).view(torch.int16), expected
+    )
+    shifted_out.zero_()
+    mv(a, weight, out=shifted_out, decode_forward=True)
+    assert torch.equal(shifted_out.view(torch.int16), expected)
+    # No call launched the skinny GEMM: it has no binary.
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+
+def test_skinny_reduce_loads_every_split_sixteen_bytes_wide():
+    """The reduce states the alignment of the first split's base; the other
+    splits sit at constant offsets from it. Every buffer load of the binary
+    is still 16 bytes a lane (four FP32 partials): none is split into
+    narrower loads."""
+    a, weight = _skinny_problem(rows=_SKINNY_FIRST_M)
+    gluon_mm_a16w16_skinny_reduce_gfx950.device_caches.clear()
+    _skinny(a, weight)
+    (binary,) = compiled_kernels(gluon_mm_a16w16_skinny_reduce_gfx950)
+    loads = re.findall(r"^\s*(buffer_load_\w+)", binary.asm["amdgcn"], re.M)
+    assert loads and set(loads) == {"buffer_load_dwordx4"}
+
+
+def test_a_projection_that_states_no_decode_forward_keeps_its_gemm():
+    """A projection that does not state a decode forward to mv makes the
+    Torch call it makes without the skinny GEMM, whether its destination is
+    aligned or an offset view, and compiles nothing of the skinny GEMM."""
+    a, weight = _skinny_problem(rows=48)
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    expected = torch.mm(a, weight.T).view(torch.int16)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    for out in (
+        torch.empty((48, _SKINNY_N), dtype=torch.bfloat16, device="cuda"),
+        _off_by_one(48, _SKINNY_N),
+    ):
+        result = kimi3_latent_projection(a, weight, out=out)
+        assert result.data_ptr() == out.data_ptr()
+        assert torch.equal(out.view(torch.int16), expected)
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+
+def test_skinny_gemm_warmup_compiles_every_binary_from_any_row_count():
+    """Startup warmup need not run a row count the skinny GEMM takes: a GEMM
+    on the weight inside kernel_warmup compiles both row tiles and the reduce,
+    and then no row count of the measured range compiles either kernel."""
+    a, weight = _skinny_problem()
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    below = a[: _SKINNY_FIRST_M - 1].contiguous()
+    assert not supports_gluon_mm_a16w16_skinny_gfx950(
+        below.shape[0], _SKINNY_N, _SKINNY_K
+    )
+
+    # Outside warmup the same GEMM compiles nothing of the skinny GEMM.
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    mm(below, weight)
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(below, weight)
+
+    # Nor does the hook inside warmup while the stream is capturing a graph.
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream), kernel_warmup(enabled=True):
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            warm_gluon_mm_a16w16_skinny(below, weight)
+    stream.synchronize()
+    assert not any(compiled_kernels(kernel) for kernel in kernels)
+
+    assert_warmup_covers(
+        kernels,
+        warm,
+        lambda m: _skinny(a[:m].contiguous(), weight),
+        range(_SKINNY_FIRST_M, _SKINNY_LAST_M + 1),
+    )
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_gfx950)) == 2
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_reduce_gfx950)) == 1
+
+
+def test_skinny_gemm_binaries_do_not_depend_on_where_the_tensors_live():
+    """Triton keys a binary on a tensor's 16-byte alignment and, on AMD, on
+    whether its storage fits in 2 GB. The skinny GEMM specializes no pointer,
+    so the binaries startup compiled from small fresh tensors serve an
+    activation and an output that are views deep into storages over 2 GB."""
+    a, weight = _skinny_problem()
+    kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
+    below = a[: _SKINNY_FIRST_M - 1].contiguous()
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(below, weight)
+
+    over_2gb = 2**31 + 2**20
+    a_rows = over_2gb // (2 * _SKINNY_K) + _SKINNY_LAST_M
+    out_rows = over_2gb // (2 * _SKINNY_N) + _SKINNY_LAST_M
+    a_arena = torch.empty((a_rows, _SKINNY_K), dtype=torch.bfloat16, device="cuda")
+    out_arena = torch.empty((out_rows, _SKINNY_N), dtype=torch.bfloat16, device="cuda")
+    assert a_arena.untyped_storage().size() > 2**31
+    assert out_arena.untyped_storage().size() > 2**31
+
+    def run(m: int) -> None:
+        # The last rows of each arena: past 2 GB from its base.
+        x = a_arena[a_rows - m :]
+        x.copy_(a[:m])
+        out = out_arena[out_rows - m :]
+        _skinny(x, weight, out=out)
+        expected = _skinny(a[:m].contiguous(), weight)
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+    assert_warmup_covers(kernels, warm, run, _SKINNY_ROWS)
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_gfx950)) == 2
+    assert len(compiled_kernels(gluon_mm_a16w16_skinny_reduce_gfx950)) == 1
+
+
+@pytest.mark.parametrize("m", [33, 128])
+def test_skinny_gemm_replays_in_a_captured_graph(m: int):
+    """A captured launch pair reads its inputs and scratch at replay."""
+    a, weight = _skinny_problem(rows=m)
+    out = torch.empty((m, weight.shape[0]), dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        _skinny(a, weight, out=out)
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            _skinny(a, weight, out=out)
+    stream.synchronize()
+    for _ in range(3):
+        a.copy_(torch.randn_like(a))
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _skinny(a, weight)
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    ("m", "selected"),
+    [
+        (_SKINNY_FIRST_M - 1, False),
+        (_SKINNY_FIRST_M, True),
+        (_SKINNY_LAST_M, True),
+        (_SKINNY_LAST_M + 1, False),
+    ],
+)
+def test_mm_selects_the_skinny_gemm_in_its_measured_row_range(m: int, selected: bool):
+    """For the rows of a decode or verify forward, which the call states."""
+    assert supports_gluon_mm_a16w16_skinny_gfx950(m, _SKINNY_N, _SKINNY_K) == selected
+    name = _select_mv(
+        m,
+        _SKINNY_N,
+        _SKINNY_K,
+        True,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        True,
+        True,
+        True,
+    ).__name__
+    assert (name == "gluon_mm_a16w16_skinny_gfx950") == selected
+    if selected:
+        a, weight = _skinny_problem(rows=m)
+        out = torch.empty((m, _SKINNY_N), dtype=torch.bfloat16, device="cuda")
+        mm(a, weight, out=out, decode_forward=True)
+        assert torch.equal(out.view(torch.int16), _skinny(a, weight).view(torch.int16))
+
+
+@pytest.mark.parametrize("m", [_SKINNY_FIRST_M, 48, 64, _SKINNY_LAST_M])
+def test_mm_keeps_the_skinny_gemm_for_decode_forwards(m: int):
+    """A call that does not state a decode forward, as an extend's, selects
+    as it does without the skinny GEMM registered: the kernel declares the
+    decode_forward trait."""
+    dtypes = (torch.bfloat16, torch.bfloat16)
+    shape = (m, _SKINNY_N, _SKINNY_K, True, *dtypes, False, True, True)
+    assert _select_mv(*shape, True).__name__ == "gluon_mm_a16w16_skinny_gfx950"
+    # No other mv kernel takes these rows, so mm goes on to its own selection,
+    # Torch's GEMM here, exactly as on a tree without the skinny GEMM.
+    assert _select_mv(*shape, False) is torch_decode_gemv
+
+    a, weight = _skinny_problem(rows=m)
+    assert not _use_mv(a, weight, None, False)
+    expected = torch.mm(a, weight.T).view(torch.int16)
+    out = torch.empty((m, _SKINNY_N), dtype=torch.bfloat16, device="cuda")
+    for stated in ({}, {"decode_forward": False}):
+        assert torch.equal(mm(a, weight, **stated).view(torch.int16), expected)
+        mm(a, weight, out=out, **stated)
+        assert torch.equal(out.view(torch.int16), expected)

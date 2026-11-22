@@ -147,7 +147,7 @@ def test_decode_gemm_routes_measured_k3_shapes(
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
-    assert _use_mv(x, w) is expected
+    assert _use_mv(x, w, None, False) is expected
     if expected:
         torch.testing.assert_close(mv(x, w), torch.mm(x, w.T), rtol=2**-7, atol=1e-3)
 

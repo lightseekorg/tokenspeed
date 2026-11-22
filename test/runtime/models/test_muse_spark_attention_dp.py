@@ -289,7 +289,9 @@ def _reference_output(
     """FP32 Muse expert block for ``hidden_states`` past the row-wise prefix."""
     if hidden_states.shape[0] == 0:
         return hidden_states.new_empty((0, HIDDEN))
-    compressed = moe.pre_expert_norm(moe.pre_expert_proj(hidden_states), torch.bfloat16)
+    compressed = moe.pre_expert_norm(
+        moe.pre_expert_proj(hidden_states, False), torch.bfloat16
+    )
     route_weights, topk_ids = moe._select_experts(moe.gate(router_input, False), None)
     routes = _reference_routes(compressed, topk_ids.long(), quantized)
     post = moe.post_expert_norm
@@ -412,7 +414,7 @@ def _check_eager_rows(layers: dict, rank: int, device: torch.device) -> None:
     ):
         hidden, router_input = _inputs(counts[rank], rank, step, device)
         for quantized, moe in layers.items():
-            output = moe.forward_rank_local(hidden, router_input, counts)
+            output = moe.forward_rank_local(hidden, router_input, counts, False)
             assert output.shape == (counts[rank], HIDDEN)
             expected = _reference_output(moe, hidden, router_input, quantized)
             _assert_matches(output, expected, quantized)
@@ -424,13 +426,14 @@ def _check_graph_replay(layers: dict, rank: int, device: torch.device) -> None:
     # Both layers share one graph, so Petit and the gathered collectives
     # replay in order with refreshed inputs.
     eager = [
-        moe.forward_rank_local(hidden, router_input, counts) for moe in layers.values()
+        moe.forward_rank_local(hidden, router_input, counts, False)
+        for moe in layers.values()
     ]
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = [
-            moe.forward_rank_local(hidden, router_input, counts)
+            moe.forward_rank_local(hidden, router_input, counts, False)
             for moe in layers.values()
         ]
     for step in (0, 1, 2):

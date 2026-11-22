@@ -68,7 +68,7 @@ def test_split_kernel_matches_fp64(m, n, k):
     x, w = _problem(m, n, k, seed=m)
     pieces = mv_weight_split(w)
     assert pieces is not None and pieces.shape == (3, n, k)
-    assert _select(m, n, k, True, x.dtype, w.dtype, True) is (
+    assert _select(m, n, k, True, x.dtype, w.dtype, True, True, True, False) is (
         triton_bf16x3.triton_bf16x3_gemm_fp32
     )
     y = mv(x, w, weight_split=pieces)
