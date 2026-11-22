@@ -1454,14 +1454,21 @@ class ModelExecutor:
             if key in tuned:
                 continue
             tuned.add(key)
+            # Gluon Petit under attention TP: each rank applies its
+            # ceil(rows / EP) share of the replicated prefill rows.
+            rows = (
+                -(-num_tokens // layer.ep_size)
+                if layer.petit_splits_replicated_rows
+                else num_tokens
+            )
             hidden_states = torch.zeros(
-                num_tokens,
+                rows,
                 layer.hidden_size,
                 dtype=layer.input_dtype,
                 device=self.device,
             )
             # Distinct expert ids per token: kernels may reject repeats.
-            scores = torch.rand(num_tokens, layer.num_experts, device=self.device)
+            scores = torch.rand(rows, layer.num_experts, device=self.device)
             topk_weights, topk_ids = torch.topk(scores, layer.top_k, dim=-1)
             topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
             if layer.supports_precomputed_topk:

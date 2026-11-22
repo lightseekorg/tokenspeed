@@ -570,6 +570,107 @@ def test_distributed_petit_reference(profile_name, capacity):
             dist.barrier()
 
 
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_replicated_rows_split(profile_name):
+    """Attention TP over Petit's EP group (TokenSpeed DeepseekV4MoE, TP4/EP4).
+
+    Every rank holds the same T rows and sends Petit only its contiguous rows
+    [r * ceil(T / 4), min(T, (r + 1) * ceil(T / 4))) (none when T < 4), writes
+    the routed share into its rows of a full-size buffer holding its
+    shared-expert partial, and one all-reduce gives every rank all T routed
+    rows plus the summed partials. Petit's capacity is ceil(8192 / 4) = 2048.
+    """
+    profile = _PROFILES[profile_name]
+    capacity = 2048
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    plan["gluon_petit_max_tokens_per_rank"] = capacity
+    kernel_moe_process_weights(plan, layer)
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    for num_rows in (1, 2, 3, 4, 5, 13, 96, 8192):
+        share = -(-num_rows // ws)
+        start = min(num_rows, rank * share)
+        end = min(num_rows, start + share)
+        # Replicated inputs: identical on every rank.
+        values = torch.arange(num_rows * profile.hidden, device=device)
+        x = (
+            ((((values * 13) % 127) - 63).float() * input_scale)
+            .reshape(num_rows, profile.hidden)
+            .to(torch.bfloat16)
+        )
+        ids, weights = _routing(num_rows, 0, profile, ws, device)
+        local = x[start:end].contiguous()
+        local_ids = ids[start:end].contiguous()
+        local_weights = weights[start:end].contiguous()
+
+        def partial_of(r):
+            # A stand-in shared-expert partial; ranks differ.
+            return (
+                (((values * (r + 3)) % 9 - 4).float() / 64)
+                .reshape(num_rows, profile.hidden)
+                .to(torch.bfloat16)
+            )
+
+        def run(shared):
+            routed = kernel_moe_apply(
+                plan,
+                local,
+                layer,
+                local.new_empty((end - start, 0)),
+                topk_weights=local_weights,
+                topk_ids=local_ids,
+                num_tokens_global=num_rows,
+                max_num_tokens_per_gpu=share,
+                do_finalize=True,
+                low_latency=None,
+                overlap_fn=None,
+                shared_input=None,
+                shared_weight=None,
+                shared_out=None,
+            )
+            shared[start:end].add_(routed)
+            return shared
+
+        expected = _reference(x, ids, weights, profile)
+        # Routed rows only: one rank contributes each row, so the sum is exact.
+        out = run(torch.zeros_like(x))
+        dist.all_reduce(out)
+        torch.testing.assert_close(out, expected, atol=2e-6, rtol=8e-3)
+        # The same split replays from a captured graph.
+        buffer = torch.zeros_like(x)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(buffer)
+        buffer.zero_()
+        graph.replay()
+        replayed = captured.clone()
+        dist.all_reduce(replayed)
+        torch.testing.assert_close(replayed, out, atol=0, rtol=0)
+        # Routed share + shared-expert partial in one all-reduce.
+        combined = run(partial_of(rank))
+        dist.all_reduce(combined)
+        shared_sum = sum(partial_of(r).float() for r in range(ws))
+        torch.testing.assert_close(
+            combined.float(), expected.float() + shared_sum, atol=2e-2, rtol=1.6e-2
+        )
+        assert torch.isfinite(combined).all()
+        dist.barrier()
+
+
 def _collective_check(device, check) -> None:
     """Run ``check`` on every rank and fail every rank together.
 

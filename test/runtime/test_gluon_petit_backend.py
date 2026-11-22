@@ -395,6 +395,31 @@ def test_petit_shared_parallelism(petit_args, attn_tp, dense_tp) -> None:
         ),
         ({}, {}, {}, {"quant_config": None}, True, "serialized MXFP4 expert weights"),
         ({}, {}, {}, {"activation_alpha": 1.5}, True, "nonstandard SiLU alpha"),
+        # Attention TP4 over EP4: only a model that splits its replicated rows.
+        (
+            {
+                "world_size": 4,
+                "attn": SimpleNamespace(tp_size=4, dp_size=1),
+                "dense": SimpleNamespace(tp_size=4),
+            },
+            {"ep_size": 4},
+            {"max_num_seqs": 4096},
+            {"ep_size": 4},
+            True,
+            "splits the replicated rows",
+        ),
+        (
+            {
+                "world_size": 4,
+                "attn": SimpleNamespace(tp_size=4, dp_size=1),
+                "dense": SimpleNamespace(tp_size=4),
+            },
+            {"ep_size": 4},
+            {"max_num_seqs": 4096},
+            {"ep_size": 4, "petit_splits_replicated_rows": True},
+            True,
+            None,
+        ),
     ],
 )
 def test_petit_layer_constraints(
@@ -699,3 +724,285 @@ def test_petit_serves_block_fp8_experts_requantized_to_mxfp4(
     assert layer._requant_block_shape == (128, 128)
     assert isinstance(layer.quant_config, Mxfp4Config)
     assert layer.quant_config.use_dynamic_mxfp4_activations
+
+
+# ---- Attention TP over Petit's EP group (replicated rows, a share per rank) ----
+
+
+def _tp_attention_mapping(attn_tp: int = 4, dense_tp: int = 4, dp: int = 1):
+    mapping = _ep4_mapping()
+    mapping.attn = SimpleNamespace(tp_size=attn_tp, dp_size=dp)
+    mapping.dense = SimpleNamespace(tp_size=dense_tp)
+    return mapping
+
+
+@pytest.mark.parametrize(
+    "attn_tp,dense_tp,dp,moe_tp,ep,expected",
+    [
+        (4, 4, 1, 1, 4, True),  # TP-style attention with Petit's EP4 MoE.
+        (1, 1, 4, 1, 4, False),  # EP4-Petit with attention DP4.
+        (1, 1, 8, 1, 8, False),  # EP8-Petit.
+        (2, 2, 2, 1, 4, False),  # Attention TP narrower than EP.
+        (4, 1, 1, 1, 4, False),  # Dense TP must follow attention TP.
+        (4, 4, 1, 4, 1, False),  # MoE TP, not EP.
+        (1, 1, 1, 1, 1, False),
+    ],
+)
+def test_petit_tp_attention_predicate(
+    petit_args, attn_tp, dense_tp, dp, moe_tp, ep, expected
+) -> None:
+    from tokenspeed.runtime.utils.server_args import (
+        gluon_petit_tp_attention,
+        gluon_petit_tp_attention_mapping,
+    )
+
+    mapping = _tp_attention_mapping(attn_tp, dense_tp, dp)
+    mapping.moe = SimpleNamespace(ep_size=ep, tp_size=moe_tp)
+    petit_args.mapping = mapping
+    assert gluon_petit_tp_attention_mapping(mapping) is expected
+    assert gluon_petit_tp_attention(petit_args) is expected
+    # TP4 itself (no Petit all-to-all) never takes the layout.
+    petit_args.all2all_backend = "none"
+    assert gluon_petit_tp_attention(petit_args) is False
+
+
+@pytest.mark.parametrize(
+    "overrides,error,capacity",
+    [
+        # TP4's 8192-token chunk: each rank sends at most 2048 rows.
+        ({}, None, 2048),
+        # TP4's recipe with DSpark (16 requests x 6 verify rows = 96 rows).
+        (
+            {
+                "speculative_algorithm": "DSPARK",
+                "draft_moe_backend": "gluon_petit",
+                "speculative_num_draft_tokens": 6,
+                "max_num_seqs": 16,
+            },
+            None,
+            2048,
+        ),
+        ({"chunked_prefill_size": 4096, "max_prefill_tokens": 4096}, None, 1024),
+        ({"chunked_prefill_size": 8193, "max_prefill_tokens": 8193}, None, 2080),
+        ({"chunked_prefill_size": 31232, "max_prefill_tokens": 31232}, None, 7808),
+        (
+            {"chunked_prefill_size": 31233, "max_prefill_tokens": 8192},
+            "at most 7808 prefill tokens per rank at EP4.*no greater than 31232",
+            None,
+        ),
+        (
+            {"chunked_prefill_size": 8192, "max_prefill_tokens": 31233},
+            "at most 7808 prefill tokens per rank at EP4",
+            None,
+        ),
+        ({"chunked_prefill_size": 0}, "at most 7808 prefill tokens per rank", None),
+        # Decode: ceil(4096 / 4) = 1024 rows per rank fits; 4097 does not.
+        ({"max_num_seqs": 4096}, None, 2048),
+        ({"max_num_seqs": 4097}, "1024 decode tokens per rank", None),
+        ({"moe_combine_order": "slot"}, "--moe-combine-order rank", None),
+    ],
+)
+def test_petit_tp_attention_capacity(petit_args, overrides, error, capacity) -> None:
+    petit_args.mapping = _tp_attention_mapping()
+    petit_args.max_num_seqs = 16
+    petit_args.chunked_prefill_size = 8192
+    petit_args.max_prefill_tokens = 8192
+    vars(petit_args).update(overrides)
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        ServerArgs.validate_petit_moe_options(petit_args)
+    if capacity is not None:
+        assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) == capacity
+
+
+@pytest.mark.parametrize(
+    "attn_tp,dense_tp,dp",
+    [(4, 1, 1), (2, 2, 2), (1, 4, 4), (4, 4, 2)],
+)
+def test_petit_tp_attention_keeps_other_refusals(
+    petit_args, attn_tp, dense_tp, dp
+) -> None:
+    petit_args.mapping = _tp_attention_mapping(attn_tp, dense_tp, dp)
+    petit_args.chunked_prefill_size = 4096
+    petit_args.max_prefill_tokens = 4096
+    petit_args.max_num_seqs = 16
+    with pytest.raises(ValueError, match="attention TP1 and dense TP1"):
+        ServerArgs.validate_petit_moe_options(petit_args)
+
+
+def test_petit_dp4_capacity_unchanged(petit_args) -> None:
+    # The DP4 layout keeps sizing from whole chunks (46671ec2).
+    petit_args.mapping = _ep4_mapping()
+    petit_args.chunked_prefill_size = 4096
+    petit_args.max_prefill_tokens = 4096
+    petit_args.max_num_seqs = 16
+    ServerArgs.validate_petit_moe_options(petit_args)
+    assert ServerArgs.gluon_petit_max_tokens_per_rank(petit_args) == 4096
+
+
+@pytest.mark.parametrize("num_rows", [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 96, 8191, 8192])
+def test_petit_tp_attention_rows_partition(num_rows) -> None:
+    from tokenspeed.runtime.utils.server_args import gluon_petit_tp_attention_rows
+
+    share = -(-num_rows // 4)
+    spans = [gluon_petit_tp_attention_rows(num_rows, 4, rank) for rank in range(4)]
+    # Contiguous, disjoint, covering [0, T), at most ceil(T / 4) rows each.
+    assert spans[0][0] == 0 and spans[-1][1] == num_rows
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        assert end == start
+    assert all(0 <= end - start <= share for start, end in spans)
+    assert spans[0] == (0, share)
+
+
+def _emulated_tp_attention_moe(rank: int, ep: int, shared_parts, calls):
+    """A DeepseekV4MoE on EP rank ``rank`` with stand-in routing and experts.
+
+    Routing scores and the routed expert are row-wise functions of the input
+    (as Petit's combine is); the shared expert is the ``rank`` slice of a
+    TP-sharded linear map, so the partials sum to the full shared expert.
+    """
+    from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    layer = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    nn.Module.__init__(layer)
+    layer.mapping = SimpleNamespace(moe=SimpleNamespace(ep_size=ep, ep_rank=rank))
+    layer.use_mega_moe = False
+    layer.use_gluon_petit = True
+    layer.petit_tp_attention = True
+    layer.stream_fork = StreamFork(None)
+
+    def topk(hidden_states, input_ids):
+        weights = torch.sigmoid(hidden_states.sum(-1, keepdim=True))
+        if input_ids is not None:
+            weights = weights + input_ids.unsqueeze(-1).to(weights.dtype)
+        return weights
+
+    def experts(
+        *,
+        hidden_states,
+        topk_output,
+        num_global_tokens,
+        max_num_tokens_per_gpu,
+        do_finalize,
+    ):
+        calls.append(
+            (
+                rank,
+                hidden_states.shape[0],
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                do_finalize,
+            )
+        )
+        return torch.tanh(hidden_states) * topk_output
+
+    layer._compute_topk_output = topk
+    layer.experts = experts
+    layer.shared_experts = (
+        None if shared_parts is None else (lambda x, w=shared_parts[rank]: x @ w)
+    )
+    return layer
+
+
+@pytest.mark.parametrize("num_rows", [0, 1, 2, 3, 4, 5, 7, 13, 96])
+@pytest.mark.parametrize("with_shared", [True, False])
+@pytest.mark.parametrize("with_out", [True, False])
+@pytest.mark.parametrize("with_ids", [True, False])
+def test_petit_tp_attention_split_sum_matches_reference(
+    num_rows, with_shared, with_out, with_ids
+) -> None:
+    """The four ranks' partials sum (the all-reduce) to the reference MoE."""
+    ep, hidden = 4, 16
+    generator = torch.Generator().manual_seed(num_rows)
+    x = torch.randn(num_rows, hidden, generator=generator, dtype=torch.float64)
+    ids = torch.randint(0, 3, (num_rows,), generator=generator) if with_ids else None
+    shared_weight = torch.randn(hidden, hidden, generator=generator, dtype=x.dtype)
+    # Column-parallel gate/up then row-parallel down: partials of one sum.
+    shared_parts = list(torch.split(shared_weight, hidden // ep, dim=0))
+    shared_parts = [
+        torch.zeros_like(shared_weight).index_copy_(
+            0, torch.arange(r * hidden // ep, (r + 1) * hidden // ep), part
+        )
+        for r, part in enumerate(shared_parts)
+    ]
+    calls = []
+    partials = []
+    for rank in range(ep):
+        layer = _emulated_tp_attention_moe(
+            rank, ep, shared_parts if with_shared else None, calls
+        )
+        out = torch.full_like(x, float("nan")) if with_out else None
+        partial = layer.forward_normal(
+            x.clone(), None if ids is None else ids.clone(), num_rows, num_rows, out
+        )
+        if with_out:
+            assert partial.data_ptr() == out.data_ptr()
+        assert partial.shape == x.shape
+        partials.append(partial)
+    reduced = torch.stack(partials).sum(0)
+    weights = torch.sigmoid(x.sum(-1, keepdim=True))
+    if ids is not None:
+        weights = weights + ids.unsqueeze(-1).to(weights.dtype)
+    reference = torch.tanh(x) * weights
+    if with_shared:
+        reference = reference + x @ shared_weight
+    torch.testing.assert_close(reduced, reference)
+    # Every rank calls Petit, with zero rows when T < EP, and the same
+    # graph-stable capacity hint ceil(T / EP).
+    share = -(-num_rows // ep)
+    assert [call[0] for call in calls] == list(range(ep))
+    assert sum(call[1] for call in calls) == num_rows
+    assert all(call[2:] == (num_rows, share, True) for call in calls)
+
+
+@pytest.mark.parametrize("splits,expected_rows", [(False, 8192), (True, 2048)])
+def test_draft_expert_warmup_takes_the_rank_share(splits, expected_rows) -> None:
+    """Startup warmup applies a row-splitting Petit draft layer to ceil(T/EP)."""
+    from tokenspeed.runtime.execution import model_executor
+
+    layer = MoELayer.__new__(MoELayer)
+    nn.Module.__init__(layer)
+    vars(layer).update(
+        plan={
+            "a2a_backend": "gluon_petit",
+            "solution": "gluon",
+            "apply_kernel_name": "gluon_petit_mxfp4_megamoe_apply",
+        },
+        hidden_size=8,
+        intermediate_size=16,
+        num_experts=8,
+        top_k=2,
+        ep_size=4,
+        input_dtype=torch.bfloat16,
+        prefix="draft.mlp.experts",
+    )
+    if splits:
+        layer.petit_splits_replicated_rows = True
+    executor = SimpleNamespace(
+        device=torch.device("cpu"),
+        drafter=SimpleNamespace(
+            draft_model_runner=SimpleNamespace(
+                model=SimpleNamespace(modules=lambda: [layer])
+            )
+        ),
+    )
+    calls = []
+    with (
+        mock.patch.object(
+            type(layer),
+            "supports_precomputed_topk",
+            new_callable=mock.PropertyMock,
+            return_value=True,
+        ),
+        mock.patch.object(
+            model_executor,
+            "kernel_moe_apply",
+            side_effect=lambda plan, x, w, logits, **kw: calls.append((x.shape, kw)),
+        ),
+    ):
+        model_executor.ModelExecutor._autotune_draft_experts(executor, 8192)
+    assert len(calls) == 1
+    shape, kwargs = calls[0]
+    assert shape == (expected_rows, 8)
+    assert kwargs["topk_ids"].shape == (expected_rows, 2)
+    assert kwargs["num_tokens_global"] == 8192

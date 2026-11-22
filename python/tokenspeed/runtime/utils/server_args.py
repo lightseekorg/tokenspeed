@@ -3062,9 +3062,20 @@ class ServerArgs:
                     "Gluon Petit MegaMoE requires --dtype bfloat16; "
                     f"configured dtype={self.dtype}"
                 )
-            if self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1:
+            tp_attention = gluon_petit_tp_attention(self)
+            if not tp_attention and (
+                self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1
+            ):
                 raise ValueError(
-                    "Gluon Petit MegaMoE requires attention TP1 and dense TP1"
+                    "Gluon Petit MegaMoE requires attention TP1 and dense TP1, "
+                    "or attention TP = dense TP = EP size with attention DP1"
+                )
+            if tp_attention and getattr(self, "moe_combine_order", "rank") == "slot":
+                # Each rank returns its quarter of the routed rows plus its
+                # shared-expert partial; only a rank-ordered sum completes it.
+                raise ValueError(
+                    "Gluon Petit MegaMoE with attention TP requires "
+                    "--moe-combine-order rank"
                 )
             decode_tokens_per_rank = _gluon_petit_decode_tokens_per_rank(self)
             if decode_tokens_per_rank > 1024:
@@ -3087,17 +3098,25 @@ class ServerArgs:
 
             world_size = self.mapping.moe.ep_size
             largest = gluon_petit_largest_max_tokens_per_rank(world_size)
+            # Under attention TP each rank hands Petit ceil(rows / EP) rows.
+            share = world_size if tp_attention else 1
             if (
                 self.chunked_prefill_size <= 0
-                or self.chunked_prefill_size > largest
-                or self.max_prefill_tokens > largest
+                or _gluon_petit_rows_per_rank(self, self.chunked_prefill_size) > largest
+                or _gluon_petit_rows_per_rank(self, self.max_prefill_tokens) > largest
             ):
                 raise ValueError(
                     f"Gluon Petit MegaMoE supports at most {largest} prefill "
                     f"tokens per rank at EP{world_size}; set "
                     "--chunked-prefill-size to a positive value no greater "
-                    f"than {largest} and --max-prefill-tokens no greater than "
-                    f"{largest}"
+                    f"than {largest * share} and --max-prefill-tokens no "
+                    f"greater than {largest * share}"
+                    + (
+                        f" (attention TP{world_size} sends each rank a "
+                        f"1/{world_size} share of the rows)"
+                        if tp_attention
+                        else ""
+                    )
                     + (
                         "; a larger per-rank capacity would exceed the Petit "
                         "symmetric heap's 32-bit offsets"
@@ -3111,7 +3130,8 @@ class ServerArgs:
 
         The largest per-rank batch (prefill chunk, prefill budget or decode
         tokens) rounded up to 32 rows with a floor of 1024, so servers with at
-        most 1024 tokens per rank keep today's buffers.
+        most 1024 tokens per rank keep today's buffers. Under attention TP
+        (``gluon_petit_tp_attention``) a rank sends ceil(rows / EP) of them.
         """
         if self.all2all_backend != "gluon_petit":
             return None
@@ -3120,8 +3140,8 @@ class ServerArgs:
         return gluon_petit_max_tokens_per_rank(
             self.mapping.moe.ep_size,
             max(
-                self.chunked_prefill_size,
-                self.max_prefill_tokens,
+                _gluon_petit_rows_per_rank(self, self.chunked_prefill_size),
+                _gluon_petit_rows_per_rank(self, self.max_prefill_tokens),
                 _gluon_petit_decode_tokens_per_rank(self),
             ),
         )
@@ -6116,11 +6136,62 @@ class PortArgs:
         )
 
 
+def gluon_petit_tp_attention_mapping(mapping) -> bool:
+    """Whether ``mapping`` is the attention-TP layout over Petit's EP group.
+
+    Attention and dense layers are tensor parallel over the whole MoE EP
+    group (attention DP1, MoE TP1), so every rank holds the same rows; each
+    rank hands Petit its contiguous ceil(rows / EP) share and one all-reduce
+    over the group completes the routed rows and the TP-sharded shared expert.
+    """
+    return (
+        mapping.attn.dp_size == 1
+        and mapping.moe.tp_size == 1
+        and mapping.attn.tp_size > 1
+        and mapping.attn.tp_size == mapping.dense.tp_size == mapping.moe.ep_size
+    )
+
+
+def gluon_petit_tp_attention(args) -> bool:
+    """Whether a server runs Gluon Petit's MoE under attention TP = EP size."""
+    return args.all2all_backend == "gluon_petit" and gluon_petit_tp_attention_mapping(
+        args.mapping
+    )
+
+
+def gluon_petit_tp_attention_rows(
+    num_rows: int, ep_size: int, ep_rank: int
+) -> tuple[int, int]:
+    """Rows [start, end) of ``num_rows`` replicated rows rank ``ep_rank`` sends.
+
+    Rank r takes [r * ceil(T / EP), min(T, (r + 1) * ceil(T / EP))); trailing
+    ranks may take none. The split depends only on the replicated row count,
+    so every rank derives the same graph-stable shapes.
+    """
+    share = -(-num_rows // ep_size)
+    start = min(num_rows, ep_rank * share)
+    return start, min(num_rows, start + share)
+
+
+def _gluon_petit_rows_per_rank(args, rows: int) -> int:
+    """Most of ``rows`` batch rows one rank sends to Petit."""
+    if gluon_petit_tp_attention(args):
+        return -(-rows // args.mapping.moe.ep_size)
+    return rows
+
+
 def _gluon_petit_decode_tokens_per_rank(args) -> int:
-    """Decode tokens one attention-DP rank sends to Petit in one step."""
+    """Decode tokens one rank sends to Petit in one step.
+
+    One attention-DP rank's batch, or under attention TP the largest share of
+    the replicated batch.
+    """
     decode_tokens_per_request = (
         args.speculative_num_draft_tokens
         if args.speculative_algorithm is not None
         else 1
     )
-    return (args.max_num_seqs // args.mapping.attn.dp_size) * decode_tokens_per_request
+    return _gluon_petit_rows_per_rank(
+        args,
+        (args.max_num_seqs // args.mapping.attn.dp_size) * decode_tokens_per_request,
+    )

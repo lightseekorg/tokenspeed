@@ -105,6 +105,9 @@ def moe_expert_weight_dtype(quant_config, prefix: str) -> str:
 
 
 class MoELayer(torch.nn.Module):
+    # Set in __init__; the class default covers layers assembled without it.
+    petit_splits_replicated_rows = False
+
     def __init__(
         self,
         top_k: int,
@@ -138,9 +141,13 @@ class MoELayer(torch.nn.Module):
         # The routed-expert bank layout the selected kernel must read
         # (``moe_plan``'s ``expert_layout``); None leaves it to selection.
         expert_layout: str | None = None,
+        # Gluon Petit under attention TP: the caller hands Petit a distinct
+        # share of its replicated rows and sums the outputs across the group.
+        petit_splits_replicated_rows: bool = False,
     ):
         super().__init__()
         self.layer_index = layer_index
+        self.petit_splits_replicated_rows = petit_splits_replicated_rows
         self.peer_weights = peer_weights
         # Deployment-level override for the activation precision (e.g. a K3
         # w4a8 flag), forcing the value the quant_config would otherwise derive.
@@ -376,6 +383,12 @@ class MoELayer(torch.nn.Module):
             if mapping.moe.tp_size != 1 or self.tp_size != 1:
                 raise ValueError(
                     "Gluon Petit MegaMoE requires MoE tensor parallel size 1"
+                )
+            if mapping.attn.tp_size != 1 and not self.petit_splits_replicated_rows:
+                # Replicated rows would each be routed EP times over.
+                raise ValueError(
+                    "Gluon Petit MegaMoE under attention TP requires a model "
+                    "that splits the replicated rows across the EP group"
                 )
             if (
                 mapping.world_size not in GLUON_PETIT_WORLD_SIZES

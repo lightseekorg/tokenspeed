@@ -51,6 +51,10 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.server_args import (
+    gluon_petit_tp_attention_mapping,
+    gluon_petit_tp_attention_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +254,10 @@ def log_shared_expert_stream(
 
 
 class DeepseekV4MoE(nn.Module):
+    # Set in __init__; the class default keeps layers built without it (tests
+    # assembling a layer by hand) on the existing paths.
+    petit_tp_attention = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -273,7 +281,16 @@ class DeepseekV4MoE(nn.Module):
         moe_backend = get_moe_backend()
         self.use_mega_moe = moe_backend.is_mega_moe()
         self.use_gluon_petit = moe_backend.is_gluon_petit()
-        self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
+        # Attention TP over Petit's EP group: every rank holds the same rows,
+        # sends Petit its contiguous share and adds its shared-expert partial;
+        # the caller's all-reduce over the MoE TPxEP group (TP4's) completes
+        # both, so the layer leaves communication to the caller.
+        self.petit_tp_attention = (
+            self.use_gluon_petit and gluon_petit_tp_attention_mapping(mapping)
+        )
+        self.owns_ep_communication = self.use_mega_moe or (
+            self.use_gluon_petit and not self.petit_tp_attention
+        )
         self.stream_fork = StreamFork(
             shared_expert_stream(aux_stream, use_gluon_petit=self.use_gluon_petit)
         )
@@ -397,6 +414,7 @@ class DeepseekV4MoE(nn.Module):
             persistent_max_num_tokens_per_gpu=(
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
+            petit_splits_replicated_rows=self.petit_tp_attention,
         )
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
@@ -591,6 +609,8 @@ class DeepseekV4MoE(nn.Module):
 
         The following all-reduce can read this memory in place.
         """
+        if self.petit_tp_attention:
+            return self._forward_petit_tp_attention(hidden_states, input_ids, out)
         if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
             return hidden_states if out is None else out.copy_(hidden_states)
         with nvtx_range("moe_select_experts"):
@@ -671,6 +691,53 @@ class DeepseekV4MoE(nn.Module):
                         max_num_tokens_per_gpu,
                         do_finalize=True,
                     )
+
+    def _forward_petit_tp_attention(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """This rank's partial of the MoE output over replicated rows.
+
+        Rank r routes only rows [r * ceil(T / EP), ...) through Petit (every
+        rank calls Petit, with zero rows when T < EP) and the TP-sharded
+        shared expert over all T rows; the routed share lands in its own rows
+        of the shared partial (zeros without a shared expert). The caller's
+        all-reduce over the MoE TPxEP group then yields routed + shared for
+        every row, exactly as TP4's routed partial + shared partial.
+        """
+        num_rows = hidden_states.shape[0]
+        start, end = gluon_petit_tp_attention_rows(
+            num_rows, self.mapping.moe.ep_size, self.mapping.moe.ep_rank
+        )
+        local = hidden_states[start:end]
+        local_ids = None if input_ids is None else input_ids[start:end]
+        with nvtx_range("moe_select_experts"):
+            topk_output = self._compute_topk_output(local, local_ids)
+        shared = None
+        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            with nvtx_range("moe_experts"):
+                routed = self._forward_routed_experts(
+                    local,
+                    topk_output,
+                    num_rows,
+                    # Rank 0 holds the largest share.
+                    -(-num_rows // self.mapping.moe.ep_size),
+                    do_finalize=True,
+                )
+            with fork.branch():
+                shared = self._forward_shared_experts(hidden_states)
+        if shared is None:
+            result = (
+                hidden_states.new_zeros(hidden_states.shape)
+                if out is None
+                else out.zero_()
+            )
+        else:
+            result = shared if out is None else out.copy_(shared)
+        result[start:end].add_(routed)
+        return result
 
     def forward(
         self,
