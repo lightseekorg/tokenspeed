@@ -654,14 +654,19 @@ def _mm_traits(
             A_scales is None or A_scales.data_ptr() % 16 == 0
         ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
         # The scale granularity says only "not both per-tensor"; these say
-        # which side has one scale per row (A) or per output channel (B).
-        # An online-quantized call gets per-token scales from mm.
-        traits["a_scales_per_row"] = (
-            _online_fp8_rows(A, A_scales, B_scales, quant)
-            or A_scales is not None
-            and A_scales.numel() == M
+        # which side has one scale per row (A, [M] or [M, 1]) or per output
+        # channel (B, [N], [N, 1] or [1, N]), and whether A's are contiguous.
+        # An online-quantized call gets contiguous per-token scales from mm.
+        online = _online_fp8_rows(A, A_scales, B_scales, quant)
+        traits["a_scales_per_row"] = online or (
+            A_scales is not None and tuple(A_scales.shape) in ((M,), (M, 1))
         )
-        traits["b_scales_per_channel"] = B_scales is not None and B_scales.numel() == N
+        traits["a_scales_contiguous"] = online or (
+            A_scales is not None and A_scales.is_contiguous()
+        )
+        traits["b_scales_per_channel"] = B_scales is not None and tuple(
+            B_scales.shape
+        ) in ((N,), (N, 1), (1, N))
 
     if A.dtype == B.dtype == torch.bfloat16:
         traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0

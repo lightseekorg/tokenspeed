@@ -300,7 +300,16 @@ def test_selected_inside_its_window_and_declined_outside(n):
     # row-strided weight copy (every other row of a wider one).
     wide = torch.zeros(n, 2 * _K, dtype=weight.dtype, device="cuda")
     wide[:, :_K] = weight
-    for odd in ({"a_s": scales[1:49]}, {"a": codes[:96:2]}, {"w": wide[:, :_K]}):
+    # An [M, 1] column view of [M, 2] scales: per row, but not contiguous.
+    paired = torch.zeros(130, 2, device="cuda")
+    paired[:, :1] = scales.reshape(-1, 1)
+    column = paired[:48, :1]
+    for odd in (
+        {"a_s": scales[1:49]},
+        {"a": codes[:96:2]},
+        {"w": wide[:, :_K]},
+        {"a_s": column},
+    ):
         assert name(48, None, **odd) == "triton_mm_fp8_scaled"
         assert name(48, streaming, **odd) is None
     # A per-tensor activation scale (a static input scale) with per-channel

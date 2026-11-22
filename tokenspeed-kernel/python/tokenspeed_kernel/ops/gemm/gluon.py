@@ -1934,6 +1934,7 @@ if platform.is_amd:
             "out_aligned_16": frozenset({True}),
             "scales_aligned_16": frozenset({True}),
             "a_scales_per_row": frozenset({True}),
+            "a_scales_contiguous": frozenset({True}),
             "b_scales_per_channel": frozenset({True}),
             "has_alpha": frozenset({False}),
         },
