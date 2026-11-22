@@ -29,6 +29,7 @@ from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
+from utils import assert_no_cute_compile
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -70,13 +71,14 @@ def reference(values, scale):
 
 
 def check(result, expected, dtype):
-    tolerance = 0.04 if dtype == torch.bfloat16 else 0.008
+    # BF16 at 1% relative: a lost split-K slice of the gate moves outputs by ~0.004.
+    atol, rtol = (0.002, 0.01) if dtype == torch.bfloat16 else (0.008, 0.008)
     for actual, wanted in zip(result, expected):
         if wanted is None:
             assert actual is None
         else:
             torch.testing.assert_close(
-                actual.cpu().double(), wanted, rtol=tolerance, atol=tolerance
+                actual.cpu().double(), wanted, rtol=rtol, atol=atol
             )
 
 
@@ -651,6 +653,7 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     workspaces = dict(cute_fused._WORKSPACES)
     graph = torch.cuda.CUDAGraph()
     with (
+        assert_no_cute_compile(),
         mock.patch.object(
             cute_fused.cute_ext,
             "compile",
@@ -683,19 +686,6 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     assert all(
         cute_fused._WORKSPACES[key] is value for key, value in workspaces.items()
     )
-
-
-@pytest.mark.parametrize("row_counts", [(17, 20, 31), (33, 40, 63)])
-def test_rows_of_one_tile_bucket_trace_no_kernel(row_counts, monkeypatch):
-    from utils import assert_no_cute_compile
-
-    _reset_caches(monkeypatch)
-    values = [inputs(rows, torch.bfloat16, True) for rows in row_counts]
-    pdl_enabled(True)
-    mix(values[0], 0.25, True)
-    with assert_no_cute_compile():
-        for value in values[1:]:
-            check(mix(value, 0.25, True), reference(value, 0.25), torch.bfloat16)
 
 
 def test_startup_warms_full_tail_tiles_and_rounds(monkeypatch):

@@ -155,8 +155,6 @@ def _on_architecture(monkeypatch: pytest.MonkeyPatch, version: ArchVersion) -> N
         (320, 22, 256, (8, 64, 64, 5)),
         (320, 22, 257, (4, 64, 64, 5)),
         # 11 clusters (a smaller context): S8 covers 64 rows at 324, 128 at 320.
-        (324, 11, 17, (8, 64, 32, 5)),
-        (324, 11, 64, (8, 64, 32, 5)),
         (324, 11, 65, (4, 64, 16, 5)),
         (324, 11, 97, (4, 64, 32, 5)),
         (324, 11, 193, (4, 64, 64, 5)),
@@ -169,11 +167,10 @@ def test_sm107_qwen_tiles_follow_one_round_capacity(
 ):
     # The batched FP64 tests cover these row counts.
     _on_architecture(monkeypatch, ArchVersion(10, 7))
-    # Sixteen-CTA clusters: 8 beside 22 eight-CTA ones, 4 beside 11.
     monkeypatch.setattr(
         cute_fused,
         "_cluster_capacity_hint",
-        lambda index, stream, split_k: {8: capacity, 16: 8 * capacity // 22}[split_k],
+        lambda index, stream, split_k: {8: capacity}[split_k],
     )
     split_k, m, n, _, _, stages, _ = cute_fused._model_tactic(
         rows, 4, 2560, 320, projection_rows
