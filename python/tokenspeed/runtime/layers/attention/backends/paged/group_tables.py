@@ -100,7 +100,7 @@ class GroupTableSpec:
 
 # Groups one packed fill serves; a router with more launches once per group.
 _PACKED_MAX_GROUPS = 8
-# The integer type of the decode and extend write slots every group stack stores.
+# The type of the decode and extend write slots GroupTableStacks computes (router K/V).
 GROUP_WRITE_SLOT_DTYPE = torch.int32
 
 

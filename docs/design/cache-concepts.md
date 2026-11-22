@@ -2250,8 +2250,8 @@ The recipe also caps the agreed parent capacity at the largest count every
 target and draft field can address: K/V and recent-QSA write slots, and
 compressed-QSA atom-page IDs. This keeps a larger GPU
 memory budget from producing an unbindable pool; a smaller draft payload
-can set the limit. The bound is independent of the kernel page size and
-includes the final page's token span. The bind-time check remains in place
+can set the limit. The bound is independent of the kernel page size and,
+for write slots, includes the final page's token span. The bind-time check remains in place
 for explicitly constructed plans.
 
 L3 compatibility follows the cache layout signature, including field strides,

@@ -119,7 +119,7 @@ class TestCacheMemoryPlanTest:
                 atom_pages_per_block=multiplier,
                 kernel_subpages=ratio,
                 kernel_page_size=kernel_page_size,
-                write_slot_dtype="int32",
+                max_write_slot=(1 << 31) - 1,
             )
 
         if error is None:

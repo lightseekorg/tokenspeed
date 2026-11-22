@@ -200,14 +200,20 @@ def test_qwen4_exp_qsa_compress_writes_slots_past_int32(device: str) -> None:
     near = torch.zeros(2, 64, 1, head_dim, device=device, dtype=torch.bfloat16)
     compress(256 + 3, near)
     assert far_page * 256 + 3 > torch.iinfo(torch.int32).max
-    # One-element row strides keep the far page's first row in a 1 GiB buffer.
-    far_row = far_page * 64
-    buffer = torch.zeros(far_row + 64 + head_dim, device=device, dtype=torch.bfloat16)
-    far = buffer.as_strided((far_page + 1, 64, 1, head_dim), (64, 1, head_dim, 1))
+    # 4-element row strides put the far row's element offset past 2^31 (4 GiB buffer).
+    row_stride = 4
+    far_offset = far_page * 64 * row_stride
+    assert far_offset > torch.iinfo(torch.int32).max
+    buffer = torch.zeros(
+        far_offset + 64 * row_stride + head_dim, device=device, dtype=torch.bfloat16
+    )
+    far = buffer.as_strided(
+        (far_page + 1, 64, 1, head_dim), (64 * row_stride, row_stride, head_dim, 1)
+    )
     compress(far_page * 256 + 3, far)
     torch.cuda.synchronize()
     assert torch.count_nonzero(near[1, 0]) > 0
-    written = buffer[far_row : far_row + head_dim]
+    written = buffer[far_offset : far_offset + head_dim]
     torch.testing.assert_close(written, near[1, 0, 0], rtol=0, atol=0)
     assert torch.count_nonzero(buffer) == torch.count_nonzero(written)
 

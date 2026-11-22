@@ -512,10 +512,14 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
     from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
     from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
+    from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+        GROUP_WRITE_SLOT_DTYPE,
+    )
+    from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+        qsa_indexer_table_specs,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
         QWEN4_EXP_PLE_CACHE_GROUP,
-        QWEN4_EXP_QSA_CACHE_GROUP,
-        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
         local_cache_capacity,
@@ -608,11 +612,6 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
         max_padding_fraction=recipe.max_padding_fraction,
     )
 
-    qsa_slot_dtypes = {
-        QWEN4_EXP_QSA_CACHE_GROUP: torch.int64,
-        QWEN4_EXP_QSA_RECENT_CACHE_GROUP: torch.int32,
-    }
-
     def validate_views(plan, owns_draft):
         arena = CacheArena(plan, "meta", cache_group_specs=setup.spec.cache_group_specs)
         sides = [(0, setup.num_target_layers, recipe.attn_config)]
@@ -633,18 +632,11 @@ def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
                 rank=0,
                 field_layer_offset=offset,
             )
-            for spec in setup.spec.cache_group_specs:
-                if spec.group_id in qsa_slot_dtypes:
-                    # The QSA indexer's tables: one kernel page per block.
-                    pool.atom_pages_per_block(
-                        spec.group_id,
-                        spec.block_granularity,
-                        write_slot_dtype=qsa_slot_dtypes[spec.group_id],
-                    )
-                elif spec.attn_kind == "full_history":
-                    pool.atom_pages_per_block(
-                        spec.group_id, kernel_page_size, write_slot_dtype=torch.int32
-                    )
+            # The real consumers: the QSA indexer's tables and the router's K/V stacks.
+            qsa_indexer_table_specs(pool, recipe.attn_config.context_len)
+            pool.atom_pages_per_block(
+                FULL_ATTENTION, kernel_page_size, write_slot_dtype=GROUP_WRITE_SLOT_DTYPE
+            )
 
     # The CI TP2 geometry exceeded int32 after sizing to free GPU memory.
     # Meta views exercise every real pool's checks without allocating the arena.

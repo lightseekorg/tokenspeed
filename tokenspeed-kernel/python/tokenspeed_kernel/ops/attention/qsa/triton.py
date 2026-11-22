@@ -41,6 +41,9 @@ from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _is_nvidia = current_platform().is_nvidia
 _SCORE_MAX_WAVES = 3
+# Location dtypes of qwen4_exp_qsa_prepare_metadata; compressed atom pages times 256 tokens pass int32.
+QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE = torch.int64
+QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE = torch.int32
 LOG2E = math.log2(math.e)
 
 
@@ -194,9 +197,12 @@ def qwen4_exp_qsa_prepare_metadata(
     outputs = (
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
         torch.empty((total_tokens,), dtype=torch.int64, device=device),
-        # Atom pages times the 256-token page pass int32 on large FlatKV pools.
-        torch.empty((total_tokens,), dtype=torch.int64, device=device),
-        torch.empty((total_tokens,), dtype=torch.int32, device=device),
+        torch.empty(
+            (total_tokens,), dtype=QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE, device=device
+        ),
+        torch.empty(
+            (total_tokens,), dtype=QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE, device=device
+        ),
         torch.empty((total_tokens,), dtype=torch.int32, device=device),
     )
     if not total_tokens or not batch:
@@ -2624,6 +2630,8 @@ register_kernel(
 
 
 __all__ = [
+    "QWEN4_EXP_QSA_COMPRESSED_LOCATION_DTYPE",
+    "QWEN4_EXP_QSA_RECENT_LOCATION_DTYPE",
     "qwen4_exp_qsa_compress_and_store",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",

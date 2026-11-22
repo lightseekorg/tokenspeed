@@ -261,7 +261,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             spec = specs[field.group_id]
             if spec.attn_kind == "state":
                 continue
-            # The last slot is block * stride / payload * block_tokens
+            # The last slot or atom ID is block * stride / payload * block_tokens
             # + block_tokens - 1, independent of the kernel page size.
             # Include each view's payload and the final page's token span.
             block_tokens = spec.block_granularity
