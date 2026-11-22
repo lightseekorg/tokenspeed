@@ -312,6 +312,28 @@ during prefill, decode, and CUDA graphs.
 
 ## FP8 decode head tile and grid
 
+FP8 prefix operands advance as `K0,V0,K1,V1,...`, with QK and PV using their
+buffer pipelines independently. Each conversion stage publishes two
+64-element fragments together and remains owned until its MMA completes.
+Initial O is published before P enables PV. Non-bulk `cp.async` completion and
+the producer warpgroup barrier protect shared-ring reads and reuse without an
+additional async-proxy shared-memory fence after each register load.
+
+Unsplit 24 Q / 2 KV-head calls with one row per CTA use six gather slots with
+five copies in flight; the unused MMA warp stages the three private tail K/V
+slots. Other tactics retain four slots and three copies in flight. Copy width
+follows the cache dtype. CUDA 13.2/PTX 9.2+ converts E4M3 pairs directly to BF16
+with a 16-bit source operand; older compilers retain the FP32 conversion.
+This adds no global workspace or persistent tensors.
+
+Against commit `947b25bc9`, 18 SM107 graph-replay cases at batch 96 measured
+geometric-mean core-attention latency reductions of **20.18% with warm L2**
+and **18.73% with cold L2**, with bitwise-equal outputs. The cases use 24 Q /
+2 KV heads, head dimension 256, 512 selected four-token blocks, 8K/32K/128K
+contexts, query widths 1/4, independent selection with PDL on/off, and shared
+selection with PDL on. These measurements exclude indexing, top-k and other
+model operations; they are not end-to-end serving throughput figures.
+
 The direct-slot CuTe path uses a 16-column tile for twelve query heads per KV
 head with FP8 caches on SM100, SM103 and SM107, for every grid. Each query
 retains its independent selected-slot list. Covering all twelve heads in one

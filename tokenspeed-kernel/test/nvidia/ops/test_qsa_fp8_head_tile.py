@@ -40,6 +40,7 @@ pytestmark = pytest.mark.skipif(
         (8, 1, False, 2),
         (32, 1, False, 2),
         (32, 1, False, 1),
+        (96, 1, False, 2),
         (128, 4, False, 2),
         (384, 4, False, 2),
         (128, 4, True, 2),
@@ -236,3 +237,148 @@ def test_large_fp8_grids_refresh_across_split_boundary(enable_pdl):
                 if empty_last:
                     assert torch.count_nonzero(output[-1]) == 0
                 torch.testing.assert_close(forward(q, selected), output, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("rows", [8, 32, 96, 128])
+def test_fp8_short_prefixes_and_private_tails_refresh_in_graph(rows, enable_pdl):
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl import qsa_sparse
+    from utils import assert_no_cute_compile
+
+    torch.manual_seed(1841)
+    query = torch.randn(rows, 24, 256, device="cuda", dtype=torch.bfloat16)
+    keys, values = (
+        (torch.randn(4096, 2, 256, device="cuda") * 0.25).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    keys[0].fill_(float("nan"))
+    values[0].fill_(float("nan"))
+    selected = torch.full((rows, 2051), -1, device="cuda", dtype=torch.int32)
+    candidates = torch.randint(
+        1, 4096, selected.shape, device="cuda", dtype=torch.int32
+    )
+    sample = [0, 1, 2, 3, rows // 2, rows - 1]
+    qsa_sparse.warmup(query, keys, values, max_rows=rows, enable_pdl=enable_pdl)
+
+    def run():
+        return qsa_sparse.kernel(
+            query,
+            keys,
+            values,
+            selected,
+            scale=1 / 16,
+            max_seqlen_q=4,
+            k_scale=0.5,
+            v_scale=0.25,
+            enable_pdl=enable_pdl,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with assert_no_cute_compile(), torch.cuda.graph(graph):
+        output = run()
+    # A one-tile prefix leaves fewer copy groups than the configured lookahead.
+    # Tail-only and empty rows must still drain safely before shared storage reuse.
+    with assert_no_cute_compile():
+        for count in (0, 1, 127, 128, 129, 255, 256, 257, 383, 384, 385, 2048):
+            selected.fill_(-1)
+            selected[:, :count] = candidates[:, :count]
+            selected[:, -3:] = candidates[:, -3:]
+            for row in range(3):
+                selected[row::4, 2048 + row :] = -1
+            selected[0] = -1
+            query.mul_(-0.75)
+            values.copy_(
+                (torch.randn_like(values, dtype=torch.float32) * 0.25).to(values.dtype)
+            )
+            values[0].fill_(float("nan"))
+            # Repeated replays exercise ring wraparound and reuse of the
+            # completed gather storage by the output epilogue.
+            for _ in range(8):
+                graph.replay()
+            expected = torch_qsa_selected_attention(
+                query[sample], keys, values, selected[sample], 1 / 16, 0.5, 0.25
+            )
+            torch.testing.assert_close(output[sample], expected, atol=1e-3, rtol=1e-2)
+            assert torch.count_nonzero(output[0]) == 0
+            torch.testing.assert_close(run(), output, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_alternating_kv_reuses_pipeline_for_serial_query_rows(enable_pdl):
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl import qsa_sparse
+    from utils import assert_no_cute_compile
+
+    torch.manual_seed(3351)
+    query = torch.randn(3, 24, 256, device="cuda", dtype=torch.bfloat16)
+    keys, values = (
+        (torch.randn(4096, 2, 256, device="cuda") * 0.25).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    keys[0].fill_(float("nan"))
+    values[0].fill_(float("nan"))
+    selected = torch.randint(1, 4096, (3, 2051), device="cuda", dtype=torch.int32)
+    output = torch.empty_like(query)
+    prefix_shared = selected[:, 0]
+    # Two rows share a CTA and its pipeline barriers; the last CTA has an
+    # absent second row. Exercise this supported tactic directly because the
+    # wave policy currently favors one row on this grid.
+    compiled = qsa_sparse._compile_kernel(
+        query,
+        query,
+        keys,
+        values,
+        selected,
+        output,
+        kv_splits=1,
+        enable_pdl=enable_pdl,
+        query_rows_per_cta=2,
+        bf16_smem_slots=1,
+        bf16_async_ready=False,
+        head_tile=16,
+        query_group=1,
+        prefix_shared=prefix_shared,
+        distinct_bf16_smem_slots=1,
+    )
+
+    def run():
+        compiled(
+            query,
+            query,
+            keys.view(torch.uint8),
+            values.view(torch.uint8),
+            selected,
+            prefix_shared,
+            output,
+            1 / 16,
+            0.5,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with assert_no_cute_compile(), torch.cuda.graph(graph):
+        run()
+    with assert_no_cute_compile():
+        for live_row in (0, 1, 2, 0):
+            selected.fill_(-1)
+            selected[live_row].random_(1, 4096)
+            selected[live_row, 513:2048] = -1
+            query.mul_(-0.75)
+            for _ in range(16):
+                graph.replay()
+            expected = torch_qsa_selected_attention(
+                query, keys, values, selected, 1 / 16, 1.0, 0.5
+            )
+            torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
+            assert (
+                torch.count_nonzero(output[torch.arange(3, device="cuda") != live_row])
+                == 0
+            )
+            saved = output.clone()
+            run()
+            torch.testing.assert_close(output, saved, atol=0, rtol=0)

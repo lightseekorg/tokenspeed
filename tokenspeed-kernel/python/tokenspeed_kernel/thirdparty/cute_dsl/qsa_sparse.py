@@ -248,6 +248,13 @@ def _compile_kernel(
         )
     else:
         register_budget = None
+    prefetch_fp8_tail = (
+        not bf16_kv
+        and heads_per_kv == 12
+        and kv_heads == 2
+        and kv_splits == 1
+        and query_rows_per_cta == 1
+    )
     fmha = MixedInputFusedMultiHeadAttentionDecode(
         kv_splits,
         enable_pdl,
@@ -293,6 +300,10 @@ def _compile_kernel(
         work_sync_threads=0,
         prefix_in_cta=prefix_shared.numel() == 0,
         large_query_grid=original_query.shape[0] > 128,
+        # Unsplit FP8 tiles retain one CTA per SM. Use the spare MMA warp for
+        # private K/V, and the remaining shared-memory budget for copy lookahead.
+        fp8_gather_depth=5 if prefetch_fp8_tail else 3,
+        prefetch_fp8_tail=prefetch_fp8_tail,
     )
 
     def dynamic_rows(tensor):
