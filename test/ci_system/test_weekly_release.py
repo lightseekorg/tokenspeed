@@ -198,6 +198,7 @@ def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
     }
     release_module.update_metadata("amd", versions)
     release_module.update_metadata("kernel", versions)
+    release_module.update_metadata("engine", versions)
     release_module.update_metadata("tokenspeed", versions)
     assert (
         release_module.read_version("tokenspeed-kernel")
@@ -208,7 +209,18 @@ def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
         f'__version__ = "{versions["tokenspeed"]}"'
         in Path("python/tokenspeed/version.py").read_text()
     )
+    assert (
+        release_module.read_version("tokenspeed-engine")
+        == versions["tokenspeed-engine"]
+    )
     deps = release_module.requirements("python/pyproject.toml")
+    assert (
+        str(deps["tokenspeed-engine"].specifier) == f'=={versions["tokenspeed-engine"]}'
+    )
+    assert (
+        f'{versions["tokenspeed-engine"]}.post20261122'
+        not in deps["tokenspeed-engine"].specifier
+    )
     assert (
         str(deps["tokenspeed-kernel"].specifier)
         == f'>={versions["tokenspeed-kernel"]}.dev0'
@@ -343,8 +355,8 @@ def test_weekly_schedule_and_failure_resume_contract():
     )
     assert workflow["jobs"]["resume"]["with"]["stage"] == "release"
     for previous, stage in zip(
-        ("plan", "amd", "kernel", "tokenspeed", "index", "docker"),
-        ("amd", "kernel", "tokenspeed", "index", "docker", "release"),
+        ("plan", "amd", "kernel", "engine", "tokenspeed", "index", "docker"),
+        ("amd", "kernel", "engine", "tokenspeed", "index", "docker", "release"),
     ):
         assert workflow["jobs"][stage]["needs"] == previous
     reusable = yaml.safe_load(
@@ -376,10 +388,11 @@ def test_weekly_schedule_and_failure_resume_contract():
 @pytest.fixture
 def publication_state(release_module):
     versions = {
-        package: "0.1.4" for package in (*release_module.PROJECTS, "tokenspeed-kernel")
+        package: "0.1.4"
+        for package in (*release_module.PACKAGES.values(), "tokenspeed-mla")
     }
     stages = {stage: {"complete": True} for stage in release_module.STAGES[:-1]}
-    for stage, letter in zip(release_module.PACKAGES, "abc"):
+    for stage, letter in zip(release_module.PACKAGES, "abdc"):
         stages[stage]["sha"] = letter * 40
     stages["docker"]["image"] = "lightseekorg/tokenspeed:0.1.4"
     runs = {}
@@ -388,6 +401,7 @@ def publication_state(release_module):
             ("release-tokenspeed-kernel-amd.yml", "amd", "workflow_dispatch"),
             ("release-tokenspeed-kernel.yml", "kernel", "workflow_dispatch"),
             ("release-tokenspeed-kernel-rocm.yml", "kernel", "workflow_dispatch"),
+            ("release-tokenspeed-engine.yml", "engine", "workflow_dispatch"),
             ("release-pypi.yml", "tokenspeed", "push"),
             ("publish-release-docker.yml", "tokenspeed", "workflow_dispatch"),
         ),
@@ -542,7 +556,7 @@ def test_release_only_recovery_validates_origin_and_never_republishes(
     with pytest.raises(RuntimeError, match="all publication stages"):
         release.validate_recovery()
     jobs[-1]["conclusion"] = "success"
-    release.state["runs"]["release-pypi.yml"]["sha"] = "d" * 40
+    release.state["runs"]["release-tokenspeed-engine.yml"]["sha"] = "e" * 40
     with pytest.raises(RuntimeError, match="source mismatch"):
         release.verify_publications()
 
@@ -586,7 +600,7 @@ def test_cleanup_deletes_only_expected_refs_and_refuses_moved_branches(
     refs[moved] = "b" * 40
     release.cleanup()
     release.cleanup()
-    assert len(deleted) == 3 and not refs and release.phase["branches_cleaned"]
+    assert len(deleted) == 4 and not refs and release.phase["branches_cleaned"]
 
 
 def workflow_python(job):
@@ -1324,3 +1338,48 @@ def test_component_version_rerun_keeps_reservation(
     resumed = controller_type(controller.path, f"{component}-version")
     resumed.run("")
     assert reserved == [expected] and resumed.state["versions"] == {package: expected}
+
+
+def test_stable_engine_requires_exact_pin_and_published_source(
+    release_module, version_repository, monkeypatch
+):
+    git = lambda *args: release_module.command("git", *args)
+    versions = {
+        p: release_module.read_version(p) for p in release_module.PACKAGES.values()
+    }
+    release_module.update_metadata("tokenspeed", versions)
+    git("add", ".")
+    git("commit", "-s", "-m", "Pin stable engine")
+    sha = git("rev-parse", "HEAD")
+    git("remote", "add", "origin", str(version_repository))
+    monkeypatch.setattr(release_module, "pypi", lambda *args: None)
+    with pytest.raises(RuntimeError, match="missing or has yanked"):
+        release_module.verify_stable_engine()
+    monkeypatch.setattr(release_module, "source_sha", lambda *args: sha)
+    assert release_module.verify_stable_engine() == versions["tokenspeed-engine"]
+    metadata = Path(release_module.PROJECTS["tokenspeed"])
+    pinned = metadata.read_text()
+    metadata.write_text(pinned.replace("tokenspeed-engine==", "tokenspeed-engine>="))
+    with pytest.raises(RuntimeError, match="must pin"):
+        release_module.verify_stable_engine()
+    metadata.write_text(pinned)
+    Path("tokenspeed-engine/unreleased.rs").write_text("// unpublished engine change\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "Unreleased engine change")
+    with pytest.raises(RuntimeError, match="Unreleased changes"):
+        release_module.verify_stable_engine()
+
+
+def test_stable_reservation_ignores_engine_post_releases(release_module, monkeypatch):
+    monkeypatch.setattr(
+        release_module,
+        "pypi",
+        lambda package: {
+            "releases": {
+                "0.1.1": [{"yanked": False}],
+                "0.1.1.post20261122": [{"yanked": False}],
+            }
+        },
+    )
+    published = release_module.latest_version("tokenspeed-engine")
+    assert release_module.next_version("0.1.1", published, "") == "0.1.2"
