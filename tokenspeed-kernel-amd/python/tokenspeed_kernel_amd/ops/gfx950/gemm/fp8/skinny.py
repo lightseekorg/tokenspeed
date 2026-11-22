@@ -161,7 +161,6 @@ def gluon_mm_fp8_skinny_gfx950(
         K % (SPLIT_K * BLOCK_K) == 0 and K // (SPLIT_K * BLOCK_K) >= NUM_STAGES,
         "each split needs at least three whole K tiles",
     )
-    NUM_TILES: gl.constexpr = N // BLOCK_N
     K_SLICE: gl.constexpr = K // SPLIT_K
     K_TILES: gl.constexpr = K_SLICE // BLOCK_K
 
