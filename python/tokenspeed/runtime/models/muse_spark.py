@@ -76,6 +76,7 @@ from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
+    post_norm_residual_pre_norm_bf16_fp8,
     residual_gate_coefficients,
 )
 from tokenspeed_kernel.ops.tuning import kernel_warmup
@@ -281,7 +282,7 @@ class _DenseFp8Weight:
         # Compile the GEMM's binaries now (its warm-up compiles every row
         # tile), whatever row counts the startup warm-up forwards run.
         with kernel_warmup(enabled=True):
-            self.project(weight.new_zeros(self.min_rows, k), None)
+            self.project(weight.new_zeros(self.min_rows, k), None, None)
 
     def applies(self, rows: int, *, decode_forward: bool) -> bool:
         """Whether a forward's ``rows`` rows project through the FP8 copy.
@@ -300,11 +301,19 @@ class _DenseFp8Weight:
             and self.min_rows <= rows <= self.max_rows
         )
 
-    def project(self, x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
-        """``x @ weight^T`` in BF16, into ``out`` when given: ``x`` is
-        quantized here, per row, with the FP8 row code. Callers check
-        ``applies`` first."""
-        rows, scales = _quantize_rows_fp8(x)
+    def project(
+        self,
+        x: torch.Tensor,
+        x_fp8: tuple[torch.Tensor, torch.Tensor] | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``x @ weight^T`` in BF16, into ``out`` when given.
+
+        ``x_fp8`` is the per-row FP8 copy of ``x`` (codes, FP32 scales) its
+        producer wrote, or None to quantize ``x`` here. Callers check
+        ``applies`` first.
+        """
+        rows, scales = x_fp8 if x_fp8 is not None else _quantize_rows_fp8(x)
         return mm(
             rows,
             self.weight.t(),
@@ -867,12 +876,18 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
         self.dense_fp8.prepare(self._local_weight().data)
 
     def forward_rows(
-        self, input_: torch.Tensor, *, decode_forward: bool
+        self,
+        input_: torch.Tensor,
+        input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        decode_forward: bool,
     ) -> torch.Tensor:
-        """Project normalized rows; the FP8 projection runs where
-        ``_DenseFp8Weight.applies``."""
+        """Project normalized rows, given their per-row FP8 copy or None.
+
+        The FP8 projection runs where ``_DenseFp8Weight.applies``.
+        """
         if self.dense_fp8.applies(input_.shape[0], decode_forward=decode_forward):
-            return self.dense_fp8.project(input_, None)
+            return self.dense_fp8.project(input_, input_fp8, None)
         return self(input_)[0]
 
     def _local_weight(self) -> torch.Tensor:
@@ -1221,6 +1236,7 @@ class MuseSparkAttention(nn.Module):
         self,
         positions: torch.Tensor,
         normalized: torch.Tensor,
+        normalized_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         owned_global_rows: int | None,
         project: bool,
@@ -1230,6 +1246,8 @@ class MuseSparkAttention(nn.Module):
         Without ``project`` the gated heads [rows, heads * head_dim] come back
         unprojected, for the owner-side output projection
         (``project_owned_heads``).
+        ``normalized_fp8`` is the rows' per-row FP8 copy from their producer,
+        or None.
         """
         # NVIDIA gathers owned rows into the projection; Iris projects them in place.
         # Without ``project`` the forward runs on Iris owned rows
@@ -1283,7 +1301,9 @@ class MuseSparkAttention(nn.Module):
                 return normalized.new_empty((0, self.hidden_size)), None, 1
             else:
                 qkv_gate = self.qkv_proj.forward_rows(
-                    normalized, decode_forward=ctx.forward_mode.is_decode()
+                    normalized,
+                    normalized_fp8,
+                    decode_forward=ctx.forward_mode.is_decode(),
                 )
             q, k, v, output_gate = qkv_gate.split(
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
@@ -1399,6 +1419,7 @@ class MuseSparkAttention(nn.Module):
         self,
         positions: torch.Tensor,
         normalized: torch.Tensor,
+        normalized_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         cache: DecodeKVView,
         stream: torch.Tensor,
@@ -1418,7 +1439,7 @@ class MuseSparkAttention(nn.Module):
         FP8 copy from their producer, or None.
         """
         qkv_gate = self.qkv_proj.forward_rows(
-            normalized, decode_forward=ctx.forward_mode.is_decode()
+            normalized, normalized_fp8, decode_forward=ctx.forward_mode.is_decode()
         )
         q, k, v, output_gate = qkv_gate.split(
             (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
@@ -2799,6 +2820,7 @@ class MuseSparkDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         attention_input: torch.Tensor,
+        attention_input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -2832,6 +2854,7 @@ class MuseSparkDecoderLayer(nn.Module):
         return attn.forward_sliding_tail(
             positions,
             attention_input,
+            attention_input_fp8,
             ctx,
             cache,
             hidden_states,
@@ -2847,16 +2870,48 @@ class MuseSparkDecoderLayer(nn.Module):
         self.post_attention_residual_gate.refresh_gate()
         self.post_feedforward_residual_gate.refresh_gate()
 
+    def mlp_boundary_writes_fp8(
+        self, rows: int, *, decode_forward: bool, owned_rows: bool, mailbox: bool
+    ) -> bool:
+        """Whether the MLP boundary writes an FP8 copy of the next layer's
+        attention input rows, which that layer's QKV projection reads in FP8.
+        Every layer's QKV takes the same rows, so this layer's predicate
+        answers for the next. An owned-row forward, a mailbox branch (the
+        next QKV then quantizes its rows itself, with the same bits) or the
+        next layer's pre_attn_comm gather replaces those rows, so none is
+        written there."""
+        # The window predicate first: with the flag off it is one check.
+        return (
+            self.self_attn.qkv_proj.dense_fp8.applies(
+                rows, decode_forward=decode_forward
+            )
+            and not owned_rows
+            and not mailbox
+            # Every Muse Spark layer is MoE, so the next layer's gather
+            # follows this layer's layout.
+            and self.comm_manager.use_all_reduce(is_moe=True)
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         attention_input: torch.Tensor | None,
+        attention_input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         next_input_layernorm: MuseSparkRMSNorm | None,
         owned_global_rows: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Advance full or owned FP32 residual rows and prepare the next attention input."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        """Advance full or owned FP32 residual rows and prepare the next attention input.
+
+        ``attention_input_fp8`` is the per-row FP8 copy of ``attention_input``
+        from the previous boundary, or None. Returns the residual rows, the next
+        attention input and its FP8 copy (None unless the next QKV takes one).
+        """
         iris = None
         owned_qkvg = False
         if owned_global_rows is not None:
@@ -2884,7 +2939,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         hidden_states,
                         self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx),
                     )
-                return hidden_states, None
+                return hidden_states, None, None
         if not owned_qkvg:
             # The input norm is row-wise, so either side of the comm agrees.
             if attention_input is None and owned_global_rows is None:
@@ -2894,10 +2949,16 @@ class MuseSparkDecoderLayer(nn.Module):
                     norm.weight.dtype,
                 )
             else:
-                attention_input = self.comm_manager.pre_attn_comm(attention_input, ctx)
+                communicated = self.comm_manager.pre_attn_comm(attention_input, ctx)
+                if communicated is not attention_input:
+                    # The FP8 copy describes the rows before the comm.
+                    attention_input_fp8 = None
+                attention_input = communicated
         # Sliding decode rows may run attention through its boundary in one launch.
         fused = (
-            self._sliding_attention_tail(positions, attention_input, ctx, hidden_states)
+            self._sliding_attention_tail(
+                positions, attention_input, attention_input_fp8, ctx, hidden_states
+            )
             if owned_global_rows is None
             else None
         )
@@ -2908,6 +2969,7 @@ class MuseSparkDecoderLayer(nn.Module):
             attention_output, attention_sentinel, attention_ranks = self.self_attn(
                 positions,
                 attention_input,
+                attention_input_fp8,
                 ctx,
                 owned_global_rows if owned_qkvg else None,
                 not heads_to_owners,
@@ -2970,7 +3032,7 @@ class MuseSparkDecoderLayer(nn.Module):
                     attention_output, hidden_states = self.comm_manager.post_attn_comm(
                         attention_output, hidden_states, ctx
                     )
-            hidden_states, router_input, mlp_input = post_norm_residual_pre_norm(
+            boundary_args = (
                 hidden_states,
                 attention_output,
                 self.post_attention_layernorm.weight,
@@ -2983,6 +3045,9 @@ class MuseSparkDecoderLayer(nn.Module):
                 pdl_enabled(),
                 attention_sentinel,
                 attention_ranks,
+            )
+            hidden_states, router_input, mlp_input = post_norm_residual_pre_norm(
+                *boundary_args
             )
         # Attention DP keeps rows rank-local: the expert exchange moves only
         # their compressed projections.
@@ -3047,25 +3112,23 @@ class MuseSparkDecoderLayer(nn.Module):
                 payload=_collective_payload(ctx.forward_mode),
             )
         if project_in_boundary:
-            return self.iris_state.gemv_all_gather_boundary(
-                mlp_output,
-                projection.weight,
-                hidden_states,
-                post_norm.weight,
-                alpha,
-                beta,
-                next_weight,
-                post_norm.eps,
-                post_norm.weight_offset,
-                next_eps,
-                next_weight_offset,
+            hidden_states, next_attention_input = (
+                self.iris_state.gemv_all_gather_boundary(
+                    mlp_output,
+                    projection.weight,
+                    hidden_states,
+                    post_norm.weight,
+                    alpha,
+                    beta,
+                    next_weight,
+                    post_norm.eps,
+                    post_norm.weight_offset,
+                    next_eps,
+                    next_weight_offset,
+                )
             )
-        boundary = (
-            post_norm_residual_pre_norm_bf16
-            if current_platform().is_cdna4
-            else post_norm_residual_pre_norm
-        )
-        boundary_outputs = boundary(
+            return hidden_states, next_attention_input, None
+        boundary_args = (
             hidden_states,
             mlp_output,
             post_norm.weight,
@@ -3080,7 +3143,32 @@ class MuseSparkDecoderLayer(nn.Module):
             None if owned_global_rows is not None else sentinel,
             1,
         )
-        hidden_states, next_attention_input = boundary_outputs[0], boundary_outputs[-1]
+        boundary = (
+            post_norm_residual_pre_norm_bf16
+            if current_platform().is_cdna4
+            else post_norm_residual_pre_norm
+        )
+        # The next layer's QKV, when it runs in FP8, reads the per-row FP8
+        # copy the boundary writes alongside the BF16 rows. Every layer's QKV
+        # takes the same rows, so this layer's answers for the next.
+        if next_weight is not None and self.mlp_boundary_writes_fp8(
+            # The residual rows give the row count: a mailbox branch is a
+            # [ranks, rows, shard] view.
+            hidden_states.shape[0],
+            decode_forward=ctx.forward_mode.is_decode(),
+            owned_rows=owned_global_rows is not None,
+            mailbox=sentinel is not None,
+        ):
+            hidden_states, next_attention_input, next_attention_input_fp8 = (
+                post_norm_residual_pre_norm_bf16_fp8(*boundary_args)
+            )
+        else:
+            next_attention_input_fp8 = None
+            boundary_outputs = boundary(*boundary_args)
+            hidden_states, next_attention_input = (
+                boundary_outputs[0],
+                boundary_outputs[-1],
+            )
         if (
             owned_global_rows is not None
             and next_attention_input is not None
@@ -3090,7 +3178,7 @@ class MuseSparkDecoderLayer(nn.Module):
             next_attention_input = iris.all_gather_owned_rows(
                 next_attention_input, owned_global_rows, False
             )
-        return hidden_states, next_attention_input
+        return hidden_states, next_attention_input, next_attention_input_fp8
 
 
 def _widen_modelopt_exclusions(quant_config: QuantizationConfig | None) -> None:
@@ -3285,6 +3373,7 @@ class MuseSparkModel(BaseTransformerModel):
         if state is not None:
             state.start_step()
         attention_input = None
+        attention_input_fp8 = None
         if owned_global_rows is not None:
             local_rows = (
                 rows + self.mapping.attn.tp_size - 1
@@ -3332,11 +3421,12 @@ class MuseSparkModel(BaseTransformerModel):
             layer_forward = layer.forward if owned_global_rows is not None else layer
             # A launch before a layer that a draft taps hands over the whole
             # rows, so the capture above read the current residual.
-            hidden_states, attention_input = layer_forward(
+            hidden_states, attention_input, attention_input_fp8 = layer_forward(
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
                 attention_input=attention_input,
+                attention_input_fp8=attention_input_fp8,
                 next_input_layernorm=next_input_layernorm,
                 owned_global_rows=owned_global_rows,
             )
@@ -4080,6 +4170,41 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             f"FP8 weight copies take {total / 2**30:.2f} GiB on this rank"
         )
 
+    def _warm_dense_fp8_boundaries(self) -> None:
+        """Compile the MLP boundary's FP8-copy variant, which the next layer's
+        QKV projection reads, before serving.
+
+        Its compile key holds only the fixed norms and flags, so one call
+        covers every row count. A mailbox branch never writes a copy, so its
+        variants have none to warm.
+        """
+        layers = self.model.layers
+        if not layers:
+            return
+        layer = layers[0]
+        pre = layer.pre_feedforward_layernorm
+        rows, width = _DENSE_FP8_MIN_ROWS, self.config.hidden_size
+        # The post-attention norm is weightless; the pre-MLP one has a weight.
+        device = pre.weight.device
+        stream = torch.zeros((rows, width), dtype=torch.float32, device=device)
+        branch = torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
+        if len(layers) > 1:
+            post, nxt = layer.post_feedforward_layernorm, layers[1].input_layernorm
+            post_norm_residual_pre_norm_bf16_fp8(
+                stream,
+                branch,
+                post.weight,
+                post.eps,
+                post.weight_offset,
+                *layer.post_feedforward_residual_gate._gate_coefficients(),
+                nxt.weight,
+                nxt.eps,
+                nxt.weight_offset,
+                pdl_enabled(),
+                None,
+                1,
+            )
+
     def begin_weight_update(self) -> None:
         # The column-split down copy is laid out for its kernel once and keeps
         # no checkpoint layout, so it cannot take new weights. Refuse before the
@@ -4223,6 +4348,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             # The QKV copy has a reader on every path.
             for layer in self.model.layers:
                 layer.self_attn.qkv_proj.prepare_fp8_weight()
+            self._warm_dense_fp8_boundaries()
             self._log_dense_fp8_memory()
         if self.model.config.decode_monokernel:
             if fp8_value != "none":

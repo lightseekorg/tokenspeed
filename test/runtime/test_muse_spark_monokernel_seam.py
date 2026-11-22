@@ -456,3 +456,26 @@ def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
             assert not (
                 takes_monokernels(rows, ctx) and fp8.applies(rows, decode_forward=True)
             ), (bs, rows)
+
+
+def test_a_launch_refuses_an_fp8_copy_of_its_input_rows() -> None:
+    """A launch projects in BF16: an FP8 copy of its input rows handed to it
+    fails the step instead of being dropped. The refusal comes before the
+    launch reads any packed state."""
+    layer = muse_spark.MuseSparkMonokernelDecoderLayer.__new__(
+        muse_spark.MuseSparkMonokernelDecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.layer_id = 1
+    rows = torch.zeros(1, HIDDEN)
+    with pytest.raises(RuntimeError, match="layer 1 got an FP8 copy"):
+        layer._decode(
+            1,
+            positions=torch.zeros(1, dtype=torch.int64),
+            hidden_states=rows,
+            ctx=None,
+            attention_input=rows.to(torch.bfloat16),
+            attention_input_fp8=(rows.to(torch.float8_e4m3fn), torch.ones(1)),
+            next_input_layernorm=None,
+            owned_global_rows=None,
+        )

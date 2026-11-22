@@ -337,13 +337,19 @@ class _AddLayer(torch.nn.Module):
         hidden_states,
         ctx,
         attention_input,
+        attention_input_fp8,
         next_input_layernorm,
         owned_global_rows,
     ):
         self.received_attention_input = attention_input
+        self.received_attention_input_fp8 = attention_input_fp8
         self.received_next_norm = next_input_layernorm
-        # Emit a marker the model must hand to the next layer untouched.
-        return hidden_states + self.value, hidden_states * self.value
+        # Emit markers the model must hand to the next layer untouched.
+        return (
+            hidden_states + self.value,
+            hidden_states * self.value,
+            (hidden_states - self.value, hidden_states[:, 0]),
+        )
 
 
 def test_forward_threads_attention_input_rows_between_layers() -> None:
@@ -365,6 +371,11 @@ def test_forward_threads_attention_input_rows_between_layers() -> None:
     torch.testing.assert_close(
         model.layers[2].received_attention_input, (hidden + 1.0) * 2.0
     )
+    # So do the FP8 copies of those rows.
+    assert model.layers[0].received_attention_input_fp8 is None
+    rows, scales = model.layers[2].received_attention_input_fp8
+    torch.testing.assert_close(rows, hidden + 1.0 - 2.0)
+    torch.testing.assert_close(scales, (hidden + 1.0)[:, 0])
     # Each boundary gets the next layer's input norm; the last layer gets none.
     assert [layer.received_next_norm for layer in model.layers] == [
         "norm2.0",
@@ -1158,7 +1169,7 @@ def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
     ctx = _forward_context(mode, 3)
     normalized = torch.randn(3, attention.hidden_size)
     rows = attention.qkv_proj(normalized)[0]
-    attention(positions, normalized, ctx, None, True)
+    attention(positions, normalized, None, ctx, None, True)
     q, k, v, positions_arg, ctx_arg = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, rows[:, :q_end])
@@ -1280,7 +1291,7 @@ def test_owned_attention_stores_prepared_rows_once(
             dtype=torch.bfloat16, kv_write_target=write_target
         ),
     )
-    output, sentinel, ranks = attention(positions, local, ctx, rows, project)
+    output, sentinel, ranks = attention(positions, local, None, ctx, rows, project)
     assert sentinel is None and ranks == 1
     assert torch.equal(output, prepared_q)
     assert len(write_targets) == 1
@@ -1305,7 +1316,14 @@ def test_mixed_rounds_are_rejected_before_any_attention_runs() -> None:
     ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_mixed=lambda: True))
     with pytest.raises(ValueError, match="mixed"):
         MuseSparkDecoderLayer.forward(
-            SimpleNamespace(), torch.arange(3), torch.zeros(3, 8), ctx, None, None, None
+            SimpleNamespace(),
+            torch.arange(3),
+            torch.zeros(3, 8),
+            ctx,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -1347,11 +1365,12 @@ def test_packed_qkv_gate_loader_replicates_kv_heads_across_ranks() -> None:
 @pytest.mark.skipif(
     not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
 )
-def test_qkv_fp8_projection_takes_its_row_window(
+def test_qkv_fp8_projection_takes_its_row_window_and_the_producer_copy(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """--dense-fp8-small-m qkv runs the QKV projection in FP8 only inside
-    its row window and in decode forwards."""
+    its row window and in decode forwards, and a producer's FP8 copy gives the
+    bits the layer's own quantization gives."""
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
     with torch.device("cuda"):
         # A TP4 rank's shape: Q 2048 + gate 2048 + K 256 + V 256 of 8192.
@@ -1373,16 +1392,20 @@ def test_qkv_fp8_projection_takes_its_row_window(
     x = torch.randn(257, 8192, device="cuda").bfloat16()
     for rows in (1, 16, 32, 129, 172, 257):
         assert torch.equal(
-            layer.forward_rows(x[:rows], decode_forward=True), layer(x[:rows])[0]
+            layer.forward_rows(x[:rows], None, decode_forward=True), layer(x[:rows])[0]
         )
     for rows in (33, 64, 65, 128):
-        projected = layer.forward_rows(x[:rows], decode_forward=True)
+        projected = layer.forward_rows(x[:rows], None, decode_forward=True)
         reference = layer(x[:rows])[0]
         assert not torch.equal(projected, reference)
         # Its numerics: the skinny FP8 GEMM's and the row code's own tests.
+        given = layer.forward_rows(
+            x[:rows], module._quantize_rows_fp8(x[:rows]), decode_forward=True
+        )
+        assert torch.equal(given, projected)
         # Prefill and extend forwards stay BF16.
         assert torch.equal(
-            layer.forward_rows(x[:rows], decode_forward=False), layer(x[:rows])[0]
+            layer.forward_rows(x[:rows], None, decode_forward=False), layer(x[:rows])[0]
         )
 
 
@@ -1432,7 +1455,7 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
     normalized = torch.randn(rows, 8192, device="cuda").bfloat16()
     decode_forward = mode == "DECODE"
     expected = attention.qkv_proj.forward_rows(
-        normalized, decode_forward=decode_forward
+        normalized, None, decode_forward=decode_forward
     )
     assert (
         torch.equal(expected, attention.qkv_proj(normalized)[0]) != decode_forward
@@ -1448,7 +1471,7 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
 
     monkeypatch.setattr(module, "mm", counted_mm)
     ctx = _forward_context(mode, rows)
-    attention(torch.arange(rows, device="cuda"), normalized, ctx, None, True)
+    attention(torch.arange(rows, device="cuda"), normalized, None, ctx, None, True)
     assert fp8_launches == ([rows] if decode_forward else [])
     q, k, v, _, _ = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
@@ -1522,6 +1545,77 @@ def test_post_quant_warmup_converts_or_refuses_by_the_flag(
         ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
     ):
         model.post_quant_warmup()
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the boundary's FP8 copy is gfx950-only"
+)
+def test_dense_fp8_boundary_warmup_runs_on_a_real_model(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warm-up compiles the MLP boundary's FP8-copy kernel from a real
+    model's norms (one binary, which every row count then uses) and skips a
+    model without layers."""
+    from tokenspeed_kernel.ops.residual._triton import gated_boundary_fp8
+
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
+    with torch.device("cuda"):
+        model = MuseSparkForConditionalGeneration(
+            config=_config(2),
+            mapping=_single_rank_mapping(),
+            quant_config=None,
+            is_multimodal_active=True,
+            mm_attention_backend="triton_attn",
+        )
+    for norm in model.modules():
+        if isinstance(norm, module.MuseSparkRMSNorm) and norm.weight is not None:
+            norm.weight.data.fill_(0.5)
+    kernel = gated_boundary_fp8._post_norm_residual_pre_norm_fp8_kernel
+    kernel.device_caches.clear()
+    model._warm_dense_fp8_boundaries()
+    # The JIT's per-device cache holds the compiled binaries (no public accessor).
+    assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 1
+    model.model.layers = torch.nn.ModuleList()
+    kernel.device_caches.clear()
+    model._warm_dense_fp8_boundaries()
+    assert sum(len(cache[0]) for cache in kernel.device_caches.values()) == 0
+
+
+def _enabled_copy(name: str) -> "module._DenseFp8Weight":
+    """An enabled FP8 copy over the widest window; a placeholder stands in for
+    the converted weight, since the writers ask only the window."""
+    fp8 = module._DenseFp8Weight(
+        name,
+        True,
+        (
+            module._DENSE_FP8_QKV_MIN_ROWS
+            if name == "qkv_proj"
+            else module._DENSE_FP8_MIN_ROWS
+        ),
+        module._DENSE_FP8_MAX_ROWS,
+    )
+    fp8.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
+    fp8.scale = torch.empty(0)
+    return fp8
+
+
+@pytest.mark.parametrize("rows", [32, 33, 128, 129])
+@pytest.mark.parametrize("decode_forward", [True, False])
+@pytest.mark.parametrize("owned_rows", [False, True])
+@pytest.mark.parametrize("mailbox", [False, True])
+def test_layer_boundaries_write_an_fp8_copy_only_where_it_is_read(
+    bf16_default_dtype, rows, decode_forward, owned_rows, mailbox
+) -> None:
+    """The MLP boundary writes the next QKV's FP8 copy for a decode forward's
+    rows in the QKV window, not for owned rows or a mailbox branch."""
+    layer = _tiny_model().model.layers[0]
+    layer.self_attn.qkv_proj.dense_fp8 = _enabled_copy("qkv_proj")
+    in_window = decode_forward and 33 <= rows <= 128
+    kwargs = dict(decode_forward=decode_forward, owned_rows=owned_rows, mailbox=mailbox)
+    assert layer.mlp_boundary_writes_fp8(rows, **kwargs) == (
+        in_window and not owned_rows and not mailbox
+    )
 
 
 def test_weight_update_is_refused_with_dense_fp8_copies(
@@ -2563,9 +2657,62 @@ def test_dense_fp8_none_keeps_the_bf16_projection_everywhere(
         for decode_forward in (True, False):
             assert not layer.dense_fp8.applies(rows, decode_forward=decode_forward)
             assert torch.equal(
-                layer.forward_rows(x[:rows], decode_forward=decode_forward),
+                layer.forward_rows(x[:rows], None, decode_forward=decode_forward),
                 layer(x[:rows])[0],
             )
+
+
+@requires_gpu
+def test_a_decoder_layer_forward_runs_its_boundaries(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real decoder layer of a tiny model runs a decode forward end to end:
+    the attention boundary (residual + norms feeding the MoE) and the MLP
+    boundary (feeding the next layer), with the attention core stubbed. It
+    returns the residual rows and the next attention input, and with the flag
+    off no FP8 copy of it."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
+    torch.manual_seed(0)
+    model = _tiny_model()
+    # Small weights keep the random layer's BF16 rows finite.
+    for parameter in model.parameters():
+        if parameter.dtype.is_floating_point:
+            parameter.data.normal_(mean=0.0, std=0.02)
+    model = _loaded(model)
+    # One layer: its own input norm stands in for the next layer's.
+    layer = model.model.layers[0]
+    rows, hidden = 3, model.config.hidden_size
+    layer.self_attn.forward = lambda *args, **kwargs: (
+        torch.randn(rows, hidden, device="cuda"),
+        None,
+        1,
+    )
+    # A decode forward of 3 one-token requests.
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows,
+        num_extends=0,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, rows, 1),
+    )
+    stream, next_input, next_input_fp8 = layer(
+        positions=torch.arange(rows, device="cuda"),
+        hidden_states=torch.randn(rows, hidden, device="cuda", dtype=torch.float32),
+        ctx=ctx,
+        attention_input=torch.randn(rows, hidden, device="cuda") * 0.1,
+        attention_input_fp8=None,
+        next_input_layernorm=layer.input_layernorm,
+        owned_global_rows=None,
+    )
+    assert stream.shape == (rows, hidden) and next_input.shape == (rows, hidden)
+    assert torch.isfinite(stream).all() and torch.isfinite(next_input.float()).all()
+    assert next_input_fp8 is None
 
 
 if __name__ == "__main__":
