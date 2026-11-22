@@ -49,6 +49,7 @@ def test_storage_group_does_not_change_compute_or_routing(rank):
     assert mapping.attn.dp_rank == rank
     assert mapping.attn.tp_group == mapping.moe.tp_ep_group == (rank,)
     assert not mapping.requires_forward_coordination
+    assert mapping.all_reduce_groups == ()
     manager = CommManager(mapping, 0, True, False, False, query_sharded=False)
     ctx = ForwardContext(
         attn_backend=None,
@@ -120,9 +121,6 @@ BASE = [
     "16",
     "--disaggregation-mode",
     "prefill",
-    "--prefill-graph-max-tokens",
-    "0",
-    "--enforce-eager",
 ]
 
 
@@ -138,7 +136,7 @@ def test_cli_selects_storage_separately_from_execution():
     "replacement",
     [
         ["--disaggregation-mode", "decode"],
-        ["--prefill-graph-max-tokens", "8192"],
+        ["--pipeline-parallel-size", "2", "--data-parallel-size", "8"],
         ["--moe-weight-sharing-size", "3"],
         ["--moe-tp-size", "16"],
         ["--kvstore-storage-backend", "mooncake"],
@@ -242,3 +240,22 @@ def test_peer_weights_accept_supported_checkpoint_loaders(load_format):
         prepare_server_args(BASE + ["--load-format", load_format]).load_format
         == load_format
     )
+
+
+@pytest.mark.parametrize(
+    "graph_args",
+    [
+        [],
+        ["--prefill-graph-max-tokens", "8192"],
+        ["--prefill-graph-max-tokens", "0"],
+        ["--enforce-eager"],
+    ],
+)
+def test_peer_weights_accept_prefill_graph_or_eager_execution(graph_args):
+    args = prepare_server_args(BASE + graph_args)
+    assert args.disaggregation_mode == "prefill"
+    assert not args.mapping.requires_forward_coordination
+    if graph_args == ["--prefill-graph-max-tokens", "8192"]:
+        assert not args.enforce_eager
+        assert not args.disable_prefill_graph
+        assert args.prefill_graph_max_tokens == 8192

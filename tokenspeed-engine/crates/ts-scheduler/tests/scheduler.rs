@@ -95,6 +95,7 @@ result = ts.Scheduler(cfg)
 
 fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
     RequestSpec {
+        admission_id: 0,
         session_id: String::new(),
         cache_group_id: String::new(),
         shared_prefix_tokens: Vec::new(),
@@ -104,6 +105,51 @@ fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
         max_new_tokens: 4,
         max_cached_prefix_tokens: i32::MAX,
     }
+}
+
+#[test]
+fn native_slot_observations_keep_admission_and_release_with_the_scheduler() {
+    use std::sync::{Arc, Mutex};
+    use ts_scheduler::{CacheEventObserver, CacheObservationKind};
+
+    interpreter();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let captured = records.clone();
+    let (observer, losses) = CacheEventObserver::new(move |event, rid| {
+        captured
+            .lock()
+            .unwrap()
+            .push((event.clone(), rid.to_owned()));
+    });
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler.install_cache_event_observer(observer).unwrap();
+    let mut request = spec("observed", vec![1, 2]);
+    request.admission_id = 42;
+    scheduler.submit_requests(&[request]).unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["observed"]);
+    drop(plan);
+    let assigned = records.lock().unwrap()[0].clone();
+    assert_eq!(assigned.0.kind, CacheObservationKind::SlotAssigned);
+    assert_eq!(assigned.0.admission_id, 42);
+    assert_eq!(assigned.1, "observed");
+    assert!(assigned.0.slot_generation > 0);
+    drop(scheduler);
+    // Deferred Python decrefs are consumed when the interpreter is entered.
+    Python::attach(|py| {
+        py.import("gc").unwrap().call_method0("collect").unwrap();
+    });
+    let records = records.lock().unwrap();
+    let released = records
+        .iter()
+        .find(|(event, _)| event.kind == CacheObservationKind::SlotReleased)
+        .unwrap();
+    assert_eq!(released.0.slot, assigned.0.slot);
+    assert_eq!(released.0.slot_generation, assigned.0.slot_generation);
+    assert_eq!(released.0.admission_id, 42);
+    assert_eq!(released.1, "observed");
+    assert_eq!(losses.take(), 0);
 }
 
 #[test]
@@ -175,6 +221,7 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
         .submit_requests(&[spec("long", (1..=52).collect()), queued])
         .unwrap();
 
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 54);
     for prefix in (0..52).step_by(8) {
         let probe = scheduler.probe_prefill_gate();
         assert!(probe.wants_prefill, "prefix {prefix}");
@@ -184,6 +231,10 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
         assert_eq!(batches[0].request_ids, ["long"]);
         assert_eq!(batches[0].extend_prefix_lens, [prefix]);
         assert_eq!(batches[0].input_lengths, [(52 - prefix).min(8)]);
+        assert_eq!(
+            scheduler.sizes().pending_prefill_tokens,
+            i64::from((52 - prefix - 8).max(0) + 2)
+        );
         assert!(plan.aborts().is_empty());
         scheduler
             .advance(&[event(
@@ -216,6 +267,42 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
 }
 
 #[test]
+fn pending_prefill_tokens_use_the_queued_prompts_observed_cache_hit() {
+    interpreter();
+    let code = NEW_SCHEDULER.replace(
+        "max_scheduled_tokens = 512",
+        "max_scheduled_tokens = 64\ncfg.enable_short_prefill_first = True",
+    );
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+    scheduler
+        .submit_requests(&[spec("seed", (0..32).collect())])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[
+            event(ForwardEventKind::ExtendResult, "seed", vec![42]),
+            event(ForwardEventKind::Finish, "seed", Vec::new()),
+        ])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .submit_requests(&[
+            spec("cold", (1000..1064).collect()),
+            spec("hot", (0..128).collect()),
+        ])
+        .unwrap();
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 192);
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["cold"]);
+    assert_eq!(scheduler.sizes().waiting, 1);
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 96);
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "hot", Vec::new())])
+        .unwrap();
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 0);
+}
+
+#[test]
 fn a_request_runs_from_prefill_to_finish() {
     interpreter();
     let mut scheduler =
@@ -226,11 +313,13 @@ fn a_request_runs_from_prefill_to_finish() {
         .unwrap();
     let sizes = scheduler.sizes();
     assert_eq!((sizes.waiting, sizes.running), (1, 0));
+    assert_eq!(sizes.pending_prefill_tokens, 10);
 
     let plan = scheduler.next_execution_plan(true, false);
     let batches = plan.forward_batches();
     assert_eq!(batches.len(), 1);
     assert_eq!(scheduler.sizes().running, 1);
+    assert_eq!(scheduler.sizes().pending_prefill_tokens, 0);
     let prefill = &batches[0];
     assert_eq!(prefill.request_ids, ["r1"]);
     assert_eq!(
@@ -421,6 +510,9 @@ fn only_a_scheduler_object_is_accepted() {
 
 #[test]
 fn a_forced_retraction_stores_and_restores_through_cache_events() {
+    use std::sync::{Arc, Mutex};
+    use ts_scheduler::{CacheEventObserver, CacheObservationKind};
+
     interpreter();
     let code = NEW_SCHEDULER.replace(
         "result = ts.Scheduler(cfg)",
@@ -431,9 +523,15 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
          result = ts.Scheduler(cfg)",
     );
     let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
-    scheduler
-        .submit_requests(&[spec("r1", (1..=10).collect())])
-        .unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let captured = records.clone();
+    let (observer, losses) = CacheEventObserver::new(move |event, _| {
+        captured.lock().unwrap().push(event.clone());
+    });
+    scheduler.install_cache_event_observer(observer).unwrap();
+    let mut request = spec("r1", (1..=10).collect());
+    request.admission_id = 42;
+    scheduler.submit_requests(&[request]).unwrap();
 
     // Decode until the scheduler retracts the request: its plan stores the
     // image and runs no forward for it.
@@ -476,12 +574,69 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
             .iter()
             .find(|op| op.kind == CacheOpKind::SnapshotRestore)
         {
+            let op_id = op.op_id;
+            let observed = records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| {
+                    event.kind == CacheObservationKind::RestoreScheduled && event.op_id == op_id
+                })
+                .expect("restoration has a native ownership observation")
+                .clone();
+            assert_eq!(observed.admission_id, 42);
+            assert_eq!(observed.restore_sequence, 1);
+            assert_eq!(observed.prompt_tokens, 10);
+            assert!(observed.computed_tokens >= observed.prompt_tokens);
+            assert!(observed.committed_tokens > observed.computed_tokens);
+            // The Python executor must receive the same frozen identity and
+            // frontiers as the native observer, not a recycled RID lookup.
+            Python::attach(|py| {
+                let globals = PyDict::new(py);
+                globals
+                    .set_item("plan", plan.into_python(py).unwrap())
+                    .unwrap();
+                globals
+                    .set_item(
+                        "expected",
+                        (
+                            observed.admission_id,
+                            op_id,
+                            observed.op_generation,
+                            observed.previous_slot,
+                            observed.previous_slot_generation,
+                            observed.slot,
+                            observed.slot_generation,
+                            observed.slot_previous_admission_id,
+                            observed.restore_sequence,
+                            observed.committed_tokens,
+                            observed.computed_tokens,
+                            observed.prompt_tokens,
+                        ),
+                    )
+                    .unwrap();
+                py.run(
+                    c"import tokenspeed_scheduler as ts\n\
+op = next(op for op in plan.cache if isinstance(op, ts.Cache.RestoreOp))\n\
+assert list(op.request_ids) == ['r1']\n\
+meta = op.telemetry[0]\n\
+actual = (meta.admission_id, op.op_ids[0], meta.op_generation,\n\
+          meta.previous_slot, meta.previous_slot_generation,\n\
+          op.request_pool_indices[0], meta.slot_generation,\n\
+          meta.slot_previous_admission_id, meta.restore_sequence,\n\
+          meta.committed_tokens, meta.computed_tokens, meta.prompt_tokens)\n\
+assert actual == expected, (actual, expected)",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+            });
             scheduler
                 .advance_head(
                     &StorageRound::default(),
                     &[CacheEvent {
                         kind: CacheEventKind::RestoreDone,
-                        op_id: op.op_id,
+                        op_id,
                     }],
                 )
                 .unwrap();
@@ -492,6 +647,7 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     assert!(restored, "the retracted request was never restored");
     let sizes = scheduler.sizes();
     assert_eq!((sizes.decoding, sizes.retracted), (1, 0));
+    assert_eq!(losses.take(), 0);
 }
 
 /// A small scheduler with the L3 tier and its storage credits.
@@ -612,6 +768,104 @@ fn a_detached_request_cancels_its_storage_operation() {
     );
     assert_eq!(ops[0].op_id, query.op_id);
     assert!(ops[1].op_id > query.op_id);
+}
+
+#[test]
+fn retaining_clear_separates_old_tickets_from_current_quarantine() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler
+        .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
+        .unwrap();
+    let query = scheduler.next_execution_plan(true, false).storage_ops()[0].clone();
+    scheduler
+        .advance_head(
+            &StorageRound {
+                done: vec![StorageDoneView {
+                    op_id: query.op_id,
+                    success: vec![1; query.keys.len()],
+                    retired: true,
+                    object_failures: vec![0; query.keys.len()],
+                }],
+                ..tick(2)
+            },
+            &[],
+        )
+        .unwrap();
+    let get = scheduler.next_execution_plan(true, false).storage_ops()[0].clone();
+    assert_eq!(get.kind, StorageOpKind::Get);
+    assert!(!get.host_blocks.is_empty());
+    scheduler
+        .advance_head(
+            &StorageRound {
+                done: vec![StorageDoneView {
+                    op_id: get.op_id,
+                    success: vec![0; get.keys.len()],
+                    retired: false,
+                    object_failures: vec![0; get.keys.len()],
+                }],
+                ..tick(3)
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(scheduler.storage_current_pending());
+    assert_eq!(scheduler.storage_blocking_quarantined(), 1);
+    assert!(scheduler.storage_non_storage_clearable());
+    assert!(scheduler.can_prepare_storage_clear());
+    assert!(scheduler.can_clear_cache_retaining_storage());
+    assert_eq!(scheduler.storage_stats().retained_operations, 0);
+    scheduler.cancel_storage_for_clear();
+    assert!(scheduler.clear_cache_retaining_storage());
+    assert!(scheduler.storage_pending());
+    assert!(!scheduler.storage_current_pending());
+    assert_eq!(scheduler.storage_blocking_quarantined(), 0);
+    let stats = scheduler.storage_stats();
+    assert_eq!(stats.operations, 1);
+    assert_eq!(stats.retained_operations, 1);
+    assert_eq!(stats.retained_host_blocks, get.host_blocks.len() as u64);
+    assert_eq!(stats.held_blocks, stats.retained_host_blocks);
+    assert_eq!(stats.retained_capacity_warnings, 0);
+    assert!(!stats.retained_capacity_exhausted);
+}
+
+#[test]
+fn ordinary_clear_preparation_allows_a_query_to_drain_without_clearing_early() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler
+        .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
+        .unwrap();
+    let query = scheduler.next_execution_plan(true, false).storage_ops()[0].clone();
+    assert!(scheduler.can_prepare_storage_clear());
+    assert!(scheduler.storage_current_pending());
+    assert!(!scheduler.can_clear_cache());
+    let before = scheduler.storage_stats();
+    assert!(scheduler.can_prepare_storage_clear());
+    assert_eq!(scheduler.storage_stats(), before);
+
+    scheduler.cancel_storage_for_clear();
+    scheduler
+        .advance_head(
+            &StorageRound {
+                done: vec![StorageDoneView {
+                    op_id: query.op_id,
+                    success: vec![0; query.keys.len()],
+                    retired: true,
+                    object_failures: vec![0; query.keys.len()],
+                }],
+                ..tick(2)
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(!scheduler.storage_pending());
+    assert!(scheduler.can_clear_cache());
+    assert!(scheduler.clear_cache());
 }
 
 /// A small scheduler of `role` whose one group transfers its suffix.
@@ -1459,4 +1713,28 @@ fn python_event_lists_keep_their_payload_after_cache_clear() {
         )
         .unwrap();
     });
+}
+
+#[test]
+fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("paused", vec![1, 2, 3])])
+        .unwrap();
+    let mut frozen = tick(1);
+    frozen.tick.as_mut().unwrap().allow_forward = false;
+    scheduler.advance_head(&frozen, &[]).unwrap();
+    // Exceed the scheduler's no-progress threshold while forwards are forbidden.
+    for _ in 0..8192 {
+        let plan = scheduler.next_execution_plan(false, false);
+        assert!(plan.forward_batches().is_empty());
+        assert!(plan.aborts().is_empty());
+        assert_eq!(scheduler.sizes().waiting, 1);
+    }
+    scheduler.advance_head(&tick(2), &[]).unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(plan.aborts().is_empty());
+    assert_eq!(plan.forward_batches()[0].request_ids, ["paused"]);
 }

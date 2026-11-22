@@ -4824,8 +4824,9 @@ def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
         kvp_rank=0,
         kvp_group=(0, 1, 2, 3),
     )
-    source_pool, destination_pool = _pool(source_recipe, "cpu"), _pool(
-        destination_recipe, "cpu"
+    source_pool, destination_pool = (
+        _pool(source_recipe, "cpu"),
+        _pool(destination_recipe, "cpu"),
     )
     source, _ = build_arena_cache_transfer_contract(source_pool.arena)
     destination, _ = build_arena_cache_transfer_contract(destination_pool.arena)

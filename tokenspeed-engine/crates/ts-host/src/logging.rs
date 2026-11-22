@@ -20,10 +20,10 @@
 
 //! Log I/O stays off serving threads when async logging is selected.
 
-use std::io::Write;
+use std::{io::Write, sync::OnceLock};
 
 use pyo3::{prelude::*, types::PyDict};
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
 
@@ -72,24 +72,41 @@ impl FormatTime for LogTimer {
 }
 
 const QUEUE_CAPACITY: usize = 8192;
+static CACHE_EVENT_WRITER: OnceLock<NonBlocking> = OnceLock::new();
+
+/// The existing asynchronous writer, without tracing-level filtering.
+///
+/// Cache evidence must use the same bounded queue and loss counter as normal
+/// logs. No writer is available for an uninitialized or synchronous logger.
+pub fn cache_event_writer() -> Option<NonBlocking> {
+    CACHE_EVENT_WRITER.get().cloned()
+}
 
 fn writer<W: Write + Send + 'static>(
     make_writer: impl Fn() -> W + Send + Sync + 'static,
     enable_async_logging: bool,
-) -> (BoxMakeWriter, Option<WorkerGuard>) {
+) -> (BoxMakeWriter, Option<WorkerGuard>, Option<NonBlocking>) {
     if enable_async_logging {
         let (writer, guard) = NonBlockingBuilder::default()
             .buffered_lines_limit(QUEUE_CAPACITY)
             .lossy(true)
             .finish(make_writer());
-        (BoxMakeWriter::new(writer), Some(guard))
+        (
+            BoxMakeWriter::new(writer.clone()),
+            Some(guard),
+            Some(writer),
+        )
     } else {
-        (BoxMakeWriter::new(make_writer), None)
+        (BoxMakeWriter::new(make_writer), None, None)
     }
 }
 
 pub fn init(enable_async_logging: bool) -> Option<WorkerGuard> {
-    let (writer, guard) = writer(std::io::stderr, enable_async_logging);
+    let (writer, guard, cache_writer) = writer(std::io::stderr, enable_async_logging);
+    if let Some(cache_writer) = cache_writer {
+        // init() installs the global subscriber once for this rank process.
+        let _ = CACHE_EVENT_WRITER.set(cache_writer);
+    }
     tracing_subscriber::fmt()
         .with_timer(LogTimer::from_env())
         .with_env_filter(
@@ -156,7 +173,7 @@ mod tests {
         let stream = CaptureWriter {
             output: output.clone(),
         };
-        let (writer, guard) = writer(move || stream.clone(), false);
+        let (writer, guard, _cache_writer) = writer(move || stream.clone(), false);
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_timer(timer)
@@ -251,6 +268,33 @@ mod tests {
     }
 
     #[test]
+    fn evidence_uses_the_existing_queue_even_when_info_logs_are_filtered() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream = CaptureWriter {
+            output: output.clone(),
+        };
+        let (writer, guard, cache_writer) = writer(move || stream.clone(), true);
+        let mut cache_writer = cache_writer.unwrap();
+        let counter = cache_writer.error_counter();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("error"))
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("filtered normal record");
+            cache_writer
+                .write_all(b"[cache-event] completed\n")
+                .unwrap();
+        });
+        drop(guard);
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"[cache-event] completed\n"
+        );
+        assert_eq!(counter.dropped_lines(), 0);
+    }
+
+    #[test]
     fn blocked_output_only_stalls_synchronous_producers() {
         for enabled in [false, true] {
             let (entered, ready) = mpsc::channel();
@@ -264,7 +308,7 @@ mod tests {
                 output: output.clone(),
             };
             let producer = thread::spawn(move || {
-                let (writer, guard) = writer(move || stream.clone(), enabled);
+                let (writer, guard, _cache_writer) = writer(move || stream.clone(), enabled);
                 let subscriber = tracing_subscriber::fmt()
                     .without_time()
                     .with_ansi(false)
@@ -319,7 +363,7 @@ mod tests {
                 writes: Arc::new(AtomicUsize::new(0)),
                 output: output.clone(),
             };
-            let (writer, guard) = writer(move || stream.clone(), enabled);
+            let (writer, guard, _cache_writer) = writer(move || stream.clone(), enabled);
             let subscriber = tracing_subscriber::fmt()
                 .without_time()
                 .with_ansi(false)

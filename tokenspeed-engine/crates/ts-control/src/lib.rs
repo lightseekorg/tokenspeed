@@ -30,6 +30,7 @@ pub mod cache_ops;
 pub mod calls;
 mod codec;
 pub mod control;
+pub mod disk;
 pub mod encode;
 pub mod eplb;
 pub mod event_loop;

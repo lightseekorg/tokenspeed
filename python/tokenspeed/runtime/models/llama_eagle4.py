@@ -115,6 +115,8 @@ _STRUCTURAL_KEYS = frozenset(
         "moe_router_bias_update_rate",
         # candidate LM head
         "efficient_lm_head_config",
+        # set on every draft config at startup (rank_setup); EAGLE-4 has no decode monokernel
+        "decode_monokernel",
         # retired structures, accepted only when off
         "enable_2hs",
         "enable_defa",
@@ -233,6 +235,7 @@ def validate_draft_config(config: LlamaConfig) -> None:
     _expect(config, "partial_rotary_factor", (None, 0, 1))
     _expect(config, "input_fuse_type", ("concat",))
     _expect(config, "num_aux_hidden_states", (3,))
+    _expect(config, "decode_monokernel", (False,))
     # The candidate head scores the target vocabulary.
     _expect(config, "draft_vocab_size", (None, config.vocab_size))
     # fc_norm is read (enable_fc_norm is its alias); the fc input is three draft-width aux states.

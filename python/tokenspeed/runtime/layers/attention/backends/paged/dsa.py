@@ -43,8 +43,9 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     reserve_flashinfer_trtllm_dsa_buffers,
     trtllm_sparse_mla_query_heads,
 )
+from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -80,8 +81,10 @@ from tokenspeed.runtime.layers.attention.dcp.cache import (
     plan_history_gather,
 )
 from tokenspeed.runtime.layers.attention.dcp.comm import (
+    ValueProjection,
     combine_attention_partials,
     combine_attention_records,
+    combine_project_attention_partials,
     gather_query_heads,
     gather_query_heads_padded,
     gather_query_heads_rank_major,
@@ -124,6 +127,20 @@ _OWNED_INDEX_COLUMN_ALIGN = 16
 # Sparse prefills of at least this many rows attend every head on a row shard;
 # on GB300 at TP8 the exchanges cost less than the core saves above ~3k rows.
 _ROW_SHARD_MIN_ROWS = 4096
+
+
+def _projected(
+    latent: torch.Tensor, heads: int, projection: ValueProjection | None
+) -> torch.Tensor:
+    """``latent`` rows, or their projection through ``projection`` when given."""
+    if projection is None:
+        return latent
+    return mla_project_value(
+        latent.view(latent.shape[0], heads, -1),
+        projection.weight,
+        gate=projection.gate,
+        out=projection.out,
+    )
 
 
 def _priority_band(name: str) -> str:
@@ -303,6 +320,9 @@ class DSABackend(PagedAttentionBackend):
     slots through the same page table.
     """
 
+    # Subclasses owning both numerical forwards reuse metadata, not these plans.
+    _uses_builtin_attention = True
+
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
     _make_dense_leaf = staticmethod(_make_dense_leaf)
 
@@ -409,7 +429,7 @@ class DSABackend(PagedAttentionBackend):
         self.kernel_solution: str | None = None
         self.prefill_kernel_plan = None
         self.decode_kernel_plan = None
-        if self.batch_invariant:
+        if self.batch_invariant and self._uses_builtin_attention:
             signature = format_signature(q=dense_tensor_format(self.q_data_type))
             traits = {
                 "qk_nope_head_dim": self.qk_nope_head_dim,
@@ -494,6 +514,8 @@ class DSABackend(PagedAttentionBackend):
         self._dcp_records_core: bool = False
         # Whether that selection runs the trtllm-gen core, which takes a padded query.
         self._dcp_padded_query: bool = False
+        # The head-sharded KVP decode's solution pin, probed with the prefill's.
+        self._kvp_decode_solution: str | None = None
         # Whether every KVP decode selection runs gfx950's dense core on an
         # FP8 cache, whose DCP records form the head-sharded decode runs.
         self._dcp_decode_records_core: bool = False
@@ -523,7 +545,8 @@ class DSABackend(PagedAttentionBackend):
             # eager attention break; a captured prefill would replay the
             # dummy's gather. Overrides the KPool consumer's declaration too.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
-            self._probe_history_gather_topk_leaf(spec)
+            if self._uses_builtin_attention:
+                self._probe_history_gather_topk_leaf(spec)
         # A pure KVP extend over gathered histories attends each request
         # group's history in the eager attention break, as the sharded extend
         # arm does, so prefill capture is off here too -- except under K3.1's
@@ -592,7 +615,10 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA cache geometry does not match KVP topology")
         self.kvp_block_granularity = block_granularity
         self.kvp_virtual_block_count = virtual_block_count
+        if not self._uses_builtin_attention:
+            return
         # Probed here: a router's solution pin lands after construction.
+        self._kvp_decode_solution = self._probe_kvp_decode_solution()
         self._dcp_records_core = self._probe_dcp_records_core()
         self._dcp_padded_query = self._probe_dcp_padded_query()
         self._dcp_decode_records_core = self._probe_dcp_decode_records_core()
@@ -714,6 +740,43 @@ class DSABackend(PagedAttentionBackend):
             return core.name == "flashinfer_trtllm_dsa_prefill"
         return False
 
+    def _probe_kvp_decode_solution(self) -> str | None:
+        """Return the solution the head-sharded KVP decode pins.
+
+        That is ``flashinfer_prims`` where it serves every decode selection
+        the forward makes (``_sparse_leaf_probes``), else the leaf's own pin.
+        The Prims-TS core attends the gathered heads unpadded and writes the
+        combine's LSE itself, -inf for a row owning no key; the trtllm-gen
+        core pads the heads and needs an LSE launch and a mask after it. Only
+        without a pin or plan of the leaf's own, on an FP8 cache, and with PDL
+        on, as the Prims-TS core launches only with it. Boot configuration
+        only, so every rank of the group agrees.
+        """
+        if (
+            len(self.kvp_group) <= 1
+            or self.kernel_solution is not None
+            or self.decode_kernel_plan is not None
+            or self.data_type != torch.float8_e4m3fn
+            or current_platform().is_npu
+            or not pdl_enabled()
+        ):
+            return self.kernel_solution
+        decodes = [
+            probe for probe in self._sparse_leaf_probes() if probe[1] == "dsa_decode"
+        ]
+        for _, mode, signature, traits, _, _ in decodes:
+            try:
+                select_kernel(
+                    "attention",
+                    mode,
+                    signature,
+                    traits=traits,
+                    solution="flashinfer_prims",
+                )
+            except NoKernelFoundError:
+                return self.kernel_solution
+        return "flashinfer_prims" if decodes else self.kernel_solution
+
     def _probe_dcp_decode_records_core(self) -> bool:
         """Whether the head-sharded KVP decode may run the DCP records core.
 
@@ -802,7 +865,7 @@ class DSABackend(PagedAttentionBackend):
                     "dsa_decode",
                     signature,
                     {**traits, "q_len": q_len, "return_lse": use_dcp},
-                    self.kernel_solution,
+                    self._kvp_decode_solution if use_dcp else self.kernel_solution,
                     self.decode_kernel_plan,
                 )
             )
@@ -1925,6 +1988,7 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor | None = None,
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
+        value_projection: ValueProjection | None = None,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -1938,9 +2002,13 @@ class DSABackend(PagedAttentionBackend):
                 topk_lens=topk_lens,
                 topk_owned=topk_owned,
                 gathered_query=gathered_query,
+                value_projection=value_projection,
             )
-        if topk_owned or gathered_query is not None:
-            raise ValueError("an owned decode top-k needs its slots")
+        if topk_owned or gathered_query is not None or value_projection is not None:
+            raise ValueError(
+                "topk_owned, gathered_query, and value_projection need the "
+                "sparse decode's top-k slots"
+            )
         if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
@@ -2466,10 +2534,15 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor | None,
         topk_owned: bool = False,
         gathered_query: torch.Tensor | None = None,
+        value_projection: ValueProjection | None = None,
     ) -> torch.Tensor:
         """Sparse decode over ``topk_indices``: the whole selection as
         scheduler slots, or with ``topk_owned`` (a sharded cache only) this
         rank's share of it as local cache slots, ``topk_lens`` counting them.
+
+        With ``value_projection`` the decode returns ``value_projection.out``,
+        the latent projected through it; a head-sharded KVP combine applies it
+        as it merges (``combine_project_attention_partials``).
 
         ``gathered_query`` is every rank's ``q`` as the owned top-k's score
         gather landed it, uint8 ``[ranks, rows, bytes]``: the rider
@@ -2616,7 +2689,9 @@ class DSABackend(PagedAttentionBackend):
                     q_len_per_req=q_len_per_req,
                     gathered_query=gathered_query,
                 )
-                return out.reshape(-1, heads * layer.v_head_dim)
+                return _projected(
+                    out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
+                )
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
@@ -2636,12 +2711,20 @@ class DSABackend(PagedAttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=1.0,
             return_lse=use_dcp,
-            solution=self.kernel_solution,
+            solution=self._kvp_decode_solution if use_dcp else self.kernel_solution,
             kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
         )
         if use_dcp:
             local_output, local_lse = out
+            if value_projection is not None and not keep_all_heads:
+                return combine_project_attention_partials(
+                    local_output,
+                    local_lse,
+                    group=self.kvp_group,
+                    rank=self.kvp_rank,
+                    projection=value_projection,
+                )
             out = combine_attention_partials(
                 local_output,
                 local_lse,
@@ -2652,7 +2735,9 @@ class DSABackend(PagedAttentionBackend):
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )
-        return out.reshape(-1, heads * layer.v_head_dim)
+        return _projected(
+            out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
+        )
 
     def _forward_dcp_records_decode(
         self,

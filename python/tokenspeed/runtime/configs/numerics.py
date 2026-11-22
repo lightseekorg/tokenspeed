@@ -104,7 +104,8 @@ RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "gree
 # ``--sampling-stream``: which random stream the FlashInfer backends' sampled
 # (non-greedy) rows draw from. ``batch`` is flashinfer's Philox stream keyed by
 # the batch row; ``per-request`` is the Gumbel-max pool route keyed by
-# (request seed, position), which the bitwise envelope requires.
+# (request seed, position) and position-keyed chain verify coins, which the
+# bitwise envelope requires.
 SAMPLING_STREAMS = ("batch", "per-request")
 
 # ``--yarn-ramp-mask-device`` selects the deepseek_yarn linear ramp device;

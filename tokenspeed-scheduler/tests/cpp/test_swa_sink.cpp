@@ -56,7 +56,7 @@ TEST(SwaSink, SinkIsPublishedWhenTheTrailingWindowIsEmpty) {
                                           .sink_tokens = 1,
                                           .cache_blocks_per_lcm_block = 1,
                                           .block_granularity = 1}};
-    auto coordinator = MakeCoordinator(specs, 1, pool, false, nullptr, nullptr, false, false, 0);
+    auto coordinator = MakeCoordinator(specs, 1, pool, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{6}}};
     ASSERT_TRUE(coordinator.Admit(coordinator.Prober().ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, {},
@@ -72,7 +72,8 @@ TEST(SwaSink, SinkIsPublishedWhenTheTrailingWindowIsEmpty) {
 
 TEST(SwaSink, DeviceMatchNeedsHeadAndWindow) {
     BlockPool pool(16, {1});
-    auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, nullptr, nullptr, false, false, 0);
+    auto coordinator =
+        MakeCoordinator(kSpecs, 4, pool, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     Put(coordinator, pool, 4, 1);
     Put(coordinator, pool, 5, 1);
     EXPECT_EQ(coordinator.Prober().ProbePrefix(kHashes).device.num_common_tokens, 0);
@@ -112,8 +113,8 @@ TEST(SwaSink, MatchedHeadFitsTheExactLandingCapacity) {
                     BlockPool pool((static_cast<std::int32_t>(hit_slots.size()) + fresh + shards - 1) / shards,
                                    {shards});
                     BlockPool host(16, {shards});
-                    auto coordinator =
-                        MakeCoordinator(specs, 4, pool, false, host_hit ? &host : nullptr, nullptr, false, host_hit, 0);
+                    auto coordinator = MakeCoordinator(specs, 4, pool, false, host_hit ? &host : nullptr,
+                                                       /*disk_pool=*/nullptr, nullptr, false, host_hit, 0);
                     for (const auto slot : hit_slots) {
                         if (host_hit) {
                             auto block = coordinator.Host().AcquireHostBlock(0, slot % shards);
@@ -149,7 +150,8 @@ TEST(SwaSink, PartialSinkTailCopiesFitTheExactLandingCapacity) {
         specs[0].sink_tokens = 6;
         BlockPool pool(host_hit ? 4 : 5, {1});
         BlockPool host(8, {1});
-        auto coordinator = MakeCoordinator(specs, 4, pool, false, &host, nullptr, false, true, 0);
+        auto coordinator =
+            MakeCoordinator(specs, 4, pool, false, &host, /*disk_pool=*/nullptr, nullptr, false, true, 0);
         std::vector<std::int32_t> tokens(25);
         std::iota(tokens.begin(), tokens.end(), 1);
         std::vector<std::span<const std::int32_t>> pages;
@@ -207,7 +209,7 @@ TEST(SwaSink, PartialSinkTailCopiesFitTheExactLandingCapacity) {
 TEST(SwaSink, HostOnlyMatchLoadsHeadAndWindow) {
     BlockPool pool(16, {1});
     BlockPool host(16, {1});
-    auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, &host, nullptr, false, true, 0);
+    auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, &host, /*disk_pool=*/nullptr, nullptr, false, true, 0);
     for (const auto slot : {0, 4, 5}) {
         auto block = coordinator.Host().AcquireHostBlock(0, 0);
         ASSERT_TRUE(block);
@@ -237,7 +239,8 @@ TEST(SwaSink, MixedHostHitUsesTheOrdinarySuffixSplit) {
         const std::array specs{
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
             kSpecs[0]};
-        auto coordinator = MakeCoordinator(specs, 4, pool, false, &host, nullptr, false, true, 0);
+        auto coordinator =
+            MakeCoordinator(specs, 4, pool, false, &host, /*disk_pool=*/nullptr, nullptr, false, true, 0);
         for (std::int32_t slot = 0; slot < 6; ++slot) {
             Put(coordinator, pool, slot, 1);
             auto block = coordinator.Host().AcquireHostBlock(0, 0);
@@ -275,7 +278,8 @@ TEST(SwaSink, MixedHostHitUsesTheOrdinarySuffixSplit) {
 TEST(SwaSink, ReclaimExportAndRestorePreserveHead) {
     BlockPool pool(16, {1});
     BlockPool snapshot(16, {1});
-    auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, nullptr, &snapshot, false, false, 0);
+    auto coordinator =
+        MakeCoordinator(kSpecs, 4, pool, false, nullptr, /*disk_pool=*/nullptr, &snapshot, false, false, 0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{24}}};
     ASSERT_TRUE(coordinator.Admit(coordinator.Prober().ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, {},
@@ -317,7 +321,8 @@ TEST(SwaSink, ReclaimExportAndRestorePreserveHead) {
 
 TEST(SwaSink, DemotedChainStillEvictsItsSinkLast) {
     BlockPool pool(6, {1});
-    auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, nullptr, nullptr, false, false, 0);
+    auto coordinator =
+        MakeCoordinator(kSpecs, 4, pool, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     LoneRequestAdmission lone{coordinator};
     std::vector<CacheKey> keys;
     for (std::int32_t slot = 0; slot < 6; ++slot) {
@@ -338,7 +343,8 @@ TEST(SwaSink, DemotedChainStillEvictsItsSinkLast) {
 
 TEST(SwaSink, PublicationRefreshesHeadAndEvictionKeepsBothEnds) {
     BlockPool pool(6, {1});
-    auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, nullptr, nullptr, false, false, 0);
+    auto coordinator =
+        MakeCoordinator(kSpecs, 4, pool, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     LoneRequestAdmission lone{coordinator};
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{24}}};

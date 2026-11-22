@@ -722,6 +722,7 @@ def test_local_inkling_config_is_detected(tmp_path):
     [
         {"model_type": "inkling2"},
         {"architectures": ["Inkling2ForConditionalGeneration"]},
+        {"architectures": ["Inkling2LoopForConditionalGeneration"]},
     ],
 )
 def test_inkling2_alias_defaults_do_not_require_legacy_fa4(tmp_path, config, is_nvidia):

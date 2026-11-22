@@ -175,6 +175,10 @@ Finished AbortEvent::operator()(PrefillAwaitingResult&& state) {
     return abortForward(std::move(state));
 }
 
+Finished AbortEvent::operator()(PrefillAwaitingDestination&& state) {
+    return abortForward(std::move(state));
+}
+
 Finished AbortEvent::operator()(Decoding&& state) {
     return abortForward(std::move(state));
 }
@@ -202,7 +206,20 @@ Retracted SnapshotRetractEvent::retract(State&& state, ResumeShape shape) {
     // The pages are released -- and may be granted away in this very round --
     // because the store reads them ahead of any reuse (stream-ordered).
     FreeRequest(*coordinator_, resources.block_tables);
+    const std::int32_t computed_tokens = std::visit(
+        [&](const auto& resume) -> std::int32_t {
+            if constexpr (std::same_as<std::remove_cvref_t<decltype(resume)>, ResumeDecoding>) {
+                return resources.token_container->Size() - 1;
+            } else {
+                return resume.window.begin + resume.window.size;
+            }
+        },
+        shape);
     return Retracted{
+        .previous_slot = resources.req_pool_index.slot_,
+        .previous_slot_generation = resources.req_pool_index.generation(),
+        .committed_tokens = resources.token_container->Size(),
+        .computed_tokens = computed_tokens,
         .token_container = resources.token_container,
         .prefix_granularity = resources.prefix_granularity,
         .cache_progress = std::move(resources.cache_progress),

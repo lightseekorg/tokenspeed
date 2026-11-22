@@ -177,7 +177,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.4 and compile isolated modules, operators, and tuning caches. They require
+0.7.5 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -252,7 +252,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.4) initializes unused rows inside active
+The pinned FlashInfer version (0.7.5) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -472,6 +472,29 @@ The kernel takes precomputed routes only as BF16 weights packed with the
 expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
+
+## FlashInfer CuTe DSL NVFP4 SiTU (`flashinfer_cutedsl.py`)
+
+`flashinfer_cutedsl_nvfp4_situ_routed_moe_apply` runs Kimi-K3 NVFP4 SiTU
+experts on FlashInfer's CuTe DSL fused MoE (`--moe-backend
+flashinfer_cutedsl`); `auto` keeps the TRT-LLM-Gen kernel. The preprocessor
+converts the checkpoint layout: W13 rows `[gate | up]` become `[up | gate]`
+interleaved in 64-row groups, and the linear E4M3 block scales are swizzled
+per expert. The scale storage stays expert-major and the kernels read it
+through an MMA-layout view, so DWDP streams these experts like the TRT-LLM
+layout. FC1 alpha is `a13 * w13_scale_2` and FC2 alpha `a2 * w2_scale_2`. The
+kernel quantizes the GEMM2 input with one global scale (`1 / a2`), so the
+preprocessor rejects checkpoints whose per-expert `a2` differ (Kimi-K3-NVFP4
+ships 1.0 everywhere).
+
+Expert parallelism uses global routing IDs and computes only the local
+expert shard; the caller owns dispatch and combines the ranks' partial outputs.
+EP1 execution also supports DWDP's full-expert views over sharded weight storage.
+
+The apply uses one fixed tactic (256-row routing tiles, 2-CTA clusters) and
+the fused, atomic finalize; it always finalizes. On GB300 at K3 prefill shapes
+(896 experts, top-16, uniform routing) the routed MoE layer is 5-6% faster than
+TRT-LLM-Gen at 16K rows and 11% faster at 24K rows beside a peer weight copy.
 
 ## FP8 per-channel experts
 

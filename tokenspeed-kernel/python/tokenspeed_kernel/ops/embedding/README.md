@@ -25,3 +25,11 @@ can also share.
 them as a GEMM's group-32 MXFP8 activation: the codes and canonical scales that
 quantizing the dequantized BF16 rows (1e-4 amax floor) would produce, without
 materializing BF16.
+
+Large `mxfp8_row_gather` lookups (at least `_SORT_MIN_ROWS` rows) sort the ids
+first, so neighbouring rows share GPU page walks, and read each distinct row
+once: the first entry of a run of equal ids reads the host and a device-side
+copy fills the rest of the run. Sorting stays on the device, so the launch
+grids do not depend on the ids. Each program of the sorted path reads several
+rows at once to keep more host reads in flight. Smaller lookups keep one
+unsorted row per program, where sorting would cost more than it saves.

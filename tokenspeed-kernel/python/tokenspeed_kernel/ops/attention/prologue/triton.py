@@ -217,8 +217,23 @@ def _gqa_store_tile(
     tl.store(dst[:, None] + i2[None, :], o2.to(dtype), mask=pair_mask)
 
 
+# A cache row's alignment in bytes, which vectorizes its writes; the request
+# check refuses a cache off it (prologue/checks.py, _misaligned).
+_CACHE_ROW_ALIGN_BYTES = tl.constexpr(16)
+
+
+# The KV cache pointers are not specialized: Triton keys a binary on whether a
+# tensor's storage fits in 2 GB, and the KV arena is sized after startup's
+# warm-up (a small probe arena, then the full one). Cache rows are addressed
+# from int64 slot offsets, so one binary serves both.
 @triton.jit(
-    do_not_specialize=["num_tokens", "num_rows", "positions_stride"],
+    do_not_specialize=[
+        "num_tokens",
+        "num_rows",
+        "positions_stride",
+        "k_cache_ptr",
+        "v_cache_ptr",
+    ],
     do_not_specialize_on_alignment=["positions_ptr", "slots_ptr"],
 )
 def _gqa_prologue_kernel(
@@ -397,11 +412,19 @@ def _gqa_prologue_kernel(
             )
         write_mask = tokens < num_rows
         slot = tl.load(slots_ptr + tokens, mask=write_mask, other=0).to(tl.int64)
-        _gqa_store_tile(
+        # The cache pointers are not specialized, so the alignment of
+        # each cache row, which vectorizes its writes, is stated here; the
+        # request check refuses a cache whose base or row / head strides are
+        # not (prologue/checks.py, _misaligned), for every solution.
+        k_rows = tl.multiple_of(
             k_cache_ptr
             + (slot // cache_page_size) * k_cache_stride_p
             + (slot % cache_page_size) * k_cache_stride_s
             + kv_head * k_cache_stride_h,
+            _CACHE_ROW_ALIGN_BYTES,
+        )
+        _gqa_store_tile(
+            k_rows,
             rows,
             o1,
             o2,
@@ -421,15 +444,14 @@ def _gqa_prologue_kernel(
             v_ptr + (tokens * v_stride_t + kv_head * head_dim)[:, None] + offs[None, :],
             mask=mask,
         )
-        dst = (
+        v_rows = tl.multiple_of(
             v_cache_ptr
-            + (
-                (slot // cache_page_size) * v_cache_stride_p
-                + (slot % cache_page_size) * v_cache_stride_s
-                + kv_head * v_cache_stride_h
-            )[:, None]
-            + offs[None, :]
+            + (slot // cache_page_size) * v_cache_stride_p
+            + (slot % cache_page_size) * v_cache_stride_s
+            + kv_head * v_cache_stride_h,
+            _CACHE_ROW_ALIGN_BYTES,
         )
+        dst = v_rows[:, None] + offs[None, :]
         if KV_SCALED:
             value = tl.clamp(value.to(tl.float32) * v_inv_scale, -448.0, 448.0)
         tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
