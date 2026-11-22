@@ -301,7 +301,11 @@ class TwoStageStage2Epilogue(DeviceTemplate):
         self.kOutputWords = self.kTileRows * self.kTileCols // 2
         self.kShmWords = self.kOutputWords + 2 * self.kTileRows
         assert self.kTileRows == self.Config.kStage2GroupM == 32
-        assert self.kTileCols == 256 and self.kAccumFragments == 8
+        # 256 columns (8 accumulator fragments, 64 per wave) or, with C5b's
+        # MegaMoEStage2N128Config, 128 (4 fragments, 32 per wave).
+        assert self.kTileCols in (128, 256)
+        assert self.kAccumFragments == self.kTileCols // 32
+        self.kWaveCols = self.kTileCols // self.kNumWarps
 
     @device_method
     def PrefetchBias(self, tiles_state, tile_col, tid):
@@ -344,7 +348,7 @@ class TwoStageStage2Epilogue(DeviceTemplate):
                     value = accum[fragment][component]
                     packed = amdgcn_cvt_pk_bf16_f32(value, value)
                     row = mi * 16 + r
-                    col = wid * 64 + ni * 16 + q * 4 + component
+                    col = wid * self.kWaveCols + ni * 16 + q * 4 + component
                     _native_store_ushort_component(
                         output,
                         row * self.kTileCols + col,
@@ -359,7 +363,7 @@ class TwoStageStage2Epilogue(DeviceTemplate):
         base = m_lane * (self.kTileCols // 2) + n_lane
         for mr in l.static_range(4):
             output_row_offset = lds_load(shm + self.kOutputWords + m_lane + mr * 8)
-            for nr in l.static_range(4):
+            for nr in l.static_range(self.kTileCols // 64):
                 value = lds_load(
                     output + base + mr * 8 * (self.kTileCols // 2) + nr * 32
                 )

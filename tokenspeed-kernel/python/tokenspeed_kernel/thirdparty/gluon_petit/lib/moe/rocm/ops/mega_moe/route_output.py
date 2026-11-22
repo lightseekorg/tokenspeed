@@ -77,7 +77,7 @@ class MegaMoETwoStage2Epilogue(TwoStageStage2Epilogue):
             output_row = BufferResource.WithRange(
                 output_row, l.where(valid, row_bytes, 0)
             )
-            for col_half in l.static_range(2):
+            for col_half in l.static_range(self.kTileCols // 128):
                 pair_col = col_half * 64 + wtid
                 value = lds_load(output + row * (self.kTileCols // 2) + pair_col)
                 col = tile_col + pair_col * 2

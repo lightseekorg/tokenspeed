@@ -27,6 +27,7 @@ from lib.moe.rocm.mega_moe_config_selector import (
     MegaMoEStage1M64W4Config,
     MegaMoEStage1M64W8Config,
     MegaMoEStage1N128Config,
+    MegaMoEStage2N128Config,
     kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
     kMegaMoETwoStageMxFp4KimiSituSolutionId,
     kMegaMoETwoStageMxFp4SiluSolutionId,
@@ -70,6 +71,17 @@ def _stage1_n128_max_tokens() -> int:
 
 
 kStage1N128MaxTokens = _stage1_n128_max_tokens()
+
+
+def _stage2_n128() -> bool:
+    """C5b switch: ``TOKENSPEED_PETIT_STAGE2_N128=1`` (read once at import)
+    launches stage 2 with the 32x128 tile (``MegaMoEStage2N128Config``) on
+    every call of a bias-free solution; stage 1 and the combine keep their
+    configs. Off (the default) launches exactly the old kernels."""
+    return os.environ.get("TOKENSPEED_PETIT_STAGE2_N128", "0") == "1"
+
+
+kStage2N128 = _stage2_n128()
 
 
 def EstimatedReceivedExperts(num_rows_global, top_k, num_experts, num_ranks):
@@ -251,8 +263,9 @@ class MegaMoESolutionAdapter:
         self.Workspace = MegaMoEWorkspace(self.Config)
 
     @cache
-    def Kernels(self, external, m64, w8, reduce_routes, n128=False):
+    def Kernels(self, external, m64, w8, reduce_routes, n128=False, stage2_n128=False):
         Config = self.Config
+        Stage2 = MegaMoEStage2N128Config(Config) if stage2_n128 else Config
         SelectedStage1 = (
             MegaMoEStage1M64W8Config(Config)
             if w8
@@ -264,7 +277,7 @@ class MegaMoESolutionAdapter:
         )
         return (
             MegaMoETwoStageCommComputeKernel(SelectedStage1, external),
-            MegaMoETwoStageCommComputeKernel(Config, external),
+            MegaMoETwoStageCommComputeKernel(Stage2, external),
             MegaMoECombineKernel(Config, reduce_routes),
         )
 
@@ -305,6 +318,13 @@ class MegaMoESolutionAdapter:
         return high > 0 and all(
             Stage1N128PaysForExperts(e, C.kInterDim // C.kStage1GroupN, C.kNumSMs)
             for e in range(low, high + 1)
+        )
+
+    def Stage2N128(self):
+        """Whether stage 2 takes the 32x128 tile (C5b, opt-in): the switch and
+        a bias-free solution (biased solutions keep their tile)."""
+        return (
+            kStage2N128 and self.Config.kSolution.bias_dtype == FusedMoEDataType.kNone
         )
 
     def SelectStage1N128(self, num_tokens, stage1_n128):
@@ -360,17 +380,22 @@ class MegaMoESolutionAdapter:
         ):
             return kFusedMoEErrorInvalidArgument
         m64, w8 = self.Stage1Tile(p.num_tokens)
+        # C5b: only with the switch on does the call name stage2_n128, so off
+        # keeps the old Kernels cache entries and kernels.
+        stage2_kw = {"stage2_n128": True} if self.Stage2N128() else {}
         if self.SelectStage1N128(p.num_tokens, p.stage1_n128):
             stage1, _, _ = self.Kernels(
                 external_input_count == 3, m64, w8, p.reduce_routes, n128=True
             )
             _, stage2, combine = self.Kernels(
-                external_input_count == 3, m64, w8, p.reduce_routes
+                external_input_count == 3, m64, w8, p.reduce_routes, **stage2_kw
             )
         else:
             stage1, stage2, combine = self.Kernels(
-                external_input_count == 3, m64, w8, p.reduce_routes
+                external_input_count == 3, m64, w8, p.reduce_routes, **stage2_kw
             )
+        # Combine always runs the base config (stage2_n128 replaces stage 2 only).
+        assert combine.Config is C
         import torch
         from lib.streams import native_stream
 

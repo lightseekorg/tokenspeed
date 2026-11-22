@@ -229,6 +229,39 @@ class MegaMoEStage1M64W8Config(DeviceTemplate):
         )(self.Stage1Tiles)
 
 
+class MegaMoEStage2N128Config(DeviceTemplate):
+    """Stage-2 tile of 32 rows x 128 hidden columns (C5b, opt-in).
+
+    Replaces only the stage-2 kernel's config: stage 1 and the combine keep
+    the base config. Each tile streams half the W2 bytes of the 256-column
+    tile over the same repacked MXFP4 layout (``MxFp4W2.Initialize`` offsets
+    by ``tile_n * kGroupN``), so a call spreads its experts over twice the
+    tiles (``kLinear2Tiles`` = kComputeHiddenSize / 128). Every stage-1 field
+    stays the base's: the stage-2 kernel waits on stage 1's L2 arrival mask
+    with ``kStage1TileCount`` from its own config, which must match stage 1.
+    """
+
+    def __init__(self, Base):
+        self.__dict__.update(Base.__dict__)
+        self._key = Base.cache_key
+        assert Base.kGroupN == 256 and Base.kStage2GroupM == 32
+        assert Base.kNumWarps == 4 and Base.kStage1GroupN == 256
+        assert Base.kComputeHiddenSize % 128 == 0
+        self.kGroupN = 128
+        self.kW2TileShape = MxFp4TileShape.kN128
+        Weight = MxFp4Weights(self)
+        self.W2Weights, self.W2 = Weight.W2Weights, Weight.W2
+        self.Stage2Bias = (
+            NoopBiasLayout(4, 128)
+            if Base.kSolution.bias_dtype == FusedMoEDataType.kNone
+            else Bf16BiasLayout(4, 128, MxFp4BiasLayout(32, 128), 2)
+        )
+        self.Stage2Tiles = W2TileSchedule(NativeMxFp4TileOps(self, self.W2))
+        assert self.W2.kGroupN == 128 and self.Stage2Tiles.kAccumFragments == 4
+        # Stage-1 fields are the base's objects, not rebuilt.
+        assert self.W13 is Base.W13 and self.Stage1Op is Base.Stage1Op
+
+
 class MegaMoEStage1N128Config(DeviceTemplate):
     """Stage-1 tile of 32 rows x 128 intermediate columns (C5, decode counts).
 

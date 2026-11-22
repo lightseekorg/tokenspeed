@@ -98,7 +98,13 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
         self.kUnionWords = max(self.kComputeWords, self.TokenDispatch.kShmWords, 1)
         self.kWorkIdWord = 0 if self.kOverlapStage1WorkId else self.kUnionWords
         self.kShmWords = self.kUnionWords + (0 if self.kOverlapStage1WorkId else 1)
-        assert Config.kGroupN == 256 and Config.kStage1GroupN in (128, 256)
+        assert Config.kGroupN in (128, 256) and Config.kStage1GroupN in (128, 256)
+        # C5b: a 128-column stage 2 only with the base stage-1 tile (its L2
+        # arrival mask is kInterDim / kStage1GroupN bits), and the stage-2
+        # epilogue, scheduler and tiles must agree on the column count.
+        assert Config.kGroupN == 256 or Config.kStage1GroupN == 256
+        assert self.Stage2Epilogue.kTileCols == Config.kGroupN
+        assert self.Stage2Tiles.kAccumFragments == Config.kGroupN // 32
         assert self.kInterDim % 512 == 0 and self.kK256Tiles >= 2
         assert self.kNumSMs % self.kWorkShards == 0
         assert (

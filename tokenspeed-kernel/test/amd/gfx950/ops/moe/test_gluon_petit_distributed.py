@@ -871,6 +871,121 @@ def test_distributed_petit_stage1_n128_bit_exact(profile_name):
     reason="requires torchrun with four gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_stage2_n128_bit_exact(profile_name):
+    """C5b (TOKENSPEED_PETIT_STAGE2_N128): the 32x128 stage-2 tile.
+
+    Every rank launches stage 2 with MegaMoEStage2N128Config (stage 1 and the
+    combine keep theirs); the output must equal the 256-column stage 2's bit
+    for bit (eager, deferred routes, CUDA graph replay) and pass the
+    reference, alone and together with C5's N=128 stage-1 tile, for zero-row
+    ranks, the tp4ep4 2/2/2/0 split, one busy DP4 rank at batch 1 and 4,
+    mixed counts and a 64-row stage-1 tile (600 rows).
+    """
+    module = _petit_launch_module()
+    profile = _PROFILES[profile_name]
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    kernel_moe_process_weights(plan, layer)
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    initial = (module.kStage1N128MaxTokens, module.kStage2N128)
+
+    def call(x, ids, weights, counts, do_finalize=True):
+        return kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            x.new_empty((x.shape[0], 0)),
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=sum(counts),
+            max_num_tokens_per_gpu=max(counts),
+            do_finalize=do_finalize,
+            low_latency=None,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+
+    # (stage-1 N=128 row threshold, stage-2 N=128); the first is the old path.
+    variants = ((-1, False), (-1, True), (8, True))
+    try:
+        for counts in (
+            [0] * ws,
+            [2, 2, 2, 0],
+            [6, 0, 0, 0],
+            [24, 0, 0, 0],
+            [1, 8, 9, 40],
+            [600, 0, 3, 0],
+        ):
+            count = counts[rank]
+            values = torch.arange(count * profile.hidden, device=device)
+            x = (
+                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
+                .reshape(count, profile.hidden)
+                .to(torch.bfloat16)
+            )
+            ids, weights = _routing(count, rank, profile, ws, device)
+            outputs = {}
+            for variant in variants:
+                module.kStage1N128MaxTokens, module.kStage2N128 = variant
+                eager = call(x, ids, weights, counts).clone()
+                routes = call(x, ids, weights, counts, do_finalize=False)[0].clone()
+                torch.cuda.synchronize()
+                dist.barrier()
+                graph = torch.cuda.CUDAGraph()
+                graph_ids, graph_weights = ids.clone(), weights.clone()
+                with torch.cuda.graph(graph):
+                    captured = call(x, graph_ids, graph_weights, counts)
+                replays = []
+                for step in (0, 1):
+                    new_ids, new_weights = _routing(
+                        count, rank + step, profile, ws, device
+                    )
+                    graph_ids.copy_(new_ids)
+                    graph_weights.copy_(new_weights)
+                    graph.replay()
+                    replays.append(captured.clone())
+                torch.cuda.synchronize()
+                dist.barrier()
+                outputs[variant] = (eager, routes, replays)
+                del graph
+                dist.barrier()
+            off = outputs[variants[0]]
+
+            def check():
+                for variant in variants[1:]:
+                    on = outputs[variant]
+                    torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
+                    torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
+                    for a, b in zip(on[2], off[2]):
+                        torch.testing.assert_close(a, b, atol=0, rtol=0)
+                    torch.testing.assert_close(on[2][0], on[0], atol=0, rtol=0)
+                if count:
+                    expected = _reference(x, ids, weights, profile)
+                    torch.testing.assert_close(
+                        outputs[variants[1]][0], expected, atol=2e-6, rtol=8e-3
+                    )
+
+            _collective_check(device, check)
+            dist.barrier()
+    finally:
+        module.kStage1N128MaxTokens, module.kStage2N128 = initial
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
     """C5's received-experts selector (TOKENSPEED_PETIT_STAGE1_N128_SELECT=experts).
 

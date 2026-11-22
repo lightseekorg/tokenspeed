@@ -1041,6 +1041,87 @@ def test_stage1_n128_switch_selects_tile_and_variants(profile) -> None:
         assert config.launch_choice(1009)[1] == "m64_w8"
 
 
+@pytest.mark.parametrize("profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE])
+def test_stage2_n128_config_replaces_stage2_only(profile) -> None:
+    """C5b (TOKENSPEED_PETIT_STAGE2_N128): MegaMoEStage2N128Config changes the
+    stage-2 kernel alone. Every site that follows stage 2's column count
+    agrees on 128 (scheduler tiles, epilogue tile and LDS words, accumulator
+    fragments, W2 tile), the stage-1 arrival mask and the stage-1 and
+    combine kernels stay the base's, and the epilogue's LDS column map and
+    write-back cover every tile element exactly once (both widths)."""
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, profile, 4, 1024)
+    adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
+    b1, b2, b_combine = adapter.Kernels(True, False, False, True)
+    s1, s2, combine = adapter.Kernels(True, False, False, True, stage2_n128=True)
+    n1, n2, n_combine = adapter.Kernels(
+        True, False, False, True, n128=True, stage2_n128=True
+    )
+    assert s1.cache_key == b1.cache_key and combine.cache_key == b_combine.cache_key
+    assert n_combine.cache_key == b_combine.cache_key and n2.cache_key == s2.cache_key
+    assert s2.cache_key != b2.cache_key
+    assert combine.Config is adapter.Config and s2.Config is not adapter.Config
+    assert (b2.Config.kGroupN, s2.Config.kGroupN) == (256, 128)
+    assert s2.Scheduler.kLinear2Tiles == 2 * b2.Scheduler.kLinear2Tiles
+    assert s2.Scheduler.kLinear1Tiles == b2.Scheduler.kLinear1Tiles
+    assert s2.kStage1TileCount == b2.kStage1TileCount  # L2 arrival mask
+    assert s2.kStage2GridBlocks == b2.kStage2GridBlocks
+    epi, base_epi = s2.Stage2Epilogue, b2.Stage2Epilogue
+    assert (epi.kTileCols, epi.kAccumFragments, epi.kWaveCols) == (128, 4, 32)
+    assert (base_epi.kTileCols, base_epi.kAccumFragments, base_epi.kWaveCols) == (
+        256,
+        8,
+        64,
+    )
+    assert epi.kShmWords == 32 * 128 // 2 + 2 * 32
+    assert s2.kComputeWords >= epi.kShmWords and s2.kShmWords >= s2.kComputeWords
+    assert s2.W2Weights.W2.kGroupN == 128 and b2.W2Weights.W2.kGroupN == 256
+    assert s2.W13Weights is b2.W13Weights
+    # The switch: off names no stage2_n128 (the old Kernels entries), on
+    # names it for bias-free solutions only.
+    with mock.patch.object(module, "kStage2N128", False):
+        assert not adapter.Stage2N128()
+    with mock.patch.object(module, "kStage2N128", True):
+        assert adapter.Stage2N128()
+    for e in (epi, base_epi):
+        # WriteShm: (wid, lane, mi, ni, component) -> LDS (row, col), BF16 units.
+        written = []
+        for wid in range(4):
+            for wtid in range(64):
+                q, r = wtid // 16, wtid % 16
+                for mi in range(2):
+                    for ni in range(e.kAccumFragments // 2):
+                        for component in range(4):
+                            row = mi * 16 + r
+                            col = wid * e.kWaveCols + ni * 16 + q * 4 + component
+                            written.append((row, col))
+        assert sorted(written) == [
+            (row, col) for row in range(32) for col in range(e.kTileCols)
+        ]
+        # Route write-back (route_output.py): per row, kTileCols // 128 halves of
+        # 64 lanes x 2 BF16 columns.
+        cols = sorted(
+            (half * 64 + wtid) * 2 + k
+            for half in range(e.kTileCols // 128)
+            for wtid in range(64)
+            for k in range(2)
+        )
+        assert cols == list(range(e.kTileCols))
+        # Single-rank write-back (op_stages.py): kTileCols // 64 x 32 lanes x 2.
+        cols = sorted(
+            nr * 64 + n_lane * 2 + k
+            for nr in range(e.kTileCols // 64)
+            for n_lane in range(32)
+            for k in range(2)
+        )
+        assert cols == list(range(e.kTileCols))
+
+
 def test_stage1_n128_received_experts_rule() -> None:
     """C5 selector: N=128 pays when it saves half a tile round (pure rule)."""
     import lib.moe.rocm.mega_moe as forwarding
