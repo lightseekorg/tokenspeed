@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -1946,8 +1947,25 @@ register_kernel(
 )(triton_qsa_block_topk_select)
 
 
-# From this many rows one program expands a row; fewer keep 256-column programs.
-_SELECTED_SLOT_ROW_PROGRAM_MIN_ROWS = 384
+# Warps of each 256-column selected-slot program.
+_SELECTED_SLOT_COLUMN_WARPS = 4
+# One program expands a whole row once the 256-column grid needs this many resident waves.
+_SELECTED_SLOT_ROW_PROGRAM_MIN_COLUMN_WAVES = 4
+
+
+@functools.cache
+def _resident_column_programs(device_index: int) -> int:
+    props = torch.cuda.get_device_properties(device_index)
+    threads = _SELECTED_SLOT_COLUMN_WARPS * props.warp_size
+    per_sm = props.max_threads_per_multi_processor // threads
+    return props.multi_processor_count * per_sm
+
+
+def _selected_slot_rows_win(rows: int, width: int, device: torch.device) -> bool:
+    """Whether one program per row expands faster than 256-column programs."""
+    columns = rows * triton.cdiv(width, 256)
+    waves = _SELECTED_SLOT_ROW_PROGRAM_MIN_COLUMN_WAVES
+    return columns >= waves * _resident_column_programs(device.index)
 
 
 @triton.jit
@@ -2032,7 +2050,7 @@ def _qwen4_exp_qsa_selected_slot_rows_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     complete = tl.load(complete_blocks + row).to(tl.int64)
     position = tl.load(logical_positions + row).to(tl.int64)
     request = tl.load(request_indices + row).to(tl.int64)
@@ -2068,7 +2086,7 @@ def _qwen4_exp_qsa_selected_slot_rows_kernel(
     suffix = tl.arange(0, RATIO_P2)
     suffix_mask = suffix < COMPRESS_RATIO - 1
     suffix_tokens = complete * COMPRESS_RATIO + suffix
-    suffix_valid = suffix_tokens <= position
+    suffix_valid = (suffix_tokens >= 0) & (suffix_tokens <= position)
     suffix_pages = tl.load(
         page_table + request * stride_pt_b + suffix_tokens // PAGE_SIZE,
         mask=suffix_mask & suffix_valid,
@@ -2135,45 +2153,57 @@ def qwen4_exp_qsa_selected_slots(
     output = torch.empty(
         (rows, width), dtype=torch.int32, device=selected_blocks.device
     )
-    if rows >= _SELECTED_SLOT_ROW_PROGRAM_MIN_ROWS:
+    blocks = triton.next_power_of_2(triton.cdiv(token_topk, compress_ratio))
+    ratio_p2 = triton.next_power_of_2(compress_ratio)
+    arguments = (
+        selected_blocks,
+        complete_blocks,
+        logical_positions,
+        request_indices,
+        page_table,
+        output,
+        selected_blocks.stride(0),
+        page_table.stride(0),
+        output.stride(0),
+    )
+    pdl = {"launch_pdl": True} if enable_pdl else {}
+
+    def launch_rows() -> None:
         _qwen4_exp_qsa_selected_slot_rows_kernel[(rows,)](
-            selected_blocks,
-            complete_blocks,
-            logical_positions,
-            request_indices,
-            page_table,
-            output,
-            selected_blocks.stride(0),
-            page_table.stride(0),
-            output.stride(0),
+            *arguments,
             TOKEN_TOPK=token_topk,
             COMPRESS_RATIO=compress_ratio,
-            RATIO_P2=triton.next_power_of_2(compress_ratio),
+            RATIO_P2=ratio_p2,
             PAGE_SIZE=page_size,
-            BLOCKS=triton.next_power_of_2(triton.cdiv(token_topk, compress_ratio)),
+            BLOCKS=blocks,
             ENABLE_PDL=enable_pdl,
-            num_warps=2,
-            **({"launch_pdl": True} if enable_pdl else {}),
+            # One warp per 1024 tile entries, between two and eight.
+            num_warps=min(max(blocks * ratio_p2 // 1024, 2), 8),
+            **pdl,
         )
-    elif rows:
+
+    def launch_columns() -> None:
         _qwen4_exp_qsa_selected_slots_kernel[(rows, triton.cdiv(width, 256))](
-            selected_blocks,
-            complete_blocks,
-            logical_positions,
-            request_indices,
-            page_table,
-            output,
-            selected_blocks.stride(0),
-            page_table.stride(0),
-            output.stride(0),
+            *arguments,
             TOKEN_TOPK=token_topk,
             COMPRESS_RATIO=compress_ratio,
             PAGE_SIZE=page_size,
             WIDTH=width,
             BLOCK=256,
             ENABLE_PDL=enable_pdl,
-            **({"launch_pdl": True} if enable_pdl else {}),
+            num_warps=_SELECTED_SLOT_COLUMN_WARPS,
+            **pdl,
         )
+
+    if rows:
+        use_rows = _selected_slot_rows_win(rows, width, selected_blocks.device)
+        launch, sibling = (
+            (launch_rows, launch_columns) if use_rows else (launch_columns, launch_rows)
+        )
+        if is_warming_up():
+            # Startup prepares the other layout too; both write the same slots.
+            sibling()
+        launch()
     return output
 
 

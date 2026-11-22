@@ -289,12 +289,15 @@ counts can then reuse startup binaries.
 ## Selected-slot expansion
 
 `qwen4_exp_qsa_selected_slots` expands each row's selected blocks, plus the
-in-progress compression group, into full-cache slots. Below 384 rows, the decode
-verify and draft sizes, it keeps 256-column programs. From 384 rows, such as a
-prefill chunk, one program expands a whole row as a block-by-member tile: each
-block id is loaded once and a block's slots are stored together. Each column's
-arithmetic is the same in both layouts, so the slots are identical across the
-switch.
+in-progress compression group, into full-cache slots. Small row counts use
+256-column programs, which spread each row over several programs. Once that
+grid would take four waves of resident programs on the GPU, one program expands
+a whole row as a block-by-member tile instead: each block id is loaded once and
+a block's slots are stored together, with warps scaled to the tile. Alone on
+the GPU the row programs already win from about two waves, but at decode they
+share the SMs with work on other streams and lose there, so the switch keeps a
+two-fold margin. Each column's arithmetic is the same in both layouts, so the
+slots are identical across the switch. Startup warmup prepares both kernels.
 
 ## Materialized Triton scoring
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import ctypes
 
 import pytest
+import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
@@ -314,6 +315,47 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
         return selected, slots
 
     _check_replays(forward, sources, targets, enabled, unordered_outputs=True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("rows_layout", [False, True])
+def test_qsa_selected_slots_wait_for_published_inputs(
+    enabled, rows_layout, restore_pdl, monkeypatch
+):
+    """Both slot layouts must wait for an early-releasing producer of their inputs."""
+    monkeypatch.setattr(
+        qsa_ops, "_selected_slot_rows_win", lambda count, width, device: rows_layout
+    )
+    torch.manual_seed(17)
+    rows, block_topk, ratio, page_size = 512, 512, 4, 64
+    logical = torch.randint(0, 4096, (rows,), device="cuda")
+    complete = ((logical + 1) // ratio).to(torch.int32)
+    blocks = torch.randint(
+        0, 1024, (rows, block_topk), device="cuda", dtype=torch.int32
+    )
+    requests = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    pages = 4096 // page_size + 1
+    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32)[None]
+    sources = (blocks, complete, logical, table)
+    targets = tuple(torch.empty_like(t) for t in sources)
+
+    def forward(enable_pdl):
+        _publish(sources, targets)
+        return (
+            qwen4_exp_qsa_selected_slots(
+                targets[0],
+                targets[1],
+                targets[2],
+                requests,
+                targets[3],
+                page_size,
+                ratio,
+                block_topk * ratio,
+                enable_pdl=enable_pdl,
+            ),
+        )
+
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=False)
 
 
 @pytest.mark.skipif(
