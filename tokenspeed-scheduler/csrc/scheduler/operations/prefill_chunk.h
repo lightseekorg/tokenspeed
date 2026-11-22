@@ -36,6 +36,10 @@ namespace tokenspeed {
 // function here is pure token arithmetic on the coordinator's facts; the
 // forward planner calls PrefillChunkTokens and never branches on a group kind
 // itself.
+// ChunkEndCheckpointTokens cuts a chunk to a page boundary for a chunk-end State checkpoint, never adding a round.
+
+// Chunk-end State checkpoints per prompt; why two: docs/design/scheduler.md §1.2.
+inline constexpr std::int32_t kChunkEndStateCheckpointsPerPrompt = 2;
 
 // The page boundary before a long prompt's replay tail where a reusable
 // State checkpoint is worth writing: a later prompt that resends this one or
@@ -72,6 +76,15 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 // segments; a terminal remainder is carried whole whenever it fits.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens);
+
+// The chunk-end State checkpoints a prompt this engine computes from first_computed_tokens on may publish.
+std::int32_t ChunkEndCheckpointCount(const CacheCoordinator& coordinator, std::int32_t first_computed_tokens,
+                                     std::int32_t chunk_budget);
+
+// The page boundary [first_pos, first_pos + tokens) is cut to for the prompt's next chunk-end State checkpoint, or 0.
+std::int32_t ChunkEndCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, std::int32_t tokens,
+                                      std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
+                                      std::int32_t state_checkpoint_tokens, std::int32_t checkpoints_left);
 
 // The round budget a local prefill chunk starting at first_pos takes when it
 // gives way to whole prompts (SchedulerConfig::prefill_chunk_yield_tokens):

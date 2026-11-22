@@ -90,6 +90,40 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
     return ChunkKeepingFinalWindow(plain, unscheduled, window);
 }
 
+std::int32_t ChunkEndCheckpointCount(const CacheCoordinator& coordinator, std::int32_t first_computed_tokens,
+                                     std::int32_t chunk_budget) {
+    // Past one chunk budget a prompt already resumes nearby; restricted State groups keep their own grid.
+    if (first_computed_tokens >= chunk_budget || coordinator.NumStateGroups() == 0 ||
+        coordinator.CheckpointGranularity() > 1) {
+        return 0;
+    }
+    return kChunkEndStateCheckpointsPerPrompt;
+}
+
+std::int32_t ChunkEndCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, std::int32_t tokens,
+                                      std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
+                                      std::int32_t state_checkpoint_tokens, std::int32_t checkpoints_left) {
+    _assert(first_pos >= 0 && 0 < tokens && tokens <= unscheduled && token_budget > 0,
+            "a chunk-end cut needs a non-empty chunk and a positive budget");
+    const std::int32_t end = first_pos + tokens;
+    // The final chunk publishes the prompt end; a chunk ending at or before a pending junction stays whole.
+    if (checkpoints_left <= 0 || tokens == unscheduled || junction_tokens >= end) {
+        return 0;
+    }
+    const std::int32_t page = coordinator.PrefixGranularity();
+    const std::int32_t boundary = end / page * page;
+    // The n-th of K goes to the first boundary at or past n / (K + 1) of the in-forward checkpoint or the prompt end.
+    const std::int32_t upper = state_checkpoint_tokens > 0 ? state_checkpoint_tokens : first_pos + unscheduled;
+    const std::int64_t nth = std::int64_t{kChunkEndStateCheckpointsPerPrompt} - checkpoints_left + 1;
+    const std::int64_t target = std::int64_t{upper} * nth / (kChunkEndStateCheckpointsPerPrompt + 1);
+    if (boundary <= first_pos || boundary < target || boundary >= upper) {
+        return 0;
+    }
+    // No cut that adds a round to the prompt's prefill at this round's budget.
+    const auto rounds = [token_budget](std::int32_t rest) { return rest / token_budget + (rest % token_budget != 0); };
+    return rounds(unscheduled - (boundary - first_pos)) > rounds(unscheduled - tokens) ? 0 : boundary;
+}
+
 std::int32_t YieldingChunkBudget(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
                                  std::int32_t unscheduled, std::int32_t token_budget, std::int32_t yield_tokens) {
     if (yield_tokens <= 0) {

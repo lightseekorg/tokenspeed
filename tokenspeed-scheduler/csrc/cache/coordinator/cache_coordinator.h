@@ -119,6 +119,7 @@ public:
 
     std::int32_t PrefixGranularity() const noexcept { return store_.PrefixGranularity(); }
     bool GroupIsState(std::size_t i) const;
+    std::int32_t NumStateGroups() const noexcept { return store_.NumStateGroups(); }
     std::int32_t CheckpointGranularity() const noexcept { return store_.CheckpointGranularity(); }
     // The replay window: the largest sliding window over the replayable
     // groups, so a hit regenerates every page such a group retains; 0 when

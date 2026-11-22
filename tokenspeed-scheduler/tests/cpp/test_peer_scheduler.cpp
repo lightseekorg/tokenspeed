@@ -776,5 +776,57 @@ TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingAndNoReplayableGroup)
     EXPECT_NO_THROW(PeerConfigFor("ok").Validate());
 }
 
+// A hybrid reader whose 9-token budget a 16-token landing exceeds, its chunks off the 2-token page grid.
+class PeerChunkEndCheckpointTest : public ::testing::Test, protected PeerPair {
+protected:
+    static SchedulerConfig Reader() {
+        SchedulerConfig cfg = PeerConfigFor("reader", /*hybrid=*/true);
+        cfg.max_scheduled_tokens = 9;
+        return cfg;
+    }
+    PeerChunkEndCheckpointTest() : PeerPair(PeerConfigFor("holder", /*hybrid=*/true), Reader()) {}
+};
+
+// Computing starts past the landing, beyond one chunk budget: the prompt takes no chunk-end State checkpoint.
+TEST_F(PeerChunkEndCheckpointTest, ALandingPastOneChunkBudgetLeavesTheChunksAfterItWhole) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
+    ASSERT_EQ(PrefillRows(Plan(holder_)).size(), 1u);
+    Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
+    Send(holder_, forward::Finish{.request_id = "h"});
+    Plan(holder_);
+
+    std::vector<std::int32_t> longer = tokens;
+    for (std::int32_t i = 0; i < 14; ++i) {
+        longer.push_back(900 + i);
+    }
+    reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer}});
+    Plan(reader_);
+    RelayLookups();
+    const ExecutionPlan landing_plan = Plan(reader_);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    const PeerFetchOperation fetch = landing_plan.peer_fetches.front();
+    ASSERT_EQ(fetch.end_tokens, 16);
+    ASSERT_EQ(Fetch(fetch, /*read_succeeds=*/true), 16);
+    std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+    for (std::int32_t round = 0; round < 8 && (chunks.empty() || chunks.back().second < 30); ++round) {
+        const ExecutionPlan plan = Plan(reader_);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->extend_prefix_lens.empty()) {
+            continue;
+        }
+        const std::int32_t start = batch->extend_prefix_lens.at(0);
+        const std::int32_t end = start + batch->input_lengths.at(0);
+        chunks.emplace_back(start, end);
+        std::vector<std::int32_t> sampled;
+        if (end == 30) {
+            sampled.push_back(77);
+        }
+        Send(reader_, forward::ExtendResult{.request_id = "r", .tokens = std::move(sampled)});
+    }
+    EXPECT_EQ(chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{16, 25}, {25, 30}}));
+    EXPECT_EQ(reader_.ChunkEndCheckpointsPublished(), 0u);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

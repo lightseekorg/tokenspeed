@@ -286,12 +286,13 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
 
 def test_device_evictions_count_a_requests_own_reclaim_apart():
     """K3 shape on twelve Device parents, a block each, a page per chunk. a
-    publishes two pages and its checkpoint at 4 (five parents); b resumes
-    there, its first chunk takes four parents more. b's second chunk, its
-    prompt's last token, rotates a's checkpoint out of slot 0 and needs five
-    parents -- its page, a State slot per group and the copy-in block of its
-    prompt end at 7 -- with three free: its own released checkpoint funds the
-    rest, counted as the request's reclaim, not as an admission's victim."""
+    publishes two pages, its chunk-end checkpoint at 2 and its checkpoint at 4
+    (eight parents); b resumes at 4, its first chunk takes the four parents
+    left. b's second chunk, its prompt's last token, rotates a's checkpoint out
+    of slot 0 and needs five parents -- its page, a State slot per group and the
+    copy-in block of its prompt end at 7 -- with none free: its own released
+    checkpoint funds three, counted as the request's reclaim, and a's
+    chunk-end checkpoint at 2 the rest, as an admission's victim."""
     cfg = _make_k3_config()
     cfg.num_device_pages = 13  # page 0 = null sentinel, 12 usable parents
     cfg.max_scheduled_tokens = PAGE

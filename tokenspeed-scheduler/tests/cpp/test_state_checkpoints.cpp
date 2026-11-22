@@ -35,14 +35,11 @@
 #include <memory>
 #include <optional>
 #include <set>
-#include <span>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
-#include "cache/prefix/prefix_hasher.h"
-#include "cache_test_access.h"
 #include "integration_test_helper.h"
 
 namespace tokenspeed::test {
@@ -2359,35 +2356,19 @@ TEST_F(StateCheckpointInForwardMixedSuite, ChunksNearTheBoundaryEndOnAPageUnderA
 }
 
 // A junction before the boundary fixes where a later chunk starts: the
-// 22-token prompt shares a cached 24-token prompt's first four pages but no
+// 22-token prompt shares a cached 56-token prompt's first four pages but no
 // state checkpoint below them, so it resumes at 0 with the junction at 16.
-// [7, 12) ends on the page at 12 for its chunk-end checkpoint, the junction
-// cuts [12, 16), and the chunk [16, 22) writes the checkpoint.
+// [7, 14) keeps its budget rather than end on the page at 12, the junction
+// cuts [14, 16), and the chunk [16, 22) writes the checkpoint.
 TEST_F(StateCheckpointInForwardMixedSuite, AJunctionBeforeTheBoundaryLeavesTheChunksBeforeItWhole) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
-    const std::vector<std::int32_t> cached = MakeTokens(24);
+    // Its chunk-end checkpoints, at 24 and 40, lie past the four pages the prompt below shares.
+    const std::vector<std::int32_t> cached = MakeTokens(56);
     Submit(RequestWithTokens("cached", cached));
-    RunPrefill("cached", 24);
+    RunPrefill("cached", 56);
     SendFinish("cached");
     AckWriteBacks(PlanOnce());
-    // Evict the cached prompt's chunk-end checkpoints, as pressure may evict a State and leave its KV.
-    CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
-    ContentHash prior;
-    for (std::int32_t end = kP; end <= 16; end += kP) {
-        prior = HashPrefixPage(std::span{cached}.subspan(static_cast<std::size_t>(end - kP), kP), prior);
-        for (std::int32_t group = 0; group < coordinator.NumGroups(); ++group) {
-            if (!coordinator.GroupIsState(static_cast<std::size_t>(group))) {
-                continue;
-            }
-            const CacheKey key{.group_id = static_cast<std::uint32_t>(group), .content_hash = prior, .page_offset = 0};
-            if (const auto location =
-                    CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, static_cast<std::size_t>(group), key)) {
-                ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
-                    coordinator, static_cast<std::uint32_t>(group), *location,
-                    &CacheEvictor::DeviceEvictionStats::admission, /*segment=*/nullptr));
-            }
-        }
-    }
+    ASSERT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 2u);
 
     StartDecoding();
     std::vector<std::int32_t> tokens(cached.begin(), cached.begin() + 16);
@@ -2397,8 +2378,91 @@ TEST_F(StateCheckpointInForwardMixedSuite, AJunctionBeforeTheBoundaryLeavesTheCh
     Submit(RequestWithTokens("seed", tokens));
     const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 22);
     EXPECT_EQ(prefill.chunks,
-              (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 12}, {12, 16}, {16, 22}}));
+              (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 14}, {14, 16}, {16, 22}}));
     EXPECT_EQ(prefill.checkpoint_len, 4);
+}
+
+// Chunk-end State checkpoints of a prompt prefilled from zero beside one decode, 7 tokens a round off the page grid.
+class ChunkEndCheckpointMixedSuite : public StateCheckpointInForwardMixedSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardMixedSuite::MakeConfig();
+        cfg.state_checkpoint_in_forward = in_forward_;
+        cfg.disable_prefix_cache = disable_prefix_cache_;
+        return cfg;
+    }
+
+    // Where a prompt sharing `tokens`' first `shared` tokens resumes.
+    std::int32_t ForkResume(const std::vector<std::int32_t>& tokens, std::int32_t shared) {
+        std::vector<std::int32_t> fork(tokens.begin(), tokens.begin() + shared);
+        fork.push_back(77);
+        fork.push_back(78);
+        return Probe("fork", std::move(fork)).prefix_tokens;
+    }
+
+    bool in_forward_{false};
+    bool disable_prefix_cache_{false};
+};
+
+// An 11-token prompt's [0, 7) ends on the page at 4, its first target, as the rest still takes one round.
+TEST_F(ChunkEndCheckpointMixedSuite, AFirstChunkEndsOnAPageForACheckpoint) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    StartDecoding();
+    const std::vector<std::int32_t> tokens = MakeTokens(11);
+    Submit(RequestWithTokens("seed", tokens));
+    const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 11);
+    EXPECT_EQ(prefill.chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 4}, {4, 11}}));
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 1u);
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(ForkResume(tokens, 6), 4);
+}
+
+// A 16-token prompt's [0, 7) has no page at its first target, 5, or past it; [7, 14) ends on the page at 12 instead.
+TEST_F(ChunkEndCheckpointMixedSuite, ALaterChunkEndsOnAPageForACheckpoint) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    StartDecoding();
+    const std::vector<std::int32_t> tokens = MakeTokens(16);
+    Submit(RequestWithTokens("seed", tokens));
+    const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 16);
+    EXPECT_EQ(prefill.chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 12}, {12, 16}}));
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 1u);
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(ForkResume(tokens, 13), 12);
+}
+
+// Ending [0, 7) of a 14-token prompt on the page at 4 would leave 10 tokens, two rounds where 7 take one: no cut.
+TEST_F(ChunkEndCheckpointMixedSuite, NoChunkIsCutWhereItWouldAddARound) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    StartDecoding();
+    Submit(RequestWithTokens("seed", MakeTokens(14)));
+    const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 14);
+    EXPECT_EQ(prefill.chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 14}}));
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 0u);
+}
+
+// Without prefix caching nothing resumes at a chunk-end checkpoint: an 11-token prompt keeps its budget's chunks.
+TEST_F(ChunkEndCheckpointMixedSuite, WithoutPrefixCachingNoChunkIsCut) {
+    disable_prefix_cache_ = true;
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    StartDecoding();
+    Submit(RequestWithTokens("seed", MakeTokens(11)));
+    const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 11);
+    EXPECT_EQ(prefill.chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 11}}));
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 0u);
+}
+
+// A 12-token prompt's in-forward checkpoint is at 8: [0, 4) publishes a chunk-end one, [4, 11) spans 8 uncut.
+TEST_F(ChunkEndCheckpointMixedSuite, AChunkSpanningTheInForwardCheckpointIsNotCutToIt) {
+    in_forward_ = true;
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    StartDecoding();
+    Submit(RequestWithTokens("seed", MakeTokens(12)));
+    const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 12);
+    EXPECT_EQ(prefill.chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 4}, {4, 11}, {11, 12}}));
+    EXPECT_EQ(prefill.checkpoint_len, 4);
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 1u);
 }
 
 // The checkpoint's block is an extra the pool may not hold right now. In the

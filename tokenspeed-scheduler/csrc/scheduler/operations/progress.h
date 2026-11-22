@@ -53,6 +53,7 @@ enum class PublicationPoint {
     // page boundary: the state is published there -- under the tail's hash
     // at a junction -- and the partial page's KV, which a junction has cached
     // already, stays the owner's, unpublished (OwnerTail::kKept).
+    // So is a chunk end cut to a page for a chunk-end State checkpoint (scheduler.md §1.2).
     kStateCheckpoint,
 };
 

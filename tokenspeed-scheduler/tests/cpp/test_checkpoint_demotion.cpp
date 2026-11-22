@@ -30,8 +30,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -40,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/coordinator/eviction_candidates.h"
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_index.h"
@@ -1234,6 +1237,13 @@ TEST_F(CheckpointDemotionSuite, TheFlagRequiresInForwardCheckpointsAndActsOnlyWi
 // Fused role, P = 4, 8-token chunks, in-forward checkpoint on: a 30-token prompt has chunk-end checkpoints at 16, 24.
 class ChunkEndCheckpointSuite : public CheckpointDemotionSuite {
 protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = CheckpointDemotionSuite::MakeConfig();
+        if (default_retention_) {
+            cfg.checkpoint_retention_requests.reset();
+        }
+        return cfg;
+    }
     void RebuildFused(std::int32_t device_pages = 257, std::int32_t host_pages = 0) {
         role_ = Role::kFused;
         Rebuild(/*demote=*/true, device_pages, host_pages);
@@ -1267,6 +1277,32 @@ protected:
         AckWriteBacks(PlanOnce());
         return prefix;
     }
+    // Expects each of `older` before each of `newer` in the order the Device evictor ranks them, retention included.
+    void ExpectEvictedFirst(const std::vector<std::pair<CacheBlockLocation, std::string>>& names,
+                            std::initializer_list<const char*> older, std::initializer_list<const char*> newer) {
+        const CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+        CacheEvictionCandidates candidates{coordinator.Store().Groups(), SchedulerTestAccess::Pool(*scheduler_),
+                                           coordinator.History().CheckpointAgingFor(CacheTier::kDevice)};
+        const CacheEvictionCandidates::LocationSet none{std::pmr::get_default_resource()};
+        std::vector<std::string> order;
+        while (const auto candidate = candidates.Next({}, none, none, [](CacheBlockLocation) { return false; })) {
+            for (const auto& [location, name] : names) {
+                if (location == candidate->location) {
+                    order.push_back(name);
+                }
+            }
+        }
+        ASSERT_EQ(order.size(), names.size());
+        const auto position = [&](const char* name) {
+            return std::ranges::find(order, std::string{name}) - order.begin();
+        };
+        for (const char* first : older) {
+            for (const char* second : newer) {
+                EXPECT_LT(position(first), position(second)) << first << " before " << second;
+            }
+        }
+    }
+    bool default_retention_{false};
 };
 
 // Chunk-end checkpoints stay out of the in-forward lineage: forks resume at them, the next turn at the in-forward one.
@@ -1296,8 +1332,8 @@ TEST_F(ChunkEndCheckpointSuite, AChunkEndCheckpointIsHeldOnlyAsTheNextChunksInpu
     EXPECT_FALSE(StateEntry(A(), 24)->pinned);
 }
 
-// Chunk-end checkpoints age under LRU like any entry, and a fork's hit dates one forward.
-TEST_F(ChunkEndCheckpointSuite, ChunkEndCheckpointsAgeLikeAnyEntry) {
+// Under plain LRU (no checkpoint retention) they age like any entry, and a fork's hit dates one forward.
+TEST_F(ChunkEndCheckpointSuite, UnderPlainLruTheyAgeLikeAnyEntry) {
     RebuildFused();
     const std::vector<std::int32_t> x = MakeTokens(30, 5000);
     ASSERT_EQ(Turn("x", x), 0);
@@ -1327,6 +1363,33 @@ TEST_F(ChunkEndCheckpointSuite, ChunkEndCheckpointsAgeLikeAnyEntry) {
     order = EvictionOrder(SchedulerTestAccess::Coordinator(*scheduler_).GroupPrefixIndex(1),
                           SchedulerTestAccess::Pool(*scheduler_), names);
     EXPECT_EQ(order.back(), "a16") << "the fork's hit dated it forward";
+}
+
+// Default retention ranks them with their prompt's checkpoints: aged once a later turn extends it, unless forked.
+TEST_F(ChunkEndCheckpointSuite, UnderDefaultRetentionTheyAgeWithTheirPromptsCheckpoints) {
+    default_retention_ = true;
+    role_ = Role::kFused;
+    Rebuild(/*demote=*/false, /*device_pages=*/257, /*host_pages=*/0);
+    const std::vector<std::int32_t> x = MakeTokens(30, 5000);
+    ASSERT_EQ(Turn("x", x), 0);
+    ASSERT_EQ(Turn("a", A()), 0);
+    std::vector<std::pair<CacheBlockLocation, std::string>> names;
+    for (const auto& [name, tokens, boundary] :
+         std::vector<std::tuple<std::string, std::vector<std::int32_t>, std::int32_t>>{
+             {"x16", x, 16}, {"x24", x, 24}, {"x28", x, 28}, {"a16", A(), 16}, {"a24", A(), 24}, {"a28", A(), 28}}) {
+        const auto entry = StateEntry(tokens, boundary);
+        ASSERT_TRUE(entry.has_value()) << name;
+        names.emplace_back(entry->location, name);
+    }
+    // Each prompt's checkpoints lead their path: they rank by their own use, x's first.
+    ExpectEvictedFirst(names, {"x16", "x24", "x28"}, {"a16", "a24", "a28"});
+    // a2 resumes at 28 and publishes past it: a's checkpoints are a request from the leaf, aged ahead of x's.
+    ASSERT_EQ(Turn("a2", Extend(First(A(), 29), 830, 30)), 28);
+    ExpectEvictedFirst(names, {"a16", "a24", "a28"}, {"x16", "x24", "x28"});
+    // A fork resuming at 16 publishes its own checkpoint past it: 16 is a junction at its own, newer rank.
+    ASSERT_EQ(Turn("fork", Extend(First(A(), 18), 800, 6)), 16);
+    ExpectEvictedFirst(names, {"a24", "a28"}, {"x16", "x24", "x28"});
+    ExpectEvictedFirst(names, {"x16", "x24", "x28"}, {"a16"});
 }
 
 // A 62-token prompt (in-forward checkpoint at 60) publishes two, at the first chunk ends past 20 and 40.

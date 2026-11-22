@@ -1371,7 +1371,7 @@ Its responsibilities:
   checkpoints inside a page, and keeps each one's distance to the nearest
   leaf below it. Distance counts the later requests whose checkpoints lie
   on the way, capped at 5: the checkpoints one request publishes (its
-  in-forward checkpoint, prompt end and end state) are no step apart, so
+  chunk-end and in-forward checkpoints, prompt end and end state) are no step apart, so
   they rank level until a later turn extends them. A checkpoint more than
   K = `SchedulerConfig::checkpoint_retention_leaf_distance` (default 0; 1
   also keeps the previous turn's checkpoints) from that leaf is aged. With N =

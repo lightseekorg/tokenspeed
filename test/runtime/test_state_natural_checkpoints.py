@@ -91,28 +91,17 @@ def _state_row(batch) -> list[int]:
 
 @pytest.mark.parametrize("disable_prefix_cache", [False, True])
 @pytest.mark.parametrize("with_state", [False, True])
-# The last column is what a cached State group's chunk-end checkpoints cut to.
 @pytest.mark.parametrize(
-    "token_budget, lengths, chunk_end_lengths",
-    [
-        (1024, [868], [868]),
-        (768, [768, 100], [768, 100]),
-        (300, [300, 300, 268], [300, 212, 256, 100]),
-    ],
+    "token_budget, lengths", [(1024, [868]), (768, [768, 100]), (300, [300, 300, 268])]
 )
 def test_chunks_follow_the_budget_alone(
     disable_prefix_cache: bool,
     with_state: bool,
     token_budget: int,
     lengths: list[int],
-    chunk_end_lengths: list[int],
 ) -> None:
     """A state group does not shape the prefill chunk: chunks end where the
-    token budget says, on a page boundary or not, and decode follows. With the
-    prefix cache on, its chunk-end checkpoints cut up to two chunks of a prompt
-    prefilled from zero to page boundaries (scheduler.md §1.2)."""
-    if with_state and not disable_prefix_cache:
-        lengths = chunk_end_lengths
+    token budget says, on a page boundary or not, and decode follows."""
     scheduler = _scheduler(
         token_budget=token_budget,
         with_state=with_state,
