@@ -340,15 +340,17 @@ class HostCacheExecutor:
         share_bytes, share_source = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=host_headroom_bytes
         )
-        align_host_buffer = (
-            l2_tier and current_platform().is_nvidia and host_register_enabled()
+        align_host_buffer = l2_tier and (
+            block_alignment > 1
+            or (current_platform().is_nvidia and host_register_enabled())
         )
         alignment_padding = HOST_BUFFER_ALIGNMENT_BYTES - 1 if align_host_buffer else 0
         # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
-        if l2_tier and host_size_gb > 0 and alignment_padding:
+        aligned_l2_blocks = host_lcm_blocks
+        if l2_tier and alignment_padding:
             l2_bytes = host_lcm_blocks * host_lcm_block_bytes
             reservation = pinned_host_bytes(l2_bytes)
             padded_reservation = pinned_host_bytes(l2_bytes + alignment_padding)
@@ -362,23 +364,28 @@ class HostCacheExecutor:
                     // host_lcm_block_bytes
                 )
                 if 0 < aligned_blocks < host_lcm_blocks:
-                    logger.warning(
-                        f"Reduced explicit Host L2 from {host_lcm_blocks} to "
-                        f"{aligned_blocks} LCM blocks to keep alignment padding "
-                        f"within its {reservation} byte pinned reservation"
-                    )
-                    host_lcm_blocks = aligned_blocks
+                    aligned_l2_blocks = aligned_blocks
+                    if host_size_gb > 0:
+                        logger.warning(
+                            f"Reduced Host L2 from {host_lcm_blocks} to "
+                            f"{aligned_blocks} LCM blocks to keep alignment padding "
+                            f"within its {reservation} byte pinned reservation"
+                        )
+                        host_lcm_blocks = aligned_blocks
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
-        fitting_l2_blocks = _min_over_ranks(
+        fitting_l2_blocks = (
             largest_pinned_fit(
                 share_bytes - pool_pinned_bytes,
                 block_bytes=host_lcm_block_bytes,
                 padding_bytes=alignment_padding,
             )
-            // host_lcm_block_bytes,
-            world_cpu_group,
+            // host_lcm_block_bytes
         )
+        if host_size_gb <= 0:
+            # PP stages can cross different buckets; agree on the ratio's count.
+            fitting_l2_blocks = min(fitting_l2_blocks, aligned_l2_blocks)
+        fitting_l2_blocks = _min_over_ranks(fitting_l2_blocks, world_cpu_group)
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
             # Only the ratio's size shrinks, to one size on every rank: the
             # mirrored schedulers share one Host page count. An explicit
@@ -388,7 +395,8 @@ class HostCacheExecutor:
                 "Capped the compact Host L2 from "
                 f"{host_lcm_blocks * host_lcm_block_bytes / 1e9:.2f} GB to "
                 f"{fitting_l2_blocks * host_lcm_block_bytes / 1e9:.2f} GB per "
-                "rank, the most every rank's share of its node holds: "
+                "rank, fitting alignment padding within the requested pinned "
+                "reservation and every rank's Host memory share: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
                 "under the pinned allocator settings; this rank's share "

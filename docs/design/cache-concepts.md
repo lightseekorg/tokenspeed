@@ -132,13 +132,14 @@ Host allocations follow PyTorch's existing allocator configuration, including
 never overrides the registration method or thread count. Without an explicit
 configuration, the original serial allocation policy remains in effect.
 
-On NVIDIA CUDA with the native allocator, an L2 buffer allocated with
-`pinned_use_cuda_host_register:True` retains a 4 KiB-aligned tensor view.
+An L2 buffer retains a 4 KiB-aligned tensor view when the Disk tier requires
+direct I/O alignment, or on NVIDIA CUDA with the native allocator and
+`pinned_use_cuda_host_register:True`.
 Allocation and the executor's pinned reservation derive their padding from the
 same alignment constant. Other allocation policies and the snapshot pool retain
-their original allocation sizes. An explicit L2 size may lose whole LCM blocks
-to fit alignment padding in its original pinned reservation, when at least one
-block remains; it is never reduced to accommodate insufficient Host memory.
+their original allocation sizes. Ratio and explicit L2 sizes may lose whole
+LCM blocks to fit alignment padding in their original pinned reservation, when
+at least one block remains; it is never reduced to accommodate insufficient Host memory.
 Ranks agree on the resulting block count before allocation. Tensor ownership
 and asynchronous-copy lifetime tracking remain with PyTorch.
 

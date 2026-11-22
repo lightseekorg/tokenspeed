@@ -21,6 +21,7 @@
 """Allocator-policy preservation, aligned buffers and memory budgeting."""
 
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -50,30 +51,51 @@ register_cuda_ci(est_time=90, suite="runtime-1gpu")
     reason="requires real CUDA allocator",
 )
 @pytest.mark.parametrize(
-    "variable,config",
+    "variable,config,expected",
     [
-        ("PYTORCH_ALLOC_CONF", None),
+        ("PYTORCH_CUDA_ALLOC_CONF", None, ("native", False, 1)),
         (
-            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_CUDA_ALLOC_CONF",
             "pinned_use_cuda_host_register:False,pinned_num_register_threads:8",
+            ("native", False, 8),
         ),
         (
-            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_CUDA_ALLOC_CONF",
             "pinned_use_cuda_host_register:True,pinned_num_register_threads:1",
+            ("native", True, 1),
         ),
         (
-            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_CUDA_ALLOC_CONF",
             "pinned_use_cuda_host_register:True,pinned_num_register_threads:2",
+            ("native", True, 2),
         ),
         (
             "PYTORCH_CUDA_ALLOC_CONF",
             "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+            ("native", True, 8),
         ),
-        ("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync"),
+        (
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "backend:cudaMallocAsync",
+            ("cudaMallocAsync", None, None),
+        ),
+        (
+            "PYTORCH_ALLOC_CONF",
+            "pinned_use_cuda_host_register:True,pinned_num_register_threads:4",
+            ("native", True, 4),
+        ),
     ],
-    ids=["default", "disabled", "serial", "parallel2", "legacy_parallel8", "async"],
+    ids=[
+        "default",
+        "disabled",
+        "serial",
+        "parallel2",
+        "parallel8",
+        "async",
+        "generic_alias",
+    ],
 )
-def test_allocator_environment_is_respected(variable, config):
+def test_allocator_environment_is_respected(variable, config, expected):
     # Each process starts with a fresh allocator and registration thread pool.
     env = dict(os.environ)
     env.pop("PYTORCH_ALLOC_CONF", None)
@@ -81,13 +103,33 @@ def test_allocator_environment_is_respected(variable, config):
     if config is not None:
         env[variable] = config
     env["OMP_NUM_THREADS"] = "1"
+    script = """
+import json
+import sys
+import torch
+import pytest
+
+backend = torch.cuda.get_allocator_backend()
+before = torch.cuda.memory._snapshot()["allocator_settings"] if backend == "native" else None
+observed = [backend, before["pinned_use_cuda_host_register"] if before else None,
+            before["pinned_num_register_threads"] if before else None]
+if observed != json.loads(sys.argv[1]):
+    print(f"Allocator environment unsupported by this PyTorch build: {observed}")
+    raise SystemExit(77)
+status = pytest.main(sys.argv[2:])
+if before is not None:
+    assert torch.cuda.memory._snapshot()["allocator_settings"] == before
+raise SystemExit(status)
+"""
     result = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "pytest",
+            "-c",
+            script,
+            json.dumps(expected),
             f"{Path(__file__)}::test_host_buffer_keeps_allocator_policy",
             f"{Path(__file__).with_name('test_host_executor.py')}::TestCompactHostParentTest::test_both_tiers_use_the_parent_rounded_to_whole_kv_pages[True]",
+            f"{Path(__file__).with_name('test_host_executor.py')}::TestCompactHostParentTest::test_both_tiers_use_the_parent_rounded_to_whole_kv_pages[disk_cuda]",
             "-q",
             "-rs",
         ],
@@ -96,8 +138,10 @@ def test_allocator_environment_is_respected(variable, config):
         text=True,
         timeout=120,
     )
+    if result.returncode == 77:
+        pytest.skip(result.stdout.strip())
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "2 passed" in result.stdout, result.stdout + result.stderr
+    assert "3 passed" in result.stdout, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(
@@ -141,5 +185,9 @@ def test_l2_alignment_padding_fits_the_pinned_reservation():
     assert pinned_host_bytes(payload + 4095) <= 8192
     assert pinned_host_bytes(payload + 1024 + 4095) > 8192
     assert largest_pinned_fit(4095, block_bytes=1024, padding_bytes=4095) == 0
+    # A roomy non-power-of-two budget needs the padded fallback when rounded.
+    payload = largest_pinned_fit(3000, block_bytes=1024, padding_bytes=100)
+    assert pinned_host_bytes(payload + 100) <= 3000
+    assert pinned_host_bytes(payload + 1024 + 100) > 3000
     with pytest.raises(ValueError, match="non-negative"):
         largest_pinned_fit(8192, block_bytes=1024, padding_bytes=-1)

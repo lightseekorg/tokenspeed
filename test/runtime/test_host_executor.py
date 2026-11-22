@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 from contextlib import ExitStack, nullcontext
+from datetime import timedelta
 from importlib import import_module, util
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
@@ -86,6 +87,31 @@ class _SyntheticPool:
 
     def register_layerwise_load_tracker(self, tracker):
         self.load_tracker = tracker
+
+
+def _ratio_alignment_rank(rank, rendezvous):
+    torch = import_module("torch")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        tests = TestHostMemoryShareTest()
+        tests.setup_method()
+        executor, _ = tests._build(
+            available_gb=956,
+            nprocs_per_node=2,
+            device_lcm_blocks=512,
+            host_lcm_block_bytes=(1 if rank == 0 else 3) << 20,
+            block_alignment=4096,
+            world_cpu_group=torch.distributed.group.WORLD,
+        )
+        assert executor.num_host_pages - 1 == 1023
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def _load_executor_module_without_triton(*, force_isolated=False):
@@ -1368,6 +1394,8 @@ class TestHostMemoryShareTest:
     LARGE_POOL_BLOCKS = 138_975
 
     def setup_method(self):
+        if not import_module("torch").cuda.is_available():
+            pytest.skip("requires accelerator runtime dependencies")
         try:
             self.executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1391,6 +1419,7 @@ class TestHostMemoryShareTest:
         snapshot_pool=NO_POOL,
         world_cpu_group=None,
         is_nvidia=False,
+        block_alignment=1,
     ):
         """An executor at --kvstore-ratio 2, L2-only by default, and its mocked
         logger."""
@@ -1482,14 +1511,37 @@ class TestHostMemoryShareTest:
                 kvp_rank=0,
                 nprocs_per_node=nprocs_per_node,
                 world_cpu_group=world_cpu_group,
-                block_alignment=1,
+                block_alignment=block_alignment,
             )
         return executor, logger
+
+    def test_ratio_alignment_agrees_across_unequal_pp_stages(
+        self, tmp_path, monkeypatch
+    ):
+        torch = import_module("torch")
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_gloo_available()
+        ):
+            pytest.skip("requires the Gloo process-group backend")
+        monkeypatch.setenv("OMP_NUM_THREADS", "1")
+        monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+        monkeypatch.setenv("MKL_NUM_THREADS", "1")
+        torch.multiprocessing.spawn(
+            _ratio_alignment_rank,
+            args=(str(tmp_path / "rendezvous"),),
+            nprocs=2,
+            join=True,
+        )
 
     @pytest.fixture
     def registered_host_allocator(self):
         torch = import_module("torch")
-        if torch.version.cuda is None or torch.cuda.get_allocator_backend() != "native":
+        if (
+            not torch.cuda.is_available()
+            or torch.version.cuda is None
+            or torch.cuda.get_allocator_backend() != "native"
+        ):
             pytest.skip("requires native CUDA allocator settings")
         before = torch.cuda.memory._snapshot()["allocator_settings"]
         original = before["PYTORCH_CUDA_ALLOC_CONF"]
@@ -1541,15 +1593,21 @@ class TestHostMemoryShareTest:
             )
 
     @pytest.mark.usefixtures("registered_host_allocator")
-    def test_native_ratio_budget_includes_alignment_padding(self):
+    @pytest.mark.parametrize("room_bytes", [1 << 30, 3 << 30], ids=["tight", "roomy"])
+    @pytest.mark.parametrize(
+        "block_bytes,device_blocks", [(1 << 20, 512), (1024, (1 << 19) - 1)]
+    )
+    def test_native_ratio_budget_includes_alignment_padding(
+        self, room_bytes, block_bytes, device_blocks
+    ):
         executor, _ = self._build(
-            available_gb=(self.headroom + (1 << 30)) / self.GB,
+            available_gb=(self.headroom + room_bytes) / self.GB,
             nprocs_per_node=1,
-            device_lcm_blocks=512,
-            host_lcm_block_bytes=1 << 20,
+            device_lcm_blocks=device_blocks,
+            host_lcm_block_bytes=block_bytes,
             is_nvidia=True,
         )
-        assert executor.num_host_pages - 1 == 1023
+        assert executor.num_host_pages - 1 == ((1 << 30) - 4095) // block_bytes
 
     @pytest.mark.usefixtures("registered_host_allocator")
     def test_native_explicit_size_away_from_a_bucket_keeps_its_capacity(self):
@@ -1928,9 +1986,13 @@ class TestCompactHostParentTest:
     tiers, their byte budgets, the scheduler's packing, the owner translation
     and the transfer geometry."""
 
-    @pytest.mark.parametrize("is_nvidia", [False, True])
+    @pytest.mark.parametrize(
+        "is_nvidia,block_alignment",
+        [(False, 1), (True, 1), (False, 4096), (True, 4096)],
+        ids=["False", "True", "disk_cpu", "disk_cuda"],
+    )
     def test_both_tiers_use_the_parent_rounded_to_whole_kv_pages(
-        self, monkeypatch, is_nvidia
+        self, monkeypatch, is_nvidia, block_alignment
     ):
         try:
             executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
@@ -1958,6 +2020,8 @@ class TestCompactHostParentTest:
         )
 
         allocate = torch.empty
+        if not is_nvidia:
+            monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
         allocation_settings = {}
         pinned_sizes = set()
         native = is_nvidia and torch.cuda.get_allocator_backend() == "native"
@@ -1972,8 +2036,6 @@ class TestCompactHostParentTest:
                 if not is_nvidia:
                     kwargs["pin_memory"] = False
             result = allocate(*args, **kwargs)
-            if not is_nvidia:
-                monkeypatch.setattr(result, "is_pinned", lambda: True)
             if kwargs.get("pin_memory", False):
                 pinned_sizes.add(result.numel() * result.element_size())
             if settings is not None:
@@ -2077,7 +2139,7 @@ class TestCompactHostParentTest:
                 kvp_rank=0,
                 nprocs_per_node=1,
                 world_cpu_group=None,
-                block_alignment=1,
+                block_alignment=block_alignment,
             )
 
         parent = 9 * 3_407_872
@@ -2088,7 +2150,7 @@ class TestCompactHostParentTest:
         # Both counts include the scheduler's null page.
         assert (executor.num_host_pages, executor.num_snapshot_pages) == (8, 2)
         if native:
-            aligned = before["pinned_use_cuda_host_register"]
+            aligned = block_alignment > 1 or before["pinned_use_cuda_host_register"]
             padding = 4095 if aligned else 0
             l2_settings = allocation_settings[
                 executor.host_storage.host_buffer_bytes + padding
@@ -2103,11 +2165,13 @@ class TestCompactHostParentTest:
         if is_nvidia:
             assert executor.host_storage.host_buffer.is_pinned()
             assert executor.snapshot_storage.host_buffer.is_pinned()
-            if not native:
+            if not native and block_alignment == 1:
                 assert executor.host_storage.host_buffer_bytes in pinned_sizes
                 assert (
                     executor.host_storage.host_buffer_bytes + 4095 not in pinned_sizes
                 )
+        if block_alignment > 1:
+            assert executor.host_storage.host_buffer.data_ptr() % 4096 == 0
         for storage, geometry, owners, parents in (
             (
                 executor.host_storage,

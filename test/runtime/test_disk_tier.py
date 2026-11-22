@@ -176,6 +176,7 @@ def _host_storage(monkeypatch) -> HostCacheStorage:
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
     field = lambda name, size: CacheField(name, 0, 0, size, size)
     layout = CacheTransferLayout(
         num_lcm_blocks=2,
@@ -201,7 +202,7 @@ def _host_storage(monkeypatch) -> HostCacheStorage:
         group_specs=specs,
         num_host_lcm_blocks=8,
         block_alignment=DIRECT_IO_ALIGNMENT,
-        align_host_buffer=False,
+        align_host_buffer=True,
     )
 
 

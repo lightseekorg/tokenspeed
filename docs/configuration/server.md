@@ -511,7 +511,8 @@ To opt into parallel page touching and `cudaHostRegister`, set before startup:
 export PYTORCH_ALLOC_CONF="pinned_use_cuda_host_register:True,pinned_num_register_threads:8"
 ```
 
-The legacy name `PYTORCH_CUDA_ALLOC_CONF` remains supported by PyTorch. Keep any
+The legacy name `PYTORCH_CUDA_ALLOC_CONF` remains supported by PyTorch; older
+builds that ignore `PYTORCH_ALLOC_CONF` require this legacy name. Keep any
 existing allocator options in the same value. `pinned_num_register_threads`
 accepts powers of two from 1 to 128; use 1 for serial registration, or disable
 registration with `pinned_use_cuda_host_register:False`.
@@ -523,9 +524,11 @@ use one task in environments with tight thread or virtual-memory limits.
 These options affect all PyTorch pinned allocations, including the snapshot
 pool. They do not bind CPUs or memory to NUMA nodes.
 
-On NVIDIA with the native allocator and registration enabled, the L2 buffer
-uses a 4 KiB-aligned view and includes its alignment padding in the Host memory
-budget. Other policies keep their original allocation sizes.
+The L2 buffer uses a 4 KiB-aligned view when the Disk tier requires direct I/O
+alignment, or on NVIDIA with the native allocator and registration enabled.
+Its alignment padding is included in the Host memory budget. Both ratio and
+explicit sizes stay within their original pinned bucket by dropping whole
+LCM blocks when possible. Other policies keep their original allocation sizes.
 
 | Parameter | Purpose |
 | --- | --- |

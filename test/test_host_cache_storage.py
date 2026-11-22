@@ -52,6 +52,7 @@ def _cpu_pinned_allocation(monkeypatch):
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
 
 
 def _kv(group_id, *, rows_per_page=1, entry_stride_tokens=1):
@@ -120,6 +121,8 @@ def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
     if null_address:
         monkeypatch.setattr(tensor, "data_ptr", lambda: 0)
         monkeypatch.setattr(tensor, "is_pinned", lambda: True)
+    else:
+        monkeypatch.setattr(tensor, "is_pinned", lambda: False)
 
     def allocate(size, *, dtype, pin_memory):
         assert size == tensor.numel() and dtype == tensor.dtype and pin_memory
@@ -171,7 +174,7 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
         group_specs=_SPECS,
         num_host_lcm_blocks=3,
         block_alignment=4096,
-        align_host_buffer=False,
+        align_host_buffer=True,
     )
 
     assert storage.host_cache_block_bytes == (8192, 12288)
@@ -181,7 +184,10 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
     # Every block starts on the alignment, so each moves in one direct I/O.
     for group_index, packing in enumerate(storage.group_packing):
         for block_id in range(1, 3 * packing + 1):
-            assert storage.host_block_offset(group_index, block_id) % 4096 == 0
+            assert (
+                storage.host_buffer.data_ptr()
+                + storage.host_block_offset(group_index, block_id)
+            ) % 4096 == 0
     with pytest.raises(ValueError, match="block_alignment"):
         HostCacheStorage(
             layout,

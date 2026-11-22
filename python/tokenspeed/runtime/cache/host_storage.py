@@ -255,9 +255,9 @@ class HostCacheStorage:
             group_specs: The scheduler's group specs, which size the shared
                 parent (``compute_host_lcm_block_bytes``).
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
-            align_host_buffer: Whether to align the pinned buffer to 4 KiB.
             block_alignment: Every packed block's size is a multiple of this
                 (``compute_host_lcm_block_bytes``).
+            align_host_buffer: Whether to align the pinned buffer to 4 KiB.
         """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
