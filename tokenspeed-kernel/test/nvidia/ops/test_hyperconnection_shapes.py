@@ -203,6 +203,14 @@ def test_sm100_and_sm103_ignore_the_sm107_tiles(monkeypatch, version):
         ]
 
 
+@pytest.mark.parametrize("version", [ArchVersion(10, 0), ArchVersion(10, 3)])
+@pytest.mark.parametrize("rows", [17, 33, 64])
+def test_sm100_and_sm103_keep_split_k_8_at_17_to_64_rows(monkeypatch, version, rows):
+    _on_architecture(monkeypatch, version)
+    tactic = cute_fused._model_tactic(rows, 4, 2560, 320, 324)
+    assert (tactic[0], tactic[1], tactic[2], tactic[5]) == (8, 64, 32, 5)
+
+
 @torch.inference_mode()
 def test_interleaved_supported_model_dimensions():
     cases = [(4, 2560, 320), (4, 8192, 1024)]

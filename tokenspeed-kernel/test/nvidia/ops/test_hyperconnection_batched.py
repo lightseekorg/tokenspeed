@@ -25,11 +25,11 @@ from unittest import mock
 
 import pytest
 import torch
+import utils
 from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
-from utils import assert_no_cute_compile
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -659,7 +659,7 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     workspaces = dict(cute_fused._WORKSPACES)
     graph = torch.cuda.CUDAGraph()
     with (
-        assert_no_cute_compile(),
+        utils.assert_no_cute_compile(),
         mock.patch.object(
             cute_fused.cute_ext,
             "compile",
