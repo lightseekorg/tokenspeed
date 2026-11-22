@@ -82,8 +82,10 @@ def test_the_dummy_loader_fills_integers_before_post_processing(monkeypatch):
 
 
 class _DerivedCopy(nn.Module):
-    """Post-processing derives a copy from a floating-point weight, as a
-    prepared GEMV weight is."""
+    """A model whose post-processing derives a copy of its weight.
+
+    The copy stands in for a prepared GEMV weight.
+    """
 
     def __init__(self) -> None:
         super().__init__()
