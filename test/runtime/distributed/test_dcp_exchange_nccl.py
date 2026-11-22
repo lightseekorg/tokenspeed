@@ -1012,6 +1012,105 @@ def _decode_records_worker(rank, degree, rendezvous):
         dist.destroy_process_group()
 
 
+def _decode_rider_worker(rank, degree, rendezvous):
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+    from tokenspeed.runtime.layers.attention.dcp.placement import (
+        compact_owned_cache_slots,
+    )
+
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=degree,
+        device_id=device,
+        timeout=timedelta(seconds=300),
+    )
+    try:
+        group = tuple(range(degree))
+        coordination = dist.new_group(backend="gloo", timeout=timedelta(seconds=300))
+        process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+        process_group_manager.register_process_group("gloo", group, coordination)
+        backend = AutoBackend()
+        backend.configure(use_pynccl=False)
+        set_global_backend(backend)
+        cache = _records_cache(degree, rank, device)
+        pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda layer_id: cache)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=_RECORDS_HEADS,
+            head_dim=576,
+            v_head_dim=512,
+            scaling=192**-0.5,
+            logit_cap=0.0,
+        )
+        requests = 4
+        tokens = requests * 4
+        slots, lengths = _records_selection(degree, tokens, device)
+        generator = torch.Generator().manual_seed(1900 + rank)
+        q = torch.randn((tokens, _RECORDS_HEADS, 576), generator=generator)
+        q = q.to(device=device, dtype=torch.bfloat16)
+        leaf = _decode_records_leaf(dsa, group, rank, requests, records_core=False)
+        rider = leaf.dcp_decode_query_rider(layer, q)
+        assert rider is not None
+        gathered = rider.new_empty((degree, *rider.shape))
+        dist.all_gather_into_tensor(gathered, rider)
+        owned_slots, owned_lens = compact_owned_cache_slots(
+            slots, lengths, leaf.cache_placement(layer)
+        )
+        # The token-major decode gathers its query, or reads it where an owned
+        # top-k's score gather landed its rider: bit for bit the same output.
+        gathering = leaf.forward_sparse_decode(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=pool,
+            bs=requests,
+            topk_indices=slots,
+            topk_lens=lengths,
+        )
+        riding = leaf.forward_sparse_decode(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=pool,
+            bs=requests,
+            topk_indices=owned_slots,
+            topk_lens=owned_lens,
+            topk_owned=True,
+            gathered_query=gathered,
+        )
+        assert torch.equal(gathering.view(torch.int16), riding.view(torch.int16))
+        # A query holding every head gathers nothing, so nothing rides.
+        every_head = SimpleNamespace(
+            **{**vars(layer), "tp_q_head_num": _RECORDS_HEADS * degree}
+        )
+        assert leaf.dcp_decode_query_rider(every_head, q.repeat(1, degree, 1)) is None
+        torch.cuda.synchronize()
+        dist.barrier(group=coordination)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_token_major_decode_takes_the_query_rider(tmp_path):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    mp.spawn(
+        _decode_rider_worker,
+        args=(2, f"file://{tmp_path / 'rendezvous'}"),
+        nprocs=2,
+        join=True,
+    )
+
+
 @pytest.mark.parametrize("degree", [2, 8])
 def test_rank_major_decode_core_matches_packed_partials(tmp_path, degree):
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
