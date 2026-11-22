@@ -1349,7 +1349,7 @@ def test_stable_engine_requires_exact_pin_and_published_source(
     }
     release_module.update_metadata("tokenspeed", versions)
     git("add", ".")
-    git("commit", "-s", "-m", "Pin stable engine")
+    git("commit", "--allow-empty", "-s", "-m", "Pin stable engine")
     sha = git("rev-parse", "HEAD")
     git("remote", "add", "origin", str(version_repository))
     monkeypatch.setattr(release_module, "pypi", lambda *args: None)
