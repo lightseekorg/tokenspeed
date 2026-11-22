@@ -43,6 +43,14 @@ const NUMERICAL_ERROR: &str = "Request terminated: numerical corruption (NaN log
 /// How long an abort for a request not registered yet is kept.
 const PENDING_ABORT_TTL: Duration = Duration::from_secs(300);
 
+/// A row's [`ForwardResult::request_ends`] entry once the device ended its
+/// request, in that forward or an earlier one (`REQUEST_ENDED` in
+/// `tokenspeed_kernel.ops.metadata.stop_conditions`); 0 while it runs.
+pub const REQUEST_ENDED: i32 = 1;
+/// The entry when the device ended the request but could not complete a
+/// decode state it defers (`REQUEST_ENDED_INCOMPLETE`).
+pub const REQUEST_ENDED_INCOMPLETE: i32 = 2;
+
 /// One forward's results, read once its device-to-host copy landed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ForwardResult {
@@ -59,6 +67,10 @@ pub struct ForwardResult {
     pub output_token_cumulative_probs: Option<Vec<f64>>,
     /// Per-row NaN-guard flags; `None` with the guard off.
     pub nan_flags: Option<Vec<i32>>,
+    /// Per row, whether the device ended the request ([`REQUEST_ENDED`],
+    /// [`REQUEST_ENDED_INCOMPLETE`]) or not (0): what a cache that defers
+    /// decode state (`OutputProcessor::defers_decode_state`) publishes on.
+    pub request_ends: Option<Vec<i32>>,
     /// P role: each row's sampled token and the drafter's candidates, the
     /// bootstrap payload a completed prompt's remote decode carries; `None`
     /// on the other roles.
@@ -129,6 +141,7 @@ impl ForwardResult {
         });
         out.option(self.grammar_terminated_at.as_deref(), Writer::i32s);
         out.option(self.input_token_logprobs.as_deref(), Writer::f64s);
+        out.option(self.request_ends.as_deref(), Writer::i32s);
         out.finish()
     }
 
@@ -146,6 +159,7 @@ impl ForwardResult {
         })?;
         let grammar_terminated_at = reader.option(Reader::i32s)?;
         let input_token_logprobs = reader.option(Reader::f64s)?;
+        let request_ends = reader.option(Reader::i32s)?;
         reader.finish(Self {
             output_tokens,
             output_lengths,
@@ -153,6 +167,7 @@ impl ForwardResult {
             // Not shared: the engine refuses the diagnostic under a pipeline.
             output_token_cumulative_probs: None,
             nan_flags,
+            request_ends,
             next_input_ids,
             serving_compiles: None,
             grammar_terminated_at,
@@ -378,6 +393,13 @@ pub enum CommitError {
     /// A decode row kept no token although its request runs.
     #[error("decode request {0} kept no token")]
     EmptyDecode(String),
+    /// The device ended a request but could not complete the decode state
+    /// it defers: the state its finish would publish lacks accepted tokens.
+    #[error("request {0} ended with a deferred decode state the device did not complete")]
+    IncompleteDecodeState(String),
+    /// A cache that defers decode state needs the device's request ends.
+    #[error("forward result lacks {0}")]
+    MissingColumn(&'static str),
     /// The P role's bootstrap token disagrees with the drafter's candidates.
     #[error("request {rid} sampled {sampled}, but its first speculative candidate is {candidate}")]
     BootstrapMismatch {
@@ -458,8 +480,8 @@ pub enum Role {
 
 fn finish(rid: &str, publishable: bool) -> ForwardEvent {
     // Abort rather than Finish keeps the request's pages out of the prefix
-    // caches: numerically corrupted KV, or a decode state the device did not
-    // complete (`OutputProcessor::defers_decode_state`).
+    // caches: numerically corrupted KV, or a deferred decode state the device
+    // did not end the request with (`OutputProcessor::defers_decode_state`).
     let kind = if publishable {
         ForwardEventKind::Finish
     } else {
@@ -513,9 +535,11 @@ pub struct OutputProcessor {
     role: Role,
     /// A cache group defers its decode state to a request's end
     /// (`Scheduler::defers_decode_state`, KDA): the device completes it in
-    /// the forward its stop criteria end. A finish only this side saw (a
+    /// the forward its stop criteria end, and says so in
+    /// `ForwardResult::request_ends`. A finish the device did not end (a
     /// grammar's end under `ignore_eos`, a client abort) ends with an abort,
-    /// which publishes nothing.
+    /// which publishes nothing; a state the device could not complete stops
+    /// the engine.
     defers_decode_state: bool,
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
@@ -1387,6 +1411,11 @@ impl OutputProcessor {
         if let Some(flags) = &result.nan_flags {
             check("nan_flags", flags.len())?;
         }
+        if let Some(ends) = &result.request_ends {
+            check("request_ends", ends.len())?;
+        } else if self.defers_decode_state {
+            return Err(CommitError::MissingColumn("request_ends"));
+        }
         if let Some(probs) = &result.output_token_cumulative_probs {
             if probs.len() != result.output_tokens.len() {
                 return Err(CommitError::TokenColumn {
@@ -1467,6 +1496,10 @@ impl OutputProcessor {
             let mid_chunk = !is_decode
                 && batch.extend_prefix_lens[i] + batch.input_lengths[i] < batch.prefill_lengths[i];
             let nan_flag = result.nan_flags.as_ref().is_some_and(|flags| flags[i] != 0);
+            let request_end = result.request_ends.as_ref().map_or(0, |ends| ends[i]);
+            if request_end == REQUEST_ENDED_INCOMPLETE {
+                return Err(CommitError::IncompleteDecodeState(rid.to_owned()));
+            }
 
             let Some(state) = self.states.get_mut(rid) else {
                 // It ended while this forward was in flight. The forward still
@@ -1706,7 +1739,7 @@ impl OutputProcessor {
                 continue;
             }
             let publishable =
-                !nan_detected && (!self.defers_decode_state || state.device_stopped());
+                !nan_detected && (!self.defers_decode_state || request_end == REQUEST_ENDED);
             if state.to_abort && state.finished() {
                 committed.events.push(finish(rid, publishable));
                 if state.abort_notify_client {
@@ -1910,6 +1943,8 @@ mod tests {
             output_logprobs: None,
             output_token_cumulative_probs: None,
             nan_flags: None,
+            // The device ends no request unless a test says so.
+            request_ends: Some(vec![0; lengths.len()]),
             next_input_ids: None,
             serving_compiles: None,
             grammar_terminated_at: None,
@@ -3239,6 +3274,7 @@ mod tests {
             output_lengths: vec![2, 1],
             output_logprobs: Some(vec![-0.25, -1.5, f64::NEG_INFINITY]),
             nan_flags: Some(vec![0, 1]),
+            request_ends: Some(vec![REQUEST_ENDED, 0]),
             next_input_ids: Some(vec![vec![5, 6], vec![]]),
             serving_compiles: None,
             grammar_terminated_at: Some(vec![-1, 0]),
@@ -3721,9 +3757,48 @@ mod tests {
         assert_eq!(c.events[1].kind, ForwardEventKind::Abort);
     }
 
+    /// A result whose every row the device reports with `end`.
+    fn ended(tokens: &[i32], lengths: &[i32], end: i32) -> ForwardResult {
+        ForwardResult {
+            request_ends: Some(vec![end; lengths.len()]),
+            ..result(tokens, lengths)
+        }
+    }
+
     #[test]
     fn a_finish_the_device_saw_publishes_when_state_is_deferred() {
-        // A stop token and a spent budget end the request on the device too.
+        // A stop token and a spent budget end the request on the device too,
+        // which reports it with the deferred state complete.
+        let mut p = deferring_processor(None);
+        register(&mut p, "s", 2, 10, &[7]);
+        p.commit(&batch(&[("s", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        let c = p
+            .commit(
+                &batch(&[("s", 1, 0, 2)], 0),
+                None,
+                &ended(&[7], &[1], REQUEST_ENDED),
+            )
+            .unwrap();
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+
+        register(&mut p, "l", 2, 1, &[]);
+        let c = p
+            .commit(
+                &batch(&[("l", 2, 0, 2)], 1),
+                None,
+                &ended(&[3], &[1], REQUEST_ENDED),
+            )
+            .unwrap();
+        assert_eq!(c.outputs[0].finish_reason, Some("length"));
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+    }
+
+    #[test]
+    fn a_deferred_state_publishes_on_the_device_word_alone() {
+        // The stop token ends the request here, but the device reports no
+        // end (its stop check saw another token): the state it holds may lack
+        // the finish, so the scheduler gets an abort.
         let mut p = deferring_processor(None);
         register(&mut p, "s", 2, 10, &[7]);
         p.commit(&batch(&[("s", 2, 0, 2)], 1), None, &result(&[3], &[1]))
@@ -3731,14 +3806,46 @@ mod tests {
         let c = p
             .commit(&batch(&[("s", 1, 0, 2)], 0), None, &result(&[7], &[1]))
             .unwrap();
-        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+        assert_eq!(c.outputs[0].finish_reason, Some("stop"));
+        assert_eq!(c.events[1].kind, ForwardEventKind::Abort);
+    }
 
-        register(&mut p, "l", 2, 1, &[]);
-        let c = p
-            .commit(&batch(&[("l", 2, 0, 2)], 1), None, &result(&[3], &[1]))
+    #[test]
+    fn a_state_the_device_could_not_complete_is_an_engine_error() {
+        // The device ended the request but rejected a layer's commit: the
+        // state its finish would publish lacks accepted tokens.
+        let mut p = deferring_processor(None);
+        register(&mut p, "s", 2, 10, &[7]);
+        p.commit(&batch(&[("s", 2, 0, 2)], 1), None, &result(&[3], &[1]))
             .unwrap();
-        assert_eq!(c.outputs[0].finish_reason, Some("length"));
-        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+        let error = p
+            .commit(
+                &batch(&[("s", 1, 0, 2)], 0),
+                None,
+                &ended(&[7], &[1], REQUEST_ENDED_INCOMPLETE),
+            )
+            .unwrap_err();
+        assert!(matches!(error, CommitError::IncompleteDecodeState(rid) if rid == "s"));
+    }
+
+    #[test]
+    fn a_deferred_state_needs_the_device_request_ends() {
+        let mut p = deferring_processor(None);
+        register(&mut p, "s", 2, 10, &[7]);
+        let bare = ForwardResult {
+            request_ends: None,
+            ..result(&[3], &[1])
+        };
+        let error = p
+            .commit(&batch(&[("s", 2, 0, 2)], 1), None, &bare)
+            .unwrap_err();
+        assert!(matches!(error, CommitError::MissingColumn("request_ends")));
+        // A cache without deferred state needs no report.
+        let mut plain = processor(None);
+        register(&mut plain, "s", 2, 10, &[7]);
+        plain
+            .commit(&batch(&[("s", 2, 0, 2)], 1), None, &bare)
+            .unwrap();
     }
 
     #[test]

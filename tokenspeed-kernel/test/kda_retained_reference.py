@@ -22,6 +22,7 @@
 
 import torch
 from tokenspeed_kernel.ops.attention import kda
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -379,7 +380,10 @@ def verify(case):
 
 
 def commit(case, accepted, *, ended_slots):
-    """Commit accepted prefixes; requests in ``ended_slots`` ended this forward."""
+    """Commit accepted prefixes; requests in ``ended_slots`` ended this forward.
+
+    Returns each row's request end after the commit (``request_ends``).
+    """
     records, conv, state = case["records"], case["conv"], case["state"]
     history = records.history
     qkv = records.original_qkv
@@ -406,6 +410,14 @@ def commit(case, accepted, *, ended_slots):
         history.length.shape[0], device="cuda", dtype=torch.bool
     )
     request_stopped[list(ended_slots)] = True
+    # Each row's report as the stop conditions leave it; the commit raises a
+    # row whose state it cannot complete.
+    slots = history.record_slots.long()
+    request_ends = torch.where(
+        (slots >= 0) & request_stopped[slots.clamp_min(0)],
+        REQUEST_ENDED,
+        0,
+    ).to(torch.int32)
     kernel = kda.resolve_kda_batched_retained_commit(
         qkv.dtype, num_heads=case["heads"], head_dim=128, recurrent_layout="v_major"
     )
@@ -425,6 +437,7 @@ def commit(case, accepted, *, ended_slots):
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
         request_stopped=request_stopped,
+        request_ends=request_ends,
         draft_token_num=case["width"],
         history_capacity=history.correction.shape[2],
         num_heads=case["heads"],
@@ -434,6 +447,7 @@ def commit(case, accepted, *, ended_slots):
         conv_state_dtype=conv.dtype,
         recurrent_state_dtype=state.dtype,
     )
+    return request_ends
 
 
 def check_prefix(case, accepted, expected):

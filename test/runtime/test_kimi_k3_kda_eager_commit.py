@@ -109,7 +109,10 @@ class _Harness:
             dtype=torch.bool,
             device=DEV,
         )
-        self.backend.bind_request_stop_flags(self.stopped)
+        # The executor's per-row request ends: 0 for every row here, raised to
+        # REQUEST_ENDED_INCOMPLETE by a commit that could not complete a state.
+        self.request_ends = torch.zeros(config.max_bs, dtype=torch.int32, device=DEV)
+        self.backend.bind_request_stop_flags(self.stopped, self.request_ends)
         # The persistent decode buffers exist from construction, as at the
         # wrapper (the verify refresh below writes into them).
         self.backend.init_cuda_graph_state(config.max_bs)

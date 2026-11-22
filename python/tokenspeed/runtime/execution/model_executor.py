@@ -702,9 +702,18 @@ class ModelExecutor:
                 if model_runner.model_config.requires_request_token_history
                 else 0
             )
+            # Per row of a forward (sized like InputBuffers.max_bs), whether
+            # the device ended its request, and with a complete decode state:
+            # the control plane's word for publishing a request's state.
+            self.request_ends = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            )
         # A backend that defers dense state writes completes them in the
-        # decode commit of the forward that ends a request.
-        self.attn_backend.bind_request_stop_flags(self.runtime_states.stopped)
+        # decode commit of the forward that ends a request, and reports a row
+        # whose state it could not complete in request_ends.
+        self.attn_backend.bind_request_stop_flags(
+            self.runtime_states.stopped, self.request_ends
+        )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -1783,6 +1792,7 @@ class ModelExecutor:
             accept_lengths,
             ib.input_lengths_buf[: ctx.bs],
             ib.extend_prompt_lens_buf[: ctx.num_extends],
+            self.request_ends[: ctx.bs],
             num_extends=ctx.num_extends,
             num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
             decode_width=ctx.output_layout.decode_width,
@@ -3043,6 +3053,10 @@ class ModelExecutor:
                     forward_logprobs = ForwardLogprobs()
 
                 output_nan_flags = self.nan_guard.flags_cpu
+                # Every row as the stop conditions and the commit left it.
+                output_request_ends = self.request_ends[:bs].to(
+                    "cpu", non_blocking=True
+                )
 
                 copy_event = self.device_module.Event()
                 copy_event.record()
@@ -3083,6 +3097,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            output_request_ends=output_request_ends,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a

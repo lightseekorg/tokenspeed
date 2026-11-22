@@ -48,6 +48,7 @@ from test.runtime.test_kimi_k3_kda import (
 import pytest
 import torch
 from ci_system.ci_register import register_cuda_ci
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED
 
 ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
@@ -113,7 +114,9 @@ class _KDA:
         # RuntimeStates.stopped, as the executor binds it: a test marks the
         # slot of a request whose round ends it, before that round's commit.
         self.stopped = torch.zeros(16, dtype=torch.bool, device="cuda")
-        self.backend.bind_request_stop_flags(self.stopped)
+        # The executor's per-row request ends (sized like its max_bs).
+        self.request_ends = torch.zeros(8, dtype=torch.int32, device="cuda")
+        self.backend.bind_request_stop_flags(self.stopped, self.request_ends)
         self.backend.init_cuda_graph_state(max_bs=8)
         self.backend.preallocate_verify_workspace(8, width)
         generator = torch.Generator(device="cpu").manual_seed(107)
@@ -637,8 +640,10 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
         output_length=width,
         device="cuda",
     )
-    # As the executor does: the decode commit reads the epilogue's stop flags.
-    actual.backend.bind_request_stop_flags(runtime.stopped)
+    # As the executor does: the decode commit reads the epilogue's stop flags
+    # and reports a row whose deferred state it could not complete.
+    request_ends = torch.zeros(8, dtype=torch.int32, device="cuda")
+    actual.backend.bind_request_stop_flags(runtime.stopped, request_ends)
     commit = _Commit()
     prompt = list(range(4))
     criteria = StopCriteria(stop_token_ids=(_STOP,), token_limit=len(prompt) + 40)
@@ -692,6 +697,7 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
             accept_lengths,
             torch.tensor([width], dtype=torch.int32, device="cuda"),
             torch.empty(0, dtype=torch.int32, device="cuda"),
+            request_ends[:1],
             num_extends=0,
             num_prefill_outputs=0,
             decode_width=width,
@@ -713,6 +719,8 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     batch, tables = _batch(scheduler, "source")
     sampled, kept = run_round(batch, tables, width, samples_stop=True)
     assert kept == 1
+    # The device ended the request with its decode state complete.
+    assert request_ends[0].item() == REQUEST_ENDED
     if overlap:
         # Planned while the finishing round is still in flight.
         next_batch, next_tables = _batch(scheduler, "source")

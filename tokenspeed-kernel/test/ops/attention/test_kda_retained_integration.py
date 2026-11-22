@@ -25,6 +25,7 @@ import pytest
 import torch
 from kda_retained_reference import prepare_history
 from tokenspeed_kernel.ops.attention import kda
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED, REQUEST_ENDED_INCOMPLETE
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
@@ -191,6 +192,12 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
     # One more flag than request slots; slot 2 ends without a row here.
     request_stopped = torch.zeros(5, device="cuda", dtype=torch.bool)
     request_stopped[list(stopped_slots)] = True
+    # Each row's report as the stop conditions leave it.
+    request_ends = torch.tensor(
+        [REQUEST_ENDED if slot in stopped_slots else 0 for slot in (1, 3, 0, -1)],
+        device="cuda",
+        dtype=torch.int32,
+    )
     (
         originals,
         convs,
@@ -269,6 +276,7 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         retained_key=records[1],
         retained_decay=records[2],
         request_stopped=request_stopped,
+        request_ends=request_ends,
         draft_token_num=window,
         history_capacity=capacity,
         num_heads=heads,
@@ -292,6 +300,8 @@ def test_batched_retained_commit_packed_groups_and_stamps(window, stale):
     )
     assert commit is not None
     commit(**args)
+    # No request ended, so a stale layer reports nothing.
+    assert args["request_ends"].tolist() == [0, 0, 0, 0]
     for values, expected_values in zip(actual[:2], expected[:2]):
         for value, expected_value in zip(values, expected_values):
             torch.testing.assert_close(value, expected_value, atol=0, rtol=0)
@@ -317,6 +327,14 @@ def test_batched_retained_commit_folds_ended_requests(window, stale, state_dtype
         torch.bfloat16, num_heads=2, head_dim=128, recurrent_layout="v_major"
     )
     commit(**args)
+    # Row 1's request ended, but its stale layer kept its records outside the
+    # live page: its report says the state is incomplete.
+    assert args["request_ends"].tolist() == [
+        0,
+        REQUEST_ENDED_INCOMPLETE if stale else REQUEST_ENDED,
+        REQUEST_ENDED,
+        0,
+    ]
     convs, lengths, states = actual
     expected_convs, expected_lengths, expected_states = expected
     for conv, expected_conv in zip(convs, expected_convs):
@@ -612,6 +630,7 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
         record_slots=args["record_slots"][:2],
         record_metadata=args["record_metadata"][:2],
         record_stamps=torch.full((3, 5, 11, 2), -1, device="cuda", dtype=torch.int64),
+        request_ends=args["request_ends"][:2],
     )
     with assert_no_triton_compile(
         kernels.retained_batched_conv_kernel, kernels.retained_batched_publish_kernel
@@ -640,6 +659,7 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
                     record_metadata=torch.full(
                         (batch, 3), -1, device="cuda", dtype=torch.int64
                     ),
+                    request_ends=torch.zeros(batch, device="cuda", dtype=torch.int32),
                 )
             )
 

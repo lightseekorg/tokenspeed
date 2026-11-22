@@ -989,6 +989,7 @@ type Completed = (
         Option<TopLogprobBuffers>,
     )>,
     Option<Py<PyAny>>,
+    Option<Vec<i32>>,
 );
 
 /// A launched forward's results, once they landed.
@@ -1003,6 +1004,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         grammar_terminated_at,
         logprobs,
         output_token_cumulative_probs,
+        request_ends,
     ): Completed = plane.call_method1("complete", (launched,))?.extract()?;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
@@ -1017,6 +1019,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         output_logprobs: output_logprobs.map(floats).transpose()?,
         output_token_cumulative_probs: output_token_cumulative_probs.map(floats).transpose()?,
         nan_flags,
+        request_ends,
         next_input_ids,
         serving_compiles,
         grammar_terminated_at,

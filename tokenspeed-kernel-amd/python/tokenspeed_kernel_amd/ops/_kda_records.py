@@ -831,6 +831,8 @@ def retained_batched_accept(
         & (count > 0)
         & (count <= WINDOW)
     )
+    # The row carries a request of this forward, whatever its commit holds.
+    live = valid
     take = gl.minimum(
         gl.maximum(gl.load(accepted + row * accepted_stride), 0),
         gl.minimum(count, WINDOW),
@@ -869,7 +871,7 @@ def retained_batched_accept(
         )
         == 0
     )
-    return source, target, begin, take, old, valid & fresh, length, record_slot
+    return source, target, begin, take, old, valid & fresh, live, length, record_slot
 
 
 @gluon.jit
@@ -1009,7 +1011,7 @@ def retained_batched_conv_kernel(
     WAVE: gl.constexpr,
 ):
     layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, length, record_slot = (
+    source, target, begin, take, old, valid, _, length, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -1125,12 +1127,14 @@ def retained_batched_publish_kernel(
     stamp_slots,
     stamp_capacity,
     stopped_count,
+    request_ends,
     CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
     WAVE: gl.constexpr,
+    INCOMPLETE: gl.constexpr,
 ):
     layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, length, record_slot = (
+    source, target, begin, take, old, valid, live, length, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -1160,9 +1164,15 @@ def retained_batched_publish_kernel(
             WAVE,
         )
     )
+    stopped = gl.load(
+        request_stopped + record_slot,
+        mask=live & (record_slot < stopped_count),
+        other=0,
+    )
     if valid:
-        stopped = gl.load(
-            request_stopped + record_slot, mask=record_slot < stopped_count, other=0
-        )
         # An ended request's records are folded into its live page.
         gl.store(length, gl.where(stopped, 0, old + take))
+    # A request that ended in this forward but whose commit this layer
+    # rejected keeps records outside its live page; its finish must not
+    # publish that page.
+    gl.store(request_ends + row, INCOMPLETE, mask=live & (stopped != 0) & (valid == 0))

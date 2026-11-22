@@ -749,8 +749,11 @@ def resolve_kda_batched_retained_commit(
     the recurrent state pointer and its page, head, value and key strides, in
     elements. record_slots selects each request's length. A request whose
     slot is set in request_stopped ended in this forward: its accepted
-    records are folded into its live page and its length is cleared.
-    Metadata and all pointers remain stable during CUDA graph capture.
+    records are folded into its live page and its length is cleared. One
+    whose commit a layer rejects instead is reported as
+    ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's per-row
+    ``apply_stop_conditions`` report. Metadata and all pointers remain stable
+    during CUDA graph capture.
     """
     return _resolve_batched_retained(
         "kda_retained_commit",

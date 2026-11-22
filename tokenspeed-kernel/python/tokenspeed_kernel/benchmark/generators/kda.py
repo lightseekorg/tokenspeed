@@ -909,6 +909,8 @@ def prepare_kda_retained_commit(
         for field in (first.correction, first.key, first.decay)
     ]
     request_stopped = torch.zeros(batch, device="cuda", dtype=torch.bool)
+    # No request ends in the measured rounds, so no row's report changes.
+    request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
 
     def reset():
         for layer, (conv, length) in zip(layer_inputs, before):
@@ -933,6 +935,7 @@ def prepare_kda_retained_commit(
             retained_key=records[1],
             retained_decay=records[2],
             request_stopped=request_stopped,
+            request_ends=request_ends,
             draft_token_num=window,
             history_capacity=max(16, window),
             num_heads=profile.heads,

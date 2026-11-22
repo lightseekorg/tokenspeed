@@ -176,13 +176,15 @@ def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBack
         config, spec, enable_prefill_graph=False, kda_backend=kda_backend
     )
     backend.set_kv_pool(contract_pool)
-    # RuntimeStates.stopped, as the executor binds it; no request ends here.
+    # RuntimeStates.stopped and the executor's per-row request ends, as the
+    # executor binds them; no request ends here.
     backend.bind_request_stop_flags(
         torch.zeros(
             RequestSlotLayout(config.max_resident_requests).capacity,
             dtype=torch.bool,
             device=device,
-        )
+        ),
+        torch.zeros(config.max_bs, dtype=torch.int32, device=device),
     )
     return backend
 
@@ -500,7 +502,8 @@ class _KDAHarness:
         # RuntimeStates.stopped, as the executor binds it: a test marks the
         # slot of a request whose round ends it, before that round's commit.
         self.stopped = torch.zeros(16, dtype=torch.bool, device=device)
-        self.backend.bind_request_stop_flags(self.stopped)
+        self.request_ends = torch.zeros(self.MAX_BS, dtype=torch.int32, device=device)
+        self.backend.bind_request_stop_flags(self.stopped, self.request_ends)
         self.backend.init_cuda_graph_state(max_bs=self.MAX_BS)
         # Per-layer weights and full token streams (so each group is proven
         # independent, not accidentally identical).

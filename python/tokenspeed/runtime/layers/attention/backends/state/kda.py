@@ -220,8 +220,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._batched_replay_kernel = None
         self._batched_prepare_kernel = None
         self._verify_split_producers = False
-        # RuntimeStates.stopped, bound by the executor (bind_request_stop_flags).
+        # RuntimeStates.stopped and the executor's per-row request_ends, bound
+        # by the executor (bind_request_stop_flags).
         self._request_stopped: torch.Tensor | None = None
+        self._request_ends: torch.Tensor | None = None
         self._reset_replay_state()
         self.kda_backend = kda_backend.strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
@@ -398,10 +400,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
         return frozenset(self._state_groups())
 
     @override
-    def bind_request_stop_flags(self, stopped: torch.Tensor) -> None:
+    def bind_request_stop_flags(
+        self, stopped: torch.Tensor, request_ends: torch.Tensor
+    ) -> None:
         if stopped.ndim != 1 or stopped.dtype != torch.bool:
             raise ValueError("request stop flags must be a bool vector")
+        if request_ends.ndim != 1 or request_ends.dtype != torch.int32:
+            raise ValueError("request ends must be an INT32 vector")
         self._request_stopped = stopped
+        self._request_ends = request_ends
 
     @override
     def fold_deferred_state(
@@ -1053,11 +1060,17 @@ class KdaAttnBackend(CapacityPrefillBackend):
             if self._mixed_forward_metadata is not None
             else self.forward_metadata
         )
+        # The decode rows follow a mixed forward's extend rows in request_ends.
+        first_row = (
+            self._mixed_forward_metadata.num_extends
+            if self._mixed_forward_metadata is not None
+            else 0
+        )
         first_layer = self._state_layer_ids()[0]
         conv, state = self._state_components(first_layer)
-        if self._request_stopped is None:
+        if self._request_stopped is None or self._request_ends is None:
             raise RuntimeError(
-                "the KDA decode commit needs the request stop flags "
+                "the KDA decode commit needs the request stop flags and ends "
                 "(bind_request_stop_flags)"
             )
         correction, key, decay = self._retained_records.unbind(2)
@@ -1065,7 +1078,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # token. Untouched layers therefore fail the generation-stamp check
         # and leave their cache fields unchanged, including subset forwards.
         # A request that ended in this forward has its records folded into
-        # its live block, which its finish publishes.
+        # its live block, which its finish publishes; if a layer rejects its
+        # commit, its row in request_ends says the block is incomplete.
         self._batched_replay_kernel(
             descriptors=self._replay_descriptors,
             group_indices=self._replay_group_indices,
@@ -1083,6 +1097,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_key=key,
             retained_decay=decay,
             request_stopped=self._request_stopped,
+            request_ends=self._request_ends[first_row : first_row + bs],
             draft_token_num=draft_token_num,
             history_capacity=self._retained_capacity,
             num_heads=state.shape[1],

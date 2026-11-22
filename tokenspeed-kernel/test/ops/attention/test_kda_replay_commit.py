@@ -23,6 +23,7 @@
 import pytest
 import torch
 from kda_retained_reference import check_prefix, commit, make_case, reference, verify
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -60,10 +61,12 @@ def test_ended_request_commit_leaves_a_dense_endpoint(width, cross_page):
     expected = reference(case)
     verify(case)
     accepted = torch.tensor([width, 1, 0], device="cuda", dtype=torch.int32)
-    commit(case, accepted, ended_slots=(0, 2))
+    ends = commit(case, accepted, ended_slots=(0, 2))
+    # Both ended requests' states are complete, so their finishes may publish.
+    assert ends.tolist() == [REQUEST_ENDED, 0, REQUEST_ENDED]
     history = case["records"].history
-    # A cross-page verify folded the two accepted records into row 1's new
-    # live page before appending its candidates.
+    # Before a cross-page verify, the prepare folded the two accepted records
+    # into row 1's new live page, so its candidates start the slot over.
     assert history.length[:, 0].tolist() == [0, (0 if cross_page else 2) + 1, 0]
     # Each live page plus its slot's remaining records is the endpoint.
     check_prefix(case, accepted, expected)

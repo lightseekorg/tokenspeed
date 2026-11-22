@@ -543,6 +543,7 @@ class RuntimeStates:
         accept_lengths: torch.Tensor,
         input_lengths: torch.Tensor,
         prompt_lengths: torch.Tensor,
+        request_ends: torch.Tensor,
         *,
         num_extends: int,
         num_prefill_outputs: int,
@@ -550,7 +551,8 @@ class RuntimeStates:
         padding_index: int,
     ) -> None:
         """Cut this forward's accepted widths at each request's stop
-        conditions and record which requests ended (``stopped``).
+        conditions and record which requests ended (``stopped``, per slot,
+        and ``request_ends``, the per-row report the control plane reads).
 
         Must run before anything reads ``accept_lengths``; see
         ``tokenspeed_kernel.ops.metadata.apply_stop_conditions``.
@@ -565,6 +567,7 @@ class RuntimeStates:
             self.stop_token_ids,
             self.token_limits,
             self.stopped,
+            request_ends,
             num_extends=num_extends,
             num_prefill_outputs=num_prefill_outputs,
             decode_width=decode_width,

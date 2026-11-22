@@ -70,7 +70,11 @@ the even and odd U contributions in FP32. Empty histories use only the
 checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
 Convolution and accepted-length publication use the common retained commit
-ABI.
+ABI. A request that ended in the forward has its records folded into its live
+page by the commit; if a layer rejects its commit (stale stamps, an interval
+past the capacity), the commit raises the row's `request_ends` entry to
+`REQUEST_ENDED_INCOMPLETE` instead, so the control plane never publishes a
+page that lacks accepted tokens.
 
 ## Retained preparation
 

@@ -22,6 +22,7 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.metadata.stop_conditions import REQUEST_ENDED_INCOMPLETE
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -155,6 +156,7 @@ def batched_commit(
     retained_key,
     retained_decay,
     request_stopped,
+    request_ends,
     draft_token_num,
     history_capacity,
     num_heads,
@@ -189,6 +191,11 @@ def batched_commit(
     Such a request's accepted records, through this round's acceptance, are
     folded into its live page's dense state, and its length is cleared
     instead of advanced. No other dense checkpoint or record is copied.
+    request_ends is the contiguous INT32 [requests] ``apply_stop_conditions``
+    report for these rows: a request that ended but whose commit a layer
+    rejected (stale stamps, an interval past the capacity) keeps records
+    outside its live page, and its entry becomes ``REQUEST_ENDED_INCOMPLETE``
+    so its finish publishes nothing.
     """
     if (
         num_heads <= 0
@@ -276,6 +283,12 @@ def batched_commit(
         )
     if request_stopped.ndim != 1 or request_stopped.dtype != torch.bool:
         raise ValueError("request stop flags must be a bool vector")
+    if (
+        request_ends.shape != (batch,)
+        or request_ends.dtype != torch.int32
+        or not request_ends.is_contiguous()
+    ):
+        raise ValueError("request ends must be contiguous INT32 [requests]")
     if any(
         x.device != descriptors.device
         for x in (
@@ -289,6 +302,7 @@ def batched_commit(
             record_stamps,
             *records,
             request_stopped,
+            request_ends,
         )
     ):
         raise ValueError("retained commit tensors must share a device")
@@ -338,8 +352,10 @@ def batched_commit(
     )
     kernels.retained_batched_publish_kernel[(layers, batch)](
         *args,
+        request_ends,
         CAPACITY=history_capacity,
         WINDOW=draft_token_num,
+        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
         num_warps=4,
         **options,
     )

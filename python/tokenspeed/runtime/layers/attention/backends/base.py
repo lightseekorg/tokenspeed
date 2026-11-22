@@ -230,17 +230,24 @@ class CachePoolBinding:
         del slot
         return []
 
-    def bind_request_stop_flags(self, stopped: torch.Tensor) -> None:
-        """Share the per-slot request-end flags with the nodes that read them.
+    def bind_request_stop_flags(
+        self, stopped: torch.Tensor, request_ends: torch.Tensor
+    ) -> None:
+        """Share the request-end flags with the nodes that read them.
 
         ``stopped`` is ``RuntimeStates.stopped``, one bool per request slot.
         The sampling epilogue sets it in the forward that ends a request,
-        before the decode commit runs. The executor binds it once; its
-        storage lives as long as the executor. Broadcast to child backends;
-        a node whose commit leaves no deferred state ignores it.
+        before the decode commit runs. ``request_ends`` is the executor's
+        INT32 per-row report of a forward's requests (``apply_stop_conditions``
+        writes it in the sampling epilogue): a commit that cannot complete
+        the deferred decode state of a request that ended raises its row to
+        ``REQUEST_ENDED_INCOMPLETE``, and the control plane then stops rather
+        than publish it. The executor binds both once; their storage lives as
+        long as the executor. Broadcast to child backends; a node whose
+        commit leaves no deferred state ignores them.
         """
         for child in self.child_backends():
-            child.bind_request_stop_flags(stopped)
+            child.bind_request_stop_flags(stopped, request_ends)
 
     def fold_deferred_state(
         self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream

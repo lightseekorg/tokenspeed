@@ -446,10 +446,16 @@ learns that the request ended. BF16 dense storage rounds at this boundary.
 A finish the device's stop criteria do not explain -- a grammar that ends
 while the request ignores EOS, a client abort -- leaves the records
 unfolded. With a group deferring its decode state
-(`Scheduler::DefersDecodeState`), the control plane ends such a request with
-`forward::Abort` rather than `forward::Finish`, so it publishes nothing, as
-for a numerically corrupted forward; the slot's next admission clears the
-count (`reset_request_workspace`).
+(`Scheduler::DefersDecodeState`), the control plane publishes on the device's
+word alone: every forward reports per row whether the device ended the
+request (`request_ends`, written by the sampling epilogue's stop conditions
+and raised by the commit when a layer rejected the row's commit). A request
+the device did not end gets `forward::Abort` rather than `forward::Finish`, so
+it publishes nothing, as for a numerically corrupted forward, and the slot's
+next admission clears the count (`reset_request_workspace`). A request the
+device ended but could not complete -- records left outside the live block --
+is an engine error (`CommitError::IncompleteDecodeState`): the engine stops
+rather than publish an incomplete state.
 
 A retraction publishes and images the victim's computed frontier. The
 backend declares its State groups as deferring their decode state

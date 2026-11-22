@@ -361,6 +361,7 @@ def test_reused_rid_updates_stop_criteria(
         accepted,
         torch.ones(1, dtype=torch.int32, device=device),
         torch.empty(0, dtype=torch.int32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
         num_extends=0,
         num_prefill_outputs=0,
         decode_width=1,
