@@ -15,6 +15,13 @@ on:
       source_sha:
         required: true
         type: string
+      release_candidate:
+        required: false
+        type: string
+      replace_nightly:
+        required: false
+        type: boolean
+        default: false
     secrets:
       LIGHTSEEK_BOT_TOKEN:
         required: true
@@ -77,11 +84,17 @@ jobs:
         id: version
         env:
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION_DATE: ${{ inputs.version_date }}
           PUBLISH_POST_TO_PYPI: ${{ inputs.publish_post_to_pypi }}
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
+          if [ "$REPLACE_NIGHTLY" = true ] && [ "$RELEASE_TYPE" != nightly ]; then
+            echo "Replacement is only supported for coordinated nightly releases." >&2
+            exit 1
+          fi
           if [ "$PUBLISH_POST_TO_PYPI" = true ] && [ "$RELEASE_TYPE" != post ]; then
             echo "publish_post_to_pypi is only valid for post releases." >&2
             exit 1
@@ -96,7 +109,7 @@ jobs:
             version_args+=(--release-tags release-tags.txt)
           fi
           version=$(python .github/scripts/prepare-engine-release.py . \
-            --target version --kind "$RELEASE_TYPE" --date "$VERSION_DATE" "${version_args[@]}")
+            --target version --kind "$RELEASE_TYPE" --date "$VERSION_DATE" --release-candidate "$RELEASE_CANDIDATE" "${version_args[@]}")
           if [ "$RELEASE_TYPE" = post ]; then
             VERSION_DATE=${version##*.post}
           fi
@@ -143,11 +156,12 @@ jobs:
       - name: Apply wheel version to the build checkout
         env:
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION_DATE: ${{ needs.metadata.outputs.date }}
           EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           version=$(python .github/scripts/prepare-engine-release.py . \
-            --target engine --kind "$RELEASE_TYPE" --date "$VERSION_DATE")
+            --target engine --kind "$RELEASE_TYPE" --date "$VERSION_DATE" --release-candidate "$RELEASE_CANDIDATE")
           test "$version" = "$EXPECTED_VERSION"
 
       - name: Build and repair wheel
@@ -218,9 +232,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION: ${{ needs.metadata.outputs.version }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
           SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           gh auth status
           test "$(gh api user --jq .login)" = lightseek-bot
@@ -233,9 +249,13 @@ jobs:
           cat release-notes.txt
           if gh release view "$TAG_NAME" --repo lightseekorg/whl >/dev/null 2>&1; then
             existing_notes=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json body --jq .body)
-            if [ "$existing_notes" != "$notes" ]; then
+            if [ "$REPLACE_NIGHTLY" != true ] && [ "$existing_notes" != "$notes" ]; then
               echo "This version belongs to a different source commit; start a new post run or choose a new version." >&2
               exit 1
+            fi
+            if [ "$REPLACE_NIGHTLY" = true ]; then
+              gh release upload "$TAG_NAME" dist/*.whl --repo lightseekorg/whl --clobber
+              gh release edit "$TAG_NAME" --repo lightseekorg/whl --notes-file release-notes.txt
             fi
             existing_assets=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json assets --jq '.assets[].name')
             for asset in dist/*.whl; do
@@ -245,7 +265,7 @@ jobs:
             done
           else
             flags=()
-            if [ "$RELEASE_TYPE" = rc ]; then
+            if [ "$RELEASE_TYPE" = rc ] || [ "$RELEASE_TYPE" = nightly ]; then
               flags+=(--prerelease --latest=false)
             fi
             gh release create "$TAG_NAME" dist/*.whl --repo lightseekorg/whl \
@@ -266,13 +286,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           variant=engine-nightly
+          replace_args=()
+          if [ "${{ inputs.replace_nightly }}" = true ]; then
+            replace_args+=(--replace)
+          fi
           if [ "$RELEASE_TYPE" = release ]; then
             variant=engine-release
           fi
-          python .github/scripts/update-nightly-index.py \
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
             --package tokenspeed-engine --variant "$variant" \
             wheelhouse engine-release.json dist > engine-index-paths.txt
           mapfile -t index_paths < engine-index-paths.txt
