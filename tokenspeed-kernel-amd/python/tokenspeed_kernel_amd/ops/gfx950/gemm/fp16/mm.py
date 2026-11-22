@@ -1864,7 +1864,6 @@ _DECODE_ONLY_CONFIGS: dict[
     },
 }
 # A shape is in one table only: the lookups below take the first that has it.
-assert not set(_DECODE_CONFIGS) & set(_DECODE_ONLY_CONFIGS)
 DECODE_MIN_M = 2
 
 

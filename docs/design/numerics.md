@@ -422,6 +422,23 @@ declaration does not promise identical bits between different providers or
 agreement with a trainer; those comparisons need numerical acceptance for the
 chosen implementation and operation order.
 
+### Decode-forward kernels
+
+A dense GEMM call may state `decode_forward`: its rows are the decode or
+verify rows of the step. Kernels registered with the trait
+`decode_forward={True}` serve only such calls; every other call (prefill,
+extend, and any caller that does not state it) selects as if those kernels
+did not exist. The trait describes the rows, not a second execution path: a
+given decode row reaches the same kernel in every step, and a prompt row
+reaches main's kernel whatever its row count. A model that sets the trait
+must therefore not run decode rows inside a mixed prefill / decode forward;
+Muse Spark rejects mixed rounds.
+
+The alternative, selecting by row count in every forward, puts a prompt's
+short prefill tail (a few dozen rows) on a decode-tuned kernel, so a single
+request's output stops being bitwise main's for no measured gain. Decode-only
+selection keeps prefill and single-request output unchanged.
+
 ### Initialization-time kernel plans
 
 A numerical requirement is independent of its provider. Dense projections and

@@ -62,6 +62,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     supports_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
+    _DECODE_ONLY_CONFIGS,
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
     _supports_mfma_lds_smallm,
@@ -531,6 +532,18 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     assert not supports_gluon_mm_a16w16_decode_only_gfx950(33, 1024, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
+
+
+def test_decode_only_shapes_have_no_entry_for_every_forward() -> None:
+    """The decode GEMM's lookup takes the first table that has a shape, so a
+    shape in both tables would lose its decode-only entries without notice."""
+    for n, k in _DECODE_ONLY_CONFIGS:
+        for rows in range(1, 257):
+            assert not supports_gluon_mm_a16w16_decode_gfx950(rows, n, k), (
+                rows,
+                n,
+                k,
+            )
 
 
 # The K3.1 TP8 speculative-verify buckets at ragged and full row counts, twice
