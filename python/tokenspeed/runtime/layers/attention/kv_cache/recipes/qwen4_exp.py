@@ -270,7 +270,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 # Raw scheduler IDs carry no atom multiplier.
                 stride = payload
             if spec.group_id == QWEN4_EXP_QSA_CACHE_GROUP:
-                # Its write slots are int64; its int32 values are atom page IDs.
+                # Its write slots are int64; its int32 atom IDs assume binding at block granularity.
                 block_tokens = 1
             limit = min(
                 limit,
