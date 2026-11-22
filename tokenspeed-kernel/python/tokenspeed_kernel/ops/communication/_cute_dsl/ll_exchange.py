@@ -62,6 +62,8 @@ UNIT = 16
 THREADS = 512
 # Fewer CTAs than SMs, so a call's grid fits beside the kernels around it.
 MAX_CTAS = 64
+# Per-rank float-gather payloads from which a call takes every SM.
+WIDE_FLOAT_BYTES = 256 << 10
 
 
 def _asm(code, constraints, operands, loc, ip):
@@ -116,6 +118,42 @@ def _poll_unit(slot, out, epoch, deadline, *, loc=None, ip=None):
     _asm(code, "l,l,r,l", [slot, out, epoch, deadline], loc, ip)
 
 
+# The float exchange's armed word: a NaN no sender stores (it sends 0x7FFFFFFF).
+SENTINEL = 0xFFFFFFFF
+
+
+@dsl_user_op
+def _push_float_unit(src, dst, *, loc=None, ip=None):
+    """Store the 16 bytes at ``src`` at ``dst``, a sentinel as 0x7FFFFFFF."""
+    code = "{ .reg .b32 w0, w1, w2, w3; .reg .pred p;\n"
+    code += "ld.global.nc.v4.b32 {w0, w1, w2, w3}, [$0];\n"
+    for w in range(4):
+        code += f"setp.eq.u32 p, w{w}, {SENTINEL}; @p mov.b32 w{w}, 0x7FFFFFFF;\n"
+    code += "st.relaxed.sys.global.v4.b32 [$1], {w0, w1, w2, w3}; }"
+    _asm(code, "l,l", [src, dst], loc, ip)
+
+
+@dsl_user_op
+def _poll_float_unit(slot, out, deadline, *, loc=None, ip=None):
+    """Wait for every word at ``slot`` to land, store them, and re-arm it."""
+    code = "{ .reg .b32 w0, w1, w2, w3; .reg .b64 now; .reg .pred p;\n"
+    code += "SENT_WAIT${:uid}:\n"
+    code += "ld.relaxed.sys.global.v4.b32 {w0, w1, w2, w3}, [$0];\n"
+    for w in range(4):
+        code += f"setp.eq.u32 p, w{w}, {SENTINEL}; @p bra SENT_LATE${{:uid}};\n"
+    code += "bra.uni SENT_DONE${:uid};\n"
+    code += "SENT_LATE${:uid}:\n"
+    code += "mov.u64 now, %globaltimer;\n"
+    code += "setp.lt.u64 p, now, $2; @p bra SENT_WAIT${:uid};\n"
+    code += "trap;\n"
+    code += "SENT_DONE${:uid}:\n"
+    code += "st.global.v4.b32 [$1], {w0, w1, w2, w3};\n"
+    code += (
+        f"st.global.v4.b32 [$0], {{{SENTINEL}, {SENTINEL}, {SENTINEL}, {SENTINEL}}}; }}"
+    )
+    _asm(code, "l,l,l", [slot, out, deadline], loc, ip)
+
+
 @dsl_user_op
 def _globaltimer(*, loc=None, ip=None):
     """The ``%globaltimer`` nanosecond clock that bounds every wait."""
@@ -167,10 +205,13 @@ def _finish(ctrl, grid, count, *, loc=None, ip=None):
 class LLExchange:
     """One call: push this rank's units, then receive every rank's."""
 
-    def __init__(self, ranks: int, gather: bool, multicast: bool):
+    def __init__(self, ranks: int, gather: bool, multicast: bool, floats: bool):
         self.ranks = ranks
         self.gather = gather
         self.multicast = multicast
+        # Float words travel as themselves (see SENTINEL), else as LL elements.
+        self.floats = floats
+        self.slot = UNIT if floats else 2 * UNIT
 
     @cute.jit
     def __call__(self, src: Int64, out: Int64, peers: cute.Tensor, ctrl: Int64, units: Int32, cap: Int32, rank: Int32, grid: Int32, multicast: Int64, timeout: Int64, stream: cuda.CUstream):  # fmt: skip
@@ -197,14 +238,14 @@ class LLExchange:
         i = start
         if cutlass.const_expr(self.multicast):
             while i < Int64(units):
-                _push_unit(src + i * UNIT, multicast + (sender_row + i) * (2 * UNIT), epoch)  # fmt: skip
+                self.push(src + i * UNIT, multicast + (sender_row + i) * self.slot, epoch)  # fmt: skip
                 i = i + stride
         else:
             while i < total:
                 d = i // Int64(units)
                 j = i - d * Int64(units)
                 source = src + (j if self.gather else i) * UNIT
-                _push_unit(source, peers[Int32(d)] + (sender_row + j) * (2 * UNIT), epoch)  # fmt: skip
+                self.push(source, peers[Int32(d)] + (sender_row + j) * self.slot, epoch)  # fmt: skip
                 i = i + stride
         # Receive: unit j of rank s from this rank's slot [parity][s][j].
         mine = peers[rank]
@@ -213,21 +254,31 @@ class LLExchange:
         while i < total:
             s = i // Int64(units)
             j = i - s * Int64(units)
-            slot = mine + ((parity_row + s) * Int64(cap) + j) * (2 * UNIT)
-            _poll_unit(slot, out + i * UNIT, epoch, deadline)
+            slot = mine + ((parity_row + s) * Int64(cap) + j) * self.slot
+            if cutlass.const_expr(self.floats):
+                _poll_float_unit(slot, out + i * UNIT, deadline)
+            else:
+                _poll_unit(slot, out + i * UNIT, epoch, deadline)
             i = i + stride
         cute.arch.sync_threads()
         if tid == 0:
             _finish(ctrl, Uint32(grid), count)
 
+    @cute.jit
+    def push(self, src: Int64, dst: Int64, epoch: Uint32):
+        if cutlass.const_expr(self.floats):
+            _push_float_unit(src, dst)
+        else:
+            _push_unit(src, dst, epoch)
+
 
 @functools.cache
-def _compiled(ranks: int, gather: bool, multicast: bool, device_index: int):
+def _compiled(ranks: int, gather: bool, multicast: bool, floats: bool, device_index: int):  # fmt: skip
     with torch.cuda.device(device_index):
         peers = make_fake_compact_tensor(cutlass.Int64, (ranks,), assumed_align=8)
         args = (Int64(0), Int64(0), peers, Int64(0), Int32(1), Int32(1), Int32(0))
         args += (Int32(1), Int64(0), Int64(1), make_fake_stream())
-        return cute.compile(LLExchange(ranks, gather, multicast), *args)
+        return cute.compile(LLExchange(ranks, gather, multicast, floats), *args)
 
 
 class LLExchangeState:
@@ -239,6 +290,7 @@ class LLExchangeState:
         device: torch.device,
         *,
         cap_bytes: int,
+        float_cap_bytes: int,
         multicast: bool,
         timeout_ns: int,
     ) -> None:
@@ -251,51 +303,90 @@ class LLExchangeState:
         self.device = device
         self.cap_units = cap_bytes // UNIT
         self.cap_bytes = self.cap_units * UNIT
+        self.float_cap_units = float_cap_bytes // UNIT
+        self.float_cap_bytes = self.float_cap_units * UNIT
         self.timeout_ns = timeout_ns
-        slot_bytes = 2 * self.ranks * self.cap_units * 2 * UNIT
         with torch.cuda.device(device):
-            self.workspace = symm_mem.empty(
-                (slot_bytes,), dtype=torch.uint8, device=device
+            # Epoch 0 marks every LL element unwritten; no call's epoch is 0.
+            self.workspace, self.handle, self.peers = self._workspace(
+                group, self.cap_units * 2 * UNIT, 0, device
             )
-            # Epoch 0 marks every element unwritten; no call's epoch is 0.
-            self.workspace.zero_()
-            handle = symm_mem.rendezvous(self.workspace, group=group)
-            self.handle = handle
-            self.peers = torch.tensor(
-                list(handle.buffer_ptrs), dtype=torch.int64, device=device
-            )
-            self.multicast_ptr = int(handle.multicast_ptr) if multicast else 0
-            # The call count, then the CTA ticket in the low half of word 1.
+            self.multicast_ptr = int(self.handle.multicast_ptr) if multicast else 0
+            # Each workspace's call count, then the CTA ticket in the low half
+            # of word 1.
             self.ctrl = torch.zeros(2, dtype=torch.int64, device=device)
             self.peers_view = from_dlpack(self.peers, assumed_align=8)
             self.sms = torch.cuda.get_device_properties(device).multi_processor_count
             for gather in (True, False):
-                _compiled(self.ranks, gather, gather and multicast, device.index)
+                _compiled(self.ranks, gather, gather and multicast, False, device.index)
+            # A float cap's slots start armed with the sentinel.
+            self.float_workspace: torch.Tensor | None = None
+            self.float_handle = None
+            self.float_peers: torch.Tensor | None = None
+            self.float_peers_view = None
+            self.float_multicast_ptr = 0
+            self.float_ctrl: torch.Tensor | None = None
+            if self.float_cap_units:
+                self.float_workspace, self.float_handle, self.float_peers = (
+                    self._workspace(group, self.float_cap_units * UNIT, 0xFF, device)
+                )
+                self.float_peers_view = from_dlpack(self.float_peers, assumed_align=8)
+                if multicast:
+                    self.float_multicast_ptr = int(self.float_handle.multicast_ptr)
+                self.float_ctrl = torch.zeros(2, dtype=torch.int64, device=device)
+                _compiled(self.ranks, True, multicast, True, device.index)
             torch.cuda.synchronize(device)
-        # Every rank's workspace is zeroed before any peer stores into it.
+        # Every rank's workspaces are set before any peer stores into them.
         dist.barrier(group=group)
 
-    def serves(self, payload_bytes: int) -> bool:
-        """Whether a per-rank payload of this size fits one call."""
-        return 0 < payload_bytes <= self.cap_bytes and payload_bytes % UNIT == 0
+    def _workspace(self, group, slot_bytes: int, fill: int, device):
+        """Return a mapped workspace as (workspace, handle, peer addresses).
 
-    def launch(self, src: torch.Tensor, out: torch.Tensor, *, gather: bool) -> None:
-        """Run one call; the public entries validate the tensors first."""
+        It holds two parities of ``slot_bytes`` per rank, filled with ``fill``
+        and mapped by every rank.
+        """
+        workspace = symm_mem.empty(
+            (2 * self.ranks * max(slot_bytes, UNIT),), dtype=torch.uint8, device=device
+        )
+        workspace.fill_(fill)
+        handle = symm_mem.rendezvous(workspace, group=group)
+        peers = torch.tensor(list(handle.buffer_ptrs), dtype=torch.int64, device=device)
+        return workspace, handle, peers
+
+    def serves(self, payload_bytes: int, *, floats: bool) -> bool:
+        """Whether a per-rank payload of this size fits one call.
+
+        ``floats`` asks for a payload of float words (an all-gather).
+        """
+        cap = self.float_cap_bytes if floats else self.cap_bytes
+        return 0 < payload_bytes <= cap and payload_bytes % UNIT == 0
+
+    def launch(
+        self, src: torch.Tensor, out: torch.Tensor, *, gather: bool, floats: bool
+    ) -> None:
+        """Run one call; the public entries validate the tensors first.
+
+        ``floats`` (gathers only) sends float words as themselves.
+        """
         payload = src.numel() * src.element_size() // (1 if gather else self.ranks)
         units = payload // UNIT
-        grid = max(1, min(MAX_CTAS, -(-self.ranks * units // THREADS)))
-        multicast = gather and self.multicast_ptr != 0
+        # A large float gather is bandwidth-bound and takes every SM it can
+        # use; smaller calls leave SMs to the kernels they overlap.
+        cap = self.sms if floats and payload >= WIDE_FLOAT_BYTES else MAX_CTAS
+        grid = max(1, min(cap, -(-self.ranks * units // THREADS)))
         stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
-        _compiled(self.ranks, gather, multicast, self.device.index)(
+        multicast_ptr = self.float_multicast_ptr if floats else self.multicast_ptr
+        multicast = gather and multicast_ptr != 0
+        _compiled(self.ranks, gather, multicast, floats, self.device.index)(
             Int64(src.data_ptr()),
             Int64(out.data_ptr()),
-            self.peers_view,
-            Int64(self.ctrl.data_ptr()),
+            self.float_peers_view if floats else self.peers_view,
+            Int64((self.float_ctrl if floats else self.ctrl).data_ptr()),
             Int32(units),
-            Int32(self.cap_units),
+            Int32(self.float_cap_units if floats else self.cap_units),
             Int32(self.rank),
             Int32(grid),
-            Int64(self.multicast_ptr),
+            Int64(multicast_ptr),
             Int64(self.timeout_ns),
             stream,
         )
@@ -306,10 +397,16 @@ def build_ll_exchange_state(
     device: torch.device,
     *,
     cap_bytes: int,
+    float_cap_bytes: int,
     multicast: bool,
     timeout_ns: int,
 ) -> LLExchangeState:
     """Allocate, rendezvous and compile a group's LL exchange (collective)."""
     return LLExchangeState(
-        group, device, cap_bytes=cap_bytes, multicast=multicast, timeout_ns=timeout_ns
+        group,
+        device,
+        cap_bytes=cap_bytes,
+        float_cap_bytes=float_cap_bytes,
+        multicast=multicast,
+        timeout_ns=timeout_ns,
     )

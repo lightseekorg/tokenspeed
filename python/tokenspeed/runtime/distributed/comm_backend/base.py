@@ -90,15 +90,26 @@ class CommBackend(ABC):
         return False
 
     def prepare_small_exchange(
-        self, group: Group, cap_bytes: int, timeout_ns: int
+        self, group: Group, cap_bytes: int, float_cap_bytes: int, timeout_ns: int
     ) -> bool:
         """Collectively prepare a one-hop exchange for small payloads.
 
         It serves ``all_gather_single``, ``all_gather`` and equal-split
-        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank; False
-        keeps the generic collectives.
+        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank, and
+        ``all_gather_float_words_single`` calls of up to ``float_cap_bytes``
+        (0 for none); False keeps the generic collectives.
         """
         return False
+
+    def all_gather_float_words_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        """Run ``all_gather_single`` over float words.
+
+        The words are FP32, BF16 pairs, or E4M3 bytes; a NaN word may come
+        back with other NaN bits.
+        """
+        self.all_gather_single(output, input, group)
 
     def try_shard_exchange(
         self, tensor: torch.Tensor, group: Group, inverse: bool
@@ -187,6 +198,20 @@ class CommBackend(ABC):
         )
 
         return projection_mm_reduce_scatter(tensor, rows, weight, workspace, self)
+
+    def projection_mm_to_owners(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> torch.Tensor:
+        """Project all rows through an output shard and return owner rows complete."""
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_mm_to_owners,
+        )
+
+        return projection_mm_to_owners(tensor, rows, weight, workspace, self)
 
     def projection_all_to_all(
         self,
