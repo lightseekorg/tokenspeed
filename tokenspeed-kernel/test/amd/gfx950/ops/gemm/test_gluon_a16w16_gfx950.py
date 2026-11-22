@@ -1014,6 +1014,31 @@ def test_decode_gemm_serves_muse_tp4_pre_expert_rows() -> None:
             run(rows)
 
 
+def test_mm_warmup_compiles_the_decode_gemm_for_every_row_count() -> None:
+    """A warm-up mm on a weight compiles every decode GEMM config it has.
+
+    The Muse TP4 pre-expert projection takes the decode GEMM only at 9-32
+    rows, with another config from 17 rows. A warm-up GEMM at 2 rows, which
+    the decode GEMM does not take, still compiles both, so a startup that never
+    runs 17 rows compiles nothing of it while serving."""
+    torch.manual_seed(0)
+    n, k = 1024, 8192
+    a = torch.randn((32, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    assert not supports_gluon_mm_a16w16_decode_gfx950(2, n, k)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(a[:2], b)
+
+    assert_warmup_covers(
+        (gluon_mm_a16w16_medium_gfx950,),
+        warm,
+        lambda rows: mm(a[:rows], b),
+        range(2, 33),
+    )
+
+
 def test_medium_coalesced_store_masks_strided_out() -> None:
     # 128x128 medium tiles store through the coalesced row layout; a padded
     # row stride must stay inside the output view.

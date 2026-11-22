@@ -434,8 +434,9 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         """Run one two-row local-columns GEMM inside the warm-up scope.
 
         Two rows is the fewest that take the GEMM rather than the one-row
-        GEMV; kernels that compile their row tiles when a warm-up GEMM meets
-        their weight (the skinny GEMM) compile them for this weight.
+        GEMV; kernels that compile their binaries when a warm-up GEMM meets
+        their weight (the skinny GEMM, the decode GEMM) compile them for this
+        weight.
         """
         weight = self._local_weight()
         with kernel_warmup(enabled=True):

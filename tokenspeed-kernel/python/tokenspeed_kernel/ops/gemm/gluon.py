@@ -132,6 +132,9 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        compile_gluon_mm_a16w16_decode_gfx950 as _compile_mm_a16w16_decode,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_grouped_mm_a16w16_decode_num_counters_gfx950 as _grouped_decode_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
@@ -151,6 +154,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_weight_gfx950 as _supports_decode_weight,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (
         compile_gluon_mm_a16w16_skinny_gfx950 as _compile_mm_a16w16_skinny,
@@ -1985,6 +1991,37 @@ def warm_gluon_mm_a16w16_skinny(x: torch.Tensor, weight: torch.Tensor) -> None:
     ):
         return
     _compile_mm_a16w16_skinny(weight.detach())
+
+
+def warm_gluon_mm_a16w16_decode(x: torch.Tensor, weight: torch.Tensor) -> None:
+    """Compile the gfx950 decode GEMM's binaries during startup kernel warmup.
+
+    The decode GEMM's configs change by row bucket, and startup warmup need not
+    run a row count of every bucket a weight has; its binaries do not depend on
+    the row count, so warming every measured config on any GEMM that meets the
+    weight keeps compilation out of graph capture and serving. Like
+    :func:`warm_gluon_mm_a16w16_skinny`, ``mm`` calls this on its plain BF16
+    path only, and it does nothing outside
+    :func:`~tokenspeed_kernel.ops.tuning.kernel_warmup`, while the current
+    stream is capturing, off gfx950, or for a weight with no decode config.
+
+    Args:
+        x: Activations of the encountered GEMM; only their dtype is used.
+        weight: ``[N, K]`` weight of the encountered GEMM.
+    """
+    if not is_warming_up() or not platform.is_cdna4:
+        return
+    if (
+        x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or weight.ndim != 2
+        or not weight.is_cuda
+        or not weight.is_contiguous()
+        or not _supports_decode_weight(weight.shape[0], weight.shape[1])
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _compile_mm_a16w16_decode(weight.detach())
 
 
 __all__ = [

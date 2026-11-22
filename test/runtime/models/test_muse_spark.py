@@ -2252,19 +2252,20 @@ def test_prefill_collective_payload_is_validated_in_server_args() -> None:
     not current_platform().is_cdna4, reason="the skinny BF16 GEMM is gfx950-only"
 )
 @pytest.mark.parametrize("ranks", [4, 8])
-def test_gathered_projection_warmup_covers_its_skinny_gemm(
+def test_gathered_projection_warmup_covers_its_gemms(
     monkeypatch: pytest.MonkeyPatch, bf16_default_dtype, ranks: int
 ) -> None:
-    """A gathered projection's warm-up leaves no skinny GEMM to compile.
+    """A gathered projection's warm-up leaves none of its GEMMs to compile.
 
-    After its local-GEMM warm-up, its GEMM at any row count compiles no skinny
-    GEMM binary: the pre-expert projection's [1024, 8192] columns at TP4
-    (which the skinny GEMM serves) and [512, 8192] at TP8 (which it does not,
-    so nothing compiles either way)."""
+    After its local-GEMM warm-up, its GEMM at any row count compiles no decode
+    or skinny GEMM binary: the pre-expert projection's [1024, 8192] columns at
+    TP4 (the decode GEMM at 9-32 rows, with another config from 17 rows, and
+    the skinny GEMM at 33-128) and [512, 8192] at TP8 (the decode GEMM
+    only)."""
     import importlib.util
     from pathlib import Path
 
-    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import skinny
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm, skinny
 
     helper_path = (
         Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
@@ -2301,6 +2302,7 @@ def test_gathered_projection_warmup_covers_its_skinny_gemm(
 
     helpers.assert_warmup_covers(
         (
+            mm.gluon_mm_a16w16_medium_gfx950,
             skinny.gluon_mm_a16w16_skinny_gfx950,
             skinny.gluon_mm_a16w16_skinny_reduce_gfx950,
         ),
