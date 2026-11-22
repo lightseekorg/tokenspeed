@@ -395,9 +395,8 @@ def test_qwen4_exp_qsa_fused_query_and_verify_staging_matches_separate(
     )
 
     torch.testing.assert_close(actual_query, expected_query, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(
-        actual_compressed, expected_compressed, rtol=2e-2, atol=2e-2
-    )
+    # The query's own program must leave the compressed keys' bits unchanged.
+    torch.testing.assert_close(actual_compressed, expected_compressed, rtol=0, atol=0)
     torch.testing.assert_close(staged[0], token_k[-4:].reshape_as(staged[0]))
     torch.testing.assert_close(staged[1], position_values[-4:].reshape_as(staged[1]))
     torch.testing.assert_close(staged[2], logical[-4:].reshape_as(staged[2]))
@@ -494,9 +493,7 @@ def test_qwen4_exp_qsa_fused_draft_staging_reads_old_ring_first(
         stage_verify_buffers=None,
     )
 
-    torch.testing.assert_close(
-        actual_compressed, expected_compressed, rtol=2e-2, atol=2e-2
-    )
+    torch.testing.assert_close(actual_compressed, expected_compressed, rtol=0, atol=0)
     for actual, expected in zip(actual_scratch, expected_scratch, strict=True):
         torch.testing.assert_close(actual, expected)
 
