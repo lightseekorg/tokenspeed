@@ -215,7 +215,7 @@ def test_gemv_compiles_once_per_row_bucket():
 def test_mm_takes_the_gemv_only_at_its_measured_buckets(m):
     for n, k in ((2560, 3072), (6144, 2560), (12288, 2560)):
         selected = _select_mv(
-            m, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True, False
+            m, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
         )
         assert (selected is registered_gemv) is prefers_gluon_gemv_a16w16_gfx950(
             m, n, k
@@ -244,7 +244,6 @@ def test_selection_takes_the_gemv_on_every_listed_bucket():
                     False,
                     True,
                     True,
-                    False,
                 )
                 assert selected is registered_gemv, (m, n, k)
 

@@ -832,26 +832,12 @@ def _muse_tp_owned_forward_worker(
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
             expected_rows, _ = moe(
-                full,
-                full.float(),
-                rows,
-                rows,
-                None,
-                project=True,
-                payload="bf16",
-                decode_forward=False,
+                full, full.float(), rows, rows, None, project=True, payload="bf16"
             )
             expected_rows = expected_rows.clone()
             expected = expected_rows[first : first + valid]
             actual, _ = moe(
-                local,
-                local.float(),
-                rows,
-                rows,
-                rows,
-                project=True,
-                payload="bf16",
-                decode_forward=False,
+                local, local.float(), rows, rows, rows, project=True, payload="bf16"
             )
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
@@ -867,18 +853,10 @@ def _muse_tp_owned_forward_worker(
                     rows_in = full[:small].contiguous()
                     router_in = rows_in.float()
                     assert (
-                        moe._route_and_quantize_inputs(rows_in, router_in, True)
-                        is not None
+                        moe._route_and_quantize_inputs(rows_in, router_in) is not None
                     )
                     decode, _ = moe(
-                        rows_in,
-                        router_in,
-                        small,
-                        small,
-                        None,
-                        True,
-                        payload="bf16",
-                        decode_forward=True,
+                        rows_in, router_in, small, small, None, True, payload="bf16"
                     )
                     torch.testing.assert_close(
                         decode, expected_rows[:small], atol=2**-7, rtol=2**-7

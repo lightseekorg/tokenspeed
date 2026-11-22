@@ -587,7 +587,6 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
         None,
         project=True,
         payload="bf16",
-        decode_forward=False,
     )
     assert sentinel is None
 
@@ -1811,46 +1810,17 @@ def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     linear.weight.data.normal_(std=0.02)
     x = torch.randn((tokens, 8192), device="cuda", dtype=torch.bfloat16)
     local = torch.full((tokens, 512), torch.nan, device="cuda")
-    linear._project(x, linear.weight, local, decode_forward=True)
+    linear._project(x, linear.weight, local)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_allocated()
 
-    result = linear._project(x, linear.weight, local, decode_forward=True)
+    result = linear._project(x, linear.weight, local)
 
     # Copying through a fresh [tokens, 512] result would raise the peak.
     assert torch.cuda.max_memory_allocated() == before
     assert result is local
-    assert torch.equal(local, mm(x, linear.weight, decode_forward=True))
-
-
-@requires_gpu
-@pytest.mark.parametrize("tokens", [64, 128])
-def test_gathered_projection_states_a_decode_forward_to_the_gemm(
-    bf16_default_dtype, tokens: int
-) -> None:
-    """Only the rows of a decode or verify forward may take a kernel
-    registered for those: an extend's rows of the same count get the bits of
-    the GEMM that serves every forward."""
-    from tokenspeed_kernel.ops.gemm import mm
-
-    if not current_platform().is_cdna4:
-        pytest.skip("the decode-forward GEMMs are registered for gfx950")
-    torch.manual_seed(7)
-    with torch.device("cuda"):
-        linear = _shard_linear(1024, 8192, tp_rank=0, tp_size=1)
-    linear.weight.data.normal_(std=0.02)
-    x = torch.randn((tokens, 8192), device="cuda", dtype=torch.bfloat16)
-    local = torch.empty((tokens, 1024), device="cuda", dtype=torch.bfloat16)
-    for_every_forward = torch.mm(x, linear.weight.T).view(torch.int16)
-    for_decode = mm(x, linear.weight, decode_forward=True).view(torch.int16)
-    # Otherwise the two halves below could not tell the calls apart.
-    assert not torch.equal(for_decode, for_every_forward)
-
-    linear._project(x, linear.weight, local, decode_forward=False)
-    assert torch.equal(local.view(torch.int16), for_every_forward)
-    linear._project(x, linear.weight, local, decode_forward=True)
-    assert torch.equal(local.view(torch.int16), for_decode)
+    assert torch.equal(local, mm(x, linear.weight))
 
 
 @requires_gpu
@@ -1864,7 +1834,7 @@ def test_gathered_projection_reads_a_square_weight_as_out_by_in(
     linear.weight.data.normal_(std=0.02)
     x = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
 
-    result = linear._project(x, linear.weight, None, decode_forward=False)
+    result = linear._project(x, linear.weight, None)
 
     torch.testing.assert_close(result, x @ linear.weight.t(), atol=2**-8, rtol=2**-7)
 
@@ -1926,9 +1896,7 @@ def _gathered_mxfp4_workspace_worker(
             for tokens in (64, 65, 84, 85, fused_max, fused_max + 1):
                 x = torch.ones(tokens, 256, device=device)
                 x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
-                rows, packed = linear.forward_mxfp4(
-                    x, norm_weight, 1e-6, 1.0, decode_forward=False
-                )
+                rows, packed = linear.forward_mxfp4(x, norm_weight, 1e-6, 1.0)
                 assert rows.shape == (tokens, 4096)
                 expected_rows = x[:, :world_size].repeat_interleave(
                     4096 // world_size, dim=1
@@ -2014,9 +1982,7 @@ def test_replicated_pool_preserves_column_projection_after_reload(
             reference.weight_loader(reference.weight, loaded)
             assert pre_expert._local_weight().is_contiguous()
             for x in inputs:
-                torch.testing.assert_close(
-                    pre_expert(x, False), reference(x, False), atol=0, rtol=0
-                )
+                torch.testing.assert_close(pre_expert(x), reference(x), atol=0, rtol=0)
             owned = inputs[1][:5].contiguous()
             output = torch.empty((5, 4096), device="cuda", dtype=torch.bfloat16)
             actual = pre_expert.forward_owned_rows(owned, output)
@@ -2079,9 +2045,7 @@ def test_gathered_projection_stores_its_block_into_a_rank_major_mailbox(
         x = torch.randn(tokens, hidden, device="cuda")
         producer(x, weight, mailbox, mailbox.data_ptr())
         torch.cuda.synchronize()
-        expected = linear._project(x, weight, None, decode_forward=False).view(
-            torch.int16
-        )
+        expected = linear._project(x, weight, None).view(torch.int16)
         assert torch.equal(blocks[rank, :tokens].view(torch.int16), expected)
         # Other ranks' blocks and the rows past the batch keep the sentinel.
         blocks[rank, :tokens].view(torch.int16).fill_(-1)

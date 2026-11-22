@@ -327,7 +327,7 @@ def select_on(monkeypatch):
 
 def _selected(m, n, k, weight_split=True):
     return gemm_api._select_mv(
-        m, n, k, True, torch.bfloat16, torch.float32, weight_split, True, True, False
+        m, n, k, True, torch.bfloat16, torch.float32, weight_split, True, True
     )
 
 

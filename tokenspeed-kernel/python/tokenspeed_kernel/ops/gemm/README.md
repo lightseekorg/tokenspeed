@@ -93,12 +93,7 @@ batch. It needs 16-byte aligned operands and output and declares the
 branch supply: an offset view selects what it would without this kernel.
 Supplying them reads tensor addresses only on a platform that registers a
 kernel declaring them; other CUDA platforms and CPU read none.
-It declares the `decode_forward` trait as well. `mm` and `mv` take
-`decode_forward`, False when left out, and always supply it to selection, so
-a kernel that declares it is selected only for a call that states that its
-rows come from a decode or verify forward. This kernel rounds a row
-differently from the GEMM that serves every forward, and an extend's rows
-keep that one's bits.
+Like every `mv` kernel it is selected by the row count alone, in any forward.
 Startup kernel warmup compiles its binaries from any `mm` call that meets
 such a weight (`warm_gluon_mm_a16w16_skinny`, beside the TGV warm hook), so
 the row counts it takes need not run before serving; outside warmup the two

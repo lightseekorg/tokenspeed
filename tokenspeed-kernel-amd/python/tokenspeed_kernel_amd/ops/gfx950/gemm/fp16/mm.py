@@ -1642,6 +1642,11 @@ _DECODE_CONFIGS: dict[
         128: (32, 32, 256, 2, 2, 3, 4, 1),
         256: (64, 32, 256, 2, 2, 3, 4, 1),
     },
+    # Muse TP4 pre-expert projection at 9-32 rows.
+    (1024, 8192): {
+        16: (16, 16, 512, 2, 2, 4, 4, 8),
+        32: (32, 32, 256, 2, 2, 4, 8, 8),
+    },
     # o_proj
     (7168, 1536): {
         4: (16, 16, 512, 1, 4, 2, 1, 8),
@@ -1850,62 +1855,21 @@ _DECODE_CONFIGS: dict[
         64: (32, 32, 64, 2, 2, 8, 5, 1),
     },
 }
-# Decode-table entries selected only for decode / verify forwards: a second
-# registration of the same launcher declares the decode_forward trait and reads
-# only this table, so a prefill or mixed forward of these rows keeps what the
-# rest of the model runs there. Shapes here are not in _DECODE_CONFIGS.
-_DECODE_ONLY_CONFIGS: dict[
-    tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
-] = {
-    # Muse TP4 pre-expert projection, 9-32 rows.
-    (1024, 8192): {
-        16: (16, 16, 512, 2, 2, 4, 4, 8),
-        32: (32, 32, 256, 2, 2, 4, 8, 8),
-    },
-}
-# A shape is in one table only: the lookups below take the first that has it.
 DECODE_MIN_M = 2
-
-
-def _decode_table(
-    N: int, K: int
-) -> dict[int, tuple[int, int, int, int, int, int, int, int]]:
-    """The measured decode configs of ``[N, K]``, from either table."""
-    return _DECODE_CONFIGS.get((N, K)) or _DECODE_ONLY_CONFIGS.get((N, K), {})
-
-
-def _bucket(M: int) -> int | None:
-    if M < DECODE_MIN_M or M > DECODE_M_BUCKETS[-1]:
-        return None
-    return next(bound for bound in DECODE_M_BUCKETS if M <= bound)
 
 
 def _choose_decode_config(
     M: int, N: int, K: int
 ) -> tuple[int, int, int, int, int, int, int, int] | None:
-    bucket = _bucket(M)
-    return None if bucket is None else _decode_table(N, K).get(bucket)
-
-
-def _choose_any_forward_decode_config(
-    M: int, N: int, K: int
-) -> tuple[int, int, int, int, int, int, int, int] | None:
-    """The decode config of ``_DECODE_CONFIGS`` (entries for every forward)."""
-    bucket = _bucket(M)
-    return None if bucket is None else _DECODE_CONFIGS.get((N, K), {}).get(bucket)
+    if M < DECODE_MIN_M or M > DECODE_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in DECODE_M_BUCKETS if M <= bound)
+    return _DECODE_CONFIGS.get((N, K), {}).get(bucket)
 
 
 def supports_gluon_mm_a16w16_decode_gfx950(M: int, N: int, K: int) -> bool:
-    """Whether the decode GEMM has a measured config beating torch.mm here,
-    for any forward (``_DECODE_CONFIGS``)."""
-    return _choose_any_forward_decode_config(M, N, K) is not None
-
-
-def supports_gluon_mm_a16w16_decode_only_gfx950(M: int, N: int, K: int) -> bool:
-    """Whether the decode GEMM has a measured config here that applies only
-    to decode / verify forwards (``_DECODE_ONLY_CONFIGS``)."""
-    bucket = _bucket(M)
-    return bucket is not None and bucket in _DECODE_ONLY_CONFIGS.get((N, K), {})
+    """Whether the decode GEMM has a measured config beating torch.mm here."""
+    return _choose_decode_config(M, N, K) is not None
 
 
 def gluon_mm_a16w16_decode_num_counters_gfx950(M: int, N: int, K: int) -> int:
@@ -2034,7 +1998,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
             gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](*args, **kwargs)
 
     if warm_variants:
-        for other in dict.fromkeys(_decode_table(N, K).values()):
+        for other in dict.fromkeys(_DECODE_CONFIGS[(N, K)].values()):
             if other != config:
                 launch(other, warm=True)
     launch(config, warm=False)
@@ -2058,7 +2022,7 @@ def supports_gluon_mm_a16w16_column_shard_gfx950(
     The full decode GEMM must have a measured split-K-1 config, so its per-output
     reduction is the shard's.
     """
-    config = _choose_any_forward_decode_config(M, N, K)
+    config = _choose_decode_config(M, N, K)
     return (
         config is not None
         and config[6] == 1
@@ -2338,7 +2302,7 @@ def supports_gluon_mm_a16w16_decode_add3_gfx950(M: int, N: int, K: int) -> bool:
     The addends are added once the full K reduction is in registers, so only
     measured decode configs without split-K qualify.
     """
-    config = _choose_any_forward_decode_config(M, N, K)
+    config = _choose_decode_config(M, N, K)
     return config is not None and config[6] == 1
 
 
@@ -2399,7 +2363,7 @@ def launch_gluon_mm_a16w16_decode_add3_gfx950(
         )
 
     block_m, block_n, block_k, warps_m, warps_n, num_buffers, _, num_xcds = (
-        _choose_any_forward_decode_config(M, N, K)
+        _choose_decode_config(M, N, K)
     )
     C = A.new_empty((M, N))
     num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)

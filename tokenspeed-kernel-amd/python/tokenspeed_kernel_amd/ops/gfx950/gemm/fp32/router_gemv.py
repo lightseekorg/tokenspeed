@@ -28,7 +28,6 @@ from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     DECODE_M_BUCKETS,
     GROUP_SIZE_M,
-    _choose_any_forward_decode_config,
     _choose_decode_config,
     _get_partial_scratch,
     gluon_mm_a16w16_medium_gfx950,
@@ -620,40 +619,24 @@ def gluon_fp32_router_gemv_mm_a16w16_gfx950(
         )  # fmt: skip
 
 
-def _supports_router_gemv_mm(
-    rows: int, n: int, k: int, mm_config: tuple[int, ...] | None
+def supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(
+    rows: int, n: int, k: int, mm_n: int, mm_k: int
 ) -> bool:
+    """Whether ``rows`` router rows and the ``[mm_n, mm_k]`` decode GEMM share a launch."""
     block_m, block_n, split_k, waves, _ = _WITH_MM_ROUTER_CONFIG
+    mm_config = _choose_decode_config(rows, mm_n, mm_k)
     return (
         0 < rows
+        and (
+            rows <= _WITH_MM_ANY_ROUTER_MAX_ROWS
+            or _choose_splitk_config(rows, n, k) == _WITH_MM_ROUTER_CONFIG
+        )
         and n % block_n == 0
         and k % (split_k * waves * 16) == 0
         and mm_config is not None
         # Both halves run the same wave count, the launch's num_warps.
         and mm_config[3] * mm_config[4] == waves
     )
-
-
-def supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(
-    rows: int, n: int, k: int, mm_n: int, mm_k: int
-) -> bool:
-    """Whether ``rows`` router rows and the ``[mm_n, mm_k]`` decode GEMM share a
-    launch in any forward: up to 16 rows, a decode GEMM entry for every forward."""
-    return rows <= _WITH_MM_ANY_ROUTER_MAX_ROWS and _supports_router_gemv_mm(
-        rows, n, k, _choose_any_forward_decode_config(rows, mm_n, mm_k)
-    )
-
-
-def supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950(
-    rows: int, n: int, k: int, mm_n: int, mm_k: int
-) -> bool:
-    """Whether they share a launch in a decode / verify forward: also past 16
-    rows where the router's standalone plan takes the shared tile, and with
-    the decode GEMM's decode-only entries."""
-    return (
-        rows <= _WITH_MM_ANY_ROUTER_MAX_ROWS
-        or _choose_splitk_config(rows, n, k) == _WITH_MM_ROUTER_CONFIG
-    ) and _supports_router_gemv_mm(rows, n, k, _choose_decode_config(rows, mm_n, mm_k))
 
 
 def _router_programs_with_mm(rows: int, n: int) -> int:
@@ -748,9 +731,7 @@ def _compile_router_mm_variants(x, weight, multiplier: float, mm_b) -> None:
     mm_n, mm_k = mm_b.shape
     seen = set()
     for rows in range(1, _WITH_MM_MAX_ROWS + 1):
-        if not supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950(
-            rows, n, k, mm_n, mm_k
-        ):
+        if not supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(rows, n, k, mm_n, mm_k):
             continue
         config = _choose_decode_config(rows, mm_n, mm_k)
         # The binary keys on the decode tile and the bucket-sized router
@@ -830,9 +811,7 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
     rows, k = x.shape
     n = weight.shape[0]
     mm_n, mm_k = mm_b.shape
-    if not supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950(
-        rows, n, k, mm_n, mm_k
-    ):
+    if not supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(rows, n, k, mm_n, mm_k):
         raise ValueError(
             f"router + decode GEMM launch does not support {rows} rows of a "
             f"[{n}, {k}] router with a [{mm_n}, {mm_k}] GEMM"
@@ -895,7 +874,6 @@ __all__ = [
     "gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950",
     "gluon_fp32_router_gemv_num_counters_gfx950",
     "launch_gluon_fp32_router_gemv_mm_a16w16_gfx950",
-    "supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950",
     "supports_gluon_fp32_router_gemv_mm_a16w16_gfx950",
     "launch_gluon_fp32_router_gemv_gfx950",
     "transpose_fp32_router_weight_gfx950",

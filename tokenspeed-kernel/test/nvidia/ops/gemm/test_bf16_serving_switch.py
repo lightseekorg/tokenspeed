@@ -79,7 +79,7 @@ def test_serving_routes_new_row_counts_away_from_per_m_compiles(warp_splitk):
     with assert_no_triton_compile(_rowcta_gemv_kernel):
         for m in (1, 5, 17, 23):
             rows = x[:m]
-            assert not _use_mv(rows, weight, None, False)
+            assert not _use_mv(rows, weight, None)
             expected = (rows.float() @ weight.float().T).to(torch.bfloat16)
             for got in (mv(rows, weight), kernel_mm(rows, weight)):
                 torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)

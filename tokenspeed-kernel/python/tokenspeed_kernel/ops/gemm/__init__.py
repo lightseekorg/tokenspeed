@@ -584,7 +584,6 @@ def _mm_traits(
     quant: str | None,
     block_size: list[int] | None,
     enable_pdl: bool,
-    decode_forward: bool,
 ) -> dict[str, object]:
     """The traits mm selects its kernel with."""
     block_scale_layout = (
@@ -625,9 +624,6 @@ def _mm_traits(
         "out_dtype": out_dtype,
         "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
-        # Always stated: a kernel that declares it must not match a call
-        # that left it out.
-        "decode_forward": decode_forward,
     }
     if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
         # Offset views can break alignment; online quantization allocates aligned ones.
@@ -695,7 +691,6 @@ def mm_activation_scale_layout(
         quant="mxfp8",
         block_size=block_size,
         enable_pdl=pdl_enabled(),
-        decode_forward=False,
     )
     signature = _gemm_format_signature(
         A, B, None, B_scales, out_dtype, "mxfp8", block_size
@@ -722,7 +717,6 @@ def mm(
     override: str | None = None,
     solution: str | None = None,
     prepacked_scales: bool = False,
-    decode_forward: bool = False,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -764,10 +758,6 @@ def mm(
             also be E4M3 codes with UE8M0 ``A_scales``, canonical
             ``[M, K/32]`` or already in the 1-D F8_128x4 layout (such as
             ``rmsnorm_quantize_fp8_group32(scale_layout="swizzled")`` writes).
-        decode_forward: The rows of ``A`` come from a decode or verify
-            forward. A kernel registered with the ``decode_forward`` trait is
-            selected only then; left out, the call selects among the other
-            kernels.
     """
     if plan is not None and prepacked_scales:
         raise ValueError("A GEMM plan cannot use prepacked online quantization")
@@ -928,8 +918,8 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_tgv_decode_gemm(A, B, out, tgv_tactic)
-        if bias is None and not small_n and _use_mv(A, B, out, decode_forward):
-            return mv(A, B, out, decode_forward=decode_forward)
+        if bias is None and not small_n and _use_mv(A, B, out):
+            return mv(A, B, out)
 
     traits = _mm_traits(
         A,
@@ -946,7 +936,6 @@ def mm(
         quant=quant,
         block_size=block_size,
         enable_pdl=enable_pdl,
-        decode_forward=decode_forward,
     )
 
     signature = _gemm_format_signature(
@@ -2008,7 +1997,6 @@ def _select_mv(
     weight_split: bool,
     operands_aligned_16: bool,
     out_aligned_16: bool,
-    decode_forward: bool,
 ):
     signature = _MV_SIGNATURES.get((x_dtype, weight_dtype))
     if not on_cuda or signature is None:
@@ -2020,8 +2008,7 @@ def _select_mv(
     # kernels. Kernels that take a split weight declare the weight_split trait.
     # A kernel that needs 16-byte aligned operands or output declares the
     # alignment traits, as mm's kernels do, and an offset view selects the
-    # next match. A kernel for the rows of decode and verify forwards alone
-    # declares decode_forward, and any other call selects the next match.
+    # next match.
     traits = {
         "m": m,
         "n": n,
@@ -2029,7 +2016,6 @@ def _select_mv(
         "operands_aligned_16": operands_aligned_16,
         "out_aligned_16": out_aligned_16,
         "weight_split": weight_split,
-        "decode_forward": decode_forward,
     }
     for spec in reg.get_for_operator(
         "gemm",
@@ -2050,8 +2036,6 @@ def _use_mv(
     # Required, so that a caller cannot omit the out it hands to mv; None for
     # a call with no destination.
     out: torch.Tensor | None,
-    # Required for the same reason: what the caller hands to mv.
-    decode_forward: bool,
 ) -> bool:
     if (
         flashinfer_joint_bf16_supported(x, weight, None)
@@ -2086,7 +2070,6 @@ def _use_mv(
             False,
             operands_aligned,
             out_aligned,
-            decode_forward,
         )
         if impl is torch_decode_gemv:
             return False
@@ -2111,7 +2094,6 @@ def _use_mv(
             False,
             operands_aligned,
             out_aligned,
-            decode_forward,
         )
         is not torch_decode_gemv
     )
@@ -2123,7 +2105,6 @@ def mv(
     out: torch.Tensor | None = None,
     *,
     weight_split: torch.Tensor | None = None,
-    decode_forward: bool = False,
 ) -> torch.Tensor:
     """``x @ weight.T`` through joint FI tuning or the ordinary registry fallback.
 
@@ -2140,10 +2121,6 @@ def mv(
         out: optional ``[M, N]`` destination in the promoted dtype.
         weight_split: the weight's :func:`mv_weight_split`, for an
             FP32 weight; ``None`` keeps the kernels that read ``weight``.
-        decode_forward: the rows of ``x`` come from a decode or verify
-            forward. A kernel registered with the ``decode_forward`` trait is
-            selected only then; left out, the call selects among the other
-            kernels.
 
     Returns:
         ``[M, N]`` output in the promoted dtype of ``x`` and ``weight``.
@@ -2181,7 +2158,6 @@ def mv(
         weight.dtype,
         weight_split is not None,
         *_mv_alignment(x, weight, out),
-        decode_forward,
     )
     if impl is triton_bf16x3_gemm_fp32:
         return impl(x, weight_split, out)
@@ -2334,7 +2310,6 @@ def _select_mv_weightless_rmsnorm_gated_sigmoid(
         weight.dtype,
         False,
         *_mv_alignment(x, weight, None),
-        False,
     )
     if (
         norm.name != "triton_weightless_rmsnorm_gated_sigmoid"
@@ -2457,7 +2432,6 @@ def _select_mv_rmsnorm_gated_sigmoid(
         weight.dtype,
         False,
         *_mv_alignment(gate, weight, None),
-        False,
     )
     if gemv is not KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950"):
         return None
@@ -2586,7 +2560,6 @@ def _select_mv_rmsnorm(
         weight.dtype,
         False,
         *_mv_alignment(x, weight, None),
-        False,
     )
     if gemv is not registry.get_impl("gluon_gemv_a16w16_gfx950"):
         return None
@@ -3327,7 +3300,7 @@ def kimi3_latent_projection(
             weight,
             out=out,
         )
-    if routed and _use_mv(hidden_states, weight, out, False):
+    if routed and _use_mv(hidden_states, weight, out):
         return mv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
@@ -3405,7 +3378,7 @@ def kimi3_mla_qkv_gate_projection(
                 if gfx1250_largem
                 else (
                     "fused"
-                    if m <= 32 or _use_mv(hidden_states, weight, None, False)
+                    if m <= 32 or _use_mv(hidden_states, weight, None)
                     else "split"
                 )
             )
@@ -3919,7 +3892,7 @@ def kimi3_shared_situ_projection(
             hidden_states, gate_up_weight, out, beta, linear_beta
         )
 
-    if routed and _use_mv(hidden_states, gate_up_weight, None, False):
+    if routed and _use_mv(hidden_states, gate_up_weight, None):
         gate_up = mv(hidden_states, gate_up_weight)
     else:
         gate_up = None
@@ -4052,7 +4025,7 @@ def kimi3_shared_down_projection(
             solution = "gluon_largem_gfx1250"
         else:
             solution = "torch"
-    if routed and _use_mv(hidden_states, weight, out, False):
+    if routed and _use_mv(hidden_states, weight, out):
         return mv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
@@ -4217,7 +4190,7 @@ def kimi3_qkvfab_projection(
             and supports_gluon_mm_a16w16_prefill_gfx950(m, output_width, input_width)
         ):
             solution = "gluon_largem"
-        elif specialized or _use_mv(hidden_states, weight, None, False):
+        elif specialized or _use_mv(hidden_states, weight, None):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "mv"
         else:
@@ -4709,7 +4682,6 @@ def _select_fp32_router_gemv_with_mm(
     x: torch.Tensor,
     mm_a: torch.Tensor,
     mm_b: torch.Tensor,
-    decode_forward: bool,
 ) -> SelectedKernel | None:
     """Select the launch that runs the router next to a decode GEMM, or None."""
     if (
@@ -4744,7 +4716,6 @@ def _select_fp32_router_gemv_with_mm(
                 "k": mm_k,
                 "router_n": plan.output_size,
                 "router_k": plan.hidden_size,
-                "decode_forward": decode_forward,
             },
         )
     except NoKernelFoundError:
@@ -4756,7 +4727,7 @@ def _select_fp32_router_gemv_with_mm(
     if (
         spec is None
         or spec.weight_preprocessor is not plan.weight_preprocessor
-        or not _use_mv(mm_a, mm_b, None, decode_forward)
+        or not _use_mv(mm_a, mm_b, None)
         or _select_mv(
             rows,
             mm_n,
@@ -4767,13 +4738,8 @@ def _select_fp32_router_gemv_with_mm(
             False,
             # No destination here: the selection is only compared.
             *_mv_alignment(mm_a, mm_b, None),
-            decode_forward,
         )
-        # Both registrations of the decode GEMM run the same launch.
-        not in (
-            registry.get_impl("gluon_mm_a16w16_decode_gfx950"),
-            registry.get_impl("gluon_mm_a16w16_decode_only_gfx950"),
-        )
+        is not registry.get_impl("gluon_mm_a16w16_decode_gfx950")
     ):
         return None
     return kernel
@@ -4784,7 +4750,6 @@ def fp32_router_gemv_with_mm_supported(
     x: torch.Tensor,
     mm_a: torch.Tensor,
     mm_b: torch.Tensor,
-    decode_forward: bool,
 ) -> bool:
     """Return whether :func:`fp32_router_gemv_execute_with_mm` serves these operands.
 
@@ -4793,17 +4758,13 @@ def fp32_router_gemv_with_mm_supported(
         x: FP32 router rows.
         mm_a: ``[rows, K]`` activations of the independent GEMM.
         mm_b: ``[N, K]`` weight of the independent GEMM.
-        decode_forward: The rows come from a decode or verify forward. Any
-            forward shares the launch at up to 16 rows with a decode GEMM
-            entry for every forward; past 16 rows or with a decode-only
-            entry, only a decode / verify forward does.
 
     Returns:
         ``True`` when one launch can run the router and ``mm(mm_a, mm_b)``.
     """
     return (
         _select_fp32_router_gemv_with_mm(
-            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b, decode_forward
+            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b
         )
         is not None
     )
@@ -4817,7 +4778,6 @@ def fp32_router_gemv_execute_with_mm(
     mm_a: torch.Tensor,
     mm_b: torch.Tensor,
     mm_out: torch.Tensor,
-    decode_forward: bool,
 ) -> torch.Tensor:
     """Project router rows and compute an independent GEMM in one launch.
 
@@ -4835,14 +4795,12 @@ def fp32_router_gemv_execute_with_mm(
         mm_a: Contiguous ``[rows, K]`` BF16 activations.
         mm_b: Contiguous ``[N, K]`` BF16 weight.
         mm_out: ``[rows, N]`` BF16 destination.
-        decode_forward: The rows come from a decode or verify forward, as
-            for :func:`fp32_router_gemv_with_mm_supported`.
 
     Returns:
         FP32 router logits in ``[rows, outputs]`` layout.
     """
     typed_plan = _require_fp32_router_gemv_plan(plan)
-    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b, decode_forward)
+    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b)
     if kernel is None:
         raise ValueError(
             "fp32_router_gemv_execute_with_mm needs supported operands "

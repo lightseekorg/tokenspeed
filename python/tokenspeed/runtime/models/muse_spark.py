@@ -402,20 +402,15 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         x: torch.Tensor,
         weight: torch.Tensor,
         out: torch.Tensor | None,
-        decode_forward: bool,
     ) -> torch.Tensor:
-        """Apply an unbiased projection, writing into ``out`` when supplied.
-
-        ``decode_forward`` says that the rows come from a decode or verify
-        forward: gemm.mm then may select a kernel registered for those alone.
-        """
+        """Apply an unbiased projection, writing into ``out`` when supplied."""
         if _gemm_dispatch_required():
             result = self.quant_method.apply(SimpleNamespace(weight=weight), x, None)
         elif (
             x.shape[0] == 1 and current_platform().is_cdna4 and x.dtype == weight.dtype
         ):
             # gfx950 single rows take the GEMV even where gemm.mm would not.
-            result = mv(x, weight, out=out, decode_forward=decode_forward)
+            result = mv(x, weight, out=out)
         elif (
             x.dtype == weight.dtype
             and weight.shape[0] != weight.shape[1]
@@ -425,7 +420,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             # writes ``out`` in place, saving a copy launch. It infers the
             # weight layout from its shape, so it could read a square [N, K]
             # weight as [K, N]. Square weights take the unquantized method.
-            result = mm(x, weight, out=out, decode_forward=decode_forward)
+            result = mm(x, weight, out=out)
         else:
             result = self.quant_method.apply(SimpleNamespace(weight=weight), x, None)
         if out is None:
@@ -440,15 +435,12 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         width = self.output_size // len(self.group)
         return self.weight[self.rank * width : (self.rank + 1) * width]
 
-    def forward(self, x: torch.Tensor, decode_forward: bool) -> torch.Tensor:
-        """Apply the projection and return complete full-width rows.
-
-        ``decode_forward`` is as for ``_project``.
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the projection and return complete full-width rows."""
         weight = self._local_weight()
         if self.workspace is None:
             return (
-                self._project(x, weight, None, decode_forward)
+                self._project(x, weight, None)
                 if current_platform().is_cdna4 or self.gather_column_view
                 else super().forward(x)[0]
             )
@@ -458,7 +450,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         if tokens > _GATHER_WORKSPACE_ROWS:
             return all_gather(
                 (
-                    self._project(x, weight, None, decode_forward)
+                    self._project(x, weight, None)
                     if current_platform().is_cdna4
                     else super().forward(x)[0]
                 ),
@@ -490,7 +482,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 if gathered is not None
                 else x.new_empty((tokens, local_width))
             )
-            self._project(x, weight, local, decode_forward)
+            self._project(x, weight, local)
             return iris.gather.run(local)
 
         rows = (
@@ -504,7 +496,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         else:
             rows.zero_()
         local = rows[:, self.rank * local_width : (self.rank + 1) * local_width]
-        self._project(x, weight, local, decode_forward)
+        self._project(x, weight, local)
         if direct:
             return _muse_all_reduce(self.iris_state, (rows,), self.group)[0]
 
@@ -528,20 +520,18 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             self.quant_method, UnquantizedLinearMethod
         )
         if _gemm_dispatch_required():
-            # Owned rows are an extend's.
-            return self._project(x, self.weight, out, decode_forward=False)
+            return self._project(x, self.weight, out)
         return torch.mm(x, self.weight.T, out=out)
 
     def forward_with_mailbox(
         self,
         x: torch.Tensor,
         consumer_handles_mailbox: bool,
-        decode_forward: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Project into the mailbox when the consumer polls it, else into full rows.
 
         Returns the rows, or the mailbox's ``[ranks, rows, shard]`` view, and
-        the mailbox sentinel. ``decode_forward`` is as for ``_project``.
+        the mailbox sentinel.
         """
         if (
             consumer_handles_mailbox
@@ -550,16 +540,13 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         ):
             rows = self.multicast.publish(x, self._local_weight())
             return rows, self.multicast.sentinel
-        return self(x, decode_forward), None
+        return self(x), None
 
-    def forward_rmsnorm(
-        self, x: torch.Tensor, norm: MuseSparkRMSNorm, decode_forward: bool
-    ) -> torch.Tensor:
+    def forward_rmsnorm(self, x: torch.Tensor, norm: MuseSparkRMSNorm) -> torch.Tensor:
         """Project, gather and apply ``norm``: full-width normalized BF16 rows.
 
         Small batches fuse the gather and the norm into one Lamport kernel,
         which matches ``norm`` on the gathered rows within one BF16 ulp.
-        ``decode_forward`` is as for ``_project``.
         """
         iris = self.iris_state
         if (
@@ -571,11 +558,11 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             local_weight = self._local_weight()
             local = x.new_empty((x.shape[0], local_weight.shape[0]))
             if iris.can_all_gather_rmsnorm(local, norm.weight):
-                self._project(x, local_weight, local, decode_forward)
+                self._project(x, local_weight, local)
                 return iris.all_gather_rmsnorm(
                     local, norm.weight, norm.eps, norm.weight_offset
                 )
-        rows = self(x, decode_forward)
+        rows = self(x)
         return norm(rows, rows.dtype)
 
     def forward_mxfp4(
@@ -584,12 +571,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         norm_weight: torch.Tensor,
         eps: float,
         weight_offset: float,
-        decode_forward: bool,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Project, gather, normalize, and dynamically quantize to MXFP4.
-
-        ``decode_forward`` is as for ``_project``.
-        """
+        """Project, gather, normalize, and dynamically quantize to MXFP4."""
         if self.workspace is not None and x.shape[0] <= min(
             _GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0]
         ):
@@ -613,14 +596,14 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             if iris is not None and iris.can_all_gather_rmsnorm_mxfp4_quant(
                 local, norm_weight
             ):
-                self._project(x, self._local_weight(), local, decode_forward)
+                self._project(x, self._local_weight(), local)
                 return self.workspace[:tokens], iris.all_gather_rmsnorm_mxfp4_quant(
                     local,
                     norm_weight,
                     eps,
                     weight_offset,
                 )
-        rows = self(x, decode_forward)
+        rows = self(x)
         return rows, rmsnorm_mxfp4_quant(rows, norm_weight, eps, weight_offset)
 
 
@@ -1453,18 +1436,11 @@ class PreparedFP32RouterGEMV(nn.Module):
         )
 
     def supports_with_mm(
-        self,
-        x: torch.Tensor,
-        mm_a: torch.Tensor,
-        mm_b: torch.Tensor,
-        decode_forward: bool,
+        self, x: torch.Tensor, mm_a: torch.Tensor, mm_b: torch.Tensor
     ) -> bool:
-        """Whether :meth:`forward_with_mm` serves these rows and GEMM: any
-        forward at up to 16 rows with a decode GEMM entry for every forward,
-        and past that or with a decode-only entry only a decode / verify
-        forward (``decode_forward``)."""
+        """Whether :meth:`forward_with_mm` serves these rows and GEMM."""
         return self.prepared_weight is not None and fp32_router_gemv_with_mm_supported(
-            self._plan, x, mm_a, mm_b, decode_forward
+            self._plan, x, mm_a, mm_b
         )
 
     def forward_with_mm(
@@ -1473,18 +1449,10 @@ class PreparedFP32RouterGEMV(nn.Module):
         mm_a: torch.Tensor,
         mm_b: torch.Tensor,
         mm_out: torch.Tensor,
-        decode_forward: bool,
     ) -> torch.Tensor:
         """Project router rows and write ``mm(mm_a, mm_b)`` to ``mm_out`` in one launch."""
         return fp32_router_gemv_execute_with_mm(
-            self._plan,
-            x,
-            self.prepared_weight,
-            self.multiplier,
-            mm_a,
-            mm_b,
-            mm_out,
-            decode_forward,
+            self._plan, x, self.prepared_weight, self.multiplier, mm_a, mm_b, mm_out
         )
 
 
@@ -2088,10 +2056,7 @@ class MuseSparkMoE(nn.Module):
         )
 
     def _route_and_quantize_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        router_input: torch.Tensor,
-        decode_forward: bool,
+        self, hidden_states: torch.Tensor, router_input: torch.Tensor
     ) -> (
         tuple[
             torch.Tensor,
@@ -2105,8 +2070,8 @@ class MuseSparkMoE(nn.Module):
         """Route and quantize decode rows in two or three launches, or None.
 
         The top-k shares a launch with the column gather, RMSNorm and MXFP4
-        quantization, and the router shares one with this rank's pre-expert
-        columns where :meth:`supports_with_mm` holds for ``decode_forward``. Neither launch has a
+        quantization, and up to the router's shared-launch row limit the router
+        shares one with this rank's pre-expert columns. Neither launch has a
         dependency between its halves, so this replaces four launches with two
         (three past that limit). Returns the BF16 placeholder rows, the MXFP4
         rows, the router logits and the top-k weights and ids.
@@ -2131,17 +2096,15 @@ class MuseSparkMoE(nn.Module):
             local, norm.weight, bias, self.topk
         ):
             return None
-        if self.gate.supports_with_mm(
-            router_input, hidden_states, weight, decode_forward
-        ):
+        if self.gate.supports_with_mm(router_input, hidden_states, weight):
             router_logits = self.gate.forward_with_mm(
-                router_input, hidden_states, weight, local, decode_forward
+                router_input, hidden_states, weight, local
             )
         else:
-            # Rows the shared launch does not serve in this forward leave the
-            # router and this rank's pre-expert columns a launch each.
+            # Rows past the router's shared-launch limit leave the router and
+            # this rank's pre-expert columns a launch each.
             router_logits = self.gate(router_input, pdl_enabled())
-            projection._project(hidden_states, weight, local, decode_forward)
+            projection._project(hidden_states, weight, local)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,
@@ -2248,7 +2211,6 @@ class MuseSparkMoE(nn.Module):
         project: bool,
         *,
         payload: str,
-        decode_forward: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
@@ -2256,9 +2218,6 @@ class MuseSparkMoE(nn.Module):
         Without ``project`` the combined expert rows are returned unprojected
         for a boundary that applies ``post_expert_proj`` itself. ``payload``
         is the owned-row reduce-scatters' encoding (``_collective_payload``).
-        ``decode_forward`` says that the rows come from a decode or verify
-        forward; the projections of rows that are not owned state it to
-        gemm.mm.
         """
         if owned_global_rows is not None and self.iris_state is None:
             assert project
@@ -2270,7 +2229,7 @@ class MuseSparkMoE(nn.Module):
                 owned_global_rows,
             )
         routed = (
-            self._route_and_quantize_inputs(hidden_states, router_input, decode_forward)
+            self._route_and_quantize_inputs(hidden_states, router_input)
             if owned_global_rows is None
             else None
         )
@@ -2318,13 +2277,12 @@ class MuseSparkMoE(nn.Module):
                             norm_weight,
                             self.pre_expert_norm.eps,
                             self.pre_expert_norm.weight_offset,
-                            decode_forward,
                         )
                     )
                 elif self.expert_quant_kind == "nvfp4":
                     width = self.pre_expert_proj.output_size
                     compressed, sentinel = self.pre_expert_proj.forward_with_mailbox(
-                        hidden_states, width & (width - 1) == 0, decode_forward
+                        hidden_states, width & (width - 1) == 0
                     )
                     compressed_quantized = rmsnorm_nvfp4_quant(
                         compressed,
@@ -2344,7 +2302,7 @@ class MuseSparkMoE(nn.Module):
                     # MXFP4 kernels dynamically quantize this normalized BF16 row
                     # into OCP E2M1 values with group-32 E8M0 scales.
                     compressed = self.pre_expert_proj.forward_rmsnorm(
-                        hidden_states, self.pre_expert_norm, decode_forward
+                        hidden_states, self.pre_expert_norm
                     )
                     compressed_quantized = None
                 with fork.branch():
@@ -2407,7 +2365,6 @@ class MuseSparkMoE(nn.Module):
             boundary_gathers_mailbox(
                 combined.shape[0], self.post_expert_proj.output_size, 1
             ),
-            decode_forward,
         )
 
     def _normalized_route_sum(
@@ -2493,7 +2450,6 @@ class MuseSparkMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_input: torch.Tensor,
         counts: list[int],
-        decode_forward: bool,
     ) -> torch.Tensor:
         """Route this rank's attention-DP rows through the EP group's experts.
 
@@ -2504,8 +2460,6 @@ class MuseSparkMoE(nn.Module):
             hidden_states: This rank's BF16 normalized rows ``[rows, hidden]``.
             router_input: The same rows in FP32 for the router.
             counts: Rows held by each EP rank, in EP rank order.
-            decode_forward: The rows come from a decode or verify forward;
-                the projections state it to gemm.mm.
 
         Returns:
             The post-expert projection of this rank's rows ``[rows, hidden]``.
@@ -2526,8 +2480,7 @@ class MuseSparkMoE(nn.Module):
                 enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
             ) as fork:
                 compressed = self.pre_expert_norm(
-                    self.pre_expert_proj(hidden_states, decode_forward),
-                    hidden_states.dtype,
+                    self.pre_expert_proj(hidden_states), hidden_states.dtype
                 )
                 with fork.branch():
                     router_logits = self.gate(router_input, pdl_enabled())
@@ -2561,7 +2514,7 @@ class MuseSparkMoE(nn.Module):
             )[:rows].to(hidden_states.dtype)
             if not rows:
                 return hidden_states.new_empty((0, output_size))
-        return self.post_expert_proj(combined, decode_forward)
+        return self.post_expert_proj(combined)
 
 
 class MuseSparkResidualGate(nn.Module):
@@ -2753,7 +2706,6 @@ class MuseSparkDecoderLayer(nn.Module):
                         ),
                         hidden_states,
                         self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx),
-                        ctx.forward_mode.is_decode(),
                     )
                 return hidden_states, None
         if not owned_qkvg:
@@ -2901,7 +2853,6 @@ class MuseSparkDecoderLayer(nn.Module):
                     mlp_input,
                     router_input,
                     self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx),
-                    ctx.forward_mode.is_decode(),
                 ),
                 None,
             )
@@ -2917,7 +2868,6 @@ class MuseSparkDecoderLayer(nn.Module):
                 owned_global_rows,
                 project=not project_in_boundary,
                 payload=_collective_payload(ctx.forward_mode),
-                decode_forward=ctx.forward_mode.is_decode(),
             )
         if project_in_boundary:
             return self.iris_state.gemv_all_gather_boundary(

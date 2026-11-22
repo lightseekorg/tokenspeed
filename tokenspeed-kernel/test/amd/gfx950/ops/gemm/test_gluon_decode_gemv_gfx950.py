@@ -91,13 +91,13 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
         gluon_rowcta_bf16_gemv_gfx950(x[row : row + 1], weight, expected[row : row + 1])
     for bucket in buckets:
         assert _select_mv(
-            bucket, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True, False
+            bucket, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
         ).__name__ == ("gluon_rowcta_bf16_gemv_gfx950")
         assert torch.equal(mv(x[:bucket], weight), expected[:bucket])
     # Rows past the largest bucket keep the decode GEMM.
     past = 2 * buckets[-1]
     assert _select_mv(
-        past, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True, False
+        past, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
     ).__name__ != ("gluon_rowcta_bf16_gemv_gfx950")
     rows = [m for m in range(2, total + 1) if 1 << (m - 1).bit_length() in buckets]
     for m in rows:
@@ -173,7 +173,7 @@ def test_gated_gemv_matches_the_gate_norm_then_the_gemv() -> None:
 
 def test_decode_gemv_selects_gluon_on_gfx950() -> None:
     assert _select_mv(
-        1, 1024, 8192, True, torch.bfloat16, torch.bfloat16, False, True, True, False
+        1, 1024, 8192, True, torch.bfloat16, torch.bfloat16, False, True, True
     ).__name__ == ("gluon_rowcta_bf16_gemv_gfx950")
 
 
@@ -181,16 +181,16 @@ def test_mm_takes_the_rowcta_gemv_on_every_listed_single_row_shape() -> None:
     for n, k in sorted(_PREFERRED_SHAPES):
         x = torch.empty((1, k), dtype=torch.bfloat16, device="cuda")
         weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
-        assert _use_mv(x, weight, None, False), (n, k)
+        assert _use_mv(x, weight, None), (n, k)
         assert _select_mv(
-            1, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True, False
+            1, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
         ).__name__ == ("gluon_rowcta_bf16_gemv_gfx950"), (n, k)
 
 
 def test_mm_keeps_its_own_path_for_an_unlisted_single_row() -> None:
     x = torch.empty((1, 1536), dtype=torch.bfloat16, device="cuda")
     weight = torch.empty((1536, 1536), dtype=torch.bfloat16, device="cuda")
-    assert not _use_mv(x, weight, None, False)
+    assert not _use_mv(x, weight, None)
 
 
 def test_mm_routes_a_listed_single_row_through_the_rowcta_gemv() -> None:
@@ -206,7 +206,7 @@ def test_qkvg_single_row_dispatch_and_graph_replay() -> None:
     torch.manual_seed(20261007)
     x = torch.randn((1, 8192), dtype=torch.bfloat16, device="cuda")
     weight = torch.randn((4608, 8192), dtype=torch.bfloat16, device="cuda") / 8192**0.5
-    assert _use_mv(x, weight, None, False)
+    assert _use_mv(x, weight, None)
     actual = mv(x, weight)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -229,7 +229,7 @@ def test_muse_decode_projection_replay_and_tail_cache(k: int) -> None:
         mv(x[:rows], weight, out=out[:rows])
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (3, 17, 32):
-            assert _use_mv(x[:rows], weight, None, False)
+            assert _use_mv(x[:rows], weight, None)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 mv(x[:rows], weight, out=out[:rows])
