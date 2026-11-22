@@ -459,18 +459,13 @@ def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
         muse_spark._DENSE_FP8_FIRST_ROWS.values()
     )
     fp8 = _fp8_projection(True)
-    assert fp8.applies(33, decode_forward=True) and not fp8.applies(
-        32, decode_forward=True
-    )
+    assert fp8.applies(33) and not fp8.applies(32)
     for bs in range(1, 5):
         for rows in range(bs, 300, bs):
             ctx = _ctx(ForwardMode.DECODE, bs, rows)
             assert not (
                 takes_monokernels(rows, ctx)
-                and (
-                    fp8.applies(rows, decode_forward=True)
-                    or pre_expert.applies(rows, decode_forward=True)
-                )
+                and (fp8.applies(rows) or pre_expert.applies(rows))
             ), (bs, rows)
 
 

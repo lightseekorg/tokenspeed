@@ -865,7 +865,7 @@ def _muse_tp_owned_forward_worker(
                 None,
                 project=True,
                 payload="bf16",
-                decode_forward=False,
+                fp8_projections=False,
             )
             expected_rows = expected_rows.clone()
             expected = expected_rows[first : first + valid]
@@ -878,7 +878,7 @@ def _muse_tp_owned_forward_worker(
                 rows,
                 project=True,
                 payload="bf16",
-                decode_forward=False,
+                fp8_projections=False,
             )
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
@@ -894,7 +894,7 @@ def _muse_tp_owned_forward_worker(
                     rows_in = full[:small].contiguous()
                     router_in = rows_in.float()
                     assert (
-                        moe._route_and_quantize_inputs(rows_in, router_in, None, True)
+                        moe._route_and_quantize_inputs(rows_in, router_in, None, False)
                         is not None
                     )
                     decode, _ = moe(
@@ -906,7 +906,7 @@ def _muse_tp_owned_forward_worker(
                         None,
                         True,
                         payload="bf16",
-                        decode_forward=True,
+                        fp8_projections=True,
                     )
                     torch.testing.assert_close(
                         decode, expected_rows[:small], atol=2**-7, rtol=2**-7
@@ -1224,14 +1224,14 @@ def _muse_fp8_decode_routing_worker(rank, world_size, device):
     projection.dense_fp8.max_rows = module._GATHER_MXFP4_FP8_MAX_ROWS
     projection.prepare_fp8_weight()
     for rows, takes in ((16, False), (17, True), (128, True), (129, False)):
-        assert moe.takes_fp8_input(rows, decode_forward=True) == takes, rows
-        assert not moe.takes_fp8_input(rows, decode_forward=False), rows
+        assert moe.takes_fp8_input(rows) == takes, rows
     for rows in (16, 17, 64, 128, 129, 172, 173):
         torch.manual_seed(rows)
         hidden = torch.randn(rows, 8192, device=device).bfloat16()
         router_input = hidden.float()
+        # A decode forward: the route's FP8 decision is takes_fp8_input's.
         fused = moe._route_and_quantize_inputs(
-            hidden, router_input, None, decode_forward=True
+            hidden, router_input, None, moe.takes_fp8_input(rows)
         )
         assert fused is not None, rows
         _, (packed, scales), logits, weights, ids = (
@@ -1243,18 +1243,23 @@ def _muse_fp8_decode_routing_worker(rank, world_size, device):
             for value in fused
         )
         _, (expected_packed, expected_scales) = projection.forward_mxfp4(
-            hidden, None, norm.weight, norm.eps, norm.weight_offset, decode_forward=True
+            hidden,
+            None,
+            norm.weight,
+            norm.eps,
+            norm.weight_offset,
+            fp8=moe.takes_fp8_input(rows),
         )
-        # A non-decode forward keeps the BF16 projection's bits. Inside the
-        # window (17-128 rows) the fused route took the FP8 projection, so its
-        # packed rows differ from them; at 16 and 173 rows they are the same.
+        # The BF16 projection's bits. Inside the window (17-128 rows) the fused
+        # route took the FP8 projection, so its packed rows differ from them;
+        # at 16 and 173 rows they are the same.
         _, (bf16_packed, _) = projection.forward_mxfp4(
             hidden,
             None,
             norm.weight,
             norm.eps,
             norm.weight_offset,
-            decode_forward=False,
+            fp8=False,
         )
         in_window = 17 <= rows <= module._GATHER_MXFP4_FP8_MAX_ROWS
         assert torch.equal(packed, bf16_packed) != in_window, rows

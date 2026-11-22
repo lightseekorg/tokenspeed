@@ -39,6 +39,12 @@ invariance for speed are refused too: `--dense-fp8-small-m` (only batches
 inside the FP8 row windows project in FP8, so a row's bits follow the batch's
 row count) under rl-bitwise or `--batch-invariant-collectives`.
 
+`--dense-fp8-small-m` quantizes only decode and verify forwards' rows: prompt
+rows write the K / V that every later token and every prefix-cache reuse
+reads, so prompt K / V stays BF16. Muse Spark decides this with one predicate
+of the forward mode (`_fp8_projections`), and mixed prefill / decode rounds
+never reach it: `MuseSparkDecoderLayer.forward` raises on them.
+
 ## The hierarchy
 
 ```

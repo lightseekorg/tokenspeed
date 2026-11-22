@@ -233,6 +233,16 @@ def _dense_fp8_small_m(projection: str) -> bool:
     return True
 
 
+def _fp8_projections(forward_mode: ForwardMode) -> bool:
+    """Whether this forward's rows may take the dense FP8 projections
+    (--dense-fp8-small-m): decode and verify forwards only. Prompt rows write
+    the K / V every later token and every prefix-cache reuse reads, so they
+    stay BF16; mixed rounds never run (MuseSparkDecoderLayer.forward raises).
+    Each FP8 projection also needs its row window (_DenseFp8Weight.applies).
+    """
+    return forward_mode.is_decode()
+
+
 def _quantize_rows_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row FP8 codes and scales of ``x``, with the recipe the boundary's
     FP8 copy uses (``token_fp8_amax_div``), so both give the same bits."""
@@ -302,22 +312,12 @@ class _DenseFp8Weight:
         with kernel_warmup(enabled=True):
             self.project(weight.new_zeros(self.min_rows, k), None, None)
 
-    def applies(self, rows: int, *, decode_forward: bool) -> bool:
-        """Whether a forward's ``rows`` rows project through the FP8 copy.
-
-        Only decode forwards (``ForwardMode.DECODE``: decode and verify steps)
-        do. Prefill, extend and mixed forwards stay BF16: prompt K / V stays
-        BF16; only the projections of generated (decode / verify) tokens are
-        quantized, so their K / V carry FP8 error and prompt K / V never does.
-        This is the only gate: the FP8 GEMM quantizes nothing, and every
-        producer and consumer of the FP8 copy asks this one predicate.
-        """
-        # Cheapest first: with the flag off no copy exists.
-        return (
-            self.weight is not None
-            and decode_forward
-            and self.min_rows <= rows <= self.max_rows
-        )
+    def applies(self, rows: int) -> bool:
+        """Whether ``rows`` rows of a forward that takes the FP8 projections
+        (``_fp8_projections``) project through this copy: the copy exists
+        and the rows are inside its window. Every producer and consumer of
+        the FP8 copy asks this with the same rows."""
+        return self.weight is not None and self.min_rows <= rows <= self.max_rows
 
     def project(
         self,
@@ -599,14 +599,13 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         x: torch.Tensor,
         out: torch.Tensor,
         x_fp8: tuple[torch.Tensor, torch.Tensor] | None,
-        decode_forward: bool,
+        fp8: bool,
     ) -> torch.Tensor:
-        """Project this rank's columns into ``out``, in FP8 where it applies
-        (``_DenseFp8Weight.applies``). ``x_fp8`` is the per-row FP8 copy of
-        ``x`` its producer wrote, or None to quantize ``x`` here;
-        ``decode_forward`` says that the rows come from a decode or verify
-        forward, the only rows that take the FP8 copy."""
-        if not self.dense_fp8.applies(x.shape[0], decode_forward=decode_forward):
+        """Project this rank's columns into ``out``, through the FP8 copy when
+        ``fp8`` (the caller's decision: ``MuseSparkMoE.takes_fp8_input`` in a
+        forward that takes the FP8 projections). ``x_fp8`` is the per-row FP8
+        copy of ``x`` its producer wrote, or None to quantize ``x`` here."""
+        if not fp8:
             return self._project(x, self._local_weight(), out)
         # The GEMM refuses a strided out; only a one-row gather passes one,
         # below the window.
@@ -788,13 +787,12 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         eps: float,
         weight_offset: float,
         *,
-        decode_forward: bool,
+        fp8: bool,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Project, gather, normalize, and dynamically quantize to MXFP4.
 
-        ``x_fp8`` is the per-row FP8 copy of ``x`` its producer wrote, or None.
-        ``decode_forward`` is as for ``_project_local``; only a decode forward
-        takes the FP8 projection.
+        ``x_fp8`` is the per-row FP8 copy of ``x`` its producer wrote, or None;
+        ``fp8`` is as for ``_project_local``.
         """
         if self.workspace is not None and x.shape[0] <= min(
             _GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0]
@@ -819,7 +817,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             if iris is not None and iris.can_all_gather_rmsnorm_mxfp4_quant(
                 local, norm_weight
             ):
-                self._project_local(x, local, x_fp8, decode_forward)
+                self._project_local(x, local, x_fp8, fp8)
                 return self.workspace[:tokens], iris.all_gather_rmsnorm_mxfp4_quant(
                     local,
                     norm_weight,
@@ -948,14 +946,11 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
         self,
         input_: torch.Tensor,
         input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
-        *,
-        decode_forward: bool,
     ) -> torch.Tensor:
-        """Project normalized rows, given their per-row FP8 copy or None.
-
-        The FP8 projection runs where ``_DenseFp8Weight.applies``.
-        """
-        if self.dense_fp8.applies(input_.shape[0], decode_forward=decode_forward):
+        """Project normalized rows of a forward that takes the FP8 projections
+        (``_fp8_projections``), given their per-row FP8 copy or None: through
+        the FP8 copy where ``_DenseFp8Weight.applies``, else in BF16."""
+        if self.dense_fp8.applies(input_.shape[0]):
             return self.dense_fp8.project(input_, input_fp8, None)
         return self(input_)[0]
 
@@ -1369,10 +1364,10 @@ class MuseSparkAttention(nn.Module):
             elif normalized.shape[0] == 0:
                 return normalized.new_empty((0, self.hidden_size)), None, 1
             else:
-                qkv_gate = self.qkv_proj.forward_rows(
-                    normalized,
-                    normalized_fp8,
-                    decode_forward=ctx.forward_mode.is_decode(),
+                qkv_gate = (
+                    self.qkv_proj.forward_rows(normalized, normalized_fp8)
+                    if _fp8_projections(ctx.forward_mode)
+                    else self.qkv_proj(normalized)[0]
                 )
             q, k, v, output_gate = qkv_gate.split(
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
@@ -1507,8 +1502,10 @@ class MuseSparkAttention(nn.Module):
         can_sliding_attention_boundary. ``normalized_fp8`` is the rows' per-row
         FP8 copy from their producer, or None.
         """
-        qkv_gate = self.qkv_proj.forward_rows(
-            normalized, normalized_fp8, decode_forward=ctx.forward_mode.is_decode()
+        qkv_gate = (
+            self.qkv_proj.forward_rows(normalized, normalized_fp8)
+            if _fp8_projections(ctx.forward_mode)
+            else self.qkv_proj(normalized)[0]
         )
         q, k, v, output_gate = qkv_gate.split(
             (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
@@ -2337,13 +2334,12 @@ class MuseSparkMoE(nn.Module):
             and self.pre_expert_proj.workspace is not None
         )
 
-    def takes_fp8_input(self, rows: int, *, decode_forward: bool) -> bool:
-        """Whether this forward's ``rows`` pre-expert rows project through the
-        FP8 copy; the layer boundary that writes the copy and the projection
-        that reads it both ask this."""
-        return self.reads_fp8_input() and self.pre_expert_proj.dense_fp8.applies(
-            rows, decode_forward=decode_forward
-        )
+    def takes_fp8_input(self, rows: int) -> bool:
+        """Whether ``rows`` pre-expert rows of a forward that takes the FP8
+        projections (``_fp8_projections``) project through the FP8 copy; the
+        layer boundary that writes the copy and the projection that reads it
+        both ask this."""
+        return self.reads_fp8_input() and self.pre_expert_proj.dense_fp8.applies(rows)
 
     def check_fp8_rows(self) -> None:
         """Refuse a pre-expert FP8 window the fused gather does not serve
@@ -2374,7 +2370,7 @@ class MuseSparkMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_input: torch.Tensor,
         hidden_states_fp8: tuple[torch.Tensor, torch.Tensor] | None,
-        decode_forward: bool,
+        fp8: bool,
     ) -> (
         tuple[
             torch.Tensor,
@@ -2415,9 +2411,6 @@ class MuseSparkMoE(nn.Module):
             local, norm.weight, bias, self.topk
         ):
             return None
-        fp8 = self.takes_fp8_input(
-            hidden_states.shape[0], decode_forward=decode_forward
-        )
         if not fp8 and self.gate.supports_with_mm(router_input, hidden_states, weight):
             router_logits = self.gate.forward_with_mm(
                 router_input, hidden_states, weight, local
@@ -2427,9 +2420,7 @@ class MuseSparkMoE(nn.Module):
             # projection, leave the router and this rank's pre-expert columns
             # a launch each.
             router_logits = self.gate(router_input, pdl_enabled())
-            projection._project_local(
-                hidden_states, local, hidden_states_fp8, decode_forward
-            )
+            projection._project_local(hidden_states, local, hidden_states_fp8, fp8)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,
@@ -2537,7 +2528,7 @@ class MuseSparkMoE(nn.Module):
         project: bool,
         *,
         payload: str,
-        decode_forward: bool,
+        fp8_projections: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
@@ -2549,8 +2540,7 @@ class MuseSparkMoE(nn.Module):
         Without ``project`` the combined expert rows are returned unprojected
         for a boundary that applies ``post_expert_proj`` itself. ``payload``
         is the owned-row reduce-scatters' encoding (``_collective_payload``).
-        ``decode_forward`` says that the rows come from a decode or verify
-        forward; only such rows take the dense FP8 copies.
+        ``fp8_projections`` is the forward's ``_fp8_projections``.
         """
         if owned_global_rows is not None and self.iris_state is None:
             assert project
@@ -2561,9 +2551,11 @@ class MuseSparkMoE(nn.Module):
                 max_num_tokens_per_gpu,
                 owned_global_rows,
             )
+        # The pre-expert projection's FP8 decision, once for the forward.
+        fp8 = fp8_projections and self.takes_fp8_input(hidden_states.shape[0])
         routed = (
             self._route_and_quantize_inputs(
-                hidden_states, router_input, hidden_states_fp8, decode_forward
+                hidden_states, router_input, hidden_states_fp8, fp8
             )
             if owned_global_rows is None
             else None
@@ -2613,7 +2605,7 @@ class MuseSparkMoE(nn.Module):
                             norm_weight,
                             self.pre_expert_norm.eps,
                             self.pre_expert_norm.weight_offset,
-                            decode_forward=decode_forward,
+                            fp8=fp8,
                         )
                     )
                 elif self.expert_quant_kind == "nvfp4":
@@ -3010,7 +3002,7 @@ class MuseSparkDecoderLayer(nn.Module):
         self.post_feedforward_residual_gate.refresh_gate()
 
     def attention_boundary_writes_fp8(
-        self, rows: int, *, decode_forward: bool, owned_rows: bool, mailbox: bool
+        self, rows: int, *, owned_rows: bool, mailbox: bool
     ) -> bool:
         """Whether the attention boundary writes an FP8 copy of the MLP's input
         rows: only where the pre-expert projection reads it
@@ -3019,19 +3011,17 @@ class MuseSparkDecoderLayer(nn.Module):
         replaces those rows, so none is written there."""
         # The window predicate first: with the flag off it is one check.
         return (
-            self.mlp.pre_expert_proj.dense_fp8.applies(
-                rows, decode_forward=decode_forward
-            )
+            self.mlp.pre_expert_proj.dense_fp8.applies(rows)
             and not owned_rows
             and not mailbox
             and not self.mlp.exchanges_rank_local_rows
             and self.pre_feedforward_layernorm.weight is not None
             and self.comm_manager.use_all_reduce(is_moe=True)
-            and self.mlp.takes_fp8_input(rows, decode_forward=decode_forward)
+            and self.mlp.takes_fp8_input(rows)
         )
 
     def mlp_boundary_writes_fp8(
-        self, rows: int, *, decode_forward: bool, owned_rows: bool, mailbox: bool
+        self, rows: int, *, owned_rows: bool, mailbox: bool
     ) -> bool:
         """Whether the MLP boundary writes an FP8 copy of the next layer's
         attention input rows, which that layer's QKV projection reads in FP8.
@@ -3042,9 +3032,7 @@ class MuseSparkDecoderLayer(nn.Module):
         written there."""
         # The window predicate first: with the flag off it is one check.
         return (
-            self.self_attn.qkv_proj.dense_fp8.applies(
-                rows, decode_forward=decode_forward
-            )
+            self.self_attn.qkv_proj.dense_fp8.applies(rows)
             and not owned_rows
             and not mailbox
             # Every Muse Spark layer is MoE, so the next layer's gather
@@ -3210,9 +3198,10 @@ class MuseSparkDecoderLayer(nn.Module):
                 attention_sentinel,
                 attention_ranks,
             )
-            if self.attention_boundary_writes_fp8(
+            if _fp8_projections(
+                ctx.forward_mode
+            ) and self.attention_boundary_writes_fp8(
                 hidden_states.shape[0],
-                decode_forward=ctx.forward_mode.is_decode(),
                 owned_rows=owned_global_rows is not None,
                 mailbox=attention_sentinel is not None,
             ):
@@ -3291,7 +3280,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 owned_global_rows,
                 project=not project_in_boundary,
                 payload=_collective_payload(ctx.forward_mode),
-                decode_forward=ctx.forward_mode.is_decode(),
+                fp8_projections=_fp8_projections(ctx.forward_mode),
             )
         if project_in_boundary:
             hidden_states, next_attention_input = (
@@ -3333,13 +3322,16 @@ class MuseSparkDecoderLayer(nn.Module):
         # The next layer's QKV, when it runs in FP8, reads the per-row FP8
         # copy the boundary writes alongside the BF16 rows. Every layer's QKV
         # takes the same rows, so this layer's answers for the next.
-        if next_weight is not None and self.mlp_boundary_writes_fp8(
-            # The residual rows give the row count: a mailbox branch is a
-            # [ranks, rows, shard] view.
-            hidden_states.shape[0],
-            decode_forward=ctx.forward_mode.is_decode(),
-            owned_rows=owned_global_rows is not None,
-            mailbox=sentinel is not None,
+        if (
+            next_weight is not None
+            and _fp8_projections(ctx.forward_mode)
+            and self.mlp_boundary_writes_fp8(
+                # The residual rows give the row count: a mailbox branch is a
+                # [ranks, rows, shard] view.
+                hidden_states.shape[0],
+                owned_rows=owned_global_rows is not None,
+                mailbox=sentinel is not None,
+            )
         ):
             hidden_states, next_attention_input, next_attention_input_fp8 = (
                 post_norm_residual_pre_norm_bf16_fp8(*boundary_args)

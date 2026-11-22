@@ -620,7 +620,7 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
         None,
         project=True,
         payload="bf16",
-        decode_forward=False,
+        fp8_projections=False,
     )
     assert sentinel is None
 
@@ -1389,26 +1389,18 @@ def test_qkv_fp8_projection_takes_its_row_window_and_the_producer_copy(
             replicate_for_owned_rows=False,
         )
     layer.weight.data.copy_(torch.randn_like(layer.weight) * 0.02)
-    assert not layer.dense_fp8.applies(33, decode_forward=True)
+    assert not layer.dense_fp8.applies(33)
     layer.prepare_fp8_weight()
     x = torch.randn(257, 8192, device="cuda").bfloat16()
     for rows in (1, 16, 32, 129, 172, 257):
-        assert torch.equal(
-            layer.forward_rows(x[:rows], None, decode_forward=True), layer(x[:rows])[0]
-        )
+        assert torch.equal(layer.forward_rows(x[:rows], None), layer(x[:rows])[0])
     for rows in (33, 64, 65, 128):
-        projected = layer.forward_rows(x[:rows], None, decode_forward=True)
+        projected = layer.forward_rows(x[:rows], None)
         reference = layer(x[:rows])[0]
         assert not torch.equal(projected, reference)
         # Its numerics: the skinny FP8 GEMM's and the row code's own tests.
-        given = layer.forward_rows(
-            x[:rows], module._quantize_rows_fp8(x[:rows]), decode_forward=True
-        )
+        given = layer.forward_rows(x[:rows], module._quantize_rows_fp8(x[:rows]))
         assert torch.equal(given, projected)
-        # Prefill and extend forwards stay BF16.
-        assert torch.equal(
-            layer.forward_rows(x[:rows], None, decode_forward=False), layer(x[:rows])[0]
-        )
 
 
 @requires_gpu
@@ -1420,8 +1412,8 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     """With --dense-fp8-small-m, a decode forward's attention gets the FP8
-    projection's q/k/v and an extend forward the BF16 projection's: an extend
-    forward launches no FP8 GEMM, whatever its row count."""
+    projection's q/k/v and an extend forward of the same rows the BF16
+    projection's (the two differ at these rows), so prompt K / V stays BF16."""
     monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv-down")
     heads, kv_heads, head_dim, rows = 32, 4, 64, 48
     attention = _stub(MuseSparkAttention)
@@ -1455,26 +1447,12 @@ def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
         module, "weightless_rmsnorm_gated_sigmoid", lambda out, *args: out
     )
     normalized = torch.randn(rows, 8192, device="cuda").bfloat16()
-    decode_forward = mode == "DECODE"
-    expected = attention.qkv_proj.forward_rows(
-        normalized, None, decode_forward=decode_forward
-    )
-    assert (
-        torch.equal(expected, attention.qkv_proj(normalized)[0]) != decode_forward
-    )  # only the decode forward projects in FP8
-    fp8_launches = []
-    real_mm = module.mm
-
-    def counted_mm(*args, **kwargs):
-        # Counts, then runs, gemm.mm's FP8 calls; the result is the real one.
-        if kwargs.get("quant") == "fp8":
-            fp8_launches.append(args[0].shape[0])
-        return real_mm(*args, **kwargs)
-
-    monkeypatch.setattr(module, "mm", counted_mm)
+    fp8 = attention.qkv_proj.forward_rows(normalized, None)
+    bf16 = attention.qkv_proj(normalized)[0]
+    assert not torch.equal(fp8, bf16)
+    expected = fp8 if mode == "DECODE" else bf16
     ctx = _forward_context(mode, rows)
     attention(torch.arange(rows, device="cuda"), normalized, None, ctx, None, True)
-    assert fp8_launches == ([rows] if decode_forward else [])
     q, k, v, _, _ = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, expected[:, :q_end])
@@ -1611,21 +1589,20 @@ def _enabled_copy(name: str) -> "module._DenseFp8Weight":
 
 
 @pytest.mark.parametrize("rows", [32, 33, 128, 129])
-@pytest.mark.parametrize("decode_forward", [True, False])
 @pytest.mark.parametrize("owned_rows", [False, True])
 @pytest.mark.parametrize("mailbox", [False, True])
 def test_layer_boundaries_write_an_fp8_copy_only_where_it_is_read(
-    bf16_default_dtype, rows, decode_forward, owned_rows, mailbox
+    bf16_default_dtype, rows, owned_rows, mailbox
 ) -> None:
-    """The MLP boundary writes the next QKV's FP8 copy for a decode forward's
-    rows in the QKV window, not for owned rows or a mailbox branch. The
+    """The MLP boundary writes the next QKV's FP8 copy for rows in the QKV
+    window, not for owned rows or a mailbox branch. The
     attention boundary writes none where the pre-expert projection has no
     reader for it (TP1: no fused gather), even with an enabled copy."""
     layer = _tiny_model().model.layers[0]
     layer.self_attn.qkv_proj.dense_fp8 = _enabled_copy("qkv_proj")
     layer.mlp.pre_expert_proj.dense_fp8 = _enabled_copy("pre_expert_proj")
-    in_window = decode_forward and 33 <= rows <= 128
-    kwargs = dict(decode_forward=decode_forward, owned_rows=owned_rows, mailbox=mailbox)
+    in_window = 33 <= rows <= 128
+    kwargs = dict(owned_rows=owned_rows, mailbox=mailbox)
     assert layer.mlp_boundary_writes_fp8(rows, **kwargs) == (
         in_window and not owned_rows and not mailbox
     )
@@ -2240,7 +2217,7 @@ def _gathered_mxfp4_workspace_worker(
                 x = torch.ones(tokens, 256, device=device)
                 x[:, :world_size] = torch.arange(1, world_size + 1, device=device)
                 rows, packed = linear.forward_mxfp4(
-                    x, None, norm_weight, 1e-6, 1.0, decode_forward=False
+                    x, None, norm_weight, 1e-6, 1.0, fp8=False
                 )
                 assert rows.shape == (tokens, 4096)
                 expected_rows = x[:, :world_size].repeat_interleave(
@@ -2290,7 +2267,7 @@ def _check_gathered_fp8_projection(state, rank, world_size, device) -> None:
     linear.iris_state = state
     norm_weight = torch.ones(4096, device=device)
     x = torch.randn(64, 8192, device=device, generator=generator).bfloat16()
-    _, bf16 = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, decode_forward=True)
+    _, bf16 = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, fp8=False)
     bf16 = (bf16[0].clone(), bf16[1].clone())
     linear.dense_fp8 = module._DenseFp8Weight(
         "pre_expert_proj",
@@ -2299,23 +2276,17 @@ def _check_gathered_fp8_projection(state, rank, world_size, device) -> None:
         module._GATHER_MXFP4_FP8_MAX_ROWS,
     )
     linear.prepare_fp8_weight()
-    for decode_forward in (False, True):
-        _, packed = linear.forward_mxfp4(
-            x, None, norm_weight, 1e-6, 1.0, decode_forward=decode_forward
-        )
-        assert torch.equal(packed[0], bf16[0]) != decode_forward
-    _, own = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, decode_forward=True)
+    for fp8 in (False, True):
+        _, packed = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, fp8=fp8)
+        assert torch.equal(packed[0], bf16[0]) != fp8
+    _, own = linear.forward_mxfp4(x, None, norm_weight, 1e-6, 1.0, fp8=True)
     own = (own[0].clone(), own[1].clone())
     given_rows = module._quantize_rows_fp8(x)
-    _, given = linear.forward_mxfp4(
-        x, given_rows, norm_weight, 1e-6, 1.0, decode_forward=True
-    )
+    _, given = linear.forward_mxfp4(x, given_rows, norm_weight, 1e-6, 1.0, fp8=True)
     assert torch.equal(given[0], own[0]) and torch.equal(given[1], own[1])
     # The norm after the projection hides a row scale, so swap rows.
     swapped_rows = module._quantize_rows_fp8(x.flip(0))
-    _, swapped = linear.forward_mxfp4(
-        x, swapped_rows, norm_weight, 1e-6, 1.0, decode_forward=True
-    )
+    _, swapped = linear.forward_mxfp4(x, swapped_rows, norm_weight, 1e-6, 1.0, fp8=True)
     assert not torch.equal(swapped[0], own[0])
     torch.cuda.synchronize()
 
@@ -2721,12 +2692,8 @@ def test_dense_fp8_none_keeps_the_bf16_projection_everywhere(
     assert layer.dense_fp8.weight is None and layer.dense_fp8.scale is None
     x = torch.randn(129, 8192, device="cuda").bfloat16()
     for rows in (1, 16, 17, 32, 33, 64, 65, 128, 129):
-        for decode_forward in (True, False):
-            assert not layer.dense_fp8.applies(rows, decode_forward=decode_forward)
-            assert torch.equal(
-                layer.forward_rows(x[:rows], None, decode_forward=decode_forward),
-                layer(x[:rows])[0],
-            )
+        assert not layer.dense_fp8.applies(rows)
+        assert torch.equal(layer.forward_rows(x[:rows], None), layer(x[:rows])[0])
 
 
 @requires_gpu
