@@ -402,6 +402,23 @@ if _AVAILABLE:
         ``[tokens, key_dim]`` and ``[tokens, channels - 2 * key_dim]`` tensors with
         the values the packed output followed by a q/k/v split would hold. Both
         widths must be multiples of ``PREFILL_QKV_CHANNEL_MULTIPLE``.
+
+        Args:
+            x: BF16 [channels, tokens] with contiguous channels and any token
+                stride, including fused projection views.
+            weight: BF16 [channels, 4] taps in oldest-to-newest order.
+            bias: Optional contiguous BF16 channel vector.
+            conv_states: BF16 [slots, channels, history], updated in place.
+            query_start_loc: Packed request boundaries [requests + 1].
+            cache_indices: Integer state slots [requests]; -1 marks padding.
+            has_initial_state: Boolean history-valid flags [requests].
+            activation: True, "silu", or "swish" applies SiLU; None/False omit it.
+            pad_slot_id: Padding sentinel; this solution requires -1.
+            prefill_metadata: Eight-token maps shared by all layers this forward.
+            key_dim: Width of the q and k channel blocks.
+
+        Returns:
+            Contiguous BF16 q, k and v rows. Padding rows are untouched.
         """
         channels, tokens = x.shape
         value_dim = channels - 2 * key_dim

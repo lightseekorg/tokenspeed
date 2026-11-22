@@ -48,4 +48,5 @@ The values are the ones the packed output followed by the GDN q/k/v split pass w
 Both widths must be multiples of `PREFILL_QKV_CHANNEL_MULTIPLE`.
 On NVIDIA from Hopper on, the CuTe DSL kernel serves it: the same tile and arithmetic as the packed CuTe DSL kernel, with each thread's four channels stored to the q, k or v row that holds them.
 Other GPUs use the Triton kernel.
-GDN prefill uses it, in place of the convolution and the split pass, on every platform but Hopper; there the split also zeroes the rows past the live tokens.
+GDN, KDA and Mamba2 prefill use it, in place of the convolution and the split pass, on every platform but Hopper; there the split also zeroes the rows past the live tokens.
+Backends whose scan reads strided q/k/v views (KDA with `cutedsl_kda` or cuDNN) keep those views.

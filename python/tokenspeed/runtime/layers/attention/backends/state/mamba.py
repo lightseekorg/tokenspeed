@@ -237,6 +237,7 @@ def _prefill_conv_writes_qkv(key_split_dim: int, value_split_dim: int) -> bool:
 
     The direct write skips the q/k/v split pass and leaves the same values.
     Hopper keeps the split, which zeroes the rows past the live tokens.
+    Backends whose scan reads strided q/k/v views keep those views.
     """
     return (
         not current_platform().is_hopper

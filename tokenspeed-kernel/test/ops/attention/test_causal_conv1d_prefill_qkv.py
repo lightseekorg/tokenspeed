@@ -262,3 +262,85 @@ def test_cute_qkv_launch_rejects_widths_off_the_thread_vector():
             enable_pdl=False,
             split_out=(k, v),
         )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        dict(cache_indices=None, has_initial_state=None),
+        dict(pad_slot_id=-2),
+        dict(bias=torch.float32),
+    ],
+    ids=["unindexed_state", "padding_slot_-2", "fp32_bias"],
+)
+def test_qkv_conv_outside_the_cute_traits_matches_conv_then_split(variant):
+    """Inputs the CuTe kernel does not take still convolve, through another
+    kernel, to the values of the packed convolution plus the split."""
+    x, weight, boundaries, metadata, slots, states, key_dim = _inputs(
+        [9, 4], 2, 4, row_pad=0
+    )
+    kwargs = dict(
+        query_start_loc=boundaries,
+        cache_indices=slots,
+        has_initial_state=torch.tensor([True, False], device="cuda"),
+        activation="silu",
+        prefill_metadata=metadata,
+    )
+    kwargs.update(variant)
+    bias_dtype = kwargs.pop("bias", None)
+    bias = None if bias_dtype is None else torch.randn(x.shape[0], device="cuda")
+    ref_states, qkv_states = states.clone(), states.clone()
+    packed = causal_conv1d_fn(x, weight, bias, conv_states=ref_states, **kwargs)
+    expected = fused_qkv_split_gdn_prefill(
+        packed.transpose(0, 1), 2, 2, 4, HEAD, HEAD, HEAD
+    )
+    actual = causal_conv1d_qkv_fn(
+        x, weight, bias, conv_states=qkv_states, key_dim=key_dim, **kwargs
+    )
+    for rows, ref in zip(actual, expected, strict=True):
+        assert torch.equal(rows, ref.view(rows.shape))
+    assert torch.equal(qkv_states, ref_states)
+
+
+@_cute
+def test_cute_qkv_conv_writes_rows_past_int32_offsets():
+    """The last v rows of a request whose element offsets pass 2**31 equal a
+    short run of the same rows; only the tail is live, so only it is touched."""
+    key_dim, value_dim, tail = 256, 8192, 40
+    dim = 2 * key_dim + value_dim
+    tokens = (1 << 31) // value_dim + 72
+    rows = torch.empty(tokens, dim, dtype=torch.bfloat16, device="cuda")
+    rows[-64:].normal_()
+    weight = (torch.randn(dim, 4, device="cuda") * 0.5).to(torch.bfloat16)
+    states = torch.randn(3, dim, 3, device="cuda").to(torch.bfloat16)
+    results = []
+    for x, lengths, slots, initial in (
+        (rows.T, [tokens - tail, tail], [-1, 1], [False, True]),
+        (rows[-tail:].T, [tail], [1], [True]),
+    ):
+        bounds = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        run_states = states.clone()
+        q, k, v = causal_conv1d_qkv_fn(
+            x,
+            weight,
+            None,
+            conv_states=run_states,
+            query_start_loc=bounds,
+            cache_indices=torch.tensor(slots, dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.tensor(initial, device="cuda"),
+            activation="silu",
+            prefill_metadata=build_causal_conv1d_prefill_metadata(
+                bounds, torch.tensor(lengths), 8
+            ),
+            key_dim=key_dim,
+        )
+        results.append(((q[-tail:], k[-tail:], v[-tail:]), run_states))
+    (far, far_states), (near, near_states) = results
+    assert (tokens - 1) * value_dim > 2**31
+    for actual, expected in zip(far, near, strict=True):
+        assert torch.equal(actual, expected)
+    assert torch.equal(far_states, near_states)
