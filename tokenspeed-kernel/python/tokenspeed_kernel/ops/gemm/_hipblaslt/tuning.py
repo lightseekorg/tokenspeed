@@ -399,7 +399,11 @@ def tune_hipblaslt_solutions(
     tunable.enable(True)
     if os.path.exists(path):
         # Stamp check with tuning still off, so its probe GEMM is not tuned.
-        stamp = hipblaslt_file_validators(path)
+        try:
+            stamp = hipblaslt_file_validators(path)
+        except OSError as e:
+            tunable.enable(False)
+            raise ValueError(f"Could not read tuned BLAS solutions {path}") from e
         current = _current_validators()
         if stamp != current:
             tunable.enable(False)

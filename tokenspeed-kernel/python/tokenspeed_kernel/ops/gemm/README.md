@@ -221,10 +221,10 @@ tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
 the GPU architecture and library builds stamped in a file, not the GPU model,
 and some drivers report a generic device name such as `AMD Radeon Graphics`:
 
-- `gcn_arch=<architecture>.csv` serves every GPU whose `gcnArchName` equals the
+- `gcn_arch=`*`architecture`*`.csv` serves every GPU whose `gcnArchName` equals the
   file's `GCN_ARCH_NAME` stamp. It holds only rows verified on every GPU model
   of that architecture to write the default solution's bits and not be slower.
-- `device_name=<name>.csv`, named after `torch.cuda.get_device_name()` with
+- `device_name=`*`name`*`.csv`, named after `torch.cuda.get_device_name()` with
   spaces replaced by underscores, adds rows for one GPU model. Its solutions
   may be chosen for speed alone and change result bits. It never lists a GEMM
   its architecture file lists.
@@ -238,11 +238,11 @@ neither file logs a warning that its GEMMs run untuned and keeps the defaults.
 Each file loads only when its own stamp matches the running stack; a stale
 device file is skipped with a warning and the architecture file still loads.
 
-The tuning tool below writes the device file of the GPU it runs on: it reads
-the architecture file first, so those GEMMs are not re-timed, and keeps them
-out of its output. A row moves to the architecture file only once it is
-checked on every model of the architecture to keep the default's bits and not
-be slower.
+The tuning tool, run as in the following command, writes the device file of
+the GPU it runs on: it reads the architecture file first, so those GEMMs are
+not re-timed, and keeps them out of its output. A row moves to the
+architecture file only once it is checked on every model of the architecture
+to keep the default's bits and not be slower.
 
 A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
 versions and the GPU architecture stamped in its `Validator` rows. On any

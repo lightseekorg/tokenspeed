@@ -187,7 +187,7 @@ def test_this_gpu_finds_its_architectures_committed_file():
 
 
 def _committed_pair(tmp_path, tuned_file, device_file):
-    """An architecture file and this GPU's device file, as committed files are laid out."""
+    """Lay out architecture and device files for a test."""
     arch_name = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).gcnArchName

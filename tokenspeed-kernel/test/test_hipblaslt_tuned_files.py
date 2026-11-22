@@ -167,6 +167,8 @@ def test_unreadable_committed_file_is_skipped_loudly(tmp_path, caplog):
 
 
 class _Properties:
+    """Device properties with an architecture that has no tuned file."""
+
     gcnArchName = "gfx000"
 
 
