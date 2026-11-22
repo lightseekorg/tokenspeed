@@ -106,8 +106,8 @@ std::int32_t ChunkEndCheckpointTokens(const CacheCoordinator& coordinator, std::
     _assert(first_pos >= 0 && 0 < tokens && tokens <= unscheduled && token_budget > 0,
             "a chunk-end cut needs a non-empty chunk and a positive budget");
     const std::int32_t end = first_pos + tokens;
-    // The final chunk publishes the prompt end; a chunk ending at or before a pending junction stays whole.
-    if (checkpoints_left <= 0 || tokens == unscheduled || junction_tokens >= end) {
+    // A chunk ending at or before a pending junction stays whole.
+    if (checkpoints_left <= 0 || junction_tokens >= end) {
         return 0;
     }
     const std::int32_t page = coordinator.PrefixGranularity();
@@ -119,7 +119,7 @@ std::int32_t ChunkEndCheckpointTokens(const CacheCoordinator& coordinator, std::
     if (boundary <= first_pos || boundary < target || boundary >= upper) {
         return 0;
     }
-    // No cut that adds a round to the prompt's prefill at this round's budget.
+    // No cut that adds a round to the prompt's prefill at this round's budget, as any cut of its final chunk would.
     const auto rounds = [token_budget](std::int32_t rest) { return rest / token_budget + (rest % token_budget != 0); };
     return rounds(unscheduled - (boundary - first_pos)) > rounds(unscheduled - tokens) ? 0 : boundary;
 }
