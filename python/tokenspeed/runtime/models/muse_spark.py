@@ -72,6 +72,7 @@ from tokenspeed_kernel.ops.residual import (
     post_norm_residual_pre_norm_bf16,
     residual_gate_coefficients,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
@@ -90,9 +91,9 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     can_acquire_all_reduce_outputs,
     prepare_projection_collectives,
-    projection_all_to_all,
     projection_gather_mm,
     projection_mm_reduce_scatter,
+    projection_mm_to_owners,
     reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -256,16 +257,13 @@ class _OwnedRowProjections:
     def matmul_to_owners(
         self, x: torch.Tensor, rows: int, weight: torch.Tensor
     ) -> torch.Tensor:
-        """Project all rows through this rank's columns; return its ``[L, world_size * N]`` rows."""
-        local_rows = self.local_rows(rows)
-        local = x.new_empty((self.world_size * local_rows, weight.shape[0]))
-        mm(x, weight, out=local[:rows])
-        local[rows:].zero_()
-        out = x.new_empty((local_rows, self.world_size * weight.shape[0]))
-        projection_all_to_all(
-            local, local_rows, True, False, out, self.post_expert, None
+        """Project all rows through this rank's columns; return its ``[L, world_size * N]`` rows.
+
+        The rows are borrowed until the next owned-row projection.
+        """
+        return projection_mm_to_owners(
+            x, self.local_rows(rows), weight, self.post_expert, None
         )
-        return out
 
     def gather_rows(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
         """Gather every rank's ``[L, width]`` rows into ``[rows, width]``."""
@@ -286,7 +284,7 @@ def _prepare_owned_projections(
         ("gather", layer.self_attn.qkv_proj.weight),
         ("scatter", layer.self_attn.o_proj.weight),
         ("gather", layer.mlp.pre_expert_proj.weight),
-        ("column", layer.mlp.post_expert_proj.weight),
+        ("transpose", layer.mlp.post_expert_proj.weight),
     )
     specs = [
         ProjectionSpec(
@@ -428,6 +426,18 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         if result.data_ptr() != out.data_ptr():
             out.copy_(result)
         return out
+
+    def warm_local_gemm(self) -> None:
+        """Run one two-row local-columns GEMM inside the warm-up scope.
+
+        Two rows is the fewest that take the GEMM rather than the one-row
+        GEMV; kernels that compile their binaries when a warm-up GEMM meets
+        their weight (the skinny GEMM, the decode GEMM) compile them for this
+        weight.
+        """
+        weight = self._local_weight()
+        with kernel_warmup(enabled=True):
+            self._project(weight.new_zeros((2, weight.shape[1])), weight, None)
 
     def _local_weight(self) -> torch.Tensor:
         if not self.gather_column_view:
@@ -1454,6 +1464,30 @@ class PreparedFP32RouterGEMV(nn.Module):
         return fp32_router_gemv_execute_with_mm(
             self._plan, x, self.prepared_weight, self.multiplier, mm_a, mm_b, mm_out
         )
+
+    def warm_with_mm(self, mm_b: torch.Tensor, max_rows: int) -> None:
+        """Compile every binary :meth:`forward_with_mm` can select with ``mm_b``.
+
+        The shared launch serves only a few rows, which the startup warm
+        forwards may never run (their extend is past that row limit). One
+        launch inside the warm-up scope, at the first of up to ``max_rows``
+        row counts it serves, makes the selected kernel compile its binary for
+        every row count it serves; does nothing when none of them shares the
+        launch. Raises if the weight was not prepared, which would otherwise
+        make every row count skip the launch and leave its compiles to serving.
+        """
+        if self.prepared_weight is None:
+            raise RuntimeError("router weight was not prepared after loading")
+        hidden = self.weight.shape[0]
+        for rows in range(1, max_rows + 1):
+            x = self.weight.new_zeros((rows, hidden))
+            mm_a = mm_b.new_zeros((rows, mm_b.shape[1]))
+            if self.supports_with_mm(x, mm_a, mm_b):
+                with kernel_warmup(enabled=True):
+                    self.forward_with_mm(
+                        x, mm_a, mm_b, mm_b.new_empty((rows, mm_b.shape[0]))
+                    )
+                return
 
 
 class MuseSparkRouter(PreparedFP32RouterGEMV):
@@ -3676,6 +3710,45 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                     widths.add(projection._local_weight().shape[0])
         for width in sorted(widths):
             state.gather.warmup(width)
+        # The local-columns GEMM of a gathered projection (_project) selects
+        # its kernel by row count, and some of those kernels compile their
+        # row tiles only when a GEMM inside the warm-up scope meets the
+        # weight; the startup warm forwards may never run one (an extend
+        # past the fused paths' rows takes another layout). Two rows is the
+        # fewest that take the GEMM rather than the one-row GEMV, so one
+        # two-row GEMM a weight shape, inside the scope, compiles the tiles
+        # those kernels warm for that weight.
+        projection_shapes = set()
+        for layer in self.model.layers:
+            for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
+                if (
+                    not isinstance(projection, _MuseGatheredLinear)
+                    or projection.workspace is None
+                ):
+                    continue
+                weight = projection._local_weight()
+                if tuple(weight.shape) in projection_shapes:
+                    continue
+                projection_shapes.add(tuple(weight.shape))
+                projection.warm_local_gemm()
+        # Each layer's router shares a launch with its pre-expert columns at
+        # few rows (MuseSparkMoE's gather, RMSNorm and top-k path); compile
+        # that launch for every row count it serves, once a weight shape.
+        router_mm_shapes = set()
+        for layer in self.model.layers:
+            mlp = layer.mlp
+            projection = mlp.pre_expert_proj
+            if (
+                not isinstance(mlp, MuseSparkMoE)
+                or not isinstance(projection, _MuseGatheredLinear)
+                or projection.workspace is None
+            ):
+                continue
+            weight = projection._local_weight()
+            shape = (tuple(mlp.gate.weight.shape), tuple(weight.shape))
+            if shape not in router_mm_shapes:
+                router_mm_shapes.add(shape)
+                mlp.gate.warm_with_mm(weight, projection.workspace.shape[0])
         for layer in self.model.layers:
             layer.iris_state = state
             layer.self_attn.iris_state = state

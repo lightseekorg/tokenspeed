@@ -233,12 +233,14 @@ class MambaForwardMetadata:
 
 
 def _prefill_conv_writes_qkv(key_split_dim: int, value_split_dim: int) -> bool:
-    """Whether the prefill convolution writes q, k and v rows itself (AMD).
+    """Whether the prefill convolution writes q, k and v rows itself.
 
     The direct write skips the q/k/v split pass and leaves the same values.
+    Hopper keeps the split, which zeroes the rows past the live tokens.
+    Backends whose scan reads strided q/k/v views keep those views.
     """
     return (
-        current_platform().is_amd
+        not current_platform().is_hopper
         and key_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
         and value_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
     )
@@ -2101,7 +2103,7 @@ class MambaAttnBackend(AttentionBackend):
                 )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            if _prefill_conv_writes_qkv(
+            if not self._prefill_supports_strided_qkv() and _prefill_conv_writes_qkv(
                 key_dim // attn_tp_size, value_dim // attn_tp_size
             ):
                 # The convolution writes q, k and v rows directly; no split pass.

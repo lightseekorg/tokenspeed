@@ -65,24 +65,25 @@ def linear(monkeypatch):
     return method, layer
 
 
-def _torch_copies(fn) -> list[str]:
+def _torch_kernels(fn) -> list[str]:
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         fn()
         torch.cuda.synchronize()
+    # Scale relayouts run as PyTorch elementwise kernels or device memcpys.
     return [
         event.name
         for event in prof.events()
         if event.device_type.name == "CUDA"
-        and ("copy" in event.name.lower() or "memcpy" in event.name.lower())
+        and ("at::native" in event.name or "memcpy" in event.name.lower())
     ]
 
 
-@pytest.mark.parametrize("m", [17, 64, 1000])
-def test_large_m_linear_launches_no_scale_copy(linear, m: int) -> None:
+@pytest.mark.parametrize("m", [1, 4, 16, 17, 64, 1000])
+def test_linear_launches_no_scale_copy(linear, m: int) -> None:
     method, layer = linear
     x = torch.randn(m, K, device="cuda", dtype=torch.bfloat16)
     method.apply(layer, x)
-    assert _torch_copies(lambda: method.apply(layer, x)) == []
+    assert _torch_kernels(lambda: method.apply(layer, x)) == []
 
 
 @pytest.mark.parametrize("m", [1, 4, 16, 17, 64, 1000])

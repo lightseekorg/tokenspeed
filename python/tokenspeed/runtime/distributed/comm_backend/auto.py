@@ -696,7 +696,9 @@ class AutoBackend(CommBackend):
         """
         state = self._small_exchanges.get(group)
         # Only the size decides, which every rank of a call shares.
-        if state is None or not state.serves(tensor.numel() * tensor.element_size()):
+        if state is None or not state.serves(
+            tensor.numel() * tensor.element_size(), floats=False
+        ):
             return None
         from tokenspeed_kernel.ops.communication.cute_dsl import cute_dsl_ll_all_gather
 
@@ -739,11 +741,15 @@ class AutoBackend(CommBackend):
         return None
 
     def prepare_small_exchange(
-        self, group: Group, cap_bytes: int, timeout_ns: int
+        self, group: Group, cap_bytes: int, float_cap_bytes: int, timeout_ns: int
     ) -> bool:
         # Pure data movement over symmetric memory; the NCCL-only switch keeps NCCL.
         if group in self._small_exchanges:
-            return self._small_exchanges[group].cap_bytes >= cap_bytes
+            state = self._small_exchanges[group]
+            return (
+                state.cap_bytes >= cap_bytes
+                and state.float_cap_bytes >= float_cap_bytes
+            )
         if len(group) < 2 or not current_platform().is_nvidia:
             return False
         from tokenspeed_kernel.ops.communication.cute_dsl import (
@@ -754,6 +760,7 @@ class AutoBackend(CommBackend):
             pg_manager.get_process_group("gloo", group),
             torch.device("cuda", torch.cuda.current_device()),
             cap_bytes=cap_bytes,
+            float_cap_bytes=float_cap_bytes,
             timeout_ns=timeout_ns,
             eligible=not self._force_deterministic_rsag(),
         )
@@ -761,6 +768,30 @@ class AutoBackend(CommBackend):
             return False
         self._small_exchanges[group] = state
         return True
+
+    def all_gather_float_words_single(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> None:
+        # Words travel as themselves when the prepared exchange serves the size.
+        state = self._small_exchanges.get(group)
+        payload = input.numel() * input.element_size()
+        received = output.numel() * output.element_size()
+        if (
+            state is None
+            or not state.serves(payload, floats=True)
+            or received != payload * len(group)
+        ):
+            return self.all_gather_single(output, input, group)
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_ll_all_gather_floats,
+        )
+
+        target = output
+        if not output.is_contiguous() or output.data_ptr() % 16:
+            target = torch.empty(output.shape, dtype=output.dtype, device=output.device)
+        cute_dsl_ll_all_gather_floats(state, _aligned(input), target)
+        if target is not output:
+            output.copy_(target)
 
     def _small_exchange(
         self, output: torch.Tensor, input: torch.Tensor, group: Group, gather: bool
@@ -780,7 +811,7 @@ class AutoBackend(CommBackend):
                 return None
             payload //= len(group)
         received = output.numel() * output.element_size()
-        if not state.serves(payload) or received != payload * len(group):
+        if not state.serves(payload, floats=False) or received != payload * len(group):
             return None
         return state
 
@@ -990,6 +1021,15 @@ class AutoBackend(CommBackend):
         workspace: ProjectionWorkspace,
     ) -> torch.Tensor:
         return self._projection.mm_reduce_scatter(tensor, rows, weight, workspace)
+
+    def projection_mm_to_owners(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        weight: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> torch.Tensor:
+        return self._projection.mm_to_owners(tensor, rows, weight, workspace)
 
     def projection_all_to_all(
         self,

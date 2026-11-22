@@ -447,7 +447,9 @@ def test_flat_kv_atom_pages_resolve_to_the_original_field_bytes(
 
     granularity = plan.prefix_granularity
     ratio = granularity // kernel_page_size
-    atom_pages = pool.atom_pages_per_block(FULL_ATTENTION, kernel_page_size)
+    atom_pages = pool.atom_pages_per_block(
+        FULL_ATTENTION, kernel_page_size, write_slot_dtype=torch.int32
+    )
     group = plan.group(FULL_ATTENTION)
     last_block = group.page_count - 1
     raw = torch.tensor([[0, 1, last_block]], dtype=torch.int32)
@@ -529,7 +531,7 @@ def test_flat_kv_rejects_a_stride_that_is_not_whole_atom_pages() -> None:
         ),
     )
     with pytest.raises(ValueError, match="is not divisible by atom-page payload"):
-        pool.atom_pages_per_block(FULL_ATTENTION, 64)
+        pool.atom_pages_per_block(FULL_ATTENTION, 64, write_slot_dtype=torch.int32)
 
 
 def test_flat_kv_reduces_resident_bytes_under_pp_without_gdn() -> None:
