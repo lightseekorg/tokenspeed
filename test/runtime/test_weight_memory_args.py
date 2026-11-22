@@ -88,7 +88,7 @@ def test_discard_rejects_unsupported_contracts_at_argument_resolution(
         ServerArgs(**discard_args(**overrides))
 
 
-@pytest.mark.parametrize("dense_fp8_small_m", ["qkv", "qkv-down"])
+@pytest.mark.parametrize("dense_fp8_small_m", ["qkv"])
 def test_discard_refuses_dense_fp8_weight_copies(dense_fp8_small_m):
     """--dense-fp8-small-m makes its FP8 weight copies once after loading and
     refuses weight updates, so under discard a released copy could never be
@@ -112,7 +112,7 @@ def test_discard_refuses_dense_fp8_weight_copies(dense_fp8_small_m):
     assert cpu_backup.dense_fp8_small_m == dense_fp8_small_m
 
 
-@pytest.mark.parametrize("dense_fp8_small_m", ["qkv", "qkv-down"])
+@pytest.mark.parametrize("dense_fp8_small_m", ["qkv"])
 def test_model_updater_refuses_dense_fp8_weight_copies(dense_fp8_small_m):
     """Every weight update refuses to start while the FP8 weight copies exist,
     so a Model Updater config is refused with them at argument resolution."""

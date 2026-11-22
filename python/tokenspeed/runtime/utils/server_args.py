@@ -2462,7 +2462,7 @@ class ServerArgs:
         _require_choice(
             "--dense-fp8-small-m",
             self.dense_fp8_small_m,
-            ("none", "qkv", "qkv-down"),
+            ("none", "qkv"),
         )
         if self.dense_fp8_small_m != "none" and (
             self.numerics in BITWISE_ENVELOPES or self.batch_invariant_collectives
@@ -5571,10 +5571,9 @@ class ServerArgs:
             "--dense-fp8-small-m",
             type=str,
             default=ServerArgs.dense_fp8_small_m,
-            choices=["none", "qkv", "qkv-down"],
+            choices=["none", "qkv"],
             help="Muse Spark on gfx950: run decode and verify forwards' QKV "
-            "projection at 33-128 rows (qkv), and also the pre-expert latent "
-            "projection at 17-128 rows (qkv-down), as FP8 GEMMs; prompt K / V "
+            "projection at 33-128 rows as an FP8 GEMM (qkv); prompt K / V "
             "stays BF16. Startup refuses what it cannot serve. A numerics "
             "change, refused under --numerics rl-bitwise and "
             "--batch-invariant-collectives. none keeps BF16.",

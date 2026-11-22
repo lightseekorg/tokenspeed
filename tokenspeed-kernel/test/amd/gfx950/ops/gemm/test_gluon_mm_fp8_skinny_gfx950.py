@@ -36,9 +36,9 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.skinny import (  # noqa: E402
 )
 
 _K = 8192
-# The two configured weight shapes ([N, 8192]) and the first row each takes.
-_SHAPES = (4608, 1024)
-_FIRST = {4608: 17, 1024: 17}
+# The configured weight shape ([N, 8192]) and the first row it takes.
+_SHAPES = (4608,)
+_FIRST = {4608: 17}
 _NAME = "gluon_mm_fp8_skinny_gfx950"
 
 
@@ -173,9 +173,8 @@ def test_refuses_problems_without_a_config():
     """Shapes and row counts outside the measured configs are refused."""
     assert supports_gluon_mm_fp8_skinny_gfx950(17, 4608, _K)
     assert not supports_gluon_mm_fp8_skinny_gfx950(16, 4608, _K)
-    assert supports_gluon_mm_fp8_skinny_gfx950(17, 1024, _K)
-    assert not supports_gluon_mm_fp8_skinny_gfx950(16, 1024, _K)
-    assert not supports_gluon_mm_fp8_skinny_gfx950(129, 1024, _K)
+    assert not supports_gluon_mm_fp8_skinny_gfx950(129, 4608, _K)
+    assert not supports_gluon_mm_fp8_skinny_gfx950(48, 1024, _K)
     assert not supports_gluon_mm_fp8_skinny_gfx950(48, 2304, _K)
     codes = torch.zeros(48, _K, device="cuda", dtype=torch.float8_e4m3fn)
     weight = torch.zeros(2304, _K, device="cuda", dtype=torch.float8_e4m3fn)

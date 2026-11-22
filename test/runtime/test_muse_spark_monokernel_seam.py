@@ -425,8 +425,7 @@ def test_other_baked_in_values_keep_the_regular_path(override, reason) -> None:
 
 
 def _fp8_projection(enabled: bool) -> muse_spark._DenseFp8Weight:
-    """A QKV projection's FP8 copy (--dense-fp8-small-m qkv), with the
-    widest window. Preparing runs the FP8 GEMM, so on the host a placeholder
+    """A QKV projection's FP8 copy (--dense-fp8-small-m qkv). Preparing runs the FP8 GEMM, so on the host a placeholder
     copy stands in for the converted weight: the launches only ask the
     window predicate."""
     fp8 = muse_spark._DenseFp8Weight(
@@ -434,7 +433,6 @@ def _fp8_projection(enabled: bool) -> muse_spark._DenseFp8Weight:
         enabled,
         muse_spark._DENSE_FP8_QKV_MIN_ROWS,
         muse_spark._DENSE_FP8_MAX_ROWS,
-        None,
     )
     if enabled:
         fp8.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
@@ -446,29 +444,15 @@ def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
     """The launches run every dense projection in BF16, so they must never
     take the rows that the regular layer projects in FP8: every decode or
     verify step that takes the kernels (at most 2 requests of at most 8
-    rows) is below every FP8 window: QKV's from 33 rows and the pre-expert
-    projection's from 17, the lowest start the load-time refusal compares
-    against."""
-    pre_expert = muse_spark._DenseFp8Weight(
-        "pre_expert_proj",
-        True,
-        muse_spark._DENSE_FP8_MIN_ROWS,
-        muse_spark._GATHER_MXFP4_FP8_MAX_ROWS,
-        "derived_weights",
-    )
-    pre_expert.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
-    assert muse_spark.MONOKERNEL_MAX_ROWS < min(
-        muse_spark._DENSE_FP8_FIRST_ROWS.values()
-    )
+    rows) is below the FP8 window, which starts at 33 rows, the start the
+    load-time refusal compares against."""
+    assert muse_spark.MONOKERNEL_MAX_ROWS < muse_spark._DENSE_FP8_QKV_MIN_ROWS
     fp8 = _fp8_projection(True)
     assert fp8.applies(33) and not fp8.applies(32)
     for bs in range(1, 5):
         for rows in range(bs, 300, bs):
             ctx = _ctx(ForwardMode.DECODE, bs, rows)
-            assert not (
-                takes_monokernels(rows, ctx)
-                and (fp8.applies(rows) or pre_expert.applies(rows))
-            ), (bs, rows)
+            assert not (takes_monokernels(rows, ctx) and fp8.applies(rows)), (bs, rows)
 
 
 def test_a_launch_refuses_an_fp8_copy_of_its_input_rows() -> None:

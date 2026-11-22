@@ -75,7 +75,6 @@ _NAMED_REGION_POOLS = {
     "runtime_states": "persistent_buffers",
     "attention_state": "persistent_buffers",
     "workspace": "persistent_buffers",
-    "derived_weights": "persistent_buffers",
 }
 
 try:

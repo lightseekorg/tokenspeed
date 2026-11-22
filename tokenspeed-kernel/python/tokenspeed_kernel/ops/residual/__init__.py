@@ -1231,7 +1231,6 @@ from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
     post_norm_residual_pre_norm_bf16_fp8,
-    post_norm_residual_pre_norm_fp8,
     residual_gate_coefficients,
 )
 
@@ -1255,7 +1254,6 @@ __all__ = [
     "post_norm_residual_pre_norm",
     "post_norm_residual_pre_norm_bf16",
     "post_norm_residual_pre_norm_bf16_fp8",
-    "post_norm_residual_pre_norm_fp8",
     "residual_gate_coefficients",
     "try_mhc_shifted_post_pre_norm",
     "try_mhc_shifted_post_pre_norm_quantize_fp8",

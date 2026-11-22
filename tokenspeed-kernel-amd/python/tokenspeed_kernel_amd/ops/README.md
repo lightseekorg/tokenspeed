@@ -342,8 +342,8 @@ launch several programs per CU. Weights pass through LDS in E4M3 and upcast
 
 `gluon_mm_fp8_skinny_gfx950` (`gfx950/gemm/fp8/skinny.py`) multiplies a few
 FP8 rows by an FP8 weight whose read dominates the launch: `gemm.mm` selects
-it for an FP8 call with row and channel scales at the two measured weight
-shapes and 17-128 rows. It quantizes nothing; callers decide which rows are
+it for an FP8 call with row and channel scales at the measured weight
+shape and 17-128 rows. It quantizes nothing; callers decide which rows are
 FP8.
 
 #### Contract
@@ -356,16 +356,16 @@ FP8.
   `max(amax / 448, 1e-12)` and codes `x / scale` rounded once to nearest even,
   both by IEEE FP32 division. The token quantizer, the weight conversion
   (`prepare_fp8_channel_weight`) and the layer boundary's FP8 copy share it.
-- Configs exist for `[4608, 8192]` and `[1024, 8192]` at 17-128 rows; they
-  are its problem filter. It offers the `weight_streaming`
-  feature. Offset, strided or unaligned operands decline it through the
-  traits. One split count per weight shape, so a row's bits do not depend on
-  `M` or on the other rows; results are deterministic.
+- A config exists for `[4608, 8192]` at 17-128 rows; it is the problem
+  filter. It offers the `weight_streaming` feature. Offset, strided or
+  unaligned operands decline it through the traits. One split count per
+  weight shape, so a row's bits do not depend on `M` or on the other rows;
+  results are deterministic.
 
 #### Algorithm
 
 - A program owns one 64-column weight slab of one K slice (`SPLIT_K` 2 for
-  `[4608, 8192]`, 8 for `[1024, 8192]`) and streams it once from HBM through
+  `[4608, 8192]`) and streams it once from HBM through
   a three-buffer LDS ring of direct-to-LDS loads, two 256-byte K tiles ahead.
   It multiplies all rows of its row tile by the unscaled
   `v_mfma_f32_32x32x64_f8f6f4` (zero scale operands to the scaled MFMA

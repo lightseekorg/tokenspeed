@@ -47,7 +47,6 @@ def _post_norm_residual_pre_norm_fp8_kernel(
     beta_ptr,
     pre_weight_ptr,
     out_stream_ptr,
-    out_pre_fp32_ptr,
     out_pre_bf16_ptr,
     out_pre_fp8_ptr,
     out_pre_scale_ptr,
@@ -59,7 +58,6 @@ def _post_norm_residual_pre_norm_fp8_kernel(
     POST_HAS_WEIGHT: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
-    RETURN_PRE_FP32: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
@@ -88,8 +86,6 @@ def _post_norm_residual_pre_norm_fp8_kernel(
     pre = stream * tl.rsqrt(variance + pre_eps)
     weight = tl.load(pre_weight_ptr + offsets, mask=mask, other=0.0)
     pre *= _centered_bf16(weight, pre_weight_offset)
-    if RETURN_PRE_FP32:
-        tl.store(out_pre_fp32_ptr + row * width + offsets, pre, mask=mask)
     pre_bf16 = pre.to(tl.bfloat16)
     tl.store(out_pre_bf16_ptr + row * width + offsets, pre_bf16, mask=mask)
     # Per-row FP8 E4M3 copy of the BF16 row, by the token quantizer's row
@@ -126,11 +122,7 @@ def triton_post_norm_residual_pre_norm_fp8(
     pre_eps: float,
     pre_weight_offset: float,
     enable_pdl: bool,
-    *,
-    return_pre_fp32: bool,
-) -> tuple[
-    torch.Tensor, torch.Tensor | None, torch.Tensor, tuple[torch.Tensor, torch.Tensor]
-]:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Registered entry of :func:`launch_post_norm_residual_pre_norm_fp8`."""
     return launch_post_norm_residual_pre_norm_fp8(
         stream,
@@ -144,7 +136,6 @@ def triton_post_norm_residual_pre_norm_fp8(
         pre_eps,
         pre_weight_offset,
         enable_pdl,
-        return_pre_fp32=return_pre_fp32,
     )
 
 
@@ -160,21 +151,16 @@ def launch_post_norm_residual_pre_norm_fp8(
     pre_eps: float,
     pre_weight_offset: float,
     enable_pdl: bool,
-    *,
-    return_pre_fp32: bool,
-) -> tuple[
-    torch.Tensor, torch.Tensor | None, torch.Tensor, tuple[torch.Tensor, torch.Tensor]
-]:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """The boundary with the FP8 copy of its BF16 pre-norm rows, one Triton
     program per row.
 
     Arguments as ``post_norm_residual_pre_norm`` for a plain ``[rows, width]``
-    BF16 branch, with ``pre_weight`` required; ``return_pre_fp32`` selects
-    whether the FP32 pre-norm rows are written.
+    BF16 branch, with ``pre_weight`` required.
 
     Returns:
-        ``(new_stream, pre_fp32 or None, pre_bf16, (codes, scales))``: FP8
-        E4M3 ``[rows, width]`` codes and FP32 ``[rows]`` scales.
+        ``(new_stream, pre_bf16, (codes, scales))``: FP8 E4M3
+        ``[rows, width]`` codes and FP32 ``[rows]`` scales.
     """
     if stream.ndim != 2 or stream.shape != branch.shape:
         raise ValueError("stream and branch must share a [rows, width] shape")
@@ -196,12 +182,11 @@ def launch_post_norm_residual_pre_norm_fp8(
     stream_values = stream.contiguous()
     branch_values = branch.contiguous()
     out_stream = torch.empty_like(stream_values)
-    pre_fp32 = torch.empty_like(stream_values) if return_pre_fp32 else None
     pre_bf16 = torch.empty((rows, width), dtype=torch.bfloat16, device=stream.device)
     codes = torch.empty((rows, width), dtype=torch.float8_e4m3fn, device=stream.device)
     scales = torch.empty(rows, dtype=torch.float32, device=stream.device)
     if rows == 0:
-        return out_stream, pre_fp32, pre_bf16, (codes, scales)
+        return out_stream, pre_bf16, (codes, scales)
     block = triton.next_power_of_2(width)
     if block > 65536:
         raise ValueError("the boundary width is too wide for one Triton block")
@@ -215,7 +200,6 @@ def launch_post_norm_residual_pre_norm_fp8(
         beta.contiguous(),
         pre_weight,
         out_stream,
-        pre_fp32 if pre_fp32 is not None else out_stream,
         pre_bf16,
         codes,
         scales,
@@ -227,9 +211,8 @@ def launch_post_norm_residual_pre_norm_fp8(
         POST_HAS_WEIGHT=post_weight is not None,
         BLOCK=block,
         ENABLE_PDL=use_pdl,
-        RETURN_PRE_FP32=return_pre_fp32,
         # As the BF16 boundary kernel: row-wide vectors spill at 4 warps.
         num_warps=16,
         **launch,
     )
-    return out_stream, pre_fp32, pre_bf16, (codes, scales)
+    return out_stream, pre_bf16, (codes, scales)

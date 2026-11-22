@@ -59,7 +59,6 @@ Allocation sites use `named_region(name)` to describe their owner:
 | `runtime_states` | request history and runtime state | `persistent_buffers` |
 | `attention_state` | attention backend and graph metadata | `persistent_buffers` |
 | `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
-| `derived_weights` | weight copies made after the weights region (Muse Spark's pre-expert FP8 copies) | `persistent_buffers` |
 
 The adapter resolves these aliases centrally. The executor owns its adapter
 and passes it to the prefill graph; their buffers do not depend on the KV

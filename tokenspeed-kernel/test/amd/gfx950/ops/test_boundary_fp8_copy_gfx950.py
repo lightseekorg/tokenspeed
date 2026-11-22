@@ -30,7 +30,6 @@ from tokenspeed_kernel.ops.residual import (  # noqa: E402
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
     post_norm_residual_pre_norm_bf16_fp8,
-    post_norm_residual_pre_norm_fp8,
     residual_gate_coefficients,
 )
 
@@ -133,37 +132,3 @@ def test_boundary_fp8_compiles_once_for_every_row_count() -> None:
     with assert_no_triton_compile(kernel):
         for rows in (1, 17, 64, 65, 128, 129, 300):
             call(rows)
-
-
-def test_boundary_fp8_copy_matches_boundary_then_row_quantize() -> None:
-    """The Triton boundary's in-launch FP8 copy (post_norm_residual_pre_norm_fp8)
-    equals post_norm_residual_pre_norm followed by the registered row
-    quantizer: the stream, both pre-norm copies, and the FP8 codes and scales,
-    at the decode row counts the FP8 projections take.
-    """
-    torch.manual_seed(47)
-    post_weight = torch.randn(8192, device="cuda").bfloat16() * 0.1
-    pre_weight = torch.randn_like(post_weight) * 0.1
-    alpha, beta = residual_gate_coefficients(torch.randn_like(post_weight), 0.3, 1e-3)
-
-    def check(rows: int) -> None:
-        stream = torch.randn(rows, 8192, device="cuda")
-        branch = torch.randn_like(stream).bfloat16()
-        # A zero row takes the scale floor instead of dividing by zero.
-        branch[0].zero_()
-        stream[0].zero_()
-        args = (stream, branch, post_weight, 1e-6, 1.0, alpha, beta, pre_weight,
-                1e-6, 1.0, False, None, 1)  # fmt: skip
-        fused_stream, fused_fp32, fused_bf16, (codes, scales) = (
-            post_norm_residual_pre_norm_fp8(*args)
-        )
-        new_stream, pre_fp32, pre_bf16 = post_norm_residual_pre_norm(*args)
-        expected_codes, expected_scales = _quantize_rows_amax_div(pre_bf16)
-        assert torch.equal(fused_stream, new_stream)
-        assert torch.equal(fused_fp32, pre_fp32)
-        assert torch.equal(fused_bf16, pre_bf16)
-        assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
-        assert torch.equal(scales, expected_scales)
-
-    for rows in (17, 24, 32, 48, 64, 96, 128):
-        check(rows)

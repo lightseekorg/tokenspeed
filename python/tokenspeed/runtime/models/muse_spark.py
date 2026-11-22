@@ -77,7 +77,6 @@ from tokenspeed_kernel.ops.residual import (
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
     post_norm_residual_pre_norm_bf16_fp8,
-    post_norm_residual_pre_norm_fp8,
     residual_gate_coefficients,
 )
 from tokenspeed_kernel.ops.tuning import kernel_warmup
@@ -161,9 +160,6 @@ from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.common import make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
-    TorchMemorySaverAdapter,
-)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
@@ -191,14 +187,8 @@ _GATHER_MXFP4_MAX_ROWS = 320
 # Lamport window (172 rows of a 1024-wide shard). It matches the separate norm
 # within one BF16 ulp, not bit for bit, so it keeps its bound.
 _GATHER_RMSNORM_MAX_ROWS = 172
-# Rows up to which that fused path projects through the FP8 copy
-# (--dense-fp8-small-m): the window its FP8 numerics were checked in. Past it
-# the pre-expert columns stay BF16.
-_GATHER_MXFP4_FP8_MAX_ROWS = 128
-# The row window of the FP8 dense GEMMs (--dense-fp8-small-m).
-_DENSE_FP8_MIN_ROWS = 17
-# The QKV projection's FP8 rows start higher: up to 32 rows its decode stays on
-# the BF16 projection.
+# The QKV projection's FP8 row window (--dense-fp8-small-m): up to 32 rows its
+# decode stays on the BF16 projection.
 _DENSE_FP8_QKV_MIN_ROWS = 33
 _DENSE_FP8_MAX_ROWS = 128
 # The GEMM family the flag runs: a weight-streaming FP8 kernel with row and
@@ -208,32 +198,11 @@ _DENSE_FP8_MAX_ROWS = 128
 _DENSE_FP8_FEATURES = frozenset({"weight_streaming"})
 
 
-# The projections each --dense-fp8-small-m value runs in FP8.
-_DENSE_FP8_PROJECTIONS = {
-    "none": frozenset(),
-    "qkv": frozenset({"qkv"}),
-    "qkv-down": frozenset({"qkv", "pre_expert"}),
-}
-# The first row of each projection's FP8 window.
-_DENSE_FP8_FIRST_ROWS = {
-    "qkv": _DENSE_FP8_QKV_MIN_ROWS,
-    "pre_expert": _DENSE_FP8_MIN_ROWS,
-}
-
-
-def _dense_fp8_small_m(projection: str) -> bool:
-    """Whether --dense-fp8-small-m runs ``projection`` ("qkv" or
-    "pre_expert") in FP8."""
-    if projection not in _DENSE_FP8_PROJECTIONS["qkv-down"]:
-        raise ValueError(f"unknown dense FP8 projection {projection!r}")
-    if (
-        projection
-        not in _DENSE_FP8_PROJECTIONS[global_server_args_dict["dense_fp8_small_m"]]
-    ):
-        return False
-    # Off gfx950 no small-M FP8 GEMM serves a projection, so loading refuses
-    # it (_DenseFp8Weight.prepare).
-    return True
+def _dense_fp8_qkv() -> bool:
+    """Whether --dense-fp8-small-m runs the QKV projection in FP8. Off gfx950
+    no small-M FP8 GEMM serves it, so loading refuses it
+    (_DenseFp8Weight.prepare)."""
+    return global_server_args_dict["dense_fp8_small_m"] == "qkv"
 
 
 def _fp8_projections(forward_mode: ForwardMode) -> bool:
@@ -274,28 +243,16 @@ class _DenseFp8Weight:
 
     Holds an FP8 E4M3 copy of the projected weight with one FP32 scale per
     output channel, made after loading, and projects decode rows in
-    ``[min_rows, max_rows]`` through it with per-row FP8 activations.
-
-    ``copy_region`` is the memory saver's named region the copy is allocated
-    in, so that releasing ``weights`` releases it and resuming restores it at
-    the same address with the same contents; None for a copy made while the
-    weights load, which is already inside the ``weights`` region (the memory
-    saver allows no region inside it).
+    ``[min_rows, max_rows]`` through it with per-row FP8 activations. The
+    copy is made while the weights load, inside the memory saver's
+    ``weights`` region, so releasing ``weights`` releases it too.
     """
 
-    def __init__(
-        self,
-        name: str,
-        enabled: bool,
-        min_rows: int,
-        max_rows: int,
-        copy_region: str | None,
-    ) -> None:
+    def __init__(self, name: str, enabled: bool, min_rows: int, max_rows: int) -> None:
         self.name = name
         self.enabled = enabled
         self.min_rows = min_rows
         self.max_rows = max_rows
-        self.copy_region = copy_region
         self.weight: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
 
@@ -333,17 +290,9 @@ class _DenseFp8Weight:
         if not self.enabled:
             return
         self.check(weight)
-        if self.copy_region is None:
-            self.weight, self.scale = prepare_fp8_channel_weight(weight)
-        else:
-            saver = TorchMemorySaverAdapter.create(
-                enable=global_server_args_dict["enable_memory_saver"]
-            )
-            with saver.named_region(self.copy_region):
-                self.weight, self.scale = prepare_fp8_channel_weight(weight)
+        self.weight, self.scale = prepare_fp8_channel_weight(weight)
         # Compile the GEMM's binaries now (its warm-up compiles every row
-        # tile), whatever row counts the startup warm-up forwards run. Its
-        # temporaries stay out of the copy's region.
+        # tile), whatever row counts the startup warm-up forwards run.
         with kernel_warmup(enabled=True):
             self.project(weight.new_zeros(self.min_rows, weight.shape[1]), None, None)
 
@@ -376,11 +325,6 @@ class _DenseFp8Weight:
             out_dtype=torch.bfloat16,
             quant="fp8",
         )
-
-
-def _dense_fp8_weights(layer: torch.nn.Module) -> tuple["_DenseFp8Weight", ...]:
-    """A decoder layer's FP8 weight copies (--dense-fp8-small-m)."""
-    return (layer.self_attn.qkv_proj.dense_fp8, layer.mlp.pre_expert_proj.dense_fp8)
 
 
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
@@ -540,7 +484,6 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         layer_count: int,
         replicate_for_owned_rows: bool,
         workspace_rows: int,
-        fp8_small_m: bool,
     ) -> None:
         # Replicate pre-/post-expert weights to avoid gathers and project owned rows.
         mapping = global_server_args_dict.get("mapping")
@@ -604,50 +547,6 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 rank_major=True,
             )
         self.iris_state: MuseIrisState | None = None
-        # The projected columns' FP8 copy (--dense-fp8-small-m qkv-down), up
-        # to the rows the fused gather that consumes it serves. Only that
-        # gather reads it, so a projection without its workspace (TP1,
-        # attention DP) cannot run in FP8.
-        if fp8_small_m and self.workspace is None:
-            raise ValueError(
-                "--dense-fp8-small-m qkv-down: the pre-expert projection "
-                f"{prefix} has no fused gather (TP1 or attention DP), its "
-                "FP8 copy's only reader; serve with --dense-fp8-small-m qkv"
-            )
-        self.dense_fp8 = _DenseFp8Weight(
-            prefix.rsplit(".", 1)[-1],
-            fp8_small_m,
-            _DENSE_FP8_MIN_ROWS,
-            min(_DENSE_FP8_MAX_ROWS, _GATHER_MXFP4_FP8_MAX_ROWS, workspace_rows),
-            # Made once the communication runtime is set up, after the
-            # weights region has closed.
-            "derived_weights",
-        )
-
-    def check_fp8_weight(self) -> None:
-        """Refuse a projected-columns shape the FP8 copy could not serve."""
-        self.dense_fp8.check(self._local_weight().data)
-
-    def prepare_fp8_weight(self) -> None:
-        """Make the projected columns' FP8 copy from the loaded weight."""
-        self.dense_fp8.prepare(self._local_weight().data)
-
-    def _project_local(
-        self,
-        x: torch.Tensor,
-        out: torch.Tensor,
-        x_fp8: tuple[torch.Tensor, torch.Tensor] | None,
-        fp8: bool,
-    ) -> torch.Tensor:
-        """Project this rank's columns into ``out``, through the FP8 copy when
-        ``fp8`` (the caller's decision: ``MuseSparkMoE.takes_fp8_input`` in a
-        forward that takes the FP8 projections). ``x_fp8`` is the per-row FP8
-        copy of ``x`` its producer wrote, or None to quantize ``x`` here."""
-        if not fp8:
-            return self._project(x, self._local_weight(), out)
-        # The GEMM refuses a strided out; only a one-row gather passes one,
-        # below the window.
-        return self.dense_fp8.project(x, x_fp8, out)
 
     def _project(
         self,
@@ -820,18 +719,11 @@ class _MuseGatheredLinear(ColumnParallelLinear):
     def forward_mxfp4(
         self,
         x: torch.Tensor,
-        x_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         norm_weight: torch.Tensor,
         eps: float,
         weight_offset: float,
-        *,
-        fp8: bool,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Project, gather, normalize, and dynamically quantize to MXFP4.
-
-        ``x_fp8`` is the per-row FP8 copy of ``x`` its producer wrote, or None;
-        ``fp8`` is as for ``_project_local``.
-        """
+        """Project, gather, normalize, and dynamically quantize to MXFP4."""
         if self.workspace is not None and x.shape[0] <= min(
             _GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0]
         ):
@@ -855,7 +747,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             if iris is not None and iris.can_all_gather_rmsnorm_mxfp4_quant(
                 local, norm_weight
             ):
-                self._project_local(x, local, x_fp8, fp8)
+                self._project(x, self._local_weight(), local)
                 return self.workspace[:tokens], iris.all_gather_rmsnorm_mxfp4_quant(
                     local,
                     norm_weight,
@@ -961,8 +853,8 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
                 device=self.weight.device,
             )
         self.iris_state: MuseIrisState | None = None
-        # The local weight's FP8 copy (--dense-fp8-small-m qkv or qkv-down).
-        if _dense_fp8_small_m("qkv") and not isinstance(
+        # The local weight's FP8 copy (--dense-fp8-small-m qkv).
+        if _dense_fp8_qkv() and not isinstance(
             self.quant_method, UnquantizedLinearMethod
         ):
             raise ValueError(
@@ -971,11 +863,9 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
             )
         self.dense_fp8 = _DenseFp8Weight(
             "qkv_proj",
-            _dense_fp8_small_m("qkv"),
+            _dense_fp8_qkv(),
             _DENSE_FP8_QKV_MIN_ROWS,
             _DENSE_FP8_MAX_ROWS,
-            # Made while the weights load, inside the weights region.
-            None,
         )
 
     def prepare_fp8_weight(self) -> None:
@@ -1861,7 +1751,6 @@ class MuseSparkMoE(nn.Module):
             layer_count=config.num_hidden_layers,
             replicate_for_owned_rows=True,
             workspace_rows=_GATHER_MXFP4_MAX_ROWS,
-            fp8_small_m=_dense_fp8_small_m("pre_expert"),
         )
         self.pre_expert_norm = MuseSparkRMSNorm(
             hidden_size=compressed_size,
@@ -1952,7 +1841,6 @@ class MuseSparkMoE(nn.Module):
             layer_count=config.num_hidden_layers,
             replicate_for_owned_rows=False,
             workspace_rows=_GATHER_WORKSPACE_ROWS,
-            fp8_small_m=False,
         )
         # Gluon Petit owns dispatch and returns each local row's routes.
         self.uses_petit = self.experts.plan["a2a_backend"] == "gluon_petit"
@@ -2361,56 +2249,8 @@ class MuseSparkMoE(nn.Module):
             columns, topk_weights, norm.weight, norm.eps, norm.weight_offset, rows
         )
 
-    def reads_fp8_input(self) -> bool:
-        """Whether this layer has a reader for an FP8 copy of its pre-expert
-        rows: the fused gather + RMSNorm + MXFP4 path, which needs the Iris
-        state, the gather workspace, a pre-expert norm and MXFP4 experts that
-        take pre-quantized rows."""
-        return (
-            self.iris_state is not None
-            and self.expert_quant_kind == "mxfp4"
-            and self.experts.supports_prequantized_input
-            and self.pre_expert_norm.weight is not None
-            and self.pre_expert_proj.workspace is not None
-        )
-
-    def takes_fp8_input(self, rows: int) -> bool:
-        """Whether ``rows`` pre-expert rows of a forward that takes the FP8
-        projections (``_fp8_projections``) project through the FP8 copy; the
-        layer boundary that writes the copy and the projection that reads it
-        both ask this."""
-        return self.reads_fp8_input() and self.pre_expert_proj.dense_fp8.applies(rows)
-
-    def check_fp8_rows(self) -> None:
-        """Refuse a pre-expert FP8 window the fused gather does not serve
-        whole, since a row count it skips would project through a copy the
-        gather then does not read. Call once the Iris state is prepared; the
-        gather's row limit (its Lamport mailbox or its ready flags) is fixed
-        from then on."""
-        projection = self.pre_expert_proj
-        fp8 = projection.dense_fp8
-        width = projection._local_weight().shape[0]
-        rows = fp8.max_rows
-        # The gather's contract is monotone in rows.
-        while rows >= _DENSE_FP8_MIN_ROWS and not (
-            self.iris_state.can_all_gather_rmsnorm_mxfp4_quant(
-                projection.weight.new_empty((rows, width)), self.pre_expert_norm.weight
-            )
-        ):
-            rows -= 1
-        if rows < fp8.max_rows:
-            raise ValueError(
-                f"--dense-fp8-small-m qkv-down: the fused gather of "
-                f"{projection.prefix} serves up to {rows} rows, not the FP8 "
-                f"window's {fp8.max_rows}; serve with --dense-fp8-small-m qkv"
-            )
-
     def _route_and_quantize_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        router_input: torch.Tensor,
-        hidden_states_fp8: tuple[torch.Tensor, torch.Tensor] | None,
-        fp8: bool,
+        self, hidden_states: torch.Tensor, router_input: torch.Tensor
     ) -> (
         tuple[
             torch.Tensor,
@@ -2424,11 +2264,10 @@ class MuseSparkMoE(nn.Module):
         """Route and quantize decode rows in two or three launches, or None.
 
         The top-k shares a launch with the column gather, RMSNorm and MXFP4
-        quantization, and up to the router's shared-launch row limit, where
-        the pre-expert columns project in BF16, the router shares one with
-        this rank's pre-expert columns. Neither launch has a dependency between
-        its halves, so this replaces four launches with two (three past that
-        limit or with the FP8 projection). Returns the BF16 placeholder rows, the MXFP4
+        quantization, and up to the router's shared-launch row limit the router
+        shares one with this rank's pre-expert columns. Neither launch has a
+        dependency between its halves, so this replaces four launches with two
+        (three past that limit). Returns the BF16 placeholder rows, the MXFP4
         rows, the router logits and the top-k weights and ids.
         """
         iris = self.iris_state
@@ -2451,16 +2290,15 @@ class MuseSparkMoE(nn.Module):
             local, norm.weight, bias, self.topk
         ):
             return None
-        if not fp8 and self.gate.supports_with_mm(router_input, hidden_states, weight):
+        if self.gate.supports_with_mm(router_input, hidden_states, weight):
             router_logits = self.gate.forward_with_mm(
                 router_input, hidden_states, weight, local
             )
         else:
-            # Rows past the router's shared-launch limit, and the FP8
-            # projection, leave the router and this rank's pre-expert columns
-            # a launch each.
+            # Rows past the router's shared-launch limit leave the router and
+            # this rank's pre-expert columns a launch each.
             router_logits = self.gate(router_input, pdl_enabled())
-            projection._project_local(hidden_states, local, hidden_states_fp8, fp8)
+            projection._project(hidden_states, weight, local)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(
             local,
             norm.weight,
@@ -2561,26 +2399,19 @@ class MuseSparkMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         router_input: torch.Tensor,
-        hidden_states_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         owned_global_rows: int | None,
         project: bool,
         *,
         payload: str,
-        fp8_projections: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
-
-        ``hidden_states_fp8`` is the per-row FP8 copy of ``hidden_states`` the
-        layer boundary wrote for the pre-expert FP8 projection, or None to
-        quantize the rows there.
 
         The returned projection may defer its gather to the residual boundary.
         Without ``project`` the combined expert rows are returned unprojected
         for a boundary that applies ``post_expert_proj`` itself. ``payload``
         is the owned-row reduce-scatters' encoding (``_collective_payload``).
-        ``fp8_projections`` is the forward's ``_fp8_projections``.
         """
         if owned_global_rows is not None and self.iris_state is None:
             assert project
@@ -2591,12 +2422,8 @@ class MuseSparkMoE(nn.Module):
                 max_num_tokens_per_gpu,
                 owned_global_rows,
             )
-        # The pre-expert projection's FP8 decision, once for the forward.
-        fp8 = fp8_projections and self.takes_fp8_input(hidden_states.shape[0])
         routed = (
-            self._route_and_quantize_inputs(
-                hidden_states, router_input, hidden_states_fp8, fp8
-            )
+            self._route_and_quantize_inputs(hidden_states, router_input)
             if owned_global_rows is None
             else None
         )
@@ -2641,11 +2468,9 @@ class MuseSparkMoE(nn.Module):
                     compressed, compressed_quantized = (
                         self.pre_expert_proj.forward_mxfp4(
                             hidden_states,
-                            hidden_states_fp8,
                             norm_weight,
                             self.pre_expert_norm.eps,
                             self.pre_expert_norm.weight_offset,
-                            fp8=fp8,
                         )
                     )
                 elif self.expert_quant_kind == "nvfp4":
@@ -3041,25 +2866,6 @@ class MuseSparkDecoderLayer(nn.Module):
         self.post_attention_residual_gate.refresh_gate()
         self.post_feedforward_residual_gate.refresh_gate()
 
-    def attention_boundary_writes_fp8(
-        self, rows: int, *, owned_rows: bool, mailbox: bool
-    ) -> bool:
-        """Whether the attention boundary writes an FP8 copy of the MLP's input
-        rows: only where the pre-expert projection reads it
-        (MuseSparkMoE.takes_fp8_input). An owned-row forward, a mailbox
-        branch, attention DP's rank-local rows or a pre_mlp_comm gather
-        replaces those rows, so none is written there."""
-        # The window predicate first: with the flag off it is one check.
-        return (
-            self.mlp.pre_expert_proj.dense_fp8.applies(rows)
-            and not owned_rows
-            and not mailbox
-            and not self.mlp.exchanges_rank_local_rows
-            and self.pre_feedforward_layernorm.weight is not None
-            and self.comm_manager.use_all_reduce(is_moe=True)
-            and self.mlp.takes_fp8_input(rows)
-        )
-
     def mlp_boundary_writes_fp8(
         self, rows: int, *, owned_rows: bool, mailbox: bool
     ) -> bool:
@@ -3201,10 +3007,6 @@ class MuseSparkDecoderLayer(nn.Module):
                         pre_norm.eps,
                         pre_norm.weight_offset,
                     )
-        # The pre-expert projection's per-row FP8 copy of the MLP input, written
-        # by the boundary below where that projection runs in FP8; None leaves
-        # the projection to quantize its rows itself.
-        mlp_input_fp8 = None
         if fused is not None:
             hidden_states, router_input, mlp_input = fused
         else:
@@ -3224,7 +3026,7 @@ class MuseSparkDecoderLayer(nn.Module):
                     attention_output, hidden_states = self.comm_manager.post_attn_comm(
                         attention_output, hidden_states, ctx
                     )
-            boundary_args = (
+            hidden_states, router_input, mlp_input = post_norm_residual_pre_norm(
                 hidden_states,
                 attention_output,
                 self.post_attention_layernorm.weight,
@@ -3238,31 +3040,11 @@ class MuseSparkDecoderLayer(nn.Module):
                 attention_sentinel,
                 attention_ranks,
             )
-            if _fp8_projections(
-                ctx.forward_mode
-            ) and self.attention_boundary_writes_fp8(
-                hidden_states.shape[0],
-                owned_rows=owned_global_rows is not None,
-                mailbox=attention_sentinel is not None,
-            ):
-                # One launch writes the FP8 copy too (the row quantizer's bits).
-                hidden_states, router_input, mlp_input, mlp_input_fp8 = (
-                    post_norm_residual_pre_norm_fp8(*boundary_args)
-                )
-            else:
-                hidden_states, router_input, mlp_input = post_norm_residual_pre_norm(
-                    *boundary_args
-                )
         # Attention DP keeps rows rank-local: the expert exchange moves only
         # their compressed projections.
         rank_local = self.mlp.exchanges_rank_local_rows
         if owned_global_rows is None and not rank_local:
-            boundary_mlp_input = mlp_input
             mlp_input = self.comm_manager.pre_mlp_comm(mlp_input, ctx)
-            if mlp_input is not boundary_mlp_input:
-                # The communication replaced the rows, so the copy no longer
-                # describes them.
-                mlp_input_fp8 = None
         else:
             assert router_input is not None and mlp_input is not None
         post_norm = self.post_feedforward_layernorm
@@ -3314,13 +3096,11 @@ class MuseSparkDecoderLayer(nn.Module):
             mlp_output, sentinel = self.mlp(
                 mlp_input,
                 router_input,
-                mlp_input_fp8,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
                 owned_global_rows,
                 project=not project_in_boundary,
                 payload=_collective_payload(ctx.forward_mode),
-                fp8_projections=_fp8_projections(ctx.forward_mode),
             )
         if project_in_boundary:
             hidden_states, next_attention_input = (
@@ -4039,14 +3819,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                     f"not prepared ({unprepared}), and the decode monokernels "
                     "need their heap. Serve without --decode-monokernel."
                 )
-            if _dense_fp8_small_m("pre_expert"):
-                # The pre-expert FP8 copy's only reader is the Iris fused gather.
-                raise RuntimeError(
-                    f"--dense-fp8-small-m qkv-down: Muse Spark's Iris "
-                    f"collectives are not prepared ({unprepared}), and the "
-                    "pre-expert FP8 projection's reader needs them. Serve with "
-                    "--dense-fp8-small-m qkv."
-                )
             # Only the Iris intermediate exchange uses the column-split down
             # copy; free it before the KV cache is sized.
             for layer in self.model.layers:
@@ -4173,8 +3945,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
                 if isinstance(projection, _MuseGatheredLinear):
                     projection.iris_state = state
-        if _dense_fp8_small_m("pre_expert"):
-            self._prepare_pre_expert_fp8()
         if owned_route_max_rows:
             # Startup may never run a batch in the expert TP8 owner-side
             # window; every layer shares the routed norm's eps and center.
@@ -4374,91 +4144,46 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             dp_lm_head_tp=False,
         )
 
-    def _prepare_pre_expert_fp8(self) -> None:
-        """Make each layer's pre-expert FP8 copy where its reader exists
-        (MuseSparkMoE.reads_fp8_input), then warm the boundary that writes the
-        rows' FP8 copy; elsewhere the projection keeps no copy."""
-        readers = [
-            layer.mlp for layer in self.model.layers if layer.mlp.reads_fp8_input()
-        ]
-        if not readers:
-            raise ValueError(
-                "--dense-fp8-small-m qkv-down: no layer has the fused gather + "
-                "MXFP4 expert path that reads the pre-expert FP8 copy; serve "
-                "with --dense-fp8-small-m qkv"
-            )
-        # Every refusal comes before the first copy.
-        for mlp in readers:
-            mlp.check_fp8_rows()
-            mlp.pre_expert_proj.check_fp8_weight()
-        for mlp in readers:
-            mlp.pre_expert_proj.prepare_fp8_weight()
-        self._warm_dense_fp8_boundaries(qkv=False, pre_expert=True)
-        self._log_dense_fp8_memory()
-
     def _log_dense_fp8_memory(self) -> None:
-        """Log, once a rank, each projection the flag runs in FP8 (shape and
-        row window) and the persistent memory its FP8 weight copies take."""
-        total = 0
-        projections: dict[str, str] = {}
-        layers: dict[str, int] = {}
-        for layer in self.model.layers:
-            for fp8 in _dense_fp8_weights(layer):
-                if fp8.weight is not None:
-                    total += fp8.weight.numel() * fp8.weight.element_size()
-                    total += fp8.scale.numel() * fp8.scale.element_size()
-                    n, k = fp8.weight.shape
-                    layers[fp8.name] = layers.get(fp8.name, 0) + 1
-                    projections[fp8.name] = (
-                        f"{fp8.name} [{n}, {k}] at {fp8.min_rows}-{fp8.max_rows} rows"
-                    )
-        # Layers without the reader keep BF16, so say how many have a copy.
-        projections = {
-            name: f"{text} in {layers[name]} of {len(self.model.layers)} layers"
-            for name, text in projections.items()
-        }
+        """Log, once a rank, the QKV projection's FP8 window, how many layers
+        hold its FP8 copy, and the persistent memory those copies take."""
+        copies = [
+            layer.self_attn.qkv_proj.dense_fp8
+            for layer in self.model.layers
+            if layer.self_attn.qkv_proj.dense_fp8.weight is not None
+        ]
+        total = sum(
+            fp8.weight.numel() * fp8.weight.element_size()
+            + fp8.scale.numel() * fp8.scale.element_size()
+            for fp8 in copies
+        )
+        shape = list(copies[0].weight.shape) if copies else []
         logger.info(
-            f"--dense-fp8-small-m {global_server_args_dict['dense_fp8_small_m']}: "
-            f"FP8 GEMMs for {', '.join(projections.values()) or 'no projection'}; "
-            f"FP8 weight copies take {total / 2**30:.2f} GiB on this rank"
+            f"--dense-fp8-small-m qkv: FP8 GEMMs for qkv_proj {shape} at "
+            f"{_DENSE_FP8_QKV_MIN_ROWS}-{_DENSE_FP8_MAX_ROWS} rows in {len(copies)} "
+            f"of {len(self.model.layers)} layers; FP8 weight copies take "
+            f"{total / 2**30:.2f} GiB on this rank"
         )
 
-    def _warm_dense_fp8_boundaries(self, *, qkv: bool, pre_expert: bool) -> None:
-        """Compile the layer boundaries' FP8-copy variants before serving: the
-        attention boundary's when the pre-expert projection reads its copy,
-        the MLP boundary's when the QKV projection does.
+    def _warm_dense_fp8_boundaries(self) -> None:
+        """Compile the MLP boundary's FP8-copy variant, which the next layer's
+        QKV projection reads, before serving.
 
-        Their compile key holds only the fixed norms and flags, so one call
-        per variant covers every row count. A mailbox branch never writes a
-        copy, so its variants have none to warm.
+        Its compile key holds only the fixed norms and flags, so one call
+        covers every row count. A mailbox branch never writes a copy, so its
+        variants have none to warm.
         """
         layers = self.model.layers
         if not layers:
             return
         layer = layers[0]
         pre = layer.pre_feedforward_layernorm
-        rows, width = _DENSE_FP8_MIN_ROWS, self.config.hidden_size
+        rows, width = _DENSE_FP8_QKV_MIN_ROWS, self.config.hidden_size
         # The post-attention norm is weightless; the pre-MLP one has a weight.
         device = pre.weight.device
         stream = torch.zeros((rows, width), dtype=torch.float32, device=device)
         branch = torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
-        if pre_expert:
-            post = layer.post_attention_layernorm
-            post_norm_residual_pre_norm_fp8(
-                stream,
-                branch,
-                post.weight,
-                post.eps,
-                post.weight_offset,
-                *layer.post_attention_residual_gate._gate_coefficients(),
-                pre.weight,
-                pre.eps,
-                pre.weight_offset,
-                pdl_enabled(),
-                None,
-                1,
-            )
-        if qkv and len(layers) > 1:
+        if len(layers) > 1:
             post, nxt = layer.post_feedforward_layernorm, layers[1].input_layernorm
             post_norm_residual_pre_norm_bf16_fp8(
                 stream,
@@ -4604,25 +4329,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if self.model.config.decode_monokernel and fp8_value != "none":
             # A launch projects in BF16, so it must not take rows the regular
             # path projects in FP8: refused before any copy is made.
-            first = min(
-                _DENSE_FP8_FIRST_ROWS[projection]
-                for projection in _DENSE_FP8_PROJECTIONS[fp8_value]
-            )
-            if MONOKERNEL_MAX_ROWS >= first:
+            if MONOKERNEL_MAX_ROWS >= _DENSE_FP8_QKV_MIN_ROWS:
                 raise ValueError(
                     f"decode monokernels take up to {MONOKERNEL_MAX_ROWS} "
                     f"rows, inside --dense-fp8-small-m {fp8_value}'s FP8 "
-                    f"windows, which start at {first} rows"
+                    f"window, which starts at {_DENSE_FP8_QKV_MIN_ROWS} rows"
                 )
         if fp8_value != "none":
-            # The QKV copy has a reader on every path; the pre-expert copy is
-            # made once the Iris state, which its reader needs, is prepared.
             for layer in self.model.layers:
                 layer.self_attn.qkv_proj.prepare_fp8_weight()
-            self._warm_dense_fp8_boundaries(qkv=True, pre_expert=False)
-            if not _dense_fp8_small_m("pre_expert"):
-                # Under qkv-down the pre-expert preparation logs both.
-                self._log_dense_fp8_memory()
+            self._warm_dense_fp8_boundaries()
+            self._log_dense_fp8_memory()
         if self.model.config.decode_monokernel:
             if fp8_value != "none":
                 logger.info(
@@ -4630,7 +4347,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                     f"{global_server_args_dict['dense_fp8_small_m']} with decode "
                     f"monokernels: decode steps of 1-{MONOKERNEL_MAX_ROWS} rows "
                     "the monokernels take stay BF16; regular decode steps "
-                    "take the FP8 projections inside their row windows"
+                    "take the FP8 QKV projection inside its row window"
                 )
             enable_decode_monokernels(self.model)
         # The BF16 route kernels' warmup only compiles, so disable_autotune keeps it.

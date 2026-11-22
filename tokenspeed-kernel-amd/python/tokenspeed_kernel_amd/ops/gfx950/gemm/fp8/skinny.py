@@ -383,12 +383,11 @@ def gluon_mm_fp8_skinny_reduce_gfx950(
 
 
 # (SPLIT_K, last row count) by (N, K), from SKINNY_FP8_MIN_M rows: the weight
-# shapes this kernel serves (Muse Spark's TP4 QKV and pre-expert slices); every
-# other shape keeps the existing FP8 GEMMs. One split count per weight, whatever
-# the row tile, so a row's bits do not depend on M.
+# shapes this kernel serves (Muse Spark's TP4 QKV slice); every other shape
+# keeps the existing FP8 GEMMs. One split count per weight, whatever the row
+# tile, so a row's bits do not depend on M.
 _SKINNY_FP8_CONFIGS: dict[tuple[int, int], tuple[int, int]] = {
     (4608, 8192): (2, 128),
-    (1024, 8192): (8, 128),
 }
 
 

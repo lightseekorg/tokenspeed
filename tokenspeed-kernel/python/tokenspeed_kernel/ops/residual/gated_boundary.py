@@ -275,98 +275,7 @@ def post_norm_residual_pre_norm_bf16_fp8(
         ``(new_stream, pre_bf16, (codes, scales))``: FP8 E4M3 ``[rows, width]``
         codes and FP32 ``[rows]`` scales.
     """
-    stream_out, _, next_input, next_input_fp8 = _boundary_with_copies(
-        stream,
-        branch,
-        post_weight,
-        post_eps,
-        post_weight_offset,
-        alpha,
-        beta,
-        pre_weight,
-        pre_eps,
-        pre_weight_offset,
-        enable_pdl,
-        branch_sentinel,
-        branch_ranks,
-        return_pre_fp32=False,
-    )
-    return stream_out, next_input, next_input_fp8
-
-
-def post_norm_residual_pre_norm_fp8(
-    stream: torch.Tensor,
-    branch: torch.Tensor,
-    post_weight: torch.Tensor | None,
-    post_eps: float,
-    post_weight_offset: float,
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    pre_weight: torch.Tensor,
-    pre_eps: float,
-    pre_weight_offset: float,
-    enable_pdl: bool,
-    branch_sentinel: int | None,
-    branch_ranks: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """``post_norm_residual_pre_norm`` plus the per-row FP8 copy of its BF16 rows.
-
-    Arguments match ``post_norm_residual_pre_norm`` (``pre_weight`` is
-    required; a plain branch of one rank, no mailbox). For a boundary whose
-    pre-normed rows feed both an FP32 consumer and an FP8 GEMM: the
-    registered ``post_norm_residual_pre_norm_fp8`` kernel writes the FP8 copy
-    in the same launch with the token quantizer's row code, so its bits are
-    that quantizer's of the BF16 rows.
-
-    Returns:
-        ``(new_stream, pre_fp32, pre_bf16, (codes, scales))``: as
-        ``post_norm_residual_pre_norm``, plus FP8 E4M3 ``[rows, width]``
-        codes and FP32 ``[rows]`` scales (row amax / 448).
-    """
-    return _boundary_with_copies(
-        stream,
-        branch,
-        post_weight,
-        post_eps,
-        post_weight_offset,
-        alpha,
-        beta,
-        pre_weight,
-        pre_eps,
-        pre_weight_offset,
-        enable_pdl,
-        branch_sentinel,
-        branch_ranks,
-        return_pre_fp32=True,
-    )
-
-
-def _boundary_with_copies(
-    stream: torch.Tensor,
-    branch: torch.Tensor,
-    post_weight: torch.Tensor | None,
-    post_eps: float,
-    post_weight_offset: float,
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    pre_weight: torch.Tensor | None,
-    pre_eps: float,
-    pre_weight_offset: float,
-    enable_pdl: bool,
-    branch_sentinel: int | None,
-    branch_ranks: int,
-    *,
-    return_pre_fp32: bool,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor,
-    tuple[torch.Tensor, torch.Tensor],
-]:
-    """The registered FP8-writing boundary, with the requested pre-norm copies:
-    ``(new_stream, pre_fp32 or None, pre_bf16, pre_fp8)``, every copy in one
-    launch. Only a plain ``[rows, width]`` branch of one rank takes it: no
-    FP8 reader follows a mailbox or cluster boundary."""
+    # No FP8 reader follows a mailbox or cluster boundary.
     if pre_weight is None:
         raise ValueError("an FP8 next input needs the pre-norm")
     if branch_sentinel is not None:
@@ -390,7 +299,6 @@ def _boundary_with_copies(
         pre_eps,
         pre_weight_offset,
         enable_pdl,
-        return_pre_fp32=return_pre_fp32,
     )
 
 
