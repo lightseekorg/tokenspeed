@@ -776,7 +776,7 @@ TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingAndNoReplayableGroup)
     EXPECT_NO_THROW(PeerConfigFor("ok").Validate());
 }
 
-// A hybrid reader whose 9-token budget a 16-token landing exceeds, its chunks off the 2-token page grid.
+// A hybrid reader with a 9-token budget, its chunks off the 2-token page grid.
 class PeerChunkEndCheckpointTest : public ::testing::Test, protected PeerPair {
 protected:
     static SchedulerConfig Reader() {
@@ -785,47 +785,79 @@ protected:
         return cfg;
     }
     PeerChunkEndCheckpointTest() : PeerPair(PeerConfigFor("holder", /*hybrid=*/true), Reader()) {}
+
+    // Lands the holder's `held` pages on the reader under `prompt`, then prefills the rest there; returns its chunks.
+    std::vector<std::pair<std::int32_t, std::int32_t>> LandThenPrefill(const std::vector<std::int32_t>& held,
+                                                                       const std::vector<std::int32_t>& prompt) {
+        holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = held, .max_new_tokens = 1}});
+        EXPECT_EQ(PrefillRows(Plan(holder_)).size(), 1u);
+        Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
+        Send(holder_, forward::Finish{.request_id = "h"});
+        Plan(holder_);
+
+        reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = prompt}});
+        Plan(reader_);
+        RelayLookups();
+        const ExecutionPlan landing_plan = Plan(reader_);
+        EXPECT_EQ(landing_plan.peer_fetches.size(), 1u);
+        if (landing_plan.peer_fetches.empty()) {
+            return {};
+        }
+        const PeerFetchOperation fetch = landing_plan.peer_fetches.front();
+        const auto landing = static_cast<std::int32_t>(held.size());
+        EXPECT_EQ(fetch.end_tokens, landing);
+        EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true), landing);
+        const auto prompt_end = static_cast<std::int32_t>(prompt.size());
+        std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+        for (std::int32_t round = 0; round < 8 && (chunks.empty() || chunks.back().second < prompt_end); ++round) {
+            const ExecutionPlan plan = Plan(reader_);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr || batch->extend_prefix_lens.empty()) {
+                continue;
+            }
+            const std::int32_t start = batch->extend_prefix_lens.at(0);
+            const std::int32_t end = start + batch->input_lengths.at(0);
+            chunks.emplace_back(start, end);
+            std::vector<std::int32_t> sampled;
+            if (end == prompt_end) {
+                sampled.push_back(77);
+            }
+            Send(reader_, forward::ExtendResult{.request_id = "r", .tokens = std::move(sampled)});
+        }
+        return chunks;
+    }
+
+    // `prompt` with `extra` tokens of its own appended.
+    static std::vector<std::int32_t> Extended(std::vector<std::int32_t> prompt, std::int32_t extra) {
+        for (std::int32_t i = 0; i < extra; ++i) {
+            prompt.push_back(900 + i);
+        }
+        return prompt;
+    }
 };
 
 // Computing starts past the landing, beyond one chunk budget: the prompt takes no chunk-end State checkpoint.
 TEST_F(PeerChunkEndCheckpointTest, ALandingPastOneChunkBudgetLeavesTheChunksAfterItWhole) {
-    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
-    holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
-    ASSERT_EQ(PrefillRows(Plan(holder_)).size(), 1u);
-    Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
-    Send(holder_, forward::Finish{.request_id = "h"});
-    Plan(holder_);
-
-    std::vector<std::int32_t> longer = tokens;
-    for (std::int32_t i = 0; i < 14; ++i) {
-        longer.push_back(900 + i);
-    }
-    reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer}});
-    Plan(reader_);
-    RelayLookups();
-    const ExecutionPlan landing_plan = Plan(reader_);
-    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
-    const PeerFetchOperation fetch = landing_plan.peer_fetches.front();
-    ASSERT_EQ(fetch.end_tokens, 16);
-    ASSERT_EQ(Fetch(fetch, /*read_succeeds=*/true), 16);
-    std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
-    for (std::int32_t round = 0; round < 8 && (chunks.empty() || chunks.back().second < 30); ++round) {
-        const ExecutionPlan plan = Plan(reader_);
-        const ForwardBatch* batch = FindForwardBatch(plan);
-        if (batch == nullptr || batch->extend_prefix_lens.empty()) {
-            continue;
-        }
-        const std::int32_t start = batch->extend_prefix_lens.at(0);
-        const std::int32_t end = start + batch->input_lengths.at(0);
-        chunks.emplace_back(start, end);
-        std::vector<std::int32_t> sampled;
-        if (end == 30) {
-            sampled.push_back(77);
-        }
-        Send(reader_, forward::ExtendResult{.request_id = "r", .tokens = std::move(sampled)});
-    }
-    EXPECT_EQ(chunks, (std::vector<std::pair<std::int32_t, std::int32_t>>{{16, 25}, {25, 30}}));
+    const std::vector<std::int32_t> held = MakeAlignedTokens(8, kP);
+    EXPECT_EQ(LandThenPrefill(held, Extended(held, 14)),
+              (std::vector<std::pair<std::int32_t, std::int32_t>>{{16, 25}, {25, 30}}));
     EXPECT_EQ(reader_.ChunkEndCheckpointsPublished(), 0u);
+}
+
+// Computing starts past an 8-token landing, within one chunk budget: chunks end at checkpoints 16 and 24 (past 10, 20).
+TEST_F(PeerChunkEndCheckpointTest, ALandingWithinOneChunkBudgetPublishesChunkEndCheckpointsAfterIt) {
+    const std::vector<std::int32_t> held = MakeAlignedTokens(4, kP);
+    const std::vector<std::int32_t> prompt = Extended(held, 22);
+    EXPECT_EQ(LandThenPrefill(held, prompt),
+              (std::vector<std::pair<std::int32_t, std::int32_t>>{{8, 16}, {16, 24}, {24, 30}}));
+    EXPECT_EQ(reader_.ChunkEndCheckpointsPublished(), 2u);
+    Send(reader_, forward::Finish{.request_id = "r"});
+    Plan(reader_);
+    std::vector<std::int32_t> fork(prompt.begin(), prompt.begin() + 27);
+    fork.push_back(77);
+    reader_.SubmitRequests({RequestSpec{.request_id = "fork", .tokens = fork}});
+    EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"fork", 24}}))
+        << "a fork resumes at the chunk-end checkpoint below it";
 }
 
 }  // namespace
