@@ -109,7 +109,9 @@ class MHATokenToKVPool(CachePool):
     }
 
     @override
-    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+    def atom_pages_per_block(
+        self, group_id: str, kernel_page_size: int, *, write_slot_dtype: torch.dtype
+    ) -> int:
         for (_, plane), field_id in self.layer_fields.items():
             if plane not in ("k", "v"):
                 continue
@@ -122,7 +124,9 @@ class MHATokenToKVPool(CachePool):
                 raise NotImplementedError(
                     "FlatKV atom pages currently require uniform K/V head geometry"
                 )
-        return super().atom_pages_per_block(group_id, kernel_page_size)
+        return super().atom_pages_per_block(
+            group_id, kernel_page_size, write_slot_dtype=write_slot_dtype
+        )
 
     def get_kv_size_bytes(self):
         # Count planned payload, not the atom view's span across neighboring

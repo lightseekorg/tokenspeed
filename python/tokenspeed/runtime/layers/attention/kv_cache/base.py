@@ -264,11 +264,15 @@ class CachePool(ABC):
             num_layers=self.layer_num,
         )
 
-    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+    def atom_pages_per_block(
+        self, group_id: str, kernel_page_size: int, *, write_slot_dtype: torch.dtype
+    ) -> int:
         """Return atom pages per scheduler block for a kernel page table.
 
         Full-history fields on the shared plane fold their physical stride
         into atom IDs. State and sliding-window groups retain scheduler IDs.
+        ``write_slot_dtype`` is the integer type the caller's token write
+        slots are stored in; the plan checks they fit it.
         """
         specs = {spec.group_id: spec for spec in self.arena.cache_group_specs}
         spec = specs[group_id]
@@ -318,6 +322,7 @@ class CachePool(ABC):
             atom_pages_per_block=multiplier,
             kernel_subpages=ratio,
             kernel_page_size=kernel_page_size,
+            max_write_slot=torch.iinfo(write_slot_dtype).max,
         )
         return multiplier
 
