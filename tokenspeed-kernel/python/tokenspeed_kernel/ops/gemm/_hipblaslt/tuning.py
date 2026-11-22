@@ -364,8 +364,10 @@ def tune_hipblaslt_solutions(
 
     Raises:
         ValueError: ``path`` exists and was made for another stack, ``path``
-            or the GPU's architecture file cannot be read, or ``path`` is
-            omitted on a GPU reporting a name in ``GENERIC_DEVICE_NAMES``.
+            or the GPU's architecture file cannot be read, ``path`` is
+            omitted on a GPU reporting a name in ``GENERIC_DEVICE_NAMES``, or
+            several committed ``gcn_arch=`` files carry the GPU's
+            architecture stamp.
     """
     if path is None:
         device_name = torch.cuda.get_device_name()
@@ -376,6 +378,12 @@ def tune_hipblaslt_solutions(
                 "of writing a device file for it"
             )
         path = hipblaslt_tuned_file(device_name)
+    # Resolve the committed files before enabling TunableOp, so a conflict
+    # among them raises with TunableOp still off.
+    committed = find_hipblaslt_tuned_files(
+        torch.cuda.get_device_name(),
+        torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName,
+    )
     tunable = torch.cuda.tunable
     tunable.tuning_enable(False)
     tunable.record_untuned_enable(False)
@@ -402,10 +410,7 @@ def tune_hipblaslt_solutions(
     # not re-timed, and keep them out of the output, since a device file never
     # lists a GEMM of its architecture file.
     architecture_keys = set()
-    for other in find_hipblaslt_tuned_files(
-        torch.cuda.get_device_name(),
-        torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName,
-    ):
+    for other in committed:
         if not os.path.basename(other).startswith("gcn_arch=") or (
             os.path.realpath(other) == os.path.realpath(path)
         ):
