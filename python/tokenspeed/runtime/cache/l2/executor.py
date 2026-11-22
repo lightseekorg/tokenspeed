@@ -190,8 +190,8 @@ class HostCacheExecutor:
                 ``host_size_gb`` is 0; capped to what fits in every rank's
                 share of its node's Host memory.
             host_size_gb: L2 size in decimal gigabytes; overrides the ratio
-                when positive and is never capped: one that does not fit is
-                refused.
+                when positive. Alignment may reduce whole blocks to avoid a
+                larger pinned bucket; one that exceeds Host memory is refused.
             snapshot_pool: The retraction snapshot pool's knobs as
                 ``ServerArgs`` resolved them, sized here against this
                 rank's layout (``resolve_retraction_pool``); a disabled
@@ -282,7 +282,16 @@ class HostCacheExecutor:
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
         # CUDA host registration is an allocator setting, not a dispatched kernel.
-        host_register_threads = 8 if l2_tier and current_platform().is_nvidia else None
+        host_register_threads = None
+        if l2_tier and current_platform().is_nvidia:
+            allocator_backend = torch.cuda.get_allocator_backend()
+            if allocator_backend == "native":
+                host_register_threads = 8
+            else:
+                logger.info(
+                    f"Keeping the Host allocator policy for {allocator_backend}; "
+                    "parallel Host registration requires native allocator snapshots"
+                )
         alignment_padding = (
             HOST_BUFFER_ALIGNMENT_BYTES - 1 if host_register_threads is not None else 0
         )
@@ -290,6 +299,26 @@ class HostCacheExecutor:
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
+        if l2_tier and host_size_gb > 0 and alignment_padding:
+            l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+            reservation = pinned_host_bytes(l2_bytes)
+            padded_reservation = pinned_host_bytes(l2_bytes + alignment_padding)
+            if padded_reservation > max(reservation, l2_bytes + alignment_padding):
+                aligned_blocks = (
+                    largest_pinned_fit(
+                        reservation,
+                        block_bytes=host_lcm_block_bytes,
+                        padding_bytes=alignment_padding,
+                    )
+                    // host_lcm_block_bytes
+                )
+                if 0 < aligned_blocks < host_lcm_blocks:
+                    logger.warning(
+                        f"Reduced explicit Host L2 from {host_lcm_blocks} to "
+                        f"{aligned_blocks} LCM blocks to keep alignment padding "
+                        f"within its {reservation} byte pinned reservation"
+                    )
+                    host_lcm_blocks = aligned_blocks
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
         fitting_l2_blocks = _min_over_ranks(
@@ -304,7 +333,8 @@ class HostCacheExecutor:
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
             # Only the ratio's size shrinks, to one size on every rank: the
             # mirrored schedulers share one Host page count. An explicit
-            # --kvstore-size that does not fit is refused below instead.
+            # --kvstore-size that does not fit is refused below instead,
+            # after accounting for alignment within its original reservation.
             logger.warning(
                 "Capped the compact Host L2 from "
                 f"{host_lcm_blocks * host_lcm_block_bytes / 1e9:.2f} GB to "

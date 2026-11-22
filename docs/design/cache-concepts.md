@@ -127,11 +127,17 @@ Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
 
-On NVIDIA CUDA, Host L2 uses eight parallel page-touch threads and
-`cudaHostRegister` during its synchronous startup allocation. The storage retains
+On NVIDIA CUDA with the native PyTorch allocator, Host L2 uses eight parallel
+page-touch threads and `cudaHostRegister` during its synchronous startup
+allocation. The storage retains
 a 4 KiB-aligned tensor view; allocation and the executor's pinned reservation
 derive their padding from the same alignment constant. The override is scoped
-to L2, never the snapshot pool; other platforms retain their existing allocation policy.
+to L2, never the snapshot pool; other platforms and non-native CUDA allocators
+retain their existing allocation policy without an override or alignment padding.
+An explicit L2 size may lose whole LCM blocks to fit the alignment padding in
+its original pinned reservation, when at least one block remains. It is never
+reduced to accommodate insufficient Host memory. Ranks agree on the resulting
+block count before allocation.
 PyTorch's controls are process-wide, so this allocation must complete before
 other threads allocate pinned buffers. Both effective settings and their original
 configuration string are restored even if allocation fails; tensor ownership and

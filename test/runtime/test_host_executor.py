@@ -1386,6 +1386,7 @@ class TestHostMemoryShareTest:
         l2_tier=True,
         snapshot_pool=NO_POOL,
         world_cpu_group=None,
+        is_nvidia=False,
     ):
         """An executor at --kvstore-ratio 2, L2-only by default, and its mocked
         logger."""
@@ -1436,6 +1437,11 @@ class TestHostMemoryShareTest:
         with (
             patch.object(
                 executor_module,
+                "current_platform",
+                return_value=SimpleNamespace(is_nvidia=is_nvidia),
+            ),
+            patch.object(
+                executor_module,
                 "compute_host_lcm_block_bytes",
                 return_value=host_lcm_block_bytes,
             ),
@@ -1474,6 +1480,56 @@ class TestHostMemoryShareTest:
                 world_cpu_group=world_cpu_group,
             )
         return executor, logger
+
+    @pytest.mark.parametrize("offset", [0, -128])
+    @pytest.mark.parametrize("block_bytes", [1024, 1 << 20])
+    def test_explicit_size_keeps_alignment_inside_the_original_bucket(
+        self, offset, block_bytes
+    ):
+        executor, logger = self._build(
+            available_gb=(self.headroom + (3 << 29)) / self.GB,
+            nprocs_per_node=1,
+            device_lcm_blocks=16,
+            host_size_gb=((1 << 30) + offset) / self.GB,
+            host_lcm_block_bytes=block_bytes,
+            is_nvidia=True,
+        )
+        assert executor.num_host_pages - 1 == ((1 << 30) - 4095) // block_bytes
+        assert (executor.num_host_pages - 1) * block_bytes + 4095 <= 1 << 30
+        if offset == 0 or block_bytes == 1024:
+            assert "alignment padding" in logger.warning.call_args.args[0]
+
+    def test_alignment_does_not_make_an_oversized_explicit_request_fit(self):
+        with pytest.raises(ValueError, match="Not enough Host memory"):
+            self._build(
+                available_gb=(self.headroom + (3 << 29)) / self.GB,
+                nprocs_per_node=1,
+                device_lcm_blocks=16,
+                host_size_gb=(2 << 30) / self.GB,
+                host_lcm_block_bytes=1 << 20,
+                is_nvidia=True,
+            )
+
+    def test_native_ratio_budget_includes_alignment_padding(self):
+        executor, _ = self._build(
+            available_gb=(self.headroom + (1 << 30)) / self.GB,
+            nprocs_per_node=1,
+            device_lcm_blocks=512,
+            host_lcm_block_bytes=1 << 20,
+            is_nvidia=True,
+        )
+        assert executor.num_host_pages - 1 == 1023
+
+    def test_native_explicit_size_away_from_a_bucket_keeps_its_capacity(self):
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            host_size_gb=128,
+            is_nvidia=True,
+        )
+        assert executor.num_host_pages - 1 == 128_000
+        logger.warning.assert_not_called()
 
     def test_four_ranks_cap_an_over_committed_ratio_l2_to_the_node(self):
         # 4 x 277.95 GB of L2 does not fit a node with 956 GB available, and
@@ -1840,12 +1896,22 @@ class TestCompactHostParentTest:
     tiers, their byte budgets, the scheduler's packing, the owner translation
     and the transfer geometry."""
 
-    def test_both_tiers_use_the_parent_rounded_to_whole_kv_pages(self, monkeypatch):
+    @pytest.mark.parametrize("is_nvidia", [False, True])
+    def test_both_tiers_use_the_parent_rounded_to_whole_kv_pages(
+        self, monkeypatch, is_nvidia
+    ):
         try:
             executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"needs runtime dependencies: {exc}")
         torch = import_module("torch")
+        if is_nvidia and (not torch.cuda.is_available() or torch.version.cuda is None):
+            pytest.skip("requires real CUDA allocator settings")
+        monkeypatch.setattr(
+            executor_module,
+            "current_platform",
+            lambda: SimpleNamespace(is_nvidia=is_nvidia),
+        )
         lanes_module = _lanes_module()
         from tokenspeed.runtime.cache.transfer.layout import (
             CacheField,
@@ -1860,12 +1926,25 @@ class TestCompactHostParentTest:
         )
 
         allocate = torch.empty
+        allocation_settings = {}
+        pinned_sizes = set()
+        native = is_nvidia and torch.cuda.get_allocator_backend() == "native"
+        before = torch.cuda.memory._snapshot()["allocator_settings"] if native else None
 
         def empty(*args, **kwargs):
-            # Pinned Host buffers need a GPU; plain CPU tensors stand in.
+            # Only the non-CUDA case substitutes ordinary CPU memory.
+            settings = None
             if kwargs.get("pin_memory", False):
-                kwargs["pin_memory"] = False
-            return allocate(*args, **kwargs)
+                if native:
+                    settings = torch.cuda.memory._snapshot()["allocator_settings"]
+                if not is_nvidia:
+                    kwargs["pin_memory"] = False
+            result = allocate(*args, **kwargs)
+            if kwargs.get("pin_memory", False):
+                pinned_sizes.add(result.numel() * result.element_size())
+            if settings is not None:
+                allocation_settings[result.numel() * result.element_size()] = settings
+            return result
 
         monkeypatch.setattr(torch, "empty", empty)
         # Qwen3.8-Flash-Next's full-attention page, recurrent-state checkpoint
@@ -1973,6 +2052,25 @@ class TestCompactHostParentTest:
         assert executor.host_group_packing == virtual_packing
         # Both counts include the scheduler's null page.
         assert (executor.num_host_pages, executor.num_snapshot_pages) == (8, 2)
+        if native:
+            l2_settings = allocation_settings[
+                executor.host_storage.host_buffer_bytes + 4095
+            ]
+            snapshot_settings = allocation_settings[
+                executor.snapshot_storage.host_buffer_bytes
+            ]
+            assert l2_settings["pinned_use_cuda_host_register"] is True
+            assert l2_settings["pinned_num_register_threads"] == 8
+            assert snapshot_settings == before
+            assert executor.host_storage.host_buffer.data_ptr() % 4096 == 0
+        if is_nvidia:
+            assert executor.host_storage.host_buffer.is_pinned()
+            assert executor.snapshot_storage.host_buffer.is_pinned()
+            if not native:
+                assert executor.host_storage.host_buffer_bytes in pinned_sizes
+                assert (
+                    executor.host_storage.host_buffer_bytes + 4095 not in pinned_sizes
+                )
         for storage, geometry, owners, parents in (
             (
                 executor.host_storage,

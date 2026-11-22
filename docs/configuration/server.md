@@ -500,11 +500,13 @@ Trainer-side contract:
 
 ## Scheduler and memory
 
-On NVIDIA CUDA, Host L2 startup allocation uses eight parallel page-touch
-threads and `cudaHostRegister`, with a 4 KiB-aligned buffer. No startup flag or
+On NVIDIA CUDA with the native PyTorch allocator, Host L2 startup allocation
+uses eight parallel page-touch threads and `cudaHostRegister`, with a
+4 KiB-aligned buffer. No startup flag or
 global pinned-allocator override is needed. Original PyTorch allocator settings
 are restored on success or failure before snapshot and later allocations.
-Other platforms keep their existing allocation policy. This does not bind CPUs
+Other platforms and non-native CUDA allocators keep their existing allocation
+policy, without an override or alignment padding. This does not bind CPUs
 or memory to NUMA nodes.
 
 | Parameter | Purpose |
@@ -1837,9 +1839,10 @@ A ratio size larger than a rank's share is capped to the largest whole-LCM
 buffer that fits under those allocator settings beside its snapshot pool,
 with one size agreed across ranks. Each rank logs the requested and capped
 size. An explicit
-`--kvstore-size` is never shrunk: one that does not fit is refused at
-startup, as is a share without room for a single LCM block. Every rank
-must also resolve the same page counts: startup compares them across the
+`--kvstore-size` may lose whole LCM blocks to keep alignment padding within its
+original pinned reservation, when at least one block remains. A size that still
+does not fit is refused at startup, as is a share without room for a single
+LCM block. Every rank must also resolve the same page counts: startup compares them across the
 ranks and refuses a difference on every rank. A size in gigabytes is a
 different page count wherever the ranks' LCM blocks differ in bytes, as
 they usually do on pipeline stages, which store different layers, so with

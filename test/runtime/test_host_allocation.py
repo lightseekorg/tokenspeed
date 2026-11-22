@@ -21,6 +21,8 @@
 """Real allocator restoration, aligned buffers and memory budgeting."""
 
 import gc
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +43,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.cuda is None,
+    reason="requires real CUDA allocator",
+)
+def test_async_allocator_starts_both_host_tiers():
+    # The device allocator backend is selected once, when Torch initializes.
+    env = dict(os.environ)
+    env.pop("PYTORCH_ALLOC_CONF", None)
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, torch, pytest; "
+            "assert torch.cuda.get_allocator_backend() == 'cudaMallocAsync'; "
+            "sys.exit(pytest.main(sys.argv[1:]))",
+            f"{Path(__file__).with_name('test_host_executor.py')}::TestCompactHostParentTest::test_both_tiers_use_the_parent_rounded_to_whole_kv_pages[True]",
+            "-q",
+            "-rs",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("threads", [0, -1, 3, 129, True])
