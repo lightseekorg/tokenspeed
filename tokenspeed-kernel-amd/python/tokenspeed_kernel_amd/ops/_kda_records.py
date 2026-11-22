@@ -787,8 +787,10 @@ def retained_batched_accept(
     layer,
     row,
     group_count,
-    read_strides,
-    write_strides,
+    read_group_stride,
+    read_row_stride,
+    write_group_stride,
+    write_row_stride,
     accepted_stride,
     query_stride,
     record_slot_stride,
@@ -803,10 +805,12 @@ def retained_batched_accept(
     group = gl.load(groups + layer).to(gl.int64)
     valid = (group >= 0) & (group < group_count)
     source = gl.load(
-        reads + group * read_strides[0] + row * read_strides[1], mask=valid, other=0
+        reads + group * read_group_stride + row * read_row_stride, mask=valid, other=0
     ).to(gl.int64)
     target = gl.load(
-        writes + group * write_strides[0] + row * write_strides[1], mask=valid, other=0
+        writes + group * write_group_stride + row * write_row_stride,
+        mask=valid,
+        other=0,
     ).to(gl.int64)
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
     pages = gl.load(base + 3).to(gl.int64)
@@ -939,15 +943,20 @@ def retained_fold_ended_request(
             gl.store(ptr, value.to(STATE), mask=mask)
 
 
+# Triton specializes each element of a tuple argument whatever
+# do_not_specialize lists, so a stride that follows the batch size -- the row
+# stride of a [groups, batch] page table -- is a scalar here. The tuples left
+# (stamps and records) hold strides fixed by their storage layout.
 _BATCHED_RUNTIME_ARGUMENTS = [
     "group_count",
-    "read_strides",
-    "write_strides",
+    "read_group_stride",
+    "read_row_stride",
+    "write_group_stride",
+    "write_row_stride",
     "accepted_stride",
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
-    "stamp_strides",
     "stamp_slots",
     "stamp_capacity",
     "stopped_count",
@@ -956,8 +965,7 @@ _BATCHED_RUNTIME_ARGUMENTS = [
 
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
-    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS
-    + ["correction_strides", "key_strides", "decay_strides"],
+    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS,
 )
 def retained_batched_conv_kernel(
     descriptors,
@@ -971,8 +979,10 @@ def retained_batched_conv_kernel(
     stamps,
     request_stopped,
     group_count,
-    read_strides,
-    write_strides,
+    read_group_stride,
+    read_row_stride,
+    write_group_stride,
+    write_row_stride,
     accepted_stride,
     query_stride,
     record_slot_stride,
@@ -1013,8 +1023,10 @@ def retained_batched_conv_kernel(
             layer,
             row,
             group_count,
-            read_strides,
-            write_strides,
+            read_group_stride,
+            read_row_stride,
+            write_group_stride,
+            write_row_stride,
             accepted_stride,
             query_stride,
             record_slot_stride,
@@ -1101,8 +1113,10 @@ def retained_batched_publish_kernel(
     stamps,
     request_stopped,
     group_count,
-    read_strides,
-    write_strides,
+    read_group_stride,
+    read_row_stride,
+    write_group_stride,
+    write_row_stride,
     accepted_stride,
     query_stride,
     record_slot_stride,
@@ -1130,8 +1144,10 @@ def retained_batched_publish_kernel(
             layer,
             row,
             group_count,
-            read_strides,
-            write_strides,
+            read_group_stride,
+            read_row_stride,
+            write_group_stride,
+            write_row_stride,
             accepted_stride,
             query_stride,
             record_slot_stride,

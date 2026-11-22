@@ -617,6 +617,31 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
         kernels.retained_batched_conv_kernel, kernels.retained_batched_publish_kernel
     ):
         commit(**shorter)
+        # Serving packs each [groups, batch] page table contiguously at the
+        # start of its buffer, so its row stride is the batch size: 1,
+        # multiples of 16 and the rest.
+        for batch in (1, 2, 16, 17, 33):
+            reads, writes = (
+                torch.full((2, batch), -1, device="cuda", dtype=torch.int32)
+                for _ in range(2)
+            )
+            commit(
+                **dict(
+                    args,
+                    read_indices=reads,
+                    write_indices=writes,
+                    accepted_length=torch.zeros(
+                        batch, device="cuda", dtype=torch.int32
+                    ),
+                    query_start_loc=torch.arange(
+                        batch + 1, device="cuda", dtype=torch.int32
+                    ),
+                    record_slots=torch.zeros(batch, device="cuda", dtype=torch.int64),
+                    record_metadata=torch.full(
+                        (batch, 3), -1, device="cuda", dtype=torch.int64
+                    ),
+                )
+            )
 
 
 def _prepare_case(window, *, state_dtype=torch.float32):

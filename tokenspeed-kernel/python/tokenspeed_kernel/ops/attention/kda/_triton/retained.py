@@ -179,8 +179,10 @@ def retained_batched_accept(
     layer,
     row,
     group_count,
-    read_strides,
-    write_strides,
+    read_group_stride,
+    read_row_stride,
+    write_group_stride,
+    write_row_stride,
     accepted_stride,
     query_stride,
     record_slot_stride,
@@ -194,10 +196,12 @@ def retained_batched_accept(
     group = tl.load(groups + layer).to(tl.int64)
     valid = (group >= 0) & (group < group_count)
     source = tl.load(
-        reads + group * read_strides[0] + row * read_strides[1], mask=valid, other=0
+        reads + group * read_group_stride + row * read_row_stride, mask=valid, other=0
     ).to(tl.int64)
     target = tl.load(
-        writes + group * write_strides[0] + row * write_strides[1], mask=valid, other=0
+        writes + group * write_group_stride + row * write_row_stride,
+        mask=valid,
+        other=0,
     ).to(tl.int64)
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
     pages = tl.load(base + 3).to(tl.int64)
@@ -329,25 +333,27 @@ def retained_fold_ended_request(
             tl.store(ptr, value, mask=mask)
 
 
+# Triton specializes each element of a tuple argument whatever
+# do_not_specialize lists, so a stride that follows the batch size -- the row
+# stride of a [groups, batch] page table -- is a scalar here. The tuples left
+# (stamps and records) hold strides fixed by their storage layout.
 _BATCHED_RUNTIME_ARGUMENTS = [
     "group_count",
-    "read_strides",
-    "write_strides",
+    "read_group_stride",
+    "read_row_stride",
+    "write_group_stride",
+    "write_row_stride",
     "accepted_stride",
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
-    "stamp_strides",
     "stamp_slots",
     "stamp_capacity",
     "stopped_count",
 ]
 
 
-@triton.jit(
-    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS
-    + ["correction_strides", "key_strides", "decay_strides"]
-)
+@triton.jit(do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS)
 def retained_batched_conv_kernel(
     descriptors,
     groups,
@@ -360,8 +366,10 @@ def retained_batched_conv_kernel(
     stamps,
     request_stopped,
     group_count,
-    read_strides,
-    write_strides,
+    read_group_stride,
+    read_row_stride,
+    write_group_stride,
+    write_row_stride,
     accepted_stride,
     query_stride,
     record_slot_stride,
@@ -401,8 +409,10 @@ def retained_batched_conv_kernel(
             layer,
             row,
             group_count,
-            read_strides,
-            write_strides,
+            read_group_stride,
+            read_row_stride,
+            write_group_stride,
+            write_row_stride,
             accepted_stride,
             query_stride,
             record_slot_stride,
@@ -481,8 +491,10 @@ def retained_batched_publish_kernel(
     stamps,
     request_stopped,
     group_count,
-    read_strides,
-    write_strides,
+    read_group_stride,
+    read_row_stride,
+    write_group_stride,
+    write_row_stride,
     accepted_stride,
     query_stride,
     record_slot_stride,
@@ -509,8 +521,10 @@ def retained_batched_publish_kernel(
             layer,
             row,
             group_count,
-            read_strides,
-            write_strides,
+            read_group_stride,
+            read_row_stride,
+            write_group_stride,
+            write_row_stride,
             accepted_stride,
             query_stride,
             record_slot_stride,
@@ -531,9 +545,9 @@ def retained_batched_publish_kernel(
 
 
 # Readying retained history for a verify forward, every layer in one launch.
-# Shared by both vendors. The page tables' strides are scalars: Triton would
-# specialize the elements of a stride tuple, and a table's row stride follows
-# the padded batch size.
+# Shared by both vendors. As for the commit, the page tables' strides are
+# scalars, since a table's row stride follows the padded batch size; the
+# record stride tuples are fixed by the records' storage.
 _PREPARE_RUNTIME_ARGUMENTS = [
     "batch",
     "group_count",
@@ -619,10 +633,7 @@ def retained_prepare_rows(
     return source, live, slot, length, count, active, valid, fold
 
 
-@triton.jit(
-    do_not_specialize=_PREPARE_RUNTIME_ARGUMENTS
-    + ["correction_strides", "key_strides", "decay_strides"]
-)
+@triton.jit(do_not_specialize=_PREPARE_RUNTIME_ARGUMENTS)
 def retained_batched_consolidate_kernel(
     descriptors,
     groups,
