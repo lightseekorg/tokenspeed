@@ -88,6 +88,9 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     assert plan["a2a_backend"] == "gluon_petit"
     # Per-route consumers take the unsummed routes.
     assert plan["supports_deferred_finalize"]
+    # C1 in the serving step: the router stores its weights in the plan's
+    # dtype, which must be Petit's FP32 so Petit reads them in place (no cast).
+    assert plan["topk_weights_dtype"] == torch.float32
 
 
 def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
@@ -483,6 +486,109 @@ def test_apply_keeps_zero_token_rank_in_collective() -> None:
     config.run.assert_called_once()
     assert config.run.call_args.args[5] == 0
     overlap.assert_called_once_with()
+
+
+@pytest.mark.parametrize("fused", (False, True))
+@pytest.mark.parametrize(
+    "id_dtype,weight_dtype",
+    [(torch.int32, torch.float32), (torch.int64, torch.bfloat16)],
+)
+@pytest.mark.parametrize("do_finalize", (True, False))
+def test_apply_fuse_prep_reads_router_buffers_in_place(
+    fused, id_dtype, weight_dtype, do_finalize
+) -> None:
+    """C1: with TOKENSPEED_PETIT_FUSE_PREP Petit gets the router's buffers.
+
+    Off, the ids and weights are copied into the heap views (the old path).
+    On, int32 ids and FP32 weights are passed through untouched (no copy
+    node); other dtypes are cast once; the heap views are not written.
+    """
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    profile = _Profile(
+        name="test",
+        num_experts=8,
+        top_k=2,
+        model_dim=64,
+        logical_intermediate=32,
+        inter_dim=32,
+        has_bias=False,
+        activation="silu",
+    )
+    heap = SimpleNamespace(
+        tokens=torch.empty((4, 32), dtype=torch.uint8),
+        scales=torch.empty((4, 2), dtype=torch.uint8),
+        expert_ids=torch.full((4, 2), -1, dtype=torch.int32),
+        expert_weights=torch.full((4, 2), -1.0, dtype=torch.float32),
+    )
+    config = mock.Mock()
+    config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
+    config.run_routes.side_effect = lambda *args, **kwargs: torch.empty(0)
+    workspace = SimpleNamespace(config=config, heap=object(), inputs=heap)
+    layer = SimpleNamespace(
+        _moe_backend_state=_GluonPetitState(
+            profile=profile,
+            w13_weight=torch.empty(0),
+            w2_weight=torch.empty(0),
+            w13_scale=torch.empty(0),
+            w2_scale=torch.empty(0),
+            w13_bias=None,
+            w2_bias=None,
+        )
+    )
+    x = torch.zeros((3, profile.model_dim), dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 5], [7, 2], [3, 4]], dtype=id_dtype)
+    topk_weights = torch.tensor(
+        [[0.75, 0.25], [0.5, 0.5], [0.125, 0.875]], dtype=weight_dtype
+    )
+    with (
+        mock.patch.object(petit, "_PETIT_FUSE_PREP", fused),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon._get_workspace", return_value=workspace
+        ),
+    ):
+        gluon_petit_mxfp4_megamoe_apply(
+            plan={},
+            x=x,
+            w=layer,
+            router_logits=torch.empty((3, 0), dtype=torch.bfloat16),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            num_tokens_global=3,
+            max_num_tokens_per_gpu=3,
+            do_finalize=do_finalize,
+            enable_pdl=False,
+            low_latency=None,
+            overlap_fn=None,
+        )
+    launch = config.run if do_finalize else config.run_routes
+    launch.assert_called_once()
+    inputs = launch.call_args.kwargs["inputs"]
+    config.quantize.assert_called_once()
+    assert inputs.tokens.data_ptr() == heap.tokens.data_ptr()
+    assert inputs.expert_ids.dtype == torch.int32
+    assert inputs.expert_weights.dtype == torch.float32
+    assert inputs.expert_ids.is_contiguous() and inputs.expert_weights.is_contiguous()
+    torch.testing.assert_close(inputs.expert_ids, topk_ids.to(torch.int32))
+    expected_weights = (
+        topk_weights.float() if do_finalize else torch.ones((3, 2), dtype=torch.float32)
+    )
+    torch.testing.assert_close(inputs.expert_weights, expected_weights)
+    if fused:
+        # The heap's id rows are never written; Petit reads the router's.
+        assert (heap.expert_ids == -1).all()
+        assert (inputs.expert_ids.data_ptr() == topk_ids.data_ptr()) == (
+            id_dtype == torch.int32
+        )
+        if do_finalize:
+            assert (heap.expert_weights == -1).all()
+            assert (inputs.expert_weights.data_ptr() == topk_weights.data_ptr()) == (
+                weight_dtype == torch.float32
+            )
+    else:
+        assert inputs.expert_ids.data_ptr() == heap.expert_ids.data_ptr()
+        assert inputs.expert_weights.data_ptr() == heap.expert_weights.data_ptr()
+        assert (heap.expert_ids[3] == -1).all()
 
 
 @pytest.mark.parametrize(

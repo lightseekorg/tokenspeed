@@ -394,6 +394,8 @@ def _profile_capacity(profile_name: str, capacity: int) -> int:
     if capacity == 1024:
         return capacity
     return _PROFILE_RAISED_CAPACITY.get(profile_name, capacity)
+
+
 # Rows of a 50,000-token prompt's last prefill chunk at each capacity
 # (848 at 1024 and 4096 rows, 1360 at 2560).
 _PROMPT_TOKENS = 50_000
@@ -548,6 +550,200 @@ def test_distributed_petit_reference(profile_name, capacity):
                     ),
                 )
             dist.barrier()
+
+
+def _collective_check(device, check) -> None:
+    """Run ``check`` on every rank and fail every rank together.
+
+    A rank that failed alone would leave its peers spinning inside Petit's
+    next collective; this all-reduces a failure flag first.
+    """
+    error = None
+    try:
+        check()
+    except AssertionError as exc:
+        error = exc
+    flag = torch.tensor([0 if error is None else 1], device=device, dtype=torch.int32)
+    dist.all_reduce(flag)
+    if error is not None:
+        raise error
+    assert int(flag.item()) == 0, f"{int(flag.item())} other rank(s) failed"
+
+
+def _graph_kernel_nodes(capture) -> int:
+    """Nodes of the graph one ``capture()`` records (all node kinds).
+
+    Asks the HIP runtime this process already loaded for the capturing
+    stream's graph (hipStreamGetCaptureInfo_v2) and its node count
+    (hipGraphGetNodes) before the capture ends; torch's debug_dump needs the
+    cuda-bindings package, which ROCm wheels do not ship.
+    """
+    import ctypes
+
+    hip = ctypes.CDLL("libamdhip64.so.7")
+    graph = torch.cuda.CUDAGraph()
+    count = ctypes.c_size_t(0)
+    with torch.cuda.graph(graph):
+        capture()
+        status, capture_id = ctypes.c_int(0), ctypes.c_ulonglong(0)
+        handle, deps, num_deps = (
+            ctypes.c_void_p(),
+            ctypes.c_void_p(),
+            ctypes.c_size_t(0),
+        )
+        stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+        assert (
+            hip.hipStreamGetCaptureInfo_v2(
+                stream,
+                ctypes.byref(status),
+                ctypes.byref(capture_id),
+                ctypes.byref(handle),
+                ctypes.byref(deps),
+                ctypes.byref(num_deps),
+            )
+            == 0
+        )
+        assert hip.hipGraphGetNodes(handle, None, ctypes.byref(count)) == 0
+    graph.reset()
+    return int(count.value)
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_fuse_prep_bit_exact(profile_name):
+    """C1 (TOKENSPEED_PETIT_FUSE_PREP): Petit reads the router's top-k buffers.
+
+    With the switch on, Petit must give bit-for-bit the copying path's output
+    for zero-row ranks, the tp4ep4 2/2/2/0 split, DP4 single-busy-rank calls,
+    int64 ids and BF16 weights (one cast each), the deferred-routes mode and
+    CUDA graph replay with refreshed router buffers; and its captured graph
+    has two fewer nodes per call than the copying path's for int32 ids and
+    FP32 weights.
+    """
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    profile = _PROFILES[profile_name]
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    kernel_moe_process_weights(plan, layer)
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    initial = petit._PETIT_FUSE_PREP
+
+    def call(x, ids, weights, counts, do_finalize=True):
+        return kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            x.new_empty((x.shape[0], 0)),
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=sum(counts),
+            max_num_tokens_per_gpu=max(counts),
+            do_finalize=do_finalize,
+            low_latency=None,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+
+    try:
+        for counts in ([0] * ws, [2, 2, 2, 0], [6, 0, 0, 0], [3, 3, 3, 3], [24] * ws):
+            count = counts[rank]
+            values = torch.arange(count * profile.hidden, device=device)
+            x = (
+                ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
+                .reshape(count, profile.hidden)
+                .to(torch.bfloat16)
+            )
+            ids, weights = _routing(count, rank, profile, ws, device)
+            for id_dtype, weight_dtype in (
+                (torch.int32, torch.float32),
+                (torch.int64, torch.bfloat16),
+            ):
+                caller_ids = ids.to(id_dtype)
+                caller_weights = weights.to(weight_dtype)
+                outputs = {}
+                for fused in (False, True):
+                    petit._PETIT_FUSE_PREP = fused
+                    eager = call(x, caller_ids, caller_weights, counts).clone()
+                    routes = call(
+                        x, caller_ids, caller_weights, counts, do_finalize=False
+                    )[0].clone()
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    graph = torch.cuda.CUDAGraph()
+                    graph_ids = caller_ids.clone()
+                    graph_weights = caller_weights.clone()
+                    with torch.cuda.graph(graph):
+                        captured = call(x, graph_ids, graph_weights, counts)
+                    replays = []
+                    for step in (0, 1):
+                        # Replays must read the router buffers' current values.
+                        new_ids, new_weights = _routing(
+                            count, rank + step, profile, ws, device
+                        )
+                        graph_ids.copy_(new_ids)
+                        graph_weights.copy_(new_weights)
+                        graph.replay()
+                        replays.append(captured.clone())
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    outputs[fused] = (eager, routes, replays)
+                    del graph
+                    dist.barrier()
+                off, on = outputs[False], outputs[True]
+
+                def check():
+                    torch.testing.assert_close(on[0], off[0], atol=0, rtol=0)
+                    torch.testing.assert_close(on[1], off[1], atol=0, rtol=0)
+                    for a, b in zip(on[2], off[2]):
+                        torch.testing.assert_close(a, b, atol=0, rtol=0)
+                    torch.testing.assert_close(on[2][0], off[0], atol=0, rtol=0)
+                    if count and weight_dtype == torch.float32:
+                        # The reference takes FP32 weights; BF16-rounded
+                        # weights are checked bit for bit against the copies.
+                        expected = _reference(x, ids, weights, profile)
+                        torch.testing.assert_close(
+                            on[0], expected, atol=2e-6, rtol=8e-3
+                        )
+
+                _collective_check(device, check)
+                dist.barrier()
+        # Nodes per call (int32 ids, FP32 weights; one busy row per rank).
+        counts = [1] * ws
+        x = torch.ones((1, profile.hidden), device=device, dtype=torch.bfloat16)
+        ids, weights = _routing(1, rank, profile, ws, device)
+        nodes = {}
+        for fused in (False, True):
+            petit._PETIT_FUSE_PREP = fused
+            torch.cuda.synchronize()
+            dist.barrier()
+            nodes[fused] = _graph_kernel_nodes(lambda: call(x, ids, weights, counts))
+            torch.cuda.synchronize()
+            dist.barrier()
+        print(
+            f"[fuse_prep] rank {rank} {profile_name} graph nodes per call "
+            f"off={nodes[False]} on={nodes[True]}"
+        )
+
+        def check_nodes():
+            assert nodes[True] == nodes[False] - 2, nodes
+
+        _collective_check(device, check_nodes)
+    finally:
+        petit._PETIT_FUSE_PREP = initial
 
 
 _PETIT_KERNELS = frozenset({"MegaMoEStage1", "MegaMoEStage2", "MegaMoECombine"})

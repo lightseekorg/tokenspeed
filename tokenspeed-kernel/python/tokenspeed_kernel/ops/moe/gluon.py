@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -3594,6 +3595,27 @@ def _compile_variants(
     )
 
 
+# C1 (opt-in, read once at import): Petit reads the router's top-k ids and
+# weights in place as its external inputs instead of copying them into the
+# heap views, so the prep nodes are the quantize plus at most one cast each
+# for ids that are not int32 or weights that are not FP32. Off keeps the copies.
+_PETIT_FUSE_PREP = os.environ.get("TOKENSPEED_PETIT_FUSE_PREP", "0") == "1"
+
+
+def _routing_input(source: torch.Tensor, dtype: torch.dtype, shape) -> torch.Tensor:
+    """``source`` itself when Petit can read it in place, else one cast copy.
+
+    Petit's external routing inputs are read locally as ``row * top_k + k``
+    32-bit words, so the tensor must be contiguous ``[rows, top_k]`` of
+    ``dtype``.
+    """
+    if tuple(source.shape) != tuple(shape):
+        raise ValueError(
+            f"Gluon Petit routing input shape {tuple(source.shape)} != {tuple(shape)}"
+        )
+    return source.to(dtype).contiguous()
+
+
 def _slice_inputs(inputs: Any, num_tokens: int) -> Any:
     """Return exact-row views required by Petit's quantize and run APIs."""
     return type(inputs)(
@@ -3785,13 +3807,32 @@ def gluon_petit_mxfp4_megamoe_apply(
     inputs = _slice_inputs(workspace.inputs, num_tokens)
     if num_tokens:
         workspace.config.quantize(x.contiguous(), out=inputs)
-        inputs.expert_ids.copy_(topk_ids.to(torch.int32))
-        if do_finalize:
-            inputs.expert_weights.copy_(topk_weights.to(torch.float32))
+        if _PETIT_FUSE_PREP:
+            # Petit reads the router's buffers in place (no heap copies).
+            # They are produced on this stream before the call and are not
+            # rewritten before Stage1 reads them.
+            expert_ids = _routing_input(topk_ids, torch.int32, inputs.expert_ids.shape)
+            expert_weights = inputs.expert_weights
+            if do_finalize:
+                expert_weights = _routing_input(
+                    topk_weights, torch.float32, inputs.expert_weights.shape
+                )
+            else:
+                expert_weights.fill_(1.0)
+            inputs = type(inputs)(
+                tokens=inputs.tokens,
+                scales=inputs.scales,
+                expert_ids=expert_ids,
+                expert_weights=expert_weights,
+            )
         else:
-            # Unit weights keep each route unscaled; the caller applies
-            # topk_weights after its per-route norm.
-            inputs.expert_weights.fill_(1.0)
+            inputs.expert_ids.copy_(topk_ids.to(torch.int32))
+            if do_finalize:
+                inputs.expert_weights.copy_(topk_weights.to(torch.float32))
+            else:
+                # Unit weights keep each route unscaled; the caller applies
+                # topk_weights after its per-route norm.
+                inputs.expert_weights.fill_(1.0)
     if overlap_fn is not None:
         overlap_fn()
     if not do_finalize:

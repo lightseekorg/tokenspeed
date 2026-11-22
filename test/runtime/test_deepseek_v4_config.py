@@ -351,6 +351,45 @@ class TestDeepseekV4Config:
         assert calls[0][0][2:6] == ("sqrt_softplus", "topk", True, 2.0)
         assert (calls[0][1]["topk_weights_dtype"]) == (torch.bfloat16)
 
+    def test_deepseek_v4_topk_emits_petit_routing_dtypes(self):
+        """C1 in the serving step: with Gluon Petit (whose plan stores FP32
+        route weights) the router emits int32 ids and FP32 weights, the dtypes
+        Petit reads in place, so its apply adds no cast node."""
+        import inspect
+
+        from tokenspeed_kernel.ops.moe import moe_topk
+
+        default = inspect.signature(moe_topk).parameters["topk_indices_dtype"]
+        assert default.default == torch.int32
+        calls = []
+
+        def fake_moe_topk(*args, **kwargs):
+            calls.append(kwargs)
+            return torch.ones((2, 2)), torch.zeros((2, 2), dtype=torch.int32)
+
+        for hash_routing in (False, True):
+            with patch.object(deepseek_v4_model, "moe_topk", fake_moe_topk):
+                DeepseekV4TopK(
+                    top_k=2,
+                    renormalize=True,
+                    correction_bias=None,
+                    routed_scaling_factor=1.0,
+                    hash_routing=hash_routing,
+                    weights_dtype=torch.float32,
+                )(
+                    torch.ones((2, 3)),
+                    torch.zeros((2, 4)),
+                    hash_indices_table=(
+                        torch.zeros((8, 2), dtype=torch.int32) if hash_routing else None
+                    ),
+                    input_ids=(
+                        torch.zeros(2, dtype=torch.int64) if hash_routing else None
+                    ),
+                )
+        for kwargs in calls:
+            assert kwargs["topk_weights_dtype"] == torch.float32
+            assert kwargs.get("topk_indices_dtype", torch.int32) == torch.int32
+
     def test_deepseek_v4_topk_routes_simulated_logits(self):
         router_logits = torch.zeros((2, 4))
         seen = []
