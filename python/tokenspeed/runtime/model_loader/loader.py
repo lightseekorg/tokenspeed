@@ -746,9 +746,14 @@ class DummyModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
-            # Post-processing can read integer weights, such as index tables,
-            # and check scales that start as NaN, so they need valid values
-            # before it runs.
+            # Post-processing reads the parameters it derives copies from (such
+            # as a prepared GEMV weight) and checks integer weights and scales
+            # that start as NaN, so every parameter needs a value before it
+            # runs. A parameter that post-processing leaves as it is gets the
+            # same values again from the call after it, since its values depend
+            # only on the seed, its size and its dtype; parameters with a dummy
+            # initializer take its values instead.
+            initialize_dummy_weights(model)
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.
@@ -770,8 +775,8 @@ class DummyModelLoader(BaseModelLoader):
             if callable(post_quant_warmup):
                 post_quant_warmup()
 
-            #  For accurate performance evaluation, we assign
-            # random values to the weights.
+            # Post-processing can replace parameters (new layouts or dtypes);
+            # give those random values as well.
             initialize_dummy_weights(model)
         return model.eval()
 
