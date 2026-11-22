@@ -565,18 +565,6 @@ impl RequestState {
         }
     }
 
-    /// Whether the device's stop criteria (`stop_criteria`) end the request
-    /// too: its last token is a stop token or spends its token budget. A
-    /// finish they do not explain (a grammar's end under `ignore_eos`, an
-    /// abort) was decided on this side only.
-    pub fn device_stopped(&self) -> bool {
-        self.output_ids.len() as i64 >= self.max_new_tokens
-            || self
-                .output_ids
-                .last()
-                .is_some_and(|last| self.stop_token_ids.contains(last))
-    }
-
     /// Abort the request; `notify_client` keeps streaming its final output.
     /// End the request with an abort; `status_code` is the HTTP status the
     /// frontend answers with (400 for the request's own error), or `None`.
