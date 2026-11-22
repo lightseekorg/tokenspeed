@@ -74,13 +74,6 @@ _MODEL_FLAG_TOKENS = ("--model", "--model-path")
 
 _HEADLESS_FLAG = "--headless"
 
-_ENGINE_MULTI_VALUE_FLAGS = {
-    "--cudagraph-capture-sizes",
-    "--prefill-graph-capture-sizes",
-    "--prefill-graph-capture-token-sizes",
-    "--prefill-graph-capture-batch-sizes",
-}
-
 
 def _has_model_flag(tokens: Iterable[str]) -> bool:
     for token in tokens:
@@ -107,13 +100,17 @@ class SplitResult:
 
 
 def _normalize(
-    argv: Iterable[str], engine_flags: set[str]
+    argv: Iterable[str],
+    engine_flags: set[str],
+    engine_multi_value_flags: frozenset[str],
 ) -> list[tuple[str, list[str] | str | None]]:
     """Convert raw argv into a list of (name, value) pairs.
 
     Handles both ``--flag value`` and ``--flag=value`` forms. Aliases are
     resolved to their canonical names. Gateway-only options keep all consecutive
     values; SMG validates their arity. Known scalar options still take one value.
+    An engine flag declared ``nargs="+"``/``"*"`` keeps every value after it:
+    only its own parser knows how many that flag accepts.
     """
     items: list[tuple[str, list[str] | str | None]] = []
     tokens = list(argv)
@@ -140,7 +137,7 @@ def _normalize(
             if nxt is None or nxt.startswith("--"):
                 value = None
                 i += 1
-            elif name in _ENGINE_MULTI_VALUE_FLAGS or name not in scalar_flags:
+            elif name in engine_multi_value_flags or name not in scalar_flags:
                 values = []
                 i += 1
                 while i < len(tokens) and not tokens[i].startswith("--"):
@@ -191,21 +188,29 @@ def split_headless_argv(argv: list[str]) -> list[str] | None:
 
 
 @functools.lru_cache(maxsize=1)
-def _engine_recognized_flags() -> set[str]:
-    """Snapshot the set of long-form flags accepted by ``prepare_server_args``."""
+def _engine_flag_groups() -> tuple[set[str], frozenset[str]]:
+    """Snapshot the flags accepted by ``prepare_server_args``.
+
+    Returns the long-form flags and the subset that repeats its values
+    (``nargs="+"``/``"*"``). Both come from the parser that defines them, so a
+    new multi-value engine flag needs no edit here.
+    """
     # Lazy import: ServerArgs pulls the full runtime stack (~200ms).
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     parser = argparse.ArgumentParser(add_help=False)
     ServerArgs.add_cli_args(parser)
     flags: set[str] = set()
+    multi_value: set[str] = set()
     for action in parser._actions:
         for opt in action.option_strings:
-            if opt.startswith("--"):
-                flags.add(opt)
+            if not opt.startswith("--"):
+                continue
+            flags.add(opt)
+            if action.nargs in ("+", "*"):
+                multi_value.add(opt)
     flags.discard("--help")
-    flags.discard("-h")
-    return flags
+    return flags, frozenset(multi_value)
 
 
 def split_argv(argv: list[str]) -> SplitResult:
@@ -234,8 +239,8 @@ def split_argv(argv: list[str]) -> SplitResult:
             )
         argv = ["--model", model, *rest]
 
-    engine_flags = _engine_recognized_flags()
-    items = _normalize(argv, engine_flags)
+    engine_flags, engine_multi_value_flags = _engine_flag_groups()
+    items = _normalize(argv, engine_flags, engine_multi_value_flags)
     result = SplitResult()
 
     for name, value in items:
