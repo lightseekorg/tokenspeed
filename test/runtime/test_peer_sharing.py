@@ -277,13 +277,15 @@ def test_peer_sharing_refuses_what_it_does_not_run_with(overrides, refused):
         _peer_args(**overrides).validate_peer_prefix_options()
 
 
-def test_every_attention_dp_rank_needs_a_valid_port():
-    # Rank 1 binds 65535.
-    _peer_args(peer_prefix_port=65534).validate_peer_prefix_options()
-    with pytest.raises(ValueError, match="valid ports"):
-        _peer_args(peer_prefix_port=65535).validate_peer_prefix_options()
-    with pytest.raises(ValueError, match="valid ports"):
-        _peer_args(peer_prefix_port=0).validate_peer_prefix_options()
+def test_attention_dp_replicas_share_one_public_port():
+    from tokenspeed.runtime.cache.peer import peer_endpoint_name
+
+    _peer_args(peer_prefix_port=65535).validate_peer_prefix_options()
+    assert peer_endpoint_name("::1", 65535, 0) == "[::1]:65535"
+    assert peer_endpoint_name("::1", 65535, 31) == "[::1]:65535/31"
+    for port in (0, 65536):
+        with pytest.raises(ValueError, match="1..65535"):
+            _peer_args(peer_prefix_port=port).validate_peer_prefix_options()
 
 
 @pytest.mark.parametrize(

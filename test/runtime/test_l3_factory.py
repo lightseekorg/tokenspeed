@@ -37,7 +37,11 @@ from tokenspeed_engine.scheduler import StorageKind
 from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.host_storage import HostCacheResources, HostCacheStorage
-from tokenspeed.runtime.cache.l3.factory import _kv_producer_options, l3_settings
+from tokenspeed.runtime.cache.l3.factory import (
+    _kv_producer_options,
+    cache_deployment_id,
+    l3_settings,
+)
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheField,
     CacheGroupLayout,
@@ -156,6 +160,15 @@ def construction(tmp_path):
         draft_attention_backend_name="",
     )
     return args, model, storage, {"host_cache": host_cache, "world_cpu_group": None}
+
+
+def test_live_peer_identity_without_checkpoint_shards(construction):
+    args, model, _, kwargs = construction
+    shard = Path(model.model_path, "model.safetensors")
+    shard.unlink()
+    before = cache_deployment_id(args, model, model, for_peer=True, **kwargs)
+    shard.write_bytes(b"replaced live weights")
+    assert cache_deployment_id(args, model, model, for_peer=True, **kwargs) == before
 
 
 def test_settings_place_the_shared_host_pool(construction):

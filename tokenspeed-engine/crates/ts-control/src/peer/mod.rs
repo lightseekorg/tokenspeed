@@ -50,6 +50,7 @@ use std::{
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use ts_collective::{Group, Mesh};
 use ts_scheduler::{
     PeerAnswerKind, PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerTier,
     Scheduler,
@@ -111,6 +112,9 @@ pub enum PeerError {
     /// Only the first member owns the replica's listener.
     #[error("the first peer member must own a listener, and other members must not")]
     Listener,
+    /// The local replica leaders could not exchange endpoints.
+    #[error("peer node listener setup: {0}")]
+    Mesh(#[from] ts_collective::Error),
     /// A thread did not start.
     #[error("starting a peer thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -201,6 +205,37 @@ struct Layout {
 pub struct PeerListener {
     net: Arc<PeerNet>,
     received: mpsc::Receiver<Vec<Bytes>>,
+    routes: Option<NodeRoutes>,
+}
+
+/// The public listener dispatches both holder requests and reader replies.
+struct NodeRoutes {
+    own_rank: u32,
+    local_ports: HashMap<u32, u16>,
+}
+
+impl NodeRoutes {
+    fn dispatch(&self, net: &PeerNet, mut frames: Vec<Bytes>) -> Option<Vec<Bytes>> {
+        let rank = match frames.as_slice() {
+            // The original two-frame address names DP rank zero.
+            [_, _] => 0,
+            [destination, _, _] => {
+                let rank = u32::from_be_bytes(destination.as_ref().try_into().ok()?);
+                frames.remove(0);
+                rank
+            }
+            _ => return None,
+        };
+        if rank == self.own_rank {
+            return Some(frames);
+        }
+        if let Some(port) = self.local_ports.get(&rank) {
+            if let Err(error) = net.forward(*port, frames) {
+                tracing::warn!(rank, %error, "peer message could not be forwarded");
+            }
+        }
+        None
+    }
 }
 
 impl PeerListener {
@@ -210,7 +245,48 @@ impl PeerListener {
     pub fn bind(host: &str, port: u16) -> Result<Self, PeerError> {
         let (incoming, received) = mpsc::channel();
         let net = Arc::new(PeerNet::start(host, port, incoming)?);
-        Ok(Self { net, received })
+        Ok(Self {
+            net,
+            received,
+            routes: None,
+        })
+    }
+
+    /// Bind one public control endpoint for the node. Its replica leaders
+    /// exchange private loopback ports once, before they advertise readiness.
+    pub fn bind_node(
+        mesh: &mut Mesh,
+        group_id: u32,
+        leaders: &[(usize, u32)],
+        host: &str,
+        port: u16,
+    ) -> Result<Self, PeerError> {
+        let ranks = leaders.iter().map(|&(rank, _)| rank).collect();
+        let group = Group::new(group_id, ranks, mesh.rank())?;
+        // Reserve the public port before the OS assigns any loopback ports.
+        let public = if group.index() == 0 {
+            Some(Self::bind(host, port)?)
+        } else {
+            None
+        };
+        mesh.broadcast(&group, 0, Vec::new())?;
+        let mut listener = match public {
+            Some(listener) => listener,
+            None => Self::bind("127.0.0.1", 0)?,
+        };
+        let ports = mesh.all_gather_i64(&group, &[i64::from(listener.port())])?;
+        if group.index() == 0 {
+            listener.routes = Some(NodeRoutes {
+                own_rank: leaders[0].1,
+                local_ports: leaders
+                    .iter()
+                    .zip(ports)
+                    .skip(1)
+                    .map(|(&(_, rank), row)| (rank, row[0] as u16))
+                    .collect(),
+            });
+        }
+        Ok(listener)
     }
 
     /// Return the bound port, including the OS-selected port when binding to 0.
@@ -813,7 +889,11 @@ fn start_endpoint(
     listener: PeerListener,
     scheduler: Arc<Mutex<Scheduler>>,
 ) -> Result<Endpoint, PeerError> {
-    let PeerListener { net, received } = listener;
+    let PeerListener {
+        net,
+        received,
+        routes,
+    } = listener;
     let holder = Arc::new(Mutex::new(Holder::new(
         Stamp {
             name: settings.name.clone(),
@@ -830,6 +910,13 @@ fn start_endpoint(
             .name("ts-peer-servicer".to_owned())
             .spawn(move || {
                 for frames in received {
+                    let frames = match &routes {
+                        Some(routes) => match routes.dispatch(&net, frames) {
+                            Some(local) => local,
+                            None => continue,
+                        },
+                        None => frames,
+                    };
                     match Inbound::decode(&frames) {
                         Ok(Inbound::Request(request)) => {
                             // Waits while the control thread runs a round's

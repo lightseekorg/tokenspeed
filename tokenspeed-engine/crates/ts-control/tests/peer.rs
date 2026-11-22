@@ -435,6 +435,75 @@ fn a_listener_keeps_its_port_reserved_through_peer_startup() {
 }
 
 #[test]
+fn two_dp_replicas_read_through_one_public_port() {
+    for public_reads in [true, false] {
+        read_through_node_port(public_reads);
+    }
+}
+
+fn read_through_node_port(public_reads: bool) {
+    let arena = Arena::new(200_000);
+    use ts_collective::{Listener, Mesh};
+
+    let mesh_listeners = [(); 2].map(|_| Listener::bind("127.0.0.1").unwrap());
+    let addresses = mesh_listeners
+        .each_ref()
+        .map(|socket| format!("127.0.0.1:{}", socket.port().unwrap()));
+    let [public, private] = std::thread::scope(|scope| {
+        let addresses = &addresses;
+        let spawn = |rank, socket| {
+            scope.spawn(move || {
+                let mut mesh =
+                    Mesh::connect(rank, socket, addresses, Duration::from_secs(5)).unwrap();
+                PeerListener::bind_node(&mut mesh, 4, &[(0, 16), (1, 31)], "127.0.0.1", 0).unwrap()
+            })
+        };
+        let [a, b] = mesh_listeners;
+        [spawn(0, a), spawn(1, b)].map(|worker| worker.join().unwrap())
+    });
+    let address = format!("127.0.0.1:{}", public.port());
+    let (reader_listener, reader_rank, holder_listener, holder_rank) = if public_reads {
+        (public, 16, private, 31)
+    } else {
+        (private, 31, public, 16)
+    };
+    let mut reader = Replica::with_listener(
+        settings(&format!("{address}/{reader_rank}"), "v1"),
+        reader_listener,
+        READER_BASE,
+        &arena,
+        "Fused",
+    );
+    let mut holder = Replica::with_listener(
+        settings(&format!("{address}/{holder_rank}"), "v1"),
+        holder_listener,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    let mut longer = tokens;
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder.name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert_eq!(landings.len(), 1);
+    assert!(prefix >= 5 * PAGE);
+    assert_eq!(landings[0].end_tokens, prefix);
+    for destination in &landings[0].destinations {
+        let page = arena.read_bytes(
+            READER_BASE + destination.block_id as u64 * PAGE_BYTES,
+            PAGE_BYTES as usize,
+        );
+        assert!(page[0] != 0 && page.iter().all(|&byte| byte == page[0]));
+    }
+}
+
+#[test]
 fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
     let arena = Arena::new(200_000);
     let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
