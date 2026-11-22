@@ -2846,6 +2846,47 @@ def test_dense_fp8_copy_is_allocated_in_its_memory_saver_region(
 
 
 @requires_gpu
+@pytest.mark.skipif(
+    current_platform().is_cdna4, reason="gfx950 has the skinny FP8 GEMM"
+)
+def test_dense_fp8_check_refuses_where_no_fp8_gemm_serves() -> None:
+    """Off gfx950 the check refuses with its own message, not a registry
+    error from the row quantizer it does not run."""
+    fp8 = module._DenseFp8Weight(
+        "qkv_proj",
+        True,
+        module._DENSE_FP8_QKV_MIN_ROWS,
+        module._DENSE_FP8_MAX_ROWS,
+        None,
+    )
+    with pytest.raises(
+        ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
+    ):
+        fp8.check(torch.zeros(4608, 8192, dtype=torch.bfloat16, device="cuda"))
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the row quantizer is gfx950-only"
+)
+def test_the_fp8_probe_has_the_row_quantizers_layout() -> None:
+    """The check probes with what the row quantizer would return."""
+    for rows in (17, 33, 128):
+        codes, scales = module._quantize_rows_fp8(
+            torch.randn(rows, 8192, device="cuda").bfloat16()
+        )
+        probe_codes, probe_scales = module._row_fp8_probe(
+            rows, 8192, torch.device("cuda")
+        )
+        for real, probe in ((codes, probe_codes), (scales, probe_scales)):
+            assert (real.dtype, real.shape, real.stride()) == (
+                probe.dtype,
+                probe.shape,
+                probe.stride(),
+            )
+
+
+@requires_gpu
 def test_dense_fp8_qkv_down_refuses_a_model_without_its_reader(
     bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -246,6 +246,17 @@ def _fp8_projections(forward_mode: ForwardMode) -> bool:
     return forward_mode.is_decode()
 
 
+def _row_fp8_probe(
+    rows: int, k: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Placeholders with ``_quantize_rows_fp8``'s output layout (FP8 codes,
+    [rows, 1] FP32 scales), made without running it: the quantizer exists only
+    where the FP8 GEMM does, so a probe elsewhere reaches the GEMM's refusal
+    instead of a registry error."""
+    codes = torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device)
+    return codes, torch.ones(rows, 1, dtype=torch.float32, device=device)
+
+
 def _quantize_rows_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row FP8 codes and scales of ``x``, with the recipe the boundary's
     FP8 copy uses (``token_fp8_amax_div``), so both give the same bits."""
@@ -301,7 +312,7 @@ class _DenseFp8Weight:
         )
         probe_scale = torch.ones(n, dtype=torch.float32, device=weight.device)
         for rows in (self.min_rows, self.max_rows):
-            codes, scales = _quantize_rows_fp8(weight.new_zeros(rows, k))
+            codes, scales = _row_fp8_probe(rows, k, weight.device)
             if not mm_has_kernel_with_features(
                 codes,
                 probe_weight.t(),
