@@ -468,7 +468,8 @@ TEST(ResumeFrontier, HostEvictionKeepsLastResumeOnlyWithinRetentionWindow) {
         SCOPED_TRACE(testing::Message() << "retention " << retention << ", peer lookup " << peer_lookup);
         BlockPool device(16, {1, 1});
         BlockPool host(16, {1, 1});
-        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, nullptr, false, false, retention);
+        auto cache = MakeCoordinator(StateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false,
+                                     false, retention);
         const Checkpoint resumed{Sequence(32)}, descendant{Sequence(36)}, unused{{90, 91, 92, 93}},
             unused_descendant{Concat(unused.tokens, {94, 95, 96, 97})};
         ASSERT_NO_FATAL_FAILURE(Publish(cache, resumed));
