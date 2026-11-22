@@ -88,7 +88,7 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 The gfx950 skinny GEMM, `gluon_mm_a16w16_skinny_gfx950`, is an `mv` kernel
 too: its `mnk_problem_filter` admits only the weight shapes and row counts it
 was measured on, and a row's bits there do not depend on the other rows of the
-batch. It needs 16-byte aligned operands and output and declares the
+batch. It needs 16-byte-aligned operands and output and declares the
 `operands_aligned_16` and `out_aligned_16` traits, which `mv` and `mm`'s `mv`
 branch supply: an offset view selects what it would without this kernel.
 Supplying them reads tensor addresses only on a platform that registers a

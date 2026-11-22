@@ -450,7 +450,7 @@ def supports_gluon_mm_a16w16_skinny_weight_gfx950(N: int, K: int) -> bool:
         K: Inner dimension.
 
     Returns:
-        True when ``compile_gluon_mm_a16w16_skinny_gfx950`` accepts the weight.
+        True when ``(N, K)`` has a measured skinny GEMM configuration.
     """
     return (N, K) in _SKINNY_CONFIGS
 
