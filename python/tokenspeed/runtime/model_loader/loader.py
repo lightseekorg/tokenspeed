@@ -751,8 +751,9 @@ class DummyModelLoader(BaseModelLoader):
             # that start as NaN, so every parameter needs a value before it
             # runs. A parameter that post-processing leaves as it is gets the
             # same values again from the call after it, since its values depend
-            # only on the seed, its size and its dtype. Parameters with a dummy
-            # initializer take its values for post-processing.
+            # only on the seed, its size and its dtype. A parameter with a
+            # dummy initializer takes the initializer's values for
+            # post-processing.
             initialize_dummy_weights(model)
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
