@@ -181,7 +181,7 @@ def _case(rank: int, dtype, queries: int, draft: bool, value_tail: bool):
             tuple(global_server_args_dict["mapping"].attn.kvp_group), rows
         )
     latent = forward().view(rows, _HEADS, _LATENT)
-    # A value-major weight: the tail needs a contiguous latent axis.
+    # A k-major weight: the tail needs a contiguous latent axis.
     k_major = torch.randn(
         _HEADS,
         _VALUE,
