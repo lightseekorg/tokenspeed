@@ -818,6 +818,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
         runtime_states=states,
         input_buffers=buffers,
         spec_num_tokens=N,
+        sampling_stream="batch",
         vocab_map=vocab_map,
         device="cpu",
     )
@@ -1080,7 +1081,10 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     from tokenspeed.runtime.execution.drafter import speculative_sampling as spec
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-    from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
+    from tokenspeed.runtime.sampling.backends.base import (
+        SamplingBackendConfig,
+        SpeculativeSamplingPools,
+    )
 
     assert Eagle.supports_speculative_sampling and Mtp.supports_speculative_sampling
     assert not DFlash.supports_speculative_sampling
@@ -1094,7 +1098,15 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
         top_p=torch.ones(POOL + 1),
         seed=torch.zeros(POOL + 1, dtype=torch.int64),
     )
-    backend = SimpleNamespace(speculative_sampling_pools=lambda: pools)
+    backend = SimpleNamespace(
+        config=SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=True,
+            sampling_stream="batch",
+            logprob_order="torch",
+        ),
+        speculative_sampling_pools=lambda: pools,
+    )
 
     block = BaseDrafter(spec_num_tokens=N, runtime_states=states, input_buffers=buffers)
     with pytest.raises(ValueError, match="whole block greedily"):

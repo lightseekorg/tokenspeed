@@ -30,6 +30,30 @@
 ; loads and stores stay on their side of the wait.
 declare void @llvm.amdgcn.s.waitcnt(i32 immarg)
 declare void @llvm.amdgcn.s.wait.storecnt(i16 immarg)
+declare void @llvm.amdgcn.s.sleep(i32 immarg)
+declare i64 @llvm.amdgcn.s.memrealtime()
+
+; A deliberate memory fault: a volatile store to the null page. Unlike a
+; noreturn trap intrinsic, the code after it stays reachable in the IR.
+define i32 @__tokenspeed_sync_stop_on_fault() alwaysinline {
+entry:
+  store volatile i32 1, ptr addrspace(1) null, align 4
+  ret i32 0
+}
+
+; The constant 100 MHz clock (s_memrealtime), ordered with memory accesses.
+define i64 @__tokenspeed_sync_realtime_clock() alwaysinline {
+entry:
+  %ticks = call i64 @llvm.amdgcn.s.memrealtime()
+  ret i64 %ticks
+}
+
+; s_sleep 1: pause this wave between the polls of a wait.
+define i32 @__tokenspeed_sync_sleep_one() alwaysinline {
+entry:
+  call void @llvm.amdgcn.s.sleep(i32 1)
+  ret i32 0
+}
 
 ; gfx9: s_waitcnt vmcnt(0). 3952 = 0x0F70 leaves expcnt and lgkmcnt untouched.
 define i32 @__tokenspeed_sync_wait_vmem() alwaysinline {

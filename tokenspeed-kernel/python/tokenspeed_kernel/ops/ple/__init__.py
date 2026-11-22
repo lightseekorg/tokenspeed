@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_conv_state_kernel,
     _ple_gate_norm_kernel,
     _ple_host_gather_kernel,
-    _ple_page_gather_kernel,
+    _ple_host_gather_persistent_kernel,
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
 )
@@ -57,7 +57,6 @@ __all__ = [
     "ple_host_gather",
     "ple_ngram_ids",
     "prepare_ngram_reciprocals",
-    "ple_page_gather",
     "ple_page_gather_pair",
     "ple_page_scatter",
 ]
@@ -71,12 +70,15 @@ def ple_host_gather(
     vocab_end: int,
     scale: float | None,
     row_scale: torch.Tensor | None,
+    *,
+    table_shards: int,
 ) -> torch.Tensor:
     """Gather global n-gram IDs from a sharded table in pinned host memory.
 
     Args:
-        table: Contiguous page-locked CPU table shaped ``[local_vocab, head_dim]``.
-            Its mapped address must be accessible to the GPU.
+        table: Contiguous mapped host table shaped ``[local_vocab, head_dim]``.
+            May be a page-locked CPU tensor or a zero-copy CUDA alias of shared
+            host storage. A CUDA alias does not imply that the bytes occupy HBM.
         ids: Device int64 global row IDs in any shape; flattened for lookup.
         out: Device output with ``ids.numel() * head_dim`` elements, reshapeable
             to ``[ids.numel(), head_dim]``. Rows outside this shard are zeroed.
@@ -87,29 +89,62 @@ def ple_host_gather(
         row_scale: Device tensor with one dequantization factor per local row
             for an online-quantized FP8 table, or ``None`` for scalar scaling
             or compute-dtype storage. At most one scale mode is used.
+        table_shards: Number of table partitions, or one for a complete table.
+            Large lookups can be sorted when the table has one partition.
 
     Returns:
         The supplied ``out`` tensor, filled with gathered and dequantized rows.
     """
 
+    if table_shards < 1:
+        raise ValueError("table_shards must be positive")
     rows = ids.numel()
     if rows == 0:
         return out
     head_dim = out.shape[-1]
-    _ple_host_gather_kernel[(rows,)](
+    flat_ids = ids.reshape(-1)
+    if table_shards == 1 and rows >= 131072:
+        block_rows = 32
+        sms = torch.cuda.get_device_properties(ids.device).multi_processor_count
+        grid = min(_triton.cdiv(rows, block_rows), sms)
+        flat_ids, destination = torch.sort(flat_ids)
+        _ple_host_gather_persistent_kernel[(grid,)](
+            current_platform().device_visible_data_ptr(table),
+            flat_ids,
+            scale if scale is not None else 1.0,
+            row_scale if row_scale is not None else out,
+            out.view(rows, head_dim),
+            head_dim,
+            vocab_start,
+            vocab_end,
+            rows,
+            grid,
+            destination,
+            IS_FP8=table.dtype == torch.float8_e4m3fn,
+            HAS_SCALE=row_scale is not None or scale is not None,
+            ROW_SCALE=row_scale is not None,
+            BLOCK_D=_triton.next_power_of_2(head_dim),
+            BLOCK_R=block_rows,
+            num_warps=8,
+        )
+        return out
+    block_rows = 4 if rows >= 256 else 1
+    _ple_host_gather_kernel[(_triton.cdiv(rows, block_rows),)](
         current_platform().device_visible_data_ptr(table),
-        ids.reshape(-1),
+        flat_ids,
         scale if scale is not None else 1.0,
         row_scale if row_scale is not None else out,
         out.view(rows, head_dim),
         head_dim,
         vocab_start,
         vocab_end,
+        rows,
         IS_FP8=table.dtype == torch.float8_e4m3fn,
         HAS_SCALE=row_scale is not None or scale is not None,
         ROW_SCALE=row_scale is not None,
         BLOCK_D=_triton.next_power_of_2(head_dim),
-        num_warps=1,
+        BLOCK_R=block_rows,
+        num_warps=block_rows,
     )
     return out
 
@@ -253,46 +288,6 @@ def ple_ngram_ids(
     return ids, tail
 
 
-def ple_page_gather(
-    field: torch.Tensor,
-    page_ids: torch.Tensor,
-    row_stride: int,
-    default: int | float = 0,
-) -> torch.Tensor:
-    """Read one cache row per page id, with null pages read as ``default``.
-
-    Args:
-        field: Cache field whose first dimension is indexed by page id.
-        page_ids: One page id per output row; id 0 is the null page.
-        row_stride: Element stride between pages, which the arena may pad past
-            the row's own extent.
-        default: Value substituted for every null-page row.
-
-    Returns:
-        A tensor shaped ``[len(page_ids), *field.shape[1:]]``.
-    """
-
-    rows = page_ids.shape[0]
-    out = field.new_empty((rows, *field.shape[1:]))
-    if rows == 0:
-        return out
-    numel = out[0].numel()
-    block = min(1024, _triton.next_power_of_2(numel))
-    use_pdl = pdl_enabled()
-    _ple_page_gather_kernel[(rows, _triton.cdiv(numel, block))](
-        field,
-        page_ids,
-        out,
-        default,
-        row_stride,
-        numel,
-        ENABLE_PDL=use_pdl,
-        BLOCK=block,
-        **({"launch_pdl": True} if use_pdl else {}),
-    )
-    return out
-
-
 def ple_page_gather_pair(
     context: torch.Tensor,
     conv: torch.Tensor,
@@ -385,6 +380,7 @@ def ple_conv_sequences(
     windows: torch.Tensor | None = None,
     windows_block_rows: int = 0,
     scatter_windows: bool = False,
+    compact_windows: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dilated depthwise conv + SiLU, plus the state carried to the next step.
 
@@ -412,6 +408,8 @@ def ple_conv_sequences(
             the last dimension has to be dense.
         windows: Destination for sliding state windows. ``None`` skips them.
         windows_block_rows: Rows per request in ``windows`` when scattering.
+        compact_windows: Keep one channel vector per candidate in scattered
+            verify scratch. The carried state remains in the first row.
         scatter_windows: Place carried state in each block's first row and token
             windows at ``req * windows_block_rows + 1 + col`` instead of packed
             rows.
@@ -422,6 +420,8 @@ def ple_conv_sequences(
         window tensor (an empty placeholder when ``windows`` is ``None``).
     """
 
+    if compact_windows and not scatter_windows:
+        raise ValueError("compact layout requires scattered verify scratch")
     if len(add_terms) > 2:
         raise ValueError("the fused conv epilogue folds at most two addends")
     channels = values.shape[-1]
@@ -460,13 +460,23 @@ def ple_conv_sequences(
         ):
             raise ValueError("windows is smaller than the requested block layout")
         write_windows = True
-    block_c = 256
+    tiled = (
+        total_tokens >= 1024
+        and channels >= 1024
+        and not write_windows
+        and values.dtype == torch.bfloat16
+        and current_platform().is_blackwell
+    )
+    block_t, block_c = (8, 128) if tiled else (1, 256)
     use_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     final_conv = values.new_empty(
         (batch_size if write_final else 0, channels, state_len)
     )
-    work_items = max(total_tokens, batch_size if write_final or scatter_windows else 0)
+    work_items = max(
+        _triton.cdiv(total_tokens, block_t),
+        batch_size if write_final or scatter_windows else 0,
+    )
     if work_items:
         grid = (work_items, _triton.cdiv(channels, block_c))
         kernel_launcher(_ple_conv_state_kernel, grid)(
@@ -499,6 +509,8 @@ def ple_conv_sequences(
             ADD_RESIDUAL=len(addends) > 1,
             ENABLE_PDL=use_pdl,
             BLOCK_C=block_c,
+            BLOCK_T=block_t,
+            COMPACT_WINDOWS=compact_windows,
             **pdl_kwargs,
         )
     return conv_output, final_conv, windows

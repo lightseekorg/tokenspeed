@@ -212,3 +212,49 @@ between two CTA barriers on the handle's signal pads. Up to 32 CTAs run it;
 on 8 GB300s over two nodes a [8192, 7168] sum takes 260 us there and 291 us at
 8 CTAs, where NCCL takes 364 us. The result lives in the buffer until the next
 stage or view of that width.
+
+## Fused GEMM + reduce-scatter
+
+`cute_dsl_gemm_reduce_scatter` (SM100 and SM103) computes this rank's row
+block of `reduce_scatter(x @ weight.T)` for BF16 operands in one persistent
+kernel, NVIDIA CUTLASS's CuTe DSL example vendored under
+`thirdparty/cute_dsl/gemm_reduce_scatter`. Each rank stores its BF16 partial
+tiles in symmetric memory and signals the tile's owner; the owner sums all
+ranks' tiles with `multimem.ld_reduce` (FP32 accumulation in the switch, one
+rounding, ties possibly broken either way) while the remaining tiles compute.
+`create_gemm_reduce_scatter_state` is collective and compiles once with dynamic
+rows before graph capture; it needs NVLink multicast. Row blocks pad to the
+128-row tile. A barrier before each call keeps a peer's exit-flag reset from
+racing a call with another row count. The runtime's scatter projections use it
+above the Lamport reduce-scatter's rows. Projecting 8192 rows of 2048 channels
+per rank into 8192 outputs over four GB200s takes 229 us against 406 us for
+the GEMM and NCCL's reduce-scatter.
+
+## One-hop LL exchange
+
+`cute_dsl_ll_all_gather` and `cute_dsl_ll_all_to_all` (SM100 and SM103) move
+small payloads in one kernel without a flag or a fence: every rank stores each
+16-byte unit as four 64-bit LL elements (a payload word in the low half, the
+call's epoch in the high half) straight into the receiver's slot of one
+symmetric workspace, through the multicast address for an all-gather and with
+one store per peer otherwise; the receiver loads the elements until each
+carries the epoch. An aligned 64-bit element is single-copy atomic, so any
+payload bits pass and the output is byte-identical to NCCL's. Two parity slots
+alternate between calls: a rank writes a slot again only after receiving its
+peers' next call, which each sends after finishing the previous one. A 64-bit
+call count in device memory picks the parity and derives each call's 32-bit
+epoch, which skips 0, the zeroed workspace's, so an element no call wrote never
+matches; CUDA graph replays need no host state.
+
+`create_ll_exchange_state` is collective, votes every refusal (SM100 or SM103,
+2, 4 or 8 ranks, a capacity that is a multiple of 16, a reachable fabric) and
+reserves `4 * ranks * cap_bytes` of symmetric memory before the KV cache is
+sized. Calls on a group run in the same order on every rank and never
+overlap one another; every wait is bounded by the state's timeout and traps.
+The runtime prepares one per KVP group (`prepare_small_exchange`), and
+`AutoBackend` routes fitting `all_gather_single`, equal-split
+`all_to_all_single` and `all_gather` calls to it (on a multicast group, an
+`all_gather` the all-reduce workspace does not serve); the NCCL-only switch
+keeps NCCL. On 8 GB300s over two nodes a
+64 KiB per-rank all-gather takes 6.9 us against NCCL's 23.4 us and a 1 MiB
+all-to-all 30 us against 37 us; NCCL wins from about 4 MiB.

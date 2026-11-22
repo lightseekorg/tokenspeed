@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import (
@@ -730,6 +731,10 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         del max_num_tokens
         if self.fused_reduce_norm is not None:
             return True
+        # Iris needs Gluon at import time, before its support check can run.
+        if not current_platform().is_cdna4:
+            return False
+
         from tokenspeed_kernel.ops.communication.iris import (
             iris_lamport_residual_rmsnorm_supported,
             prepare_iris_lamport_residual_rmsnorm,

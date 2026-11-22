@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling import chain_verify_coins
 from tokenspeed_kernel.ops.sampling.block_verify import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
@@ -171,9 +172,10 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     ``config.sampling_stream == "per-request"`` swaps the single-step kernel
     for the Gumbel-max pool route (``_sample_per_request``), including
-    verification at N == 1. Sampled adaptive V4.1 DSpark uses position-keyed
-    CuTe probability sampling for every width. Other multi-token verification
-    retains the chain kernels and its per-slot coin generators.
+    verification at N == 1. Multi-token chain verification uses independent
+    coins for each round, keyed by request seed and first target position.
+    Sampled adaptive V4.1 DSpark uses position-keyed CuTe probability sampling
+    for every width.
     """
 
     _HAS_POOL_STATE = True
@@ -216,6 +218,11 @@ class FlashInferSamplingBackend(SamplingBackend):
                 "sampling backend"
             )
         super().__init__(config)
+        # Batch sampling and tree verify need legacy generators and coin
+        # refills. Sampled adaptive DSpark uses its own position-keyed sampler.
+        self._uses_legacy_coins = not self._dspark_sampling and (
+            config.sampling_stream != "per-request" or config.draft_tree
+        )
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
@@ -327,18 +334,16 @@ class FlashInferSamplingBackend(SamplingBackend):
             (pool_rows,), dtype=torch.int64, device=config.device
         )
 
-        # Per-slot CPU-side torch.Generators used to advance speculative
-        # coin buffers outside the CUDA graph. Seeded on flip from sp.seed.
-        # Slot 0 is pre-filled with _capture_gen so capture warm-up works
-        # without any real request having been registered.
-        #
-        # A retraction image carries the generator's state (a fixed-size byte
-        # tensor, imaged in front of the slot's rows) and the restore installs
-        # it in the new slot, so the restored request's coins continue the
-        # stream exactly where the victim's stopped.
+        # The legacy coin stream advances outside the graph and its retraction
+        # image carries the generator state. The position-keyed chain stream
+        # needs only the seed and the restored cache frontier.
         self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._cpu_generator_per_slot[0] = self._capture_gen
-        self._generator_state_bytes = torch.Generator(device="cpu").get_state().numel()
+        self._generator_state_bytes = (
+            torch.Generator(device="cpu").get_state().numel()
+            if self._uses_legacy_coins
+            else 0
+        )
         self._generator_image_bytes = aligned_slot_state_bytes(
             self._generator_state_bytes
         )
@@ -357,9 +362,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._top_p_pool[pool_idx].fill_(float(sp.top_p))
         self._seed_pool[pool_idx].fill_(int(sp.seed))
 
-        cpu_gen = torch.Generator(device="cpu")
-        cpu_gen.manual_seed(int(sp.seed))
-        self._cpu_generator_per_slot[pool_idx] = cpu_gen
+        if self._uses_legacy_coins:
+            cpu_gen = torch.Generator(device="cpu")
+            cpu_gen.manual_seed(int(sp.seed))
+            self._cpu_generator_per_slot[pool_idx] = cpu_gen
 
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter): the scalars and the coin generator
@@ -377,28 +383,30 @@ class FlashInferSamplingBackend(SamplingBackend):
         return self._generator_image_bytes + super()._slot_payload_bytes()
 
     def _export_slot_payload(self, slot: int, out: torch.Tensor, stream) -> None:
-        # Only a prepared slot is exported (the base checks the marker), and
-        # _reset_slot gave every prepared slot its own CPU generator.
-        generator = self._cpu_generator_per_slot[slot]
-        if generator is None or generator.device.type != "cpu":
-            raise RuntimeError(
-                f"sampling slot {slot} has no per-request coin generator to image"
-            )
-        out[: self._generator_state_bytes].copy_(generator.get_state())
+        if self._uses_legacy_coins:
+            # The base checks the prepared marker before exporting, so every
+            # imaged slot already owns its CPU generator.
+            generator = self._cpu_generator_per_slot[slot]
+            if generator is None or generator.device.type != "cpu":
+                raise RuntimeError(
+                    f"sampling slot {slot} has no per-request coin generator to image"
+                )
+            out[: self._generator_state_bytes].copy_(generator.get_state())
         super()._export_slot_payload(slot, out[self._generator_image_bytes :], stream)
 
     def _import_slot_payload(self, slot: int, src: torch.Tensor, stream) -> None:
-        generator = torch.Generator(device="cpu")
-        generator.set_state(src[: self._generator_state_bytes].clone())
-        self._cpu_generator_per_slot[slot] = generator
+        if self._uses_legacy_coins:
+            generator = torch.Generator(device="cpu")
+            generator.set_state(src[: self._generator_state_bytes].clone())
+            self._cpu_generator_per_slot[slot] = generator
         super()._import_slot_payload(slot, src[self._generator_image_bytes :], stream)
 
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 
         max_pad_bs = self._dp_max_pad_bs
         max_n = config.max_draft_tokens_per_req
-        # Persistent coin buffers. Filled per-request in prepare() outside the
-        # CUDA graph so verify() only reads from them.
+        # Persistent coin buffers, filled within verify() for the position-keyed
+        # chain stream and outside the graph for the legacy stream.
         self._coins_buf = torch.zeros(
             (max_pad_bs, max_n),
             dtype=torch.float32,
@@ -409,8 +417,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         )
 
         # Stub generator used during CUDA-graph capture/warm-up (no requests yet).
-        self._capture_gen = torch.Generator(device=config.device)
-        self._capture_gen.manual_seed(config.random_seed)
+        self._capture_gen: torch.Generator | None = None
+        if self._uses_legacy_coins:
+            self._capture_gen = torch.Generator(device=config.device)
+            self._capture_gen.manual_seed(config.random_seed)
 
         # Pre-allocated persistent buffers — no per-step alloc in the hot path.
         self._ones_buf = torch.ones(
@@ -559,23 +569,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         bs: int,
         request_pool_indices: list[int] | None = None,
     ) -> None:
-        """Refill persistent coin buffers outside the captured graph.
-        request_pool_indices=None is the capture/warm-up path — uses
-        _capture_gen for all rows. Otherwise reads per-slot generators
-        populated via _reset_slot."""
-        if bs <= 0 or self._dspark_sampling:
-            return
-        if self.config.sampling_stream == "per-request":
-            if num_tokens_per_req == 1:
-                # Position-keyed direct draws need no prepared coins.
-                return
-            # Multi-token rejection still consumes the legacy coin buffers.
-            # Position-keyed accept/residual coins are not implemented yet.
-        self._refill_legacy_coins(
-            num_tokens_per_req=num_tokens_per_req,
-            bs=bs,
-            request_pool_indices=request_pool_indices,
-        )
+        """Refill legacy coins outside the graph, for batch sampling and trees."""
+        if bs > 0 and self._uses_legacy_coins:
+            self._refill_legacy_coins(
+                num_tokens_per_req=num_tokens_per_req,
+                bs=bs,
+                request_pool_indices=request_pool_indices,
+            )
 
     def _refill_legacy_coins(
         self,
@@ -592,6 +592,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         n = min(num_tokens_per_req, self.config.max_draft_tokens_per_req)
         lo = coin_eps(self._coins_buf.dtype)
         if request_pool_indices is None:
+            assert self._capture_gen is not None
             self._coins_buf[:bs, :n].uniform_(lo, 1.0, generator=self._capture_gen)
             self._final_coins_buf[:bs].uniform_(lo, 1.0, generator=self._capture_gen)
             return
@@ -611,6 +612,36 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         self._coins_buf[:bs, :n].copy_(cpu_coins, non_blocking=True)
         self._final_coins_buf[:bs].copy_(cpu_final, non_blocking=True)
+
+    def _chain_verify_coins(
+        self,
+        sampling_info: SamplingBatchInfo,
+        pool_indices: torch.Tensor,
+        *,
+        width: int,
+        row_offset: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bs = pool_indices.numel()
+        if self.config.sampling_stream == "per-request":
+            # The CUDA verifier takes contiguous [bs, width] input even when
+            # the backing scratch was allocated for a wider verify window.
+            coins = self._coins_buf.view(-1)[: bs * width].view(bs, width)
+            final_coins = self._final_coins_buf[:bs]
+            # DP verify only draws its local rows. The offsets are prepared
+            # for the real requests before their local padded indices read them.
+            chain_verify_coins(
+                pool_indices,
+                self._seed_pool,
+                self._prepare_sampling_offsets(sampling_info),
+                coins=coins,
+                final_coins=final_coins,
+            )
+            return coins, final_coins
+
+        # Legacy coins were filled in full-batch order. Skip prefill rows in
+        # a mixed batch, or take the verifier's DP shard.
+        rows = slice(row_offset, row_offset + bs)
+        return self._coins_buf[rows, :width], self._final_coins_buf[rows]
 
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
@@ -790,8 +821,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 num_tokens_per_req=num_tokens_per_req,
                 shard=shard,
             )
-            coins = self._coins_buf[shard]
-            final_coins = self._final_coins_buf[shard]
+            coin_row_offset = rank * bs
             if (
                 self._predict_local_buf is None
                 or self._accept_index_local_buf is None
@@ -807,12 +837,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             accept_length = self._accept_length_local_buf[:bs]
         else:
             pool_indices = sampling_info.req_pool_indices
-            # prepare_step filled the coin buffers in the step's full batch
-            # order; a MIXED round's verify sees only the decode suffix, so
-            # read each row's own coins at its batch offset.
-            row0 = sampling_info.batch_row_offset
-            coins = self._coins_buf[row0 : row0 + bs]
-            final_coins = self._final_coins_buf[row0 : row0 + bs]
+            coin_row_offset = sampling_info.batch_row_offset
             predict = self._predict_buf[: bs * num_tokens_per_req]
             accept_index = (
                 self._accept_index_buf[: bs * num_tokens_per_req]
@@ -865,6 +890,12 @@ class FlashInferSamplingBackend(SamplingBackend):
             # Match sample(): publish rank 0's direct draw on replicated TP.
             needs_tp_sync = True
         else:
+            coins, final_coins = self._chain_verify_coins(
+                sampling_info,
+                pool_indices,
+                width=n,
+                row_offset=coin_row_offset,
+            )
             temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
                 pool_indices,
                 temperature=self._temperature_pool,
@@ -920,8 +951,8 @@ class FlashInferSamplingBackend(SamplingBackend):
                     accept_index=accept_index,
                     accept_token_num=accept_length,
                     candidates=candidates,
-                    uniform_samples=coins[:bs, :n],
-                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    uniform_samples=coins,
+                    uniform_samples_for_final_sampling=final_coins,
                     target_probs=target_probs,
                     draft_probs=draft_probs,
                     reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
@@ -932,13 +963,13 @@ class FlashInferSamplingBackend(SamplingBackend):
                     accept_index=accept_index,
                     accept_token_num=accept_length,
                     candidates=candidates,
-                    uniform_samples=coins[:bs, :n],
-                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    uniform_samples=coins,
+                    uniform_samples_for_final_sampling=final_coins,
                     target_probs=target_probs,
                     draft_probs=draft_probs,
                     threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                     threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                    deterministic=not dp_sampling,
+                    deterministic=per_request_stream or not dp_sampling,
                     use_draft_prob=use_draft_prob,
                     reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
                 )
@@ -957,9 +988,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 )
                 self.write_synthetic_outputs(
                     candidates,
-                    self.sample_synthetic_targets(
-                        target_probs, lengths, final_coins[:bs]
-                    ),
+                    self.sample_synthetic_targets(target_probs, lengths, final_coins),
                     lengths,
                     predict,
                     accept_index,

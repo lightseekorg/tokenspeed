@@ -320,6 +320,49 @@ def test_external_manifest_cannot_replace_inline_method(
     assert model._parse_quant_hf_config() == inline
 
 
+@pytest.mark.parametrize(
+    "architecture",
+    ["Inkling2ForConditionalGeneration", "Inkling2LoopForConditionalGeneration"],
+)
+def test_released_modelopt_summary_defers_to_the_manifest(
+    tmp_path, manifest: dict, architecture: str
+) -> None:
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(manifest))
+    summary = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    model = _loader_model(str(tmp_path), summary)
+    model.quantization = None
+    model.hf_config.architectures = [architecture]
+    model._verify_quantization()
+    assert model.quantization == "inkling2"
+    config = get_quant_config(model, LoadConfig())
+    assert config.tensor_precisions == (
+        Inkling2QuantConfig.from_config(manifest).tensor_precisions
+    )
+    model.hf_config.architectures = ["LlamaForCausalLM"]
+    assert model._parse_quant_hf_config() == summary
+
+
+def test_released_modelopt_summary_fetches_the_manifest_on_a_cold_cache(
+    tmp_path, manifest: dict, monkeypatch
+) -> None:
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(manifest))
+    calls = []
+
+    def snapshot_download(repo_id, *, revision, allow_patterns, local_files_only):
+        calls.append(local_files_only)
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+    model = _loader_model("org/released-checkpoint", None)
+    model.hf_config.architectures = ["Inkling2LoopForConditionalGeneration"]
+    model.hf_config.quantization_config = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4",
+    }
+    assert model._parse_quant_hf_config() == manifest
+    assert calls == [False]
+
+
 def test_empty_inline_config_is_unquantized_only_for_the_inkling2_draft(
     tmp_path, manifest: dict
 ) -> None:

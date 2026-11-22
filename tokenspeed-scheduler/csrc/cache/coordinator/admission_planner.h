@@ -29,7 +29,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <memory_resource>
 #include <optional>
@@ -1058,7 +1057,7 @@ protected:
     // its holes needs empty parents, and a parent of a cached group empties
     // only once the walk reaches its newest entry: with the epochs mixed in
     // every parent, that is most of the cache. Each tracked parent's newest
-    // epoch (PrefixCacheIndex::ParentEntries) gives that point directly. The
+    // epoch gives that point directly (EmptiableParents). The
     // walk's fit holds first at the event F where the demand fits with every
     // cached group's own holes taken as enough -- a parent emptying, or a
     // request reclaim -- once each cached group's oldest candidates outside
@@ -1070,7 +1069,8 @@ protected:
     // alone; State groups rank by checkpoint aging, which a parent's epoch
     // does not give, so either keeps the walk.
     //
-    // Virtual so that a test can compare the selection with the walk.
+    // Virtual so that a test can compare the selection with the walk; an
+    // override returns nullopt or this function's result.
     virtual std::optional<std::vector<VictimCandidate>> candidatesThroughParentFit(
         std::span<const BlockPlacementDemand> block_demands, const AdmissionCandidateConstraints& constraints) const {
         ProfileSpan profile_span{"AdmissionPlanner::candidatesThroughParentFit"};
@@ -1094,7 +1094,11 @@ protected:
                 .blocks_by_bucket = std::vector<std::int64_t>(block_demands[i].blocks_by_bucket.size(), 0)};
         }
         // A reclaim in a cached group would take holes from it as Minimize
-        // restores it.
+        // restores it. Checking the candidates covers every reclaim location
+        // (EmptiableParents does not filter them) only while the two match
+        // one to one (BuildAdmissionCandidateConstraints).
+        _assert(constraints.request_reclaim_locations.size() == constraints.request_reclaim_candidates.size(),
+                "every request reclaim location has its candidate");
         if (std::ranges::any_of(constraints.request_reclaim_candidates,
                                 [&](const VictimCandidate& candidate) { return cached[candidate.group_id]; })) {
             return std::nullopt;
@@ -1105,103 +1109,29 @@ protected:
             return std::nullopt;
         }
 
-        // Every cached parent whose occupants are all entries, earliest
-        // emptied first: by its newest epoch, then, once its children are
-        // read, by its newest child as the walk ranks it.
-        struct Parent {
-            std::uint64_t newest_access_epoch;
-            std::int32_t lcm_block_id;
-            std::uint32_t group_id;
-            // Its children in walk order, once read (children_of).
-            std::size_t children{0};
-            bool read{false};
-        };
-        std::vector<std::vector<VictimCandidate>> children_of;
-        const auto later = [&](const Parent& lhs, const Parent& rhs) {
-            if (lhs.newest_access_epoch != rhs.newest_access_epoch) {
-                return lhs.newest_access_epoch > rhs.newest_access_epoch;
-            }
-            if (lhs.read != rhs.read) {
-                return lhs.read;
-            }
-            return lhs.read &&
-                   CacheEvictionCandidates::Before(children_of[rhs.children].back(), children_of[lhs.children].back());
-        };
-        std::vector<Parent> parents;
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            if (!cached[i]) {
-                continue;
-            }
-            const std::span<const PrefixCacheIndex::ParentEntries> entries = groups_[i].Index().EntriesByParent(pool_);
-            for (std::size_t id = 1; id < entries.size(); ++id) {
-                const auto lcm_block_id = static_cast<std::int32_t>(id);
-                if (entries[id].count > 0 && entries[id].count == pool_.OccupiedCount(lcm_block_id)) {
-                    parents.push_back(Parent{.newest_access_epoch = entries[id].newest_access_epoch,
-                                             .lcm_block_id = lcm_block_id,
-                                             .group_id = static_cast<std::uint32_t>(i)});
-                }
-            }
-        }
-        std::ranges::make_heap(parents, later);
-        // Reads the earliest parent's children until the earliest is read,
-        // dropping a parent with one the walk never offers (in use or kept).
-        const auto read_earliest = [&] {
-            while (!parents.empty() && !parents.front().read) {
-                std::ranges::pop_heap(parents, later);
-                Parent parent = parents.back();
-                parents.pop_back();
-                std::vector<VictimCandidate> children;
-                bool offered = true;
-                for (std::int32_t slot = 0; offered && slot < pool_.Packing(parent.group_id); ++slot) {
-                    const CacheBlockLocation location{.lcm_block_id = parent.lcm_block_id, .slot_index = slot};
-                    if (!pool_.IsOccupied(location)) {
-                        continue;
-                    }
-                    const auto entry = groups_[parent.group_id].Index().UnpinnedCandidateAt(pool_, location);
-                    offered = entry && !constraints.protected_locations.contains(location);
-                    if (offered) {
-                        children.push_back(CacheEvictionCandidates::MakeCandidate(groups_[parent.group_id], *entry));
-                    }
-                }
-                if (!offered) {
-                    continue;
-                }
-                CacheEvictionCandidates::Sort(children);
-                _assert(children.back().rank_epoch == parent.newest_access_epoch,
-                        "a parent's newest child ranks at the parent's newest epoch");
-                parent.read = true;
-                parent.children = children_of.size();
-                children_of.push_back(std::move(children));
-                parents.push_back(parent);
-                std::ranges::push_heap(parents, later);
-            }
-        };
-
         // Events in walk order until the demand fits on the uncached groups.
         std::vector<VictimCandidate> through_fit;
         // By LCM block id: the parents the events emptied.
         std::vector<bool> emptied(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, false);
+        CacheEvictionCandidates::EmptiableParents parents{groups_, cached, pool_, constraints.protected_locations};
         std::size_t next_reclaim = 0;
         std::optional<VictimCandidate> fit;
         while (!fit) {
-            read_earliest();
+            const std::span<const VictimCandidate> children = parents.Earliest();
             const VictimCandidate* reclaim = next_reclaim < constraints.request_reclaim_candidates.size()
                                                  ? &constraints.request_reclaim_candidates[next_reclaim]
                                                  : nullptr;
-            if (!parents.empty() &&
-                (reclaim == nullptr ||
-                 CacheEvictionCandidates::Before(children_of[parents.front().children].back(), *reclaim))) {
-                std::ranges::pop_heap(parents, later);
-                const Parent parent = parents.back();
-                parents.pop_back();
-                for (const VictimCandidate& child : children_of[parent.children]) {
+            if (!children.empty() &&
+                (reclaim == nullptr || CacheEvictionCandidates::Before(children.back(), *reclaim))) {
+                for (const VictimCandidate& child : children) {
                     shadow.Remove(child.group_id, child.location);
                     through_fit.push_back(child);
                 }
-                emptied[static_cast<std::size_t>(parent.lcm_block_id)] = true;
+                emptied[static_cast<std::size_t>(children.back().location.lcm_block_id)] = true;
                 if (shadow.Fits(uncached_demands)) {
-                    fit = children_of[parent.children].back();
+                    fit = children.back();
                 }
+                parents.PopEarliest();
             } else if (reclaim != nullptr) {
                 shadow.Remove(reclaim->group_id, reclaim->location);
                 through_fit.push_back(*reclaim);
@@ -1224,7 +1154,9 @@ protected:
         };
         std::size_t num_short = 0;
         for (std::uint32_t i = 0; i < groups_.size(); ++i) {
-            num_short += cached[i] && short_of_holes(i) ? 1 : 0;
+            if (cached[i] && short_of_holes(i)) {
+                ++num_short;
+            }
         }
         CacheEvictionCandidates oldest{groups_, pool_, device_aging_};
         // Selection only matters to checkpoint aging, which needs a State group.
@@ -1242,7 +1174,9 @@ protected:
             }
             shadow.Remove(candidate->group_id, candidate->location);
             through_fit.push_back(*candidate);
-            num_short -= short_of_holes(candidate->group_id) ? 0 : 1;
+            if (!short_of_holes(candidate->group_id)) {
+                --num_short;
+            }
         }
         CacheEvictionCandidates::Sort(through_fit);
         return through_fit;
@@ -1264,6 +1198,8 @@ protected:
             std::optional<ExpandedVictimSet> expanded =
                 expandVictimSet(candidate, /*candidates_ran_out=*/false, constraints, selection);
             _assert(expanded.has_value(), "a candidate without segments leaves alone");
+            // Whether a reclaim left only matters to retrying passed-over
+            // segments.
             takeVictimSet(std::move(*expanded), candidate.location, selection);
             return true;
         });

@@ -384,6 +384,11 @@ class SonicSamplingBackend(SamplingBackend):
 
     def _vocab_shard(self, shard: SampledVocabShard) -> sonic.VocabShard:
         """The launch's view of ``shard``: its slice of the vocabulary and the gather of every rank's candidates."""
+        if shard.softcap_form not in (None, "sigmoid"):
+            raise ValueError(
+                f"sonic caps vocab shards in the fused sigmoid form, not "
+                f"{shard.softcap_form}"
+            )
         return sonic.VocabShard(
             vocab_start=shard.vocab_start,
             logit_scale=shard.logit_scale,

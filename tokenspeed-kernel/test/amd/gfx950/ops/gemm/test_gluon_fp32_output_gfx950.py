@@ -31,9 +31,30 @@ if not is_cdna4():
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.fp32_output import (
     gluon_mm_bf16_fp32_narrow_gfx950,
+    gluon_mm_bf16_fp32_num_counters_gfx950,
+    gluon_mm_bf16_fp32_serial_gfx950,
     launch_gluon_mm_bf16_fp32_gfx950,
+    launch_gluon_mm_bf16_fp32_serial_gfx950,
+    launch_gluon_mm_bf16_fp32_split_gfx950,
+    serial_projection_tile,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import gluon_mm_a16w16_medium_gfx950
+
+# The Inkling2 projections of half the width: local and full QKV, a separate
+# K or V source's rows of them, router, wo.
+HALF_WIDTH = [
+    (2152, 2304),
+    (2168, 2304),
+    (256, 2304),
+    (264, 2304),
+    (128, 2304),
+    (2304, 768),
+]
+
+
+def split_counters(m, n):
+    """Arrival counters of the program-a-split kernel's 16x64 tiles."""
+    return torch.zeros(-(-m // 16) * -(-n // 64), device="cuda", dtype=torch.int32)
 
 
 def project(a, b, out):
@@ -54,7 +75,10 @@ def project(a, b, out):
     )
 
 
-@pytest.mark.parametrize("n,k", [(8, 4608), (384, 4608), (3792, 4608), (4608, 1536)])
+@pytest.mark.parametrize(
+    "n,k",
+    [(8, 4608), (384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH],
+)
 def test_gfx950_projection_batch_invariance_and_accuracy(n, k):
     torch.manual_seed(8)
     source = torch.randn((1, k), device="cuda", dtype=torch.bfloat16) * 0.3
@@ -62,11 +86,14 @@ def test_gfx950_projection_batch_invariance_and_accuracy(n, k):
     expected = source.double() @ weight.double().T
     first = project(source, weight, None)
     torch.testing.assert_close(first.double(), expected, rtol=2e-6, atol=2e-6)
-    # The shared MFMA kernel specializes runtime scalars by alignment class.
-    for count in (16, 17):
+    # The MFMA kernels specialize runtime scalars by alignment class; the
+    # rows choose among them (serial_projection_tile).
+    for count in (16, 17, 96, 97, 1024, 1025):
         project(source.expand(count, -1).contiguous(), weight, None)
     with assert_no_triton_compile(
-        gluon_mm_bf16_fp32_narrow_gfx950, gluon_mm_a16w16_medium_gfx950
+        gluon_mm_bf16_fp32_narrow_gfx950,
+        gluon_mm_a16w16_medium_gfx950,
+        gluon_mm_bf16_fp32_serial_gfx950,
     ):
         for count in (2, 4, 8, 24, 32, 64, 71, 79, 128, 256, 1287, 1962, 2048):
             inputs = torch.randn((count, k), device="cuda", dtype=torch.bfloat16)
@@ -77,7 +104,10 @@ def test_gfx950_projection_batch_invariance_and_accuracy(n, k):
     assert not torch.equal(first, first.bfloat16().float())
 
 
-@pytest.mark.parametrize("n,k", [(8, 4608), (384, 4608), (3792, 4608), (4608, 1536)])
+@pytest.mark.parametrize(
+    "n,k",
+    [(8, 4608), (384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH],
+)
 @pytest.mark.parametrize("padding,offset", [(3, 0), (4, 1)])
 def test_gfx950_projection_strided_output_graph(n, k, padding, offset):
     torch.manual_seed(11)
@@ -112,6 +142,27 @@ def test_gfx950_projection_strided_output_graph(n, k, padding, offset):
         assert (backing[:, n:] == 12345.0).all()
 
 
+@pytest.mark.parametrize(
+    "n,segments",
+    [
+        (2152, [(768, 1024)]),
+        (2168, [(768, 1024), (2150, 2158)]),
+        (2168, [(1024, 1280), (2158, 2166)]),
+    ],
+)
+@pytest.mark.parametrize("m", [8, 129, 769, 2048])
+def test_gfx950_qkv_rows_project_their_columns_of_the_whole_qkv(n, segments, m):
+    """A K or V source's rows of the QKV weight give the bits of their
+    columns in the whole projection."""
+    torch.manual_seed(m + n)
+    a = torch.randn((m, 2304), device="cuda", dtype=torch.bfloat16) * 0.3
+    b = torch.randn((n, 2304), device="cuda", dtype=torch.bfloat16) * 0.03
+    whole = project(a, b, None)
+    rows = torch.cat([b[start:end] for start, end in segments])
+    expected = torch.cat([whole[:, start:end] for start, end in segments], dim=1)
+    assert torch.equal(project(a, rows, None), expected)
+
+
 @pytest.mark.parametrize("operand", ["a", "b", "out"])
 def test_gfx950_projection_rejects_buffer_offset_wrap(operand):
     a = torch.empty((2, 4608), device="cuda", dtype=torch.bfloat16)
@@ -136,3 +187,46 @@ def test_gfx950_projection_rejects_split_k_offset_overflow():
     counters = torch.empty(0, device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="Unsupported FP32 projection shape"):
         launch_gluon_mm_bf16_fp32_gfx950(a, b, out, counters=counters)
+
+
+@pytest.mark.parametrize(
+    "n,k", [(384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH]
+)
+@pytest.mark.parametrize("tile", [(64, 64), (128, 128)])
+@pytest.mark.parametrize("m", [1, 24, 128, 383, 2048, 4096])
+def test_gfx950_projection_serial_splits_give_the_split_k_bits(n, k, tile, m):
+    """Every K split in one program, added in split order, gives each output
+    the bits of a program a split (FP32 words compared, -0.0 included)."""
+    torch.manual_seed(m + n)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.3
+    # A row of exact -0.0 sums: zero inputs but one tiny negative product.
+    a[m // 2].zero_()
+    a[m // 2, 5] = -1e-30
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.03
+    counters = split_counters(m, n)
+    split = launch_gluon_mm_bf16_fp32_split_gfx950(a, b, None, counters=counters)
+    serial = launch_gluon_mm_bf16_fp32_serial_gfx950(a, b, None, tile=tile)
+    assert torch.equal(serial.view(torch.int32), split.view(torch.int32))
+    assert torch.signbit(serial[m // 2]).any()
+
+
+@pytest.mark.parametrize("n,k", [(384, 4608), (3808, 4608), (4608, 1536)])
+def test_gfx950_projection_serial_kernel_writes_strided_rows(n, k):
+    torch.manual_seed(n)
+    m = 300
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.03
+    backing = torch.full((m, n + 5), 12345.0, device="cuda")
+    out = backing[:, 2 : n + 2]
+    counters = split_counters(m, n)
+    expected = launch_gluon_mm_bf16_fp32_split_gfx950(a, b, None, counters=counters)
+    assert launch_gluon_mm_bf16_fp32_serial_gfx950(a, b, out, tile=(64, 64)) is out
+    assert torch.equal(out, expected)
+    assert (backing[:, :2] == 12345.0).all() and (backing[:, n + 2 :] == 12345.0).all()
+
+
+def test_gfx950_projection_serial_rows_need_no_counters():
+    assert serial_projection_tile(24, 3808, 4608) is None
+    assert gluon_mm_bf16_fp32_num_counters_gfx950(24, 3808, 4608) > 0
+    assert serial_projection_tile(2048, 3808, 4608) == (128, 128)
+    assert gluon_mm_bf16_fp32_num_counters_gfx950(2048, 3808, 4608) == 0

@@ -26,7 +26,12 @@ import re
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4, vmcnt_zero_before_barrier
+from utils import (
+    assert_no_triton_compile,
+    assert_warmup_covers,
+    is_cdna4,
+    vmcnt_zero_before_barrier,
+)
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -40,6 +45,7 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     fp32_router_gemv_with_mm_supported,
     mm,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (  # noqa: E402
     MAX_K,
     MAX_ROWS,
@@ -67,7 +73,7 @@ def _counters(x: torch.Tensor, prepared: torch.Tensor) -> torch.Tensor:
 def _launch(x: torch.Tensor, prepared: torch.Tensor, multiplier: float):
     counters = _counters(x, prepared)
     return launch_gluon_fp32_router_gemv_gfx950(
-        x, prepared, multiplier, counters, False
+        x, prepared, multiplier, counters, False, warm_variants=False
     )
 
 
@@ -201,7 +207,9 @@ def test_splitk_router_matches_fp64_reference_and_top_k(rows: int) -> None:
     weight *= 0.02
     prepared = transpose_fp32_router_weight_gfx950(weight)
     counters = _counters(x, prepared)
-    out = launch_gluon_fp32_router_gemv_gfx950(x, prepared, MULTIPLIER, counters, False)
+    out = launch_gluon_fp32_router_gemv_gfx950(
+        x, prepared, MULTIPLIER, counters, False, warm_variants=False
+    )
     expected = (x.double() @ weight.double()) * MULTIPLIER
     torch.testing.assert_close(
         out.double(), expected, rtol=0, atol=2e-6 * 0.02 * 8192**0.5
@@ -211,7 +219,7 @@ def test_splitk_router_matches_fp64_reference_and_top_k(rows: int) -> None:
     # next call reuses the buffer and sums the same partials bitwise.
     assert not counters.any()
     again = launch_gluon_fp32_router_gemv_gfx950(
-        x, prepared, MULTIPLIER, counters, False
+        x, prepared, MULTIPLIER, counters, False, warm_variants=False
     )
     assert torch.equal(again, out)
 
@@ -226,6 +234,86 @@ def test_splitk_router_compiles_once_per_bucket() -> None:
     with assert_no_triton_compile(gluon_fp32_router_gemv_splitk_gfx950):
         for rows in range(min(SPLITK_ROWS), max(SPLITK_ROWS) + 1):
             _launch(x[:rows].contiguous(), prepared, MULTIPLIER)
+
+
+# The measured split-K table's shape, and one the table does not list (GEMV
+# up to MAX_ROWS, BLAS above).
+@pytest.mark.parametrize("columns", [256, 128])
+def test_startup_warmup_covers_every_row_count(columns: int) -> None:
+    """One warm call compiles every GEMV and split-K variant of its shape, so
+    no row count up to the last split-K bucket compiles afterwards."""
+    hidden = 8192
+    x, weight = _problem(max(SPLITK_ROWS), hidden, columns, 23)
+    prepared = transpose_fp32_router_weight_gfx950(weight)
+    first = x[:1].contiguous()
+
+    def warm() -> None:
+        launch_gluon_fp32_router_gemv_gfx950(
+            first,
+            prepared,
+            MULTIPLIER,
+            _counters(first, prepared),
+            False,
+            warm_variants=True,
+        )
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_gfx950, gluon_fp32_router_gemv_splitk_gfx950),
+        warm,
+        lambda rows: _launch(x[:rows].contiguous(), prepared, MULTIPLIER),
+        range(1, max(SPLITK_ROWS) + 1),
+    )
+
+
+def test_registered_router_warms_its_variants_under_kernel_warmup() -> None:
+    """The registered op passes warm_variants during kernel warmup: one
+    planned call there covers every served row count."""
+    plan = _router_plan()
+    x, weight = _problem(max(SPLITK_ROWS), 8192, 256, 29)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    counters = fp32_router_gemv_counters(256, x.device)
+
+    def execute(rows: int) -> None:
+        fp32_router_gemv_execute(
+            plan, x[:rows].contiguous(), prepared, MULTIPLIER, counters, False
+        )
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            execute(1)
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_gfx950, gluon_fp32_router_gemv_splitk_gfx950),
+        warm,
+        execute,
+        range(1, max(SPLITK_ROWS) + 1),
+    )
+
+
+def test_registered_router_with_mm_warms_every_decode_bucket() -> None:
+    """The router + decode GEMM launch compiles every decode GEMM bucket from
+    one call under kernel warmup."""
+    plan = _router_plan()
+    x, weight = _problem(16, 8192, 256, 31)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
+
+    def run(rows: int) -> None:
+        mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+        mm_out = torch.empty((rows, 512), dtype=torch.bfloat16, device="cuda")
+        router_rows = x[:rows].contiguous()
+        if fp32_router_gemv_with_mm_supported(plan, router_rows, mm_a, mm_b):
+            fp32_router_gemv_execute_with_mm(
+                plan, router_rows, prepared, MULTIPLIER, mm_a, mm_b, mm_out
+            )
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(16)
+
+    assert_warmup_covers(
+        (gluon_fp32_router_gemv_mm_a16w16_gfx950,), warm, run, range(1, 17)
+    )
 
 
 def _compile_splitk(**config):

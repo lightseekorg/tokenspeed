@@ -192,6 +192,10 @@ pub struct EngineLoad {
     pub kv_total_pages: i64,
     /// Resident LCM blocks, including reclaimable prefix-cache entries.
     pub kv_used_pages: i64,
+    /// Prompt plus committed output tokens; absent on older engines.
+    pub num_resident_tokens: Option<i64>,
+    /// Pending uncached prompt work; absent on older engines.
+    pub num_waiting_uncached_tokens: Option<i64>,
     received_at: Option<Instant>,
 }
 
@@ -352,6 +356,8 @@ impl Shared {
                     kv_active_pages: batch.kv_active_pages,
                     kv_total_pages: batch.kv_total_pages,
                     kv_used_pages: batch.kv_used_pages,
+                    num_resident_tokens: batch.num_resident_tokens,
+                    num_waiting_uncached_tokens: batch.num_waiting_uncached_tokens,
                     received_at: Some(Instant::now()),
                 };
             }

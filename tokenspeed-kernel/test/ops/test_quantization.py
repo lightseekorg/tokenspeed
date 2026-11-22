@@ -36,7 +36,11 @@ from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError
-from utils import assert_fp8_same_or_adjacent_at_midpoint, kernel_supported
+from utils import (
+    assert_fp8_same_or_adjacent_at_midpoint,
+    kernel_supported,
+    make_mxfp4_scale_ladder,
+)
 
 _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_FINFO = torch.finfo(_FP8_DTYPE)
@@ -365,6 +369,34 @@ def test_quantize_mxfp4_dynamic_scales(
 
     dequant = _dequantize_mxfp4(out.cpu(), scale.cpu())
     torch.testing.assert_close(dequant, x.cpu().to(torch.float32), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("solution", ["triton"])
+def test_quantize_mxfp4_scale_bytes_for_small_and_large_blocks(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "mxfp4", solution, dtype, "x")
+
+    # Block maxima from 2**-20 to 2**10 plus an all-zero block (byte 0); most
+    # are below 4, where the scale exponent is negative before the bias.
+    x, expected_scale = make_mxfp4_scale_ladder(11, 11, device=device)
+
+    out, scale = quantize_mxfp4(
+        x, scale_size=32, scale_layout="linear", solution=solution
+    )
+    torch.cuda.synchronize()
+
+    assert scale.dtype == torch.uint8
+    assert torch.equal(scale.cpu(), expected_scale)
+
+    # Every value in these blocks is within half a scale unit of an E2M1 code.
+    dequant = _dequantize_mxfp4(out.cpu(), scale.cpu())
+    step = torch.exp2(expected_scale.float() - 127.0).repeat_interleave(32, dim=-1)
+    error = (dequant - x.cpu().float()).abs()
+    assert (error <= 0.5 * step).all()
 
 
 @pytest.mark.parametrize("solution", ["triton"])

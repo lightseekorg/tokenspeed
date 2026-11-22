@@ -26,6 +26,7 @@ from tokenspeed.runtime.configs.deepseek_v41_config import (
     DeepseekV41TextConfig,
 )
 from tokenspeed.runtime.configs.inkling2 import (
+    Inkling2LoopMMConfig,
     Inkling2MMConfig,
     Inkling2ModelConfig,
     Inkling2MTPConfig,
@@ -90,6 +91,7 @@ __all__ = [
     "KimiK3VisionConfig",
     "KimiLinearConfig",
     "InklingAudioConfig",
+    "Inkling2LoopMMConfig",
     "Inkling2MMConfig",
     "Inkling2ModelConfig",
     "Inkling2MTPConfig",

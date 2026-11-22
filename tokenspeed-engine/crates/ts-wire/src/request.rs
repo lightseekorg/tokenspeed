@@ -107,6 +107,8 @@ wire_struct! {
         /// The replica the router expects to hold this prompt's prefix (peer
         /// prefix sharing); a hint the holder confirms.
         pub peer_holder: Option<String> = None,
+        /// Router estimate of additional usable peer tokens beyond the local prefix.
+        pub peer_expected_tokens: Option<u64> = None,
     }
 }
 
@@ -142,6 +144,7 @@ impl TokenizedGenerateReqInput {
             cache_group_id: None,
             shared_prefix_tokens: Vec::new(),
             peer_holder: None,
+            peer_expected_tokens: None,
         }
     }
 }

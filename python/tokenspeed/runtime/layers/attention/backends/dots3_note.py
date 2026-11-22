@@ -91,6 +91,8 @@ class Dots3NoteSWABackend(MLAAttnBackend):
         extend_seq_lens_cpu,
         page_table,
         page_table_cpu,
+        *,
+        extend_with_prefix,
     ):
         # The window's shifted prefix table has no host copy; a sharded cache
         # would need one and refuses None.
@@ -121,6 +123,7 @@ class Dots3NoteSWABackend(MLAAttnBackend):
             extend_seq_lens_cpu,
             prefix_table,
             page_table_cpu=None,
+            extend_with_prefix=extend_with_prefix,
         )
         metadata = self.chunked_prefill_metadata
         lengths = metadata.chunked_seq_len
