@@ -130,8 +130,8 @@ def _is_qwen38_decode_shape(
         and num_experts == 512
         and (
             (num_local_experts == 128 and 1 <= num_tokens <= 32)
-            # TP1 64- to 512-token buckets: skewed decode routes favour tile 32 (README).
-            or (num_local_experts == 512 and 64 <= num_tokens <= 512)
+            # TP1 buckets 128 to 512: skewed decode routes favor tile 32 (README).
+            or (num_local_experts == 512 and 128 <= num_tokens <= 512)
         )
         and hidden_size == 2560
         and intermediate_size == 640

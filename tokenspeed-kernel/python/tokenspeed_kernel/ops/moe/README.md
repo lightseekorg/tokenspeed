@@ -331,7 +331,7 @@ For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with
 TP4/EP4 and top-k 10, the private runner restricts inputs of at most 32 tokens
 to FlashInfer's valid tile-32 tactics. If the native launcher does not offer
 tile 32 for a profile, all native tactics remain available. Other models and
-larger token counts use the full tuner. Only the matching shape gets a separate
+larger TP4 token counts use the full tuner. Only the matching shape gets a separate
 tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
@@ -358,25 +358,29 @@ selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
 implementations.
 
-With TP1 (all 512 experts local), the policy covers the 64- to 512-token
-buckets instead (33 to 512 rows: 9 to 128 requests with four MTP rows each).
-FlashInfer tunes on balanced routes, about 2.5 to 10 tokens per expert there,
-and picks tiles of 8 or 16 tokens. Decode routes are skewed: on routes captured
-from a real-text prefill, a batch of 32 requests x 4 rows reaches only about
-161 of the 512 experts per layer, and a few experts take most of the rows. On
-SM107 with those routes (routing, FC1 and FC2 in a CUDA graph with PDL), the
-tuner's pick vs the tile-32 pick it makes under this policy, us per MoE call:
+With TP1 (all 512 experts local), the policy covers the 128- to 512-token
+buckets instead (65 to 512 rows: 17 to 128 requests with four MTP rows each).
+It keys on the token bucket, so TP1 prefill and extend batches of 65 to 512
+tokens get tile 32 as well. FlashInfer tunes on balanced routes, about 2.5 to
+10 tokens per expert there, and usually picks tiles of 8 or 16 tokens. Decode
+routes are skewed: on routes captured from a real-text prefill, a batch of 32
+requests x 4 rows reaches only about 161 of the 512 experts per layer, and a
+few experts take most of the rows. On SM107 with FlashInfer 0.7.5 and those
+routes (routing, FC1 and FC2 in a CUDA graph with PDL), the tuner's pick vs
+the tile-32 pick it makes under this policy, us per MoE call:
 
 | rows | tuner today | tile 32 |
 |---|---|---|
-| 64 | 44.96 | 43.07 |
-| 128 | 57.54 | 52.19 |
-| 256 | 65.83 | 62.78 |
-| 512 | 88.27 | 77.97 |
+| 128 | 60.16 | 54.26 |
+| 256 | 67.55 | 63.68 |
+| 512 | 84.80 | 75.71 |
 
-At 8 to 32 rows the tuner's tile-8 and tile-16 picks are as fast or faster
-(tile 32: +4% at 8 rows), and at 1024 rows the tuner already picks tile 32, so
-other buckets keep the full tuner.
+On balanced routes tile 32 costs 1.3 to 2.5% per MoE call at 33 to 256 rows.
+The 64-token bucket (33 to 64 rows) keeps the full tuner: tile 32 saved 3% per
+call on the captured routes but nothing in serving at 9 to 16 requests, and
+tile 8 wins at 33 rows. At 8 to 32 rows the tuner's tile-8 and tile-16 picks are
+as fast or faster, and from the next bucket (768) the tuner already picks tile
+32, so other buckets keep the full tuner.
 
 ### Kimi-K3 decode tactic
 
