@@ -500,15 +500,29 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
 class MegaMoECombineKernel(DeviceTemplate):
     kNumSMs, kNumWarps, kThreads, kOutputHandoffGridSyncIndex = 128, 8, 512, 4
 
-    def __init__(self, Config, kReduceRoutes):
-        self._key = (Config.cache_key, kReduceRoutes)
+    def __init__(self, Config, kReduceRoutes, kAddResidual=False):
+        self._key = (Config.cache_key, kReduceRoutes) + (
+            ("residual",) if kAddResidual else ()
+        )
         self.Config, self.Workspace = Config, MegaMoEWorkspace(Config)
+        self.kAddResidual = kAddResidual
         self.Reducer = SourceRouteReducer(
-            Config, self.kNumSMs, self.kThreads, kReduceRoutes
+            Config, self.kNumSMs, self.kThreads, kReduceRoutes, kAddResidual
         )
 
     @device_method
-    def Run(self, out, num_tokens, output_row_stride, base, rank, sm_id, tid):
+    def Run(
+        self,
+        out,
+        num_tokens,
+        output_row_stride,
+        base,
+        rank,
+        sm_id,
+        tid,
+        residual=None,
+        residual_row_stride=0,
+    ):
         """Synchronize stage-two writes across ranks and read local token routes.
 
         Every rank participates in the epoch handoff, even with zero tokens.
@@ -561,7 +575,15 @@ class MegaMoECombineKernel(DeviceTemplate):
             wave_barrier()
         l.barrier()
         self.Reducer.Run(
-            workspace, out, num_tokens, output_row_stride, sm_id, wid, wtid
+            workspace,
+            out,
+            num_tokens,
+            output_row_stride,
+            sm_id,
+            wid,
+            wtid,
+            residual,
+            residual_row_stride,
         )
 
 
@@ -714,6 +736,67 @@ def MegaMoECombine(out, num_tokens, output_row_stride, base, rank, Kernel: l.con
         out,
         num_tokens,
         output_row_stride,
+        base,
+        rank,
+        l.program_id(0).to(l.uint32),
+        tid,
+    )
+
+
+@g.jit
+def _combine_residual(
+    Kernel: l.constexpr,
+    out,
+    num_tokens,
+    output_row_stride,
+    residual,
+    residual_row_stride,
+    base,
+    rank,
+    sm_id,
+    tid,
+):
+    Kernel.Run(
+        out,
+        num_tokens,
+        output_row_stride,
+        base,
+        rank,
+        sm_id,
+        tid,
+        residual,
+        residual_row_stride,
+    )
+
+
+@g.jit
+def MegaMoECombineResidual(
+    out,
+    num_tokens,
+    output_row_stride,
+    residual,
+    residual_row_stride,
+    base,
+    rank,
+    Kernel: l.constexpr,
+):
+    """MegaMoECombine with C3's post add folded in (TOKENSPEED_PETIT_FUSE_POST).
+
+    As MegaMoECombine with reduced routes, but each token's FP32 sum starts
+    from its BF16 ``residual`` row (``residual_row_stride`` elements apart;
+    it may alias ``out``), so ``out = bf16(((s + r0) + r1) + ...)``.
+    Kernel must be built with kAddResidual.
+    """
+    tid = l.arange(
+        0, Kernel.kThreads, layout=l.BlockedLayout([1], [64], [Kernel.kNumWarps], [0])
+    ).to(l.uint32)
+    _combine_residual(
+        Kernel,
+        out,
+        num_tokens,
+        output_row_stride,
+        residual,
+        residual_row_stride,
         base,
         rank,
         l.program_id(0).to(l.uint32),

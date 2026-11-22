@@ -166,6 +166,8 @@ def MegaMoe(
     input_topk_weights=None,
     compile_only=False,
     stage1_n128=None,
+    residual=None,
+    residual_ready=None,
 ):
     """Launch MegaMoE; return reduced rows or, without reduction, the routes.
 
@@ -174,7 +176,10 @@ def MegaMoe(
     checks run and the kernels this launch needs are compiled, but nothing is
     launched (no collective) and ``out`` is left unwritten. ``stage1_n128``
     (C5's received-experts selector) is the call-wide stage-1 tile choice;
-    None keeps the per-rank row rule.
+    None keeps the per-rank row rule. ``residual`` (C3, reduced rows only)
+    is a BF16 ``[num_tokens, hidden_size]`` row block (unit column stride; it
+    may alias ``out``) the combine adds before rounding; ``residual_ready``
+    is an event the combine waits for first.
     """
     info = LookupSolution(heap, solution_id)
     device = heap.device_index
@@ -263,6 +268,23 @@ def MegaMoe(
                 input_topk_weights.shape == input_topk_ids.shape,
                 "input_topk_weights must match input_topk_ids",
             )
+        residual_kw = {}
+        if residual is not None:
+            CheckTensor(residual, torch.bfloat16, device, "residual")
+            _check(reduce_routes, "residual needs reduced routes")
+            _check(
+                residual.ndim == 2
+                and residual.shape[0] == num_tokens
+                and residual.shape[1] in (info.hidden_size, info.compute_hidden_size)
+                and residual.stride(1) == 1
+                and residual.stride(0) >= info.hidden_size,
+                "residual must be [num_tokens, hidden_size] rows with unit column stride",
+            )
+            residual_kw = dict(
+                residual=residual,
+                residual_row_stride=residual.stride(0),
+                residual_ready=residual_ready,
+            )
         params = MegaMoEParams(
             out,
             # Elements between consecutive token or route rows.
@@ -284,6 +306,7 @@ def MegaMoe(
             reduce_routes,
             torch.cuda.current_stream(device),
             stage1_n128,
+            **residual_kw,
         )
         CheckKernelStatus(MegaMoECompute(params, solution_id, compile_only), "MegaMoE")
     return out

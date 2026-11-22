@@ -599,7 +599,17 @@ class MegaMoeConfig:
         out: torch.Tensor | None = None,
         inputs: MegaMoeInputViews | None = None,
         stage1_n128: bool | None = None,
+        residual: torch.Tensor | None = None,
+        residual_ready: object = None,
     ) -> torch.Tensor:
+        """``residual`` (C3, TOKENSPEED_PETIT_FUSE_POST): BF16 rows the
+        combine adds before its one rounding (may alias ``out``);
+        ``residual_ready``: an event the combine waits for first."""
+        residual_kw = (
+            {}
+            if residual is None
+            else {"residual": residual, "residual_ready": residual_ready}
+        )
         return self._launch(
             heap,
             w13,
@@ -613,6 +623,7 @@ class MegaMoeConfig:
             out=out,
             inputs=inputs,
             stage1_n128=stage1_n128,
+            **residual_kw,
         )
 
     def run_routes(
@@ -665,6 +676,7 @@ class MegaMoeConfig:
         inputs: MegaMoeInputViews | None,
         compile_only: bool = False,
         stage1_n128: bool | None = None,
+        **residual_kw,
     ) -> torch.Tensor:
         num_tokens = int(num_tokens)
         if num_tokens < 0 or num_tokens > self.max_tokens_per_rank:
@@ -718,4 +730,5 @@ class MegaMoeConfig:
             input_topk_weights,
             compile_only=compile_only,
             stage1_n128=stage1_n128,
+            **residual_kw,
         )

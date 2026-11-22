@@ -10,6 +10,7 @@ from lib.gemm.rocm.intrinsics import (
     lds_load,
 )
 from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
+from lib.moe.rocm.memory_ops import MakeBufferResource
 from lib.moe.rocm.ops.op_stages import TwoStageStage2Epilogue
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.tensor_ops import load_words, store_vector4
@@ -94,9 +95,18 @@ class SourceRouteReducer(DeviceTemplate):
     ``[topk, hidden]`` rows.
     """
 
-    def __init__(self, Config, kGridBlocks, kBlockThreads, kReduceRoutes):
-        self._key = (Config.cache_key, kGridBlocks, kBlockThreads, kReduceRoutes)
+    def __init__(
+        self, Config, kGridBlocks, kBlockThreads, kReduceRoutes, kAddResidual=False
+    ):
+        self._key = (Config.cache_key, kGridBlocks, kBlockThreads, kReduceRoutes) + (
+            ("residual",) if kAddResidual else ()
+        )
         self.kReduceRoutes = kReduceRoutes
+        # C3 (TOKENSPEED_PETIT_FUSE_POST): the FP32 sum starts from a BF16
+        # residual row (the shared expert's output), so the model's post add
+        # is folded into this write: bf16(((s + r0) + r1) + ... + r[k-1]).
+        self.kAddResidual = kAddResidual
+        assert kReduceRoutes or not kAddResidual
         self.Workspace = MegaMoEWorkspace(Config)
         self.kNumRanks = Config.kNumRanks
         self.kNumSMs = Config.kNumSMs if kGridBlocks is None else kGridBlocks
@@ -114,9 +124,27 @@ class SourceRouteReducer(DeviceTemplate):
         )
 
     @device_method
-    def Run(self, workspace, output, num_tokens, output_row_stride, sm_id, wid, wtid):
+    def Run(
+        self,
+        workspace,
+        output,
+        num_tokens,
+        output_row_stride,
+        sm_id,
+        wid,
+        wtid,
+        residual=None,
+        residual_row_stride=0,
+    ):
         num_tokens = (l.full((), 0, l.uint32) + num_tokens).to(l.uint32)
         output_row_stride = (l.full((), 0, l.uint32) + output_row_stride).to(l.uint32)
+        if self.kAddResidual:
+            residual_row_stride = (l.full((), 0, l.uint32) + residual_row_stride).to(
+                l.uint32
+            )
+            residual_br = MakeBufferResource(
+                residual, num_tokens * residual_row_stride * 2
+            )
         kWarpsPerBlock: l.constexpr = self.kThreads // 64
         kTotalWaves: l.constexpr = self.kNumSMs * kWarpsPerBlock
         kPackedElements: l.constexpr = self.kElementsPerVec // 2
@@ -172,6 +200,24 @@ class SourceRouteReducer(DeviceTemplate):
                 if self.kReduceRoutes:
                     zero = l.full((), 0.0, l.float32)
                     accum = ((zero, zero),) * kPackedElements
+                    if self.kAddResidual:
+                        residual_words = load_words(
+                            residual_br,
+                            col_offset,
+                            amdgcn_readfirstlane(token * residual_row_stride * 2),
+                            4,
+                            BufferResource.kNone,
+                            valid,
+                        )
+                        accum = ()
+                        for pair in l.static_range(kPackedElements):
+                            word = residual_words[pair]
+                            accum += (
+                                (
+                                    (word << 16).to(l.float32, bitcast=True),
+                                    (word & 0xFFFF0000).to(l.float32, bitcast=True),
+                                ),
+                            )
                     for topk in l.static_range(self.kTopK):
                         for pair in l.static_range(kPackedElements):
                             word = route_values[topk][pair]

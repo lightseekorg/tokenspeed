@@ -312,6 +312,7 @@ class TestDeepseekV4Config:
 
         moe = SimpleNamespace(
             use_mega_moe=False,
+            use_gluon_petit=False,
             n_shared_experts=1,
             shared_experts=shared_experts,
             stream_fork=stream_fork,
@@ -601,6 +602,56 @@ class TestDeepseekV4Config:
         assert actual.shape == hidden_states.shape
         assert actual.is_contiguous()
         torch.testing.assert_close(actual, hidden_states * 2, atol=0, rtol=0)
+
+    def test_deepseek_v4_moe_petit_fuse_post_folds_the_shared_add(self):
+        """C3 (TOKENSPEED_PETIT_FUSE_POST), DP4: the shared expert is issued
+        first and passed to Petit's combine as the residual, writing out;
+        no torch.add. Off: the old routed + shared add."""
+        from tokenspeed_kernel.ops.moe import gluon as petit
+
+        hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)
+        input_ids = torch.arange(2)
+        calls = []
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states, input_ids, StreamFork(None), calls, norm_topk_prob=True
+        )
+        moe.use_gluon_petit = True
+        moe._forward_petit_fused_post = MethodType(
+            DeepseekV4MoE._forward_petit_fused_post, moe
+        )
+        seen = []
+
+        def experts(**kwargs):
+            calls.append("routed")
+            routed = (hidden_states + 1) * 2
+            if not petit._PETIT_COMBINE_POST:
+                return routed
+            residual, out, ready = petit._PETIT_COMBINE_POST[-1]
+            seen.append((residual, out, ready))
+            target = out if out is not None else torch.empty_like(routed)
+            return target.copy_(routed + residual)
+
+        moe.experts = Mock(side_effect=experts)
+        moe.experts.supports_deferred_cuda_finalize = False
+        out = torch.empty_like(hidden_states)
+        with patch.object(deepseek_v4_model, "_PETIT_FUSE_POST", True), patch.object(
+            torch, "add", side_effect=AssertionError("post add not folded")
+        ):
+            actual = moe.forward_normal(hidden_states, input_ids, 2, 2, out=out)
+        assert actual is out and len(seen) == 1
+        residual, target, ready = seen[0]
+        torch.testing.assert_close(residual, hidden_states + 3, atol=0, rtol=0)
+        assert target is out and ready is None  # no aux stream outside capture
+        assert calls.index("shared") < calls.index("routed")
+        torch.testing.assert_close(
+            actual, (hidden_states + 1) * 2 + hidden_states + 3, atol=0, rtol=0
+        )
+        assert not petit._PETIT_COMBINE_POST
+        calls.clear()
+        with patch.object(deepseek_v4_model, "_PETIT_FUSE_POST", False):
+            off = moe.forward_normal(hidden_states, input_ids, 2, 2)
+        assert len(seen) == 1 and calls.index("routed") < calls.index("shared")
+        torch.testing.assert_close(off, actual, atol=0, rtol=0)
 
     def test_deepseek_v4_moe_keeps_finalize_for_unsupported_consumer(self):
         hidden_states = torch.ones(2, 3, dtype=torch.bfloat16)

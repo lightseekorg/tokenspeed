@@ -17,6 +17,7 @@ from lib.moe.rocm.fused_moe import (
 from lib.moe.rocm.mega_moe.mega_moe_two_stage_kernel import (
     MegaMoECombine,
     MegaMoECombineKernel,
+    MegaMoECombineResidual,
     MegaMoEStage1,
     MegaMoEStage2,
     MegaMoETwoStageCommComputeKernel,
@@ -168,6 +169,13 @@ class MegaMoEParams:
     # C5 tile chosen by the caller for the whole call (received-experts
     # selector); None keeps the per-rank row rule.
     stage1_n128: object = None
+    # C3 (TOKENSPEED_PETIT_FUSE_POST): a BF16 [num_tokens, hidden] row block
+    # the combine adds before its one rounding (may alias out), its row
+    # stride in elements, and an event the combine waits for (the shared
+    # expert's aux-stream completion) or None.
+    residual: object = None
+    residual_row_stride: int = 0
+    residual_ready: object = None
 
 
 @dataclass(frozen=True)
@@ -263,7 +271,16 @@ class MegaMoESolutionAdapter:
         self.Workspace = MegaMoEWorkspace(self.Config)
 
     @cache
-    def Kernels(self, external, m64, w8, reduce_routes, n128=False, stage2_n128=False):
+    def Kernels(
+        self,
+        external,
+        m64,
+        w8,
+        reduce_routes,
+        n128=False,
+        stage2_n128=False,
+        add_residual=False,
+    ):
         Config = self.Config
         Stage2 = MegaMoEStage2N128Config(Config) if stage2_n128 else Config
         SelectedStage1 = (
@@ -278,7 +295,11 @@ class MegaMoESolutionAdapter:
         return (
             MegaMoETwoStageCommComputeKernel(SelectedStage1, external),
             MegaMoETwoStageCommComputeKernel(Stage2, external),
-            MegaMoECombineKernel(Config, reduce_routes),
+            (
+                MegaMoECombineKernel(Config, reduce_routes, True)
+                if add_residual
+                else MegaMoECombineKernel(Config, reduce_routes)
+            ),
         )
 
     def Stage1Tile(self, num_tokens):
@@ -383,6 +404,12 @@ class MegaMoESolutionAdapter:
         # C5b: only with the switch on does the call name stage2_n128, so off
         # keeps the old Kernels cache entries and kernels.
         stage2_kw = {"stage2_n128": True} if self.Stage2N128() else {}
+        if p.residual is not None:
+            # C3: only reduced rows take a residual; the stage kernels are
+            # the same, the combine is its residual variant.
+            if not p.reduce_routes or p.residual_row_stride <= 0:
+                return kFusedMoEErrorInvalidArgument
+            stage2_kw["add_residual"] = True
         if self.SelectStage1N128(p.num_tokens, p.stage1_n128):
             stage1, _, _ = self.Kernels(
                 external_input_count == 3, m64, w8, p.reduce_routes, n128=True
@@ -433,17 +460,37 @@ class MegaMoESolutionAdapter:
                 enable_fp_fusion=False,
                 **Grid((stage2.kStage2GridBlocks,)),
             )
-            Launch(MegaMoECombine, (combine.kNumSMs,))(
-                p.out,
-                p.num_tokens,
-                p.output_row_stride,
-                p.workspace,
-                p.rank,
-                combine,
-                num_warps=combine.kNumWarps,
-                enable_fp_fusion=False,
-                **Grid((combine.kNumSMs,)),
-            )
+            if p.residual is None:
+                Launch(MegaMoECombine, (combine.kNumSMs,))(
+                    p.out,
+                    p.num_tokens,
+                    p.output_row_stride,
+                    p.workspace,
+                    p.rank,
+                    combine,
+                    num_warps=combine.kNumWarps,
+                    enable_fp_fusion=False,
+                    **Grid((combine.kNumSMs,)),
+                )
+            else:
+                assert combine.kAddResidual
+                if p.residual_ready is not None and not compile_only:
+                    # The shared expert runs on the aux stream: its rows
+                    # must be complete before the combine reads them.
+                    torch.cuda.current_stream().wait_event(p.residual_ready)
+                Launch(MegaMoECombineResidual, (combine.kNumSMs,))(
+                    p.out,
+                    p.num_tokens,
+                    p.output_row_stride,
+                    p.residual,
+                    p.residual_row_stride,
+                    p.workspace,
+                    p.rank,
+                    combine,
+                    num_warps=combine.kNumWarps,
+                    enable_fp_fusion=False,
+                    **Grid((combine.kNumSMs,)),
+                )
         return 0
 
 

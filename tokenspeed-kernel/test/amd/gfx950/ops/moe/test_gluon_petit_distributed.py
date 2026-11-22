@@ -871,6 +871,117 @@ def test_distributed_petit_stage1_n128_bit_exact(profile_name):
     reason="requires torchrun with four gfx950 GPUs",
 )
 @pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
+def test_distributed_petit_fuse_post_combine(profile_name):
+    """C3 (TOKENSPEED_PETIT_FUSE_POST): the combine adds a residual row.
+
+    A zero residual is bit-exact against the plain combine (eager and graph
+    replay); a residual s in a separate tensor, aliased with out (the
+    tp4ep4 in-place form) and produced on a side stream behind the ready
+    event all agree bit for bit with each other and stay within the
+    rounding bound of the old bf16(bf16(sum r) + s) (test_gluon_petit.py
+    _fuse_post_bound: 2^-8 |sum r| + 2^-7 max(|old|, |new|)).
+    """
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    profile = _PROFILES[profile_name]
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
+    kernel_moe_process_weights(plan, layer)
+    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+
+    def call(x, ids, weights, counts):
+        return kernel_moe_apply(
+            plan,
+            x,
+            layer,
+            x.new_empty((x.shape[0], 0)),
+            topk_weights=weights,
+            topk_ids=ids,
+            num_tokens_global=sum(counts),
+            max_num_tokens_per_gpu=max(counts),
+            do_finalize=True,
+            low_latency=None,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+
+    for counts in ([0] * ws, [2, 2, 2, 0], [6, 0, 0, 0], [24, 0, 0, 0], [6] * ws):
+        count = counts[rank]
+        values = torch.arange(count * profile.hidden, device=device)
+        x = (
+            ((((values * 13 + rank * 7) % 127) - 63).float() * input_scale)
+            .reshape(count, profile.hidden)
+            .to(torch.bfloat16)
+        )
+        ids, weights = _routing(count, rank, profile, ws, device)
+        gen = torch.Generator(device=device).manual_seed(1234 + rank)
+        shared = (
+            torch.randn((count, profile.hidden), generator=gen, device=device) * 0.5
+        ).to(torch.bfloat16)
+        plain = call(x, ids, weights, counts).clone()
+        with petit.petit_combine_post(torch.zeros_like(shared)):
+            zero = call(x, ids, weights, counts).clone()
+        with petit.petit_combine_post(shared):
+            fused = call(x, ids, weights, counts).clone()
+        inplace = shared.clone()
+        with petit.petit_combine_post(inplace, out=inplace):
+            call(x, ids, weights, counts)
+        # Residual produced on a side stream; the combine waits for its event.
+        side, ready = torch.cuda.Stream(device), torch.cuda.Event()
+        side.wait_stream(torch.cuda.current_stream())
+        late = torch.empty_like(shared)
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(2_000_000)
+            late.copy_(shared)
+            ready.record(side)
+        with petit.petit_combine_post(late, ready=ready):
+            waited = call(x, ids, weights, counts).clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph_shared = shared.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with petit.petit_combine_post(graph_shared):
+                captured = call(x, ids, weights, counts)
+        graph.replay()
+        replay = captured.clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+        del graph
+
+        def check():
+            torch.testing.assert_close(zero, plain, atol=0, rtol=0)
+            torch.testing.assert_close(inplace, fused, atol=0, rtol=0)
+            torch.testing.assert_close(waited, fused, atol=0, rtol=0)
+            torch.testing.assert_close(replay, fused, atol=0, rtol=0)
+            old = torch.add(plain, shared).float()
+            new = fused.float()
+            bound = (
+                plain.float().abs() * 2.0**-8
+                + torch.maximum(old.abs(), new.abs()) * 2.0**-7
+                + 2.0**-120
+            )
+            assert bool(((old - new).abs() <= bound).all())
+
+        _collective_check(device, check)
+        dist.barrier()
+
+
+@pytest.mark.skipif(
+    _WORLD_SIZE != 4 or not is_cdna4(),
+    reason="requires torchrun with four gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", ("dsv41_flash", "dsv41_flash_dspark"))
 def test_distributed_petit_stage2_n128_bit_exact(profile_name):
     """C5b (TOKENSPEED_PETIT_STAGE2_N128): the 32x128 stage-2 tile.
 

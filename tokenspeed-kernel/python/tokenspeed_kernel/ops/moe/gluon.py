@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import os
@@ -3601,6 +3602,28 @@ def _compile_variants(
 # for ids that are not int32 or weights that are not FP32. Off keeps the copies.
 _PETIT_FUSE_PREP = os.environ.get("TOKENSPEED_PETIT_FUSE_PREP", "0") == "1"
 
+# C3 (opt-in: TOKENSPEED_PETIT_FUSE_POST=1 in the DeepSeek V4.1 MoE): the
+# model's post add (DP4: routed + shared; tp4ep4-petit: the routed rows added
+# into the shared partial) is folded into Petit's combine, which starts each
+# row's FP32 sum from the residual row: bf16(((s + r0) + ...) + r[k-1])
+# instead of bf16(fp32(bf16(r0 + ... + r[k-1])) + s). Not bit-exact; gate on
+# GSM8K agreement (eval_agreement.py) before serving a result. Empty (no
+# scope open) keeps the old call.
+_PETIT_COMBINE_POST: list = []
+
+
+@contextlib.contextmanager
+def petit_combine_post(residual, out=None, ready=None):
+    """C3: Petit calls with reduced rows inside this scope write
+    ``out = bf16(residual + routes)`` from the combine (``out`` None: a new
+    tensor; it may alias ``residual``), the combine first waiting for the
+    ``ready`` event (the shared expert's aux-stream completion)."""
+    _PETIT_COMBINE_POST.append((residual, out, ready))
+    try:
+        yield
+    finally:
+        _PETIT_COMBINE_POST.pop()
+
 
 def _routing_input(source: torch.Tensor, dtype: torch.dtype, shape) -> torch.Tensor:
     """``source`` itself when Petit can read it in place, else one cast copy.
@@ -3860,7 +3883,13 @@ def gluon_petit_mxfp4_megamoe_apply(
             stage1_n128=stage1_n128,
         )
         return routes, topk_weights, None
-    output = x.new_empty((num_tokens, profile.model_dim))
+    post = {}
+    if _PETIT_COMBINE_POST:
+        residual, out, ready = _PETIT_COMBINE_POST[-1]
+        post = {"residual": residual, "residual_ready": ready}
+        output = x.new_empty((num_tokens, profile.model_dim)) if out is None else out
+    else:
+        output = x.new_empty((num_tokens, profile.model_dim))
     return workspace.config.run(
         workspace.heap,
         state.w13_weight,
@@ -3873,6 +3902,7 @@ def gluon_petit_mxfp4_megamoe_apply(
         out=output,
         inputs=inputs,
         stage1_n128=stage1_n128,
+        **post,
     )
 
 

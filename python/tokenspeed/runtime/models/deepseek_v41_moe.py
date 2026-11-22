@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 
 import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
@@ -78,6 +79,13 @@ def _random_expert_ids(
         param.shape[0], num_experts, generator=generator, device=param.device
     )
     param.data.copy_(scores.topk(param.shape[1], dim=1).indices)
+
+
+# C3 (opt-in, read once at import): fold the post add into Petit's combine
+# (gluon.petit_combine_post). Not bit-exact: bf16(((s + r0) + ...) + r5)
+# instead of bf16(fp32(bf16(r0 + ... + r5)) + s); gate on GSM8K agreement.
+# Off keeps every path below unchanged.
+_PETIT_FUSE_POST = os.environ.get("TOKENSPEED_PETIT_FUSE_POST", "0") == "1"
 
 
 class DeepseekV4MoEGate(nn.Module):
@@ -591,6 +599,20 @@ class DeepseekV4MoE(nn.Module):
             hidden_states.dtype == torch.bfloat16
             and self.experts.supports_deferred_cuda_finalize
         )
+        if (
+            _PETIT_FUSE_POST
+            and self.use_gluon_petit
+            and not deferred_finalize
+            and self.shared_experts is not None
+            and hidden_states.shape[0] > 0
+        ):
+            return self._forward_petit_fused_post(
+                hidden_states,
+                topk_output,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                out,
+            )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
@@ -619,6 +641,36 @@ class DeepseekV4MoE(nn.Module):
         if shared is None:
             return routed if out is None else out.copy_(routed)
         return torch.add(routed, shared, out=out)
+
+    def _forward_petit_fused_post(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """C3 (TOKENSPEED_PETIT_FUSE_POST), DP4: routed + shared in Petit's combine.
+
+        The shared expert is issued first (on the aux stream when capturing)
+        and the combine waits for it, then writes
+        ``bf16(((shared + r0) + ...) + r5)`` into ``out``: no ``torch.add``.
+        """
+        from tokenspeed_kernel.ops.moe.gluon import petit_combine_post
+
+        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            with fork.branch():
+                shared = self._forward_shared_experts(hidden_states)
+            ready = fork.join_event if getattr(fork, "_active", False) else None
+            with petit_combine_post(shared, out=out, ready=ready):
+                with nvtx_range("moe_experts"):
+                    return self._forward_routed_experts(
+                        hidden_states,
+                        topk_output,
+                        num_global_tokens,
+                        max_num_tokens_per_gpu,
+                        do_finalize=True,
+                    )
 
     def forward(
         self,

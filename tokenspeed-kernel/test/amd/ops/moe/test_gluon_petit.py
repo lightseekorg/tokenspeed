@@ -1415,3 +1415,134 @@ def test_apply_passes_call_wide_stage1_tile(selected, do_finalize) -> None:
     config.stage1_n128_for_global_rows.assert_called_once_with(7)
     launch = config.run if do_finalize else config.run_routes
     assert launch.call_args.kwargs["stage1_n128"] is selected
+
+
+def _fuse_post_bound(old, new, routed):
+    """C3's rounding bound. Old: bf16(fp32(bf16(A)) + s), A the FP32 route
+    sum; new: bf16(fl(((s + r0) + ...) + r5)). With bf16 half-ulp u = 2^-9:
+    |bf16(A) - A| <= u|A|, each final rounding <= u|A + s|, and the two FP32
+    orders differ by <= 6 * 2^-24 * (|s| + sum |r|), far below u. So
+    |old - new| <= u|A| + 2u|A + s| (+ FP32 noise); the check doubles it:
+    2^-8 |A| + 2^-7 max(|old|, |new|) + 2^-120."""
+    old, new, routed = old.float(), new.float(), routed.float()
+    return (old - new).abs() <= (
+        routed.abs() * 2.0**-8
+        + torch.maximum(old.abs(), new.abs()) * 2.0**-7
+        + 2.0**-120
+    )
+
+
+def test_fuse_post_rounding_bound_on_cpu() -> None:
+    """C3 changes the rounding of the DP4 post add; emulate both orders in
+    PyTorch (FP32 adds round to nearest even like v_pk_add_f32) and check
+    the stated bound, that the change is not bit-exact, and that a zero
+    residual is bit-exact (the residual load adds an exact 0)."""
+    gen = torch.Generator().manual_seed(0)
+    routes = (torch.randn((64, 6, 512), generator=gen) * 0.05).to(torch.bfloat16)
+    shared = (torch.randn((64, 512), generator=gen) * 0.5).to(torch.bfloat16)
+
+    def fused(s):
+        acc = s.float()
+        for k in range(routes.shape[1]):
+            acc = acc + routes[:, k].float()
+        return acc.to(torch.bfloat16)
+
+    acc = torch.zeros((64, 512))
+    for k in range(routes.shape[1]):
+        acc = acc + routes[:, k].float()
+    routed = acc.to(torch.bfloat16)
+    old = torch.add(routed, shared)
+    new = fused(shared)
+    assert bool(_fuse_post_bound(old, new, acc).all())
+    assert not torch.equal(old, new)  # not bit-exact: needs the GSM8K gate
+    assert torch.equal(fused(torch.zeros_like(shared)), routed)
+
+
+def test_fuse_post_combine_variant_and_apply_plumbing() -> None:
+    """C3: the residual combine is its own kernel (the off path keeps the old
+    cache keys); inside petit_combine_post the apply passes residual, ready
+    and out to run(); outside it passes neither."""
+    import sys
+
+    petit_kernel = _import_petit_kernel()
+    import lib.moe.rocm.mega_moe as forwarding
+    from tokenspeed_kernel.ops.moe import gluon as petit
+
+    module = sys.modules[forwarding.MegaMoESolutionAdapter.__module__]
+    config = _megamoe_config(petit_kernel, _DSV41_FLASH_PROFILE, 4, 1024)
+    adapter = module._MegaMoESolution(config._solution_id_for_tokens(1))
+    b1, b2, b_combine = adapter.Kernels(True, False, False, True)
+    r1, r2, r_combine = adapter.Kernels(True, False, False, True, add_residual=True)
+    assert r1.cache_key == b1.cache_key and r2.cache_key == b2.cache_key
+    assert r_combine.kAddResidual and not b_combine.kAddResidual
+    assert r_combine.cache_key != b_combine.cache_key
+    assert r_combine.Reducer.kAddResidual and r_combine.Reducer.kReduceRoutes
+    from lib.moe.rocm.ops.mega_moe.route_output import SourceRouteReducer
+
+    with pytest.raises(AssertionError):  # a residual needs reduced routes
+        SourceRouteReducer(adapter.Config, 128, 512, False, True)
+
+    profile = _Profile(
+        name="test",
+        num_experts=8,
+        top_k=2,
+        model_dim=64,
+        logical_intermediate=32,
+        inter_dim=32,
+        has_bias=False,
+        activation="silu",
+    )
+    heap = SimpleNamespace(
+        tokens=torch.empty((4, 32), dtype=torch.uint8),
+        scales=torch.empty((4, 2), dtype=torch.uint8),
+        expert_ids=torch.empty((4, 2), dtype=torch.int32),
+        expert_weights=torch.empty((4, 2), dtype=torch.float32),
+    )
+    run_config = mock.Mock()
+    run_config.run.side_effect = lambda *args, **kwargs: kwargs["out"]
+    run_config.stage1_n128_for_global_rows.return_value = None
+    workspace = SimpleNamespace(config=run_config, heap=object(), inputs=heap)
+    layer = SimpleNamespace(
+        _moe_backend_state=_GluonPetitState(
+            profile=profile,
+            w13_weight=torch.empty(0),
+            w2_weight=torch.empty(0),
+            w13_scale=torch.empty(0),
+            w2_scale=torch.empty(0),
+            w13_bias=None,
+            w2_bias=None,
+        )
+    )
+    x = torch.zeros((1, profile.model_dim), dtype=torch.bfloat16)
+
+    def apply():
+        return petit.gluon_petit_mxfp4_megamoe_apply(
+            plan={},
+            x=x,
+            w=layer,
+            router_logits=torch.empty((1, 0), dtype=torch.bfloat16),
+            topk_weights=torch.ones((1, 2), dtype=torch.float32),
+            topk_ids=torch.zeros((1, 2), dtype=torch.int32),
+            num_tokens_global=1,
+            max_num_tokens_per_gpu=1,
+            do_finalize=True,
+            enable_pdl=False,
+            low_latency=None,
+            overlap_fn=None,
+        )
+
+    with mock.patch(
+        "tokenspeed_kernel.ops.moe.gluon._get_workspace", return_value=workspace
+    ):
+        apply()
+        kwargs = run_config.run.call_args.kwargs
+        assert "residual" not in kwargs and "residual_ready" not in kwargs
+        residual = torch.ones((1, profile.model_dim), dtype=torch.bfloat16)
+        target = torch.empty_like(residual)
+        ready = object()
+        with petit.petit_combine_post(residual, out=target, ready=ready):
+            got = apply()
+        kwargs = run_config.run.call_args.kwargs
+        assert kwargs["residual"] is residual and kwargs["residual_ready"] is ready
+        assert got is target and kwargs["out"] is target
+        assert not petit._PETIT_COMBINE_POST  # the scope is popped
