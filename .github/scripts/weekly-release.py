@@ -46,15 +46,17 @@ from packaging.version import Version
 REPO = "lightseekorg/tokenspeed"
 WHL = "lightseekorg/whl"
 IDENTITY = "243258330+lightseek-bot@users.noreply.github.com"
-STAGES = ("plan", "amd", "kernel", "tokenspeed", "index", "docker", "release")
+STAGES = ("plan", "amd", "kernel", "engine", "tokenspeed", "index", "docker", "release")
 SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish")
 MLA_STAGES = ("mla-version", "mla-publish", "mla-dependency")
 PACKAGES = {
     "amd": "tokenspeed-kernel-amd",
     "kernel": "tokenspeed-kernel",
+    "engine": "tokenspeed-engine",
     "tokenspeed": "tokenspeed",
 }
 PROJECTS = {
+    "tokenspeed-engine": "tokenspeed-engine/pyproject.toml",
     "tokenspeed-mla": "tokenspeed-mla/pyproject.toml",
     "tokenspeed-scheduler": "tokenspeed-scheduler/pyproject.toml",
     "tokenspeed-kernel-amd": "tokenspeed-kernel-amd/pyproject.toml",
@@ -62,6 +64,7 @@ PROJECTS = {
 }
 PR_FILES = {
     "amd": [PROJECTS[PACKAGES["amd"]]],
+    "engine": [PROJECTS[PACKAGES["engine"]]],
     "kernel": [
         "tokenspeed-kernel/python/setup.py",
         "tokenspeed-kernel/python/requirements/rocm-thirdparty.txt",
@@ -175,6 +178,7 @@ def latest_version(package):
         and any(not f["yanked"] for f in files)
         and not Version(v).is_prerelease
         and not Version(v).is_devrelease
+        and not Version(v).is_postrelease
     ]
     return str(max(versions))
 
@@ -336,7 +340,7 @@ def update_metadata(stage, versions):
         raise RuntimeError(
             "Main has moved past the reserved version; manual intervention required"
         )
-    if stage in ("amd", "tokenspeed"):
+    if stage in ("amd", "engine", "tokenspeed"):
         replace(
             PROJECTS[PACKAGES[stage]], r'^version = "[^"]+"$', f'version = "{version}"'
         )
@@ -360,6 +364,25 @@ def update_metadata(stage, versions):
             r'"tokenspeed-kernel>=[^"]+"',
             f'"tokenspeed-kernel>={versions["tokenspeed-kernel"]}.dev0"',
         )
+
+        replace(
+            PROJECTS["tokenspeed"],
+            r'"tokenspeed-engine[^"]+"',
+            f'"tokenspeed-engine=={versions["tokenspeed-engine"]}"',
+        )
+
+
+def verify_stable_engine():
+    """Require a published stable engine matching the runtime's source and pin."""
+    version = read_version("tokenspeed-engine")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise RuntimeError("TokenSpeed requires a stable engine version")
+    dependency = requirements(PROJECTS["tokenspeed"])["tokenspeed-engine"]
+    if str(dependency.specifier) != f"=={version}":
+        raise RuntimeError(f"TokenSpeed must pin tokenspeed-engine=={version}")
+    sha = source_sha("tokenspeed-engine", version, "release-tokenspeed-engine.yml")
+    check_tree(sha, "tokenspeed-engine")
+    return version
 
 
 def version_pr_ready(pr):
@@ -611,7 +634,9 @@ class Release:
         ci = self.state.get("main_ci", {})
         if not ci.get("validated"):
             raise RuntimeError("Version merging requires successful main CI")
-        previous = {"kernel": "amd", "tokenspeed": "kernel"}.get(stage)
+        previous = {"kernel": "amd", "engine": "kernel", "tokenspeed": "engine"}.get(
+            stage
+        )
         return self.state["stages"][previous]["sha"] if previous else ci["sha"]
 
     def update_metadata(self, stage):
@@ -1049,8 +1074,10 @@ class Release:
         self.gate()
         if stage == "kernel":
             check_tree(self.state["stages"]["amd"]["sha"], "tokenspeed-kernel-amd")
-        if stage == "tokenspeed":
+        if stage in ("engine", "tokenspeed"):
             check_tree(self.state["stages"]["kernel"]["sha"], "tokenspeed-kernel")
+        if stage == "tokenspeed":
+            check_tree(self.state["stages"]["engine"]["sha"], "tokenspeed-engine")
         sha = self.pr(stage)
         ref = self.immutable_ref(stage, sha)
         version = self.state["versions"][PACKAGES[stage]]
@@ -1095,6 +1122,17 @@ class Release:
             )
             for variant, count in (("cu129", 6), ("cu130", 6), ("rocm72", 3)):
                 self.wheelhouse(f"tokenspeed-kernel-v{version}-{variant}", sha, count)
+        elif stage == "engine":
+            workflow = "release-tokenspeed-engine.yml"
+            self.child(
+                workflow,
+                sha,
+                ref,
+                {"mode": "publish", "release_type": "release"},
+                event="workflow_dispatch",
+            )
+            self.published(PACKAGES[stage], workflow, sha)
+            self.wheelhouse(f"tokenspeed-engine-v{version}", sha, 4)
         else:
             workflow = "release-pypi.yml"
             run_id = self.child(workflow, sha, "main", {}, event="push")
@@ -1196,6 +1234,11 @@ class Release:
                         "kernel",
                         f"tokenspeed-kernel-v{versions['tokenspeed-kernel']}-{suffix}",
                         count,
+                    ),
+                    (
+                        "engine",
+                        f"tokenspeed-engine-v{versions['tokenspeed-engine']}",
+                        4,
                     ),
                     ("tokenspeed", f"tokenspeed-v{versions['tokenspeed']}", 1),
                 ):
@@ -1313,12 +1356,13 @@ class Release:
             ("release-tokenspeed-kernel-amd.yml", "amd", "workflow_dispatch"),
             ("release-tokenspeed-kernel.yml", "kernel", "workflow_dispatch"),
             ("release-tokenspeed-kernel-rocm.yml", "kernel", "workflow_dispatch"),
+            ("release-tokenspeed-engine.yml", "engine", "workflow_dispatch"),
             ("release-pypi.yml", "tokenspeed", "push"),
             ("publish-release-docker.yml", "tokenspeed", "workflow_dispatch"),
         )
         if set(self.state["runs"]) != {workflow for workflow, _, _ in expected} or set(
             self.state["versions"]
-        ) != set(PROJECTS) | {"tokenspeed-kernel"}:
+        ) != set(PACKAGES.values()) | {"tokenspeed-mla"}:
             raise RuntimeError("Recovery state has unexpected packages or publishers")
         for workflow, stage, event in expected:
             version = self.state["versions"][PACKAGES[stage]]
@@ -1354,7 +1398,8 @@ class Release:
         for stage, workflow in (
             ("amd", expected[0][0]),
             ("kernel", expected[1][0]),
-            ("tokenspeed", expected[3][0]),
+            ("engine", "release-tokenspeed-engine.yml"),
+            ("tokenspeed", "release-pypi.yml"),
         ):
             package = PACKAGES[stage]
             version = self.state["versions"][package]
@@ -1366,6 +1411,11 @@ class Release:
             f"tokenspeed-kernel-amd-v{versions['tokenspeed-kernel-amd']}",
             self.state["stages"]["amd"]["sha"],
             1,
+        )
+        self.wheelhouse(
+            f"tokenspeed-engine-v{versions['tokenspeed-engine']}",
+            self.state["stages"]["engine"]["sha"],
+            4,
         )
         self.wheelhouse(
             f"tokenspeed-v{versions['tokenspeed']}",
@@ -1402,6 +1452,7 @@ class Release:
         tags = (
             f"tokenspeed-kernel-amd-v{versions['tokenspeed-kernel-amd']}",
             f"tokenspeed-v{versions['tokenspeed']}",
+            f"tokenspeed-engine-v{versions['tokenspeed-engine']}",
             *(
                 f"tokenspeed-kernel-v{versions['tokenspeed-kernel']}-{v}"
                 for v in ("cu129", "cu130", "rocm72")

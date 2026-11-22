@@ -66,7 +66,7 @@ concurrency:
 
 jobs:
   metadata:
-    if: inputs.mode == 'dry-run' || (inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main')
+    if: inputs.mode == 'dry-run' || (inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/heads/release/engine-') && inputs.release_type == 'release' && inputs.source_sha == '' && github.actor == 'lightseek-bot')))
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -76,6 +76,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -101,6 +102,12 @@ jobs:
           fi
           if [ "$RELEASE_TYPE" != release ]; then
             VERSION_DATE=${VERSION_DATE:-$(date -u +%Y%m%d)}
+          fi
+          if [[ "$GITHUB_REF" == refs/heads/release/engine-* ]]; then
+            version=$(python .github/scripts/prepare-engine-release.py . --target version --kind release --date '')
+            test "$GITHUB_REF_NAME" = "release/engine-$version"
+            git fetch origin main
+            git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD
           fi
           version_args=()
           if [ "$RELEASE_TYPE" = post ]; then
@@ -204,7 +211,7 @@ jobs:
 
   publish-whl:
     needs: [metadata, build]
-    if: inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/heads/release/engine-') && inputs.release_type == 'release' && inputs.source_sha == '' && github.actor == 'lightseek-bot'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
@@ -338,7 +345,7 @@ jobs:
 
   publish:
     needs: publish-whl
-    if: inputs.source_sha == '' && inputs.mode == 'publish' && (inputs.release_type == 'release' || (inputs.release_type == 'post' && inputs.publish_post_to_pypi)) && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: inputs.source_sha == '' && inputs.mode == 'publish' && (inputs.release_type == 'release' || (inputs.release_type == 'post' && inputs.publish_post_to_pypi)) && github.repository == 'lightseekorg/tokenspeed' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/heads/release/engine-') && inputs.release_type == 'release' && inputs.source_sha == '' && github.actor == 'lightseek-bot'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi

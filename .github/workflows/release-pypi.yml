@@ -47,6 +47,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -125,15 +127,27 @@ jobs:
           echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify published stable engine
+        if: steps.metadata.outputs.nightly != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m pip install packaging cryptography PyYAML
+          python - <<'PY'
+          import runpy
+          runpy.run_path('.github/scripts/weekly-release.py')['verify_stable_engine']()
+          PY
+
   engine:
     needs: metadata
+    if: needs.metadata.outputs.nightly == 'true'
     uses: ./.github/workflows/release-tokenspeed-engine.yml
     permissions:
       contents: read
       id-token: write
     with:
       mode: ${{ needs.metadata.outputs.nightly == 'true' && !inputs.publish_github && 'dry-run' || 'publish' }}
-      release_type: ${{ needs.metadata.outputs.nightly == 'true' && 'nightly' || 'post' }}
+      release_type: nightly
       replace_nightly: ${{ inputs.replace_nightly == true }}
       release_candidate: ${{ inputs.release_candidate }}
       version_date: ${{ needs.metadata.outputs.version_date }}
@@ -143,6 +157,7 @@ jobs:
 
   build:
     needs: [metadata, engine]
+    if: ${{ !cancelled() && needs.metadata.result == 'success' && ((needs.metadata.outputs.nightly == 'true' && needs.engine.result == 'success') || (needs.metadata.outputs.nightly != 'true' && needs.engine.result == 'skipped')) }}
     runs-on: ubuntu-latest
     outputs:
       nightly: ${{ needs.metadata.outputs.nightly }}
@@ -157,9 +172,11 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           ENGINE_VERSION: ${{ needs.engine.outputs.version }}
+          NIGHTLY: ${{ needs.metadata.outputs.nightly }}
         run: |
-          # A skipped reusable workflow must not allow runtime publication.
-          test -n "$ENGINE_VERSION"
+          if [ "$NIGHTLY" = true ]; then
+            test -n "$ENGINE_VERSION"
+          fi
           # The kernel's commit can predate changes to the release tooling.
           cp .github/scripts/prepare-tokenspeed-nightly.py "$RUNNER_TEMP/prepare-tokenspeed-nightly.py"
           if [ "$SOURCE_SHA" != "$GITHUB_SHA" ]; then
@@ -202,7 +219,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.repository == 'lightseekorg/tokenspeed' && needs.build.outputs.nightly != 'true'
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.repository == 'lightseekorg/tokenspeed' && needs.build.outputs.nightly != 'true' }}
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
