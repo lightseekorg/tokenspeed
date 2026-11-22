@@ -1471,6 +1471,9 @@ def triton_gemma_rmsnorm(
 
 # Rows each gated RMSNorm program normalizes when one warp covers a row.
 GATED_RMSNORM_ROWS_PER_PROGRAM = 8
+# From this many rows a program loops over row blocks to keep more loads in flight.
+GATED_RMSNORM_ROW_LOOP_MIN_ROWS = 2048
+GATED_RMSNORM_ROW_BLOCKS = 8
 
 
 @register_kernel(
@@ -1524,7 +1527,12 @@ def triton_gated_rmsnorm(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
-    grid = (triton.cdiv(M, block_m), ngroups)
+    row_blocks = (
+        GATED_RMSNORM_ROW_BLOCKS
+        if block_m > 1 and M >= GATED_RMSNORM_ROW_LOOP_MIN_ROWS
+        else 1
+    )
+    grid = (triton.cdiv(M, block_m * row_blocks), ngroups)
     with torch.cuda.device(x.device.index):
         # Pass the heuristic explicitly so startup can retain and load each
         # compiled binary; the heuristic wrapper discards that return value.
@@ -1542,6 +1550,7 @@ def triton_gated_rmsnorm(
             eps,
             BLOCK_M=block_m,
             BLOCK_N=BLOCK_N,
+            ROW_BLOCKS=row_blocks,
             HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,

@@ -23,12 +23,14 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.layernorm.triton as layernorm_triton
 import torch
 from tokenspeed_kernel.numerics.torch.layernorm import torch_gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import gated_rmsnorm_kernel
 from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 platform = current_platform()
 
@@ -129,6 +131,7 @@ def test_gated_rmsnorm_row_blocks_match_one_row_programs(
         1e-6,
         BLOCK_M=1,
         BLOCK_N=128,
+        ROW_BLOCKS=1,
         NORM_BEFORE_GATE=norm_before_gate,
         SIGMOID_GATE=False,
         ENABLE_PDL=False,
@@ -138,6 +141,98 @@ def test_gated_rmsnorm_row_blocks_match_one_row_programs(
         num_warps=1,
     )
     torch.testing.assert_close(out, single, rtol=0, atol=0)
+
+
+def _model_norm_inputs(rows: int, device: str):
+    generator = torch.Generator(device=device).manual_seed(rows)
+    x = torch.randn(rows, 32 * 128, device=device, generator=generator)
+    # z is the gate slice of a wider projection row, as in the linear-attention block.
+    z = torch.randn(rows, 96 * 128, device=device, generator=generator)[:, 64 * 128 :]
+    weight = 1.0 + 0.1 * torch.randn(128, device=device, generator=generator)
+    return x.bfloat16(), z.bfloat16(), weight.bfloat16()
+
+
+@pytest.mark.parametrize("rows", [2048, 2049, 2111, 4097, 8449])
+@pytest.mark.parametrize(
+    "norm_before_gate,sigmoid_gate,fp8", [(True, True, False), (False, False, True)]
+)
+def test_gated_rmsnorm_row_loops_match_single_row_blocks(
+    rows: int,
+    norm_before_gate: bool,
+    sigmoid_gate: bool,
+    fp8: bool,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Looping over row blocks writes the same bits as one row block per program."""
+    x, z, weight = _model_norm_inputs(rows, device)
+    kwargs = dict(
+        eps=1e-6,
+        group_size=128,
+        norm_before_gate=norm_before_gate,
+        sigmoid_gate=sigmoid_gate,
+        fp8_scale=torch.tensor(0.05, device=device) if fp8 else None,
+        weights_independent=True,
+    )
+    looped = gated_rmsnorm(x, weight, z, **kwargs)
+    monkeypatch.setattr(layernorm_triton, "GATED_RMSNORM_ROW_LOOP_MIN_ROWS", 2**31)
+    single = gated_rmsnorm(x, weight, z, **kwargs)
+    assert torch.equal(looped.view(torch.uint8), single.view(torch.uint8))
+
+
+def test_gated_rmsnorm_loops_over_row_blocks_from_the_threshold(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grids = []
+    launch = layernorm_triton.kernel_launcher
+
+    def recording_launcher(kernel, grid):
+        grids.append(tuple(grid))
+        return launch(kernel, grid)
+
+    monkeypatch.setattr(layernorm_triton, "kernel_launcher", recording_launcher)
+    first = layernorm_triton.GATED_RMSNORM_ROW_LOOP_MIN_ROWS
+    for rows in (first - 1, first):
+        x, z, weight = _model_norm_inputs(rows, device)
+        gated_rmsnorm(
+            x,
+            weight,
+            z,
+            eps=1e-6,
+            group_size=128,
+            norm_before_gate=True,
+            sigmoid_gate=True,
+            fp8_scale=None,
+            weights_independent=True,
+        )
+    rows_per_loop = ROWS_PER_PROGRAM * layernorm_triton.GATED_RMSNORM_ROW_BLOCKS
+    assert grids == [
+        ((first - 1 + ROWS_PER_PROGRAM - 1) // ROWS_PER_PROGRAM, 32),
+        ((first + rows_per_loop - 1) // rows_per_loop, 32),
+    ]
+
+
+def test_gated_rmsnorm_row_loops_reuse_one_compile(device: str) -> None:
+    def run(rows: int) -> None:
+        x, z, weight = _model_norm_inputs(rows, device)
+        gated_rmsnorm(
+            x,
+            weight,
+            z,
+            eps=1e-6,
+            group_size=128,
+            norm_before_gate=True,
+            sigmoid_gate=True,
+            fp8_scale=None,
+            weights_independent=True,
+        )
+
+    # Both alignment classes of the row count, as startup warms them.
+    run(2048)
+    run(2049)
+    with assert_no_triton_compile(gated_rmsnorm_kernel.fn):
+        for rows in (3001, 4096, 16384, 16389):
+            run(rows)
 
 
 def test_one_group_weight_on_whole_rows_matches_one_row_per_group(device):

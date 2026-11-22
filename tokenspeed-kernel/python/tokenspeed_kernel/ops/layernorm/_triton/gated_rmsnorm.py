@@ -50,6 +50,7 @@ def gated_rmsnorm_kernel(
     eps,  # epsilon to avoid division by zero
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ROW_BLOCKS: tl.constexpr,
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
@@ -59,13 +60,9 @@ def gated_rmsnorm_kernel(
     SHARED_WEIGHT: tl.constexpr,
 ):
     # Each program normalizes BLOCK_M rows of one group, one warp per row.
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     group = tl.program_id(1)
     cols = tl.arange(0, BLOCK_N)
     col_mask = cols < N
-    mask = (rows < M)[:, None] & col_mask[None, :]
-    # Row offsets in int64: z may be a view with a projection-wide row stride.
-    rows = rows.to(tl.int64)
     offsets = group * N + cols[None, :]
     if not SHARED_WEIGHT:
         W += group * N
@@ -76,28 +73,36 @@ def gated_rmsnorm_kernel(
         tl.extra.cuda.gdc_launch_dependents()
     if not WEIGHTS_INDEPENDENT:
         w = tl.load(W + cols, mask=col_mask).to(tl.float32)
-    x = tl.load(X + rows[:, None] * stride_x_row + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    if HAS_Z:
-        z = tl.load(Z + rows[:, None] * stride_z_row + offsets, mask=mask).to(
-            tl.float32
+    # The loop keeps each row's tile and reduction; stages overlap the next block's loads.
+    for block in tl.range(ROW_BLOCKS, num_stages=3 if ROW_BLOCKS > 1 else 1):
+        rows = (tl.program_id(0) * ROW_BLOCKS + block) * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask = (rows < M)[:, None] & col_mask[None, :]
+        # Row offsets in int64: z may be a view with a projection-wide row stride.
+        rows = rows.to(tl.int64)
+        x = tl.load(
+            X + rows[:, None] * stride_x_row + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        if HAS_Z:
+            z = tl.load(Z + rows[:, None] * stride_z_row + offsets, mask=mask).to(
+                tl.float32
+            )
+        if HAS_Z and not NORM_BEFORE_GATE:
+            x *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
+        xbar = tl.where(mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+        rstd = 1 / tl.sqrt(var + eps)
+        y = x * rstd[:, None] * w[None, :]
+        if HAS_Z and NORM_BEFORE_GATE:
+            y *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
+        if OUT_FP8:
+            # Quantize the activation-dtype output, as the consumer would.
+            y = y.to(X.dtype.element_ty).to(tl.float32)
+            y = tl.clamp(y * (1.0 / tl.load(FP8_SCALE).to(tl.float32)), -448.0, 448.0)
+        tl.store(
+            Y + rows[:, None] * stride_y_row + offsets,
+            y.to(Y.dtype.element_ty),
+            mask=mask,
         )
-    if HAS_Z and not NORM_BEFORE_GATE:
-        x *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
-    xbar = tl.where(mask, x, 0.0)
-    var = tl.sum(xbar * xbar, axis=1) / N
-    rstd = 1 / tl.sqrt(var + eps)
-    y = x * rstd[:, None] * w[None, :]
-    if HAS_Z and NORM_BEFORE_GATE:
-        y *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
-    if OUT_FP8:
-        # Quantize the activation-dtype output, as the consumer would.
-        y = y.to(X.dtype.element_ty).to(tl.float32)
-        y = tl.clamp(y * (1.0 / tl.load(FP8_SCALE).to(tl.float32)), -448.0, 448.0)
-    tl.store(
-        Y + rows[:, None] * stride_y_row + offsets, y.to(Y.dtype.element_ty), mask=mask
-    )
 
 
 register_triton_warmup(gated_rmsnorm_kernel.fn, variants=({"M": (1, 16, 17)},))
