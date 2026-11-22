@@ -20,9 +20,10 @@
 
 """Portable Triton MHA reads of a unit-scale FP8 E4M3 KV cache under a 16-bit
 query: the kernels widen each K/V tile to the query dtype in registers, so the
-result equals the same kernel over the dequantized (bf16) cache bit for bit,
-and an fp32 reference over the dequantized cache within the tolerance the
-bf16-cache tests of these kernels use."""
+result equals the same kernel over the dequantized (bf16) cache (bit for bit on
+AMD, see ``_assert_matches_dequant``), and an fp32 reference over the
+dequantized cache within the tolerance the bf16-cache tests of these kernels
+use."""
 
 from __future__ import annotations
 
@@ -98,6 +99,24 @@ def _reference(q, k_cache, v_cache, table, cache_lens, q_lens, scale):
     return out, lse
 
 
+def _assert_matches_dequant(actual, expected):
+    """The FP8 read widens each K/V tile and then does the dequantized read's
+    arithmetic. On AMD both compile to the same instructions and agree bit for
+    bit. Triton's NVIDIA backend does not lower the dot over a widened FP8 load
+    the same way (on B200 a few elements differ by an ulp): the fp32
+    accumulators can differ in their last bits, which can flip the rounding of
+    the probabilities to the query dtype before P.V and of the output. There a
+    16-bit output may be two rounding steps off, and the float32 log-sum-exp is
+    checked at torch's float32 default tolerance."""
+    if current_platform().is_amd:
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    elif actual.dtype == torch.float32:
+        torch.testing.assert_close(actual, expected)
+    else:
+        eps = torch.finfo(actual.dtype).eps
+        torch.testing.assert_close(actual, expected, atol=2 * eps, rtol=2 * eps)
+
+
 def _decode(q, k, v, table, lens, q_len, return_lse=False):
     return mha_decode_with_kvcache(
         q=q,
@@ -159,15 +178,15 @@ def test_triton_decode_reads_fp8_cache(
     dequant = _decode(q, k.to(q_dtype), v.to(q_dtype), table, lens, q_len)
 
     assert out.dtype == q_dtype
-    torch.testing.assert_close(out, dequant, atol=0, rtol=0)
+    _assert_matches_dequant(out, dequant)
     torch.testing.assert_close(out.float().cpu(), ref, atol=3e-2, rtol=3e-2)
 
     out, lse = _decode(q, k, v, table, lens, q_len, return_lse=True)
     dequant, dequant_lse = _decode(
         q, k.to(q_dtype), v.to(q_dtype), table, lens, q_len, return_lse=True
     )
-    torch.testing.assert_close(out, dequant, atol=0, rtol=0)
-    torch.testing.assert_close(lse, dequant_lse, atol=0, rtol=0)
+    _assert_matches_dequant(out, dequant)
+    _assert_matches_dequant(lse, dequant_lse)
     torch.testing.assert_close(out.float().cpu(), ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse.cpu(), ref_lse, atol=1e-3, rtol=1e-3)
 
@@ -196,8 +215,8 @@ def test_triton_extend_reads_fp8_cache(
     )
 
     assert out.dtype == q_dtype
-    torch.testing.assert_close(out, dequant, atol=0, rtol=0)
-    torch.testing.assert_close(lse, dequant_lse, atol=0, rtol=0)
+    _assert_matches_dequant(out, dequant)
+    _assert_matches_dequant(lse, dequant_lse)
     torch.testing.assert_close(out.float().cpu(), ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse.cpu(), ref_lse, atol=1e-3, rtol=1e-3)
 
