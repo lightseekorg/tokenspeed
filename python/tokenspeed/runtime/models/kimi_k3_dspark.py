@@ -583,6 +583,9 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             Whether the draft armed the fusion.
         """
         del max_num_tokens
+        if not self.layers:
+            # A PP stage without draft layers has no boundary norms to fuse.
+            return False
         self.allreduce_fusion = prepare_reduce_norm_fusion(
             self.mapping, int(self.config.hidden_size)
         )

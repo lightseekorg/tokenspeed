@@ -475,16 +475,24 @@ def test_both_layer_boundaries_fuse_the_reduce_into_the_norm(armed, rows, fused)
     assert all_reduce.call_count == (0 if fused else 2)
 
 
-@pytest.mark.parametrize("ranks,prepared", [(8, True), (8, False), (1, True)])
-def test_the_draft_arms_the_fused_all_reduce_norm_once_per_group(ranks, prepared):
-    """The shared dense and attention group arms once; one rank never does."""
+@pytest.mark.parametrize(
+    "ranks,prepared,layers", [(8, True, 2), (8, False, 2), (1, True, 2), (8, True, 0)]
+)
+def test_the_draft_arms_the_fused_all_reduce_norm_once_per_group(
+    ranks, prepared, layers
+):
+    """The shared dense and attention group arms once; one rank never does.
+
+    Nor does a pipeline stage without draft layers: it has no norms to fuse.
+    """
     model = K3DSparkModel.__new__(K3DSparkModel)
     torch.nn.Module.__init__(model)
     group = tuple(range(ranks))
     model.mapping = SimpleNamespace(dense=_tp(group), attn=_tp(group))
     model.config = SimpleNamespace(hidden_size=7168)
-    model.layers = [SimpleNamespace(allreduce_fusion=False) for _ in range(2)]
-    armed = ranks > 1 and prepared
+    model.layers = [SimpleNamespace(allreduce_fusion=False) for _ in range(layers)]
+    model.allreduce_fusion = False
+    armed = ranks > 1 and prepared and layers > 0
 
     with (
         mock.patch.dict(
@@ -498,10 +506,10 @@ def test_the_draft_arms_the_fused_all_reduce_norm_once_per_group(ranks, prepared
         assert model.prepare_communication_runtime(512) is armed
 
     assert prepare.call_args_list == (
-        [mock.call(group, 7168, 2048)] if ranks > 1 else []
+        [mock.call(group, 7168, 2048)] if ranks > 1 and layers > 0 else []
     )
     assert model.allreduce_fusion is armed
-    assert [layer.allreduce_fusion for layer in model.layers] == [armed, armed]
+    assert [layer.allreduce_fusion for layer in model.layers] == [armed] * layers
 
 
 def test_every_remaining_checkpoint_key_has_a_destination() -> None:
