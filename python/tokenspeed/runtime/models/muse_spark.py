@@ -161,6 +161,9 @@ from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.common import make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+    TorchMemorySaverAdapter,
+)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
@@ -261,13 +264,27 @@ class _DenseFp8Weight:
     Holds an FP8 E4M3 copy of the projected weight with one FP32 scale per
     output channel, made after loading, and projects decode rows in
     ``[min_rows, max_rows]`` through it with per-row FP8 activations.
+
+    ``copy_region`` is the memory saver's named region the copy is allocated
+    in, so that releasing ``weights`` releases it and resuming restores it at
+    the same address with the same contents; None for a copy made while the
+    weights load, which is already inside the ``weights`` region (the memory
+    saver allows no region inside it).
     """
 
-    def __init__(self, name: str, enabled: bool, min_rows: int, max_rows: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        enabled: bool,
+        min_rows: int,
+        max_rows: int,
+        copy_region: str | None,
+    ) -> None:
         self.name = name
         self.enabled = enabled
         self.min_rows = min_rows
         self.max_rows = max_rows
+        self.copy_region = copy_region
         self.weight: torch.Tensor | None = None
         self.scale: torch.Tensor | None = None
 
@@ -301,16 +318,23 @@ class _DenseFp8Weight:
 
     def prepare(self, weight: torch.Tensor) -> None:
         """Convert the loaded BF16 ``[N, K]`` weight when enabled, after
-        ``check``."""
+        ``check``, then compile the GEMM."""
         if not self.enabled:
             return
         self.check(weight)
-        k = weight.shape[1]
-        self.weight, self.scale = prepare_fp8_channel_weight(weight)
+        if self.copy_region is None:
+            self.weight, self.scale = prepare_fp8_channel_weight(weight)
+        else:
+            saver = TorchMemorySaverAdapter.create(
+                enable=global_server_args_dict["enable_memory_saver"]
+            )
+            with saver.named_region(self.copy_region):
+                self.weight, self.scale = prepare_fp8_channel_weight(weight)
         # Compile the GEMM's binaries now (its warm-up compiles every row
-        # tile), whatever row counts the startup warm-up forwards run.
+        # tile), whatever row counts the startup warm-up forwards run. Its
+        # temporaries stay out of the copy's region.
         with kernel_warmup(enabled=True):
-            self.project(weight.new_zeros(self.min_rows, k), None, None)
+            self.project(weight.new_zeros(self.min_rows, weight.shape[1]), None, None)
 
     def applies(self, rows: int) -> bool:
         """Whether ``rows`` rows of a forward that takes the FP8 projections
@@ -584,6 +608,9 @@ class _MuseGatheredLinear(ColumnParallelLinear):
             fp8_small_m,
             _DENSE_FP8_MIN_ROWS,
             min(_DENSE_FP8_MAX_ROWS, _GATHER_MXFP4_FP8_MAX_ROWS, workspace_rows),
+            # Made once the communication runtime is set up, after the
+            # weights region has closed.
+            "derived_weights",
         )
 
     def check_fp8_weight(self) -> None:
@@ -936,6 +963,8 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
             _dense_fp8_small_m("qkv"),
             _DENSE_FP8_QKV_MIN_ROWS,
             _DENSE_FP8_MAX_ROWS,
+            # Made while the weights load, inside the weights region.
+            None,
         )
 
     def prepare_fp8_weight(self) -> None:

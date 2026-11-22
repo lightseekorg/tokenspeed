@@ -1473,6 +1473,7 @@ def test_dense_fp8_refuses_a_projection_without_a_tuned_gemm_at_load() -> None:
         True,
         module._DENSE_FP8_MIN_ROWS,
         module._GATHER_MXFP4_FP8_MAX_ROWS,
+        "derived_weights",
     )
     with pytest.raises(ValueError, match=r"pre_expert_proj projection \[512, 8192\]"):
         fp8.prepare(torch.zeros(512, 8192, device="cuda", dtype=torch.bfloat16))
@@ -1582,6 +1583,7 @@ def _enabled_copy(name: str) -> "module._DenseFp8Weight":
             else module._DENSE_FP8_MIN_ROWS
         ),
         module._DENSE_FP8_MAX_ROWS,
+        None if name == "qkv_proj" else "derived_weights",
     )
     fp8.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
     fp8.scale = torch.empty(0)
@@ -2050,7 +2052,9 @@ def _shard_linear(
     linear.workspace = None
     linear.multicast = None
     linear.gather_column_view = False
-    linear.dense_fp8 = module._DenseFp8Weight("pre_expert_proj", False, 0, 0)
+    linear.dense_fp8 = module._DenseFp8Weight(
+        "pre_expert_proj", False, 0, 0, "derived_weights"
+    )
     return linear
 
 
@@ -2274,6 +2278,7 @@ def _check_gathered_fp8_projection(state, rank, world_size, device) -> None:
         True,
         module._DENSE_FP8_MIN_ROWS,
         module._GATHER_MXFP4_FP8_MAX_ROWS,
+        "derived_weights",
     )
     linear.prepare_fp8_weight()
     for fp8 in (False, True):
@@ -2747,6 +2752,97 @@ def test_a_decoder_layer_forward_runs_its_boundaries(
     assert stream.shape == (rows, hidden) and next_input.shape == (rows, hidden)
     assert torch.isfinite(stream).all() and torch.isfinite(next_input.float()).all()
     assert next_input_fp8 is None
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the small-M FP8 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("copy_region", ["derived_weights", None])
+def test_dense_fp8_copy_is_allocated_in_its_memory_saver_region(
+    copy_region: str | None, bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the memory saver on, a copy made after loading (the pre-expert
+    one) is allocated in the CPU-backed persistent-buffer region, which the
+    saver pauses with ``weights`` and resumes at the same address with the
+    same contents; a copy made while the weights load (QKV) opens no region
+    of its own and is allocated in the ``weights`` region the load opens.
+    The memory saver is not available in the test environment, so this
+    checks where each copy is allocated, not a release."""
+    from contextlib import contextmanager
+
+    from tokenspeed.runtime.utils import torch_memory_saver_adapter as saver_module
+
+    monkeypatch.setitem(module.global_server_args_dict, "enable_memory_saver", True)
+    regions: list[tuple[str, bool]] = []
+    primary: list[str] = []
+
+    class _Primary:
+        """The weights' saver; records the region a conversion runs in."""
+
+        @contextmanager
+        def region(self, *, tag: str, enable_cpu_backup: bool):
+            primary.append(tag)
+            try:
+                yield
+            finally:
+                primary.pop()
+
+    monkeypatch.setattr(
+        saver_module, "_primary_memory_saver", _Primary(), raising=False
+    )
+
+    class _Pool:
+        """The persistent-buffer saver; records the regions it opens."""
+
+        @contextmanager
+        def region(self, *, tag: str, enable_cpu_backup: bool):
+            regions.append((tag, enable_cpu_backup))
+            yield
+
+    monkeypatch.setattr(
+        saver_module,
+        "_buffer_memory_savers",
+        {"persistent_buffers": _Pool()},
+        raising=False,
+    )
+    in_region: list[tuple[bool, list[str]]] = []
+    convert = module.prepare_fp8_channel_weight
+
+    def recording_convert(weight: torch.Tensor):
+        in_region.append(
+            (saver_module._active_buffer_pool.get() is not None, list(primary))
+        )
+        return convert(weight)
+
+    monkeypatch.setattr(module, "prepare_fp8_channel_weight", recording_convert)
+    fp8 = module._DenseFp8Weight(
+        "pre_expert_proj",
+        True,
+        module._DENSE_FP8_MIN_ROWS,
+        module._GATHER_MXFP4_FP8_MAX_ROWS,
+        copy_region,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    weight = (
+        torch.randn(1024, 8192, device="cuda", generator=generator).bfloat16() * 0.02
+    )
+    if copy_region is None:
+        # As weight_loader.py loads the model: inside the weights region.
+        saver = saver_module.TorchMemorySaverAdapter.create(enable=True)
+        with saver.region(tag="weights", enable_cpu_backup=True):
+            fp8.prepare(weight)
+    else:
+        fp8.prepare(weight)
+    assert fp8.weight is not None and fp8.scale is not None
+    # The conversion runs inside its region; the GEMM's warm-up after it
+    # opens none.
+    if copy_region is None:
+        assert in_region == [(False, ["weights"])]
+        assert regions == []
+    else:
+        assert in_region == [(True, [])]
+        assert regions == [("weights", True)]
 
 
 @requires_gpu

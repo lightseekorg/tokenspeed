@@ -1212,6 +1212,7 @@ def _muse_fp8_decode_routing_worker(rank, world_size, device):
         True,
         module._DENSE_FP8_MIN_ROWS,
         module._GATHER_MXFP4_FP8_MAX_ROWS,
+        "derived_weights",
     )
     # The fused gather reads the copy here, so the attention boundary writes
     # it (MuseSparkDecoderLayer.attention_boundary_writes_fp8 asks this).

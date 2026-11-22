@@ -434,6 +434,7 @@ def _fp8_projection(enabled: bool) -> muse_spark._DenseFp8Weight:
         enabled,
         muse_spark._DENSE_FP8_QKV_MIN_ROWS,
         muse_spark._DENSE_FP8_MAX_ROWS,
+        None,
     )
     if enabled:
         fp8.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
@@ -453,6 +454,7 @@ def test_no_launch_has_rows_that_the_dense_fp8_projections_take() -> None:
         True,
         muse_spark._DENSE_FP8_MIN_ROWS,
         muse_spark._GATHER_MXFP4_FP8_MAX_ROWS,
+        "derived_weights",
     )
     pre_expert.weight = torch.empty(0, dtype=torch.float8_e4m3fn)
     assert muse_spark.MONOKERNEL_MAX_ROWS < min(
