@@ -55,19 +55,20 @@ AUTOTUNE_ENV = "TOKENSPEED_HIPBLASLT_AUTOTUNE"
 
 
 def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
-    """Replay the BLAS solutions (hipBLASLt or rocBLAS) in a TunableOp results file.
+    """Replay the BLAS solutions (hipBLASLt or rocBLAS) in TunableOp results files.
 
     See ``tokenspeed_kernel.ops.gemm._hipblaslt.tuning.load_hipblaslt_tuned_solutions``.
 
     Args:
         path: TunableOp results CSV made on the same software stack and GPU
-            architecture. When omitted, the in-repo file of the current GPU
-            is loaded, at most once per process; on a non-ROCm build or a
-            GPU without a file this is a no-op.
+            architecture. When omitted, the committed files of the current
+            GPU (its architecture file, then its device file) are loaded, at
+            most once per process; on a non-ROCm build or a GPU without a
+            file this is a no-op.
 
     Returns:
-        Whether the file was loaded. False on a non-ROCm build or when the
-        implementation rejects the file.
+        Whether any file was loaded. False on a non-ROCm build or when the
+        implementation rejects every file.
     """
     if path is None:
         return _load_default()

@@ -26,10 +26,21 @@ measured solution can be much faster. PyTorch's TunableOp times both
 hipBLASLt and rocBLAS solutions, and can replay the fastest one from a results
 file, so a tuned file can list solutions from either library.
 
-Tuned files live next to this module, one per GPU, named like the Triton
-kernel configs: ``configs/device_name=<torch.cuda.get_device_name()>.csv``
-with spaces replaced by underscores (``device_name=AMD_Instinct_MI355X.csv``).
-Serving loads the file of its GPU read-only:
+Tuned files live next to this module, in two kinds. TunableOp checks a
+file's solutions against the GPU architecture and library builds stamped in
+it, not the GPU model, and some drivers report a generic device name (such as
+``AMD Radeon Graphics``), so:
+
+* ``configs/gcn_arch=<architecture>.csv`` serves every GPU whose
+  ``gcnArchName`` equals the file's ``GCN_ARCH_NAME`` stamp. It holds only
+  rows verified on every GPU model of the architecture to write the default
+  solution's bits and not be slower.
+* ``configs/device_name=<torch.cuda.get_device_name()>.csv``, spaces replaced
+  by underscores (``device_name=AMD_Instinct_MI355X.csv``), adds rows for one
+  GPU model, which may be chosen for speed alone. It never lists a GEMM the
+  architecture file lists.
+
+Serving loads the architecture file and then the device file, read-only:
 
 * lookups only, so serving never tunes;
 * GEMM shapes the file does not list keep PyTorch's default solution;
@@ -50,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
 import logging
 import math
 import os
@@ -60,6 +72,7 @@ import torch
 
 __all__ = [
     "TUNED_CONFIG_DIR",
+    "find_hipblaslt_tuned_files",
     "hipblaslt_file_validators",
     "hipblaslt_online_tuning",
     "hipblaslt_tuned_file",
@@ -111,6 +124,43 @@ def hipblaslt_file_validators(path: str) -> dict[str, str]:
     return validators
 
 
+def find_hipblaslt_tuned_files(device_name: str, arch_name: str) -> list[str]:
+    """The committed tuned files for a GPU, in load order.
+
+    Args:
+        device_name: ``torch.cuda.get_device_name()`` of the GPU.
+        arch_name: ``gcnArchName`` of the GPU's properties, such as
+            ``gfx950:sramecc+:xnack-``.
+
+    Returns:
+        The ``gcn_arch=`` file stamped with ``arch_name``, if one is
+        committed, then the GPU's ``device_name=`` file, if one is committed
+        and stamped with ``arch_name``. Empty when neither is.
+    """
+    stamped = [
+        path
+        for path in sorted(glob.glob(os.path.join(TUNED_CONFIG_DIR, "*.csv")))
+        if hipblaslt_file_validators(path).get("GCN_ARCH_NAME") == arch_name
+    ]
+    architecture = [
+        path for path in stamped if os.path.basename(path).startswith("gcn_arch=")
+    ]
+    if len(architecture) > 1:
+        raise ValueError(
+            f"several committed tuned files for {arch_name}: {architecture}"
+        )
+    named = hipblaslt_tuned_file(device_name)
+    if named in stamped:
+        return architecture + [named]
+    if os.path.exists(named):
+        logger.warning(
+            f"Ignoring tuned BLAS solutions {named}: stamped for "
+            f"{hipblaslt_file_validators(named).get('GCN_ARCH_NAME')!r}, not this "
+            f"GPU's {arch_name!r}"
+        )
+    return architecture
+
+
 def _current_validators() -> dict[str, str]:
     # TunableOp registers the BLAS library stamps when its first GEMM runs.
     a = torch.zeros(16, 16, device="cuda", dtype=torch.bfloat16)
@@ -119,7 +169,7 @@ def _current_validators() -> dict[str, str]:
 
 
 def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
-    """Replay the BLAS solutions (hipBLASLt or rocBLAS) in a TunableOp results file.
+    """Replay the BLAS solutions (hipBLASLt or rocBLAS) in TunableOp results files.
 
     Process-wide: every later ``torch.mm``-family GEMM whose shape, layout
     and dtype the file lists uses the recorded solution; other GEMMs keep
@@ -128,63 +178,82 @@ def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
 
     Args:
         path: TunableOp results CSV made on the same software stack and GPU
-            architecture. Defaults to the in-repo file of the current GPU,
-            ``hipblaslt_tuned_file()``.
+            architecture. Defaults to the committed files of the current GPU,
+            ``find_hipblaslt_tuned_files``, loaded together.
 
     Returns:
-        Whether the file was loaded. False when this is not a ROCm build,
-        the GPU has no tuned file, the file cannot be read, or its stamp
-        differs from the running stack (logged); TunableOp then stays
-        disabled.
+        Whether any file was loaded. Each file is loaded only when its stamp
+        matches the running stack; one that does not is skipped with a
+        warning, and the others still load. False when this is not a ROCm
+        build, the GPU has no tuned file, a file cannot be read, or no file
+        matches the stack (logged); TunableOp then stays disabled.
     """
     tunable = torch.cuda.tunable
     if torch.version.hip is None:
         logger.warning(f"Ignoring tuned BLAS solutions {path}: not a ROCm build")
         return False
     if path is None:
-        path = hipblaslt_tuned_file()
-        if not os.path.exists(path):
-            logger.info(
-                f"No tuned BLAS solutions for {torch.cuda.get_device_name()!r} "
-                f"({path}); using default solutions"
+        device_name = torch.cuda.get_device_name()
+        arch_name = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).gcnArchName
+        paths = find_hipblaslt_tuned_files(device_name, arch_name)
+        if not paths:
+            logger.warning(
+                f"No tuned BLAS solutions for {device_name!r} ({arch_name}) in "
+                f"{TUNED_CONFIG_DIR}: neither a gcn_arch= file nor "
+                f"{os.path.basename(hipblaslt_tuned_file(device_name))} is "
+                "committed with this architecture's stamp; GEMMs run untuned, "
+                "with the BLAS libraries' default solutions"
             )
             return False
-    try:
-        expected = hipblaslt_file_validators(path)
-    except OSError as e:
-        logger.warning(f"Ignoring tuned BLAS solutions {path}: {e}")
-        return False
+    else:
+        paths = [path]
     # Lookups only: no tuning on a miss and no untuned-shape log. TunableOp
-    # rewrites its file at exit only when it tuned something new, so the file
-    # stays untouched.
+    # rewrites its file at exit only when it tuned something new; it also
+    # reads that file lazily before its first GEMM. Point it at os.devnull, so
+    # it reads nothing on its own (only the files whose stamps match below are
+    # read) and never picks up a stray default-named file from the working
+    # directory.
     tunable.tuning_enable(False)
     tunable.record_untuned_enable(False)
-    # TunableOp reads its file lazily on first use; point it at this one so it
-    # never picks up a stray default-named file from the working directory.
-    tunable.set_filename(path, insert_device_ordinal=False)
+    tunable.set_filename(os.devnull, insert_device_ordinal=False)
     tunable.enable(True)
     current = _current_validators()
-    mismatch = {
-        key: (value, current.get(key))
-        for key, value in expected.items()
-        if current.get(key) != value
-    }
-    missing = sorted(set(current) - set(expected))
-    if not expected or mismatch or missing:
+    loaded = []
+    for file in paths:
+        try:
+            stamp = hipblaslt_file_validators(file)
+        except OSError as e:
+            logger.warning(f"Ignoring tuned BLAS solutions {file}: {e}")
+            continue
+        mismatch = {
+            key: (value, current.get(key))
+            for key, value in stamp.items()
+            if current.get(key) != value
+        }
+        missing = sorted(set(current) - set(stamp))
+        if not stamp or mismatch or missing:
+            logger.warning(
+                f"Ignoring tuned BLAS solutions {file}: made for a different "
+                f"stack (file vs running: {mismatch}, unstamped: {missing}); "
+                "its GEMMs use default solutions"
+            )
+            continue
+        # Each read adds the file's rows to those already loaded.
+        if not tunable.read_file(file):
+            logger.warning(
+                f"Could not load tuned BLAS solutions {file}; its GEMMs use "
+                "default solutions"
+            )
+            continue
+        loaded.append(file)
+    if not loaded:
         tunable.enable(False)
-        logger.warning(
-            f"Ignoring tuned BLAS solutions {path}: made for a different "
-            f"stack (file vs running: {mismatch}, unstamped: {missing}); "
-            "using default solutions"
-        )
-        return False
-    if not tunable.read_file(path):
-        tunable.enable(False)
-        logger.warning(f"Could not load tuned BLAS solutions {path}")
         return False
     logger.info(
         f"Loaded {len(tunable.get_results())} tuned BLAS solutions (TunableOp) "
-        f"from {path}"
+        f"from {', '.join(loaded)}"
     )
     return True
 
@@ -256,14 +325,18 @@ def tune_hipblaslt_solutions(
         rows: Activation row counts ``m`` to tune, such as the token counts
             of captured verify or decode graphs.
         dtype: Activation and weight dtype.
-        path: Output TunableOp results CSV. Defaults to the in-repo file of
-            the current GPU, ``hipblaslt_tuned_file()``. An existing file
-            must carry the running stack's stamp; its GEMMs are kept and not
+        path: Output TunableOp results CSV. Defaults to the current GPU's
+            device file, ``hipblaslt_tuned_file()``. An existing file must
+            carry the running stack's stamp; its GEMMs are kept and not
             re-timed, and the new ones are added. Delete it to re-tune all.
+            GEMMs the GPU's committed architecture file lists (when its
+            stamp matches) are neither re-timed nor written, also for a
+            scratch ``path``; they are logged.
         cold_bytes: Rotating buffer size in bytes.
 
     Returns:
-        Number of tuned GEMMs written, existing ones included.
+        Number of tuned GEMMs written to ``path``: those already in it and
+        the new ones, without the architecture file's.
 
     Raises:
         ValueError: ``path`` exists and was made for another stack.
@@ -292,6 +365,37 @@ def tune_hipblaslt_solutions(
         if not tunable.read_file(path):
             tunable.enable(False)
             raise ValueError(f"Could not read tuned BLAS solutions {path}")
+    # The GPU's architecture file already lists its GEMMs: read it, so they are
+    # not re-timed, and keep them out of the output, since a device file never
+    # lists a GEMM of its architecture file.
+    architecture_keys = set()
+    for other in find_hipblaslt_tuned_files(
+        torch.cuda.get_device_name(),
+        torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName,
+    ):
+        if not os.path.basename(other).startswith("gcn_arch=") or (
+            os.path.abspath(other) == os.path.abspath(path)
+        ):
+            continue
+        if hipblaslt_file_validators(other) != _current_validators():
+            logger.warning(
+                f"{other} was made for another stack: its GEMMs are tuned "
+                f"and written to {path} too; regenerate it by its own rule"
+            )
+            continue
+        if not tunable.read_file(other):
+            tunable.enable(False)
+            raise ValueError(f"Could not read tuned BLAS solutions {other}")
+        with open(other) as f:
+            architecture_keys |= {
+                tuple(line.split(",")[:2])
+                for line in f
+                if not line.startswith("Validator")
+            }
+    # Everything to keep is read; from here TunableOp writes nowhere on its
+    # own, so the architecture rows it holds cannot reach ``path`` at exit.
+    # The file is written below, without them.
+    tunable.set_filename(os.devnull, insert_device_ordinal=False)
     tunable.tuning_enable(True)
     for n, k in shapes:
         weight = torch.randn(n, k, device="cuda", dtype=dtype)
@@ -300,7 +404,23 @@ def tune_hipblaslt_solutions(
             torch.mm(x, weight.t())
     torch.cuda.synchronize()
     tunable.enable(False)
-    results = tunable.get_results()
+    results = [
+        result
+        for result in tunable.get_results()
+        if tuple(result[:2]) not in architecture_keys
+    ]
+    # TunableOp keys a TN GEMM ``tn_<n>_<m>_<k>_...``.
+    skipped = sorted(
+        f"{n}x{k} at {m} rows"
+        for _, params in architecture_keys
+        for n, m, k in [params.split("_")[1:4]]
+        if (int(n), int(k)) in shapes and int(m) in rows
+    )
+    if skipped:
+        logger.info(
+            f"Not re-timed or written to {path}, the architecture file lists "
+            f"them: {', '.join(skipped)}"
+        )
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         for key, value in tunable.get_validators():

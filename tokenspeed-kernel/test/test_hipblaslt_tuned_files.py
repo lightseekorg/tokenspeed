@@ -54,12 +54,13 @@ def _committed_files() -> list[str]:
 
 def test_mi355x_file_is_committed():
     assert os.path.exists(tuning.hipblaslt_tuned_file("AMD Instinct MI355X"))
+    assert os.path.exists(os.path.join(tuning.TUNED_CONFIG_DIR, "gcn_arch=gfx950.csv"))
 
 
 @pytest.mark.parametrize("path", _committed_files(), ids=os.path.basename)
 def test_committed_file_is_wellformed(path):
     name = os.path.basename(path)
-    assert name.startswith("device_name=") and " " not in name
+    assert name.startswith(("device_name=", "gcn_arch=")) and " " not in name
     assert set(tuning.hipblaslt_file_validators(path)) == _STAMP_KEYS
     entries = 0
     with open(path) as f:
@@ -76,13 +77,81 @@ def test_committed_file_is_wellformed(path):
     assert entries > 0
 
 
-def test_gpu_without_file_is_skipped():
+_GFX950 = "gfx950:sramecc+:xnack-"
+
+
+def _gemm_keys(path) -> set[tuple[str, str]]:
+    with open(path) as f:
+        return {
+            tuple(line.split(",")[:2]) for line in f if not line.startswith("Validator")
+        }
+
+
+@pytest.mark.parametrize(
+    "device_name, arch_name, files, rows",
+    [
+        # Unchanged from the single MI355X file this split replaced.
+        (
+            "AMD Instinct MI355X",
+            _GFX950,
+            ["gcn_arch=gfx950.csv", "device_name=AMD_Instinct_MI355X.csv"],
+            105,
+        ),
+        # A generic name some MI355X drivers report, and the MI350X, share the
+        # architecture's rows only.
+        ("AMD Radeon Graphics", _GFX950, ["gcn_arch=gfx950.csv"], 75),
+        ("AMD Instinct MI350X", _GFX950, ["gcn_arch=gfx950.csv"], 75),
+        ("AMD Instinct MI355X", "gfx942", [], 0),
+    ],
+)
+def test_committed_files_of_a_gpu(device_name, arch_name, files, rows):
+    paths = tuning.find_hipblaslt_tuned_files(device_name, arch_name)
+    assert [os.path.basename(path) for path in paths] == files
+    assert sum(len(_gemm_keys(path)) for path in paths) == rows
+
+
+@pytest.mark.parametrize("path", _committed_files(), ids=os.path.basename)
+def test_device_file_lists_no_gemm_of_its_architecture_file(path):
+    # A device file adds GEMMs; one listed in both would leave the
+    # architecture file's same-bits row to load order.
+    arch_name = tuning.hipblaslt_file_validators(path)["GCN_ARCH_NAME"]
+    shared = [
+        other
+        for other in tuning.find_hipblaslt_tuned_files("", arch_name)
+        if other != path and _gemm_keys(other) & _gemm_keys(path)
+    ]
+    assert not shared
+
+
+def test_device_file_of_another_architecture_is_skipped_loudly(tmp_path, caplog):
+    with open(tmp_path / "device_name=AMD_Instinct_MI355X.csv", "w") as f:
+        for key in sorted(_STAMP_KEYS - {"GCN_ARCH_NAME"}):
+            f.write(f"Validator,{key},1\n")
+        f.write("Validator,GCN_ARCH_NAME,gfx942\n")
+    with (
+        patch.object(tuning, "TUNED_CONFIG_DIR", str(tmp_path)),
+        caplog.at_level("WARNING", logger=tuning.logger.name),
+    ):
+        assert tuning.find_hipblaslt_tuned_files("AMD Instinct MI355X", _GFX950) == []
+    assert "stamped for 'gfx942'" in caplog.text
+
+
+class _Properties:
+    gcnArchName = "gfx000"
+
+
+def test_gpu_without_file_is_skipped_loudly(caplog):
     with (
         patch.object(torch.version, "hip", "7.2"),
         patch.object(torch.cuda, "get_device_name", return_value="No Such GPU"),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "get_device_properties", return_value=_Properties()),
+        caplog.at_level("WARNING", logger=tuning.logger.name),
     ):
         # Returns before TunableOp or the GPU are touched.
         assert not tuning.load_hipblaslt_tuned_solutions()
+    assert "GEMMs run untuned" in caplog.text
+    assert "device_name=No_Such_GPU.csv" in caplog.text
 
 
 def test_default_load_is_noop_off_rocm():
