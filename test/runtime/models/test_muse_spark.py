@@ -239,6 +239,27 @@ def _tiny_model() -> MuseSparkForConditionalGeneration:
         )
 
 
+def _forward_context(mode: str, rows: int) -> "ForwardContext":
+    """A one-request ForwardContext of ``rows`` rows in ``mode`` (DECODE or
+    EXTEND); the attention backend and KV pool are left to the test."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    decode = mode == "DECODE"
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows if decode else 1,
+        num_extends=0 if decode else 1,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode[mode],
+        output_layout=ForwardOutputLayout(
+            0 if decode else 1, 0 if decode else 1, rows if decode else 0, 1
+        ),
+    )
+
+
 def _stub(cls: type) -> torch.nn.Module:
     instance = cls.__new__(cls)
     torch.nn.Module.__init__(instance)
@@ -1098,28 +1119,46 @@ def test_embedding_norm_applies_to_supplied_input_embeds() -> None:
     torch.testing.assert_close(once, normalized.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("mode", ["DECODE", "EXTEND", "MIXED"])
 def test_attention_leaves_norm_rope_and_kv_write_to_the_prologue(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    """The layer hands raw q/k/v and positions to PagedAttention, whose
-    prologue normalizes, rotates and writes K/V."""
+    """The layer hands raw q/k/v of its QKV projection and the positions to
+    PagedAttention, whose prologue normalizes, rotates and writes K/V."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
     heads, kv_heads, head_dim = 4, 2, 8
     attention = _stub(MuseSparkAttention)
     attention.hidden_size, attention.head_dim = heads * head_dim, head_dim
     attention.num_heads, attention.num_kv_heads = heads, kv_heads
     attention.q_size, attention.kv_size = heads * head_dim, kv_heads * head_dim
     attention.rms_norm_eps = 1e-5
-    width = 2 * attention.q_size + 2 * attention.kv_size
-    rows = torch.arange(3 * width, dtype=torch.bfloat16).view(3, width)
-    attention.qkv_proj = lambda x: (rows, None)
+    attention.owned_projections = None
+    attention.qkv_proj = QKVOGateParallelLinear(
+        hidden_size=attention.hidden_size,
+        head_size=head_dim,
+        total_num_heads=heads,
+        total_num_kv_heads=kv_heads,
+        quant_config=None,
+        prefix="qkv_proj",
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        replicate_for_owned_rows=False,
+    )
+    torch.manual_seed(5)
+    attention.qkv_proj.weight.data.normal_(0, 0.1)
     attention._project = lambda x: (x, None, 1)
     attention.attn = Mock(return_value=torch.zeros(3, attention.q_size))
     monkeypatch.setattr(
         module, "weightless_rmsnorm_gated_sigmoid", lambda out, *args: out
     )
     monkeypatch.setattr(module, "pdl_enabled", lambda: False)
-    positions, ctx = torch.arange(3), SimpleNamespace()
-    attention(positions, torch.zeros(3, attention.hidden_size), ctx, None, True)
+    positions = torch.arange(3)
+    ctx = _forward_context(mode, 3)
+    normalized = torch.randn(3, attention.hidden_size)
+    rows = attention.qkv_proj(normalized)[0]
+    attention(positions, normalized, ctx, None, True)
     q, k, v, positions_arg, ctx_arg = attention.attn.call_args.args
     q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
     assert torch.equal(q, rows[:, :q_end])
@@ -1302,6 +1341,200 @@ def test_packed_qkv_gate_loader_replicates_kv_heads_across_ranks() -> None:
             [full["q"][q_rows], full["k"], full["v"], full["g"][q_rows]]
         )
         assert torch.equal(layer.weight.data, expected)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
+)
+def test_qkv_fp8_projection_takes_its_row_window(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dense-fp8-small-m qkv runs the QKV projection in FP8 only inside
+    its row window and in decode forwards."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    with torch.device("cuda"):
+        # A TP4 rank's shape: Q 2048 + gate 2048 + K 256 + V 256 of 8192.
+        layer = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+    layer.weight.data.copy_(torch.randn_like(layer.weight) * 0.02)
+    assert not layer.dense_fp8.applies(33, decode_forward=True)
+    layer.prepare_fp8_weight()
+    x = torch.randn(257, 8192, device="cuda").bfloat16()
+    for rows in (1, 16, 32, 129, 172, 257):
+        assert torch.equal(
+            layer.forward_rows(x[:rows], decode_forward=True), layer(x[:rows])[0]
+        )
+    for rows in (33, 64, 65, 128):
+        projected = layer.forward_rows(x[:rows], decode_forward=True)
+        reference = layer(x[:rows])[0]
+        assert not torch.equal(projected, reference)
+        # Its numerics: the skinny FP8 GEMM's and the row code's own tests.
+        # Prefill and extend forwards stay BF16.
+        assert torch.equal(
+            layer.forward_rows(x[:rows], decode_forward=False), layer(x[:rows])[0]
+        )
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("mode", ["DECODE", "EXTEND"])
+def test_attention_takes_the_fp8_qkv_in_decode_forwards_only(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """With --dense-fp8-small-m, a decode forward's attention gets the FP8
+    projection's q/k/v and an extend forward the BF16 projection's: an extend
+    forward launches no FP8 GEMM, whatever its row count."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    heads, kv_heads, head_dim, rows = 32, 4, 64, 48
+    attention = _stub(MuseSparkAttention)
+    attention.hidden_size, attention.head_dim = 8192, head_dim
+    attention.num_heads, attention.num_kv_heads = heads, kv_heads
+    attention.q_size, attention.kv_size = heads * head_dim, kv_heads * head_dim
+    attention.rms_norm_eps = 1e-5
+    attention.owned_projections = None
+    with torch.device("cuda"):
+        attention.qkv_proj = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=head_dim,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+    attention.qkv_proj.weight.data.copy_(
+        torch.randn_like(attention.qkv_proj.weight) * 0.02
+    )
+    attention.qkv_proj.prepare_fp8_weight()
+    attention._project = lambda x: (x, None, 1)
+    attention.attn = Mock(
+        return_value=torch.zeros(rows, attention.q_size, device="cuda")
+    )
+    monkeypatch.setattr(
+        module, "weightless_rmsnorm_gated_sigmoid", lambda out, *args: out
+    )
+    normalized = torch.randn(rows, 8192, device="cuda").bfloat16()
+    decode_forward = mode == "DECODE"
+    expected = attention.qkv_proj.forward_rows(
+        normalized, decode_forward=decode_forward
+    )
+    assert (
+        torch.equal(expected, attention.qkv_proj(normalized)[0]) != decode_forward
+    )  # only the decode forward projects in FP8
+    fp8_launches = []
+    real_mm = module.mm
+
+    def counted_mm(*args, **kwargs):
+        # Counts, then runs, gemm.mm's FP8 calls; the result is the real one.
+        if kwargs.get("quant") == "fp8":
+            fp8_launches.append(args[0].shape[0])
+        return real_mm(*args, **kwargs)
+
+    monkeypatch.setattr(module, "mm", counted_mm)
+    ctx = _forward_context(mode, rows)
+    attention(torch.arange(rows, device="cuda"), normalized, ctx, None, True)
+    assert fp8_launches == ([rows] if decode_forward else [])
+    q, k, v, _, _ = attention.attn.call_args.args
+    q_end, kv_end = attention.q_size, attention.q_size + attention.kv_size
+    assert torch.equal(q, expected[:, :q_end])
+    assert torch.equal(k, expected[:, q_end:kv_end])
+    assert torch.equal(v, expected[:, kv_end : kv_end + attention.kv_size])
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny FP8 GEMM is gfx950-only"
+)
+def test_dense_fp8_refuses_a_projection_without_a_tuned_gemm_at_load() -> None:
+    """Preparing a projection whose shape the skinny FP8 GEMM has no config
+    for (the TP8 pre-expert slice) fails at load, naming it, instead of
+    running another FP8 kernel while serving."""
+    fp8 = module._DenseFp8Weight(
+        "qkv_proj",
+        True,
+        module._DENSE_FP8_QKV_MIN_ROWS,
+        module._DENSE_FP8_MAX_ROWS,
+    )
+    with pytest.raises(ValueError, match=r"qkv_proj projection \[2304, 8192\]"):
+        fp8.prepare(torch.zeros(2304, 8192, device="cuda", dtype=torch.bfloat16))
+
+
+def _loaded(model: MuseSparkForConditionalGeneration):
+    """``model`` as if its checkpoint (random weights) had loaded; the caller
+    sets the server arguments the warm-up reads."""
+    model._loaded_audio = {
+        name for name, _ in model.named_parameters() if name.startswith("audio_tower.")
+    }
+    # The loader's post-processing hooks, run before post_quant_warmup.
+    # Like the loader, this walks every module, so it asks for the hooks.
+    for _, layer in model.named_modules():
+        quant_method = getattr(layer, "quant_method", None)
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(layer)
+        process = getattr(layer, "process_weights_after_loading", None)
+        if process is not None:
+            process(layer)
+    return model
+
+
+@requires_gpu
+@pytest.mark.parametrize("value", ["none", "qkv"])
+def test_post_quant_warmup_converts_or_refuses_by_the_flag(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """At the default, loading a real model makes no FP8 copy. With the flag
+    on, loading converts the QKV weight and checks that a small-M FP8 GEMM
+    serves it: this model's [hidden 256] QKV has none, so loading refuses it
+    by name rather than serving another kernel."""
+    if value != "none" and not current_platform().is_cdna4:
+        pytest.skip("the skinny FP8 GEMM is gfx950-only")
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", value)
+    for key, setting in (
+        ("chunked_prefill_size", 8192),
+        ("max_cudagraph_capture_size", 64),
+        ("max_num_seqs", 64),
+        ("speculative_algorithm", None),
+    ):
+        monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    model = _loaded(_tiny_model())
+    if value == "none":
+        model.post_quant_warmup()
+        for layer in model.model.layers:
+            assert layer.self_attn.qkv_proj.dense_fp8.weight is None
+        return
+    with pytest.raises(
+        ValueError, match="no weight-streaming FP8 GEMM serves the qkv_proj projection"
+    ):
+        model.post_quant_warmup()
+
+
+def test_weight_update_is_refused_with_dense_fp8_copies(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _tiny_model()
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+
+    with pytest.raises(RuntimeError, match="dense-fp8-small-m"):
+        with weight_update_session([model], require_complete=False, cpu_group=None):
+            pass
+
+    assert not model._weight_update_active
 
 
 def _forward_ctx(decode: bool) -> SimpleNamespace:
@@ -2246,6 +2479,93 @@ def test_prefill_collective_payload_is_validated_in_server_args() -> None:
         ServerArgs(
             model="x", prefill_collective_payload="int8-block16", numerics="rl-bitwise"
         )
+
+
+@requires_gpu
+def test_dense_fp8_refuses_a_quantized_qkv_weight(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dense-fp8-small-m converts a BF16 QKV weight; a QKV projection with
+    a quantization method is refused when it is built, not left in BF16."""
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    with torch.device("cuda"), pytest.raises(ValueError, match="converts a BF16 QKV"):
+        QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=Fp8Config(),
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+
+
+@requires_gpu
+@pytest.mark.parametrize("monokernel_rows", [32, 40])
+def test_dense_fp8_refuses_monokernels_inside_a_window_before_any_copy(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch, monokernel_rows: int
+) -> None:
+    """Decode monokernels project in BF16, so a monokernel row limit inside an
+    enabled FP8 window is refused before any FP8 copy is made. With qkv the
+    window starts at 33: a 32-row limit passes that check (loading then
+    refuses this model's untuned QKV shape at the copy), a 40-row one is
+    refused first, with no copy made."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "qkv")
+    for key, setting in (
+        ("chunked_prefill_size", 8192),
+        ("max_cudagraph_capture_size", 64),
+        ("max_num_seqs", 64),
+        ("speculative_algorithm", None),
+    ):
+        monkeypatch.setitem(module.global_server_args_dict, key, setting)
+    # The real limit (16 rows) is below every window; raise it to test the check.
+    monkeypatch.setattr(module, "MONOKERNEL_MAX_ROWS", monokernel_rows)
+    model = _loaded(_tiny_model())
+    model.model.config.decode_monokernel = True
+    match = "decode monokernels" if monokernel_rows >= 33 else "no weight-streaming"
+    with pytest.raises(ValueError, match=match):
+        model.post_quant_warmup()
+    for layer in model.model.layers:
+        assert layer.self_attn.qkv_proj.dense_fp8.weight is None
+
+
+@requires_gpu
+def test_dense_fp8_none_keeps_the_bf16_projection_everywhere(
+    bf16_default_dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the default, none, preparing makes no copy and a QKV projection's
+    rows at every row count of decode and extend forwards are the BF16
+    projection's own bits (main's call)."""
+    monkeypatch.setitem(module.global_server_args_dict, "dense_fp8_small_m", "none")
+    with torch.device("cuda"):
+        layer = QKVOGateParallelLinear(
+            hidden_size=8192,
+            head_size=64,
+            total_num_heads=128,
+            total_num_kv_heads=16,
+            quant_config=None,
+            prefix="qkv_proj",
+            tp_rank=0,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            replicate_for_owned_rows=False,
+        )
+    layer.weight.data.copy_(torch.randn_like(layer.weight) * 0.02)
+    layer.prepare_fp8_weight()
+    assert layer.dense_fp8.weight is None and layer.dense_fp8.scale is None
+    x = torch.randn(129, 8192, device="cuda").bfloat16()
+    for rows in (1, 16, 17, 32, 33, 64, 65, 128, 129):
+        for decode_forward in (True, False):
+            assert not layer.dense_fp8.applies(rows, decode_forward=decode_forward)
+            assert torch.equal(
+                layer.forward_rows(x[:rows], decode_forward=decode_forward),
+                layer(x[:rows])[0],
+            )
 
 
 if __name__ == "__main__":

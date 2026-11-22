@@ -38,9 +38,11 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_process_weight,
     fp32_router_gemv_with_mm_supported,
     mm,
+    mm_has_kernel_with_features,
     mv,
     mv_weightless_rmsnorm_gated_sigmoid,
     mv_weightless_rmsnorm_gated_sigmoid_supported,
+    prepare_fp8_channel_weight,
 )
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
@@ -65,13 +67,18 @@ from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     AllReduceMailbox,
     KimiK3LatentDownOp,
 )
-from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant, rmsnorm_nvfp4_quant
+from tokenspeed_kernel.ops.quantization import (
+    quantize_fp8,
+    rmsnorm_mxfp4_quant,
+    rmsnorm_nvfp4_quant,
+)
 from tokenspeed_kernel.ops.residual import (
     boundary_gathers_mailbox,
     post_norm_residual_pre_norm,
     post_norm_residual_pre_norm_bf16,
     residual_gate_coefficients,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
@@ -129,6 +136,9 @@ from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.muse_spark_audio import MuseSparkAudioTower
 from tokenspeed.runtime.models.muse_spark_monokernel import (
+    MAX_ROWS as MONOKERNEL_MAX_ROWS,
+)
+from tokenspeed.runtime.models.muse_spark_monokernel import (
     MuseSparkMonokernelLayer,
     MuseSparkMonokernelState,
     enable_decode_monokernels,
@@ -176,6 +186,141 @@ _GATHER_MXFP4_MAX_ROWS = 320
 # Lamport window (172 rows of a 1024-wide shard). It matches the separate norm
 # within one BF16 ulp, not bit for bit, so it keeps its bound.
 _GATHER_RMSNORM_MAX_ROWS = 172
+# The row window of the FP8 dense GEMMs (--dense-fp8-small-m).
+_DENSE_FP8_MIN_ROWS = 17
+# The QKV projection's FP8 rows start higher: up to 32 rows its decode stays on
+# the BF16 projection.
+_DENSE_FP8_QKV_MIN_ROWS = 33
+_DENSE_FP8_MAX_ROWS = 128
+# The GEMM family the flag runs: a weight-streaming FP8 kernel with row and
+# channel scales. Loading refuses a projection no such kernel serves at either
+# end of its window; the serving call selects among the FP8 kernels by the
+# same traits, so with its own aligned, contiguous copies it takes that kernel.
+_DENSE_FP8_FEATURES = frozenset({"weight_streaming"})
+
+
+# The projections each --dense-fp8-small-m value runs in FP8.
+_DENSE_FP8_PROJECTIONS = {
+    "none": frozenset(),
+    "qkv": frozenset({"qkv"}),
+}
+# The first row of each projection's FP8 window.
+_DENSE_FP8_FIRST_ROWS = {"qkv": _DENSE_FP8_QKV_MIN_ROWS}
+
+
+def _dense_fp8_small_m(projection: str) -> bool:
+    """Whether --dense-fp8-small-m runs ``projection`` ("qkv") in FP8."""
+    if projection not in _DENSE_FP8_PROJECTIONS["qkv"]:
+        raise ValueError(f"unknown dense FP8 projection {projection!r}")
+    if (
+        projection
+        not in _DENSE_FP8_PROJECTIONS[global_server_args_dict["dense_fp8_small_m"]]
+    ):
+        return False
+    # Off gfx950 no small-M FP8 GEMM serves a projection, so loading refuses
+    # it (_DenseFp8Weight.prepare).
+    return True
+
+
+def _quantize_rows_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row FP8 codes and scales of ``x``, with the recipe the boundary's
+    FP8 copy uses (``token_fp8_amax_div``), so both give the same bits."""
+    return quantize_fp8(
+        x.contiguous(),
+        granularity="token",
+        scale_encoding="float32",
+        enable_pdl=False,
+        required_features=frozenset({"token_fp8_amax_div"}),
+    )
+
+
+class _DenseFp8Weight:
+    """A projection's FP8 copy for small-M decode GEMMs (--dense-fp8-small-m).
+
+    Holds an FP8 E4M3 copy of the projected weight with one FP32 scale per
+    output channel, made after loading, and projects decode rows in
+    ``[min_rows, max_rows]`` through it with per-row FP8 activations.
+    """
+
+    def __init__(self, name: str, enabled: bool, min_rows: int, max_rows: int) -> None:
+        self.name = name
+        self.enabled = enabled
+        self.min_rows = min_rows
+        self.max_rows = max_rows
+        self.weight: torch.Tensor | None = None
+        self.scale: torch.Tensor | None = None
+
+    def prepare(self, weight: torch.Tensor) -> None:
+        """Convert the loaded BF16 ``[N, K]`` weight when enabled, refusing a
+        shape no small-M FP8 kernel serves at either end of the window."""
+        if not self.enabled:
+            return
+        n, k = weight.shape
+        # Probe on placeholders of the copy's shape and layout, so a refusal
+        # comes before any conversion.
+        probe_weight = torch.empty(
+            (n, k), dtype=torch.float8_e4m3fn, device=weight.device
+        )
+        probe_scale = torch.ones(n, dtype=torch.float32, device=weight.device)
+        for rows in (self.min_rows, self.max_rows):
+            codes, scales = _quantize_rows_fp8(weight.new_zeros(rows, k))
+            if not mm_has_kernel_with_features(
+                codes,
+                probe_weight.t(),
+                A_scales=scales,
+                B_scales=probe_scale,
+                out_dtype=torch.bfloat16,
+                quant="fp8",
+                features=_DENSE_FP8_FEATURES,
+            ):
+                raise ValueError(
+                    f"--dense-fp8-small-m: no weight-streaming FP8 GEMM serves "
+                    f"the {self.name} projection [{n}, {k}] at {rows} rows"
+                )
+        self.weight, self.scale = prepare_fp8_channel_weight(weight)
+        # Compile the GEMM's binaries now (its warm-up compiles every row
+        # tile), whatever row counts the startup warm-up forwards run.
+        with kernel_warmup(enabled=True):
+            self.project(weight.new_zeros(self.min_rows, k), None)
+
+    def applies(self, rows: int, *, decode_forward: bool) -> bool:
+        """Whether a forward's ``rows`` rows project through the FP8 copy.
+
+        Only decode forwards (``ForwardMode.DECODE``: decode and verify steps)
+        do. Prefill, extend and mixed forwards stay BF16: prompt K / V stays
+        BF16; only the projections of generated (decode / verify) tokens are
+        quantized, so their K / V carry FP8 error and prompt K / V never does.
+        This is the only gate: the FP8 GEMM quantizes nothing, and every
+        producer and consumer of the FP8 copy asks this one predicate.
+        """
+        # Cheapest first: with the flag off no copy exists.
+        return (
+            self.weight is not None
+            and decode_forward
+            and self.min_rows <= rows <= self.max_rows
+        )
+
+    def project(self, x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+        """``x @ weight^T`` in BF16, into ``out`` when given: ``x`` is
+        quantized here, per row, with the FP8 row code. Callers check
+        ``applies`` first."""
+        rows, scales = _quantize_rows_fp8(x)
+        return mm(
+            rows,
+            self.weight.t(),
+            A_scales=scales,
+            B_scales=self.scale,
+            out=out,
+            out_dtype=torch.bfloat16,
+            quant="fp8",
+        )
+
+
+def _dense_fp8_weights(layer: torch.nn.Module) -> tuple["_DenseFp8Weight", ...]:
+    """A decoder layer's FP8 weight copies (--dense-fp8-small-m)."""
+    return (layer.self_attn.qkv_proj.dense_fp8,)
+
+
 _gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
@@ -702,6 +847,33 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
                 device=self.weight.device,
             )
         self.iris_state: MuseIrisState | None = None
+        # The local weight's FP8 copy (--dense-fp8-small-m qkv).
+        if _dense_fp8_small_m("qkv") and not isinstance(
+            self.quant_method, UnquantizedLinearMethod
+        ):
+            raise ValueError(
+                f"--dense-fp8-small-m converts a BF16 QKV weight; {prefix} is "
+                f"quantized by {type(self.quant_method).__name__}"
+            )
+        self.dense_fp8 = _DenseFp8Weight(
+            "qkv_proj",
+            _dense_fp8_small_m("qkv"),
+            _DENSE_FP8_QKV_MIN_ROWS,
+            _DENSE_FP8_MAX_ROWS,
+        )
+
+    def prepare_fp8_weight(self) -> None:
+        """Make the local weight's FP8 copy from the loaded weight."""
+        self.dense_fp8.prepare(self._local_weight().data)
+
+    def forward_rows(
+        self, input_: torch.Tensor, *, decode_forward: bool
+    ) -> torch.Tensor:
+        """Project normalized rows; the FP8 projection runs where
+        ``_DenseFp8Weight.applies``."""
+        if self.dense_fp8.applies(input_.shape[0], decode_forward=decode_forward):
+            return self.dense_fp8.project(input_, None)
+        return self(input_)[0]
 
     def _local_weight(self) -> torch.Tensor:
         if not self.replicate_for_owned_rows:
@@ -1110,7 +1282,9 @@ class MuseSparkAttention(nn.Module):
             elif normalized.shape[0] == 0:
                 return normalized.new_empty((0, self.hidden_size)), None, 1
             else:
-                qkv_gate, _ = self.qkv_proj(normalized)
+                qkv_gate = self.qkv_proj.forward_rows(
+                    normalized, decode_forward=ctx.forward_mode.is_decode()
+                )
             q, k, v, output_gate = qkv_gate.split(
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
@@ -1240,9 +1414,12 @@ class MuseSparkAttention(nn.Module):
         applies the gated norm and o_proj, all-reduces and runs the boundary
         (MuseIrisState.sliding_attention_boundary). Returns the FP32 residual,
         router input and pre-expert input. The caller checked
-        can_sliding_attention_boundary.
+        can_sliding_attention_boundary. ``normalized_fp8`` is the rows' per-row
+        FP8 copy from their producer, or None.
         """
-        qkv_gate, _ = self.qkv_proj(normalized)
+        qkv_gate = self.qkv_proj.forward_rows(
+            normalized, decode_forward=ctx.forward_mode.is_decode()
+        )
         q, k, v, output_gate = qkv_gate.split(
             (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
         )
@@ -3883,6 +4060,26 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             dp_lm_head_tp=False,
         )
 
+    def _log_dense_fp8_memory(self) -> None:
+        """Log, once a rank, each projection the flag runs in FP8 (shape and
+        row window) and the persistent memory its FP8 weight copies take."""
+        total = 0
+        projections: dict[str, str] = {}
+        for layer in self.model.layers:
+            for fp8 in _dense_fp8_weights(layer):
+                if fp8.weight is not None:
+                    total += fp8.weight.numel() * fp8.weight.element_size()
+                    total += fp8.scale.numel() * fp8.scale.element_size()
+                    n, k = fp8.weight.shape
+                    projections[fp8.name] = (
+                        f"{fp8.name} [{n}, {k}] at {fp8.min_rows}-{fp8.max_rows} rows"
+                    )
+        logger.info(
+            f"--dense-fp8-small-m {global_server_args_dict['dense_fp8_small_m']}: "
+            f"FP8 GEMMs for {', '.join(projections.values()) or 'no projection'}; "
+            f"FP8 weight copies take {total / 2**30:.2f} GiB on this rank"
+        )
+
     def begin_weight_update(self) -> None:
         # The column-split down copy is laid out for its kernel once and keeps
         # no checkpoint layout, so it cannot take new weights. Refuse before the
@@ -3901,6 +4098,9 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 "with --owned-attention-output all-to-all's gathered output "
                 "projections"
             )
+        if global_server_args_dict["dense_fp8_small_m"] != "none":
+            # Its FP8 weight copies are made once, after loading.
+            raise RuntimeError("live weight updates do not support --dense-fp8-small-m")
         super().begin_weight_update()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -4005,7 +4205,34 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
         for layer in self.model.layers:
             layer.self_attn.prepare_owned_output_weight()
+        fp8_value = global_server_args_dict["dense_fp8_small_m"]
+        if self.model.config.decode_monokernel and fp8_value != "none":
+            # A launch projects in BF16, so it must not take rows the regular
+            # path projects in FP8: refused before any copy is made.
+            first = min(
+                _DENSE_FP8_FIRST_ROWS[projection]
+                for projection in _DENSE_FP8_PROJECTIONS[fp8_value]
+            )
+            if MONOKERNEL_MAX_ROWS >= first:
+                raise ValueError(
+                    f"decode monokernels take up to {MONOKERNEL_MAX_ROWS} "
+                    f"rows, inside --dense-fp8-small-m {fp8_value}'s FP8 "
+                    f"windows, which start at {first} rows"
+                )
+        if fp8_value != "none":
+            # The QKV copy has a reader on every path.
+            for layer in self.model.layers:
+                layer.self_attn.qkv_proj.prepare_fp8_weight()
+            self._log_dense_fp8_memory()
         if self.model.config.decode_monokernel:
+            if fp8_value != "none":
+                logger.info(
+                    f"--dense-fp8-small-m "
+                    f"{global_server_args_dict['dense_fp8_small_m']} with decode "
+                    f"monokernels: decode steps of 1-{MONOKERNEL_MAX_ROWS} rows "
+                    "the monokernels take stay BF16; regular decode steps "
+                    "take the FP8 projections inside their row windows"
+                )
             enable_decode_monokernels(self.model)
         # The BF16 route kernels' warmup only compiles, so disable_autotune keeps it.
         mlps_to_warm = [
