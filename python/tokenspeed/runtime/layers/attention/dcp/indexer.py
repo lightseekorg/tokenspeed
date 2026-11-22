@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_exchange_input,
     all_gather,
+    all_gather_float_words_single,
     all_gather_single,
     all_to_all_single,
 )
@@ -819,7 +820,8 @@ def select_owned_dsa_topk(
         gathered = torch.empty(
             (len(group), send.numel()), device=q.device, dtype=torch.uint8
         )
-        all_gather_single(gathered.flatten(), send, group)
+        # FP32 scores and the query's float words.
+        all_gather_float_words_single(gathered.flatten(), send, group)
         scores = (
             gathered[:, :score_bytes].view(torch.float32).view(len(group), rows, topk)
         )
