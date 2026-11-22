@@ -164,6 +164,64 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
+### gfx950 skinny BF16 GEMM
+
+`gluon_mm_a16w16_skinny_gfx950` (`gemm/fp16/skinny.py`) computes `A @ B.T` for
+a few BF16 rows against a cold `[N, K]` weight whose read dominates.
+
+#### Contract
+
+- `A` is a contiguous `[M, K]` BF16 activation, `B` a contiguous `[N, K]` BF16
+  weight, the output a contiguous `[M, N]` BF16 tensor, all on one GPU and
+  each at a 16-byte aligned address. The launcher refuses strided and
+  unaligned tensors (the direct-to-LDS loads have no lowering without the
+  alignment).
+- It runs only the `(N, K)` shapes and row counts in `_SKINNY_CONFIGS`, each
+  measured faster than the other `gemm.mm` solutions with cold weights;
+  `supports_gluon_mm_a16w16_skinny_gfx950` answers for a problem.
+- M is a runtime argument. A launch runs the smaller of two row tiles, 64 or
+  128 rows, that covers M. The binaries (one per row tile, and the reduce)
+  depend only on the weight's shape: the kernels specialize no pointer, so
+  neither a tensor's alignment class nor whether its storage fits in 2 GB
+  keys a binary, and they state the 16-byte alignment instead.
+  `compile_gluon_mm_a16w16_skinny_gfx950(B)` compiles them without a launch,
+  whatever row count startup runs and wherever the served activation and
+  output live.
+- Nothing here compiles at import. A caller compiles at startup with
+  `compile_gluon_mm_a16w16_skinny_gfx950`; one that does not compiles each
+  row tile at its first launch.
+- A row's bits depend only on that row and the weight: not on M, on the row
+  tile, or on the other rows of the launch.
+- The first launch writes FP32 partials to scratch laid out
+  `[SPLIT_K, 128, N]` row-major: split `s`, row `m`, column `n` is element
+  `(s * 128 + m) * N + n`. Split `s` covers
+  `K[s * K / SPLIT_K : (s + 1) * K / SPLIT_K]`; rows at and past M are not
+  written. `_SKINNY_CONFIGS[(N, K)]` gives `SPLIT_K`.
+
+#### Algorithm
+
+- Each program owns one 64-column weight slab of one K slice
+  (`N / 64 * SPLIT_K` programs) and reads it from HBM once. All M rows form one
+  row tile, so the weight traffic does not grow with M.
+- A and B tiles go straight to LDS two K tiles ahead of the MFMA
+  (`32x32x16`) that reads them, through a ring of three LDS buffers. The K
+  loop is a real loop: unrolling it keeps every tile's offsets live, and the
+  VGPR count that follows costs the wave occupancy that hides HBM latency.
+  The K tile is 128 for the 64-row tile and 64 for the 128-row tile, so three
+  tiles fit LDS; it does not change the result.
+- B tiles sit in LDS as `[K, N]` with K contiguous, the weight's own order
+  and the MFMA operand's. One wave's direct-to-LDS load writes a contiguous
+  span of 512 elements (64 lanes of 16 bytes), so the layout pads between
+  spans; a shorter padding interval has no direct-to-LDS lowering.
+- `gluon_mm_a16w16_skinny_reduce_gfx950` then sums the partials in split order
+  (`((p0 + p1) + p2) + ...` in FP32) and rounds once to BF16. One program is
+  four waves of 16-byte loads: 16 rows of 64 columns. The alignment is
+  stated for the first split's base only; the other splits sit at constant
+  offsets from it, and a test asserts that every buffer load of the compiled
+  reduce is `buffer_load_dwordx4`, 16 bytes a lane.
+- The K split, the MFMA order inside a split, and the split summation order
+  depend only on `K` and `SPLIT_K`, which gives the row invariance above.
+
 ### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
@@ -253,11 +311,13 @@ the router's split-K GEMM and an independent BF16 decode GEMM
 
 - Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
   `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
-- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
-  four-wave decode GEMM config for `(M, N', K')`.
+- `N` a multiple of 16, `K` a multiple of 512, a measured four-wave decode
+  GEMM config for `(M, N', K')`, and `1 <= M <= 16`, or a larger `M` at which
+  the router's standalone plan takes the shared launch's router tile.
 - `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
-  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
-  rows and differ from the GEMV's in the last bits at 1-8 rows.
+  16 x 16 split-K-by-8 tile, so its logits equal the standalone router's
+  wherever that plan takes the same tile, and differ from it in the last bits
+  elsewhere.
 - One binary per decode GEMM M bucket; `warm_variants` compiles each of them
   at startup, as for the router GEMV.
 

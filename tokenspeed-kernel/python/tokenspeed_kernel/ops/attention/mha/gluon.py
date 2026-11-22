@@ -83,7 +83,7 @@ if current_platform().is_amd:
         # schedule select.
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "head_dim": frozenset({64, 128}),
+            "head_dim": frozenset({64, 128, 256}),
             "page_size": frozenset({64}),
             # A plain sliding mask cannot keep leading tokens visible outside the
             # window; an undeclared trait would serve every value and hand this
@@ -120,7 +120,7 @@ if current_platform().is_amd:
             },
         ),
         traits={
-            "head_dim": frozenset({64, 128}),
+            "head_dim": frozenset({64, 128, 256}),
             "page_size": frozenset({64}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
