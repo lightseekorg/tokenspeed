@@ -1163,6 +1163,102 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype, tree
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mamba2_prefill_conv_writing_qkv_matches_conv_then_split():
+    """Two prefill chunks give the same outputs and states bit for bit whether
+    the split pass or the convolution writes the C, B and x rows."""
+    from test.runtime.test_gdn_state_paging import _ContractPool, _extend_kwargs
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.platform import current_platform
+
+    import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+    heads, head_dim, groups, d_state, total, boundary = 8, 64, 2, 128, 45, 19
+    key_dim, value_dim = groups * d_state, heads * head_dim
+    conv_dim = 2 * key_dim + value_dim
+    # Both widths are 256-channel multiples: serving takes the direct write here.
+    assert mamba._prefill_conv_writes_qkv(key_dim, value_dim) is not (
+        current_platform().is_hopper
+    )
+    g = torch.Generator(device="cuda").manual_seed(11)
+    raw = torch.randn(total, conv_dim, generator=g, device="cuda").bfloat16()
+    a = torch.randn(total, heads, generator=g, device="cuda").bfloat16()
+    common = dict(
+        conv_weights=(
+            0.1 * torch.randn(conv_dim, 4, generator=g, device="cuda")
+        ).bfloat16(),
+        bias=None,
+        activation="silu",
+        key_dim=key_dim,
+        value_dim=value_dim,
+        attention_tp_size=1,
+        head_k_dim=d_state,
+        head_v_dim=head_dim,
+        b=None,
+        A_log=torch.log(torch.arange(1, heads + 1, device="cuda").float()),
+        dt_bias=torch.rand(heads, generator=g, device="cuda") - 4,
+        D=torch.rand(heads, generator=g, device="cuda"),
+        layer_id=0,
+    )
+
+    def run(direct):
+        conv = torch.zeros(5, conv_dim, 3, device="cuda", dtype=torch.bfloat16)
+        ssm = torch.zeros(5, heads, head_dim, d_state, device="cuda")
+        pool = _ContractPool({0: ("linear_attention", conv, ssm)})
+        backend = _backend(heads, head_dim, groups, d_state)
+        backend.set_kv_pool(pool)
+        backend.init_cuda_graph_state(2)
+        outputs = []
+        for before, after, row in ((0, boundary, [0, 1]), (boundary, total, [1, 3])):
+            backend.init_forward_metadata(
+                bs=1,
+                num_extends=1,
+                req_pool_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+                seq_lens=torch.tensor([after], dtype=torch.int32, device="cuda"),
+                forward_mode=ForwardMode.EXTEND,
+                block_tables={
+                    "linear_attention": torch.tensor(
+                        [row], dtype=torch.int32, device="cuda"
+                    )
+                },
+                **_extend_kwargs(
+                    torch,
+                    torch.tensor([after - before], dtype=torch.int32),
+                    torch.tensor([before], dtype=torch.int32),
+                    "cuda",
+                ),
+            )
+            with patch.object(mamba, "_prefill_conv_writes_qkv", lambda *_: direct):
+                outputs.append(
+                    backend.forward_extend(
+                        None,
+                        None,
+                        None,
+                        layer=None,
+                        out_cache_loc=None,
+                        token_to_kv_pool=pool,
+                        bs=1,
+                        forward_mode=ForwardMode.EXTEND,
+                        mixed_qkv=raw[before:after],
+                        a=a[before:after],
+                        seq_len=after - before,
+                        **common,
+                    )
+                )
+        return outputs, conv, ssm
+
+    (direct, direct_conv, direct_ssm), (split, split_conv, split_ssm) = (
+        run(True),
+        run(False),
+    )
+    for actual, expected in zip(direct, split, strict=True):
+        assert torch.equal(actual, expected)
+    assert torch.equal(direct_conv, split_conv)
+    assert torch.equal(direct_ssm, split_ssm)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shared_scale", [True, False])
 def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     shared_scale: bool,
