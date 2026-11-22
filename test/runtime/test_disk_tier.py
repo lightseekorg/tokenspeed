@@ -201,7 +201,7 @@ def _host_storage(monkeypatch) -> HostCacheStorage:
         group_specs=specs,
         num_host_lcm_blocks=8,
         block_alignment=DIRECT_IO_ALIGNMENT,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
 

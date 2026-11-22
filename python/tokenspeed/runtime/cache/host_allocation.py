@@ -18,87 +18,35 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Scoped CUDA host allocation settings for startup Host L2 storage."""
-
-from contextlib import contextmanager
+"""Pinned Host buffers honoring the user's PyTorch allocator policy."""
 
 HOST_BUFFER_ALIGNMENT_BYTES = 4096
 
 
-def validate_host_register_threads(threads: int) -> None:
-    if (
-        type(threads) is not int
-        or threads <= 0
-        or threads > 128
-        or threads & (threads - 1)
-    ):
-        raise ValueError(
-            "Host registration threads must be a power of two from 1 to 128"
-        )
-
-
-@contextmanager
-def host_register_settings(threads: int):
-    """Override only registration settings, restoring them even on failure.
-
-    PyTorch settings are process-wide; use during synchronous startup allocation,
-    before other threads allocate pinned storage.
-    """
+def host_register_enabled() -> bool:
+    """Whether the native CUDA host allocator currently uses registration."""
     import torch
 
-    validate_host_register_threads(threads)
-    before = torch.cuda.memory._snapshot()["allocator_settings"]
-    original = before["PYTORCH_CUDA_ALLOC_CONF"]
-    base = original.rstrip(",")
-    override = ",".join(
-        filter(
-            None,
-            [
-                base,
-                f"pinned_use_cuda_host_register:True,pinned_num_register_threads:{threads}",
-            ],
-        )
-    )
-    restore = ",".join(
-        filter(
-            None,
-            [
-                base,
-                (
-                    f"pinned_use_cuda_host_register:{before['pinned_use_cuda_host_register']},"
-                    f"pinned_num_register_threads:{before['pinned_num_register_threads']}"
-                ),
-            ],
-        )
-    )
-    try:
-        torch.cuda.memory._set_allocator_settings(override)
-        yield
-    finally:
-        # Omitted pinned options stay sticky, so restore effective values first.
-        torch.cuda.memory._set_allocator_settings(restore)
-        torch.cuda.memory._set_allocator_settings(original)
+    if torch.version.cuda is None or torch.cuda.get_allocator_backend() != "native":
+        return False
+    return torch.cuda.memory._snapshot()["allocator_settings"][
+        "pinned_use_cuda_host_register"
+    ]
 
 
-def allocate_host_buffer(nbytes: int, *, register_threads: int | None):
-    """Allocate pinned uint8 storage, optionally overriding startup registration.
+def allocate_host_buffer(nbytes: int, *, align: bool):
+    """Allocate pinned uint8 storage, optionally returning a 4 KiB-aligned view.
 
-    With an override, the returned view is 4 KiB aligned and retains its PyTorch
-    allocation. None preserves the caller's allocator policy and allocation size.
+    Allocation, registration and freeing always follow PyTorch's current policy.
+    The aligned view retains its backing allocation.
     """
     import torch
 
     if nbytes <= 0:
         raise ValueError("Host buffer size must be positive")
-    if register_threads is None:
-        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-    if not torch.cuda.is_available() or torch.version.cuda is None:
-        raise ValueError("Parallel Host registration requires CUDA")
-    with host_register_settings(register_threads):
-        backing = torch.empty(
-            nbytes + HOST_BUFFER_ALIGNMENT_BYTES - 1,
-            dtype=torch.uint8,
-            pin_memory=True,
-        )
+    padding = HOST_BUFFER_ALIGNMENT_BYTES - 1 if align else 0
+    backing = torch.empty(nbytes + padding, dtype=torch.uint8, pin_memory=True)
+    if not align:
+        return backing
     offset = (-backing.data_ptr()) % HOST_BUFFER_ALIGNMENT_BYTES
     return backing[offset : offset + nbytes]

@@ -1486,6 +1486,30 @@ class TestHostMemoryShareTest:
             )
         return executor, logger
 
+    @pytest.fixture
+    def registered_host_allocator(self):
+        torch = import_module("torch")
+        if torch.version.cuda is None or torch.cuda.get_allocator_backend() != "native":
+            pytest.skip("requires native CUDA allocator settings")
+        before = torch.cuda.memory._snapshot()["allocator_settings"]
+        original = before["PYTORCH_CUDA_ALLOC_CONF"]
+        base = original.rstrip(",")
+        try:
+            torch.cuda.memory._set_allocator_settings(
+                f"{base},pinned_use_cuda_host_register:True,pinned_num_register_threads:1".lstrip(
+                    ","
+                )
+            )
+            yield
+        finally:
+            restore = (
+                f"{base},pinned_use_cuda_host_register:{before['pinned_use_cuda_host_register']},"
+                f"pinned_num_register_threads:{before['pinned_num_register_threads']}"
+            )
+            torch.cuda.memory._set_allocator_settings(restore.lstrip(","))
+            torch.cuda.memory._set_allocator_settings(original)
+
+    @pytest.mark.usefixtures("registered_host_allocator")
     @pytest.mark.parametrize("offset", [0, -128])
     @pytest.mark.parametrize("block_bytes", [1024, 1 << 20])
     def test_explicit_size_keeps_alignment_inside_the_original_bucket(
@@ -1504,6 +1528,7 @@ class TestHostMemoryShareTest:
         if offset == 0 or block_bytes == 1024:
             assert "alignment padding" in logger.warning.call_args.args[0]
 
+    @pytest.mark.usefixtures("registered_host_allocator")
     def test_alignment_does_not_make_an_oversized_explicit_request_fit(self):
         with pytest.raises(ValueError, match="Not enough Host memory"):
             self._build(
@@ -1515,6 +1540,7 @@ class TestHostMemoryShareTest:
                 is_nvidia=True,
             )
 
+    @pytest.mark.usefixtures("registered_host_allocator")
     def test_native_ratio_budget_includes_alignment_padding(self):
         executor, _ = self._build(
             available_gb=(self.headroom + (1 << 30)) / self.GB,
@@ -1525,6 +1551,7 @@ class TestHostMemoryShareTest:
         )
         assert executor.num_host_pages - 1 == 1023
 
+    @pytest.mark.usefixtures("registered_host_allocator")
     def test_native_explicit_size_away_from_a_bucket_keeps_its_capacity(self):
         executor, logger = self._build(
             available_gb=956,
@@ -2061,16 +2088,18 @@ class TestCompactHostParentTest:
         # Both counts include the scheduler's null page.
         assert (executor.num_host_pages, executor.num_snapshot_pages) == (8, 2)
         if native:
+            aligned = before["pinned_use_cuda_host_register"]
+            padding = 4095 if aligned else 0
             l2_settings = allocation_settings[
-                executor.host_storage.host_buffer_bytes + 4095
+                executor.host_storage.host_buffer_bytes + padding
             ]
             snapshot_settings = allocation_settings[
                 executor.snapshot_storage.host_buffer_bytes
             ]
-            assert l2_settings["pinned_use_cuda_host_register"] is True
-            assert l2_settings["pinned_num_register_threads"] == 8
+            assert l2_settings == before
             assert snapshot_settings == before
-            assert executor.host_storage.host_buffer.data_ptr() % 4096 == 0
+            if aligned:
+                assert executor.host_storage.host_buffer.data_ptr() % 4096 == 0
         if is_nvidia:
             assert executor.host_storage.host_buffer.is_pinned()
             assert executor.snapshot_storage.host_buffer.is_pinned()

@@ -247,7 +247,7 @@ class HostCacheStorage:
         group_specs: Sequence[CacheGroupSpec],
         num_host_lcm_blocks: int,
         block_alignment: int,
-        host_register_threads: int | None,
+        align_host_buffer: bool,
     ):
         """
         Args:
@@ -255,7 +255,7 @@ class HostCacheStorage:
             group_specs: The scheduler's group specs, which size the shared
                 parent (``compute_host_lcm_block_bytes``).
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
-            host_register_threads: Startup-only registration override, or None.
+            align_host_buffer: Whether to align the pinned buffer to 4 KiB.
             block_alignment: Every packed block's size is a multiple of this
                 (``compute_host_lcm_block_bytes``).
         """
@@ -275,7 +275,7 @@ class HostCacheStorage:
         from tokenspeed.runtime.cache.host_allocation import allocate_host_buffer
 
         self.host_buffer = allocate_host_buffer(
-            self.host_buffer_bytes, register_threads=host_register_threads
+            self.host_buffer_bytes, align=align_host_buffer
         )
         if self.host_buffer.data_ptr() == 0 or not self.host_buffer.is_pinned():
             raise RuntimeError(

@@ -132,7 +132,7 @@ def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
             group_specs=_SPECS,
             num_host_lcm_blocks=2,
             block_alignment=1,
-            host_register_threads=None,
+            align_host_buffer=False,
         )
 
 
@@ -143,7 +143,7 @@ def test_block_offsets_follow_group_packing_without_overlap():
         group_specs=_SPECS,
         num_host_lcm_blocks=2,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
     # The 80-byte State rounds the parent up to three whole KV pages.
@@ -171,7 +171,7 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
         group_specs=_SPECS,
         num_host_lcm_blocks=3,
         block_alignment=4096,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
     assert storage.host_cache_block_bytes == (8192, 12288)
@@ -188,7 +188,7 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
             group_specs=_SPECS,
             num_host_lcm_blocks=1,
             block_alignment=0,
-            host_register_threads=None,
+            align_host_buffer=False,
         )
 
 
@@ -199,7 +199,7 @@ def test_the_host_block_capacity_is_the_densest_groups_blocks():
         group_specs=_SPECS,
         num_host_lcm_blocks=5,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
     assert storage.group_packing == (3, 1)
     assert host_block_capacity(storage, (1, 1)) == 15
@@ -215,7 +215,7 @@ def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
         group_specs=_SPECS,
         num_host_lcm_blocks=2,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
     with pytest.raises(IndexError):
@@ -253,7 +253,7 @@ def test_host_fields_are_packed_without_padding():
         group_specs=_SPECS,
         num_host_lcm_blocks=1,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
     assert storage.host_cache_block_bytes == (80, 1200)
@@ -278,7 +278,7 @@ def test_host_storage_does_not_retain_device_buffers():
         group_specs=_SPECS,
         num_host_lcm_blocks=2,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
     del layout, buffer
     gc.collect()
@@ -303,7 +303,7 @@ def test_shared_host_storage_packs_payloads_independently_of_device_strides():
         group_specs=(*_SPECS, _kv("aux")),
         num_host_lcm_blocks=2,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
     # Three 32-byte KV pages make the 96-byte parent: 19 aux payloads fit it.
@@ -342,7 +342,7 @@ def test_parent_packs_whole_kv_pages_beside_a_larger_state_checkpoint():
         group_specs=specs,
         num_host_lcm_blocks=2,
         block_alignment=1,
-        host_register_threads=None,
+        align_host_buffer=False,
     )
 
     # The State checkpoint is 8.63 full-attention pages: 8 pages leave a 7.3%

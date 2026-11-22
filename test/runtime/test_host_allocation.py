@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Real allocator restoration, aligned buffers and memory budgeting."""
+"""Allocator-policy preservation, aligned buffers and memory budgeting."""
 
 import gc
 import os
@@ -26,13 +26,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import psutil
 import pytest
 import torch
 
 from tokenspeed.runtime.cache.host_allocation import (
     allocate_host_buffer,
-    host_register_settings,
-    validate_host_register_threads,
+    host_register_enabled,
 )
 from tokenspeed.runtime.cache.transfer.lanes import (
     largest_pinned_fit,
@@ -42,25 +42,51 @@ from tokenspeed.runtime.cache.transfer.lanes import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, suite="runtime-1gpu")
+register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.cuda is None,
     reason="requires real CUDA allocator",
 )
-def test_async_allocator_starts_both_host_tiers():
-    # The device allocator backend is selected once, when Torch initializes.
+@pytest.mark.parametrize(
+    "variable,config",
+    [
+        ("PYTORCH_ALLOC_CONF", None),
+        (
+            "PYTORCH_ALLOC_CONF",
+            "pinned_use_cuda_host_register:False,pinned_num_register_threads:8",
+        ),
+        (
+            "PYTORCH_ALLOC_CONF",
+            "pinned_use_cuda_host_register:True,pinned_num_register_threads:1",
+        ),
+        (
+            "PYTORCH_ALLOC_CONF",
+            "pinned_use_cuda_host_register:True,pinned_num_register_threads:2",
+        ),
+        (
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+        ),
+        ("PYTORCH_ALLOC_CONF", "backend:cudaMallocAsync"),
+    ],
+    ids=["default", "disabled", "serial", "parallel2", "legacy_parallel8", "async"],
+)
+def test_allocator_environment_is_respected(variable, config):
+    # Each process starts with a fresh allocator and registration thread pool.
     env = dict(os.environ)
     env.pop("PYTORCH_ALLOC_CONF", None)
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    if config is not None:
+        env[variable] = config
+    env["OMP_NUM_THREADS"] = "1"
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            "import sys, torch, pytest; "
-            "assert torch.cuda.get_allocator_backend() == 'cudaMallocAsync'; "
-            "sys.exit(pytest.main(sys.argv[1:]))",
+            "-m",
+            "pytest",
+            f"{Path(__file__)}::test_host_buffer_keeps_allocator_policy",
             f"{Path(__file__).with_name('test_host_executor.py')}::TestCompactHostParentTest::test_both_tiers_use_the_parent_rounded_to_whole_kv_pages[True]",
             "-q",
             "-rs",
@@ -71,70 +97,41 @@ def test_async_allocator_starts_both_host_tiers():
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "1 passed" in result.stdout, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("threads", [0, -1, 3, 129, True])
-def test_invalid_thread_override_is_rejected(threads):
-    with pytest.raises(ValueError, match="power of two"):
-        validate_host_register_threads(threads)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.cuda is None,
-    reason="requires real CUDA allocator",
-)
-@pytest.mark.parametrize(
-    "config",
-    [
-        "pinned_use_cuda_host_register:False,pinned_num_register_threads:1",
-        "max_split_size_mb:256,garbage_collection_threshold:0.8,roundup_power2_divisions:[256:1,512:2,>:4],pinned_use_cuda_host_register:False,pinned_num_register_threads:1",
-        "max_split_size_mb:128,pinned_use_cuda_host_register:True,pinned_num_register_threads:4",
-    ],
-)
-@pytest.mark.parametrize("fail", [False, True])
-def test_settings_restore_after_success_and_exception(config, fail):
-    original = torch.cuda.memory._snapshot()["allocator_settings"]
-    try:
-        torch.cuda.memory._set_allocator_settings(config)
-        before = torch.cuda.memory._snapshot()["allocator_settings"]
-        try:
-            with host_register_settings(8):
-                active = torch.cuda.memory._snapshot()["allocator_settings"]
-                assert active["pinned_use_cuda_host_register"] is True
-                assert active["pinned_num_register_threads"] == 8
-                if fail:
-                    raise RuntimeError("allocation interrupted")
-        except RuntimeError as error:
-            assert fail and str(error) == "allocation interrupted"
-        assert torch.cuda.memory._snapshot()["allocator_settings"] == before
-    finally:
-        restore = original["PYTORCH_CUDA_ALLOC_CONF"].rstrip(",")
-        restore += f",pinned_use_cuda_host_register:{original['pinned_use_cuda_host_register']},pinned_num_register_threads:{original['pinned_num_register_threads']}"
-        torch.cuda.memory._set_allocator_settings(restore.lstrip(","))
-        torch.cuda.memory._set_allocator_settings(original["PYTORCH_CUDA_ALLOC_CONF"])
+    assert "2 passed" in result.stdout, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.cuda is None,
     reason="requires pinned memory and CUDA",
 )
-def test_aligned_buffer_survives_views_and_restores_later_allocations():
-    before = torch.cuda.memory._snapshot()["allocator_settings"]
-    buffer = allocate_host_buffer((2 << 20) + 37, register_threads=8)
-    assert buffer.is_pinned() and buffer.data_ptr() % 4096 == 0
-    assert buffer.numel() == (2 << 20) + 37
+def test_host_buffer_keeps_allocator_policy():
+    torch.cuda.init()
+    warmup = torch.empty(1, dtype=torch.uint8, pin_memory=True)
+    native = torch.cuda.get_allocator_backend() == "native"
+    before = torch.cuda.memory._snapshot()["allocator_settings"] if native else None
+    aligned = host_register_enabled()
+    before_threads = psutil.Process().num_threads()
+    buffer = allocate_host_buffer((2 << 20) + 37, align=aligned)
+    if before is not None and (
+        not before["pinned_use_cuda_host_register"]
+        or before["pinned_num_register_threads"] == 1
+    ):
+        # Allow driver housekeeping, but never an implicit 128-thread pool.
+        assert psutil.Process().num_threads() <= before_threads + 8
+    assert buffer.is_pinned() and buffer.numel() == (2 << 20) + 37
+    if aligned:
+        assert buffer.data_ptr() % 4096 == 0
     buffer.fill_(17)
     tail = buffer[-37:]
-    del buffer
+    del buffer, warmup
     gc.collect()
     assert torch.all(tail.to("cuda", non_blocking=True) == 17).item()
-    assert torch.cuda.memory._snapshot()["allocator_settings"] == before
-    snapshot = allocate_host_buffer(1 << 20, register_threads=None)
+    snapshot = allocate_host_buffer(1 << 20, align=False)
     snapshot.fill_(29)
     assert torch.all(snapshot.to("cuda", non_blocking=True) == 29).item()
     torch.cuda.synchronize()
-    assert torch.cuda.memory._snapshot()["allocator_settings"] == before
+    if native:
+        assert torch.cuda.memory._snapshot()["allocator_settings"] == before
 
 
 def test_l2_alignment_padding_fits_the_pinned_reservation():

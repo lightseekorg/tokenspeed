@@ -502,14 +502,30 @@ Trainer-side contract:
 
 ## Scheduler and memory
 
-On NVIDIA CUDA with the native PyTorch allocator, Host L2 startup allocation
-uses eight parallel page-touch threads and `cudaHostRegister`, with a
-4 KiB-aligned buffer. No startup flag or
-global pinned-allocator override is needed. Original PyTorch allocator settings
-are restored on success or failure before snapshot and later allocations.
-Other platforms and non-native CUDA allocators keep their existing allocation
-policy, without an override or alignment padding. This does not bind CPUs
-or memory to NUMA nodes.
+Host L2 allocation honors PyTorch's original allocator environment variables;
+TokenSpeed does not temporarily override the user's registration or thread
+settings. With no allocator configuration, the original serial path is used.
+To opt into parallel page touching and `cudaHostRegister`, set before startup:
+
+```bash
+export PYTORCH_ALLOC_CONF="pinned_use_cuda_host_register:True,pinned_num_register_threads:8"
+```
+
+The legacy name `PYTORCH_CUDA_ALLOC_CONF` remains supported by PyTorch. Keep any
+existing allocator options in the same value. `pinned_num_register_threads`
+accepts powers of two from 1 to 128; use 1 for serial registration, or disable
+registration with `pinned_use_cuda_host_register:False`.
+
+The parallel task count is not the thread-pool size: PyTorch 2.14 creates a
+persistent 128-thread pool on the first sufficiently large parallel registration.
+Choosing 2 or 4 tasks still creates that pool. Leave registration disabled or
+use one task in environments with tight thread or virtual-memory limits.
+These options affect all PyTorch pinned allocations, including the snapshot
+pool. They do not bind CPUs or memory to NUMA nodes.
+
+On NVIDIA with the native allocator and registration enabled, the L2 buffer
+uses a 4 KiB-aligned view and includes its alignment padding in the Host memory
+budget. Other policies keep their original allocation sizes.
 
 | Parameter | Purpose |
 | --- | --- |
