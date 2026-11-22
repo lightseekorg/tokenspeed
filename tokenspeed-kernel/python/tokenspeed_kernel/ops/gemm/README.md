@@ -236,14 +236,32 @@ either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
 
 `hipblaslt.py` is the runtime entry point; the loader, the stack check and the
 tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
-`_hipblaslt/configs/`, one per GPU, named like the Triton kernel configs after
-`torch.cuda.get_device_name()` with spaces replaced by underscores, such as
-`device_name=AMD_Instinct_MI355X.csv`. Serving loads the file of its GPU
-automatically, through `hipblaslt.py`, once per process and before graph
-capture, and replays it read-only through PyTorch TunableOp. GEMMs the file
-does not list keep the default solution. Serving never rewrites the file, and
-tunes only with the opt-in switch below. A GPU without a file keeps the
-defaults.
+`_hipblaslt/configs/`, in two kinds, because TunableOp checks solutions against
+the GPU architecture and library builds stamped in a file, not the GPU model,
+and some drivers report a generic device name such as `AMD Radeon Graphics`:
+
+- `gcn_arch=`*`architecture`*`.csv` serves every GPU whose `gcnArchName` equals the
+  file's `GCN_ARCH_NAME` stamp. It holds only rows verified on every GPU model
+  of that architecture to write the default solution's bits and not be slower.
+- `device_name=`*`name`*`.csv`, named after `torch.cuda.get_device_name()` with
+  spaces replaced by underscores, adds rows for one GPU model. Its solutions
+  may be chosen for speed alone and change result bits. It never lists a GEMM
+  its architecture file lists.
+
+Serving loads the architecture file and then the device file of its GPU
+(`find_hipblaslt_tuned_files`) automatically, through `hipblaslt.py`, once per
+process and before graph capture, and replays them read-only through PyTorch
+TunableOp. GEMMs the files do not list keep the default solution. Serving never
+rewrites a file, and tunes only with the opt-in switch below. A GPU with
+neither file logs a warning that its GEMMs run untuned and keeps the defaults.
+Each file loads only when its own stamp matches the running stack; a stale
+device file is skipped with a warning and the architecture file still loads.
+
+The tuning tool, run as in the following command, writes the device file of
+the GPU it runs on: it reads the architecture file first, so those GEMMs are
+not re-timed, and keeps them out of its output. A row moves to the
+architecture file only once it is checked on every model of the architecture
+to keep the default's bits and not be slower.
 
 A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
 versions and the GPU architecture stamped in its `Validator` rows. On any
@@ -258,7 +276,10 @@ python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
     --rows 64,128,192,256,384,512
 ```
 
-Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
+Without `--out`, the tool writes this GPU's device file in
+`_hipblaslt/configs/`, except on a GPU whose driver reports a generic device
+name (`GENERIC_DEVICE_NAMES`): a file named after it would load on every model
+reporting that name, so the tool refuses and `--out` must be passed. If
 the file exists with the running stack's stamp, its GEMMs are kept and only
 new ones are timed, so one file can cover several models; on another stack
 the tool stops, and the file must be deleted to re-tune. Tuning rotates
@@ -266,12 +287,10 @@ weight copies through `--cold-bytes`, so each timing reads the weight from
 HBM as a serving step does. Another solution can sum K in another order, so
 results differ from the default within BF16 rounding.
 
-The MI355X file also lists Muse Spark TP4 decode and prefill GEMMs whose
-solution was chosen among those that give the default's bits, not only the
-fastest: the output projection (8192 x 2048) at 49-96 and 320 rows, the MoE
-unpooler (8192 x 4096) at 74-96 rows, and three prefill shapes at one row
-count each. Re-tuning the file should keep those rows, or re-pick them by
-the same rule.
+A row of an architecture file is chosen among the solutions that give the
+default's bits, not only the fastest, and checked on every GPU model of the
+architecture. Re-tuning should keep those rows, or re-pick them by the same
+rule.
 
 To cover GEMMs the file does not list without regenerating it, such as a new
 model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).
