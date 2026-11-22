@@ -147,6 +147,8 @@ __all__ = [
     "mxfp4_swiglu_linear",
     "prepare_mxfp4_linear",
     "mm",
+    "prepare_fp8_channel_weight",
+    "mm_has_kernel_with_features",
     "prepare_mxfp8_weight_scales",
     "prepare_nvfp4_a16_weights",
 ]
@@ -611,6 +613,8 @@ def _mm_traits(
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "a_scales_layout": _scales_major(A_scales),
         "b_contiguous": B.is_contiguous(),
+        # A KN view of a contiguous [N, K] weight; a row-strided weight is not.
+        "b_t_contiguous": B.t().is_contiguous(),
         "b_inner_stride_one": B.stride(-1) == 1,
         "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
@@ -621,7 +625,9 @@ def _mm_traits(
         "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
     }
-    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+    if quant == "fp8" or (
+        quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128)
+    ):
         # Offset views can break alignment; online quantization allocates aligned ones.
         traits["operands_aligned_16"] = (
             online_contiguous_a or A.data_ptr() % 16 == 0
@@ -630,6 +636,10 @@ def _mm_traits(
         traits["scales_aligned_16"] = (
             A_scales is None or A_scales.data_ptr() % 16 == 0
         ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
+        # The scale granularity says only "not both per-tensor"; these say
+        # which side has one scale per row (A) or per output channel (B).
+        traits["a_scales_per_row"] = A_scales is not None and A_scales.numel() == M
+        traits["b_scales_per_channel"] = B_scales is not None and B_scales.numel() == N
 
     if A.dtype == B.dtype == torch.bfloat16:
         traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0
@@ -695,6 +705,125 @@ def mm_activation_scale_layout(
         "gemm", "mm", signature, traits=traits, solution=solution, override=override
     )
     return "mn_major" if _reads_mn_major_scales(kernel.name) else "k_major"
+
+
+def mm_has_kernel_with_features(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    quant: str | None,
+    features: frozenset[str],
+) -> bool:
+    """Whether a registered ``gemm.mm`` kernel offering ``features`` serves
+    this problem, by the same signature and traits ``mm`` selects with.
+
+    A load-time capability check for a caller whose flag promises a kernel
+    family: it refuses at startup rather than let ``mm`` serve the problem
+    with another kernel.
+
+    Args:
+        A, B, A_scales, B_scales, out_dtype, quant: As for :func:`mm`.
+        features: Operator features the kernel must offer.
+
+    Returns:
+        True when such a kernel is selectable for these operands.
+    """
+    return (
+        _mm_selected_kernel_name(
+            A,
+            B,
+            A_scales=A_scales,
+            B_scales=B_scales,
+            out_dtype=out_dtype,
+            quant=quant,
+            features=features,
+        )
+        is not None
+    )
+
+
+def _mm_selected_kernel_name(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    quant: str | None,
+    features: frozenset[str] | None,
+) -> str | None:
+    """The kernel ``mm`` would select for these operands (no ``out``,
+    ``alpha`` or override), requiring ``features`` (None: no requirement);
+    None when no kernel serves them. The other arguments are as for
+    :func:`mm`."""
+    M, K = A.shape
+    # mm's own reading of B's layout and width.
+    b_layout = "KN" if B.shape[0] == K else "NK"
+    N = B.shape[-1] if b_layout == "KN" else B.shape[0]
+    traits = _mm_traits(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        M=M,
+        N=N,
+        K=K,
+        b_layout=b_layout,
+        out=None,
+        out_dtype=out_dtype,
+        alpha=None,
+        quant=quant,
+        block_size=None,
+        enable_pdl=False,
+    )
+    signature = _gemm_format_signature(A, B, A_scales, B_scales, out_dtype, quant, None)
+    try:
+        selected = select_kernel(
+            "gemm", "mm", signature, traits=traits, features=features
+        )
+    except NoKernelFoundError:
+        return None
+    return selected.name
+
+
+def prepare_fp8_channel_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a BF16 ``[N, K]`` weight for ``mm(quant="fp8")`` with channel scales.
+
+    Each output channel is one row of the per-row FP8 E4M3 code the
+    activations use (``ops/quantization/_triton_fp8_rows.py``): its scale is
+    ``max(channel amax / 448, 1e-12)`` and its codes the channel divided by
+    that scale, both by IEEE FP32 division. ``weight`` must be finite.
+
+    Args:
+        weight: ``[N, K]`` BF16 weight.
+
+    Returns:
+        A contiguous FP8 E4M3 ``[N, K]`` copy and its FP32 ``[N]`` scales.
+    """
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        raise ValueError(
+            f"expected a 2-D BF16 weight, got {weight.dtype} {weight.dim()}-D"
+        )
+    # Named, not selected through the registry: the weight must take the exact
+    # row code the activations take (the token_fp8_amax_div feature), and this
+    # portable Triton solution is the one that defines it.
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_quantize_fp8_per_token_amax_div,
+    )
+
+    codes, scales = triton_quantize_fp8_per_token_amax_div(
+        weight.contiguous(),
+        granularity="token",
+        group_size=None,
+        scale_encoding="float32",
+        enable_pdl=False,
+    )
+    return codes, scales.view(-1)
 
 
 def mm(
