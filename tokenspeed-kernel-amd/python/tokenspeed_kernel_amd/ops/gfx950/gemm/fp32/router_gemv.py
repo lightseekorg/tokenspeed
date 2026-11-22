@@ -26,7 +26,9 @@ import torch
 from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+    DECODE_M_BUCKETS,
     GROUP_SIZE_M,
+    _choose_any_forward_decode_config,
     _choose_decode_config,
     _get_partial_scratch,
     gluon_mm_a16w16_medium_gfx950,
@@ -522,13 +524,26 @@ def launch_gluon_fp32_router_gemv_gfx950(
 
 
 # Router tiles (BLOCK_M, BLOCK_N, SPLIT_K, waves, chunks) when the router
-# shares a launch with a decode GEMM: the 9-64 row split-K tile, 128 programs
-# at 256 outputs. Its programs read 32 KB of activations each where a
-# one-output GEMV program reads all 256 KB. Next to a 512 x 8192 decode
+# shares a launch with a decode GEMM: 128 programs per 16-row band at 256
+# outputs. Its programs read 32 KB of activations each where a one-output
+# GEMV program reads all 256 KB. Next to a 512 x 8192 decode
 # GEMM's 128 programs, this tile beat the GEMV (two outputs per program) at
 # 8 rows in graph replay on MI355X.
 _WITH_MM_ROUTER_CONFIG = (16, 16, 8, 4, 1)
-_WITH_MM_MAX_ROWS = 16
+# Up to this many rows the shared launch serves every router shape it fits.
+_WITH_MM_ANY_ROUTER_MAX_ROWS = 16
+# Past that, it serves only row counts at which the router's standalone plan
+# (_PREFERRED_SPLITK_CONFIGS) takes this same tile, so the logits keep the
+# standalone router's bits; the largest such count bounds the warm-up.
+_WITH_MM_MAX_ROWS = max(
+    [_WITH_MM_ANY_ROUTER_MAX_ROWS]
+    + [
+        bound
+        for buckets in _PREFERRED_SPLITK_CONFIGS.values()
+        for bound, config in buckets.items()
+        if config == _WITH_MM_ROUTER_CONFIG
+    ]
+)
 _MM_GROUP_SIZE_M = gl.constexpr(GROUP_SIZE_M)
 
 
@@ -574,22 +589,27 @@ def gluon_fp32_router_gemv_mm_a16w16_gfx950(
     ``c = a @ b.T``. Neither waits on the other, so the launch saves one kernel
     boundary and both weight streams share the CUs.
     """
-    if gl.program_id(0) < ROUTER_PROGRAMS:
-        gluon_fp32_router_gemv_splitk_gfx950(
-            x_ptr,
-            weight_ptr,
-            out_ptr,
-            router_partial_ptr,
-            router_counter_ptr,
-            M,
-            K,
-            N,
-            BLOCK_M,
-            BLOCK_N,
-            SPLIT_K,
-            CHUNKS,
-            MULTIPLIER,
-        )
+    pid = gl.program_id(0)
+    if pid < ROUTER_PROGRAMS:
+        # ROUTER_PROGRAMS covers the decode row bucket's largest row count, so
+        # it is fixed per compiled bucket; programs past this batch's router
+        # tiles have no work. The kernel maps the rest to (tile, split) from M.
+        if pid < gl.cdiv(M, BLOCK_M) * (N // BLOCK_N) * SPLIT_K:
+            gluon_fp32_router_gemv_splitk_gfx950(
+                x_ptr,
+                weight_ptr,
+                out_ptr,
+                router_partial_ptr,
+                router_counter_ptr,
+                M,
+                K,
+                N,
+                BLOCK_M,
+                BLOCK_N,
+                SPLIT_K,
+                CHUNKS,
+                MULTIPLIER,
+            )
     else:
         gluon_mm_a16w16_medium_gfx950(
             a_ptr, b_ptr, c_ptr, c_ptr, c_ptr, partial_ptr, counter_ptr, M, MM_N,
@@ -600,20 +620,49 @@ def gluon_fp32_router_gemv_mm_a16w16_gfx950(
         )  # fmt: skip
 
 
-def supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(
-    rows: int, n: int, k: int, mm_n: int, mm_k: int
+def _supports_router_gemv_mm(
+    rows: int, n: int, k: int, mm_config: tuple[int, ...] | None
 ) -> bool:
-    """Whether ``rows`` router rows and the ``[mm_n, mm_k]`` decode GEMM share a launch."""
     block_m, block_n, split_k, waves, _ = _WITH_MM_ROUTER_CONFIG
-    mm_config = _choose_decode_config(rows, mm_n, mm_k)
     return (
-        0 < rows <= _WITH_MM_MAX_ROWS
+        0 < rows
         and n % block_n == 0
         and k % (split_k * waves * 16) == 0
         and mm_config is not None
         # Both halves run the same wave count, the launch's num_warps.
         and mm_config[3] * mm_config[4] == waves
     )
+
+
+def supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(
+    rows: int, n: int, k: int, mm_n: int, mm_k: int
+) -> bool:
+    """Whether ``rows`` router rows and the ``[mm_n, mm_k]`` decode GEMM share a
+    launch in any forward: up to 16 rows, a decode GEMM entry for every forward."""
+    return rows <= _WITH_MM_ANY_ROUTER_MAX_ROWS and _supports_router_gemv_mm(
+        rows, n, k, _choose_any_forward_decode_config(rows, mm_n, mm_k)
+    )
+
+
+def supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950(
+    rows: int, n: int, k: int, mm_n: int, mm_k: int
+) -> bool:
+    """Whether they share a launch in a decode / verify forward: also past 16
+    rows where the router's standalone plan takes the shared tile, and with
+    the decode GEMM's decode-only entries."""
+    return (
+        rows <= _WITH_MM_ANY_ROUTER_MAX_ROWS
+        or _choose_splitk_config(rows, n, k) == _WITH_MM_ROUTER_CONFIG
+    ) and _supports_router_gemv_mm(rows, n, k, _choose_decode_config(rows, mm_n, mm_k))
+
+
+def _router_programs_with_mm(rows: int, n: int) -> int:
+    """Router programs of a router + decode GEMM launch: sized for the largest
+    row count of ``rows``' decode bucket, a compile-time value fixed per bucket
+    (the kernel idles the programs past the batch's tiles)."""
+    bucket = next(bound for bound in DECODE_M_BUCKETS if rows <= bound)
+    block_m, block_n, split_k = _WITH_MM_ROUTER_CONFIG[:3]
+    return triton.cdiv(bucket, block_m) * (n // block_n) * split_k
 
 
 def gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows: int, n: int) -> int:
@@ -640,9 +689,7 @@ def _mm_launch(
     n = weight.shape[0]
     mm_n, mm_k = mm_b.shape
     block_m, block_n, split_k, waves, chunks = _WITH_MM_ROUTER_CONFIG
-    router_programs = (
-        gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, n) * split_k
-    )
+    router_programs = _router_programs_with_mm(rows, n)
     mm_block_m, mm_block_n, mm_block_k, warps_m, warps_n, buffers, mm_split, xcds = (
         _choose_decode_config(rows, mm_n, mm_k)
     )
@@ -693,19 +740,25 @@ def _compile_router_mm_variants(x, weight, multiplier: float, mm_b) -> None:
     """Compile, without launching, the router + decode GEMM launch per bucket.
 
     One binary per decode GEMM bucket that a row count up to _WITH_MM_MAX_ROWS
-    selects: the MM_* tile is compile-time and follows the bucket. Stand-in
-    tensors have the dtypes and shapes serving allocates.
+    selects: the MM_* tile and the router program count are compile-time and
+    follow the bucket. Stand-in tensors have the dtypes and shapes serving
+    allocates.
     """
     k, n = x.shape[1], weight.shape[0]
     mm_n, mm_k = mm_b.shape
     seen = set()
     for rows in range(1, _WITH_MM_MAX_ROWS + 1):
-        if not supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(rows, n, k, mm_n, mm_k):
+        if not supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950(
+            rows, n, k, mm_n, mm_k
+        ):
             continue
         config = _choose_decode_config(rows, mm_n, mm_k)
-        if config in seen:
+        # The binary keys on the decode tile and the bucket-sized router
+        # program count, which buckets sharing a tile can still differ in.
+        key = (config, _router_programs_with_mm(rows, n))
+        if key in seen:
             continue
-        seen.add(config)
+        seen.add(key)
         block_m, block_n, split_k = _WITH_MM_ROUTER_CONFIG[:3]
         router_tiles = gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, n)
         mm_out = mm_b.new_empty((rows, mm_n))
@@ -750,8 +803,9 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
     """Project FP32 router rows and compute ``mm_out = mm_a @ mm_b.T`` in one launch.
 
     The router runs the split-K GEMM for every supported row count, so its
-    logits round as that GEMM's do at 9-16 rows; ``mm_out`` is bitwise what
-    the decode GEMM alone writes.
+    logits round as that GEMM's do wherever the router's standalone plan
+    takes the same tile; ``mm_out`` is bitwise what the decode GEMM alone
+    writes.
 
     Args:
         x: Contiguous FP32 router rows ``[M, K]``.
@@ -775,7 +829,9 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
     rows, k = x.shape
     n = weight.shape[0]
     mm_n, mm_k = mm_b.shape
-    if not supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(rows, n, k, mm_n, mm_k):
+    if not supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950(
+        rows, n, k, mm_n, mm_k
+    ):
         raise ValueError(
             f"router + decode GEMM launch does not support {rows} rows of a "
             f"[{n}, {k}] router with a [{mm_n}, {mm_k}] GEMM"
@@ -838,6 +894,7 @@ __all__ = [
     "gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950",
     "gluon_fp32_router_gemv_num_counters_gfx950",
     "launch_gluon_fp32_router_gemv_mm_a16w16_gfx950",
+    "supports_gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950",
     "supports_gluon_fp32_router_gemv_mm_a16w16_gfx950",
     "launch_gluon_fp32_router_gemv_gfx950",
     "transpose_fp32_router_weight_gfx950",

@@ -1453,11 +1453,18 @@ class PreparedFP32RouterGEMV(nn.Module):
         )
 
     def supports_with_mm(
-        self, x: torch.Tensor, mm_a: torch.Tensor, mm_b: torch.Tensor
+        self,
+        x: torch.Tensor,
+        mm_a: torch.Tensor,
+        mm_b: torch.Tensor,
+        decode_forward: bool,
     ) -> bool:
-        """Whether :meth:`forward_with_mm` serves these rows and GEMM."""
+        """Whether :meth:`forward_with_mm` serves these rows and GEMM: any
+        forward at up to 16 rows with a decode GEMM entry for every forward,
+        and past that or with a decode-only entry only a decode / verify
+        forward (``decode_forward``)."""
         return self.prepared_weight is not None and fp32_router_gemv_with_mm_supported(
-            self._plan, x, mm_a, mm_b
+            self._plan, x, mm_a, mm_b, decode_forward
         )
 
     def forward_with_mm(
@@ -1466,10 +1473,18 @@ class PreparedFP32RouterGEMV(nn.Module):
         mm_a: torch.Tensor,
         mm_b: torch.Tensor,
         mm_out: torch.Tensor,
+        decode_forward: bool,
     ) -> torch.Tensor:
         """Project router rows and write ``mm(mm_a, mm_b)`` to ``mm_out`` in one launch."""
         return fp32_router_gemv_execute_with_mm(
-            self._plan, x, self.prepared_weight, self.multiplier, mm_a, mm_b, mm_out
+            self._plan,
+            x,
+            self.prepared_weight,
+            self.multiplier,
+            mm_a,
+            mm_b,
+            mm_out,
+            decode_forward,
         )
 
 
@@ -2090,8 +2105,8 @@ class MuseSparkMoE(nn.Module):
         """Route and quantize decode rows in two or three launches, or None.
 
         The top-k shares a launch with the column gather, RMSNorm and MXFP4
-        quantization, and up to the router's shared-launch row limit the router
-        shares one with this rank's pre-expert columns. Neither launch has a
+        quantization, and the router shares one with this rank's pre-expert
+        columns where :meth:`supports_with_mm` holds for ``decode_forward``. Neither launch has a
         dependency between its halves, so this replaces four launches with two
         (three past that limit). Returns the BF16 placeholder rows, the MXFP4
         rows, the router logits and the top-k weights and ids.
@@ -2116,13 +2131,15 @@ class MuseSparkMoE(nn.Module):
             local, norm.weight, bias, self.topk
         ):
             return None
-        if self.gate.supports_with_mm(router_input, hidden_states, weight):
+        if self.gate.supports_with_mm(
+            router_input, hidden_states, weight, decode_forward
+        ):
             router_logits = self.gate.forward_with_mm(
-                router_input, hidden_states, weight, local
+                router_input, hidden_states, weight, local, decode_forward
             )
         else:
-            # Rows past the router's shared-launch limit leave the router and
-            # this rank's pre-expert columns a launch each.
+            # Rows the shared launch does not serve in this forward leave the
+            # router and this rank's pre-expert columns a launch each.
             router_logits = self.gate(router_input, pdl_enabled())
             projection._project(hidden_states, weight, local, decode_forward)
         quantized, topk_weights, topk_ids = iris.all_gather_rmsnorm_mxfp4_quant_topk(

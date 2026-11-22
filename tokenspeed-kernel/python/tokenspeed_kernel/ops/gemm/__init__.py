@@ -169,6 +169,9 @@ _fp8_dtype = torch.float8_e4m3fn
 #   <dim>_min            spec only: set of accepted minimums for <dim>
 #   mnk_problem_filter   spec only: ``(m, n, k) -> bool`` predicates for rules
 #                        the above cannot express
+#   problem_filter       spec only: predicates over named request traits
+#                        (``selection.traits_problem_filter``), for rules that
+#                        also read traits other than m, n and k
 #
 # ``selection.spec_matches_shape_traits`` evaluates these; a spec that
 # constrains a dimension rejects a request that does not supply it. Every
@@ -4706,6 +4709,7 @@ def _select_fp32_router_gemv_with_mm(
     x: torch.Tensor,
     mm_a: torch.Tensor,
     mm_b: torch.Tensor,
+    decode_forward: bool,
 ) -> SelectedKernel | None:
     """Select the launch that runs the router next to a decode GEMM, or None."""
     if (
@@ -4740,6 +4744,7 @@ def _select_fp32_router_gemv_with_mm(
                 "k": mm_k,
                 "router_n": plan.output_size,
                 "router_k": plan.hidden_size,
+                "decode_forward": decode_forward,
             },
         )
     except NoKernelFoundError:
@@ -4751,7 +4756,7 @@ def _select_fp32_router_gemv_with_mm(
     if (
         spec is None
         or spec.weight_preprocessor is not plan.weight_preprocessor
-        or not _use_mv(mm_a, mm_b, None, False)
+        or not _use_mv(mm_a, mm_b, None, decode_forward)
         or _select_mv(
             rows,
             mm_n,
@@ -4762,9 +4767,13 @@ def _select_fp32_router_gemv_with_mm(
             False,
             # No destination here: the selection is only compared.
             *_mv_alignment(mm_a, mm_b, None),
-            False,
+            decode_forward,
         )
-        is not registry.get_impl("gluon_mm_a16w16_decode_gfx950")
+        # Both registrations of the decode GEMM run the same launch.
+        not in (
+            registry.get_impl("gluon_mm_a16w16_decode_gfx950"),
+            registry.get_impl("gluon_mm_a16w16_decode_only_gfx950"),
+        )
     ):
         return None
     return kernel
@@ -4775,6 +4784,7 @@ def fp32_router_gemv_with_mm_supported(
     x: torch.Tensor,
     mm_a: torch.Tensor,
     mm_b: torch.Tensor,
+    decode_forward: bool,
 ) -> bool:
     """Return whether :func:`fp32_router_gemv_execute_with_mm` serves these operands.
 
@@ -4783,13 +4793,17 @@ def fp32_router_gemv_with_mm_supported(
         x: FP32 router rows.
         mm_a: ``[rows, K]`` activations of the independent GEMM.
         mm_b: ``[N, K]`` weight of the independent GEMM.
+        decode_forward: The rows come from a decode or verify forward. Any
+            forward shares the launch at up to 16 rows with a decode GEMM
+            entry for every forward; past 16 rows or with a decode-only
+            entry, only a decode / verify forward does.
 
     Returns:
         ``True`` when one launch can run the router and ``mm(mm_a, mm_b)``.
     """
     return (
         _select_fp32_router_gemv_with_mm(
-            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b
+            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b, decode_forward
         )
         is not None
     )
@@ -4803,6 +4817,7 @@ def fp32_router_gemv_execute_with_mm(
     mm_a: torch.Tensor,
     mm_b: torch.Tensor,
     mm_out: torch.Tensor,
+    decode_forward: bool,
 ) -> torch.Tensor:
     """Project router rows and compute an independent GEMM in one launch.
 
@@ -4820,12 +4835,14 @@ def fp32_router_gemv_execute_with_mm(
         mm_a: Contiguous ``[rows, K]`` BF16 activations.
         mm_b: Contiguous ``[N, K]`` BF16 weight.
         mm_out: ``[rows, N]`` BF16 destination.
+        decode_forward: The rows come from a decode or verify forward, as
+            for :func:`fp32_router_gemv_with_mm_supported`.
 
     Returns:
         FP32 router logits in ``[rows, outputs]`` layout.
     """
     typed_plan = _require_fp32_router_gemv_plan(plan)
-    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b)
+    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b, decode_forward)
     if kernel is None:
         raise ValueError(
             "fp32_router_gemv_execute_with_mm needs supported operands "

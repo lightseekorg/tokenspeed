@@ -119,6 +119,11 @@ Qwen3.8-Flash-Next decode batches.
   entry beat `torch.mm` (hipBLASLt) by at least 4%, at the row counts its
   model sends, in cold-cache sweeps at Kimi K3 TP8, Muse Spark TP4/TP8 and
   Qwen3.8-Flash-Next TP2 shapes; table comments note the exceptions.
+- Entries in `_DECODE_ONLY_CONFIGS` run under a second registration,
+  `gluon_mm_a16w16_decode_only_gfx950`, that declares the `decode_forward`
+  trait: only a call that states `decode_forward=True` (a decode or verify
+  forward) selects them, and any other forward of those rows keeps
+  `torch.mm`. The two registrations run the same launch.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets
@@ -311,11 +316,24 @@ the router's split-K GEMM and an independent BF16 decode GEMM
 
 - Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
   `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
-- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
-  four-wave decode GEMM config for `(M, N', K')`.
-- `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
-  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
-  rows and differ from the GEMV's in the last bits at 1-8 rows.
+- Any forward shares the launch at up to 16 rows with a decode GEMM entry of
+  `_DECODE_CONFIGS`; everything else it serves (past 16 rows, and the
+  decode-only entries) only a decode / verify forward shares: a second
+  registration,
+  `gluon_fp32_router_gemv_mm_a16w16_decode_only_gfx950`, runs the same launch
+  and declares the `decode_forward` trait, so a call that does not state
+  `decode_forward=True` never selects it.
+- The `*_decode_only_*` registrations of this op and of the decode GEMM call
+  the same launcher and jit kernel as the registrations they extend, so they
+  have no `launch_` function or kernel of their own.
+- `N` a multiple of 16, `K` a multiple of 512, a measured four-wave decode
+  GEMM config for `(M, N', K')`, and `1 <= M <= 16`, or a larger `M` at which
+  the router's standalone plan takes the shared launch's router tile.
+- `mm_out` is bitwise `gemm.mm(mm_a, mm_b)` with the call's `decode_forward`.
+  The router always runs the
+  16 x 16 split-K-by-8 tile, so its logits equal the standalone router's
+  wherever that plan takes the same tile, and differ from it in the last bits
+  elsewhere.
 - One binary per decode GEMM M bucket; `warm_variants` compiles each of them
   at startup, as for the router GEMV.
 

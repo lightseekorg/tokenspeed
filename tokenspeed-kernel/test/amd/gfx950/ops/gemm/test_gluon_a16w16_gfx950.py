@@ -78,6 +78,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
+    supports_gluon_mm_a16w16_decode_only_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (  # noqa: E402
     gluon_mm_a16w16_skinny_gfx950,
@@ -520,6 +521,14 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
     assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
+    # The Muse TP4 pre-expert projection: 9-32 rows, decode / verify forwards
+    # only, so it is not among the entries that serve every forward.
+    for rows in (8, 9, 32, 33):
+        assert not supports_gluon_mm_a16w16_decode_gfx950(rows, 1024, 8192)
+    assert not supports_gluon_mm_a16w16_decode_only_gfx950(8, 1024, 8192)
+    assert supports_gluon_mm_a16w16_decode_only_gfx950(9, 1024, 8192)
+    assert supports_gluon_mm_a16w16_decode_only_gfx950(32, 1024, 8192)
+    assert not supports_gluon_mm_a16w16_decode_only_gfx950(33, 1024, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
 
@@ -975,6 +984,56 @@ def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (72, 100, 172, 200):
             run(rows)
+
+
+def test_decode_gemm_serves_muse_tp4_pre_expert_rows() -> None:
+    # The Muse TP4 pre-expert projection takes the decode GEMM at 9-32 rows of
+    # a decode / verify forward only: 1-8 rows keep hipBLASLt, and 33 rows and
+    # up do not take it.
+    torch.manual_seed(0)
+    n, k = 1024, 8192
+    for rows in (1, 2, 8, 33, 64, 128, 256):
+        assert not supports_gluon_mm_a16w16_decode_only_gfx950(rows, n, k)
+    a = torch.randn((32, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    reference = a.double() @ b.double().T
+
+    def run(rows):
+        assert supports_gluon_mm_a16w16_decode_only_gfx950(rows, n, k)
+        out = _decode(a[:rows], b, torch.bfloat16)
+        # One BF16 rounding of an FP32 accumulation over K = 8192.
+        error = (out.double() - reference[:rows]).norm() / reference[:rows].norm()
+        assert error < 4e-3, (rows, error.item())
+        assert torch.equal(mm(a[:rows], b, decode_forward=True), out)
+        return out
+
+    # A row's bits do not depend on the batch's row count inside a bucket:
+    # the bucket's tile and split are fixed and rows do not mix.
+    for rows in ((9, 12, 16), (17, 24, 32)):
+        outs = [run(m) for m in rows]
+        for out in outs[1:]:
+            assert torch.equal(out[: rows[0]], outs[0])
+    # Each bucket compiles once per integer class (divisible by 16 or not).
+    for rows in (9, 16, 17, 32):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (10, 15, 20, 31):
+            run(rows)
+
+
+@pytest.mark.parametrize("rows", [16, 32])
+def test_tp4_pre_expert_rows_outside_a_decode_forward_keep_torch_mm(
+    rows: int,
+) -> None:
+    """A prefill / extend / mixed forward of 16 or 32 rows of the TP4
+    pre-expert projection does not take its decode-only entry: mm returns
+    torch.mm's bits."""
+    torch.manual_seed(1)
+    a = torch.randn((rows, 8192), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((1024, 8192), device="cuda", dtype=torch.bfloat16) * 0.25
+    assert torch.equal(mm(a, b), torch.mm(a, b.T))
+    assert torch.equal(mm(a, b, decode_forward=False), torch.mm(a, b.T))
+    assert torch.equal(mm(a, b, decode_forward=True), _decode(a, b, torch.bfloat16))
 
 
 def test_medium_coalesced_store_masks_strided_out() -> None:
