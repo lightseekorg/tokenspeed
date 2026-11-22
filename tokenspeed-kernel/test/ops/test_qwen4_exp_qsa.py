@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
 import tokenspeed_kernel.ops.attention.qsa as qsa_api
@@ -1619,6 +1620,146 @@ def test_qwen4_exp_qsa_selected_slots_matches_torch(device: str) -> None:
     expected = torch.where(valid & (pages > 0), expected, -1).to(torch.int32)
 
     torch.testing.assert_close(actual, expected)
+
+
+def _selected_slot_inputs(
+    device: str,
+    *,
+    rows: int,
+    requests: int,
+    block_topk: int,
+    ratio: int,
+    page_size: int,
+    seed: int,
+):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    owners = torch.arange(requests, device=device).repeat_interleave(
+        triton.cdiv(rows, requests)
+    )[:rows]
+    # Positions start below one compression group so early rows lack whole blocks.
+    logical = torch.randint(0, 4096, (rows,), device=device, generator=generator)
+    logical[:4] = torch.arange(4, device=device)
+    complete = ((logical + 1) // ratio).to(torch.int32)
+    blocks = torch.randint(
+        -2, 1100, (rows, 2 * block_topk), device=device, generator=generator
+    )[:, ::2]
+    pages = triton.cdiv(4096, page_size) + 1
+    table = torch.randint(
+        1,
+        1 << 20,
+        (requests, pages + 3),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    )
+    # Zero entries are page-table holes, whose slots read as -1.
+    table[:, ::7] = 0
+    return blocks, complete, logical, owners, table[:, :pages]
+
+
+@pytest.mark.parametrize(
+    ("rows", "requests", "block_topk", "ratio", "token_topk", "page_size"),
+    [
+        (5, 2, 512, 4, 2048, 64),
+        (600, 3, 512, 4, 2048, 64),
+        (600, 3, 512, 4, 2048, 1),
+        (37, 1, 8, 4, 32, 8),
+        (37, 2, 8, 3, 23, 5),
+        (400, 4, 64, 4, 254, 16),
+    ],
+)
+def test_qwen4_exp_qsa_selected_slot_rows_match_column_programs(
+    rows: int,
+    requests: int,
+    block_topk: int,
+    ratio: int,
+    token_topk: int,
+    page_size: int,
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One program per row writes the same slots as 256-column programs."""
+    blocks, complete, logical, owners, table = _selected_slot_inputs(
+        device,
+        rows=rows,
+        requests=requests,
+        block_topk=block_topk,
+        ratio=ratio,
+        page_size=page_size,
+        seed=rows + ratio + page_size,
+    )
+    outputs = []
+    for threshold in (1, 2**31):
+        monkeypatch.setattr(qsa_ops, "_SELECTED_SLOT_ROW_PROGRAM_MIN_ROWS", threshold)
+        outputs.append(
+            qwen4_exp_qsa_selected_slots(
+                blocks,
+                complete,
+                logical,
+                owners,
+                table,
+                page_size,
+                ratio,
+                token_topk,
+                enable_pdl=False,
+            )
+        )
+
+    assert (outputs[0] >= 0).any() and (outputs[0] == -1).any()
+    assert torch.equal(outputs[0], outputs[1])
+
+
+class _SlotGridRecorder:
+    def __init__(self, kernel: Any) -> None:
+        self.kernel = kernel
+        self.grids: list[tuple[int, ...]] = []
+
+    def __getitem__(self, grid: tuple[int, ...]) -> Any:
+        self.grids.append(tuple(grid))
+        return self.kernel[grid]
+
+
+def test_qwen4_exp_qsa_selected_slots_switch_to_row_programs_at_the_threshold(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows_kernel = _SlotGridRecorder(qsa_ops._qwen4_exp_qsa_selected_slot_rows_kernel)
+    columns_kernel = _SlotGridRecorder(qsa_ops._qwen4_exp_qsa_selected_slots_kernel)
+    monkeypatch.setattr(
+        qsa_ops, "_qwen4_exp_qsa_selected_slot_rows_kernel", rows_kernel
+    )
+    monkeypatch.setattr(qsa_ops, "_qwen4_exp_qsa_selected_slots_kernel", columns_kernel)
+    first = qsa_ops._SELECTED_SLOT_ROW_PROGRAM_MIN_ROWS
+    for rows in (first - 1, first):
+        blocks, complete, logical, owners, table = _selected_slot_inputs(
+            device, rows=rows, requests=2, block_topk=512, ratio=4, page_size=64, seed=0
+        )
+        qwen4_exp_qsa_selected_slots(
+            blocks, complete, logical, owners, table, 64, 4, 2048, enable_pdl=False
+        )
+    # 2051 columns: nine 256-column programs per row below the threshold.
+    assert columns_kernel.grids == [(first - 1, 9)]
+    assert rows_kernel.grids == [(first,)]
+
+
+def test_qwen4_exp_qsa_selected_slot_rows_reuse_one_compile(device: str) -> None:
+    def run(rows: int, requests: int, seed: int) -> None:
+        blocks, complete, logical, owners, table = _selected_slot_inputs(
+            device,
+            rows=rows,
+            requests=requests,
+            block_topk=512,
+            ratio=4,
+            page_size=64,
+            seed=seed,
+        )
+        qwen4_exp_qsa_selected_slots(
+            blocks, complete, logical, owners, table, 64, 4, 2048, enable_pdl=False
+        )
+
+    run(16384, 1, 0)
+    with assert_no_triton_compile(qsa_ops._qwen4_exp_qsa_selected_slot_rows_kernel):
+        for rows, requests in ((384, 96), (1000, 3), (4097, 1)):
+            run(rows, requests, rows)
 
 
 def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:

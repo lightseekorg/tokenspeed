@@ -1946,6 +1946,10 @@ register_kernel(
 )(triton_qsa_block_topk_select)
 
 
+# From this many rows one program expands a row; fewer keep 256-column programs.
+_SELECTED_SLOT_ROW_PROGRAM_MIN_ROWS = 384
+
+
 @triton.jit
 def _qwen4_exp_qsa_selected_slots_kernel(
     selected_blocks,
@@ -2007,6 +2011,77 @@ def _qwen4_exp_qsa_selected_slots_kernel(
     )
 
 
+@triton.jit
+def _qwen4_exp_qsa_selected_slot_rows_kernel(
+    selected_blocks,
+    complete_blocks,
+    logical_positions,
+    request_indices,
+    page_table,
+    selected_slots,
+    stride_b_n,
+    stride_pt_b,
+    stride_o_n,
+    TOKEN_TOPK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    RATIO_P2: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    complete = tl.load(complete_blocks + row).to(tl.int64)
+    position = tl.load(logical_positions + row).to(tl.int64)
+    request = tl.load(request_indices + row).to(tl.int64)
+    # A [block, member] tile loads each block id once and stores whole groups.
+    blocks = tl.arange(0, BLOCKS)
+    members = tl.arange(0, RATIO_P2)
+    columns = blocks[:, None] * COMPRESS_RATIO + members[None, :]
+    in_range = (columns < TOKEN_TOPK) & (members[None, :] < COMPRESS_RATIO)
+    block_ids = tl.load(
+        selected_blocks + row * stride_b_n + blocks,
+        mask=blocks * COMPRESS_RATIO < TOKEN_TOPK,
+        other=-1,
+    ).to(tl.int64)
+    token_ok = (block_ids >= 0) & (block_ids < complete)
+    logical_tokens = tl.where(
+        token_ok[:, None], block_ids[:, None] * COMPRESS_RATIO + members[None, :], -1
+    )
+    valid = (logical_tokens >= 0) & (logical_tokens <= position)
+    safe_tokens = tl.maximum(logical_tokens, 0)
+    pages = tl.load(
+        page_table + request * stride_pt_b + safe_tokens // PAGE_SIZE,
+        mask=in_range & valid,
+        other=0,
+    ).to(tl.int64)
+    slots = pages * PAGE_SIZE + safe_tokens % PAGE_SIZE
+    tl.store(
+        selected_slots + row * stride_o_n + columns,
+        tl.where(valid & (pages > 0), slots, -1).to(tl.int32),
+        mask=in_range,
+    )
+
+    # The in-progress compression group follows the block-derived columns.
+    suffix = tl.arange(0, RATIO_P2)
+    suffix_mask = suffix < COMPRESS_RATIO - 1
+    suffix_tokens = complete * COMPRESS_RATIO + suffix
+    suffix_valid = suffix_tokens <= position
+    suffix_pages = tl.load(
+        page_table + request * stride_pt_b + suffix_tokens // PAGE_SIZE,
+        mask=suffix_mask & suffix_valid,
+        other=0,
+    ).to(tl.int64)
+    suffix_slots = suffix_pages * PAGE_SIZE + suffix_tokens % PAGE_SIZE
+    tl.store(
+        selected_slots + row * stride_o_n + TOKEN_TOPK + suffix,
+        tl.where(suffix_valid & (suffix_pages > 0), suffix_slots, -1).to(tl.int32),
+        mask=suffix_mask,
+    )
+
+
 def qwen4_exp_qsa_selected_slots(
     selected_blocks: torch.Tensor,
     complete_blocks: torch.Tensor,
@@ -2060,7 +2135,27 @@ def qwen4_exp_qsa_selected_slots(
     output = torch.empty(
         (rows, width), dtype=torch.int32, device=selected_blocks.device
     )
-    if rows:
+    if rows >= _SELECTED_SLOT_ROW_PROGRAM_MIN_ROWS:
+        _qwen4_exp_qsa_selected_slot_rows_kernel[(rows,)](
+            selected_blocks,
+            complete_blocks,
+            logical_positions,
+            request_indices,
+            page_table,
+            output,
+            selected_blocks.stride(0),
+            page_table.stride(0),
+            output.stride(0),
+            TOKEN_TOPK=token_topk,
+            COMPRESS_RATIO=compress_ratio,
+            RATIO_P2=triton.next_power_of_2(compress_ratio),
+            PAGE_SIZE=page_size,
+            BLOCKS=triton.next_power_of_2(triton.cdiv(token_topk, compress_ratio)),
+            ENABLE_PDL=enable_pdl,
+            num_warps=2,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    elif rows:
         _qwen4_exp_qsa_selected_slots_kernel[(rows, triton.cdiv(width, 256))](
             selected_blocks,
             complete_blocks,

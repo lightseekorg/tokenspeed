@@ -286,6 +286,16 @@ prepares request-limited variants: pure target verification skips the writer
 when there are no extends. Changed table widths and mixed-prefill request
 counts can then reuse startup binaries.
 
+## Selected-slot expansion
+
+`qwen4_exp_qsa_selected_slots` expands each row's selected blocks, plus the
+in-progress compression group, into full-cache slots. Below 384 rows, the decode
+verify and draft sizes, it keeps 256-column programs. From 384 rows, such as a
+prefill chunk, one program expands a whole row as a block-by-member tile: each
+block id is loaded once and a block's slots are stored together. Each column's
+arithmetic is the same in both layouts, so the slots are identical across the
+switch.
+
 ## Materialized Triton scoring
 
 The `logits` path materializes FP32 block scores before top-k selection.
