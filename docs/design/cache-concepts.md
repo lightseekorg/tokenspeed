@@ -139,7 +139,10 @@ Allocation and the executor's pinned reservation derive their padding from the
 same alignment constant. Other allocation policies and the snapshot pool retain
 their original allocation sizes. Ratio and explicit L2 sizes may lose whole
 LCM blocks to fit alignment padding in their original pinned reservation, when
-at least one block remains; it is never reduced to accommodate insufficient Host memory.
+at least one block remains. Ratio sizing is also capped to every rank's Host
+memory share; an explicit size that exceeds the Host memory budget is refused.
+When the buffer is aligned, block alignment must divide its 4 KiB alignment;
+unsupported alignments are rejected before allocation.
 Ranks agree on the resulting block count before allocation. Tensor ownership
 and asynchronous-copy lifetime tracking remain with PyTorch.
 

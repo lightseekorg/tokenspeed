@@ -257,7 +257,8 @@ class HostCacheStorage:
             num_host_lcm_blocks: Parents to allocate, the null block excluded.
             block_alignment: Every packed block's size is a multiple of this
                 (``compute_host_lcm_block_bytes``).
-            align_host_buffer: Whether to align the pinned buffer to 4 KiB.
+            align_host_buffer: Whether to align the pinned buffer to 4 KiB;
+                block_alignment must divide that alignment.
         """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
@@ -272,7 +273,16 @@ class HostCacheStorage:
         )
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
-        from tokenspeed.runtime.cache.host_allocation import allocate_host_buffer
+        from tokenspeed.runtime.cache.host_allocation import (
+            HOST_BUFFER_ALIGNMENT_BYTES,
+            allocate_host_buffer,
+        )
+
+        if align_host_buffer and HOST_BUFFER_ALIGNMENT_BYTES % block_alignment:
+            raise ValueError(
+                f"block_alignment {block_alignment} must divide the "
+                f"{HOST_BUFFER_ALIGNMENT_BYTES}-byte Host buffer alignment"
+            )
 
         self.host_buffer = allocate_host_buffer(
             self.host_buffer_bytes, align=align_host_buffer

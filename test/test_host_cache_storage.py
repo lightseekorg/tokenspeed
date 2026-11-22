@@ -198,6 +198,18 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
         )
 
 
+@pytest.mark.parametrize("block_alignment", [3, 8192])
+def test_aligned_buffer_rejects_incompatible_block_alignment(block_alignment):
+    with pytest.raises(ValueError, match="block_alignment .* must divide"):
+        HostCacheStorage(
+            _layout(),
+            group_specs=_SPECS,
+            num_host_lcm_blocks=2,
+            block_alignment=block_alignment,
+            align_host_buffer=True,
+        )
+
+
 def test_the_host_block_capacity_is_the_densest_groups_blocks():
     # Three 32-byte KV pages per 96-byte parent beside one 80-byte State.
     storage = HostCacheStorage(
