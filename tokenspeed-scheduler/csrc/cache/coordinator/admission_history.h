@@ -63,7 +63,7 @@ private:
     static constexpr std::size_t kResumeGapAdmissions{std::size_t{1} << 16};
 
     const CheckpointTree& checkpoints_;
-    std::int64_t checkpoint_retention_requests_{0};
+    const std::int64_t checkpoint_retention_requests_;
     std::uint64_t next_access_epoch_{0};
     // The access epochs of the latest new-request admissions, oldest first
     // from num_admissions_ (a ring); it covers the retention window and the

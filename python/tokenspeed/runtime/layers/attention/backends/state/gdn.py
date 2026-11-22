@@ -67,6 +67,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
+    _verify_conv_writes_rows = True
 
     def __init__(
         self,
@@ -130,10 +131,12 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # with a copy of it. Where a decode or verify kernel takes strided
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
-        ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
+        ssm_state = self._state_components(self._state_layer_ids()[0])[1]
+        ssm_dtype = ssm_state.dtype
         decode_traits = {
             "head_dim": self._head_k_dim,
             "value_head_dim": self._head_v_dim,
+            "strided_state": not ssm_state.is_contiguous(),
         }
         verify_traits = {
             **decode_traits,
@@ -186,6 +189,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
         a: torch.Tensor | None,
         b: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        # Projection views to the dense, aligned rows FlashInfer's kernels need;
-        # skipped where the selected kernels read the views by stride.
+        # Single-token decode: projection views to the dense, aligned rows
+        # FlashInfer's kernel needs; skipped where the selected kernel reads the
+        # views by stride. A chain verify's conv update writes dense rows instead.
         return pack_gdn_projection(mixed_qkv, a, b)

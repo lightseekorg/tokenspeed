@@ -173,6 +173,7 @@ def prepare_gdn_decode_step(
         "head_dim": profile.head_dim,
         "value_head_dim": profile.value_head_dim,
         "padding_safe": False,
+        "strided_state": False,
     }
     if request.solution != "flashinfer":
         traits["state_dtype"] = state_dtype
@@ -236,6 +237,7 @@ def prepare_gdn_decode_mtp(
         "verify_tokens": tokens,
         "output_only": not per_token,
         "padding_safe": False,
+        "strided_state": False,
         "tree": False,
         # Probe the general verify registration, not the serving-time chain candidate.
         "chunked_chain": False,

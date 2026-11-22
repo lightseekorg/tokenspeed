@@ -29,7 +29,8 @@ import site
 import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from functools import cache, lru_cache
+from functools import cache, lru_cache, wraps
+from inspect import signature
 from pathlib import Path
 
 import torch
@@ -451,6 +452,30 @@ def pdl_enabled(overwrite: bool | None = None) -> bool:
     elif _pdl_enabled is None:
         _pdl_enabled = current_platform().is_hopper_plus
     return _pdl_enabled
+
+
+def resolve_enable_pdl(enable_pdl: bool | None) -> bool:
+    """``enable_pdl``, or the process default (:func:`pdl_enabled`) when None."""
+    return pdl_enabled() if enable_pdl is None else enable_pdl
+
+
+def with_pdl_default(function):
+    """Wrap ``function`` so a missing or None ``enable_pdl`` takes the default."""
+    enable_pdl_index = tuple(signature(function).parameters).index("enable_pdl")
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if len(args) > enable_pdl_index:
+            args = (
+                *args[:enable_pdl_index],
+                resolve_enable_pdl(args[enable_pdl_index]),
+                *args[enable_pdl_index + 1 :],
+            )
+        else:
+            kwargs["enable_pdl"] = resolve_enable_pdl(kwargs.get("enable_pdl"))
+        return function(*args, **kwargs)
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------

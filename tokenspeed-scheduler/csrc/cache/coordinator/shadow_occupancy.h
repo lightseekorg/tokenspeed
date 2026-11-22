@@ -30,6 +30,7 @@
 
 #include "cache/cache_group.h"
 #include "cache/coordinator/parent_occupancy.h"
+#include "cache/core/block_placement_demand.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "utils.h"
@@ -106,16 +107,9 @@ public:
         }
     }
 
-    // One fit formula for every demand (ParentsNeededForBuckets): per group the
-    // bucket-constrained blocks need_by_bucket[i] share the parents they open,
-    // the pair_need[i] same-bucket pairs take the buckets NextPairBucket
-    // gives them against this shadow's holes, the dense_need[i] blocks take any
-    // hole, and a demand with no bucket constraint reduces to holes plus
-    // parents times packing.
-    bool Fits(std::span<const std::vector<std::int64_t>> need_by_bucket, std::span<const std::int64_t> dense_need,
-              std::span<const std::int64_t> pair_need) const {
-        return ParentShortfall(need_by_bucket, dense_need, pair_need) == 0;
-    }
+    // Each group's placement demand uses its holes and a share of the
+    // pool's empty parents, respecting fixed buckets and same-bucket pairs.
+    bool Fits(std::span<const BlockPlacementDemand> block_demands) const { return ParentShortfall(block_demands) == 0; }
 
     // The empty parents the demand needs beyond those the shadow has: zero
     // exactly when it fits. A Remove lowers it by at most one. It either adds
@@ -124,20 +118,16 @@ public:
     // only holes leave. With pairs too, as NextPairBucket's buckets need the
     // fewest parents of any choice. So a demand short by n parents cannot fit
     // before n more Removes, and a planner need not ask again before then.
-    std::int64_t ParentShortfall(std::span<const std::vector<std::int64_t>> need_by_bucket,
-                                 std::span<const std::int64_t> dense_need,
-                                 std::span<const std::int64_t> pair_need) const {
-        _assert(need_by_bucket.size() == groups_.size() && dense_need.size() == groups_.size() &&
-                    pair_need.size() == groups_.size(),
-                "a shadow fit takes one demand per group");
+    std::int64_t ParentShortfall(std::span<const BlockPlacementDemand> block_demands) const {
+        _assert(block_demands.size() == groups_.size(), "a shadow fit takes one demand per group");
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::span<std::int64_t> scratch =
-                pair_need[i] == 0 ? std::span<std::int64_t>{}
-                                  : std::span<std::int64_t>(pair_scratch_).first(holes_by_bucket_[i].size());
-            parents_needed +=
-                ParentsNeededForBucketsAndPairs(need_by_bucket[i], holes_by_bucket_[i], dense_need[i], pair_need[i],
-                                                pool_.Packing(static_cast<std::uint32_t>(i)), scratch);
+                block_demands[i].same_bucket_pairs == 0
+                    ? std::span<std::int64_t>{}
+                    : std::span<std::int64_t>(pair_scratch_).first(holes_by_bucket_[i].size());
+            parents_needed += ParentsNeededForBucketsAndPairs(block_demands[i], holes_by_bucket_[i],
+                                                              pool_.Packing(static_cast<std::uint32_t>(i)), scratch);
         }
         return std::max<std::int64_t>(parents_needed - empty_parent_count_, 0);
     }

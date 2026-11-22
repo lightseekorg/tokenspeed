@@ -59,7 +59,8 @@ pub struct RegistrationInfo {
 }
 
 impl RegistrationInfo {
-    /// Parse a registration's nine frames (`KVArgsRegisterInfo.from_zmq`).
+    /// Parse a registration's nine frames, or ten with the id it is
+    /// acknowledged by (`wire::registration_id`) (`KVArgsRegisterInfo.from_zmq`).
     pub fn from_frames(frames: &[Bytes]) -> Result<Self, LayoutError> {
         let (endpoint, port, cache_id) =
             wire::registration_route(frames).map_err(|error| LayoutError::new(error.0))?;
@@ -237,6 +238,10 @@ pub struct PrefillRoute {
     pub expected_prefill_ranks: Vec<i64>,
     /// The Prefill node's attention DP size; a room picks its DP group.
     pub prefill_dp_size: i64,
+    /// The Prefill node defers the decode allocation: a room is announced to
+    /// it, and may be admitted here only after the node's notice that the
+    /// request holds every page of its prompt there.
+    pub deferred: bool,
 }
 
 /// A JSON integer, or a string holding one (Python's `int(value)`).
@@ -323,5 +328,6 @@ pub fn plan_route(
         dummy_tp_ranks: dummy,
         expected_prefill_ranks: expected,
         prefill_dp_size: dp_size,
+        deferred: payload["prefill_decode_allocation_policy"] == "deferred",
     })
 }

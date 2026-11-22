@@ -45,7 +45,6 @@ def main() -> None:
         top_k=top_k,
         num_experts=experts,
         dtype=torch.bfloat16,
-        weights_dtype=torch.bfloat16,
     )
     print(f"rank={rank} transport initialized", flush=True)
 
@@ -120,7 +119,7 @@ def main() -> None:
             expected = expected.to(torch.bfloat16)
 
             def round_trip():
-                recv, recv_ids, recv_weights, offset = transport.dispatch(
+                recv, recv_ids, recv_weights = transport.dispatch(
                     dispatched, ids, weights, capacity
                 )
                 if prequantized:
@@ -133,7 +132,7 @@ def main() -> None:
                     -1, keepdim=True
                 ) * (rank + 1)
                 partial = (recv.float() * factor).to(torch.bfloat16)
-                return transport.combine(partial, count, capacity, offset)
+                return transport.combine(partial)
 
             for _ in range(2):
                 actual = round_trip()

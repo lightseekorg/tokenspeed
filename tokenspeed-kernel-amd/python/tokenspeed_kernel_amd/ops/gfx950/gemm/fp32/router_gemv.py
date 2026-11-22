@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     GROUP_SIZE_M,
     _choose_decode_config,
@@ -361,12 +361,94 @@ def transpose_fp32_router_weight_gfx950(weight: torch.Tensor) -> torch.Tensor:
     return weight.T.contiguous()
 
 
+def _gemv_launch(x, weight, out, rows: int, multiplier: float):
+    """The GEMV's arguments and compile-time options for ``rows`` rows."""
+    k, n = x.shape[1], weight.shape[0]
+    return (x, weight, out, rows), dict(
+        K=k,
+        N=n,
+        # Bucketed so at most five variants compile per (K, N).
+        BLOCK_M=triton.next_power_of_2(rows),
+        # Scalar loads keep K values that are not 16-byte aligned addressable.
+        VECTOR=_VECTOR if k % _VECTOR == 0 else 1,
+        MULTIPLIER=float(multiplier),
+        num_warps=_NUM_WARPS,
+    )
+
+
+def _splitk_launch(
+    x, weight, out, partial, counters, rows: int, multiplier: float, config
+):
+    """The split-K GEMM's arguments and compile-time options for ``config``."""
+    block_m, block_n, split_k, waves, chunks = config
+    return (x, weight, out, partial, counters, rows), dict(
+        K=x.shape[1],
+        N=weight.shape[0],
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        SPLIT_K=split_k,
+        CHUNKS=chunks,
+        MULTIPLIER=float(multiplier),
+        num_warps=waves,
+        **extern_compile_options(),
+    )
+
+
+def _router_selections(n: int, k: int) -> list[tuple[int, tuple[int, ...] | None]]:
+    """Row counts probing each distinct kernel choice of an ``[N, K]`` router.
+
+    Each comes with the split-K config it selects (None: the GEMV): each GEMV
+    BLOCK_M that a row count up to MAX_ROWS takes, then each measured split-K
+    bucket.
+    """
+    selections = {}
+    for rows in range(1, MAX_ROWS + 1):
+        if _choose_splitk_config(rows, n, k) is None and k <= MAX_K:
+            # The probe row count is the block itself, so it selects BLOCK_M.
+            block_m = triton.next_power_of_2(rows)
+            selections.setdefault(("gemv", block_m), (block_m, None))
+    for bound, config in sorted(_PREFERRED_SPLITK_CONFIGS.get((n, k), {}).items()):
+        if config is not None:
+            selections.setdefault(("splitk", config), (bound, config))
+    return list(selections.values())
+
+
+def _compile_router_variants(x, weight, multiplier: float) -> None:
+    """Compile, without launching, every GEMV and split-K variant of this router.
+
+    These are the variants any other row count selects. The row count is a
+    runtime argument of both kernels, but the GEMV's BLOCK_M (its power of two;
+    a block shape, so it cannot be left unspecialized) and the split-K tile
+    (its bucket) are compile-time, so a batch in a bucket startup never reached
+    would compile while serving. Stand-in tensors have the dtypes and shapes
+    serving allocates.
+    """
+    k, n = x.shape[1], weight.shape[0]
+    for rows, config in _router_selections(n, k):
+        rows_in = x.new_empty((rows, k))
+        out = x.new_empty((rows, n))
+        if config is None:
+            args, options = _gemv_launch(rows_in, weight, out, rows, multiplier)
+            compile_ahead(gluon_fp32_router_gemv_gfx950, *args, **options)
+            continue
+        block_m, block_n, split_k = config[:3]
+        tiles = triton.cdiv(rows, block_m) * (n // block_n)
+        partial = x.new_empty((split_k * tiles * block_m * block_n,))
+        counters = torch.zeros(tiles, dtype=torch.int32, device=x.device)
+        args, options = _splitk_launch(
+            rows_in, weight, out, partial, counters, rows, multiplier, config
+        )
+        compile_ahead(gluon_fp32_router_gemv_splitk_gfx950, *args, **options)
+
+
 def launch_gluon_fp32_router_gemv_gfx950(
     x: torch.Tensor,
     weight: torch.Tensor,
     multiplier: float,
     counters: torch.Tensor,
     enable_pdl: bool,
+    *,
+    warm_variants: bool,
 ) -> torch.Tensor:
     """Project FP32 rows through a transposed router weight.
 
@@ -384,6 +466,8 @@ def launch_gluon_fp32_router_gemv_gfx950(
             ``gluon_fp32_router_gemv_num_counters_gfx950(M, N, K)`` of them;
             the launch leaves them zeroed.
         enable_pdl: Accepted for the registry signature; unused.
+        warm_variants: Also compile, without launching, every variant another
+            row count of this shape picks (startup warmup).
 
     Returns:
         FP32 ``[M, N]`` logits.
@@ -406,31 +490,21 @@ def launch_gluon_fp32_router_gemv_gfx950(
         raise ValueError("weight must be contiguous transposed FP32 [N, K] beside x")
     rows, k = x.shape
     n = weight.shape[0]
+    if warm_variants:
+        _compile_router_variants(x, weight, multiplier)
     if rows == 0:
         return x.new_empty((0, n))
     out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
     config = _choose_splitk_config(rows, n, k)
     if config is None and rows <= MAX_ROWS and k <= MAX_K:
-        gluon_fp32_router_gemv_gfx950[(n,)](
-            x,
-            weight,
-            out,
-            rows,
-            K=k,
-            N=n,
-            # Bucketed so at most five variants compile per (K, N).
-            BLOCK_M=triton.next_power_of_2(rows),
-            # Scalar loads keep K values that are not 16-byte aligned addressable.
-            VECTOR=_VECTOR if k % _VECTOR == 0 else 1,
-            MULTIPLIER=float(multiplier),
-            num_warps=_NUM_WARPS,
-        )
+        args, options = _gemv_launch(x, weight, out, rows, multiplier)
+        gluon_fp32_router_gemv_gfx950[(n,)](*args, **options)
         return out
     if config is None:
         # hipBLASLt applies alpha once to the finished FP32 dot product, which
         # matches a separate multiply bit for bit without its extra launch.
         return torch.addmm(out, x, weight.T, beta=0, alpha=multiplier)
-    block_m, block_n, split_k, waves, chunks = config
+    block_m, block_n, split_k = config[:3]
     num_tiles = triton.cdiv(rows, block_m) * (n // block_n)
     check_splitk_counters(
         counters, num_tiles, x.device, "gfx950 FP32 router split-K GEMM"
@@ -440,23 +514,10 @@ def launch_gluon_fp32_router_gemv_gfx950(
         dtype=torch.float32,
         device=x.device,
     )
-    gluon_fp32_router_gemv_splitk_gfx950[(num_tiles * split_k,)](
-        x,
-        weight,
-        out,
-        partial,
-        counters,
-        rows,
-        K=k,
-        N=n,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        SPLIT_K=split_k,
-        CHUNKS=chunks,
-        MULTIPLIER=float(multiplier),
-        num_warps=waves,
-        **extern_compile_options(),
+    args, options = _splitk_launch(
+        x, weight, out, partial, counters, rows, multiplier, config
     )
+    gluon_fp32_router_gemv_splitk_gfx950[(num_tiles * split_k,)](*args, **options)
     return out
 
 
@@ -561,6 +622,119 @@ def gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows: int, n: int) -> i
     return triton.cdiv(rows, block_m) * (n // block_n)
 
 
+def _mm_launch(
+    x,
+    weight,
+    out,
+    router_partial,
+    counters,
+    mm_a,
+    mm_b,
+    mm_out,
+    partial,
+    mm_counters,
+    multiplier,
+):
+    """Grid size, arguments and options of the router + decode GEMM launch."""
+    rows, k = x.shape
+    n = weight.shape[0]
+    mm_n, mm_k = mm_b.shape
+    block_m, block_n, split_k, waves, chunks = _WITH_MM_ROUTER_CONFIG
+    router_programs = (
+        gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, n) * split_k
+    )
+    mm_block_m, mm_block_n, mm_block_k, warps_m, warps_n, buffers, mm_split, xcds = (
+        _choose_decode_config(rows, mm_n, mm_k)
+    )
+    mm_tiles = triton.cdiv(rows, mm_block_m) * triton.cdiv(mm_n, mm_block_n)
+    args = (
+        x,
+        weight,
+        out,
+        router_partial,
+        counters,
+        mm_a,
+        mm_b,
+        mm_out,
+        partial,
+        mm_counters,
+        rows,
+        mm_n,
+        mm_a.stride(0),
+        mm_b.stride(0),
+        mm_out.stride(0),
+    )
+    options = dict(
+        K=k,
+        N=n,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        SPLIT_K=split_k,
+        CHUNKS=chunks,
+        MULTIPLIER=float(multiplier),
+        ROUTER_PROGRAMS=router_programs,
+        MM_K=mm_k,
+        MM_BLOCK_M=mm_block_m,
+        MM_BLOCK_N=mm_block_n,
+        MM_BLOCK_K=mm_block_k,
+        MM_WARPS_M=warps_m,
+        MM_WARPS_N=warps_n,
+        MM_NUM_BUFFERS=buffers,
+        MM_SPLIT_K=mm_split,
+        MM_NUM_XCDS=xcds,
+        num_warps=waves,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+        **extern_compile_options(),
+    )
+    return router_programs + mm_tiles * mm_split, args, options  # fmt: skip
+
+
+def _compile_router_mm_variants(x, weight, multiplier: float, mm_b) -> None:
+    """Compile, without launching, the router + decode GEMM launch per bucket.
+
+    One binary per decode GEMM bucket that a row count up to _WITH_MM_MAX_ROWS
+    selects: the MM_* tile is compile-time and follows the bucket. Stand-in
+    tensors have the dtypes and shapes serving allocates.
+    """
+    k, n = x.shape[1], weight.shape[0]
+    mm_n, mm_k = mm_b.shape
+    seen = set()
+    for rows in range(1, _WITH_MM_MAX_ROWS + 1):
+        if not supports_gluon_fp32_router_gemv_mm_a16w16_gfx950(rows, n, k, mm_n, mm_k):
+            continue
+        config = _choose_decode_config(rows, mm_n, mm_k)
+        if config in seen:
+            continue
+        seen.add(config)
+        block_m, block_n, split_k = _WITH_MM_ROUTER_CONFIG[:3]
+        router_tiles = gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, n)
+        mm_out = mm_b.new_empty((rows, mm_n))
+        mm_split = config[6]
+        if mm_split > 1:
+            mm_tiles = triton.cdiv(rows, config[0]) * triton.cdiv(mm_n, config[1])
+            # The launch's own scratch, as serving passes it.
+            partial = _get_partial_scratch(
+                x.device, mm_tiles, mm_split, config[1], config[0]
+            )
+            mm_counters = torch.zeros(mm_tiles, dtype=torch.int32, device=x.device)
+        else:
+            partial = mm_counters = mm_out
+        _, args, options = _mm_launch(
+            x.new_empty((rows, k)),
+            weight,
+            x.new_empty((rows, n)),
+            x.new_empty((split_k * router_tiles * block_m * block_n,)),
+            torch.zeros(router_tiles, dtype=torch.int32, device=x.device),
+            mm_b.new_empty((rows, mm_k)),
+            mm_b,
+            mm_out,
+            partial,
+            mm_counters,
+            multiplier,
+        )
+        compile_ahead(gluon_fp32_router_gemv_mm_a16w16_gfx950, *args, **options)
+
+
 def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -570,6 +744,8 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
     mm_b: torch.Tensor,
     mm_out: torch.Tensor,
     mm_counters: torch.Tensor,
+    *,
+    warm_variants: bool,
 ) -> torch.Tensor:
     """Project FP32 router rows and compute ``mm_out = mm_a @ mm_b.T`` in one launch.
 
@@ -589,6 +765,9 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
         mm_out: ``[M, mm_n]`` BF16 destination with unit inner stride.
         mm_counters: Zeroed split-K counters of the decode GEMM, as for
             ``launch_gluon_mm_a16w16_decode_gfx950``.
+        warm_variants: Also compile, without launching, the launch for every
+            decode GEMM bucket another supported row count picks (startup
+            warmup).
 
     Returns:
         FP32 router logits ``[M, N]``.
@@ -620,7 +799,9 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
             "router + decode GEMM launch needs contiguous FP32 router rows and "
             "weight, contiguous BF16 GEMM operands and a row-major BF16 output"
         )
-    block_m, block_n, split_k, waves, chunks = _WITH_MM_ROUTER_CONFIG
+    if warm_variants:
+        _compile_router_mm_variants(x, weight, multiplier, mm_b)
+    block_m, block_n, split_k = _WITH_MM_ROUTER_CONFIG[:3]
     router_tiles = gluon_fp32_router_gemv_mm_a16w16_num_counters_gfx950(rows, n)
     check_splitk_counters(
         counters, router_tiles, x.device, "gfx950 router + decode GEMM launch"
@@ -631,9 +812,9 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
         dtype=torch.float32,
         device=x.device,
     )
-    mm_block_m, mm_block_n, mm_block_k, warps_m, warps_n, buffers, mm_split, xcds = (
-        _choose_decode_config(rows, mm_n, mm_k)
-    )
+    mm_config = _choose_decode_config(rows, mm_n, mm_k)
+    mm_block_m, mm_block_n = mm_config[:2]
+    mm_split = mm_config[6]
     mm_tiles = triton.cdiv(rows, mm_block_m) * triton.cdiv(mm_n, mm_block_n)
     if mm_split > 1:
         check_splitk_counters(
@@ -644,18 +825,11 @@ def launch_gluon_fp32_router_gemv_mm_a16w16_gfx950(
         )
     else:
         partial = mm_counters = mm_out
-    router_programs = router_tiles * split_k
-    gluon_fp32_router_gemv_mm_a16w16_gfx950[(router_programs + mm_tiles * mm_split,)](
+    programs, args, options = _mm_launch(
         x, weight, out, router_partial, counters, mm_a, mm_b, mm_out, partial,
-        mm_counters, rows, mm_n, mm_a.stride(0), mm_b.stride(0), mm_out.stride(0),
-        K=k, N=n, BLOCK_M=block_m, BLOCK_N=block_n, SPLIT_K=split_k,
-        CHUNKS=chunks, MULTIPLIER=float(multiplier),
-        ROUTER_PROGRAMS=router_programs, MM_K=mm_k, MM_BLOCK_M=mm_block_m,
-        MM_BLOCK_N=mm_block_n, MM_BLOCK_K=mm_block_k, MM_WARPS_M=warps_m,
-        MM_WARPS_N=warps_n, MM_NUM_BUFFERS=buffers, MM_SPLIT_K=mm_split,
-        MM_NUM_XCDS=xcds, num_warps=waves,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),), **extern_compile_options(),
+        mm_counters, multiplier,
     )  # fmt: skip
+    gluon_fp32_router_gemv_mm_a16w16_gfx950[(programs,)](*args, **options)
     return out
 
 

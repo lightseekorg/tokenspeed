@@ -1137,12 +1137,12 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionNeverClearsTheProbesT
         ASSERT_TRUE(probe.device.tail);
         ASSERT_EQ(probe.device.tail->tail_tokens, 6);
         const std::vector<CacheBlockLocation> tail_at = index.MatchedLocations(
-            pool, probe.device.tail->group_keys[0], /*begin_blocks=*/0, probe.device.tail->per_group[0]);
+            pool, probe.device.tail->group_keys[0], /*begin_block=*/0, probe.device.tail->per_group[0]);
         ASSERT_EQ(tail_at.size(), 1u);
         EXPECT_EQ(pool.ResolveCacheBlockId(0, tail_at.front()), 50);
         const CacheKey tail_key = *index.KeyOf(pool, tail_at.front());
         const std::vector<CacheBlockLocation> hits =
-            index.MatchedLocations(pool, (*probe.group_keys)[0], /*begin_blocks=*/0, probe.device.per_group[0]);
+            index.MatchedLocations(pool, (*probe.group_keys)[0], /*begin_block=*/0, probe.device.per_group[0]);
         std::vector<std::int32_t> hit_pages;
         for (const CacheBlockLocation hit : hits) {
             hit_pages.push_back(pool.ResolveCacheBlockId(0, hit));
@@ -1244,7 +1244,7 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionMovesTheProbesTailBlo
         ASSERT_EQ(probe.device.num_common_tokens, 43);
         ASSERT_TRUE(probe.device.tail);
         const std::vector<CacheBlockLocation> tail_at = index.MatchedLocations(
-            pool, probe.device.tail->group_keys[0], /*begin_blocks=*/0, probe.device.tail->per_group[0]);
+            pool, probe.device.tail->group_keys[0], /*begin_block=*/0, probe.device.tail->per_group[0]);
         ASSERT_EQ(tail_at.size(), 1u);
         ASSERT_EQ(pool.ResolveCacheBlockId(0, tail_at.front()), 24);
         const CacheKey tail_key = *index.KeyOf(pool, tail_at.front());
@@ -1355,9 +1355,9 @@ TEST_F(LoneRequestCompactionSuite, MovesOneProbeTailBlockPerCompaction) {
     for (std::uint32_t group = 0; group < 2; ++group) {
         const PrefixCacheIndex& index = coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group));
         std::vector<CacheBlockLocation> reached =
-            index.MatchedLocations(pool, (*probe.group_keys)[group], /*begin_blocks=*/0, probe.device.per_group[group]);
+            index.MatchedLocations(pool, (*probe.group_keys)[group], /*begin_block=*/0, probe.device.per_group[group]);
         const std::vector<CacheBlockLocation> tail_at = index.MatchedLocations(
-            pool, probe.device.tail->group_keys[group], /*begin_blocks=*/0, probe.device.tail->per_group[group]);
+            pool, probe.device.tail->group_keys[group], /*begin_block=*/0, probe.device.tail->per_group[group]);
         reached.insert(reached.end(), tail_at.begin(), tail_at.end());
         if (group == 0) {
             ASSERT_EQ(tail_at.size(), 2u);
@@ -1633,7 +1633,7 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
         std::vector<CacheGroupSpec>{
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
             CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
-        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     LoneRequestAdmission lone{coordinator};
     const auto page_hashes = [](const std::vector<std::int32_t>& tokens, std::int32_t pages) {
@@ -1653,7 +1653,7 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
             << k;
         const std::vector<std::string> hashes = page_hashes(MakeTokens(32, 1000 + 100 * k), 4);
         coordinator.CacheFullBlocks(freed.back(), std::span<const std::string>(hashes).first(k < 2 ? 3 : 1),
-                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*first_slot=*/0,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator), /*first_prefix_page=*/0,
                                     CacheBoundaryKind::kChunk);
     }
     for (std::vector<BlockTable>& tables : freed) {
@@ -1677,7 +1677,7 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
     const std::vector<std::string> hashes = page_hashes(prompt, 15);
     coordinator.CacheFullBlocks(r, std::span<const std::string>(hashes).first(8), admitted->access_epoch,
-                                /*first_slot=*/0, CacheBoundaryKind::kChunk);
+                                /*first_prefix_page=*/0, CacheBoundaryKind::kChunk);
     const CacheBlockRef held_state_input = r[1].Blocks()[0];
 
     const TailPublication tail{
@@ -1751,7 +1751,7 @@ TEST(LoneRequestWindowCompactionTest, VacatesAParentBesideAnExpiredBlockTheRetry
                            .cache_blocks_per_lcm_block = 2,
                            .block_granularity = kP},
             CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
-        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     LoneRequestAdmission lone{coordinator};
     std::vector<BlockTable> g(2);
@@ -1827,7 +1827,7 @@ TEST(LoneRequestBucketCompactionTest, ZeroesOnlyThePageADisplacedBlockEndsOn) {
                            .block_granularity = kP,
                            .shard_count = 4},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
-        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     LoneRequestAdmission lone{coordinator};
     std::vector<BlockTable> r(2);
@@ -1896,7 +1896,7 @@ TEST(LoneRequestBucketCompactionTest, VacatesAParentOfFreeBlocksFirstAmongEquall
                            .block_granularity = kP,
                            .shard_count = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
-        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     LoneRequestAdmission lone{coordinator};
     const auto admit = [&](std::vector<BlockTable>& tables, std::int32_t first, std::int32_t second,
@@ -1971,7 +1971,7 @@ TEST(LoneRequestBucketCompactionTest, ReplacesADisplacedBlockInItsOwnParentFirst
                            .block_granularity = kP,
                            .shard_count = 2},
             CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP}},
-        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+        kP, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     LoneRequestAdmission lone{coordinator};
     std::vector<BlockTable> r(2);

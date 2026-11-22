@@ -97,8 +97,25 @@ jobs:
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
+          # Use the same formatter as local pre-commit, regardless of runner image.
+          python - <<'PY'
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          config = yaml.safe_load(Path(".pre-commit-config.yaml").read_text())
+          formatter = next(
+              repo for repo in config["repos"]
+              if repo["repo"] == "https://github.com/pre-commit/mirrors-clang-format"
+          )
+          version = formatter["rev"].removeprefix("v")
+          subprocess.run([sys.executable, "-m", "pip", "install", f"clang-format=={version}"], check=True)
+          PY
           sudo apt-get update
-          sudo apt-get install -y clang-format clang-tidy cmake ninja-build
+          sudo apt-get install -y clang-tidy cmake ninja-build
+          clang-format --version
 
       - name: Configure scheduler compile database
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
