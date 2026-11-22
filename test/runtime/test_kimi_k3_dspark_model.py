@@ -477,7 +477,7 @@ def test_both_layer_boundaries_fuse_the_reduce_into_the_norm(armed, rows, fused)
 
 @pytest.mark.parametrize("ranks,prepared", [(8, True), (8, False), (1, True)])
 def test_the_draft_arms_the_fused_all_reduce_norm_once_per_group(ranks, prepared):
-    """The shared dense and attention group arms once; a lone rank never does."""
+    """The shared dense and attention group arms once; one rank never does."""
     model = K3DSparkModel.__new__(K3DSparkModel)
     torch.nn.Module.__init__(model)
     group = tuple(range(ranks))
