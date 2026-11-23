@@ -171,7 +171,11 @@ LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> 
     const std::uint32_t op_id = nextOpId();
     const bool inserted = load_backs_.emplace(op_id, std::move(block_transfers)).second;
     _assert(inserted, "duplicate loadback op id");
-    return LoadBackOperation{op_id, std::move(transfers)};
+    return LoadBackOperation{
+        .op_id = op_id,
+        .transfers = std::move(transfers),
+        .telemetry = PrefixLoadTelemetry{.op_generation = (next_op_id_ - 1) >> 32},
+    };
 }
 
 std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
@@ -398,6 +402,17 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
     // Both ends were pinned for the copy; the destinations were published
     // when the admission claimed the Host hit, so the ACK only lets go.
     load_backs_.erase(op_id);
+}
+
+std::vector<std::unordered_set<std::int32_t>> TierTransferManager::LoadBackDestinations() const {
+    std::vector<std::unordered_set<std::int32_t>> destinations(static_cast<std::size_t>(coordinator_.NumGroups()));
+    for (const auto& [op_id, transfers] : load_backs_) {
+        for (const BlockTransfer& transfer : transfers) {
+            const GroupAllocator& allocator = coordinator_.Allocator(static_cast<std::int32_t>(transfer.group_id));
+            destinations[transfer.group_id].insert(allocator.ResolveCacheBlockId(*transfer.destination));
+        }
+    }
+    return destinations;
 }
 
 TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks() const {
@@ -636,6 +651,12 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
         .snapshot_slot = blob_slot->slot_,
         .transfers = resolveTransfers(load_pairs),
         .source_tier = std::vector<HostTier>(load_pairs.size(), HostTier::kL2),
+        .telemetry =
+            RestoreTelemetry{
+                .op_generation = (next_op_id_ - 1) >> 32,
+                .slot_generation = request_pool_index.generation(),
+                .slot_previous_admission_id = request_pool_index.previous_admission_id(),
+            },
     };
     // Only the L2 rows are Host L2 traffic; the snapshot-pool rows follow.
     if (!op.transfers.empty()) {

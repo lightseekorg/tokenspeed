@@ -23,6 +23,15 @@
 The decoder reuses Inkling's cache geometry, but has a distinct architecture.
 Numerical settings come from the checkpoint. MTP metadata does not change the
 target's layer count or select the older Inkling NextN execution path.
+
+A looped Inkling2 (model type ``inkling2_loop``, with a
+``text_config.loop_config``) runs a contiguous core of its decoder layers
+several times per token. Each run of a layer is a layer visit; every visit of
+a core layer owns its own attention and convolution caches, so the cache view
+counts cache layers, not decoder layers. A variable-loop checkpoint
+(``is_varloop``) can also serve another pass count, or one attention cache
+per core layer that all its passes share (:meth:`configure_loop`); the
+convolution state stays one per visit.
 """
 
 from __future__ import annotations
@@ -57,8 +66,11 @@ class Inkling2ModelConfig(InklingModelConfig):
         attn_res_normalize_values: bool,
         mlp_gate_softcap: float,
         mlp_up_softcap: float,
+        loop_config: dict[str, int | bool] | None = None,
+        decode_monokernel: bool = False,
         **kwargs: Any,
     ) -> None:
+        # A non-looped checkpoint has no loop_config: every layer runs once.
         required = {
             "vocab_size",
             "hidden_size",
@@ -122,6 +134,8 @@ class Inkling2ModelConfig(InklingModelConfig):
                 raise ValueError(f"Inkling2 requires {name}={value!r}")
             kwargs[name] = value
         super().__init__(model_max_length=model_max_length, **kwargs)
+        # --decode-monokernel (ModelConfig sets it for the serving target).
+        self.decode_monokernel = bool(decode_monokernel)
         self.max_position_embeddings = model_max_length
         self.use_value_norm_no_gamma = use_value_norm_no_gamma
         self.qk_l2_clip_threshold = qk_l2_clip_threshold
@@ -130,6 +144,10 @@ class Inkling2ModelConfig(InklingModelConfig):
         self.attn_res_normalize_values = attn_res_normalize_values
         self.mlp_gate_softcap = mlp_gate_softcap
         self.mlp_up_softcap = mlp_up_softcap
+        self.loop_config = None if loop_config is None else dict(loop_config)
+        # Whether all passes of a core layer share one attention cache
+        # (configure_loop); the checkpoint layout keeps one per pass.
+        self.loop_share_cache = False
         if not 0 < n_layers_per_attn_res_block <= self.num_hidden_layers:
             raise ValueError(
                 "Attention residual block size must be within the layer count"
@@ -162,6 +180,160 @@ class Inkling2ModelConfig(InklingModelConfig):
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
+        if self.loop_config is not None:
+            self._validate_loop_config()
+
+    def _validate_loop_config(self) -> None:
+        loop = self.loop_config
+        int_fields = {"core_start", "core_end", "num_passes", "gate_rank"}
+        # is_varloop=True marks a checkpoint trained to also serve other pass
+        # counts or one shared cache per core layer (configure_loop). Without
+        # such overrides it serves exactly like is_varloop=False.
+        if (
+            set(loop) != int_fields | {"is_varloop"}
+            or any(type(loop[name]) is not int for name in int_fields)
+            or type(loop["is_varloop"]) is not bool
+        ):
+            raise ValueError(
+                f"loop_config requires integer fields {sorted(int_fields)} "
+                "and a boolean is_varloop"
+            )
+        start, end = loop["core_start"], loop["core_end"]
+        if not 0 <= start < end <= self.num_hidden_layers:
+            raise ValueError("The loop core must lie within the decoder layers")
+        block = self.n_layers_per_attn_res_block
+        if start % block or end % block:
+            raise ValueError(
+                "Loop core boundaries must align with attention residual blocks"
+            )
+        if loop["num_passes"] < 2 or loop["gate_rank"] <= 0:
+            raise ValueError(
+                "Looping requires at least two passes and a positive gate rank"
+            )
+        # The K and V messages read RMS-normalized residual blocks.
+        if not self.attn_res_normalize_values:
+            raise ValueError("loop_config requires attn_res_normalize_values=True")
+
+    def configure_loop(self, *, num_passes: int | None, share_cache: bool) -> None:
+        """Serve a variable-loop checkpoint at another pass count or with one
+        attention cache per core layer that all its passes share.
+
+        Args:
+            num_passes: Passes of the core per token, at least 1 (1 runs each
+                core layer once, with no messages); None keeps the
+                checkpoint's count.
+            share_cache: Whether every pass of a core layer reads and writes
+                that layer's one attention cache, so later tokens attend to
+                the last pass's K/V. Convolution state stays one per visit.
+        """
+        if self.loop_config is None or not self.loop_config["is_varloop"]:
+            raise ValueError(
+                "--inkling2-loop-num-passes and --inkling2-loop-share-cache need "
+                "an inkling2_loop checkpoint with loop_config.is_varloop=true"
+            )
+        if num_passes is not None:
+            if type(num_passes) is not int or num_passes < 1:
+                raise ValueError(
+                    f"A variable loop needs at least 1 pass, got {num_passes!r}"
+                )
+            self.loop_config = {**self.loop_config, "num_passes": num_passes}
+        self.loop_share_cache = share_cache
+
+    @property
+    def loop_core_layers(self) -> range:
+        """Decoder layers that run once per pass; empty without a loop."""
+        loop = self.loop_config
+        if loop is None:
+            return range(0)
+        return range(loop["core_start"], loop["core_end"])
+
+    @property
+    def num_loop_passes(self) -> int:
+        """Runs of each core layer per token (1 without a loop)."""
+        return 1 if self.loop_config is None else self.loop_config["num_passes"]
+
+    def layer_passes(self, layer_id: int) -> int:
+        """How many times decoder layer ``layer_id`` runs per token."""
+        return self.num_loop_passes if layer_id in self.loop_core_layers else 1
+
+    @property
+    def num_layer_visits(self) -> int:
+        """Decoder layer runs per token, in execution order."""
+        return self.num_hidden_layers + (self.num_loop_passes - 1) * len(
+            self.loop_core_layers
+        )
+
+    @property
+    def layer_visits(self) -> list[tuple[int, int]]:
+        """``(layer_id, pass_idx)`` of every visit in execution order: the
+        prelude once, the core ``num_loop_passes`` times, then the coda."""
+        core = self.loop_core_layers
+        if not core:
+            return [(layer, 0) for layer in range(self.num_hidden_layers)]
+        return (
+            [(layer, 0) for layer in range(core.start)]
+            + [
+                (layer, pass_idx)
+                for pass_idx in range(self.num_loop_passes)
+                for layer in core
+            ]
+            + [(layer, 0) for layer in range(core.stop, self.num_hidden_layers)]
+        )
+
+    def conv_layer_id(self, layer_id: int, pass_idx: int) -> int:
+        """The convolution state layer of one visit: pass 0 keeps the decoder
+        layer id; later passes of the core follow all decoder layers, pass by
+        pass."""
+        if not 0 <= layer_id < self.num_hidden_layers or not (
+            0 <= pass_idx < self.layer_passes(layer_id)
+        ):
+            raise ValueError(f"Layer {layer_id} has no pass {pass_idx}")
+        if pass_idx == 0:
+            return layer_id
+        core = self.loop_core_layers
+        return (
+            self.num_hidden_layers + (pass_idx - 1) * len(core) + layer_id - core.start
+        )
+
+    def cache_layer_id(self, layer_id: int, pass_idx: int) -> int:
+        """The attention cache layer of one visit: its convolution layer, or
+        the decoder layer when all passes share one cache."""
+        conv_layer = self.conv_layer_id(layer_id, pass_idx)
+        return layer_id if self.loop_share_cache else conv_layer
+
+    @property
+    def num_conv_layers(self) -> int:
+        """Convolution state layers: one per layer visit."""
+        return self.num_layer_visits
+
+    def conv_layers_of_cache_layer(self, cache_layer: int) -> tuple[int, ...]:
+        """Convolution state layers whose checkpoints ride this cache layer's
+        pages, in pass order: under a shared cache, every pass of its layer."""
+        return tuple(
+            self.conv_layer_id(layer, pass_idx)
+            for layer, pass_idx in self.layer_visits
+            if self.cache_layer_id(layer, pass_idx) == cache_layer
+        )
+
+    @property
+    def num_cache_layers(self) -> int:
+        """Attention cache layers: one per layer visit, or one per decoder
+        layer when the passes share a cache."""
+        return (
+            self.num_hidden_layers if self.loop_share_cache else self.num_layer_visits
+        )
+
+    @property
+    def local_cache_layer_ids(self) -> list[int]:
+        """Attention cache layers of the sliding-window (local) layers."""
+        local = set(self.local_layer_ids)
+        return sorted(
+            {
+                self.cache_layer_id(layer, pass_idx)
+                for layer, pass_idx in self.layer_visits
+                if layer in local
+            }
+        )
 
 
 class Inkling2VisionConfig(PretrainedConfig):
@@ -208,6 +380,8 @@ class Inkling2MMConfig(PretrainedConfig):
     """
 
     model_type = "inkling2"
+    # The one architecture a checkpoint of this model type declares.
+    architecture = "Inkling2ForConditionalGeneration"
     has_no_defaults_at_init = True
     sub_configs = {
         "text_config": Inkling2ModelConfig,
@@ -233,11 +407,23 @@ class Inkling2MMConfig(PretrainedConfig):
             if isinstance(vision_config, Inkling2VisionConfig) or vision_config is None
             else Inkling2VisionConfig(**copy.deepcopy(vision_config))
         )
+        if (self.text_config.loop_config is not None) != (
+            type(self).model_type == Inkling2LoopMMConfig.model_type
+        ):
+            raise ValueError(
+                "Looped Inkling2 checkpoints use model_type inkling2_loop with a "
+                "loop_config; model_type inkling2 has none"
+            )
         self.mtp_config = copy.deepcopy(mtp_config)
         self.text_config.eos_token_id = eos_token_id
         if kwargs.pop("tie_word_embeddings", False):
             raise ValueError("Inkling2 requires tie_word_embeddings=False")
         super().__init__(tie_word_embeddings=False, eos_token_id=eos_token_id, **kwargs)
+        if self.architectures != [self.architecture]:
+            raise ValueError(
+                f"model_type {self.model_type} checkpoints use architectures "
+                f"[{self.architecture!r}], got {self.architectures!r}"
+            )
 
     @property
     def vocab_size(self) -> int:
@@ -263,6 +449,18 @@ class Inkling2MMConfig(PretrainedConfig):
     def image_placeholder_token_id(self) -> int | None:
         """The native image payload token, not the transport's soft anchor."""
         return 200005 if self.vision_config is not None else None
+
+
+class Inkling2LoopMMConfig(Inkling2MMConfig):
+    """A looped Inkling2 checkpoint; its ``text_config`` has a ``loop_config``."""
+
+    model_type = "inkling2_loop"
+    architecture = "Inkling2LoopForConditionalGeneration"
+
+    # Transformers turns config subclasses into dataclasses and generates an
+    # __init__ for one that has none, which would skip the parent's parsing.
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
 
 
 class Inkling2MTPConfig(PretrainedConfig):
@@ -353,16 +551,19 @@ class Inkling2MTPConfig(PretrainedConfig):
         draft = cls(**copy.deepcopy(config.mtp_config))
         if draft.hidden_size != text.hidden_size:
             raise ValueError("Inkling2 MTP and target hidden sizes must match")
+        # Taps count layer visits (decoder layers without a loop); the
+        # sentinel is the final-norm output after the last visit.
         features = draft.target_layer_ids
+        num_visits = text.num_layer_visits
         if (
             len(features) < 2
             or features != sorted(set(features))
-            or (features[-1] != text.num_hidden_layers)
-            or any(i < 0 or i >= text.num_hidden_layers for i in features[:-1])
+            or (features[-1] != num_visits)
+            or any(i < 0 or i >= num_visits for i in features[:-1])
         ):
             raise ValueError(
-                "MTP target_layer_ids must be sorted unique target indices "
-                "followed by the final-norm sentinel num_hidden_layers"
+                "MTP target_layer_ids must be sorted unique target layer visits "
+                f"followed by the final-norm sentinel {num_visits}"
             )
         values = draft.to_dict()
         values.update(
@@ -389,7 +590,7 @@ class Inkling2MTPConfig(PretrainedConfig):
             dspark_target_layer_ids=list(features),
             mask_token_id=0,
             dflash_config=dict(
-                num_target_layers=text.num_hidden_layers,
+                num_target_layers=num_visits,
                 target_layer_ids=list(features[:-1]),
             ),
         )

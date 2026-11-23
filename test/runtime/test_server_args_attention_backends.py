@@ -28,12 +28,14 @@ import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.layers.attention import registry
+from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
 from tokenspeed.runtime.layers.attention.backends.state import kda
-from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
@@ -55,6 +57,20 @@ class TestAttentionBackendChoices:
             if action.dest == dest:
                 return action
         raise AssertionError(f"no action with dest={dest!r}")
+
+    @pytest.mark.parametrize(
+        ("flags", "enabled"),
+        [
+            ([], True),
+            (["--qwen4-exp-flat-kv"], True),
+            (["--no-qwen4-exp-flat-kv"], False),
+            (["--qwen4-exp-flat-kv", "--no-qwen4-exp-flat-kv"], False),
+            (["--no-qwen4-exp-flat-kv", "--qwen4-exp-flat-kv"], True),
+        ],
+    )
+    def test_qwen4_exp_flat_kv_default_and_overrides(self, flags, enabled):
+        args = prepare_server_args(["--model", "x", *flags])
+        assert args.qwen4_exp_flat_kv is enabled
 
     def test_attention_backend_accepts_trtllm_mla(self):
         args = self._build_parser().parse_args(
@@ -127,23 +143,24 @@ class TestAttentionBackendChoices:
         spec = MHAConfig(
             num_attention_heads=4, num_kv_heads=4, head_dim=128, attn_tp_size=1
         )
-        components = {
-            SoftmaxAttnConfig: spec,
-            LinearAttnConfig: SimpleNamespace(
-                layer_ids=(0,),
-                replay_ssm=False,
-                draft_tree=False,
-                tree_node_state_workspace=True,
-            ),
-        }
-        config = SimpleNamespace(
+        linear = LinearAttnConfig(
+            num_k_heads=4,
+            num_v_heads=4,
+            head_k_dim=128,
+            head_v_dim=128,
+            conv_kernel_size=4,
+            layer_ids=(0,),
+            tp_size=1,
+        )
+        config = AttnConfig(
             device="cpu",
-            dtype=None,
-            is_draft=False,
-            speculative_num_draft_tokens=1,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_quant_method="none",
+            context_len=256,
             max_bs=4,
             max_resident_requests=4,
-            component=components.get,
+            components=(spec, linear),
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(full_attention_layer_ids=[1]),
@@ -462,15 +479,12 @@ class TestAttentionBackendChoices:
         assert (config.context_len) == (4108)
 
 
-class _GpuBackendStandIn:
+class _GpuBackendStandIn(CachePoolBinding):
     """Stands in for GPU backend construction, injected through the
     ``reuse_*_backend`` seam of ``create_attn_components``."""
 
     def __init__(self):
-        self.cache_pool = None
-
-    def set_cache_pool(self, pool):
-        self.cache_pool = pool
+        self._init_pool_binding()
 
 
 class TestCacheBackendIdentity:

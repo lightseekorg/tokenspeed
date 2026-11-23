@@ -134,6 +134,7 @@ VENDOR_KERNEL_SOLUTIONS = {
             "faster_hadamard_transform",
             "flash_mla",
             "flashinfer",
+            "flashinfer_cutedsl",
             "flashinfer_prims",
             "marlin",
             "mega_moe",

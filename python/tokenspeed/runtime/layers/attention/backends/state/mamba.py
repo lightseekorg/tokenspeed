@@ -80,6 +80,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    PrefillRequestLayout,
     reject_bounded_replay,
     reject_query_shard,
 )
@@ -233,12 +234,14 @@ class MambaForwardMetadata:
 
 
 def _prefill_conv_writes_qkv(key_split_dim: int, value_split_dim: int) -> bool:
-    """Whether the prefill convolution writes q, k and v rows itself (AMD).
+    """Whether the prefill convolution writes q, k and v rows itself.
 
     The direct write skips the q/k/v split pass and leaves the same values.
+    Hopper keeps the split, which zeroes the rows past the live tokens.
+    Backends whose scan reads strided q/k/v views keep those views.
     """
     return (
-        current_platform().is_amd
+        not current_platform().is_hopper
         and key_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
         and value_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
     )
@@ -292,6 +295,9 @@ class MambaAttnBackend(AttentionBackend):
     # Whether the family's prefill scan stores in-forward State checkpoints
     # (SchedulerConfig::state_checkpoint_in_forward).
     _stores_in_forward_state_checkpoints: bool = False
+    # Whether a chain verify's conv update writes dense q/k/v rows and the
+    # ReplaySSM payload (GDN's q | k | v channels and scalar a/b gates).
+    _verify_conv_writes_rows: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -991,7 +997,7 @@ class MambaAttnBackend(AttentionBackend):
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "MambaStateBackend")
-        del extend_prefix_lens_cpu, extend_with_prefix
+        del extend_with_prefix
         self._mixed_forward_metadata = None
         del extend_prompt_lens_cpu, kwargs
         reject_bounded_replay(extend_replay_lens_cpu, "MambaStateBackend")
@@ -1002,7 +1008,15 @@ class MambaAttnBackend(AttentionBackend):
             )
         if not 0 <= num_extends <= bs:
             raise ValueError("num_extends must be between 0 and bs")
+        request_layout = (
+            PrefillRequestLayout.from_cpu_lengths(
+                num_extends, extend_seq_lens_cpu, extend_prefix_lens_cpu
+            )
+            if num_extends and not forward_mode.is_idle()
+            else None
+        )
         if forward_mode.is_idle():
+            self._prefill_request_layout = None
             # Idle warmup carries no requests and never reaches the state
             # kernels (the router returns early); the rows only take the
             # decode query shape — one token, or the verify window under
@@ -1114,6 +1128,9 @@ class MambaAttnBackend(AttentionBackend):
                 block_tables,
                 state_checkpoints=state_checkpoints,
             )
+        # The split decode tail refreshes its own metadata first; publish the
+        # complete forward's extend layout only after that refresh finishes.
+        self._prefill_request_layout = request_layout
 
     def _scan_state_checkpoints(
         self,
@@ -1341,6 +1358,7 @@ class MambaAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        self._prefill_request_layout = None
         mamba_output_indices = None
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
@@ -1389,6 +1407,8 @@ class MambaAttnBackend(AttentionBackend):
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
+        if num_extends == 0:
+            self._prefill_request_layout = None
         del req_pool_indices, kwargs
         self._mixed_forward_metadata = None
         real_bs = actual_bs
@@ -2022,19 +2042,14 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
-            if self.tree_verify is None and not self._verify_packed_qkv_views:
-                # A chain verifies through the dense MTP kernels (FlashInfer's).
-                mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
-            if (
-                self.tree_verify is None
-                and self.replay_ssm
-                and self._verify_scan_writes_replay
-                and self._verify_packed_qkv_views
-            ):
-                # The selected verify reads projection views; conv also fills the replay payload.
-                conv_replay = self._replay_inputs(
-                    layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
-                )
+            if self.tree_verify is None and self._verify_conv_writes_rows:
+                # A chain's conv update reads the projection view and writes dense
+                # q/k/v rows and the ReplaySSM payload: no pack and no split. The
+                # verify kernels read the gates as projection views.
+                if self.replay_ssm:
+                    conv_replay = self._replay_inputs(
+                        layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
+                    )
                 conv_rows = mixed_qkv.new_empty(mixed_qkv.shape).view(
                     batch_size, draft_token_num, -1
                 )
@@ -2103,7 +2118,7 @@ class MambaAttnBackend(AttentionBackend):
                 )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            if _prefill_conv_writes_qkv(
+            if not self._prefill_supports_strided_qkv() and _prefill_conv_writes_qkv(
                 key_dim // attn_tp_size, value_dim // attn_tp_size
             ):
                 # The convolution writes q, k and v rows directly; no split pass.
@@ -2175,7 +2190,7 @@ class MambaAttnBackend(AttentionBackend):
                 and (
                     self._verify_packed_qkv_views
                     or scan_replay is not None
-                    or conv_replay is not None
+                    or conv_rows is not None
                 )
                 or not is_target_verify
                 and self._prefill_supports_strided_qkv()

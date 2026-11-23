@@ -48,6 +48,8 @@ from tokenspeed_kernel.ops.attention.prologue import (
     latent_store,
     mla_prologue,
 )
+from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -271,16 +273,32 @@ class PagedAttention(nn.Module):
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         ctx: ForwardContext,
+        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Core attention over prepared inputs, the eager break: the prologue's
         query and, for a forward that is not a decode, its returned key and
         value rows. A model that runs :meth:`prologue` inside its own stream
-        scope calls this afterwards."""
+        scope calls this afterwards.
+
+        ``rmsnorm_output_gate=(gate, eps)`` returns
+        ``weightless_rmsnorm_gated_sigmoid`` of the output instead: per-head
+        RMSNorm, times the sigmoid of ``gate`` (``[tokens, heads *
+        head_dim]``). A decode whose backend ``gates_decode_output`` applies
+        it where the kernel stores the output, with the same bits; every other
+        forward runs the separate op after.
+        """
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-        return ctx.attn_backend.forward(
+        in_kernel = (
+            rmsnorm_output_gate is not None
+            and ctx.forward_mode.is_decode()
+            and ctx.attn_backend.gates_decode_output(self)
+        )
+        if in_kernel:
+            kwargs["rmsnorm_output_gate"] = rmsnorm_output_gate
+        output = ctx.attn_backend.forward(
             q,
             k,
             v,
@@ -291,6 +309,17 @@ class PagedAttention(nn.Module):
             save_kv_cache=False,
             ctx=ctx,
             **kwargs,
+        )
+        if rmsnorm_output_gate is None or in_kernel:
+            return output
+        gate, eps = rmsnorm_output_gate
+        return weightless_rmsnorm_gated_sigmoid(
+            output.contiguous(),
+            gate,
+            self.tp_q_head_num,
+            self.v_head_dim,
+            eps,
+            pdl_enabled(),
         )
 
     def decode_kv_view(self, ctx: ForwardContext) -> "DecodeKVView | None":
@@ -722,7 +751,7 @@ def _check_visibility_within_retention(
             f"sink tokens but cache group {spec.group_id!r} retains {spec.sink_tokens}."
         )
     # The scheduler keeps the last `retained - 1` computed tokens ahead of
-    # the next position (GroupGeometry::ExpiredBlocksAt), exactly the HF
+    # the next position (GroupGeometry::ExpiredBlockEndAt), exactly the HF
     # window minus the current token.
     if retained is None or window_left + 1 > retained:
         raise ValueError(

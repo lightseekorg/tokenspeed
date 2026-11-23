@@ -85,6 +85,7 @@ import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
+import tokenspeed_kernel.ops.model.kimi_k3.gluon as _model_kimi_k3_gluon
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_ep as _moe_deep_ep
@@ -120,6 +121,10 @@ from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel
 from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32 as kernel_dsv4_linear_fp32
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.model.kimi_k3 import (
+    KimiK3MoeTailShape,
+    kimi_k3_moe_tail_expert_layout,
+)
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -210,6 +215,7 @@ _RELOAD_MODULES = [
     _moe_deep_ep,
     _moe_flashinfer,
     _moe_gluon,
+    _model_kimi_k3_gluon,
     _moe_marlin,
     _moe_native,
     _moe_triton,
@@ -316,6 +322,7 @@ def test_residual_family_exports_and_modes():
         "pad_gated_residual_projection_weight",
         "post_norm_residual_pre_norm",
         "post_norm_residual_pre_norm_bf16",
+        "post_norm_residual_pre_norm_bf16_fp8",
         "residual_gate_coefficients",
         "try_mhc_shifted_post_pre_norm",
         "try_mhc_shifted_post_pre_norm_quantize_fp8",
@@ -585,6 +592,7 @@ def _mm_mxfp8(m: int) -> torch.Tensor:
             None,
             "trtllm_cutedsl_mm_fp8_blockscale_large_m",
         ),
+        (512, "k_major_scales", torch.bfloat16, None, "flashinfer_mm_fp8_blockscale"),
         (33, "contiguous", torch.float16, None, "flashinfer_mm_fp8_blockscale"),
         (17, "contiguous", torch.float16, None, "triton_mm_fp8_blockscale"),
         (16, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
@@ -640,6 +648,10 @@ def test_blackwell_block_fp8_auto_boundary(
         b = b[::2]
     if layout == "out_rows":
         out = out[::2]
+    # Callers quantize into the layout the kernel reads: MN-major for CuTe-DSL.
+    a_scales = torch.empty((m, 2), dtype=torch.float32)
+    if expected.startswith("trtllm_cutedsl"):
+        a_scales = torch.empty((2, m), dtype=torch.float32).t()
     active_case, calls = selected_kernel_spy
     active_case["case"] = _case(
         _is_blackwell_plus,
@@ -655,7 +667,7 @@ def test_blackwell_block_fp8_auto_boundary(
         kernel_mm(
             a,
             b,
-            A_scales=torch.empty((m, 2), dtype=torch.float32),
+            A_scales=a_scales,
             B_scales=torch.empty((1, 2), dtype=torch.float32),
             out_dtype=out_dtype,
             out=out,
@@ -4310,18 +4322,28 @@ def test_triton_mxfp4_supports_input_activation_dtype(
 
 
 @pytest.mark.parametrize(
-    "ep_size,ispp,solution,kernel_name,preprocessor",
+    "ep_size,ispp,solution,expert_layout,kernel_name,preprocessor",
     [
         (
             1,
             384,
             None,
+            None,
             "gluon_mxfp4_a8w4_situ_precomputed_moe_apply",
             "gluon_mxfp4_gfx950_moe_weights",
         ),
         (
+            1,
+            384,
+            None,
+            "n16",
+            "gluon_mxfp4_a8w4_situ_precomputed_n16_moe_apply",
+            "gluon_mxfp4_gfx950_n16_moe_weights",
+        ),
+        (
             8,
             3072,
+            None,
             None,
             "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
             "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
@@ -4330,6 +4352,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             8,
             3072,
             "gluon",
+            None,
             "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply",
             "gluon_mxfp4_gfx950_a8w4_situ_ep_weights",
         ),
@@ -4340,6 +4363,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     ep_size: int,
     ispp: int,
     solution: str | None,
+    expert_layout: str | None,
     kernel_name: str,
     preprocessor: str,
 ) -> None:
@@ -4358,6 +4382,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             ep_size=ep_size,
             ispp=ispp,
             internal_activation_dtype="input",
+            expert_layout=expert_layout,
             solution=solution,
             hidden=None,
             swiglu_form=None,
@@ -4374,7 +4399,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
-    # Only the TP apply reads the fused router's expert sort, at the decode
+    # Only the TP applies read the fused router's expert sort, at the decode
     # widths it sorts itself.
     if ep_size == 1:
         assert plan["sorted_route_rows"] == frozenset(range(8, 193))
@@ -4382,6 +4407,102 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     else:
         assert plan["sorted_route_rows"] == frozenset()
         assert plan["sorted_route_block_size"] is None
+
+
+def test_kimi3_mxfp4_situ_n16_needs_a_kernel_that_reads_it(
+    mi350_platform: PlatformInfo,
+) -> None:
+    # The EP8 apply declares no bank layout: an N16 request there fails when
+    # the plan is built, never during a request.
+    if (
+        KernelRegistry.get().get_by_name(
+            "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+        )
+        is None
+    ):
+        pytest.skip("the gfx950 EP8 apply is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(ValueError, match="'n16' expert layout"):
+            kernel_moe_plan(
+                "mxfp4",
+                input_dtype=torch.bfloat16,
+                activation="situ",
+                routing_mode="precomputed_topk",
+                ep_size=8,
+                ispp=3072,
+                internal_activation_dtype="fp8",
+                expert_layout="n16",
+                solution=None,
+                hidden=None,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+                combine_order="rank",
+                features=frozenset(),
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
+
+
+# Kimi-K3.1 at TP8, one request's 8-row speculative verify.
+_KIMI_K3_MOE_TAIL = KimiK3MoeTailShape(
+    rows=8,
+    hidden_size=7168,
+    tp_size=8,
+    num_heads=96,
+    head_dim=128,
+    num_experts=896,
+    top_k=16,
+    latent_size=3584,
+    intermediate_size=3072,
+    shared_intermediate_size=6144,
+    weight_dtype="mxfp4",
+    num_expert_groups=1,
+    topk_groups=1,
+    scoring_func="sigmoid",
+    routed_scaling_factor=1.0,
+    renormalize=True,
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
+)
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,change,layout",
+    [
+        ("mi350_platform", {}, "n16"),
+        ("mi350_platform", {"rows": 9}, None),
+        ("mi350_platform", {"tp_size": 4}, None),
+        ("mi350_platform", {"weight_dtype": "unquant"}, None),
+        ("h100_platform", {}, None),
+    ],
+)
+def test_kimi_k3_moe_tail_serves_only_its_sizes_on_gfx950(
+    platform_fixture: str,
+    change: dict,
+    layout: str | None,
+    request: pytest.FixtureRequest,
+) -> None:
+    registry = KernelRegistry.get()
+    if (
+        layout is not None
+        and registry.get_by_name("gluon_kimi_k3_moe_tail_gfx950") is None
+    ):
+        pytest.skip("the gfx950 MoE tail is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        registry.clear_cache()
+        shape = replace(_KIMI_K3_MOE_TAIL, **change)
+        assert kimi_k3_moe_tail_expert_layout(shape) == layout
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
 
 
 @pytest.mark.parametrize(

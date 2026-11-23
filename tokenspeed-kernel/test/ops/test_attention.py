@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 import torch
@@ -867,11 +868,49 @@ def test_triton_mha_decode_folds_query_rows(
         torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads",
+    [
+        pytest.param(48, 2, id="gqa24"),
+        pytest.param(40, 2, id="gqa20"),
+        pytest.param(64, 2, id="gqa32"),
+        pytest.param(24, 4, id="gqa6"),
+    ],
+)
+def test_triton_mha_decode_grouped_heads_read_their_kv_head(
+    device: str, num_q_heads: int, num_kv_heads: int, require
+) -> None:
+    """Grouped one-token decode matches attention past a 16-head tile."""
+    require("attention", "mha_decode_with_kvcache", "triton", torch.bfloat16, "q")
+    seq_lens = [3, 64, 333, 2049]
+    q, k_cache, v_cache, page_table, cache_seqlens = _paged_decode_problem(
+        seq_lens, 1, num_q_heads, num_kv_heads, 128, 64, device
+    )
+    scale = 128**-0.5
+    expected, _ = _causal_decode_reference(
+        q, k_cache, v_cache, page_table, cache_seqlens, 1, -1, None, scale
+    )
+    out = mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max(seq_lens),
+        max_seqlen_q=1,
+        softmax_scale=scale,
+        solution="triton",
+        block_draft=False,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
 def test_triton_mha_decode_folded_no_recompile_across_batches(
     device: str, require
 ) -> None:
     """The folded decode's split count follows the batch size; it is a runtime
-    value, so serving's batch sizes share the compiled kernels."""
+    value, so serving's batch sizes share the compiled kernels. A single-row
+    decode (a plain or draft decode step) takes the same kernels."""
     from tokenspeed_kernel.ops.attention.mha._triton.decode import (
         _fwd_folded_kernel_stage1,
         _fwd_folded_kernel_stage2,
@@ -886,7 +925,7 @@ def test_triton_mha_decode_folded_no_recompile_across_batches(
         [17 + 29 * i % 700 for i in range(max_bs)], 16, 24, 4, 256, 64, device
     )
 
-    def run(bs: int, rows: int) -> None:
+    def run(bs: int, rows: int, return_lse: bool) -> None:
         mha_decode_with_kvcache(
             q=q_all[: bs * rows],
             k_cache=k_cache,
@@ -895,17 +934,18 @@ def test_triton_mha_decode_folded_no_recompile_across_batches(
             cache_seqlens=cache_seqlens[:bs],
             max_seqlen_k=page_table.shape[1] * 64,
             max_seqlen_q=rows,
-            return_lse=True,
+            return_lse=return_lse,
             solution="triton",
             block_draft=False,
         )
 
-    for rows in (8, 16):
-        run(1, rows)
+    shapes = ((8, True), (16, True), (1, False))
+    for rows, return_lse in shapes:
+        run(1, rows, return_lse)
     with assert_no_triton_compile(_fwd_folded_kernel_stage1, _fwd_folded_kernel_stage2):
         for bs in (2, 3, 8, 17, 32, 64, 256):
-            for rows in (8, 16):
-                run(bs, rows)
+            for rows, return_lse in shapes:
+                run(bs, rows, return_lse)
 
 
 def _paged_cache(
@@ -953,10 +993,10 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
     device: str, num_q_heads: int, window_left: int, require
 ) -> None:
     """The Triton decode matches an FP32 reference at every batch size, its
-    output alone (the single-row kernels, which split a small batch's keys
-    across programs) and with the natural-log LSE (the folded kernel); an
-    empty cache yields a zero output and an LSE of -inf, and a new batch size
-    or key split reuses the compiled kernels."""
+    output alone and with the natural-log LSE (both from the folded kernel,
+    which splits a small batch's keys across programs); an empty cache yields
+    a zero output and an LSE of -inf, and a new batch size or key split
+    reuses the compiled kernels."""
     from tokenspeed_kernel.ops.attention.mha._triton import decode
     from utils import assert_no_triton_compile
 
@@ -997,13 +1037,7 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
     # Warm both alignment classes of the page-table stride (16 and 2 pages).
     check([1000, 1])
     check([100])
-    kernels = (
-        decode._fwd_kernel_stage1,
-        decode._fwd_grouped_kernel_stage1,
-        decode._fwd_kernel_stage2,
-        decode._fwd_folded_kernel_stage1,
-        decode._fwd_folded_kernel_stage2,
-    )
+    kernels = (decode._fwd_folded_kernel_stage1, decode._fwd_folded_kernel_stage2)
     with assert_no_triton_compile(*kernels):
         # One request: its keys split across programs.
         check([2049])
@@ -1011,3 +1045,7 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
         check([777, 0, 64, 1500, 3])
         # Enough requests to fill the GPU without splitting.
         check([int(n) for n in torch.randint(1, 900, (512,))])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

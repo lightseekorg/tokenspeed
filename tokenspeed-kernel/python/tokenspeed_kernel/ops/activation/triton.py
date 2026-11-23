@@ -27,6 +27,7 @@ import functools
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops._triton_l2 import prefetch_l2
+from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
@@ -1192,25 +1193,27 @@ def _rmsnorm_gated_kernel(
     BLOCK_H: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     offs_h = tl.arange(0, BLOCK_H)
     offs_d = tl.arange(0, head_dim)
     mask_h = offs_h < num_heads
-    idx = token * num_heads * head_dim + offs_h[:, None] * head_dim + offs_d[None, :]
+    idx = offs_h[:, None] * head_dim + offs_d[None, :]
+    x_row = x_ptr + token * (num_heads * head_dim)
+    out_row = out_ptr + token * (num_heads * head_dim)
+    gate_row = gate_ptr + token * gate_stride
     w = tl.load(weight_ptr + offs_d).to(tl.float32)
-    gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
-    g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    g = tl.load(gate_row + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     if ENABLE_PDL:
         # Release the next kernel at once; its own wait orders it after this one.
         tl.extra.cuda.gdc_launch_dependents()
         # Gate and norm weight are independent of the KDA primary. Delay only
         # the attention-output read until every primary CTA has completed.
         tl.extra.cuda.gdc_wait()
-    x = tl.load(x_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    x = tl.load(x_row + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
-    tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
+    tl.store(out_row + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
 
 def rmsnorm_gated_sigmoid(
@@ -2011,14 +2014,18 @@ def _mul_rn_f32(left, right):
     if _IS_HIP:
         # HIP launches disable FP contraction; use the portable FP32 multiply.
         return left * right
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[left, right],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    return mul_rn_f32(left, right)
+
+
+@triton.jit
+def tanh_softcap_value(x, inv_cap, cap):
+    """:func:`tanh_softcap` of FP32 ``x`` in registers, the kernel's steps:
+    ``inv_cap`` and ``cap`` are :func:`tanh_softcap_scalars`."""
+    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
+    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
+    y = _mul_rn_f32(x, inv_cap)
+    y = libdevice.tanh(y)
+    return _mul_rn_f32(y, cap)
 
 
 @triton.jit
@@ -2035,11 +2042,7 @@ def _tanh_softcap_kernel(
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < n_cols
     x = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
-    # Torch's three FP32 kernels in their order: ``x / cap`` is ``x * fl32(1 /
-    # cap)`` (a CPU-scalar divisor), then ``tanhf``, then ``* cap``.
-    y = _mul_rn_f32(x, inv_cap)
-    y = libdevice.tanh(y)
-    y = _mul_rn_f32(y, cap)
+    y = tanh_softcap_value(x, inv_cap, cap)
     tl.store(out_ptr + row * n_cols + cols, y, mask=mask)
 
 

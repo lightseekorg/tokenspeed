@@ -48,11 +48,23 @@ class StorageRuntimeConfig:
     write_workers: int
     failure_threshold: int
     recovery_interval_ms: int
+    clear_cache_drain_timeout_ms: int
 
     @classmethod
     def from_extra_config(
         cls, raw: str | None, *, host_blocks: int, prefix_granularity: int
     ) -> StorageRuntimeConfig:
+        """The L3 settings ``--kvstore-storage-backend-extra-config`` tunes.
+
+        Args:
+            raw: The extra config's JSON, or None.
+            host_blocks: The Host pool's blocks in its densest group: its
+                parents, the null block excluded, times the largest packing
+                (``SchedulerConfig::HostBlockCapacity``). Host credits count
+                blocks in any group, since a hybrid model's GET holds every KV
+                page under the State checkpoint it restores.
+            prefix_granularity: Tokens per prefix page.
+        """
         from tokenspeed_engine.scheduler import StorageConfig, StoragePressure
 
         knobs = parse_extra_config(raw).get("async", {})
@@ -74,6 +86,7 @@ class StorageRuntimeConfig:
             write_workers=1,
             failure_threshold=1,
             recovery_interval_ms=30000,
+            clear_cache_drain_timeout_ms=500,
             queue_high_operations=8,
             queue_low_operations=4,
             queue_high_bytes=256 * 1024 * 1024,
@@ -89,7 +102,12 @@ class StorageRuntimeConfig:
             minimum = (
                 0
                 if name
-                in {"queue_low_operations", "queue_low_bytes", "operation_low_age_ms"}
+                in {
+                    "queue_low_operations",
+                    "queue_low_bytes",
+                    "operation_low_age_ms",
+                    "clear_cache_drain_timeout_ms",
+                }
                 else 1
             )
             if type(value) is not int or value < minimum or value > (2**63 - 1) // 1000:
@@ -120,7 +138,7 @@ class StorageRuntimeConfig:
             if values[name] > 2**31 - 1:
                 raise ValueError(f"L3 {name} exceeds the scheduler's int32 limit")
         if values["max_host_blocks"] > host_blocks:
-            raise ValueError("L3 max_host_blocks exceeds usable Host parents")
+            raise ValueError("L3 max_host_blocks exceeds the Host pool's blocks")
         if values["min_prefetch_tokens"] > values["max_prefetch_tokens"]:
             raise ValueError("L3 minimum prefetch must fit the maximum")
         return cls(
@@ -149,6 +167,7 @@ class StorageRuntimeConfig:
             write_workers=values["write_workers"],
             failure_threshold=values["failure_threshold"],
             recovery_interval_ms=values["recovery_interval_ms"],
+            clear_cache_drain_timeout_ms=values["clear_cache_drain_timeout_ms"],
         )
 
 

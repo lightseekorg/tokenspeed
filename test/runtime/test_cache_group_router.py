@@ -8,6 +8,7 @@ check the fused triton fills against the same torch reference.
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import sys
 import textwrap
@@ -21,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.cache_pool_test_utils import (
     assert_no_alias,
     binding_state,
+    make_mha_pool_for_groups,
     reachable_tensors,
     storages_of,
 )
@@ -46,9 +48,31 @@ from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
     extend_write_locations,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 FULL = "full_attention"
 SWA = "sliding_attention"
+
+
+@pytest.mark.parametrize("width", [1, 16])
+def test_beam_mixed_fixture_uses_bound_pool_page_geometry(width):
+    from test.runtime.test_beam_triton_attention import (
+        _runtime_mixed_round,
+        _RuntimeMixedAttention,
+    )
+
+    harness = _RuntimeMixedAttention(width, device="cpu")
+    description = _runtime_mixed_round(
+        width, larger=False, all_fresh=False, first_prefix=0
+    )
+    harness.prepare(description, seed=23)
+    length = description[3][-1]
+    positions = torch.arange(length - width, length)
+    for gid in harness.groups:
+        raw_pages = harness.tables[gid][-1, positions // 16].to(torch.int64)
+        expected = raw_pages * 16 + positions % 16
+        actual = harness.router.decode_write_locations.by_group[gid][-width:]
+        torch.testing.assert_close(actual.to(torch.int64), expected, atol=0, rtol=0)
 
 
 class TestWriteLocationMathTest:
@@ -164,7 +188,11 @@ class TestPersistentExtendSpanTest:
     def _stacks(self, capacity):
         specs = [
             GroupTableSpec(
-                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+                FULL,
+                block_granularity=4,
+                kernel_page_size=4,
+                max_num_pages=3,
+                atom_pages_per_block=1,
             )
         ]
         stacks = GroupTableStacks(
@@ -284,10 +312,18 @@ class TestGroupTableStacksTest:
     def _stacks(self, device="cpu", max_bs=4):
         specs = [
             GroupTableSpec(
-                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+                FULL,
+                block_granularity=4,
+                kernel_page_size=4,
+                max_num_pages=3,
+                atom_pages_per_block=1,
             ),
             GroupTableSpec(
-                SWA, block_granularity=4, kernel_page_size=2, max_num_pages=6
+                SWA,
+                block_granularity=4,
+                kernel_page_size=2,
+                max_num_pages=6,
+                atom_pages_per_block=2,
             ),
         ]
         return GroupTableStacks(
@@ -489,13 +525,25 @@ class TestGroupTableStacksTest:
         # A geometry no other test builds, so only the construction compiles it.
         specs = [
             GroupTableSpec(
-                "a", block_granularity=8, kernel_page_size=8, max_num_pages=5
+                "a",
+                block_granularity=8,
+                kernel_page_size=8,
+                max_num_pages=5,
+                atom_pages_per_block=1,
             ),
             GroupTableSpec(
-                "b", block_granularity=8, kernel_page_size=2, max_num_pages=9
+                "b",
+                block_granularity=8,
+                kernel_page_size=2,
+                max_num_pages=9,
+                atom_pages_per_block=4,
             ),
             GroupTableSpec(
-                "c", block_granularity=8, kernel_page_size=4, max_num_pages=7
+                "c",
+                block_granularity=8,
+                kernel_page_size=4,
+                max_num_pages=7,
+                atom_pages_per_block=2,
             ),
         ]
         stacks = GroupTableStacks(
@@ -605,6 +653,17 @@ def _layer(group_id, layer_id=0):
     return SimpleNamespace(group_id=group_id, layer_id=layer_id)
 
 
+def _router_pool():
+    return make_mha_pool_for_groups(
+        (
+            CacheGroupSpec(FULL, "full_history", 4, 1, replayable=False),
+            CacheGroupSpec(SWA, "sliding_window", 4, 1, 4, replayable=False),
+            CacheGroupSpec("linear_attention_0", "state", replayable=False),
+        ),
+        device="cpu",
+    )
+
+
 class TestCacheGroupRouterTest:
     def _router(self, *, is_draft=False, spec=1):
         leaves = {
@@ -612,13 +671,13 @@ class TestCacheGroupRouterTest:
             SWA: _StubLeaf(2, is_draft=is_draft, spec=spec),
         }
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaves[gid],
             is_draft=is_draft,
             spec_num_tokens=spec,
             device="cpu",
             consumed_group_ids=None,
         )
-        router.bind(_geometry(), leaves)
+        router.set_cache_pool(_router_pool())
         router.init_cuda_graph_state(4)
         return router, leaves
 
@@ -660,22 +719,12 @@ class TestCacheGroupRouterTest:
             return _StubLeaf(block_granularity)
 
         groups = (FULL, "qwen4_exp_qsa", "qwen4_exp_qsa_recent")
-        pool = SimpleNamespace(
-            paged_group_ids=groups,
-            arena=SimpleNamespace(
-                offload=None,
-                cache_group_specs=tuple(
-                    SimpleNamespace(
-                        group_id=gid,
-                        attn_kind="full_history",
-                        block_granularity=4,
-                        rows_per_page=4,
-                        entry_stride_tokens=1,
-                        sliding_window_tokens=None,
-                    )
-                    for gid in groups
-                ),
+        pool = make_mha_pool_for_groups(
+            tuple(
+                CacheGroupSpec(gid, "full_history", 4, 1, replayable=False)
+                for gid in groups
             ),
+            device="cpu",
         )
         router = CacheGroupRouter(
             create_leaf,
@@ -737,13 +786,13 @@ class TestCacheGroupRouterTest:
 
         batched, own = _CopyOnlyLeaf(4), _StubLeaf(2)
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: {FULL: batched, SWA: own}[gid],
             is_draft=False,
             spec_num_tokens=1,
             device="cpu",
             consumed_group_ids=None,
         )
-        router.bind(_geometry(), {FULL: batched, SWA: own})
+        router.set_cache_pool(_router_pool())
         router.init_cuda_graph_state(4)
         foreach_copy = torch._foreach_copy_
         launches = []
@@ -1443,13 +1492,13 @@ class TestCacheGroupRouterTest:
 
         leaves = {FULL: _KRowLeaf(4), SWA: _StubLeaf(2)}
         router = CacheGroupRouter(
-            None,
+            lambda gid, grain: leaves[gid],
             is_draft=True,
             spec_num_tokens=4,
             device="cpu",
             consumed_group_ids=None,
         )
-        router.bind(_geometry(), leaves)
+        router.set_cache_pool(_router_pool())
         router.init_cuda_graph_state(4)
 
         router.update_draft_forward_metadata(torch.tensor([7, 3], dtype=torch.int32))
@@ -1529,21 +1578,26 @@ def _spec(
     entry_stride_tokens=None,
     sliding_window_tokens=None,
 ):
-    return SimpleNamespace(
+    return CacheGroupSpec(
         group_id=group_id,
         attn_kind=attn_kind,
-        block_granularity=granularity,
-        rows_per_page=rows_per_page,
-        entry_stride_tokens=entry_stride_tokens,
+        rows_per_page=(
+            None
+            if attn_kind == "state"
+            else (rows_per_page if rows_per_page is not None else granularity)
+        ),
+        entry_stride_tokens=(
+            None
+            if attn_kind == "state"
+            else (entry_stride_tokens if entry_stride_tokens is not None else 1)
+        ),
         sliding_window_tokens=sliding_window_tokens,
+        replayable=False,
     )
 
 
-def _pool(*specs, paged=(FULL, SWA)):
-    return SimpleNamespace(
-        arena=SimpleNamespace(cache_group_specs=tuple(specs), offload=None),
-        paged_group_ids=tuple(paged),
-    )
+def _pool(*specs):
+    return make_mha_pool_for_groups(tuple(specs), device="cpu")
 
 
 class TestCacheGroupRouterRebindTest:
@@ -1568,7 +1622,11 @@ class TestCacheGroupRouterRebindTest:
 
     def test_same_geometry_rebind_keeps_leaves_and_their_state(self):
         router, built = self._router()
-        specs = (_spec(FULL), _spec(SWA), _spec("linear_attention_0", "state", 8))
+        specs = (
+            _spec(FULL),
+            _spec(SWA),
+            _spec("linear_attention_0", attn_kind="state"),
+        )
         router.set_cache_pool(_pool(*specs))
         assert (sorted(built)) == (sorted([FULL, SWA]))
         first = dict(router.leaves)
@@ -1612,11 +1670,9 @@ class TestCacheGroupRouterRebindTest:
         router, _ = self._router()
         original = _pool(
             _spec(FULL, granularity=4, rows_per_page=4, entry_stride_tokens=1),
-            paged=(FULL,),
         )
         changed = _pool(
             _spec(FULL, granularity=4, rows_per_page=2, entry_stride_tokens=2),
-            paged=(FULL,),
         )
         router.set_cache_pool(original)
 
@@ -1630,12 +1686,12 @@ class TestCacheGroupRouterRebindTest:
         probe_specs = (_spec(FULL), _spec("full_history_1"))
         real_specs = tuple(reversed(probe_specs))
         rebound, _ = self._router()
-        rebound.set_cache_pool(_pool(*probe_specs, paged=(FULL, "full_history_1")))
+        rebound.set_cache_pool(_pool(*probe_specs))
 
-        rebound.set_cache_pool(_pool(*real_specs, paged=("full_history_1", FULL)))
+        rebound.set_cache_pool(_pool(*real_specs))
 
         fresh, _ = self._router()
-        fresh.set_cache_pool(_pool(*real_specs, paged=("full_history_1", FULL)))
+        fresh.set_cache_pool(_pool(*real_specs))
         assert (rebound.geometry) == (fresh.geometry)
         assert (rebound.geometry.full_history_group_id) == (
             fresh.geometry.full_history_group_id
@@ -1749,47 +1805,48 @@ class TestCacheGroupRouterRebindTest:
 
 
 class TestPagedLeafRebindTest:
-    """Every leaf forgets the per-forward and per-graph state it annotates as optional.
-
-    The gate reads ``self.<name>: <Type> | None = None`` annotations in ``__init__``
-    whose name mentions ``metadata`` or ends in ``_buf``; state declared another way
-    (DSA's page-table alias, FlashMLA's keepalive list) gets its own test below.
-    """
+    """Rebinding drops forward/graph views, including state owned by a base class."""
 
     def _optional_slots(self, backend_cls):
-        import inspect
-
-        init = ast.parse(textwrap.dedent(inspect.getsource(backend_cls.__init__)))
-        slots = []
-        for node in ast.walk(init):
-            if (
-                isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Attribute)
-                and isinstance(node.target.value, ast.Name)
-                and node.target.value.id == "self"
-                and ast.unparse(node.annotation).endswith("| None")
-            ):
-                slots.append(node.target.attr)
+        slots = set()
+        for owner in backend_cls.__mro__:
+            # Common paged state has separate rebind coverage above. Include
+            # intermediate owners such as MLAMetadataBackend in the leaf check.
+            if owner is PagedAttentionBackend:
+                break
+            init = owner.__dict__.get("__init__")
+            if init is None:
+                continue
+            tree = ast.parse(textwrap.dedent(inspect.getsource(init)))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Attribute)
+                    and isinstance(node.target.value, ast.Name)
+                    and node.target.value.id == "self"
+                    and ast.unparse(node.annotation).endswith("| None")
+                ):
+                    slots.add(node.target.attr)
         return slots
 
     def _check(self, backend_cls, expected, **publish_reads):
         slots = self._optional_slots(backend_cls)
         assert slots
-        assert (sorted(slots)) == (sorted(expected))
+        assert sorted(slots) == sorted(expected)
         leaf = backend_cls.__new__(backend_cls)
         leaf._init_pool_binding()
         leaf.cache_pool = object()
         for name, value in publish_reads.items():
             setattr(leaf, name, value)
         stale = object()
-        for name in slots:
+        for name in expected:
             setattr(leaf, name, stale)
         pool = object()
 
         leaf.set_cache_pool(pool)
 
         assert (leaf.cache_pool) is (pool)
-        for name in slots:
+        for name in expected:
             _pytest_obj_1 = getattr(leaf, name)
             _pytest_msg_2 = name
             assert _pytest_obj_1 is None, _pytest_msg_2

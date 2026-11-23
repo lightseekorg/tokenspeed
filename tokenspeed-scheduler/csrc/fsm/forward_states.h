@@ -34,12 +34,15 @@
 #include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
+#include "cache/tier/peer.h"
 #include "scheduler/request_spec.h"
 #include "utils.h"
 
 namespace tokenspeed::fsm {
 
-enum class PrefillSource { kLocal, kRemote };
+// Who fills a first chunk's pages: this engine's forward, the PD peer's
+// prefill (the D role), or another replica's cache (a peer prefix landing).
+enum class PrefillSource { kLocal, kRemote, kPeer };
 
 // A scheduling attempt advances this in place and StagedCacheProgress
 // (scheduler/operations/progress.h) undoes the advance when the attempt
@@ -119,11 +122,24 @@ struct StorageReadyHold {
 
 // Resources shared by pre-admission states. Moving a state carries the hold
 // with it, including when a PD bootstrap completes after the L3 read.
+// A holder's answer to a waiting prompt's lookup: the boundary it soft-pinned
+// under the lease (docs/rfcs/0004-peer-prefix-sharing.md).
+struct PeerHit {
+    PeerLeaseId lease;
+    std::int32_t num_tokens{0};
+};
+
 struct AdmissionResources {
     TokenContainer* token_container;
     std::int32_t prefix_granularity;
+    // Last admission probe's hit, for load reporting only; never reused by admission.
+    std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // The request has asked its peer holder once (or has none to ask), and
+    // what the holder answered.
+    bool peer_prepared{false};
+    std::optional<PeerHit> peer_hit;
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
@@ -246,6 +262,9 @@ struct PrefillDone : RestoreMarker {
 
     ForwardResources resources;
     TokenContainer::Window window{};
+    // Deferred decode allocation: the error about this prompt's remote
+    // decode not being admitted was logged.
+    bool remote_decode_failure_logged{false};
 
 private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
@@ -293,6 +312,11 @@ using ResumeShape = std::variant<ResumePrefilling, ResumePrefillDone, ResumeDeco
 // where it was (a decoding victim decodes, a mid-prefill victim runs its next
 // chunk). Nothing is recomputed and nothing is rebased.
 struct Retracted {
+    // Frozen before the old RAII slot is released, not reconstructed at restore.
+    std::int32_t previous_slot{-1};
+    std::uint64_t previous_slot_generation{0};
+    std::int32_t committed_tokens{0};
+    std::int32_t computed_tokens{0};
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
     CacheProgress cache_progress;

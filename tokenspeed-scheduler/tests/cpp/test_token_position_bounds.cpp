@@ -60,7 +60,8 @@ TEST(TokenPositionBoundsTest, ASlidingWindowNearInt32MaxEndsAtItsLastBlock) {
                                           .sliding_window = 4096,
                                           .cache_blocks_per_lcm_block = 1,
                                           .block_granularity = 1024}};
-    const auto coordinator = MakeCoordinator(specs, 1024, pool, false, nullptr, nullptr, false, false, 0);
+    const auto coordinator =
+        MakeCoordinator(specs, 1024, pool, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     // T = 2^31 - 1001: rows [T - 4095, T) lie in blocks 2097147 to 2097151.
     const CacheStore::BlockRange window = coordinator.Store().SlidingWindowBlocks(0, kInt32Max - 1000);
     EXPECT_EQ(window.first, 2097147);
@@ -103,7 +104,8 @@ protected:
     static constexpr std::array kSpecs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kPage}};
     BlockPool pool_{kBlocks, {1}};
-    CacheCoordinator coordinator_ = MakeCoordinator(kSpecs, kPage, pool_, false, nullptr, nullptr, false, false, 0);
+    CacheCoordinator coordinator_ =
+        MakeCoordinator(kSpecs, kPage, pool_, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
     const std::vector<std::string> hashes_ = PageHashes(kFullPages);
     std::optional<std::array<BlockTable, 1>> tables_;
 };
@@ -135,7 +137,7 @@ TEST(TokenPositionBoundsTest, AnInt32MaxWindowsLookbackRoundsUpToWholeBlocks) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 1024,
     });
-    EXPECT_EQ(matcher->BoundaryLookbackPages(), 2097152);
+    EXPECT_EQ(matcher->BoundaryLookbackBlocks(), 2097152);
 }
 
 }  // namespace

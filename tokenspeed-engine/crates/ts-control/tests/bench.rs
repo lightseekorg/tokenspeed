@@ -25,7 +25,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::CString;
-use std::sync::{mpsc, Once};
+use std::sync::{mpsc, Arc, Once};
 use std::time::{Duration, Instant};
 
 use pyo3::{prelude::*, types::PyDict};
@@ -428,7 +428,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
         controls: ControlConfig {
             memory_saver: false,
             memory_regions: Vec::new(),
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: false,
         },
         batch_log: BatchLogConfig {
@@ -478,7 +478,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     });
     let config = round_loop_config(&shape, pages);
     let mut event_loop = EventLoop::new(
-        round_scheduler(&shape, pages),
+        Arc::new(parking_lot::Mutex::new(round_scheduler(&shape, pages))),
         InstantDevice {
             plans,
             verify_width: shape.verify_width,

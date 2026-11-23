@@ -67,7 +67,7 @@ pub use layout::{
     registration::{PrefillLayout, PrefillRoute},
     LayoutError,
 };
-pub use net::NetError;
+pub use net::{NetError, SendError, Sockets};
 pub use prefill::{Layerwise, PrefillConfig, PrefillOutbox, PrefillPeer};
 pub use status::TransferPoll;
 use ts_mooncake::{Engine, PageGrid};
@@ -302,6 +302,77 @@ impl Transport {
             *self.engine.write().expect("the engine lock is poisoned") = engine.clone();
             sender.engine = engine;
             sender.sessions.clear();
+        }
+        Ok(())
+    }
+
+    /// Whether deregistering the cache from an engine stops every peer
+    /// write through that engine's keys. An RDMA NIC checks each incoming
+    /// write against the destination's registration, and deregistration
+    /// returns only once the NIC no longer uses it (the kernel may unpin and
+    /// reuse the pages right after). Other transports are not known to fence
+    /// a remote writer this way. This relies on `ts_mooncake_unregister`
+    /// returning success only after it deregistered the range on every
+    /// device.
+    fn deregistration_fences_writes(&self) -> bool {
+        self.protocol == "rdma"
+    }
+
+    /// A new engine with the cache registered, not yet addressed by peers.
+    fn fresh_engine(&self) -> Result<Arc<Engine>, String> {
+        let engine = Engine::start(
+            self.library.clone(),
+            &self.local_ip,
+            &self.protocol,
+            &self.ib_device,
+        )
+        .map_err(|error| error.to_string())?;
+        for &(addr, length) in &self.regions {
+            engine
+                .register(addr, length)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Arc::new(engine))
+    }
+
+    /// Run transfers on `engine` and tell peers its session from now on.
+    /// Returns the engines it replaced.
+    fn install_engine(&self, engine: Arc<Engine>) -> Vec<Arc<Engine>> {
+        let mut sender = self
+            .cache_sender
+            .lock()
+            .expect("the cache sender lock is poisoned");
+        tracing::info!(session = engine.session_id(), "a fresh transfer session");
+        let public = std::mem::replace(
+            &mut *self.engine.write().expect("the engine lock is poisoned"),
+            engine.clone(),
+        );
+        let private = std::mem::replace(&mut sender.engine, engine);
+        sender.sessions.clear();
+        if Arc::ptr_eq(&public, &private) {
+            vec![public]
+        } else {
+            vec![public, private]
+        }
+    }
+
+    /// Deregister the cache from `engines`, which [`Transport::install_engine`]
+    /// replaced. On success no peer write through their keys lands any more
+    /// where [`Transport::deregistration_fences_writes`].
+    fn deregister(&self, engines: &[Arc<Engine>]) -> Result<(), String> {
+        let failed: usize = engines
+            .iter()
+            .map(|engine| {
+                self.regions
+                    .iter()
+                    .filter(|&&(addr, _)| engine.unregister(addr).is_err())
+                    .count()
+            })
+            .sum();
+        if failed > 0 {
+            return Err(format!(
+                "Mooncake failed to deregister {failed} cache region(s) from a replaced engine"
+            ));
         }
         Ok(())
     }

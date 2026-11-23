@@ -84,18 +84,19 @@ pub struct ControlConfig {
     /// The regions this engine can release (`nccl` needs an NCCL that can
     /// suspend its communicators).
     pub memory_regions: Vec<String>,
-    /// With the L3 storage tier, the checkpoint identity its pages publish
-    /// under (`--weight-version`); `None` without the tier.
-    pub l3_weight_version: Option<String>,
+    /// With a cache shared beyond this engine -- the L3 storage tier or
+    /// peer prefix sharing -- the checkpoint identity its pages are named
+    /// under (`--weight-version`); `None` without one.
+    pub shared_weight_version: Option<String>,
     /// `--allow-reload-forward`: `reload_forward` is served; refused on arrival otherwise.
     pub allow_reload_forward: bool,
 }
 
-/// `L3_FLUSH_REQUIRES_WEIGHT_VERSION`.
-const L3_FLUSH_REQUIRES_WEIGHT_VERSION: &str = "L3 flushed updates require weight_version so \
-     independent replicas cannot restore another checkpoint's objects";
+/// `SHARED_FLUSH_REQUIRES_WEIGHT_VERSION`.
+const SHARED_FLUSH_REQUIRES_WEIGHT_VERSION: &str = "with L3 or peer prefix sharing, flushed \
+     updates require weight_version so independent replicas cannot read another checkpoint's KV";
 
-/// The L3 namespace a weight load asks to publish: its explicit
+/// The shared namespace a weight load asks to publish: its explicit
 /// `weight_version`; a flushed Mooncake load without one takes the committed
 /// version's own identity (`mooncake_load_weight_version`).
 fn requested_weight_version(op: &ControlRequest) -> Option<String> {
@@ -264,6 +265,31 @@ fn resume_memory_reply(success: bool, message: &str) -> ControlOutput {
     })
 }
 
+/// A checked metadata update. Dropping it changes no namespace; the control
+/// gate publishes it only after every owner prepared its storage namespace.
+#[derive(Debug)]
+pub struct PreparedSharedWeightVersion {
+    expected: Option<String>,
+    target: Option<String>,
+    changed: bool,
+}
+
+impl PreparedSharedWeightVersion {
+    /// The shared identity after publication, or None without shared caching.
+    pub fn target_version(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
+    /// The new identity only when this member needs to change it.
+    pub fn changed_version(&self) -> Option<&str> {
+        if self.changed {
+            self.target.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// Pause, memory and weight-operation state of one loop.
 #[derive(Debug)]
 pub struct Controls {
@@ -296,8 +322,8 @@ pub struct Controls {
     flushes: usize,
     /// Replies to send.
     replies: Vec<ControlOutput>,
-    /// The L3 namespace pages publish under, with the L3 tier.
-    l3_weight_version: Option<String>,
+    /// The shared namespace pages are named under, with L3 or peer sharing.
+    shared_weight_version: Option<String>,
     /// The engine's own gated operations (the expert rebalance's steps), in
     /// their own queue: frontend operations reach the attention-DP ranks in
     /// different rounds, internal ones in the same round everywhere.
@@ -340,27 +366,27 @@ impl Controls {
             weight_ops: VecDeque::new(),
             flushes: 0,
             replies: Vec::new(),
-            l3_weight_version: config.l3_weight_version.clone(),
+            shared_weight_version: config.shared_weight_version.clone(),
             internal_ops: VecDeque::new(),
             config,
         }
     }
 
-    /// Why a weight load would break the L3 namespace (the request
-    /// handler's `_require_*` checks): a flushed load must name its
-    /// checkpoint, and the namespace may change only with a flush, or later
+    /// Why a weight load would break the shared namespace, of L3 or peer
+    /// sharing (the request handler's `_require_*` checks): a flushed load
+    /// must name its checkpoint, and the namespace may change only with a flush, or later
     /// copies of the old weights' KV would land under the new one.
-    fn l3_version_refusal(&self, op: &ControlRequest) -> Option<String> {
-        let current = self.l3_weight_version.as_ref()?;
+    fn shared_version_refusal(&self, op: &ControlRequest) -> Option<String> {
+        let current = self.shared_weight_version.as_ref()?;
         let requested = requested_weight_version(op);
         if wants_flush(op) {
             return requested
                 .is_none()
-                .then(|| L3_FLUSH_REQUIRES_WEIGHT_VERSION.to_owned());
+                .then(|| SHARED_FLUSH_REQUIRES_WEIGHT_VERSION.to_owned());
         }
         match requested {
             Some(version) if version != *current => Some(
-                "L3 weight_version cannot change without flush_cache; retry the update with \
+                "a shared cache's weight_version cannot change without flush_cache; retry the update with \
                  flush_cache=True so Device/Host KV and in-flight writebacks cannot land in the \
                  new namespace"
                     .to_owned(),
@@ -369,28 +395,50 @@ impl Controls {
         }
     }
 
-    /// After a weight load succeeded on every rank, the L3 namespace new
-    /// pages publish under: `Ok(None)` keeps the current one, `Err` refuses
-    /// the load. Re-sending the current version keeps it too: the namespace
-    /// already names it, and the storage executor refuses a namespace change
-    /// while it has unretired operations.
-    pub fn commit_l3_weight_version(
+    /// Check the requested shared identity without publishing it. All fallible
+    /// isolation preparation must finish before this metadata becomes visible.
+    pub fn prepare_shared_weight_version(
+        &self,
+        op: &ControlRequest,
+    ) -> Result<PreparedSharedWeightVersion, String> {
+        if self.shared_weight_version.is_none() {
+            return Ok(PreparedSharedWeightVersion {
+                expected: None,
+                target: None,
+                changed: false,
+            });
+        }
+        if let Some(refusal) = self.shared_version_refusal(op) {
+            return Err(refusal);
+        }
+        let target = requested_weight_version(op).or_else(|| self.shared_weight_version.clone());
+        Ok(PreparedSharedWeightVersion {
+            expected: self.shared_weight_version.clone(),
+            changed: target != self.shared_weight_version,
+            target,
+        })
+    }
+
+    /// Publish a prepared identity on the same exclusive control gate. The
+    /// gate must not alter the identity between preparation and publication.
+    pub fn commit_prepared_shared_weight_version(&mut self, prepared: PreparedSharedWeightVersion) {
+        assert_eq!(
+            self.shared_weight_version, prepared.expected,
+            "prepared weight metadata remains current"
+        );
+        self.shared_weight_version = prepared.target;
+    }
+
+    /// Apply the control metadata alone, for callers with no fallible storage
+    /// preparation left. Returns a version only when its identity changes.
+    pub fn commit_shared_weight_version(
         &mut self,
         op: &ControlRequest,
     ) -> Result<Option<String>, String> {
-        if self.l3_weight_version.is_none() {
-            return Ok(None);
-        }
-        if let Some(refusal) = self.l3_version_refusal(op) {
-            return Err(refusal);
-        }
-        match requested_weight_version(op) {
-            Some(version) if self.l3_weight_version.as_ref() != Some(&version) => {
-                self.l3_weight_version = Some(version.clone());
-                Ok(Some(version))
-            }
-            _ => Ok(None),
-        }
+        let prepared = self.prepare_shared_weight_version(op)?;
+        let changed = prepared.changed_version().map(str::to_owned);
+        self.commit_prepared_shared_weight_version(prepared);
+        Ok(changed)
     }
 
     /// New requests are withheld from the scheduler.
@@ -449,6 +497,12 @@ impl Controls {
     /// Pop the head once every rank holds one.
     pub fn pop_weight_op(&mut self) -> Option<ControlRequest> {
         self.weight_ops.pop_front()
+    }
+
+    /// Return the gated head when cache clearing yields to I/O completions.
+    /// The next round must see the same operation before any later arrivals.
+    pub fn defer_weight_op(&mut self, op: ControlRequest) {
+        self.weight_ops.push_front(op);
     }
 
     /// Gated operations still queued, frontend or internal: either may
@@ -725,7 +779,7 @@ impl Controls {
             | ControlRequest::UpdateWeightsFromMooncake(_)
             | ControlRequest::UpdateWeightFromDisk(_)) => match self
                 .refuse_weight_load()
-                .or_else(|| self.l3_version_refusal(&op))
+                .or_else(|| self.shared_version_refusal(&op))
             {
                 Some(message) => {
                     let reply = gated_reply(&op, false, message);
@@ -1052,7 +1106,7 @@ mod tests {
         Controls::new(ControlConfig {
             memory_saver,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: true,
         })
     }
@@ -1188,7 +1242,7 @@ mod tests {
         let mut off = Controls::new(ControlConfig {
             memory_saver: false,
             memory_regions: Vec::new(),
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: false,
         });
         off.handle(reload("wait"), None);
@@ -1231,12 +1285,12 @@ mod tests {
         let mut l3 = Controls::new(ControlConfig {
             memory_saver: false,
             memory_regions: Vec::new(),
-            l3_weight_version: Some("v1".to_owned()),
+            shared_weight_version: Some("v1".to_owned()),
             allow_reload_forward: false,
         });
         // A flushed load without a version publishes the committed one's.
         assert_eq!(
-            l3.commit_l3_weight_version(&mooncake_load(true, None)),
+            l3.commit_shared_weight_version(&mooncake_load(true, None)),
             Ok(Some("7".to_owned()))
         );
         // Switching the namespace needs a flush; keeping it does not.
@@ -1247,19 +1301,50 @@ mod tests {
         );
         // Re-sending the current version changes nothing.
         assert_eq!(
-            l3.commit_l3_weight_version(&mooncake_load(false, Some("7"))),
+            l3.commit_shared_weight_version(&mooncake_load(false, Some("7"))),
             Ok(None)
         );
         assert_eq!(
-            l3.commit_l3_weight_version(&mooncake_load(false, None)),
+            l3.commit_shared_weight_version(&mooncake_load(false, None)),
             Ok(None)
         );
         // Without the tier nothing is checked.
         let mut plain = controls(false);
         assert_eq!(
-            plain.commit_l3_weight_version(&mooncake_load(false, Some("x"))),
+            plain.commit_shared_weight_version(&mooncake_load(false, Some("x"))),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn preparing_or_abandoning_a_shared_version_does_not_publish_it() {
+        let mut controls = Controls::new(ControlConfig {
+            memory_saver: false,
+            memory_regions: Vec::new(),
+            shared_weight_version: Some("B".to_owned()),
+            allow_reload_forward: false,
+        });
+        let change = mooncake_load(true, Some("A"));
+        let prepared = controls.prepare_shared_weight_version(&change).unwrap();
+        assert_eq!(prepared.target_version(), Some("A"));
+        assert_eq!(prepared.changed_version(), Some("A"));
+        assert_eq!(controls.shared_weight_version.as_deref(), Some("B"));
+        drop(prepared); // A later nonce/storage preparation failed.
+        controls.handle(mooncake_load(false, Some("A")), None);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("UpdateWeightsFromMooncakeReqOutput", false)]
+        );
+        assert_eq!(controls.shared_weight_version.as_deref(), Some("B"));
+        let retry = controls.prepare_shared_weight_version(&change).unwrap();
+        assert_eq!(retry.changed_version(), Some("A"));
+        controls.commit_prepared_shared_weight_version(retry);
+        assert_eq!(controls.shared_weight_version.as_deref(), Some("A"));
+        assert!(controls
+            .prepare_shared_weight_version(&change)
+            .unwrap()
+            .changed_version()
+            .is_none());
     }
 
     #[test]

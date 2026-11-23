@@ -25,6 +25,15 @@ from tokenspeed_kernel._triton import tl, triton
 
 
 @triton.jit
+def _float32_to_ordered_key(value):
+    """The FP32 bits as a uint32 that sorts like the float (-0.0 below +0.0)."""
+    bits = value.to(tl.uint32, bitcast=True)
+    sign = tl.full(bits.shape, 0x80000000, tl.uint32)
+    full = tl.full(bits.shape, 0xFFFFFFFF, tl.uint32)
+    return bits ^ tl.where((bits & sign) != 0, full, sign)
+
+
+@triton.jit
 def _routing_kernel(
     topk_ids_ptr,
     expert_route_ids_ptr,

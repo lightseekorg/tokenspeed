@@ -21,6 +21,7 @@
 #include "cache/coordinator/storage_queries.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -29,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/tier/peer.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -167,17 +169,17 @@ StorageQuery StorageQueries::MissingStorageKeys(const PromptPrefix& prompt, std:
             boundary.tail_tokens > 0
                 ? std::optional{TailPublication{.tail_tokens = boundary.tail_tokens, .hash = boundary.hash}}
                 : std::nullopt;
-        PrefixProbe::Tier device = local.device;
-        PrefixProbe::Tier probe;
-        prober_.ProbeHostSuffix(candidate, *local.group_keys, store_.MatchOrder(), local_tokens, &possible, device,
-                                probe);
+        const auto suffix = prober_.ProbeHostSuffix(candidate, *local.group_keys, store_.MatchOrder(), local_tokens,
+                                                    &possible, local.device);
+        const PrefixProbe::Tier& probe = suffix.host;
         _assert(probe.num_common_tokens == candidate.max_tokens, "an optimistic candidate must match completely");
         std::vector<CacheKey> additional;
         std::vector<std::int32_t> additional_tokens;
         std::unordered_set<CacheKey, CacheKeyHash> distinct;
         bool fits = true;
         forEachStorageDependency(
-            probe, *local.group_keys, device.full_page_tokens, [&](const CacheKey& key, std::int32_t logical_block) {
+            probe, *local.group_keys, suffix.device.full_page_tokens,
+            [&](const CacheKey& key, std::int32_t logical_block) {
                 if (!fits || host_.ContainsHostCachedBlock(key) || selected.contains(key) ||
                     !distinct.insert(key).second)
                     return;
@@ -222,13 +224,13 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         groups.clear();
         buckets.clear();
         result.keys.clear();
+        result.logical_blocks.clear();
         result.blocks.clear();
         result.tail.reset();
         result.tail_prior = ContentHash{};
-        PrefixProbe::Tier device = device_only;
-        PrefixProbe::Tier probe;
-        prober_.ProbeHostSuffix(candidate, group_keys, store_.MatchOrder(), device_only.num_common_tokens, &remote,
-                                device, probe);
+        const auto suffix = prober_.ProbeHostSuffix(candidate, group_keys, store_.MatchOrder(),
+                                                    device_only.num_common_tokens, &remote, device_only);
+        const PrefixProbe::Tier& probe = suffix.host;
         if (probe.num_common_tokens <= device_only.num_common_tokens) return {};
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = store_.AcquireHostCachedBlock(key);
@@ -236,13 +238,14 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
                 warm_blocks.push_back(std::move(ref));
             } else {
                 result.keys.push_back(key);
+                result.logical_blocks.push_back(logical_block);
                 groups.push_back(key.group_id);
                 buckets.push_back(logical_block % store_.Groups()[key.group_id].Spec().shard_count);
             }
         };
         // Protect warm dependencies only while allocating destinations. They
         // stay evictable during I/O; ordinary admission matches the cache again.
-        forEachStorageDependency(probe, group_keys, device.full_page_tokens, pin);
+        forEachStorageDependency(probe, group_keys, suffix.device.full_page_tokens, pin);
         if (probe.tail) {
             result.tail_prior =
                 probe.full_page_tokens == 0
@@ -254,6 +257,7 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         if (result.keys.size() + warm_blocks.size() <= max_blocks) {
             auto allocation = host_.AcquireHostBlocks(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
+                result.num_tokens = probe.num_common_tokens;
                 result.blocks = std::move(allocation.blocks);
                 return result;
             }
@@ -263,6 +267,60 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         candidate.tail.reset();
     }
     return {};
+}
+
+PrefixProber::PrefixListing StorageQueries::ListWithDisk(const PromptPrefix& prompt,
+                                                         std::span<const CacheKey> disk_hits) const {
+    const BlockPool* disk_pool = store_.DiskPool();
+    if (disk_pool == nullptr || disk_hits.empty()) return {};
+    const std::unordered_set<CacheKey, CacheKeyHash> disk(disk_hits.begin(), disk_hits.end());
+    const PreparedPrefixKeys keys = prober_.ResolvePreparedPrefixKeys(prompt);
+    const auto& group_keys = *keys;
+    const PrefixProbe::Tier device_only =
+        prober_.ProbeTier(prompt, group_keys, store_.MatchOrder(), /*claim_partial=*/true);
+    // The Disk's keys stand in as Host hits, as for a Disk prefetch.
+    const auto suffix = prober_.ProbeHostSuffix(prompt, group_keys, store_.MatchOrder(), device_only.num_common_tokens,
+                                                &disk, device_only);
+    if (suffix.host.num_common_tokens <= device_only.num_common_tokens) return {};
+    PrefixProber::PrefixListing out{.num_tokens = suffix.host.num_common_tokens};
+    bool missing = false;
+    const auto list = [&](const CacheKey& key, std::int32_t logical_block, bool device_part) {
+        const auto& group = store_.Groups()[key.group_id];
+        const bool state = store_.GroupIsState(key.group_id);
+        // A State group's one checkpoint, the Device's first.
+        if (state && std::ranges::any_of(out.pages, [&](const PrefixProber::ListedPage& page) {
+                return page.key.group_id == key.group_id;
+            })) {
+            return;
+        }
+        std::array<std::pair<const BlockPool*, CacheTier>, 3> tiers{
+            std::pair{&store_.DevicePool(), CacheTier::kDevice},
+            std::pair{store_.HostPool(), CacheTier::kHost},
+            std::pair{disk_pool, CacheTier::kDisk},
+        };
+        for (const auto& [pool, tier] : tiers) {
+            if (pool == nullptr || (device_part && tier != CacheTier::kDevice)) continue;
+            if (const auto location = group.Index().LocationOf(*pool, key)) {
+                out.pages.push_back(PrefixProber::ListedPage{
+                    .key = key,
+                    .slot = state ? kPeerStateSlot : logical_block,
+                    .tier = tier,
+                    .block_id = pool->ResolveCacheBlockId(group.Id(), *location),
+                });
+                return;
+            }
+        }
+        missing = true;
+    };
+    if (suffix.device.num_common_tokens > 0) {
+        forEachStorageDependency(suffix.device, group_keys, /*floor_tokens=*/0,
+                                 [&](const CacheKey& key, std::int32_t block) { list(key, block, true); });
+    }
+    forEachStorageDependency(suffix.host, group_keys, suffix.device.full_page_tokens,
+                             [&](const CacheKey& key, std::int32_t block) { list(key, block, false); });
+    // A match is read off the indexes it found the keys in.
+    _assert(!missing, "a listed key is on no tier");
+    return out;
 }
 
 }  // namespace tokenspeed

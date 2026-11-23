@@ -33,6 +33,7 @@
 
 #include "cache/coordinator/host_cache.h"
 #include "cache/coordinator/shadow_occupancy.h"
+#include "cache/core/block_placement_demand.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -56,9 +57,9 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
                 sink_span_tokens, static_cast<std::int64_t>(sink_blocks) * store_.Geometry()[i].BlockGranularity());
         }
         if (!store_.GroupIsReplayable(i) && !store_.GroupIsState(i) && !store_.Groups()[i].Matcher().IsPrefixClosed()) {
-            lookback_tokens = std::max(lookback_tokens,
-                                       static_cast<std::int64_t>(store_.Groups()[i].Matcher().BoundaryLookbackPages()) *
-                                           store_.Geometry()[i].BlockGranularity());
+            lookback_tokens = std::max(
+                lookback_tokens, static_cast<std::int64_t>(store_.Groups()[i].Matcher().BoundaryLookbackBlocks()) *
+                                     store_.Geometry()[i].BlockGranularity());
         }
     }
     std::vector<const BoundaryTree::Node*> ancestors;
@@ -273,22 +274,20 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
     _assert(next_row == group_ids.size(), "Host segments cover every row");
     // The placed segments' rows by group and bucket, the demand the shadow
     // fits: every segment's to begin with.
-    std::vector<std::vector<std::int64_t>> need_by_bucket(store_.Groups().size());
+    std::vector<BlockPlacementDemand> block_demands(store_.Groups().size());
     for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
-        need_by_bucket[i].assign(static_cast<std::size_t>(store_.Groups()[i].Allocator().ShardCount()), 0);
+        block_demands[i].blocks_by_bucket.assign(static_cast<std::size_t>(store_.Groups()[i].Allocator().ShardCount()),
+                                                 0);
     }
     for (std::size_t row = 0; row < group_ids.size(); ++row) {
         _assert(group_ids[row] < store_.Groups().size(), "Host block group id out of range");
         _assert(buckets[row] >= 0 && buckets[row] < store_.Groups()[group_ids[row]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
-        ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
+        ++block_demands[group_ids[row]].blocks_by_bucket[static_cast<std::size_t>(buckets[row])];
     }
-    // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
-    const std::vector<std::int64_t> no_dense_need(store_.Groups().size(), 0);
-    const std::vector<std::int64_t> no_pair_need(store_.Groups().size(), 0);
     ShadowOccupancy shadow{*store_.HostPool(), store_.Groups()};
     // Nothing is evicted while free capacity fits every segment.
-    if (shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
+    if (shadow.Fits(block_demands)) {
         return HostPlacementPlan{.num_placed = segments.size()};
     }
     // These snapshots and indexes live for one plan only. Allocate their
@@ -665,7 +664,7 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
     // unheld copy, and a second one takes those once the Host-only cache is
     // next, skipping the held copies the first one took.
     bool unheld_duplicates_deferred = false;
-    while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
+    while (!shadow.Fits(block_demands)) {
         // Descendants taken in this plan can bring an aged checkpoint within
         // the leaf distance, where it ranks by its own use.
         while (!candidates.empty() && candidates.top().aged_distance != 0 &&
@@ -695,7 +694,7 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
                     victim.reason = &CacheEvictor::HostEvictionStats::duplicate_kv;
                     victims.push_back(std::move(victim));
                 }
-                return !shadow.Fits(need_by_bucket, no_dense_need, no_pair_need);
+                return !shadow.Fits(block_demands);
             });
             added_kv_duplicates = true;
             unheld_duplicates_deferred = deferred;
@@ -863,12 +862,12 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
     }
 
     // Whole segments go, the last first, while the rest cannot fit.
-    while (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
+    while (!shadow.Fits(block_demands)) {
         _assert(num_placed_segments > 0, "a batch without rows always fits");
         --num_placed_segments;
         const HostSegmentRows& dropped = segments[num_placed_segments];
         for (std::size_t row = dropped.first_row; row < dropped.past_end_row; ++row) {
-            --need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
+            --block_demands[group_ids[row]].blocks_by_bucket[static_cast<std::size_t>(buckets[row])];
         }
     }
 
@@ -883,7 +882,7 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
         for (const auto& [group_id, location] : victim.members) {
             shadow.Restore(group_id, location);
         }
-        if (!shadow.Fits(need_by_bucket, no_dense_need, no_pair_need)) {
+        if (!shadow.Fits(block_demands)) {
             for (const auto& [group_id, location] : victim.members) {
                 shadow.Remove(group_id, location);
             }

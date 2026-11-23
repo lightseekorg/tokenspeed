@@ -30,9 +30,11 @@ order of the startup steps -- not the shape of the production source.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal, get_args
@@ -313,6 +315,9 @@ class _AutotuneExecutor:
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
 
+    # autotune() and warm_kernels() both run the real traversal.
+    _warm_kernels = ModelExecutor._warm_kernels
+
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
 
@@ -489,6 +494,72 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     assert not tuning_module.is_autotuning()
     for tensor in metadata:
         tensor.fill_(1)  # Capture must be able to mutate warmup metadata later.
+
+
+def test_rewarm_after_a_rebind_compiles_but_tunes_nothing(monkeypatch, tmp_path):
+    # The post-rebind warm-up runs the same forwards under kernel warmup, but
+    # with profiling off and no cache load or save, so it allocates no tuning
+    # workspace outside the rebind's reserve.
+    events = []
+
+    def forward(**kwargs):
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append(("target", kwargs["input_ids"].numel()))
+
+    def draft(*, batch_sizes, graph_phase):
+        assert tuning_module.is_warming_up()
+        assert not tuning_module.is_autotuning()
+        events.append("draft")
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(
+            chunked_prefill_size=16,
+            attention_tp_size=1,
+            autotune_cache_key={},
+            disable_autotune=False,
+            prefill_only=False,
+        ),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **_: events.append("scrub"),
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(warmup_decode_path=draft, max_decode_bs=8),
+        drafter=_DrafterDouble(events),
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=events,
+    )
+    monkeypatch.setattr(
+        executor_module, "autotune_cache_path", lambda key: str(tmp_path / "cache.json")
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "load_autotune_cache",
+        lambda *args: events.append("load"),
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "save_autotune_cache",
+        lambda *args: events.append("save"),
+    )
+    ModelExecutor.warm_kernels(executor)
+    assert events == [
+        "scrub",
+        ("target", 16),
+        ("draft_extend", 16),
+        ("draft_experts", 16),
+        "draft",
+    ]
+    assert not tuning_module.is_warming_up()
 
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
@@ -765,6 +836,13 @@ class _ObserverDouble:
         return nullcontext()
 
 
+@dataclass
+class _CaptureConfig:
+    """The ModelExecutorConfig field capture_graphs() reads."""
+
+    enable_cudagraph_gc: bool
+
+
 class _CaptureExecutor:
     """The ModelExecutor state capture_graphs() reads, without the GPU boot."""
 
@@ -774,7 +852,8 @@ class _CaptureExecutor:
     drafter_extend_ladders = ModelExecutor.drafter_extend_ladders
     _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
 
-    def __init__(self, *, forward_step, prefill_graph, drafter):
+    def __init__(self, *, forward_step, prefill_graph, drafter, enable_cudagraph_gc):
+        self.config = _CaptureConfig(enable_cudagraph_gc=enable_cudagraph_gc)
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
@@ -823,6 +902,7 @@ def test_capture_lifecycle_preserves_main_order(
                 extend_graphs=drafter_graphs == "extend", on_capture=capture_draft
             )
         ),
+        enable_cudagraph_gc=False,
     )
     ModelExecutor.capture_graphs(
         executor,
@@ -836,6 +916,133 @@ def test_capture_lifecycle_preserves_main_order(
         *(["draft"] if not prefill_disabled and drafter_graphs is not None else []),
     ]
     reset_workspace_pools()
+
+
+@pytest.fixture
+def unfrozen_heap() -> Iterator[int]:
+    """Yield the freeze count of a heap nothing froze, with fresh workspace pools."""
+    gc.unfreeze()
+    # A collection parks CPython's immortal objects in the permanent generation.
+    gc.collect()
+    reset_workspace_pools()
+    yield gc.get_freeze_count()
+    reset_workspace_pools()
+
+
+def _record_gc_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    for name, real in (
+        ("collect", gc.collect),
+        ("freeze", gc.freeze),
+        ("unfreeze", gc.unfreeze),
+    ):
+
+        def record(
+            *args: int, name: str = name, real: Callable[..., object] = real
+        ) -> object:
+            calls.append(name)
+            return real(*args)
+
+        monkeypatch.setattr(gc, name, record)
+    return calls
+
+
+def _capture_executor(
+    capture: Callable[[str], Callable[..., None]],
+    *,
+    decode_disabled: bool,
+    prefill_disabled: bool,
+    drafter_graphs: Literal["own", "extend"],
+    enable_cudagraph_gc: bool,
+) -> _CaptureExecutor:
+    return _CaptureExecutor(
+        forward_step=_DecodeCaptureDouble(
+            disable=decode_disabled, stream=object(), on_capture=capture("decode")
+        ),
+        prefill_graph=_PrefillCaptureDouble(
+            disable=prefill_disabled, on_capture=capture("prefill")
+        ),
+        drafter=_DrafterCaptureDouble(
+            extend_graphs=drafter_graphs == "extend", on_capture=capture("draft")
+        ),
+        enable_cudagraph_gc=enable_cudagraph_gc,
+    )
+
+
+@pytest.mark.parametrize("enable_cudagraph_gc", [False, True])
+@pytest.mark.parametrize("decode_disabled", [False, True])
+@pytest.mark.parametrize("prefill_disabled", [False, True])
+@pytest.mark.parametrize("drafter_graphs", ["own", "extend"])
+def test_capture_freezes_the_heap_once_around_every_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    unfrozen_heap: int,
+    enable_cudagraph_gc: bool,
+    decode_disabled: bool,
+    prefill_disabled: bool,
+    drafter_graphs: Literal["own", "extend"],
+) -> None:
+    """One freeze spans the decode, prefill and drafter captures unless
+    --enable-cudagraph-gc, and a boot that captures nothing collects nothing."""
+    frozen: dict[str, bool] = {}
+
+    def capture(name: str) -> Callable[..., None]:
+        def run(*_args: object) -> None:
+            frozen[name] = gc.get_freeze_count() > unfrozen_heap
+
+        return run
+
+    executor = _capture_executor(
+        capture,
+        decode_disabled=decode_disabled,
+        prefill_disabled=prefill_disabled,
+        drafter_graphs=drafter_graphs,
+        enable_cudagraph_gc=enable_cudagraph_gc,
+    )
+    calls = _record_gc_calls(monkeypatch)
+    ModelExecutor.capture_graphs(executor, entries=None, observer=_ObserverDouble())
+
+    captured = [
+        *([] if decode_disabled else ["decode"]),
+        *([] if prefill_disabled else ["prefill", "draft"]),
+    ]
+    assert frozen == {name: not enable_cudagraph_gc for name in captured}
+    if not captured:
+        assert calls == []
+    elif enable_cudagraph_gc:
+        assert calls == ["collect"]
+    else:
+        assert calls == ["collect", "freeze", "unfreeze", "collect"]
+    assert gc.get_freeze_count() == unfrozen_heap
+
+
+@pytest.mark.parametrize(
+    ("failing", "drafter_graphs"),
+    [("decode", "own"), ("prefill", "own"), ("draft", "own"), ("draft", "extend")],
+)
+def test_a_failed_capture_leaves_the_heap_unfrozen(
+    unfrozen_heap: int, failing: str, drafter_graphs: Literal["own", "extend"]
+) -> None:
+    frozen: list[bool] = []
+
+    def capture(name: str) -> Callable[..., None]:
+        def run(*_args: object) -> None:
+            frozen.append(gc.get_freeze_count() > unfrozen_heap)
+            if name == failing:
+                raise RuntimeError(f"{name} capture failed")
+
+        return run
+
+    executor = _capture_executor(
+        capture,
+        decode_disabled=False,
+        prefill_disabled=False,
+        drafter_graphs=drafter_graphs,
+        enable_cudagraph_gc=False,
+    )
+    with pytest.raises(RuntimeError, match=f"{failing} capture failed"):
+        ModelExecutor.capture_graphs(executor, entries=None, observer=_ObserverDouble())
+    assert frozen and all(frozen)
+    assert gc.get_freeze_count() == unfrozen_heap
 
 
 # ---------------------------------------------------------------------------
@@ -1612,7 +1819,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
     monkeypatch.setattr(gemm_module, "torch_decode_gemv", fallback)
     x = _CudaTensorDouble((m, k))
     weight = _CudaTensorDouble((7168, k))
-    assert gemm_module._use_mv(x, weight) is expected
+    assert gemm_module._use_mv(x, weight, None) is expected
     if fi and m <= 32:
         assert select_calls == []
 
@@ -1656,9 +1863,10 @@ def test_decode_gemv_selection_obeys_shape_traits(
     )
     monkeypatch.setattr(gemm_module, "KernelRegistry", _GetAccess(registry))
     gemm_module._select_mv.cache_clear()
+    gemm_module._mv_declares_alignment.cache_clear()
     fallback = gemm_module.torch_decode_gemv
     selected = gemm_module._select_mv(
-        m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False
+        m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False, True, True
     )
     # A full trait match selects the registered kernel. Anything less keeps
     # the portable fallback -- including the non-CUDA caller, whose early
@@ -1666,10 +1874,13 @@ def test_decode_gemv_selection_obeys_shape_traits(
     assert selected is (specialized_gemv if expected else fallback)
     # A dtype pair with no registry signature keeps the fallback as well.
     assert (
-        gemm_module._select_mv(m, n, k, on_cuda, torch.float16, torch.float16, False)
+        gemm_module._select_mv(
+            m, n, k, on_cuda, torch.float16, torch.float16, False, True, True
+        )
         is fallback
     )
     gemm_module._select_mv.cache_clear()
+    gemm_module._mv_declares_alignment.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -1716,7 +1927,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(
     )
     x = torch.ones(1, 128, dtype=torch.bfloat16)
     w = torch.ones(32, 128, dtype=torch.bfloat16)
-    assert gemm_module._use_mv(x, w) is not serving
+    assert gemm_module._use_mv(x, w, None) is not serving
     result = gemm_module.mv(x, w)
     torch.testing.assert_close(result, x @ w.T)
     used, idle = (

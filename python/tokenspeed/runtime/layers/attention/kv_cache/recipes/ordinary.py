@@ -329,18 +329,18 @@ def _config_layer_fields(
             index_k_field(config, rows, layer_id),
         )
     if isinstance(spec, MSAConfig):
-        fields = _mha_layer_fields(config, rows, layer_id, occurrence)
+        fields = mha_layer_fields(config, rows, layer_id, occurrence)
         if local_layer_id in spec.sparse_layer_ids:
             fields += (index_k_field(config, rows, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence)
     if isinstance(spec, MHAConfig):
-        return _mha_layer_fields(config, rows, layer_id, occurrence)
+        return mha_layer_fields(config, rows, layer_id, occurrence)
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
-def _mha_layer_fields(config, rows: int, layer_id: int, occurrence: int):
+def mha_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)

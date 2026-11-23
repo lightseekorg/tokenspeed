@@ -52,8 +52,12 @@ FP32 residual and the whole BF16 attention input of the next layer (normed by
 that layer's input norm). The regular layers hand over the whole residual
 row. So the first launch of a run of fused layers reads its slice of that
 row, and the last one gathers the 8 slices back into a whole row for the
-regular layer after it. Layers 0 and 61 keep the regular code: a forward
-mixes them with the launches, which the design doc allows for a model's
+regular layer after it. The regular boundary's third value, the next
+attention input's per-row FP8 copy, is always None at a launch's rows: the
+dense FP8 projections (``--dense-fp8-small-m``) start past ``MAX_ROWS``
+(startup refuses a window that does not), and a launch refuses an FP8 copy
+rather than drop it. Layers 0 and 61 keep the regular code: a forward mixes
+them with the launches, which the design doc allows for a model's
 boundary layers. They are the first and last layers (they hand over to the
 embedding and the LM head) and this checkpoint's layers with BF16 routed
 experts. Fusing them changes their summation order, a numerics change that
@@ -619,23 +623,33 @@ class MuseSparkMonokernelLayer(MonokernelLayer):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         attention_input: torch.Tensor,
+        attention_input_fp8: tuple[torch.Tensor, torch.Tensor] | None,
         next_input_layernorm: torch.nn.Module | None,
         owned_global_rows: int | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         """Run the layer's launch. Returns ``(residual, next attention
-        input)`` as the regular layer does: the whole residual rows when the
-        next layer keeps the regular code or a draft's regular capture taps
-        it, else the input rows unchanged (the next launch reads the owned
-        columns this one wrote)."""
+        input, None)`` as the regular layer does: the whole residual rows
+        when the next layer keeps the regular code or a draft's regular
+        capture taps it, else the input rows unchanged (the next launch reads
+        the owned columns this one wrote). The third value is the next
+        attention input's FP8 copy, which a launch never makes: it projects in
+        BF16, and its rows are all below --dense-fp8-small-m's window."""
         if owned_global_rows is not None:
             # The owned-row path starts at MUSE_OWNED_ROWS_MIN_TOKENS rows, far past
             # a launch's MAX_ROWS.
             raise RuntimeError("Muse Spark monokernel: an owned-row forward")
+        rows = hidden_states.shape[0]
+        if attention_input_fp8 is not None:
+            # A launch projects in BF16 and would drop the copy.
+            raise RuntimeError(
+                f"Muse Spark monokernel: layer {self.layer_id} got an FP8 copy of "
+                f"its {rows} attention input rows, which the BF16 launch would "
+                "drop"
+            )
         state = self.monokernel_state
         index, fused = self.layer_id, self.fused
         served = state.fused
         rank = fused.weights.rank
-        rows = hidden_states.shape[0]
         requests = rows // chain
         if state.owned is None:
             h = hidden_states[:rows, rank * OWNED : (rank + 1) * OWNED].contiguous()
@@ -714,9 +728,9 @@ class MuseSparkMonokernelLayer(MonokernelLayer):
         muse_spark_layer_decode(fused, compile_only=False, **operands)
         if whole_rows:
             state.owned = None
-            return h_out, a_out
+            return h_out, a_out, None
         state.owned = h_out
-        return hidden_states, a_out
+        return hidden_states, a_out, None
 
 
 def enable_decode_monokernels(model: torch.nn.Module) -> None:

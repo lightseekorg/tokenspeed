@@ -35,11 +35,16 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache/tier/disk_manager.h"
+#include "cache/tier/peer_exports.h"
+#include "cache/tier/peer_host_landings.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
+#include "fsm/peer_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/checkpoint_lineage.h"
+#include "scheduler/cache_event_sink.h"
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
@@ -116,6 +121,9 @@ public:
     static constexpr std::int64_t kNoProgressAbortPlans{4096};
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
+    // Install before submission. The scheduler keeps the sink alive through
+    // destruction of every request and in-flight slot owner.
+    void SetCacheEventSink(std::shared_ptr<CacheEventSink> sink);
 
     // What one plan call may do, decided by the control plane's prefill-delay
     // vote (docs/design/prefill-delay.md).
@@ -158,18 +166,56 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
-    // Same in-flight, pin and suspended-request checks as ClearCache, with no
-    // mutation. Weight updates MIN-reduce this across the replica before any
-    // rank clears. Every flush refuses while RetractedSize() > 0: a
+    // Explicit cancellation of best-effort PUTs. Runtime cancellation is
+    // carried by the next plan; source pins still require retired completion.
+    void CancelStorageBackups();
+    // After the non-storage preflight succeeds, detach request preparations
+    // and backups so healthy storage work can drain without attached leases.
+    void CancelStorageForClear();
+    // Inspect current in-flight, pin and suspended-request checks with no
+    // mutation or cancellation. Weight updates MIN-reduce preflight across
+    // the replica before detaching storage or clearing any rank's cache.
+    // Every flush refuses while RetractedSize() > 0: a
     // suspended request's image would otherwise resume old KV under a flushed
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
     // pin.
     bool CanClearCache() const;
-    bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
+    // Ordinary clear may first drain actual storage references on indexed
+    // Host entries. Keep main's indexed-pin checks for all other owners.
+    bool CanPrepareStorageClear() const;
+    // Explicit recovery. Old I/O blocks remain unavailable; new namespace
+    // operations can use the remaining Host space and global I/O credits.
+    bool CanClearCacheRetainingStorage() const;
+    bool StorageNonStorageClearable() const { return CanPrepareStorageClear(); }
+    bool ClearCacheRetainingStorage();
+    bool StorageHasRetainedOperations() const {
+        return storage_transfers_ && storage_transfers_->HasRetainedOperations();
+    }
+    // Storage covers L3 and the Disk tier, which never run together, and
+    // peer landings into Host: each writes Host blocks a clear must wait for.
+    bool StoragePending() const {
+        return (storage_transfers_ && storage_transfers_->HasPending()) ||
+               (disk_transfers_ && disk_transfers_->HasPending()) || peerHostLandingsPending();
+    }
+    bool StorageCurrentPending() const {
+        return (storage_transfers_ && storage_transfers_->HasCurrentPending()) ||
+               (disk_transfers_ && disk_transfers_->HasPending()) || peerHostLandingsPending();
+    }
+    bool StorageProgressPending() const {
+        return (storage_transfers_ && storage_transfers_->HasProgressPending()) ||
+               (disk_transfers_ && disk_transfers_->HasProgressPending()) ||
+               (peer_host_landings_ && peer_host_landings_->HasProgressPending());
+    }
+    std::size_t StorageBlockingQuarantined() const {
+        return storage_transfers_ ? storage_transfers_->NumBlockingQuarantined() : 0;
+    }
     std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
     std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }
     std::size_t StorageNegativeKeys() const { return storage_transfers_ ? storage_transfers_->NumNegativeKeys() : 0; }
     StorageStats GetStorageStats() const;
+    // The Disk tier's observations (docs/rfcs/0006-disk-tier.md); all zero
+    // without one.
+    DiskStats GetDiskStats() const;
     bool SharedPrefixStorageEnabled() const;
     struct SharedPrefixPublication {
         std::string status;
@@ -179,6 +225,35 @@ public:
     SharedPrefixPublication GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
                                                        std::int32_t max_prefix_tokens) const;
 
+    // Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md).
+    //
+    // A reader's lookups since the last take; mirrored ranks produce the
+    // same, and the runtime sends one replica's.
+    std::vector<PeerLookupRequest> TakePeerLookups() { return std::exchange(peer_lookups_, {}); }
+    // A holder's answers: reads of the cache as it stands, which the runtime
+    // gives between rounds (PeerExports). What a message changes reaches
+    // every member as its event at the next round's head.
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup) const {
+        return PeerExports::AnswerLookup(coordinator_, lookup);
+    }
+    bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
+                        std::span<const PeerPage> pages) const;
+    bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
+    // Plans built so far: no cache entry leaves between two plans.
+    std::int64_t PlanCalls() const { return plan_calls_; }
+    struct PeerStats {
+        std::size_t leases{0};
+        std::size_t pinned_blocks{0};
+        std::size_t looking_requests{0};
+        std::size_t landing_requests{0};
+        std::uint64_t landed_tokens{0};
+        std::uint64_t failed_landings{0};
+    };
+    PeerStats GetPeerStats() const;
+    std::vector<PeerExports::PinSample> TakePeerPinSamples() {
+        return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
+    }
+
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
     // Requests waiting for an admission: Submitted or Prefetching once PD
@@ -186,12 +261,14 @@ public:
     // Retracted (waiting to be restored) and Restoring (their copy back is in
     // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
+    // Waiting prompts less their last observed cache hit, plus unscheduled local prefill tokens.
+    std::int64_t PendingPrefillTokens() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
     // Requests in the running batch: local prefill forwards, prompts whose
-    // prefill is done (about to decode or to transfer), and decodes.
-    // RemotePrefilling (waiting for the peer's KV), waiting and retracted
-    // requests are not running.
+    // prefill is done (about to decode or to transfer, or waiting for their
+    // Decode destination), and decodes. RemotePrefilling (waiting for the
+    // peer's KV), waiting and retracted requests are not running.
     std::size_t RunningSize() const;
     // Physical resources include in-flight cleanup, even after its request
     // leaves the runnable FSM states. D-role decode permits include restore tickets.
@@ -199,6 +276,13 @@ public:
     std::int32_t ActiveDecodeSlots() const { return decode_slots_.Size() - decode_slots_.AvailableSlots(); }
     // D-role prefill is complete but the first local decode has not acquired a permit.
     std::size_t ReadyWaitingSize() const;
+    // P role, deferred decode allocation: computed prompts waiting for their
+    // Decode destination (PrefillAwaitingDestination, a subset of
+    // PrefillSize() and RunningSize()), and the Device parents in their block
+    // tables, counted as ActiveLcmBlocks() counts them; blocks held outside the
+    // tables (e.g. a pending in-forward State checkpoint) are not included.
+    std::size_t AwaitingDestinationSize() const;
+    std::int32_t AwaitingDestinationLcmBlocks() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
@@ -217,6 +301,9 @@ public:
     std::size_t RemotePrefillSize() const;
     // Requests whose pages PD still pins. This resource count overlaps FSM states.
     std::size_t PdTransferSize() const;
+    // P-role prompts with their final result ready, awaiting PD completion.
+    // Excludes local prefill compute and aborted-transfer cleanup.
+    std::size_t PrefillInflightSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Only fused, page-less requests can finish without the normal forward/PD
     // completion fence. This is a read-only check for the head event channel.
@@ -307,6 +394,10 @@ private:
         // the blocker itself, the next of these, if any, is who its pages
         // serve first (maybeRetractForCapacity lists the rest).
         std::vector<Request*> capacity_blocked;
+        // Set by a local prefill admission whose chunk the yield
+        // (prefill_chunk_yield_tokens) cut shorter than the budget allowed;
+        // the phases clear it before each attempt.
+        bool chunk_gave_way{false};
 
         void NoteCapacityBlocked(Request* request) {
             if (capacity_blocker == nullptr) {
@@ -339,6 +430,8 @@ private:
         // so the peer omits the state transfer (PrefillOperation::state_prefix_cached).
         bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
+        // A peer landing's destinations: every block it fills whole.
+        std::vector<PeerPage> peer_destinations;
     };
     // `yield_tokens`: what a chunk that cannot finish gives up for whole
     // prompts behind it (YieldingChunkBudget). `must_complete`: admit only a
@@ -346,10 +439,14 @@ private:
     // a chunk's forward; one that would not is skipped (no capacity failure),
     // and one whose in-forward checkpoint block does not fit fails for
     // capacity rather than ending at the checkpoint.
+    // peer_landing_tokens, when positive, is the end of a peer landing: the
+    // first chunk is [hit, end), filled from the holder instead of computed
+    // (fsm::PrefillSource::kPeer). Zero computes it, or on the D role lands
+    // the whole prompt from the PD peer.
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
                                                 std::int64_t kv_token_limit, std::int32_t yield_tokens,
-                                                bool must_complete);
+                                                bool must_complete, std::int32_t peer_landing_tokens);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
@@ -357,12 +454,15 @@ private:
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
+    LoadBackOperation startPrefixLoad(Request& request, std::vector<BlockTransfer> load_pairs);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                  std::vector<LoadBackOperation>& load_back_operations);
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
+    // The same probe, matching no further than max_probe_tokens.
+    AdmissionMatch matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens);
     // Records an admission's fresh pages (to zero) and copies on the plan, a
     // copy from a block an earlier copy of the plan fills reading that copy's
     // source. Asserts that each copy destination is written once and never
@@ -474,18 +574,50 @@ private:
     // while a transfer may still touch its pages.
     void abortRequest(Request& request);
 
+    // A waiting prompt with a peer hint asks its holder, once; one past its
+    // wait gives the holder up. With Host landings, a prompt the holder
+    // answered starts its landing into Host here (startPeerHostLanding).
+    void preparePeer(Request& request);
+    // The answered prompt's landing into Host blocks before its admission:
+    // it waits in Prefetching, or is admitted from its local hit when the
+    // Host cannot take the whole answered prefix.
+    void startPeerHostLanding(Request& request);
+    // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
+    // request's tables: a token-spanned group's from the block holding
+    // hit_tokens through the one holding the end, a State group's live slot.
+    std::vector<PeerPage> peerLandingDestinations(std::span<const BlockTable> tables, std::int32_t hit_tokens,
+                                                  std::int32_t end_tokens) const;
+    // Takes a landing's destinations out of the admission's pages to zero;
+    // none may be a copy or load destination.
+    void excludeLandedPages(AdmissionResult& admission, std::span<const PeerPage> destinations) const;
+    void handleEvent(const cache::PeerTick& event);
+    void handleEvent(const cache::PeerLookup& event);
+    void handleEvent(const cache::PeerPin& event);
+    void handleEvent(const cache::PeerRelease& event);
+    void handleEvent(const cache::PeerLookupAnswered& event);
+    void handleEvent(const cache::PeerFetchDone& event);
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
+    void handleEvent(const cache::DiskDone& event);
     void handleEvent(const cache::StorageDetach& event);
     void prepareStorage(Request& request);
+    // The Disk tier's counterpart of prepareStorage: a waiting prompt whose
+    // prefix Disk extends past its local hit reads it into Host before its
+    // admission (Prefetching), and holds what it read until then.
+    void prepareDisk(Request& request);
     void releaseStorage(Request& request);
     void expireStorage(Request& request);
+    // Whether L3 or the Disk tier issued `lease`, whose waits the storage
+    // clock times; a peer landing into Host keeps the peer clock.
+    bool ownsStorageLease(const StorageLease& lease) const;
+    bool peerHostLandingsPending() const { return peer_host_landings_ && peer_host_landings_->NumLandings() > 0; }
     std::int32_t cacheablePrefixTokens(const Request& request) const;
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
+    void handleEvent(const pd::DestinationReadyEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::TransferStoppedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
@@ -525,6 +657,10 @@ private:
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
         std::int32_t pending_prefill_reserve{0};
+        // The requests whose prefill chunk this round runs. Unlike
+        // `scheduled`, a forced retraction victim sitting the round out is
+        // not among them.
+        std::unordered_set<const Request*> prefilled;
         bool pushed_prefill{false};
         bool pushed_decode{false};
         bool Full(std::int32_t max_batch_size) const {
@@ -556,6 +692,7 @@ private:
                     static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
             }
             build.pushed_prefill = true;
+            build.prefilled.insert(&request);
         } else if (config_.role != Role::kD) {
             build.token_budget -= operation.input_length;
         }
@@ -576,10 +713,12 @@ private:
                                                              std::int32_t kv_page_budget, std::int32_t yield_tokens,
                                                              bool must_complete);
 
-    // SchedulerConfig::prefill_chunk_yield_tokens (docs/design/scheduler.md
-    // §1.1): a Submitted prompt a chunk that cannot finish may carry in its
-    // forward -- its position in the round's candidates, and the tokens
-    // (replay included) and KV pages the whole prompt takes.
+    // A Submitted prompt a P-role chunk that cannot finish may carry in its
+    // forward (docs/design/scheduler.md §1.1) -- one it gives way to
+    // (SchedulerConfig::prefill_chunk_yield_tokens) or one filling the budget
+    // it leaves, whatever that option: its position in the round's
+    // candidates, and the tokens (replay included) and KV pages the whole
+    // prompt takes.
     struct WholePrompt {
         std::size_t index{0};
         Request* request{nullptr};
@@ -597,32 +736,38 @@ private:
     std::optional<std::int32_t> wholePromptTokens(Request& request, Request* resident_holder, bool has_state_group);
     // The round's whole prompts, probed once: the Submitted candidates from
     // position `from` on that no phase scheduled yet and whose whole prompt
-    // takes at most prefill_chunk_yield_tokens, in candidate order, after at
-    // most kMaxYieldProbesPerRound probes; `resident_holder` is the resident
-    // chunk they are probed for, null for a new prompt's.
+    // takes at most prefill_chunk_yield_tokens or the budget left, whichever
+    // is more, in candidate order, after at most kMaxYieldProbesPerRound
+    // probes; `resident_holder` is the resident chunk they are probed for
+    // before its admission, null otherwise.
     std::vector<WholePrompt> wholePromptsAfter(std::span<Request* const> candidates, std::size_t from,
                                                const PlanBuild& build, Request* resident_holder);
-    // The whole prompts a holder carries: from the round's list, those from
-    // position `from` on still Submitted and unscheduled, in order, while
-    // their tokens fit prefill_chunk_yield_tokens and they and the holder fit
-    // the batch, the free request slots (one more for a new holder,
-    // `holder_is_new`) and, with max_kv_page_num, the KV page budget beside
-    // the holder's most pages (`holder_max_pages`).
+    // The whole prompts a holder gives way to: from the round's list, those
+    // from position `from` on still Submitted, unscheduled and taking at most
+    // prefill_chunk_yield_tokens, in order, while their tokens together fit
+    // it and they and the holder fit the batch, the free request slots (one
+    // more for a new holder, `holder_is_new`) and, with max_kv_page_num, the
+    // KV page budget beside the holder's most pages (`holder_max_pages`).
     std::vector<WholePrompt> carriedPrompts(std::span<const WholePrompt> whole_prompts, std::size_t from,
                                             const PlanBuild& build, bool holder_is_new,
                                             std::int32_t holder_max_pages) const;
-    // Admits the carried prompts behind a holder that kept the head of line
-    // (its operation the last pushed), each only if its first chunk completes
-    // it on the budget left; stops at the first capacity failure, and admits
-    // none once the plan is a lone-request compaction's (the holder's own;
-    // LoneRequestRecovery::ActedInPlan). Nothing it admits holds the head of line,
-    // and the holder's operation then moves behind theirs: the completing
+    // Admits the carried prompts beside a holder that kept the head of line
+    // (its operation the last pushed) -- those it gave way to, or those
+    // filling the budget it leaves (with enable_short_prefill_first one at a
+    // time, in rank order) -- each only if its first chunk completes it on
+    // the budget left, and skips one whose `tokens` exceed that budget; stops
+    // at the first capacity failure, and admits none once the plan is a
+    // lone-request compaction's (the holder's own;
+    // LoneRequestRecovery::ActedInPlan). Of each prompt it reads only
+    // `request` and `tokens`. Nothing it admits holds the head of line, and
+    // the holder's operation then moves behind theirs: the completing
     // prefills run first, the incomplete one last. candidates supplies the
     // round's FIFO order. With enable_short_prefill_first, a successful
     // carried first admission that overtakes the oldest waiting prompt
     // increments that prompt's bypass count.
-    void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                           std::span<const WholePrompt> carried, std::int32_t decode_reserve);
+    // Returns how many of `carried` it admitted.
+    std::int32_t carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                   std::span<const WholePrompt> carried, std::int32_t decode_reserve);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -680,7 +825,8 @@ private:
     // publication is aborted here too.
     void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
-    // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
+    // (N > 0) or Prefilling (N < 0) request with forced budget remaining
+    // every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it. A victim whose image
     // does not fit (imageShortfall) runs on with nothing published; one
     // refused only after its publication is aborted.
@@ -704,16 +850,32 @@ private:
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
     // True when a local-prefill candidate has been held back by the
-    // prefill/decode interval for prefill_decode_interval rounds in total
+    // prefill/decode interval for prefill_decode_interval rounds: in total,
+    // or since its last chunk ran under max_consecutive_prefill_rounds
     // (docs/design/scheduler.md §3.3).
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
+    // Whether an overdue prompt may suspend the interval this round:
+    // always without max_consecutive_prefill_rounds; with it, only until a
+    // run of back-to-back prefill rounds reaches the cap.
+    bool prefillSuspensionAllowed() const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
+    // Admits the waiting prompts whose holder answered with more than their
+    // local hit, each as a landing (fsm::PrefillSource::kPeer) that rides
+    // ExecutionPlan::peer_fetches beside the batch, taking no token budget
+    // and no batch row. One that did not fit keeps its hit, and no local
+    // admission takes it this round.
+    void schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                              bool new_prompts_sealed);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    // Declared before the allocator, tickets and requests: they release their
+    // slots before the sink's last reference can be destroyed.
+    std::shared_ptr<CacheEventSink> cache_event_sink_;
+    bool submitted_requests_{false};
     ReqPoolAllocator req_pool_allocator_;
     DecodeSlotAllocator decode_slots_;
     // One slot per retracted request: the index of its slot-state blob in
@@ -725,9 +887,24 @@ private:
     BlockPool block_pool_;
     BlockPool host_pool_;
     BlockPool snapshot_pool_;
+    BlockPool disk_pool_;
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::unique_ptr<StorageTransferManager> storage_transfers_;
+    // The Disk tier's prefetches and cleaning writes; null without one.
+    std::unique_ptr<DiskTransferManager> disk_transfers_;
+    // Peer prefix sharing, when configured: the holder's leases, the peer
+    // clock, the reader's lease counter and what goes out to other replicas.
+    std::unique_ptr<PeerExports> peer_exports_;
+    // A reader's landings into Host, with PeerLandingTier::kHost; null
+    // otherwise. The fetches started since the last plan go out with it.
+    std::unique_ptr<PeerHostLandings> peer_host_landings_;
+    std::vector<PeerFetchOperation> peer_host_fetches_;
+    std::int64_t peer_now_us_{0};
+    std::uint64_t next_peer_lease_{0};
+    std::vector<PeerLookupRequest> peer_lookups_;
+    std::uint64_t peer_landed_tokens_{0};
+    std::uint64_t peer_failed_landings_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};
@@ -755,6 +932,13 @@ private:
     // prefill_decode_min_interval: the same clock, but no overdue prompt
     // suspends it.
     std::int32_t prefill_min_rounds_left_{0};
+    // max_consecutive_prefill_rounds: back-to-back prefill rounds that held
+    // a decode back (saturating at the cap), and whether the current
+    // interval was owed by a run that reached the cap (no overdue prompt
+    // suspends it until it has been paid). Derived from the plans and the
+    // candidates, identical on every rank, like the interval.
+    std::int32_t consecutive_prefill_rounds_{0};
+    bool prefill_interval_held_{false};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work, leaves work in flight or aborts a request (the
@@ -775,18 +959,20 @@ private:
     // currently out (a BlockStored not yet followed by its BlockRemoved).
     // Residency itself is the coordinator's answer, never mirrored here.
     // Cache mutations and registrations only mark a boundary for reconcile;
-    // DrainKvEvents reconciles each marked boundary against its residency, so
-    // the order of evictions and publications inside one admission does not
-    // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with any Device cached child, including State entries excluded from
-    // routing residency: their later mutations still need the descriptor.
+    // DrainKvEvents reconciles each marked boundary against its residency on
+    // the Device and on the Host, so the order of evictions and publications
+    // inside one admission does not matter. After a drain, a descriptor exists
+    // exactly for the boundaries with any Device cached child, including State
+    // entries excluded from routing residency, or any Host entry or pending
+    // Host store: their later mutations still need the descriptor.
     struct KvEventBoundary {
         KvEventDescriptorRef stored;
         // Position in the prefix chain (page index). Consumers resolve a
         // Stored event's parent_block_hash on receipt, so DrainKvEvents
         // orders each batch by depth rather than by mutation order.
         std::int32_t depth{0};
-        bool published{false};
+        // Out on each medium (KvEventMedium order).
+        std::array<bool, kNumKvEventMedia> published{};
         bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;

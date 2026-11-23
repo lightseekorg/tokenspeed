@@ -23,9 +23,10 @@
 A round proposes block position k from the hoisted base logits of position
 k-1 plus the Markov bias of the token proposed at k-1. Each rank packs its
 vocab shard's best logit and token id into one int64 per row, so a single
-all-gather of those words lets every rank, in the next round's launch, decode
-the winner that the walk then conditions on. The words order by BF16 logit,
-then by lower token id, as the reference's first-index max does.
+all-gather of those words, or an all-reduce MAX of them, lets every rank, in
+the next round's launch, decode the winner that the walk then conditions on.
+The words order by BF16 logit, then by lower token id, as the reference's
+first-index max does.
 """
 
 from __future__ import annotations
@@ -130,9 +131,10 @@ def dspark_walk_round(
 ) -> None:
     """Propose ``tokens[:, column]``'s shard winner into ``packed``.
 
-    ``gathered`` holds the previous round's ``tp`` gathered words, rank-major;
-    None reads the previous token from ``tokens[:, column - 1]`` instead.
-    ``packed`` must be zero on entry.
+    ``gathered`` holds the previous round's ``tp`` gathered words, rank-major
+    (``tp`` is 1 once they were reduced with MAX); None reads the previous
+    token from ``tokens[:, column - 1]`` instead. ``packed`` must be zero on
+    entry.
     """
     rows, num_org = base_logits.shape
     rank = int(latent_table.shape[1])

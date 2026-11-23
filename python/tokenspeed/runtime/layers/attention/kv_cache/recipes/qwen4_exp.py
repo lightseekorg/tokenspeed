@@ -50,8 +50,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
     pipeline_cache_ownership,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    FLAT_KV_PLANE,
     CacheFieldSpec,
+    CacheLayout,
     cache_dtype_name,
+    cache_field_layer_id,
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
@@ -63,6 +66,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
+from tokenspeed.runtime.utils.common import round_up
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
@@ -111,6 +115,170 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     def max_padding_fraction(self) -> float:
         """Allow side groups that do not fill every shared plane."""
         return float("inf")
+
+    @cached_property
+    def _flat_kv(self) -> bool:
+        """Whether the cache groups share one physical plane per stage."""
+        enabled = bool(self.server_args.qwen4_exp_flat_kv)
+        if (
+            enabled
+            and self.draft_attn_config is not None
+            and self.draft_attn_config.kv_cache_mxfp8
+        ):
+            raise NotImplementedError(
+                "Qwen4-Exp FlatKV does not support MXFP8 draft scale addressing; "
+                "pass --no-qwen4-exp-flat-kv to use the plane-based layout"
+            )
+        return enabled
+
+    @cached_property
+    @override
+    def _num_state_groups(self) -> int:
+        # FlatKV can fit every GDN layer in one parent instead of splitting
+        # states to match the ordinary layout's K/V plane count.
+        if self._flat_kv:
+            return 1
+        return super()._num_state_groups
+
+    def _flat_groups(
+        self, groups: Sequence[CacheGroupDeclaration]
+    ) -> tuple[CacheGroupDeclaration, ...]:
+        """Give each PP stage one shared plane in the global plan."""
+        plane_by_layer = (
+            {
+                layer: f"{FLAT_KV_PLANE}.{stage}"
+                for stage, (start, end) in enumerate(self._stage_cache_windows)
+                for layer in range(start, end)
+            }
+            if self.server_args.mapping.has_pp
+            else None
+        )
+        return tuple(
+            (
+                spec,
+                tuple(
+                    replace(
+                        field,
+                        plane_id=(
+                            FLAT_KV_PLANE
+                            if plane_by_layer is None
+                            else plane_by_layer[cache_field_layer_id(field.field_id)]
+                        ),
+                        exact_page_stride=False,
+                        page_stride_alignment_bytes=math.lcm(
+                            field.page_stride_alignment_bytes,
+                            (
+                                field.payload_bytes
+                                if spec.attn_kind == "full_history"
+                                else field.element_size
+                            ),
+                        ),
+                    )
+                    for field in fields
+                ),
+            )
+            for spec, fields in groups
+        )
+
+    @override
+    def packing(self, groups: Sequence[CacheGroupDeclaration]) -> dict[str, int] | None:
+        if not self._flat_kv:
+            return None
+        # Each plane is one stage. A group's block only carries that stage's
+        # fields, packed in the same order as in the arena.
+        by_plane: dict[str, dict[str, tuple[int, int]]] = {}
+        for spec, fields in groups:
+            for field in sorted(fields, key=lambda field: field.field_id):
+                stage = by_plane.setdefault(field.plane_id, {})
+                size, alignment = stage.get(spec.group_id, (0, 1))
+                stage[spec.group_id] = (
+                    round_up(size, field.element_size) + field.payload_bytes,
+                    math.lcm(
+                        alignment, field.element_size, field.page_stride_alignment_bytes
+                    ),
+                )
+
+        # A stage can fill a parent with K/V blocks up to the size needed by
+        # its largest local block, rounded to a whole aligned K/V block.
+        # Mirrored schedulers need one K/V count across all its owners.
+        parent_bytes_by_plane = {}
+        kv_counts = []
+        for plane_id, stage in by_plane.items():
+            kv_size, kv_alignment = stage.get(FULL_ATTENTION, (1, 1))
+            kv_stride = round_up(kv_size, kv_alignment)
+            parent_alignment = math.lcm(
+                kv_stride, *(align for _, align in stage.values())
+            )
+            parent_bytes = round_up(
+                max(size for size, _ in stage.values()), parent_alignment
+            )
+            parent_bytes_by_plane[plane_id] = parent_bytes
+            if FULL_ATTENTION in stage:
+                kv_counts.append(parent_bytes // kv_stride)
+        packing = {spec.group_id: 1 for spec, _ in groups}
+        if kv_counts:
+            packing[FULL_ATTENTION] = min(kv_counts)
+
+        if len(by_plane) > 1:
+            # With the common K/V count, size each plane for its own K/V
+            # and one block of each side group. This can shrink a plane
+            # whose K/V count fell when we reconciled the stages.
+            seed = pack(
+                groups,
+                prefix_granularity=self.prefix_granularity,
+                cache_blocks_per_lcm_block=packing,
+                alignment=self.alignment,
+                max_padding_fraction=self.max_padding_fraction,
+            )
+            parent_bytes_by_plane = dict(seed.plane_bytes)
+
+        # Take the largest count fitting every plane that owns the group,
+        # without changing the plane sizes needed for K/V and state.
+        limits: dict[str, list[tuple[int, int]]] = {}
+        for plane_id, parent_bytes in parent_bytes_by_plane.items():
+            for group_id, (payload, alignment) in by_plane[plane_id].items():
+                if group_id != FULL_ATTENTION:
+                    limits.setdefault(group_id, []).append(
+                        (parent_bytes // payload, parent_bytes // alignment)
+                    )
+        for group_id, constraints in limits.items():
+            divisor = math.gcd(*(factor for _, factor in constraints))
+            upper = min(divisor, *(count for count, _ in constraints))
+            packing[group_id] = next(
+                count for count in range(upper, 0, -1) if divisor % count == 0
+            )
+        return packing
+
+    @override
+    def parent_id_limit(self, layout: CacheLayout) -> int:
+        """Keep every int32 kernel address of the target and draft fields in range."""
+        limit = super().parent_id_limit(layout)
+        if not self._flat_kv:
+            return limit
+        specs = {spec.group_id: spec for spec in self._group_specs}
+        packing = dict(layout.group_packing)
+        for field in layout.fields:
+            spec = specs[field.group_id]
+            if spec.attn_kind == "state":
+                continue
+            # The last slot or atom ID is block * stride / payload * block_tokens
+            # + block_tokens - 1, independent of the kernel page size.
+            # Include each view's payload and the final page's token span.
+            block_tokens = spec.block_granularity
+            stride, payload = field.page_stride_bytes, field.payload_bytes
+            if spec.attn_kind != "full_history":
+                # Raw scheduler IDs carry no atom multiplier.
+                stride = payload
+            if spec.group_id == QWEN4_EXP_QSA_CACHE_GROUP:
+                # Its write slots are int64; its int32 atom IDs assume binding at block granularity.
+                block_tokens = 1
+            limit = min(
+                limit,
+                ((1 << 31) - block_tokens)
+                * payload
+                // (packing[field.group_id] * stride * block_tokens),
+            )
+        return limit
 
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
         if not getattr(self._text_config, "ple_layer_ids", None):
@@ -296,7 +464,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             field.field_id.endswith(".conv") for field in self._ple_fields()
         )
         # Source and destination int64 row ids, shared by every batch size.
-        ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
+        # Each layer also keeps an int64 destination element stride.
+        ple_commit_bytes = num_ple_layers * (2 * self.attn_config.max_bs + 1) * 8
         return (
             super().workspace_bytes()
             + ple_commit_bytes
@@ -387,6 +556,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 for spec, (_, fields) in zip(policies, extras, strict=True)
             )
         decoder_groups = super().groups()
+        if self._flat_kv:
+            return self._flat_groups((*decoder_groups, *extras))
         attention_plane_bytes = {
             field.plane_id: field.payload_bytes
             for spec, fields in decoder_groups

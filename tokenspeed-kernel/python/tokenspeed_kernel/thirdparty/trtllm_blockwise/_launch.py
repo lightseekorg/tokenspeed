@@ -50,7 +50,7 @@ def _compile_arguments(a, b, sa, sb, out):
     )
     c = from_dlpack(out.view(1, m, n).permute(1, 2, 0), enable_tvm_ffi=True)
     c = c.mark_layout_dynamic(leading_dim=1)
-    return (m, n, k, m, n // 128, k // 128, 1, *pointers, c)
+    return (m, n, k, _scale_rows(sa), n // 128, k // 128, 1, *pointers, c)
 
 
 def _arguments(a, b, sa, sb, out):
@@ -66,7 +66,7 @@ def _arguments(a, b, sa, sb, out):
         m,
         n,
         k,
-        m,
+        _scale_rows(sa),
         n // 128,
         k // 128,
         1,
@@ -110,9 +110,24 @@ def _default_tactic(m):
 DEFAULT_TACTICS = frozenset(_default_tactic(m) for m in (64, 128, 256))
 
 
+def _scale_rows(a_scales):
+    """The M extent of the activation scales, which is also their K stride."""
+    m, k_blocks = a_scales.shape
+    return a_scales.stride(1) if k_blocks > 1 else m
+
+
 def _scales(a_scales, b_scales):
-    # A scales are logically [M,K/128], but this kernel reads MN-major.
-    return a_scales.T.contiguous(), b_scales.contiguous()
+    """Check the scale layouts the kernel reads in place."""
+    m = a_scales.shape[0]
+    if (m > 1 and a_scales.stride(0) != 1) or _scale_rows(a_scales) < m:
+        raise ValueError(
+            "TRT-LLM CuTe-DSL reads MN-major activation scales with stride(0) 1 "
+            f"and stride(1) at least M, got {tuple(a_scales.shape)} with strides "
+            f"{a_scales.stride()}"
+        )
+    if not b_scales.is_contiguous():
+        raise ValueError("TRT-LLM CuTe-DSL reads contiguous weight scales")
+    return a_scales, b_scales
 
 
 def _compiled_tactic(a, b, sa, sb, out, tactic):

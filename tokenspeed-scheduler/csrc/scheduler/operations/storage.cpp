@@ -36,6 +36,10 @@ StorageStats Scheduler::GetStorageStats() const {
     if (!storage_transfers_) return stats;
     stats.operations = storage_transfers_->NumOperations();
     stats.held_blocks = storage_transfers_->NumHeldBlocks();
+    stats.retained_operations = storage_transfers_->NumRetainedOperations();
+    stats.retained_host_blocks = storage_transfers_->NumRetainedHostBlocks();
+    stats.retained_capacity_exhausted = storage_transfers_->RetainedCapacityExhausted();
+    stats.retained_capacity_warnings = storage_transfers_->NumRetainedCapacityWarnings();
     stats.quarantined = storage_transfers_->NumQuarantined();
     stats.negative_keys = storage_transfers_->NumNegativeKeys();
     stats.backup_candidates = storage_transfers_->NumBackupCandidates();
@@ -98,7 +102,7 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
                                  [&](const auto& key) { return storage_transfers_->WasPublished(key); })) {
         result.status = "published";
         result.confirmed_prefix_tokens = max_prefix_tokens;
-    } else if (storage_transfers_->PressureGateClosed() || storage_transfers_->NumQuarantined() > 0) {
+    } else if (storage_transfers_->PressureGateClosed() || storage_transfers_->NumBlockingQuarantined() > 0) {
         result.status = "pressure";
     }
     return result;
@@ -131,8 +135,9 @@ void Scheduler::handleEvent(const cache::StorageTick& event) {
     for (const auto& request : requests_) {
         const auto* prefetch = request->GetIf<fsm::Prefetching>();
         const auto* admission = request->AdmissionResourcesPtr();
-        if ((prefetch != nullptr && storage_now_us_ >= prefetch->deadline_us) ||
-            (admission != nullptr && admission->storage_hold &&
+        // A peer landing into Host keeps the peer clock (handleEvent(PeerTick)).
+        if ((prefetch != nullptr && ownsStorageLease(prefetch->lease) && storage_now_us_ >= prefetch->deadline_us) ||
+            (admission != nullptr && admission->storage_hold && ownsStorageLease(admission->storage_hold->lease) &&
              storage_now_us_ >= admission->storage_hold->deadline_us)) {
             expireStorage(*request);
         }
@@ -148,8 +153,13 @@ void Scheduler::handleEvent(const cache::StorageDetach& event) {
     if (auto* request = findRequest(event.request_id)) releaseStorage(*request);
 }
 
+bool Scheduler::ownsStorageLease(const StorageLease& lease) const {
+    return (storage_transfers_ && lease.IssuedBy(*storage_transfers_)) ||
+           (disk_transfers_ && lease.IssuedBy(*disk_transfers_));
+}
+
 void Scheduler::releaseStorage(Request& request) {
-    if (!storage_transfers_) return;
+    if (!storage_transfers_ && !disk_transfers_ && !peer_host_landings_) return;
     // The request gives L3 up and keeps its place: the lease on the operation
     // it waits for, or on its Ready data, dies with the wait.
     if (request.Is<fsm::Prefetching>()) {
@@ -165,6 +175,7 @@ void Scheduler::prepareStorage(Request& request) {
     if (!storage_transfers_) return;
     const auto& limits = storage_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
+        if (!state->lease.IssuedBy(*storage_transfers_)) return;
         const std::uint64_t operation = state->lease.OperationId();
         if (storage_transfers_->Completed(operation) && !storage_transfers_->IsQuery(operation)) {
             const auto deadline =
@@ -200,7 +211,7 @@ void Scheduler::prepareStorage(Request& request) {
             return;
         }
         if (!storage_transfers_->Completed(operation) || !storage_allowed_) return;
-        const auto hits = storage_transfers_->QueryHits(operation);
+        const auto hits = storage_transfers_->RecordQueryHits(operation);
         // The finished query retires before the GET starts: CanStart counts
         // its ticket.
         state->lease.reset();

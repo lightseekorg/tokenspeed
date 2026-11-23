@@ -72,7 +72,10 @@ def _shard_candidates(
             rank * _SHARD,
             pairs[rank],
             softcap=None,
+            softcap_form=None,
             vocab_mask=vocab_mask,
+            values_out=None,
+            halo_out=None,
         )
     ids = torch.empty(rows, k, dtype=torch.int32, device=logits.device)
     values = torch.empty(rows, k, device=logits.device)

@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
         IrisPullExchange,
     )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
@@ -61,6 +62,7 @@ class IrisBackend(CommBackend):
         self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._ordinary_all_reduces: dict[Group, ProducerAllReduce] = {}
         self._pull_exchanges: dict[Group, IrisPullExchange] = {}
+        self._word_maxes: dict[Group, LamportWordMax] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -172,6 +174,31 @@ class IrisBackend(CommBackend):
         state.run(tensor)
         return True
 
+    def install_word_max(self, group: Group, state: "LamportWordMax") -> None:
+        """Bind a prepared word MAX without replacing captured mailboxes."""
+        previous = self._word_maxes.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris word max")
+        self._word_maxes[group] = state
+
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        state = self._word_maxes.get(group)
+        if (
+            state is None
+            or words.dtype != torch.int64
+            or words.dim() != 1
+            or not 0 < words.numel() <= state.max_rows
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.iris import iris_lamport_word_max
+
+        # Layout is fixed up locally; every rank still runs the same launch.
+        if words.is_contiguous():
+            iris_lamport_word_max(state, words, out=words)
+        else:
+            words.copy_(iris_lamport_word_max(state, words.contiguous()))
+        return True
+
     def _create(
         self,
         group: Group,
@@ -203,6 +230,13 @@ class IrisBackend(CommBackend):
                 self._producer_direct_max_bytes // dtype.itemsize,
             )
         return state
+
+    def prepare_all_reduce_runtime(self, group: Group, dtype: torch.dtype) -> bool:
+        """Create the ordinary state without replacing model-prepared capacities."""
+        if len(group) <= 1 or not current_platform().is_amd or dtype != torch.bfloat16:
+            return False
+        self._get_or_create(group, dtype)
+        return True
 
     def prepare_all_reduce_buffers(
         self,
@@ -407,6 +441,22 @@ class IrisBackend(CommBackend):
             if gather is not None and gather.can_run(tensor):
                 return gather.run(tensor)
         return self._fallback.all_gather(tensor, group, dim)
+
+    def gathers_in_one_launch(self, tensor: torch.Tensor, group: Group) -> bool:
+        """Whether the column all-gather of ``tensor`` fits the group's
+        symmetric buffer: larger ones run a launch, each with its own peer
+        handshake, a chunk of the buffer's rows."""
+        gather = self.get_prepared_all_gather(group, tensor.dtype)
+        if gather is not None:
+            capacity = gather.producer.data.numel()
+        else:
+            state = self.state(group, tensor.dtype)
+            capacity = (
+                state.producer_direct_max_numel
+                if state is not None
+                else self._producer_direct_max_bytes // tensor.element_size()
+            )
+        return tensor.numel() * len(group) <= capacity
 
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group

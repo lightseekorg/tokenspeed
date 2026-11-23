@@ -33,6 +33,15 @@ people and average people is more than tenfold.
   where it might be tricky for humans to understand. Keep project- and
   component-level (design) docs focused on the high-level picture. Put docs in
   the right place and avoid duplicating the same content across many places.
+* Make data flow explicit and prefer a functional style. Return computed results
+  instead of using preparation functions with no return value to silently
+  populate object state. Pass inputs and per-operation working state explicitly;
+  keep necessary mutations localized behind clearly named operations.
+* Apply `const` to read-only methods, views, and immutable configuration where
+  appropriate. Do not use `mutable` merely to hide side effects in a query.
+* Keep names consistent when the same data passes through functions and layers.
+  Rename a value when its meaning or unit changes, and distinguish counts,
+  indices, exclusive bounds, and token/block/page units explicitly.
 * For code comments, use common/existing terms for easy human understanding;
   avoid obscure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
@@ -46,6 +55,19 @@ people and average people is more than tenfold.
 * Avoid defensive fallback. Propagate errors and fail explicitly by default.
   Introduce fallback or automatic recovery only when justified by a concrete,
   documented need.
+* Preserve zero occupancy after memory release (see
+  `docs/design/event-loop.md`). Review every new or changed runtime GPU
+  allocation, including lazy initialization, workspace growth and storage
+  retained by views. Persistent runtime tensors must use the memory saver's
+  CPU-backed named regions so `weights` release/resume unmaps/restores their
+  storage while preserving addresses and contents; keep the existing
+  discard/rebuild and communication lifecycles separate. Even a small tensor
+  must not pin an ordinary allocator segment. Changes that add or move
+  allocations must extend GPU release/resume regression coverage through the
+  affected path, including repeated cycles and any lazy allocation or growth:
+  after draining and release, ordinary Torch CUDA allocator segments
+  (`segment_pool_id=(0, 0)`) must occupy 0 bytes, and resumed execution must
+  remain correct with restored persistent data and addresses.
 * Kernels must generalize beyond example configurations. Restrictions on
   tensor shape/layout/contiguity, communication topology, SM versions/counts,
   model names must reflect correctness requirements or measured performance

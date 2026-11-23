@@ -23,341 +23,32 @@
 from __future__ import annotations
 
 import math
-import weakref
-from typing import Any
 
 import torch
-import torch.distributed as dist
-from tokenspeed_kernel.ops.attention.dsa import prepare_dsa_resources
-from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_kernels
-from tokenspeed_kernel.ops.attention.prologue import mla_prologue
+from tokenspeed_kernel.ops.attention.prologue import latent_store
 from torch import nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
-from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    AscendDSABackend,
-    ascend_dsa_prefill_backend,
-    prepare_ascend_dsa_cp_metadata,
+from tokenspeed.runtime.distributed.comm_ops import all_gather
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
+    DSA_DECODE_ROWS,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm
-from tokenspeed.runtime.layers.linear import ColumnParallelLinear, ReplicatedLinear
+from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy
 from tokenspeed.runtime.models.deepseek_v3 import (
-    DeepseekV3AttentionMLA,
     _prepare_mla_kv_b_proj_weights,
 )
 from tokenspeed.runtime.utils import add_prefix
-
-
-def _nk(weight, widths, kl1=512):
-    # Bit-preserving private NK panel stream; no dtype conversion.
-    assert sum(widths) == weight.shape[0] and weight.shape[1] % kl1 == 0
-    panels = []
-    col = 0
-    for width in widths:
-        for start in range(0, weight.shape[1], kl1):
-            tile = weight[col : col + width, start : start + kl1]
-            panels.append(
-                tile.reshape(width // 16, 16, kl1 // 16, 16)
-                .permute(2, 0, 1, 3)
-                .contiguous()
-                .view(-1)
-            )
-        col += width
-    return torch.cat(panels)
-
-
-def pack_qb_panels(qb):
-    """Encode the native N128 tiles without changing coefficient bits."""
-    if qb.device.type != "cpu" or tuple(qb.shape) not in ((20480, 1536), (8192, 768)):
-        raise ValueError("Expected CPU QB [20480,1536] or [8192,768]")
-    packed = _nk(
-        qb, [128] * (qb.shape[0] // 128), kl1=256 if qb.shape[1] == 768 else 512
-    )
-    return packed.reshape(-1, 16, 16).permute(1, 0, 2).contiguous().reshape(16, -1)
-
-
-def pack_down_qa_panels(down):
-    """Encode N96 QA tiles followed by the genuine-NZ KV/Indexer suffix."""
-    if down.device.type != "cpu" or tuple(down.shape) not in (
-        (2240, 4096),
-        (1472, 2048),
-    ):
-        raise ValueError("Expected CPU down [2240,4096] or [1472,2048]")
-    columns, hidden = down.shape
-    query_rank = columns - 704
-    qa = _nk(down[:query_rank], [96] * (query_rank // 96))
-    aux = (
-        down[query_rank:]
-        .reshape(44, 16, hidden // 16, 16)
-        .permute(0, 2, 3, 1)
-        .contiguous()
-        .view(-1)
-    )
-    packed = torch.cat((qa, aux))
-    return (
-        packed.reshape(columns // 16, hidden // 16, 16, 16)
-        .permute(1, 2, 0, 3)
-        .contiguous()
-        .reshape(hidden, columns)
-    )
-
-
-DSA_DECODE_ROWS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
-
-
-def supports_fused_dsa_decode(layer) -> bool:
-    """Check the loaded geometry owned by the fused projection implementation."""
-    indexer = layer.indexer
-    geometry = (
-        layer.hidden_size,
-        layer.num_heads,
-        layer.num_local_heads,
-        layer.q_lora_rank,
-    )
-    if geometry not in ((4096, 64, 8, 1536), (2048, 32, 4, 768)):
-        return False
-    if (
-        layer.kv_lora_rank,
-        layer.qk_nope_head_dim,
-        layer.qk_rope_head_dim,
-        layer.v_head_dim,
-        indexer.index_head_dim,
-    ) != (512, 128, 64, 128, 128):
-        return False
-    hidden, _, local_heads, query_rank = geometry
-    heads = indexer.index_n_heads
-    if (
-        (hidden == 2048 and heads != 16)
-        or (hidden == 4096 and heads not in (32, 64))
-        or layer.use_output_gate
-    ):
-        return False
-    weights = (
-        (layer.q_a_proj.weight, (query_rank, hidden), torch.bfloat16),
-        (layer.kv_a_proj_with_mqa.weight, (576, hidden), torch.bfloat16),
-        (layer.q_b_proj.weight, (local_heads * 192, query_rank), torch.bfloat16),
-        (indexer.wq_b.weight, (heads * 128, query_rank), torch.bfloat16),
-        (indexer.wk.weight, (128, hidden), torch.bfloat16),
-        (indexer.weights_proj.weight, (heads, hidden), torch.float32),
-    )
-    return all(
-        value.shape == shape and value.dtype == dtype for value, shape, dtype in weights
-    ) and all(
-        rotary is None or (not rotary.is_neox_style and rotary.rotary_dim == 64)
-        for rotary in (layer.rotary_emb, indexer.rotary_emb)
-    )
-
-
-def pack_dsa_qb(mla_qb, index_qb):
-    """Pack actual attention and Indexer channels into the native carrier.
-
-    The32-head attention layout splits each128-wide Indexer head across two64-wide carrier lanes,
-    retaining all32 attention heads and16 Indexer heads without extra heads.
-    The historical attention64 carrier retains its128-wide Indexer lanes.
-    """
-    if tuple(mla_qb.shape) == (32, 192, 768) and tuple(index_qb.shape) == (
-        16,
-        128,
-        768,
-    ):
-        index_lanes = index_qb.reshape(32, 64, 768)
-    elif tuple(mla_qb.shape) == (64, 192, 1536) and tuple(index_qb.shape) in (
-        (32, 128, 1536),
-        (64, 128, 1536),
-    ):
-        index_lanes = (
-            F.pad(index_qb, (0, 0, 0, 0, 0, 32))
-            if index_qb.shape[0] == 32
-            else index_qb
-        )
-    else:
-        raise ValueError(
-            "Expected attention32/Indexer16 or attention64/Indexer32,64 QB weights"
-        )
-    return pack_qb_panels(
-        torch.cat((mla_qb, index_lanes), 1).reshape(-1, mla_qb.shape[2])
-    )
-
-
-def pack_score_fp32(weight):
-    """Opaque ND buffer containing FP32 NZ_KN coefficients, bit preserving."""
-    if (
-        tuple(weight.shape) not in ((16, 2048), (32, 4096), (64, 4096))
-        or weight.dtype != torch.float32
-    ):
-        raise ValueError(
-            "FP32 score pack requires [16,2048] or [32/64,4096] float32 weights"
-        )
-    return (
-        weight.reshape(-1, 8, weight.shape[1] // 16, 16)
-        .permute(0, 2, 3, 1)
-        .contiguous()
-        .reshape(weight.shape)
-    )
-
-
-class FusedDSADecode:
-    def __init__(self, layer, *, rank, group, eps_q, eps_kv):
-        if not supports_fused_dsa_decode(layer):
-            raise ValueError("Unsupported fused DSA projection geometry or weights")
-        self.rank = rank
-        self.hidden_size = layer.hidden_size
-        self.index_heads = layer.indexer.index_n_heads
-        self.layer_id = layer.layer_id
-        self.attention_layer = layer.attn_mqa
-        self.initial_tokens = layer.index_init_tokens
-        self.window_tokens = layer.index_local_tokens
-        self.kernels = ascend_dsa_kernels()
-        self.kernels.require_fused_prolog(index_heads=self.index_heads)
-        self.eps_q, self.eps_kv = eps_q, eps_kv
-        self.eps_index = layer.indexer.k_norm.variance_epsilon
-
-        def gathered(value):
-            value = value.detach().contiguous()
-            outputs = [torch.empty_like(value) for _ in range(8)]
-            dist.all_gather(outputs, value, group=group)
-            return torch.cat(outputs, 0)
-
-        qb = (
-            gathered(layer.q_b_proj.weight)
-            .cpu()
-            .view(layer.num_heads, 192, layer.q_lora_rank)
-        )
-        self.query_scale = 1.0
-        if layer.scale_q_lora:
-            scale = math.sqrt(layer.hidden_size / layer.q_lora_rank)
-            if self.index_heads != 64:
-                self.query_scale = scale
-            else:
-                qb = qb * scale
-        iqb = (
-            layer.indexer.wq_b.weight.detach()
-            .cpu()
-            .view(self.index_heads, 128, layer.q_lora_rank)
-        )
-        self.qb = self.kernels.prepare_projection_weight(pack_dsa_qb(qb, iqb).npu())
-        down = torch.cat(
-            (
-                layer.q_a_proj.weight.detach(),
-                layer.kv_a_proj_with_mqa.weight.detach(),
-                layer.indexer.wk.weight.detach(),
-            ),
-            0,
-        )
-        self.down = self.kernels.prepare_projection_weight(
-            pack_down_qa_panels(down.detach().cpu()).npu()
-        )
-        self.uk = gathered(layer.w_kc)
-        self.gamma_q = layer.q_a_layernorm.weight.detach().contiguous()
-        self.gamma_kv = layer.kv_a_layernorm.weight.detach().contiguous()
-        self.gamma_index = layer.indexer.k_norm.weight.detach().contiguous()
-        self.score_scale = (
-            layer.indexer.weights_softmax_scale if self.index_heads == 16 else 1.0
-        )
-        score_weight = layer.indexer.weights_proj.weight.detach().float()
-        if self.index_heads != 16:
-            score_weight = score_weight * layer.indexer.weights_softmax_scale
-        self.score_weight = pack_score_fp32(score_weight.contiguous())
-        self.w_vc = layer.w_vc.detach().contiguous()
-        self.w_o = layer.o_proj.weight.detach().contiguous()
-        self.rotary_mode = int(layer.rotary_emb is not None) | (
-            int(layer.indexer.use_rotary) << 1
-        )
-        self.rotary_emb = (
-            layer.rotary_emb
-            if layer.rotary_emb is not None
-            else layer.indexer.rotary_emb
-        )
-        if self.rotary_emb is not None:
-            if self.rotary_emb.is_neox_style or self.rotary_emb.rotary_dim != 64:
-                raise ValueError("Fused DSA RoPE requires 64 adjacent-pair channels")
-            self.cos_sin = self.rotary_emb.cos_sin_cache.float().contiguous().npu()
-        else:
-            self.cos_sin = None
-        self.window = None
-        # TopK membership is sensitive to score-weight rounding. Preserve the
-        # ordinary FP32 projection for index32 through the fused transport.
-        score_dtype = torch.bfloat16 if self.index_heads == 64 else torch.float32
-        self.outputs = {
-            rows: (
-                torch.empty(
-                    (8, rows, layer.num_local_heads, 576),
-                    dtype=torch.bfloat16,
-                    device="npu",
-                ),
-                torch.empty(
-                    (rows, self.index_heads, 128), dtype=torch.bfloat16, device="npu"
-                ),
-                torch.empty((rows, self.index_heads), dtype=score_dtype, device="npu"),
-            )
-            for rows in DSA_DECODE_ROWS
-        }
-
-    def prolog(self, hidden, positions, ctx):
-        if self.window is None:
-            raise RuntimeError("Initialize DSA transport before forward/capture")
-        query, index_query, score = self.outputs[hidden.shape[0]]
-        pool = ctx.token_to_kv_pool
-        placement = ctx.attn_backend.cache_placement(self.attention_layer)
-        locations = ctx.attn_backend.write_locations(
-            self.attention_layer, ctx.forward_mode
-        )
-        slots = prepare_ascend_dsa_cp_metadata(
-            locations,
-            placement,
-            initial_tokens=self.initial_tokens,
-            window_tokens=self.window_tokens,
-        )
-        kv_buffer = pool.get_key_buffer(self.layer_id)
-        if kv_buffer.dtype != torch.bfloat16:
-            raise ValueError("Native DSA requires BF16 KV cache")
-        kv = kv_buffer.view(-1, 576)
-        index_k = pool.get_component(self.layer_id, "dsa_index_k").view(-1, 128)
-        if self.rotary_mode:
-            if (
-                positions is None
-                or positions.ndim != 1
-                or positions.numel() != hidden.shape[0]
-                or positions.dtype not in (torch.int32, torch.int64)
-            ):
-                raise ValueError(
-                    "RoPE positions must be integer indices for all gathered DSA rows"
-                )
-            positions = positions.to(dtype=torch.int64).contiguous()
-        else:
-            positions = None
-        self.kernels.fused_prolog(
-            hidden.contiguous(),
-            self.down,
-            self.gamma_q,
-            self.gamma_kv,
-            self.gamma_index,
-            self.score_weight,
-            self.qb,
-            self.uk,
-            self.window,
-            kv,
-            index_k,
-            slots,
-            eps_q=self.eps_q,
-            eps_kv=self.eps_kv,
-            eps_index=self.eps_index,
-            query_scale=self.query_scale,
-            score_scale=self.score_scale,
-            positions=positions,
-            cos_sin=self.cos_sin,
-            rotary_mode=self.rotary_mode,
-            out=(query, index_query, score),
-        )
-        return query, index_query, score
-
-    def output_projection(self, output):
-        return self.kernels.output_projection_partial(output, self.w_vc, self.w_o)
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class AscendDSAIndexer(nn.Module):
@@ -373,19 +64,7 @@ class AscendDSAIndexer(nn.Module):
     ) -> None:
         super().__init__()
         self.index_n_heads = config.index_n_heads
-        self.use_rotary = bool(getattr(config, "index_use_rope", False))
-        self.rotary_emb = (
-            get_rope(
-                64,
-                rotary_dim=64,
-                max_position=config.max_position_embeddings,
-                base=config.rope_theta,
-                rope_scaling=config.rope_scaling,
-                is_neox_style=False,
-            )
-            if self.use_rotary
-            else None
-        )
+        self.rotary_emb = None
         self.index_head_dim = config.index_head_dim
         self.weights_softmax_scale = self.index_head_dim**-0.5 * (
             self.index_n_heads**-0.5
@@ -414,12 +93,20 @@ class AscendDSAIndexer(nn.Module):
             prefix=add_prefix("weights_proj", prefix),
         )
 
+    def forward(self, hidden_states, q_lora):
+        """Project Index-Q/K and scores from the unscaled normalized Q latent."""
+        query = self.wq_b(q_lora)[0].view(-1, self.index_n_heads, self.index_head_dim)
+        key = self.k_norm(self.wk(hidden_states)[0]).unsqueeze(1)
+        weights = (
+            self.weights_proj(hidden_states.float())[0] * self.weights_softmax_scale
+        )
+        return query, key, weights
 
-class AscendDSAAttention(DeepseekV3AttentionMLA):
+
+class AscendDSAAttention(nn.Module):
     """DSA projections and attention with one independent indexer per layer."""
 
-    _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
-    rope_is_neox_style = False
+    supports_head_tp = False
 
     def __init__(
         self,
@@ -432,85 +119,135 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         v_head_dim: int,
         q_lora_rank: int,
         kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: dict[str, Any] | None = None,
-        max_position_embeddings: int = 8192,
         quant_config: QuantizationConfig | None = None,
         layer_id: int | None = None,
         prefix: str = "",
         reduce_attn_results: bool = True,
-        alt_stream: torch.cuda.Stream | None = None,
         *,
         lora_norm_eps: float,
-        independent_selection: bool,
         prefill_enabled: bool,
-        separate_mla_projections: bool,
+        decode_enabled: bool | None = None,
     ) -> None:
-        if not independent_selection:
-            raise ValueError("Ascend DSA requires independent per-layer selection")
+        if config.index_n_heads not in (16, 32):
+            raise NotImplementedError("Ascend DSA supports only Indexer16/32")
+        if not config.mla_use_nope or config.index_use_rope:
+            raise ValueError(
+                "Ascend DSA requires both attention and Indexer RoPE disabled"
+            )
         self.use_output_gate = bool(getattr(config, "mla_use_output_gate", False))
         self.scale_q_lora = bool(getattr(config, "mla_scale_q_lora", False))
         self.scale_kv_lora = bool(getattr(config, "mla_scale_kv_lora", False))
-        self.separate_mla_projections = bool(separate_mla_projections)
         if self.use_output_gate:
             raise ValueError("Native DSA requires no output gate")
-        if not separate_mla_projections:
-            raise ValueError("Native DSA requires separate checkpoint projections")
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            layer_id=layer_id,
-            prefix=prefix,
-            reduce_attn_results=reduce_attn_results,
-            alt_stream=alt_stream,
-            skip_rope=bool(getattr(config, "mla_use_nope", False)),
-        )
+        super().__init__()
         if mapping.attn.has_head_tp:
             raise NotImplementedError(
                 "Ascend DSA does not yet implement the head-TP token exchange"
             )
+        if global_server_args_dict["tp_batch_invariant"] != "none":
+            raise ValueError("--tp-batch-invariant requires supported head-TP exchange")
         if q_lora_rank is None:
             raise ValueError("Ascend DSA requires q_lora_rank")
+        self.config, self.mapping = config, mapping
+        self.layer_id, self.hidden_size = layer_id, hidden_size
+        self.qk_nope_head_dim, self.qk_rope_head_dim = (
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+        )
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank, self.kv_lora_rank = q_lora_rank, kv_lora_rank
+        self.num_heads = num_heads
+        # Earlier callers select only Prefill capability. Their full projections
+        # also serve local (KVP1) Decode. Sharded Decode must be requested on
+        # replicas that serve both phases.
+        if decode_enabled is None:
+            if (
+                prefill_enabled
+                and mapping.attn.kvp_size > 1
+                and global_server_args_dict.get("disaggregation_mode") in (None, "null")
+            ):
+                raise ValueError(
+                    "Unified DSA with KVP>1 needs explicit decode_enabled=True. "
+                    "Upgrade the model plugin or configure a Prefill-only worker."
+                )
+            decode_enabled = not prefill_enabled or mapping.attn.kvp_size == 1
+        use_decode_shards = not prefill_enabled or (
+            decode_enabled and mapping.attn.kvp_size > 1
+        )
+        self.head_tp_size = mapping.attn.head_tp_size if use_decode_shards else 1
+        self.head_tp_rank = mapping.attn.head_tp_rank if use_decode_shards else 0
+        self.head_tp_group = mapping.attn.head_tp_group if use_decode_shards else None
+        if decode_enabled and mapping.attn.kvp_size == 1 and self.head_tp_size != 1:
+            raise ValueError("Local DSA Decode requires TP1/KVP1 projections")
+        if num_heads % self.head_tp_size:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by head TP size {self.head_tp_size}"
+            )
+        self.num_local_heads = num_heads // self.head_tp_size
+        self.scaling = self.qk_head_dim**-0.5
+
+        # Construct only the checkpoint projections this layer actually uses.
+        self.q_a_proj = ReplicatedLinear(
+            hidden_size,
+            q_lora_rank,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("q_a_proj", prefix),
+        )
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            hidden_size,
+            kv_lora_rank + qk_rope_head_dim,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+        )
+        self.q_b_proj = ColumnParallelLinear(
+            q_lora_rank,
+            num_heads * self.qk_head_dim,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            tp_rank=self.head_tp_rank,
+            tp_size=self.head_tp_size,
+            tp_group=self.head_tp_group,
+            prefix=add_prefix("q_b_proj", prefix),
+        )
+        self.kv_b_proj = ColumnParallelLinear(
+            kv_lora_rank,
+            num_heads * (qk_nope_head_dim + v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_b_proj", prefix),
+            tp_rank=self.head_tp_rank,
+            tp_size=self.head_tp_size,
+            tp_group=self.head_tp_group,
+        )
+        self.o_proj = RowParallelLinear(
+            num_heads * v_head_dim,
+            hidden_size,
+            bias=False,
+            reduce_results=reduce_attn_results,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+            tp_rank=self.head_tp_rank,
+            tp_size=self.head_tp_size,
+            tp_group=self.head_tp_group,
+        )
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=lora_norm_eps)
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=lora_norm_eps)
-        if self.separate_mla_projections:
-            del self.fused_qkv_a_proj_with_mqa
-            qk_dim = qk_nope_head_dim + qk_rope_head_dim
-            self.q_a_proj = ReplicatedLinear(
-                hidden_size,
-                q_lora_rank,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                prefix=add_prefix("q_a_proj", prefix),
-            )
-            self.kv_a_proj_with_mqa = ReplicatedLinear(
-                hidden_size,
-                kv_lora_rank + qk_rope_head_dim,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                prefix=add_prefix("kv_a_proj_with_mqa", prefix),
-            )
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                num_heads * qk_dim,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                tp_rank=mapping.attn.head_tp_rank,
-                tp_size=mapping.attn.head_tp_size,
-                tp_group=mapping.attn.head_tp_group,
-                prefix=add_prefix("q_b_proj", prefix),
-            )
+        self.rotary_emb = None
+        self.attn_mqa = PagedAttention(
+            self.num_local_heads,
+            kv_lora_rank + qk_rope_head_dim,
+            self.scaling,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=kv_lora_rank,
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
+        )
+        self.w_kc = None
+        self.w_vc = None
         self.index_topk = int(config.index_topk)
         self.index_init_tokens = int(config.index_init_tokens)
         self.index_local_tokens = int(config.index_local_tokens)
@@ -522,75 +259,57 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             prefix=add_prefix("indexer", prefix),
         )
         self._scales_prepared = False
-        self._fused_decode_runtime = None
-        self._prefill_weights = None
+        self._fused_tp_kvp_decode_runtime = None
         self.prefill_enabled = prefill_enabled
+        self.decode_enabled = decode_enabled
+        self._prefill_weights: tuple[torch.Tensor, ...] | None = None
 
-    def configure_fused_decode(self, runtime) -> None:
+    def configure_fused_tp_kvp_decode(self, runtime) -> None:
         """Attach prepared weights and communication state outside forward."""
-        self._fused_decode_runtime = runtime
+        self._fused_tp_kvp_decode_runtime = runtime
+
+    def _prepare_lora_scales(self):
+        """Fold native KV scaling; numerical variants may keep it in forward."""
+        # The Indexer consumes unscaled normalized Q latent, so Q scaling
+        # stays after the main projection and never enters the shared norm.
+        if self.scale_kv_lora:
+            self.kv_a_layernorm.weight.data.mul_(
+                math.sqrt(self.hidden_size / self.kv_lora_rank)
+            )
 
     def process_weights_after_loading(self, _module=None):
         if not self._scales_prepared:
-            # The indexer consumes the unscaled normalized Q latent. Apply
-            # Q-LoRA scaling after the main projection, never to this shared norm.
-            if self.scale_kv_lora:
-                self.kv_a_layernorm.weight.data.mul_(
-                    math.sqrt(self.hidden_size / self.kv_lora_rank)
-                )
+            self._prepare_lora_scales()
             self._scales_prepared = True
-            self.w_kc, self.w_vc = _prepare_mla_kv_b_proj_weights(
-                self.kv_b_proj.weight, self
-            )
 
-        if self.prefill_enabled and self._prefill_weights is None:
-            group = self.mapping.attn.head_tp_group
-            pg = (
-                process_group_manager.get_device_process_group(group)
-                if len(group) > 1
-                else None
-            )
+        self.w_kc, self.w_vc = _prepare_mla_kv_b_proj_weights(
+            self.kv_b_proj.weight, self
+        )
+        if not self.prefill_enabled:
+            return
 
-            def gather(value, dim):
-                if len(group) == 1:
-                    return value.contiguous()
-                pieces = [torch.empty_like(value) for _ in group]
-                dist.all_gather(pieces, value.contiguous(), group=pg)
-                return torch.cat(pieces, dim=dim).contiguous()
+        local = (self.q_b_proj.weight, self.w_kc, self.w_vc, self.o_proj.weight)
+        if self.head_tp_size == 1:
+            # Keep the original absorbed strides and avoid redundant copies.
+            self._prefill_weights = local
+            return
 
-            # Token-local Prefill computes all heads and the complete O row.
-            # Decode continues to use the original sharded weights.
-            self._prefill_weights = (
-                gather(self.q_b_proj.weight, 0),
-                gather(self.w_kc, 0),
-                gather(self.w_vc, 0),
-                gather(self.o_proj.weight, 1),
+        # QB, KC and VC are partitioned by head; O is partitioned by input.
+        # Reuse each prepared buffer when the model reloads its coefficients.
+        previous = self._prefill_weights or (None, None, None, None)
+        self._prefill_weights = tuple(
+            bind_or_copy(
+                buffer, all_gather(weight.contiguous(), self.head_tp_group, dim)
             )
+            for buffer, weight, dim in zip(previous, local, (0, 0, 0, 1), strict=True)
+        )
 
-    def _forward_fused_decode(self, positions, hidden_states, ctx, comm_manager):
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        if self._fused_decode_runtime is None:
-            raise RuntimeError("Initialize native DSA resources before forward/capture")
-        if (
-            hidden_states.ndim != 2
-            or hidden_states.shape[0] not in DSA_DECODE_ROWS
-            or hidden_states.shape[1] != self._fused_decode_runtime.hidden_size
-            or not ctx.forward_mode.is_decode()
-            or ctx.num_extends != 0
-            or not 1 <= ctx.bs <= 64
-            or ctx.output_layout.decode_width not in (1, 8)
-            or hidden_states.shape[0] != ctx.bs * ctx.output_layout.decode_width
-        ):
-            raise ValueError(
-                "Native DSA requires decode-only power-of-two rows1..512, "
-                "matching hidden width and query width1/8"
-            )
-        packed_query, index_query, index_weights = self._fused_decode_runtime.prolog(
-            hidden_states, positions, ctx
+    def _forward_fused_tp_kvp_decode(self, positions, hidden_states, ctx, comm_manager):
+        packed_query, index_query, index_weights = (
+            self._fused_tp_kvp_decode_runtime.prolog(hidden_states, positions, ctx)
         )
         out = ctx.attn_backend.forward(
-            packed_query[self._fused_decode_runtime.rank],
+            packed_query[self._fused_tp_kvp_decode_runtime.rank],
             None,
             None,
             self.attn_mqa,
@@ -609,61 +328,16 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             index_cache_written=True,
             packed_query=packed_query,
         )
-        return self._fused_decode_runtime.output_projection(out)
-
-    def _rotate_indexer(self, positions, index_query, index_key):
-        if self.indexer.rotary_emb is not None:
-            # The Indexer rotary module describes only the first 64 dimensions,
-            # not the full 128-dimensional head. Preserve the NoPE half.
-            rotary_dim = self.indexer.rotary_emb.rotary_dim
-            query_rope, key_rope = self.indexer.rotary_emb(
-                positions,
-                index_query[..., :rotary_dim].contiguous().flatten(1),
-                index_key[..., :rotary_dim].contiguous().flatten(1),
-            )
-            index_query = torch.cat(
-                (
-                    query_rope.view(*index_query.shape[:-1], rotary_dim),
-                    index_query[..., rotary_dim:],
-                ),
-                dim=-1,
-            )
-            index_key = torch.cat(
-                (
-                    key_rope.view(*index_key.shape[:-1], rotary_dim),
-                    index_key[..., rotary_dim:],
-                ),
-                dim=-1,
-            )
-        return index_query, index_key
+        return self._fused_tp_kvp_decode_runtime.output_projection(out)
 
     def _forward_prefill(self, positions, hidden, ctx):
         if self._prefill_weights is None:
             raise RuntimeError("Prepare token-local DSA Prefill weights before forward")
-        backend = ascend_dsa_prefill_backend(ctx.attn_backend)
-        plan = backend._prefill_plan
-        if plan is None or hidden.shape[0] != plan.row_end - plan.row_start:
-            raise ValueError(
-                "DSA Prefill hidden rows must follow the CP query partition"
-            )
-        positions = positions[plan.row_start : plan.row_end]
         qb, kc, vc, wo = self._prefill_weights
         indexer = self.indexer
         if hidden.shape[0]:
             q_lora = self.q_a_layernorm(self.q_a_proj(hidden)[0])
-            iq = indexer.wq_b(q_lora)[0].view(
-                -1, indexer.index_n_heads, indexer.index_head_dim
-            )
-            ik = indexer.k_norm(indexer.wk(hidden)[0]).unsqueeze(1)
-            iq, ik = self._rotate_indexer(positions, iq, ik)
-        else:
-            iq = hidden.new_empty((0, indexer.index_n_heads, indexer.index_head_dim))
-            ik = hidden.new_empty((0, 1, indexer.index_head_dim))
-        if hidden.shape[0]:
-            # Keep Index-K ready to pack with KV once the latent is formed.
-            weights = (
-                indexer.weights_proj(hidden.float())[0] * indexer.weights_softmax_scale
-            )
+            iq, ik, weights = indexer(hidden, q_lora)
             kv = self.kv_a_proj_with_mqa(hidden)[0]
             q = F.linear(q_lora, qb).view(
                 -1, kc.shape[0], self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -681,24 +355,11 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                 dim=-1,
             )
             latent = torch.cat((latent, kv[:, self.kv_lora_rank :]), dim=-1)
-            prologue = mla_prologue(
-                query,
-                query[..., self.kv_lora_rank :],
-                latent,
-                expanded=None,
-                rotary=(
-                    None
-                    if self.rotary_emb is None
-                    else self.rotary_emb.as_rotary(positions)
-                ),
-                cache=None,
-                solution=None,
-                override=None,
-            )
-            query, latent = prologue.query, prologue.latent
             if ctx.token_to_kv_pool.latent_write_sanitizes:
                 latent = torch.nan_to_num(latent)
         else:
+            iq = hidden.new_empty((0, indexer.index_n_heads, indexer.index_head_dim))
+            ik = hidden.new_empty((0, 1, indexer.index_head_dim))
             weights = torch.empty(
                 (0, indexer.index_n_heads), dtype=torch.float32, device=hidden.device
             )
@@ -737,22 +398,35 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                     "DSA Prefill weights were disabled for this decode-only model"
                 )
             return self._forward_prefill(positions, hidden_states, ctx)
+        if not self.decode_enabled:
+            raise RuntimeError(
+                "DSA Decode weights were disabled for this Prefill-only model"
+            )
         if hidden_states.shape[0] == 0:
             return hidden_states
+        if self.head_tp_size == 1 and self.mapping.attn.kvp_size == 1:
+            return self._forward_decode(hidden_states, ctx)
+        return self._forward_tp_kvp_decode(positions, hidden_states, ctx, comm_manager)
+
+    def _forward_tp_kvp_decode(self, positions, hidden_states, ctx, comm_manager):
         if (
-            self._fused_decode_runtime is not None
+            self._fused_tp_kvp_decode_runtime is not None
             and hidden_states.ndim == 2
             and hidden_states.shape[0] in DSA_DECODE_ROWS
-            and hidden_states.shape[1] == self._fused_decode_runtime.hidden_size
+            and hidden_states.shape[1] == self._fused_tp_kvp_decode_runtime.hidden_size
             and ctx.forward_mode.is_decode()
             and ctx.num_extends == 0
             and 1 <= ctx.bs <= 64
             and ctx.output_layout.decode_width in (1, 8)
             and hidden_states.shape[0] == ctx.bs * ctx.output_layout.decode_width
         ):
-            return self._forward_fused_decode(
+            return self._forward_fused_tp_kvp_decode(
                 positions, hidden_states, ctx, comm_manager
             )
+        return self._forward_decode(hidden_states, ctx)
+
+    def _forward_decode(self, hidden_states, ctx):
+        """Ordinary projections and owner-local stores; the backend owns attention."""
         if self.w_kc is None:
             raise RuntimeError("Prepare DSA weights before forward/capture")
         # CommManager has already gathered this attention group's input rows.
@@ -777,26 +451,12 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         slots = ctx.attn_backend.padded_write_locations(
             self.attn_mqa, ctx.forward_mode, query.shape[0]
         )
-        query = self.attn_mqa.latent_prologue(
-            query,
-            query[..., self.kv_lora_rank :],
+        latent_store(
             latent_cache,
-            positions,
-            ctx,
-            slots=slots,
-            expanded=None,
-            key_rows=None,
-        ).query
-        indexer = self.indexer
-        index_query = indexer.wq_b(q_lora)[0].view(
-            -1, indexer.index_n_heads, indexer.index_head_dim
+            kv_lora_rank=self.kv_lora_rank,
+            cache=self.attn_mqa._local_target(slots, ctx),
         )
-        index_key = indexer.k_norm(indexer.wk(hidden_states)[0]).unsqueeze(1)
-        index_query, index_key = self._rotate_indexer(positions, index_query, index_key)
-        index_weights = (
-            indexer.weights_proj(hidden_states.float())[0]
-            * indexer.weights_softmax_scale
-        )
+        index_query, index_key, index_weights = self.indexer(hidden_states, q_lora)
         output = ctx.attn_backend.forward(
             query,
             None,
@@ -821,124 +481,4 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         return self.o_proj(projected.flatten(1))[0]
 
 
-class _RuntimeDSADecode(FusedDSADecode):
-    """Bind shared HCCL views around the unchanged host DSA computation."""
-
-    def __init__(self, layer, *, rank, group, eps_q, eps_kv, owner):
-        super().__init__(layer, rank=rank, group=group, eps_q=eps_q, eps_kv=eps_kv)
-        self.owner = owner
-
-    def prolog(self, hidden, positions, ctx):
-        self.owner.bind_backend(ctx.attn_backend)
-        stream = torch.npu.current_stream()
-        hidden.record_stream(stream)
-        if positions is not None and positions.dtype in (torch.int32, torch.int64):
-            positions = positions.to(dtype=torch.int64).contiguous()
-            positions.record_stream(stream)
-        return super().prolog(hidden, positions, ctx)
-
-
-class AscendDSARuntime:
-    """Prepare native DSA once before profiling; retain it across cache rebinds."""
-
-    def __init__(self, layers, mapping):
-        from tokenspeed.runtime.distributed.process_group_manager import (
-            process_group_manager as pg,
-        )
-
-        self.layers = tuple(layers)
-        self.ranks = tuple(mapping.attn.tp_group)
-        if len(self.ranks) != 8 or not self.layers:
-            raise ValueError(
-                "Native DSA requires a complete eight-rank attention group"
-            )
-        rank = self.ranks.index(dist.get_rank())
-        group = pg.get_dedicated_device_group(self.ranks, "ascend_dsa")
-        pg.init_process_group(self.ranks, backend="gloo")
-        cpu_group = pg.get_process_group("gloo", self.ranks)
-        probe = torch.ones(1, device=self.layers[0].q_a_proj.weight.device)
-        dist.all_reduce(probe, group=group)
-        name = group._get_backend(probe.device).get_hccl_comm_name(dist.get_rank())
-        self.group = name
-        self.resources = prepare_dsa_resources(
-            group=name, rank=rank, heads=self.layers[0].num_heads
-        )
-        self.window = self.resources.window
-        self.outputs = self.resources.outputs
-        self.backends = weakref.WeakSet()
-        self.runtimes = []
-        self.closed = False
-        try:
-            torch.npu.synchronize()
-            dist.barrier(group=cpu_group)
-            for layer in self.layers:
-                if layer.num_heads != self.layers[0].num_heads:
-                    raise ValueError(
-                        "Native DSA resources require a uniform attention head count"
-                    )
-                runtime = _RuntimeDSADecode(
-                    layer,
-                    rank=rank,
-                    group=pg.get_device_process_group(self.ranks),
-                    eps_q=layer.q_a_layernorm.variance_epsilon,
-                    eps_kv=layer.kv_a_layernorm.variance_epsilon,
-                    owner=self,
-                )
-                runtime.window = self.window
-                layer.configure_fused_decode(runtime)
-                self.runtimes.append(runtime)
-        except BaseException:
-            self.close()
-            raise
-
-    def bind_backend(self, backend):
-        if self.closed:
-            raise RuntimeError("DSA runtime is closed")
-        if backend in self.backends:
-            return
-        pending = [backend]
-        found = False
-        while pending:
-            node = pending.pop()
-            if isinstance(node, AscendDSABackend):
-                if tuple(node._dcp.ranks) != self.ranks:
-                    raise ValueError("DSA model and cache backend groups differ")
-                node.configure_fused_decode(
-                    group=self.group,
-                    ranks=self.ranks,
-                    attention_outputs=self.outputs,
-                )
-                found = True
-            pending.extend(node.child_backends())
-        if not found:
-            raise ValueError("Native DSA requires an Ascend DSA cache backend")
-        self.backends.add(backend)
-
-    def close(self):
-        """The caller has drained forwards and destroyed every referencing graph."""
-        if self.closed:
-            return
-        torch.npu.synchronize()
-        for layer in self.layers:
-            layer.configure_fused_decode(None)
-        for runtime in self.runtimes:
-            runtime.window = None
-        self.resources.release(self.window)
-        self.resources = None
-        self.window = None
-        self.outputs.clear()
-        self.runtimes.clear()
-        self.backends.clear()
-        self.closed = True
-
-
-__all__ = [
-    "AscendDSAAttention",
-    "AscendDSARuntime",
-    "AscendDSAIndexer",
-    "FusedDSADecode",
-    "supports_fused_dsa_decode",
-    "pack_qb_panels",
-    "pack_down_qa_panels",
-    "pack_score_fp32",
-]
+__all__ = ["AscendDSAAttention", "AscendDSAIndexer"]

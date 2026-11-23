@@ -70,6 +70,7 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
+    wrapper.moe_source_rows = ()
     wrapper.dp_local_graph = False
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
@@ -137,6 +138,7 @@ def _runner(
     if has_drafter:
         drafter = object.__new__(DummyDrafter)
         drafter.spec_num_tokens = 4
+        drafter.decode_overlap = None
         drafter.attn_backend = draft_backend
         if packed_query_tokens is not None:
             drafter.prepare_decode_graph_token_layout = lambda ctx, **kwargs: (

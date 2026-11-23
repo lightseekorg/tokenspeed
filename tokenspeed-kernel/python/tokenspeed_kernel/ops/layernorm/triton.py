@@ -6,10 +6,12 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32, rcp_approx_ftz_f32
 from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import (
     gated_rmsnorm_kernel,
 )
 from tokenspeed_kernel.ops.quantization.triton import (
+    _fp8_swizzled_scale_offset,
     fp8_dequantize_unscaled,
     fp8_quantize_by_multiplier,
     fp8_token_multiplier,
@@ -19,31 +21,6 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enable
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.warmup import kernel_launcher
-
-
-@triton.jit
-def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
-    # Equivalent to [Mtiles,4,32,Ktiles,4].transpose(1,3).contiguous().
-    return (
-        (row // 128 * K_TILES + column // 4) * 512
-        + row % 32 * 16
-        + row // 32 % 4 * 4
-        + column % 4
-    )
-
-
-@triton.jit
-def _mul_rn_f32(a, b):
-    # One IEEE round-to-nearest FP32 multiply that the compiler can neither
-    # contract into an FMA nor flush to zero.
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        "=f,f,f",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
 
 
 @triton.jit
@@ -85,9 +62,9 @@ def _rmsnorm_kernel(
         if SCALE_INPUTS_BF16:
             # Each product is rounded to BF16, as an eager BF16 tensor times a
             # Python float is.
-            x = _mul_rn_f32(x, x_scale).to(tl.bfloat16).to(tl.float32)
+            x = mul_rn_f32(x, x_scale).to(tl.bfloat16).to(tl.float32)
             residual = (
-                _mul_rn_f32(residual, residual_scale).to(tl.bfloat16).to(tl.float32)
+                mul_rn_f32(residual, residual_scale).to(tl.bfloat16).to(tl.float32)
             )
         x += residual
         if ROUND_RESIDUAL_SUM_BF16:
@@ -847,7 +824,7 @@ def _fused_qk_rmsnorm_kernel(
             # bf16(fp32(q) * scale) once; IEEE .rn multiply, no FTZ. K rows are unchanged.
             position = tl.load(positions_ptr + token, mask=live, other=0)
             scale = _ssmax_scale_f32(position)
-            output = tl.where(is_k, output, _mul_rn_f32(output, scale))
+            output = tl.where(is_k, output, mul_rn_f32(output, scale))
         dst = tl.where(
             is_k,
             k_out_ptr + token * k_out_token_stride,
@@ -1137,18 +1114,6 @@ def rmsnorm_fused_parallel(
 
 
 @triton.jit
-def _rcp_approx_ftz(x):
-    return tl.inline_asm_elementwise(
-        "rcp.approx.ftz.f32 $0, $1;",
-        "=f,f",
-        [x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _mul_ftz(a, b):
     # fp4_quantize is built with fast math: its products flush subnormal inputs and results to zero.
     return tl.inline_asm_elementwise(
@@ -1195,7 +1160,7 @@ def _store_nvfp4(
     # A block whose E4M3 scale rounds to zero encodes zero values.
     out_scale = tl.where(
         sf.to(tl.float32) != 0,
-        _rcp_approx_ftz(_mul_ftz(sf.to(tl.float32), rcp_sf_scale)),
+        rcp_approx_ftz_f32(_mul_ftz(sf.to(tl.float32), rcp_sf_scale)),
         0.0,
     )
     scaled = _mul_ftz(blocks.to(tl.float32), out_scale[:, None])
@@ -1270,10 +1235,10 @@ def _add_rmsnorm_kernel(
         inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
     if HAS_FP4:
         sf_scale = tl.load(fp4_scale_ptr).to(tl.float32)
-        rcp_sf_scale = _rcp_approx_ftz(
+        rcp_sf_scale = rcp_approx_ftz_f32(
             tl.full([BLOCK // 16], 0.0, tl.float32) + sf_scale
         )
-        rcp6 = _rcp_approx_ftz(tl.full([BLOCK // 16], 6.0, tl.float32))
+        rcp6 = rcp_approx_ftz_f32(tl.full([BLOCK // 16], 6.0, tl.float32))
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
     # Every row load before the in-place residual store, which loads cannot move past.

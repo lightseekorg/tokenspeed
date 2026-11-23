@@ -131,10 +131,12 @@ fn requests(s: Shape, prompt: usize, steps: usize) -> Vec<RequestSpec> {
             // Each row has its own hash chain, including in the cache-seeding run.
             tokens[0] = row as i32 + 110000;
             RequestSpec {
+                admission_id: 0,
                 request_id: format!("{row:08x}-9f09-89be-5c9d-5d65f086d356"),
                 session_id: String::new(),
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),
+                peer_holder: String::new(),
                 tokens,
                 max_new_tokens: steps as i32,
                 max_cached_prefix_tokens: i32::MAX,

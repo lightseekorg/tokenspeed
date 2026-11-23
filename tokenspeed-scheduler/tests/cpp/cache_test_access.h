@@ -20,9 +20,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -114,13 +116,14 @@ struct CacheCoordinatorTestAccess {
     // between coordinator operations.
     static std::vector<std::string> BoundaryTreeMismatches(const CacheCoordinator& coordinator) {
         struct Counts {
-            std::array<std::int32_t, 2> entries{};
-            std::array<std::int32_t, 2> state{};
-            std::array<std::int32_t, 2> closed{};
+            std::array<std::int32_t, kNumCacheTiers> entries{};
+            std::array<std::int32_t, kNumCacheTiers> state{};
+            std::array<std::int32_t, kNumCacheTiers> closed{};
             std::int32_t pairs{0};
         };
         std::unordered_map<ContentHash, Counts> expected;
-        const std::array<const BlockPool*, 2> pools{&coordinator.store_.DevicePool(), coordinator.store_.HostPool()};
+        const std::array<const BlockPool*, kNumCacheTiers> pools{
+            &coordinator.store_.DevicePool(), coordinator.store_.HostPool(), coordinator.store_.DiskPool()};
         for (std::size_t i = 0; i < coordinator.store_.Groups().size(); ++i) {
             const PrefixCacheIndex& index = coordinator.store_.Groups()[i].Index();
             const bool state = coordinator.GroupIsState(i);
@@ -150,7 +153,7 @@ struct CacheCoordinatorTestAccess {
                 mismatches.push_back("no node for the indexed hash " + hash.ToString());
                 continue;
             }
-            for (const std::size_t tier : {BoundaryTree::kDevice, BoundaryTree::kHost}) {
+            for (const std::size_t tier : BoundaryTree::kTiers) {
                 if (node->Entries(tier) != counts.entries[tier] || node->StateEntries(tier) != counts.state[tier] ||
                     node->ClosedEntries(tier) != counts.closed[tier]) {
                     mismatches.push_back("entry counts of " + hash.ToString() + " on tier " + std::to_string(tier));
@@ -182,12 +185,13 @@ struct CacheCoordinatorTestAccess {
                 if (!residency.held) {
                     mismatches.push_back("the checkpoint tree tracks the unheld checkpoint " + node->hash.ToString());
                 }
-                // Distance is reported for a checkpoint present on either tier.
-                const bool present = residency.complete[0] || residency.complete[1] || residency.pending_host_store;
+                // Distance is reported for a checkpoint present on any tier.
+                const bool present =
+                    std::ranges::any_of(residency.complete, std::identity{}) || residency.pending_host_store;
                 if (checkpoints.Distance(node->hash).has_value() != present) {
                     mismatches.push_back("checkpoint presence of " + node->hash.ToString());
                 }
-                for (const CacheTier tier : {CacheTier::kDevice, CacheTier::kHost}) {
+                for (const CacheTier tier : {CacheTier::kDevice, CacheTier::kHost, CacheTier::kDisk}) {
                     if (checkpoints.AgedDistance(node->hash, tier) != 0 &&
                         !residency.complete[static_cast<std::size_t>(tier)]) {
                         mismatches.push_back("aged checkpoint " + node->hash.ToString() + " incomplete on tier " +
@@ -214,9 +218,9 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
 }
 
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
-                                   std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
+                                   std::span<const std::string> content_hashes, std::int32_t first_prefix_page = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot, CacheBoundaryKind::kChunk);
+                                first_prefix_page, CacheBoundaryKind::kChunk);
 }
 
 // Publishes the newly hashed pages [first_new_prefix_page, prefix_hashes.size())
