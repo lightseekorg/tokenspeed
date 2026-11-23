@@ -33,6 +33,63 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 
+@triton.jit(do_not_specialize=["COUNT", "WIDTH", "STRIDE", "COL_STRIDE"])
+def _remap_cache_slots(
+    Slots,
+    Lengths,
+    Out,
+    COUNT,
+    WIDTH,
+    STRIDE,
+    COL_STRIDE,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    row, col = offset // WIDTH, offset % WIDTH
+    slot = tl.load(
+        Slots + row * STRIDE + col * COL_STRIDE, mask=offset < COUNT, other=-1
+    ).to(tl.int64)
+    valid = slot >= 0
+    if Lengths is not None:
+        valid &= col < tl.load(Lengths + row, mask=offset < COUNT, other=0)
+    mapped = slot // PAGE_SIZE * PAGE_STRIDE + slot % PAGE_SIZE
+    tl.store(Out + offset, tl.where(valid, mapped, -1), mask=offset < COUNT)
+
+
+def remap_cache_slots(
+    slots: torch.Tensor,
+    *,
+    page_size: int,
+    page_stride: int,
+    lengths: torch.Tensor | None,
+) -> torch.Tensor:
+    """Map [rows, width] logical cache slots to padded physical rows.
+
+    Negative slots and entries beyond optional per-row lengths become -1.
+    Returns the input when neither remapping nor length masking is needed.
+    Otherwise returns a contiguous tensor in the input's dtype.
+    """
+    if page_size == page_stride and lengths is None:
+        return slots
+    out = torch.empty(slots.shape, dtype=slots.dtype, device=slots.device)
+    if slots.numel():
+        _remap_cache_slots[(triton.cdiv(slots.numel(), 256),)](
+            slots,
+            lengths,
+            out,
+            slots.numel(),
+            slots.shape[1],
+            slots.stride(0),
+            slots.stride(1),
+            PAGE_SIZE=page_size,
+            PAGE_STRIDE=page_stride,
+            BLOCK=256,
+        )
+    return out
+
+
 @triton.jit
 def virtual_block_to_local(block, DEGREE: tl.constexpr, RANK: tl.constexpr):
     """Return a safe physical page and its explicit owner mask."""
@@ -180,6 +237,7 @@ def _compact_owned_slots(
     OSTRIDE,
     WIDTH,
     ROWS: tl.constexpr,
+    OUTPUT_ROWS: tl.constexpr,
     VIRTUAL_COUNT: tl.constexpr,
     DEGREE: tl.constexpr,
     RANK: tl.constexpr,
@@ -202,7 +260,7 @@ def _compact_owned_slots(
         dest = count + tl.cumsum(valid.to(tl.int32), axis=0) - 1
         tl.store(
             Out + row * OSTRIDE + dest,
-            (local * ROWS + safe % ROWS).to(tl.int32),
+            (local * OUTPUT_ROWS + safe % ROWS).to(tl.int32),
             mask=valid,
         )
         count += tl.sum(valid.to(tl.int32), axis=0)
@@ -225,6 +283,7 @@ def compact_owned_slots(
     virtual_block_count: int,
     degree: int,
     rank: int,
+    output_page_stride: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack one owner's selected slots, as local slots, at each row's front.
 
@@ -243,6 +302,8 @@ def compact_owned_slots(
         virtual_block_count: Scheduler capacity including null block 0.
         degree: Number of owners (the KVP group width).
         rank: Owner index in [0, degree).
+        output_page_stride: Rows between output pages, including padding;
+            None uses ``rows_per_page``.
 
     Returns:
         ``(local_slots, counts)``: int32 [rows, width] local slots, owned
@@ -267,6 +328,9 @@ def compact_owned_slots(
         raise ValueError(
             "owned slot lengths must be int32 or int64 [rows] on the slots' device"
         )
+    output_page_stride = (
+        rows_per_page if output_page_stride is None else output_page_stride
+    )
     rows, width = slots.shape
     out = torch.empty((rows, width), dtype=torch.int32, device=slots.device)
     counts = torch.empty((rows,), dtype=torch.int32, device=slots.device)
@@ -283,6 +347,7 @@ def compact_owned_slots(
             out.stride(0),
             width,
             ROWS=rows_per_page,
+            OUTPUT_ROWS=output_page_stride,
             VIRTUAL_COUNT=virtual_block_count,
             DEGREE=degree,
             RANK=rank,
@@ -296,6 +361,7 @@ def compact_owned_slots(
             degree=degree,
             rank=rank,
         )
+        local = local // rows_per_page * output_page_stride + local % rows_per_page
         cols = torch.arange(width, device=slots.device)
         if lengths is not None:
             owned &= cols < lengths.to(torch.int64).clamp(0, width).unsqueeze(1)

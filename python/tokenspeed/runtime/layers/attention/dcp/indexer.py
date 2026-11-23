@@ -734,6 +734,7 @@ def select_owned_dsa_topk(
     query_group_size: int,
     out: torch.Tensor,
     lens_out: torch.Tensor,
+    output_page_stride: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """This rank's share of :func:`select_dsa_topk`'s selection over
     ``metadata``'s rows, as local cache slots, for rows that
@@ -770,6 +771,8 @@ def select_owned_dsa_topk(
             as in :func:`select_dsa_topk`.
         out: Preallocated int32 ``[rows, topk]`` local slots.
         lens_out: Preallocated int32 ``[rows]`` counts.
+        output_page_stride: Physical rows between output page starts; None
+            keeps the logical ``page_size`` stride.
 
     Returns:
         ``out``: int32 ``[rows, topk]`` local slots, this rank's selected
@@ -848,6 +851,7 @@ def select_owned_dsa_topk(
         topk=topk,
         page_size=page_size,
         solution=None,
+        output_page_stride=output_page_stride,
         out=out,
         lens_out=lens_out,
     )

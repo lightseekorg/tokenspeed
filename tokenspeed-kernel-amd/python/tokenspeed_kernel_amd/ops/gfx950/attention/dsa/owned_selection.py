@@ -57,6 +57,7 @@ def _select_owned_from_gathered_kernel(
     WIDTH: gl.constexpr,
     DEGREE: gl.constexpr,
     PAGE: gl.constexpr,
+    OUTPUT_ROWS: gl.constexpr,
     RADIX0_BITS: gl.constexpr,
     RADIX1_BITS: gl.constexpr,
     RADIX2_BITS: gl.constexpr,
@@ -162,7 +163,7 @@ def _select_owned_from_gathered_kernel(
     slot = gl.cumsum(keep.to(gl.int32), 0) - 1
     gl.store(
         slots + row.to(gl.int64) * WIDTH + slot,
-        page * PAGE + position % PAGE,
+        page.to(gl.int64) * OUTPUT_ROWS + position % PAGE,
         mask=keep,
     )
     count = gl.sum(keep.to(gl.int32), axis=0)
@@ -217,6 +218,7 @@ def gluon_dsa_select_owned_from_gathered_gfx950(
     rank: int,
     topk: int,
     page_size: int,
+    output_page_stride: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -279,6 +281,7 @@ def gluon_dsa_select_owned_from_gathered_gfx950(
             WIDTH=width,
             DEGREE=degree,
             PAGE=page_size,
+            OUTPUT_ROWS=page_size if output_page_stride is None else output_page_stride,
             RADIX0_BITS=_RADIX_SCHEDULE[0],
             RADIX1_BITS=_RADIX_SCHEDULE[1],
             RADIX2_BITS=_RADIX_SCHEDULE[2],

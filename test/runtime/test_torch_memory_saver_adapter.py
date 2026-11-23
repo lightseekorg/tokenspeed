@@ -368,7 +368,23 @@ def _check_managed_metadata_on_cuda():
         (
             (
                 group,
-                (CacheFieldSpec("layer.0.kv", "layer.0.kv", (8, 1, 32), "bfloat16"),),
+                (
+                    CacheFieldSpec(
+                        "layer.0.kv",
+                        "layer.0.kv",
+                        (8, 1, 32),
+                        "bfloat16",
+                        exact_page_stride=False,
+                        page_stride_alignment_bytes=64,
+                    ),
+                    CacheFieldSpec(
+                        "layer.0.index_k",
+                        "layer.0.kv",
+                        (8, 16),
+                        "uint8",
+                        exact_page_stride=False,
+                    ),
+                ),
             ),
         ),
         prefix_granularity=8,
@@ -379,6 +395,10 @@ def _check_managed_metadata_on_cuda():
     arena = CacheArena(
         layout.bind(2), "cuda", cache_group_specs=(group,), enable_memory_saver=True
     )
+    from tokenspeed_kernel.ops.kvcache import flatten_paged_latent_cache
+
+    physical_rows, _, _ = flatten_paged_latent_cache(arena.field("layer.0.kv"))
+    physical_address = physical_rows.data_ptr()
     table = arena._zero_field_tables[group.group_id][1]
     address = table.data_ptr()
     expected = table.cpu()
@@ -471,6 +491,7 @@ def _check_managed_metadata_on_cuda():
             )
             assert ordinary_bytes == 0, ordinary_bytes
             saver.resume(tag="weights")
+            assert physical_rows.data_ptr() == physical_address
             for tensor, pointer, reference in retained:
                 assert tensor.data_ptr() == pointer
                 torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)

@@ -1102,6 +1102,8 @@ def _check_packed_fp8_inputs(
             f"{index_k_cache.dtype}"
         )
     row_bytes = q.shape[2] + q.shape[2] // 128 * 4
+    if index_k_cache.dim() == 3:
+        index_k_cache = index_k_cache.view(index_k_cache.shape[0], -1)
     if index_k_cache.dim() != 2:
         raise ValueError(
             "index_k_cache must be a packed slot matrix or page-planar matrix, "

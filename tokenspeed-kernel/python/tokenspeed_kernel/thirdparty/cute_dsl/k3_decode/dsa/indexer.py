@@ -395,14 +395,14 @@ class IndexerScore:
             cute.recast_ptr(query_bytes.iterator, dtype=ab),
             cute.make_layout((vectors, DIM, 1), stride=(DIM, 1, vectors * DIM)),
         )
-        blocks = cache.shape[0] // PAGE
+        blocks = cache.shape[0]
         keys = cute.make_tensor(
             cute.recast_ptr(cache.iterator, dtype=ab),
-            cute.make_layout((PAGE, DIM, blocks), stride=(DIM, 1, PAGE * ROW_BYTES)),
+            cute.make_layout((PAGE, DIM, blocks), stride=(DIM, 1, cache.stride[0])),
         )
         scales = cute.make_tensor(
             cute.recast_ptr(cache.iterator + PAGE * DIM, dtype=Int32),
-            cute.make_layout((blocks, PAGE), stride=(PAGE * ROW_BYTES // 4, 1)),
+            cute.make_layout((blocks, PAGE), stride=(cache.stride[0] // 4, 1)),
         )
         mma = sm100_utils.make_trivial_tiled_mma(
             ab,
@@ -1441,7 +1441,9 @@ def compile_indexer(q: int, topk: int, ctas: int, pdl: bool):
     sym = cute.sym_int
     query = _fake(Uint8, (sym(), DIM), (DIM, 1), 16)
     weights = _fake(Float32, (sym(),), (1,), 16)
-    cache = _fake(Uint8, (sym(), ROW_BYTES), (ROW_BYTES, 1), 16)
+    cache = _fake(
+        Uint8, (sym(), PAGE * ROW_BYTES), (cute.sym_int64(divisibility=16), 1), 16
+    )
     table = _fake(Int32, (sym(), sym()), (cute.sym_int64(), 1), 4)
     seq_lens = _fake(Int32, (sym(),), (1,), 4)
     logits = _fake(Float32, (sym(),), (1,), 16)
@@ -1488,7 +1490,9 @@ def compile_candidates(q: int, topk: int, ctas: int, pdl: bool):
     sym = cute.sym_int
     query = _fake(Uint8, (sym(), DIM), (DIM, 1), 16)
     weights = _fake(Float32, (sym(),), (1,), 16)
-    cache = _fake(Uint8, (sym(), ROW_BYTES), (ROW_BYTES, 1), 16)
+    cache = _fake(
+        Uint8, (sym(), PAGE * ROW_BYTES), (cute.sym_int64(divisibility=16), 1), 16
+    )
     table = _fake(Int32, (sym(), sym()), (cute.sym_int64(), 1), 4)
     seq_lens = _fake(Int32, (sym(),), (sym(),), 4)
     row_ends = _fake(Int32, (sym(),), (1,), 4)

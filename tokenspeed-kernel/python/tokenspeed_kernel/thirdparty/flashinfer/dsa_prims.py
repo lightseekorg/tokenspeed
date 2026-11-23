@@ -134,8 +134,10 @@ def sparse_attention(
 
     Args:
         q: Prepared contiguous E4M3 queries [tokens, heads, 576].
-        kv_cache: Contiguous native E4M3 cache [slots, 576].
-        topk_slots: INT32 physical slot IDs [tokens, topk]; -1 marks holes.
+        kv_cache: Native E4M3 [slots, 576] or paged NHD cache. Each page
+            stride must be a whole number of 576-element rows.
+        topk_slots: INT32 physical row IDs [tokens, topk], including page
+            padding; -1 marks holes.
         topk_lens: Visible prefix lengths, or None to inspect the full width.
         mode: Explicit decode or prefill scheduling policy.
         query_width: Query rows per request for decode.
