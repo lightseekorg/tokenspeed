@@ -1393,9 +1393,9 @@ class RecoverSsmVerify:
     ):
         """Load this key channel's key and decay of every history row into registers.
 
-        The loads are all in flight at once. Rows past the count are not
-        loaded (their registers hold zeros no one reads), and a row's offset
-        within the records is 32-bit.
+        The loads are all in flight at once. Blocks of rows past the count
+        are skipped and the rows past it predicated off (their registers hold
+        values no one reads), and a row's offset within the records is 32-bit.
         """
         key_field, decay_field = retained[2], retained[3]
         key_row = key_field.iterator + (
@@ -1412,10 +1412,14 @@ class RecoverSsmVerify:
         decay_addr = decay_row.toint()
         key_step = Int32(key_field.stride[2]) * 4
         decay_step = Int32(decay_field.stride[2]) * 4
-        for p in cutlass.range_constexpr(self.history_rows):
-            present = Int32(p < count)
-            keys[p] = _ldg_f32_if(present, key_addr + Int64(p * key_step))
-            decays[p] = _ldg_f32_if(present, decay_addr + Int64(p * decay_step))
+        block = self.history_rows // 4
+        for b in cutlass.range_constexpr(4):
+            if b * block < count:
+                for j in cutlass.range_constexpr(block):
+                    p = b * block + j
+                    present = Int32(p < count)
+                    keys[p] = _ldg_f32_if(present, key_addr + Int64(p * key_step))
+                    decays[p] = _ldg_f32_if(present, decay_addr + Int64(p * decay_step))
 
     @cute.jit
     def _store_history_rows(
