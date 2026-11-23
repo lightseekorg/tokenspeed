@@ -233,7 +233,14 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
         global_server_args_dict["batch_invariant_collectives"] = True
         workspace = prepare_projection_collectives(
             ProjectionSpec(
-                parallel.tp_group, "row", width, stored, 128, torch.bfloat16, device
+                group=parallel.tp_group,
+                kind="row",
+                input_size=width,
+                output_size=stored,
+                max_tokens=128,
+                dtype=torch.bfloat16,
+                weight_dtype=torch.bfloat16,
+                device=device,
             ),
             None,
         )
