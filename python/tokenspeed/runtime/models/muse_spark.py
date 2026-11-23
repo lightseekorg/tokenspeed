@@ -445,6 +445,7 @@ def _prepare_owned_projections(
             output_size=weight.shape[0] * (1 if kind == "scatter" else size),
             max_tokens=rows,
             dtype=torch.bfloat16,
+            weight_dtype=weight.dtype,
             device=weight.device,
         )
         for kind, weight in projections

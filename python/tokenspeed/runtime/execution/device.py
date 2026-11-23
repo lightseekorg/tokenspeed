@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.attention.registry import AttentionBuild
@@ -422,6 +423,7 @@ class DeviceHandle:
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
         self._awake_cuda_stack_limit: int | None = None
+        self._released_dp_projections: tuple[tuple[ModelRunner, int], ...] | None = None
         # The compact Host cache -- the L2 prefix tier, the retraction
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
@@ -820,7 +822,10 @@ class DeviceHandle:
 
     def empty_cache(self) -> None:
         """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
-        if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
+        if self._forward_device.type == "cuda" and (
+            self._executor.config.enforce_eager
+            or self._released_dp_projections is not None
+        ):
             # Graphs may retain these addresses; eager GEMMs acquire new workspaces lazily.
             with allow_host_sync(
                 "release eager cuBLAS workspaces after device work drains"
@@ -885,8 +890,37 @@ class DeviceHandle:
             self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
-        """Drain GPU work and release NCCL buffers, allocator cache and the CUDA stack."""
+        """Drain GPU work and release projection workspaces and NCCL buffers."""
         self.synchronize()
+        if self._released_dp_projections is None:
+            executor = self._executor
+            projections = tuple(
+                (runner, capacity)
+                for runner in (executor.model_runner, executor.draft_model_runner)
+                if runner is not None
+                if (capacity := runner.dp_linear_max_tokens) is not None
+            )
+            rebuild_graphs = bool(projections)
+            if torch.distributed.is_initialized():
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager,
+                )
+
+                # Some ranks may lack a local projection, but graph capture
+                # uses the whole world. All ranks agree before dropping graphs.
+                world = tuple(range(torch.distributed.get_world_size()))
+                process_group_manager.init_process_group(world, backend="gloo")
+                group = process_group_manager.get_process_group("gloo", world)
+                needs_rebuild = torch.tensor(int(rebuild_graphs), device="cpu")
+                torch.distributed.all_reduce(
+                    needs_rebuild, op=torch.distributed.ReduceOp.MAX, group=group
+                )
+                rebuild_graphs = bool(needs_rebuild.item())
+            if rebuild_graphs:
+                executor.release_graphs()
+                for runner, _ in projections:
+                    runner.release_dp_linear_communication()
+                self._released_dp_projections = projections
         suspend_nccl_communicators()
         self.empty_cache()
         if self._forward_device.type == "cuda" and torch.version.hip is None:
@@ -899,6 +933,22 @@ class DeviceHandle:
             restore_cuda_stack(self._awake_cuda_stack_limit)
             self._awake_cuda_stack_limit = None
         resume_nccl_communicators()
+
+    def finish_memory_resume(self) -> None:
+        """Rebind projection workspaces and capture graphs on fully awake ranks."""
+        if self._released_dp_projections is None:
+            return
+        from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+
+        with allow_host_sync("restore DP projection workspaces and CUDA graphs"):
+            for runner, capacity in self._released_dp_projections:
+                runner.prepare_dp_linear_communication(capacity)
+            with torch.random.fork_rng(devices=[self._forward_device.index]):
+                self._executor.forget_served_inputs()
+                self._executor.capture_graphs(
+                    entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
+                )
+        self._released_dp_projections = None
 
     def run_remote_prefill_landing(
         self,

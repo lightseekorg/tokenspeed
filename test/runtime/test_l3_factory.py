@@ -130,6 +130,7 @@ def construction(tmp_path):
         ),
         num_host_lcm_blocks=16,
         block_alignment=1,
+        align_host_buffer=False,
     )
     host_cache = HostCacheResources(
         storage=storage,
