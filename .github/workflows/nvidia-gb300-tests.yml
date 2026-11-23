@@ -114,18 +114,28 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
 
-      - name: Build multi-node task matrix
+      - name: Build GB300 Slurm task matrix
         if: steps.changes.outputs.should_run == 'true'
         id: matrix
         run: |
-          matrix=$(python3 test/ci_system/pipeline.py scan \
-            --root test/ci \
-            --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-            ${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }} \
-            --trigger "${{ github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
-            --runner-group nvidia-arm \
-            --workflow-stage model-test \
-            --multi-node only)
+          set -euo pipefail
+          scan() {
+            python3 test/ci_system/pipeline.py scan \
+              --root test/ci \
+              --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
+              ${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }} \
+              --trigger "${{ github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
+              --runner-group nvidia-arm "$@"
+          }
+          unit_matrix=$(scan --workflow-stage unit-test --multi-node exclude)
+          model_matrix=$(scan --workflow-stage model-test --multi-node only)
+          matrix=$(printf '%s\n' "$unit_matrix" "$model_matrix" | python3 -c '
+          import json, sys
+          unit, model = map(json.loads, sys.stdin)
+          entries = unit["include"] + model["include"]
+          gb300_entries = [entry for entry in entries if entry["runner"].startswith("slurm-gb300-")]
+          print(json.dumps({"include": gb300_entries}, separators=(",", ":")))
+          ')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           printf '%s' "$matrix" | python3 -c \
             "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" \

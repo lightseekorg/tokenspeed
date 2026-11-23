@@ -148,10 +148,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::module_ kv_event = m.def_submodule("KVEvent");
     // The memory an event concerns, as vLLM's events name it: None for the
-    // GPU cache, "CPU_PINNED" for the pinned Host cache.
+    // GPU cache, "CPU_PINNED" for the pinned Host cache, "DISK" for the Disk
+    // tier.
     const auto medium_name = [](tokenspeed::KvEventMedium medium) -> nb::object {
-        if (medium == tokenspeed::KvEventMedium::kDevice) return nb::none();
-        return nb::str("CPU_PINNED");
+        switch (medium) {
+            case tokenspeed::KvEventMedium::kDevice:
+                return nb::none();
+            case tokenspeed::KvEventMedium::kHost:
+                return nb::str("CPU_PINNED");
+            case tokenspeed::KvEventMedium::kDisk:
+                return nb::str("DISK");
+        }
+        return nb::none();
     };
     nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockStoredEvent&) { return "BlockStored"; })
@@ -255,6 +263,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_rw(
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
+        // The Disk tier (docs/rfcs/0006-disk-tier.md), packed like the Host
+        // (virtual block count including the null page): 1 or less means none.
+        .def_prop_rw(
+            "num_disk_pages", [](const tokenspeed::SchedulerConfig& c) { return c.disk_allocator.total_pages; },
+            [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.disk_allocator.total_pages = v; })
         // The request-private snapshot pool (virtual block count including
         // the null page): 1 means the engine never retracts.
         .def_prop_rw(
@@ -262,6 +275,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.snapshot_allocator.total_pages = v; })
         .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
+        .def_rw("debug_force_retraction_max_per_request",
+                &tokenspeed::SchedulerConfig::debug_force_retraction_max_per_request)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("host_group_packing", &tokenspeed::SchedulerConfig::host_group_packing)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
@@ -271,6 +286,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("prefill_decode_min_interval", &tokenspeed::SchedulerConfig::prefill_decode_min_interval)
+        .def_rw("max_consecutive_prefill_rounds", &tokenspeed::SchedulerConfig::max_consecutive_prefill_rounds)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
@@ -280,9 +296,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
         .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
         // P role: the most tokens a prefill chunk that cannot finish gives up
-        // for whole prompts behind it; 0 is off, at most half of
-        // max_scheduled_tokens.
-        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens);
+        // for whole prompts behind it (0 is off, at most half of
+        // max_scheduled_tokens), and the most rounds one prompt gives way
+        // (unbounded by default; positive while the yield is on).
+        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens)
+        .def_rw("prefill_chunk_yield_max_rounds", &tokenspeed::SchedulerConfig::prefill_chunk_yield_max_rounds);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -306,6 +324,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
+        .def_rw("admission_id", &tokenspeed::RequestSpec::admission_id)
         .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
         .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
         .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
@@ -363,18 +382,55 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("max_writes_in_flight", &tokenspeed::SharedL2Config::max_writes_in_flight)
         .def_ro("max_keys_per_write", &tokenspeed::SharedL2Config::max_keys_per_write);
     scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
+    nb::class_<tokenspeed::DiskConfig>(m, "DiskConfig")
+        .def(nb::init<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int64_t,
+                      std::int64_t>(),
+             nb::arg("max_operations"), nb::arg("max_blocks_per_operation"), nb::arg("max_host_blocks"),
+             nb::arg("max_write_host_blocks"), nb::arg("max_queued_cleanings"), nb::arg("min_prefetch_tokens"),
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"))
+        .def_ro("max_operations", &tokenspeed::DiskConfig::max_operations)
+        .def_ro("max_blocks_per_operation", &tokenspeed::DiskConfig::max_blocks_per_operation)
+        .def_ro("max_host_blocks", &tokenspeed::DiskConfig::max_host_blocks)
+        .def_ro("max_write_host_blocks", &tokenspeed::DiskConfig::max_write_host_blocks)
+        .def_ro("max_queued_cleanings", &tokenspeed::DiskConfig::max_queued_cleanings)
+        .def_ro("min_prefetch_tokens", &tokenspeed::DiskConfig::min_prefetch_tokens)
+        .def_ro("wait_timeout_us", &tokenspeed::DiskConfig::wait_timeout_us)
+        .def_ro("ready_timeout_us", &tokenspeed::DiskConfig::ready_timeout_us);
+    scheduler_config.def_rw("disk_config", &tokenspeed::SchedulerConfig::disk_config);
+    nb::class_<tokenspeed::DiskStats>(m, "DiskStats")
+        .def_ro("operations", &tokenspeed::DiskStats::operations)
+        .def_ro("held_host_blocks", &tokenspeed::DiskStats::held_host_blocks)
+        .def_ro("queued_cleanings", &tokenspeed::DiskStats::queued_cleanings)
+        .def_ro("waiting_requests", &tokenspeed::DiskStats::waiting_requests)
+        .def_ro("ready_requests", &tokenspeed::DiskStats::ready_requests)
+        .def_ro("disk_blocks", &tokenspeed::DiskStats::disk_blocks)
+        .def_ro("free_disk_parents", &tokenspeed::DiskStats::free_disk_parents)
+        .def_ro("written_blocks", &tokenspeed::DiskStats::written_blocks)
+        .def_ro("read_blocks", &tokenspeed::DiskStats::read_blocks)
+        .def_ro("failed_reads", &tokenspeed::DiskStats::failed_reads)
+        .def_ro("failed_writes", &tokenspeed::DiskStats::failed_writes)
+        .def_ro("dropped_cleanings", &tokenspeed::DiskStats::dropped_cleanings)
+        .def_ro("wait_timeouts", &tokenspeed::DiskStats::wait_timeouts)
+        .def_ro("ready_expirations", &tokenspeed::DiskStats::ready_expirations);
+    nb::enum_<tokenspeed::PeerLandingTier>(m, "PeerLandingTier")
+        .value("Device", tokenspeed::PeerLandingTier::kDevice)
+        .value("Host", tokenspeed::PeerLandingTier::kHost);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
-        .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t,
-                      std::int32_t>(),
+        .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t,
+                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t>(),
              nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
-             nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"))
+             nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"), nb::arg("landing_tier"),
+             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"))
         .def_ro("name", &tokenspeed::PeerConfig::name)
         .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
         .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
         .def_ro("soft_pin_us", &tokenspeed::PeerConfig::soft_pin_us)
         .def_ro("hard_pin_us", &tokenspeed::PeerConfig::hard_pin_us)
         .def_ro("lookup_timeout_us", &tokenspeed::PeerConfig::lookup_timeout_us)
-        .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens);
+        .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens)
+        .def_ro("landing_tier", &tokenspeed::PeerConfig::landing_tier)
+        .def_ro("max_host_landing_blocks", &tokenspeed::PeerConfig::max_host_landing_blocks)
+        .def_ro("host_ready_timeout_us", &tokenspeed::PeerConfig::host_ready_timeout_us);
     scheduler_config.def_rw("peer_config", &tokenspeed::SchedulerConfig::peer_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
@@ -519,6 +575,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("success", &tokenspeed::cache::StorageDone::success)
         .def_ro("retired", &tokenspeed::cache::StorageDone::retired)
         .def_ro("object_failures", &tokenspeed::cache::StorageDone::object_failures);
+
+    // Every cache owner finished a Disk operation (docs/rfcs/0006-disk-tier.md).
+    nb::class_<tokenspeed::cache::DiskDone>(cache, "DiskDone")
+        .def(nb::init<std::uint64_t, bool>(), nb::arg("op_id"), nb::arg("success"))
+        .def_ro("op_id", &tokenspeed::cache::DiskDone::op_id)
+        .def_ro("success", &tokenspeed::cache::DiskDone::success);
 
     // A shared L2 rank's commands to its pool, relayed by the runtime; keys,
     // tails and tokens have the shapes SharedL2Pool takes.
@@ -691,8 +753,28 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("num_extends", &tokenspeed::ForwardBatch::NumExtends);
 
     // ─── CacheOperation (attached to the Cache submodule) ──────────
+    nb::class_<tokenspeed::PrefixLoadTelemetry>(cache, "PrefixLoadTelemetry")
+        .def_ro("admission_id", &tokenspeed::PrefixLoadTelemetry::admission_id)
+        .def_ro("op_generation", &tokenspeed::PrefixLoadTelemetry::op_generation)
+        .def_ro("request_pool_index", &tokenspeed::PrefixLoadTelemetry::request_pool_index)
+        .def_ro("slot_generation", &tokenspeed::PrefixLoadTelemetry::slot_generation);
+
+    nb::class_<tokenspeed::RestoreTelemetry>(cache, "RestoreTelemetry")
+        .def_ro("admission_id", &tokenspeed::RestoreTelemetry::admission_id)
+        .def_ro("op_generation", &tokenspeed::RestoreTelemetry::op_generation)
+        .def_ro("previous_slot", &tokenspeed::RestoreTelemetry::previous_slot)
+        .def_ro("previous_slot_generation", &tokenspeed::RestoreTelemetry::previous_slot_generation)
+        .def_ro("slot_generation", &tokenspeed::RestoreTelemetry::slot_generation)
+        .def_ro("slot_previous_admission_id", &tokenspeed::RestoreTelemetry::slot_previous_admission_id)
+        .def_ro("restore_sequence", &tokenspeed::RestoreTelemetry::restore_sequence)
+        .def_ro("committed_tokens", &tokenspeed::RestoreTelemetry::committed_tokens)
+        .def_ro("computed_tokens", &tokenspeed::RestoreTelemetry::computed_tokens)
+        .def_ro("prompt_tokens", &tokenspeed::RestoreTelemetry::prompt_tokens);
+
     nb::class_<tokenspeed::LoadBackBatch>(cache, "LoadBackOp")
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
+        .def_ro("request_ids", &tokenspeed::LoadBackBatch::request_ids)
+        .def_ro("telemetry", &tokenspeed::LoadBackBatch::telemetry)
         .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
@@ -726,6 +808,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // request_pool_indices[i]. Runs after the plan's zeroing.
     nb::class_<tokenspeed::SnapshotRestoreBatch>(cache, "RestoreOp")
         .def_ro("op_ids", &tokenspeed::SnapshotRestoreBatch::op_ids)
+        .def_ro("telemetry", &tokenspeed::SnapshotRestoreBatch::telemetry)
         .def_ro("request_ids", &tokenspeed::SnapshotRestoreBatch::request_ids)
         .def_ro("request_pool_indices", &tokenspeed::SnapshotRestoreBatch::request_pool_indices)
         .def_ro("snapshot_slots", &tokenspeed::SnapshotRestoreBatch::snapshot_slots)
@@ -735,6 +818,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("content_hashes", &tokenspeed::SnapshotRestoreBatch::content_hashes)
         .def_ro("page_offsets", &tokenspeed::SnapshotRestoreBatch::page_offsets)
         .def_ro("source_tiers", &tokenspeed::SnapshotRestoreBatch::source_tiers);
+
+    // Host <-> Disk rows a plan starts on every cache owner's disk executor;
+    // no Device copy, so the data plane leaves them to the control plane.
+    nb::enum_<tokenspeed::DiskOpKind>(cache, "DiskOpKind")
+        .value("Read", tokenspeed::DiskOpKind::kRead)
+        .value("Write", tokenspeed::DiskOpKind::kWrite);
+    nb::class_<tokenspeed::DiskOperation>(cache, "DiskOp")
+        .def_ro("kind", &tokenspeed::DiskOperation::kind)
+        .def_ro("op_id", &tokenspeed::DiskOperation::op_id)
+        .def_ro("group_ids", &tokenspeed::DiskOperation::group_ids)
+        .def_ro("host_blocks", &tokenspeed::DiskOperation::host_blocks)
+        .def_ro("disk_blocks", &tokenspeed::DiskOperation::disk_blocks);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
@@ -960,6 +1055,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "exports none, and reading them changes nothing.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
+        .def("disk_stats", &tokenspeed::Scheduler::GetDiskStats)
         .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)
         .def("storage_quarantined", &tokenspeed::Scheduler::StorageQuarantined)
         .def("storage_negative_keys", &tokenspeed::Scheduler::StorageNegativeKeys)

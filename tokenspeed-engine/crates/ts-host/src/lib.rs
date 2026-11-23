@@ -27,6 +27,7 @@
 //! The extension also serves a shared L2 pool's owner, which is no rank
 //! (`shared_l2_owner`).
 
+mod cache_events;
 mod data_plane;
 mod encode;
 mod host_spans;
@@ -62,7 +63,8 @@ use ts_control::{
     transport::{EngineTransport, TransportError},
 };
 use ts_metrics::{
-    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3Labels, L3Metrics, MetricsConfig,
+    DiskMetrics, EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3Labels, L3Metrics,
+    MetricsConfig,
 };
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
@@ -90,6 +92,7 @@ const DP_GROUP: u32 = 0;
 const REPLICA_GROUP: u32 = 1;
 const PP_GROUP: u32 = 2;
 const EP_GROUP: u32 = 3;
+const PEER_NODE_GROUP: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
@@ -111,6 +114,8 @@ enum HostError {
     KvEvents(#[from] ts_control::kv_events::KvEventsError),
     #[error("the L3 store: {0}")]
     Storage(#[from] ts_mooncake::Error),
+    #[error("the Disk tier: {0}")]
+    Disk(#[from] ts_control::disk::DiskError),
     #[error(transparent)]
     Loop(#[from] LoopError),
     #[error("the EPD embedding sender: {0}")]
@@ -123,6 +128,60 @@ enum HostError {
     Io(#[from] std::io::Error),
 }
 
+/// The data plane's `DiskSettings` (`cache/disk.py`), or None without the
+/// Disk tier.
+fn disk_settings(settings: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::disk::DiskSettings>> {
+    if settings.is_none() {
+        return Ok(None);
+    }
+    let backend: String = settings.getattr("backend")?.extract()?;
+    let backend = match backend.as_str() {
+        "io_uring" => ts_disk::Backend::IoUring,
+        "psync" => ts_disk::Backend::Psync,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported Disk tier I/O backend {other:?}"
+            )))
+        }
+    };
+    let groups: Vec<(usize, usize, usize)> = settings.getattr("groups")?.extract()?;
+    let layout = |num_lcm_blocks: usize| -> PyResult<ts_l3::HostLayout> {
+        Ok(ts_l3::HostLayout {
+            groups: groups
+                .iter()
+                .map(|&(packing, block_bytes, shard_count)| ts_l3::GroupLayout {
+                    packing,
+                    block_bytes,
+                    shard_count,
+                })
+                .collect(),
+            lcm_block_bytes: settings.getattr("lcm_block_bytes")?.extract()?,
+            num_lcm_blocks,
+            owner_rank: settings.getattr("owner_rank")?.extract()?,
+            tp_rank: settings.getattr("tp_rank")?.extract()?,
+        })
+    };
+    Ok(Some(ts_control::disk::DiskSettings {
+        file: std::path::PathBuf::from(settings.getattr("file")?.extract::<String>()?),
+        file_bytes: settings.getattr("file_bytes")?.extract()?,
+        executor: ts_disk::ExecutorConfig {
+            backend,
+            queue_depth: settings.getattr("queue_depth")?.extract()?,
+            write_queue_depth: settings.getattr("write_queue_depth")?.extract()?,
+            max_io_bytes: settings.getattr("max_io_bytes")?.extract()?,
+            write_bytes_per_second: settings.getattr("write_bytes_per_second")?.extract()?,
+        },
+        host: ts_l3::HostBuffer {
+            base: settings.getattr("host_buffer")?.extract()?,
+            len: settings.getattr("host_buffer_bytes")?.extract()?,
+        },
+        host_layout: layout(settings.getattr("num_host_lcm_blocks")?.extract()?)?,
+        disk_layout: layout(settings.getattr("num_disk_lcm_blocks")?.extract()?)?,
+        max_operations: settings.getattr("max_operations")?.extract()?,
+        push_ring_bytes: settings.getattr("push_ring_bytes")?.extract()?,
+    }))
+}
+
 fn python_error(py: Python<'_>, error: PyErr) -> HostError {
     HostError::Python(data_plane::describe(py, &error))
 }
@@ -130,6 +189,7 @@ fn python_error(py: Python<'_>, error: PyErr) -> HostError {
 struct Args {
     control_fd: i32,
     enable_async_logging: bool,
+    cache_events: Option<cache_events::Settings>,
 }
 
 /// The control and forward threads report to the same launcher.
@@ -269,6 +329,8 @@ struct HostConfig {
     kv_events_publisher: Option<KvEventsConfig>,
     /// With the L3 storage tier, the executor's settings.
     l3: Option<ts_l3::Settings>,
+    /// With the Disk tier, its file and executor's settings.
+    disk: Option<ts_control::disk::DiskSettings>,
     /// `--enable-eplb`: the rebalance's settings.
     eplb: Option<Eplb>,
     /// An EPD prefill node: it receives image embeddings from encode
@@ -383,6 +445,8 @@ struct Metrics {
     transfer: bool,
     /// The L3 tier's metrics, on every rank with the tier.
     l3: bool,
+    /// The Disk tier's metrics, on every rank with the tier.
+    disk: bool,
     labels: EngineLabels,
     /// The L3 metrics' extra labels: the attention-TP rank and the role.
     tp_rank: i64,
@@ -402,6 +466,7 @@ impl Metrics {
             engine: config.getattr("engine_metrics")?.extract()?,
             transfer: config.getattr("transfer_metrics")?.extract()?,
             l3: config.getattr("l3_metrics")?.extract()?,
+            disk: config.getattr("disk_metrics")?.extract()?,
             labels: EngineLabels {
                 model_name: config.getattr("metrics_model_name")?.extract()?,
                 app_key: config.getattr("metrics_app_key")?.extract()?,
@@ -412,27 +477,36 @@ impl Metrics {
         })
     }
 
+    /// The storage metrics' labels.
+    fn storage_labels(&self) -> L3Labels {
+        L3Labels {
+            model_name: self.labels.model_name.clone(),
+            app_key: self.labels.app_key.clone(),
+            dp_rank: self.labels.dp_rank,
+            tp_rank: self.tp_rank,
+            engine_role: self.engine_role.clone(),
+        }
+    }
+
     /// The L3 tier's metrics, on a rank that reports them.
     fn l3_metrics(&self, exporter: Option<&Arc<Exporter>>) -> Option<L3Metrics> {
-        exporter.filter(|_| self.l3).map(|exporter| {
-            L3Metrics::new(
-                exporter,
-                &L3Labels {
-                    model_name: self.labels.model_name.clone(),
-                    app_key: self.labels.app_key.clone(),
-                    dp_rank: self.labels.dp_rank,
-                    tp_rank: self.tp_rank,
-                    engine_role: self.engine_role.clone(),
-                },
-            )
-        })
+        exporter
+            .filter(|_| self.l3)
+            .map(|exporter| L3Metrics::new(exporter, &self.storage_labels()))
+    }
+
+    /// The Disk tier's metrics, on a rank that reports them.
+    fn disk_metrics(&self, exporter: Option<&Arc<Exporter>>) -> Option<DiskMetrics> {
+        exporter
+            .filter(|_| self.disk)
+            .map(|exporter| DiskMetrics::new(exporter, &self.storage_labels()))
     }
 
     /// The exporter, when any metric of this rank is on.
     fn exporter(&self) -> Result<Option<Arc<Exporter>>, ts_metrics::MetricsError> {
         let any_output =
             self.outputs.prometheus_dir.is_some() || self.outputs.relay_endpoint.is_some();
-        if !any_output || !(self.engine || self.transfer || self.l3) {
+        if !any_output || !(self.engine || self.transfer || self.l3 || self.disk) {
             return Ok(None);
         }
         Exporter::new(&self.outputs).map(Some)
@@ -540,6 +614,7 @@ impl HostConfig {
                 allow_reload_forward: config.getattr("allow_reload_forward")?.extract()?,
             },
             l3,
+            disk: disk_settings(&config.getattr("disk")?)?,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
             epd_receive_enabled: config.getattr("epd_receive_enabled")?.extract()?,
             grammar: {
@@ -655,6 +730,17 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
 }
 
 fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
+    let cache_writer = args
+        .cache_events
+        .as_ref()
+        .map(|_| {
+            logging::cache_event_writer().ok_or_else(|| {
+                HostError::Interpreter(
+                    "cache observations require the host nonblocking logger".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
@@ -692,7 +778,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         return encode::serve(bootstrap, &stop);
     }
 
-    let (bootstrap, scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
+    let (bootstrap, mut scheduler, config, data_plane, role, peers, peer_sharing, exporter) =
         Python::attach(|py| {
             let built = (|| {
                 let bootstrap = bootstrap.into_bound(py);
@@ -743,6 +829,25 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             })();
             built.map_err(|error| python_error(py, error))
         })?;
+
+    // Install before startup requests or client admissions. Scheduler RAII
+    // retains this context through the last slot release, including teardown.
+    let cache_events = args
+        .cache_events
+        .clone()
+        .zip(cache_writer)
+        .map(|(settings, writer)| {
+            cache_events::CacheEvents::install(
+                settings,
+                &config.metrics.engine_role,
+                config.metrics.labels.dp_rank,
+                config.rank,
+                writer,
+                &mut scheduler,
+            )
+            .map_err(HostError::Interpreter)
+        })
+        .transpose()?;
 
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
@@ -801,8 +906,9 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     // when it joined the pool at device build is the loop's; the data plane
     // keeps the handle, for the acknowledgments of the rank's loads.
     let shared_l2_client = shared_l2_handle.get().take_client();
-    let data_plane = PythonDataPlane::start(data_plane, peers.streams, shared_l2_handle)
-        .map_err(HostError::DataPlane)?;
+    let data_plane =
+        PythonDataPlane::start(data_plane, peers.streams, cache_events, shared_l2_handle)
+            .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -866,6 +972,18 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     );
     // The L3 tier's executor connects its store before serving starts.
     let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
+    // The Disk tier's file is allocated before serving starts.
+    let disk_metrics = config.metrics.disk_metrics(exporter.as_ref());
+    let disk = config
+        .disk
+        .as_ref()
+        .map(|settings| {
+            ts_control::disk::DiskTier::start(
+                settings,
+                disk_metrics.as_ref().map(DiskMetrics::jobs),
+            )
+        })
+        .transpose()?;
     let grammars = config
         .grammar
         .clone()
@@ -893,6 +1011,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 &ranks.replica,
                 scheduler.clone(),
                 peer_outbox.get(),
+                disk.as_ref(),
             )
         })
         .transpose()
@@ -929,6 +1048,8 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
             shared_l2: shared_l2_client,
+            disk_metrics,
+            disk,
             peer,
         },
     );
@@ -1006,14 +1127,21 @@ fn finish_serving(
 /// Run one rank on the calling (main) thread and exit without Python finalization.
 #[pyfunction]
 fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
+    // Reject explicit incompatible settings before any Python model bootstrap.
+    let cache_events = cache_events::Settings::from_env(enable_async_logging)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     py.detach(|| {
         let args = Args {
             control_fd,
             enable_async_logging,
+            cache_events,
         };
         let log_guard = logging::init(args.enable_async_logging);
         let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Outside serve: reacquiring the GIL here drains its deferred
+            // bootstrap/scheduler decrefs, so their last ownership callbacks
+            // can finish the cache trace before the native log guard flushes.
             let _python_logs = logging::PythonLogGuard;
             serve(&args, launcher)
         }));
@@ -1035,6 +1163,13 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
     })
 }
 
+/// Cache observation protocol implemented by the linked native scheduler.
+/// This probe does not bootstrap a model or initialize a device.
+#[pyfunction]
+fn cache_event_protocol() -> String {
+    cache_events::protocol()
+}
+
 /// The rank's native control loop and its single scheduler implementation.
 #[pymodule]
 fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
@@ -1044,6 +1179,7 @@ fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
         shared_l2_owner::run_shared_l2_owner,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(cache_event_protocol, module)?)?;
     Ok(())
 }
 

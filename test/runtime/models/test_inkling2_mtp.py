@@ -458,6 +458,7 @@ def test_bf16_recurrence_feeds_back_each_sample_and_padded_shard_ids_agree():
         hidden_states=hidden,
         f_rnn=features,
         logits_out=torch.empty(2, 96, dtype=torch.bfloat16),
+        keys_out=None,
         sampler=sample,
         shard_padding=None,
     )
@@ -480,6 +481,7 @@ def test_bf16_recurrence_feeds_back_each_sample_and_padded_shard_ids_agree():
         hidden_states=hidden,
         f_rnn=features,
         logits_out=torch.empty(2, 96, dtype=torch.bfloat16),
+        keys_out=None,
         sampler=sample_padded,
         shard_padding=(40, 16),
     )
@@ -529,6 +531,7 @@ def test_gpu_recurrence_matches_teacher_forced_cpu_and_padded_shards():
             hidden_states=hidden.to(device),
             f_rnn=features.to(device),
             logits_out=torch.empty(3, 96, dtype=torch.bfloat16, device=device),
+            keys_out=None,
             sampler=sample,
             shard_padding=shard_padding,
         )
@@ -555,6 +558,7 @@ def test_fold_and_final_cap_mask_use_native_vocabulary_shard_offsets():
         base,
         torch.zeros(2, 4, dtype=torch.bfloat16),
         torch.empty(2, 8, dtype=torch.bfloat16),
+        None,
     )
     assert logits.dtype == torch.bfloat16
     assert torch.equal(logits[:, :4], torch.full((2, 4), 30, dtype=torch.bfloat16))
@@ -572,6 +576,7 @@ def test_softcap_runs_only_after_the_bf16_recurrent_correction():
         base,
         torch.zeros(2, 4, dtype=torch.bfloat16),
         torch.empty(2, 64, dtype=torch.bfloat16),
+        None,
     )
     assert torch.equal(actual[:, :60], torch.zeros(2, 60, dtype=torch.bfloat16))
     assert torch.isneginf(actual[:, 60:]).all()
@@ -661,3 +666,25 @@ def test_native_loader_shards_complete_qkv_context_and_dense_weights(tp):
             model.layers[0].mlp.down_proj.weight,
             source.layers[0].mlp.down_proj.weight.chunk(tp, dim=1)[rank],
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("rows", [1, 8, 64])
+def test_gpu_step_invariant_projection_is_the_fp32_projection(rows):
+    """Every vendor's GPU projects the step-invariant inputs once per block,
+    in FP32 with the bias (skinny_mm or the registry GEMM)."""
+    config = _config()
+    config.hidden_size, config.markov_rank = 256, 16
+    torch.manual_seed(rows)
+    head = Inkling2MTPHead(config)
+    for parameter in head.parameters():
+        parameter.data.copy_(torch.randn_like(parameter.float()) * 0.1)
+    head.cuda()
+    hidden = torch.randn(rows, 7, 256, device="cuda").bfloat16()
+    features = torch.randn(rows, 256, device="cuda").bfloat16()
+    projected = head.step_invariant_projection(hidden, features)
+    assert projected is not None and projected.dtype == torch.float32
+    inputs = torch.cat((hidden, features[:, None].expand(-1, 7, -1)), dim=-1)
+    weight = head.rnn_proj.weight[:, 2 * head.markov_rank :]
+    expected = inputs.double() @ weight.double().T + head.rnn_proj.bias.double()
+    torch.testing.assert_close(projected.double(), expected, rtol=1e-5, atol=1e-5)

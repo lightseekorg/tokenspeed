@@ -325,11 +325,13 @@ mod tests {
                     sources: vec![1_000],
                     destinations: vec![100 + 3 * 32],
                     lengths: vec![12],
+                    host_bytes: 0,
                 },
                 Spans {
                     sources: vec![5_112],
                     destinations: vec![100 + 32],
                     lengths: vec![12],
+                    host_bytes: 0,
                 },
             ]
         );
@@ -342,11 +344,13 @@ mod tests {
                     sources: vec![1_012, 1_000 + 28 + 12],
                     destinations: vec![116 + 3 * 32, 500 + 8 * 16],
                     lengths: vec![16, 12],
+                    host_bytes: 0,
                 },
                 Spans {
                     sources: vec![5_124],
                     destinations: vec![116 + 32],
                     lengths: vec![16],
+                    host_bytes: 0,
                 },
             ]
         );
@@ -364,6 +368,7 @@ mod tests {
                 sources: vec![100 + 5 * 32, 116 + 5 * 32],
                 destinations: vec![1_056, 1_068],
                 lengths: vec![12, 16],
+                host_bytes: 0,
             }
         );
         // State page 9 opens the pool's fifth LCM block, p1's second.
@@ -373,6 +378,7 @@ mod tests {
                 sources: vec![500 + 2 * 16],
                 destinations: vec![5_028],
                 lengths: vec![12],
+                host_bytes: 0,
             }
         );
     }

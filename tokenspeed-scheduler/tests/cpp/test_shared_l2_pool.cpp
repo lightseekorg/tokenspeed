@@ -646,8 +646,8 @@ struct LocalHostTier {
 
     LocalHostTier(std::int32_t num_lcm_blocks, std::int64_t retention, std::int32_t leaf_distance)
         : host{num_lcm_blocks, {1, 1}},
-          cache{MakeCoordinator(TwoStateSpecs(), kPage, device, false, &host, nullptr, false, false, retention,
-                                leaf_distance)} {}
+          cache{MakeCoordinator(TwoStateSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr, false,
+                                false, retention, leaf_distance)} {}
 
     void Publish(const Prompt& point) {
         const std::vector<CacheKey> keys = StateKeys(point);
@@ -819,10 +819,10 @@ struct TierPair {
     BlockPool device{32, {2, 1}};
     BlockPool unused_device{1, {2, 1}};
     BlockPool host{32, {2, 1}};
-    CacheCoordinator on_device{
-        MakeCoordinator(HybridSpecs(), kPage, device, false, nullptr, nullptr, false, false, kRetention)};
-    CacheCoordinator on_host{
-        MakeCoordinator(HybridSpecs(), kPage, unused_device, false, &host, nullptr, false, false, kRetention)};
+    CacheCoordinator on_device{MakeCoordinator(HybridSpecs(), kPage, device, false, nullptr, /*disk_pool=*/nullptr,
+                                               nullptr, false, false, kRetention)};
+    CacheCoordinator on_host{MakeCoordinator(HybridSpecs(), kPage, unused_device, false, &host, /*disk_pool=*/nullptr,
+                                             nullptr, false, false, kRetention)};
 
     // Publishes the prompt's pages and tail on both, with its checkpoint when
     // `state`: a chunk end otherwise.
@@ -919,7 +919,7 @@ TEST(SharedL2Pool, BoundedTakesOfARanksStoreCandidatesKeepTheirOrder) {
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kPage}};
     BlockPool device{16, {1}};
     BlockPool host{4, {1}};
-    CacheCoordinator cache{MakeCoordinator(specs, kPage, device, false, &host, nullptr,
+    CacheCoordinator cache{MakeCoordinator(specs, kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr,
                                            /*stream_device_cache_to_host=*/true, false, kRetention)};
     const Prompt prompt{Sequence(10 * kPage)};
     std::vector<BlockTable> tables(1);
@@ -967,8 +967,8 @@ TEST(SharedL2Pool, BoundedTakesOfARanksStoreCandidatesKeepTheirOrder) {
 TEST(SharedL2Pool, ATailPastThePerPageCapCostsTheOldestWaitingPromptItsHit) {
     BlockPool device{4, {2, 1}};
     BlockPool host{32, {2, 1}};
-    CacheCoordinator rank{
-        MakeCoordinator(HybridSpecs(), kPage, device, false, &host, nullptr, false, false, kRetention)};
+    CacheCoordinator rank{MakeCoordinator(HybridSpecs(), kPage, device, false, &host, /*disk_pool=*/nullptr, nullptr,
+                                          false, false, kRetention)};
     std::vector<Prompt> prompts;
     std::vector<std::vector<CacheBlockRef>> held;
     for (std::int32_t i = 0; i <= TailTable::kMaxTailsPerPrior; ++i) {

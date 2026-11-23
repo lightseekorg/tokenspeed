@@ -66,10 +66,15 @@ _SLIDING_DECODE_STAGES = 2
 # s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
 # 63 of its outstanding vector memory loads.
 _GFX950_MAX_VMCNT = 63
+# LDS bytes a gfx950 work-group may allocate.
+_GFX950_LDS_BYTES = 160 * 1024
 # Full-attention decode takes its split count as a constexpr, so it is not held to
 # the runtime-reduce bound MAX_KV_SPLITS. Above 64, the split reduce and the
 # per-split prologue outweigh the extra waves.
 _FULL_DECODE_MAX_SPLITS = 64
+# Floats of split partials the one-wave decode reduce holds per tile: 128
+# registers per lane.
+_REDUCE_TILE_ELEMS = gl.constexpr(64 * 128)
 # Rows of a decode work-group: four waves of one 16-row MFMA tile each.
 _DECODE_MAX_BLOCK_M = 64
 # Sliding windows, or contexts, of at most this many pages are short: their
@@ -99,6 +104,8 @@ class AttentionConfig:
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     IS_FP8: gl.constexpr
+    UNIFORM_ROWS: gl.constexpr
+    CAUSAL_ROWS: gl.constexpr
     GROUP_SIZE: gl.constexpr
     ROWS: gl.constexpr
     NUM_ROW_BLOCKS: gl.constexpr
@@ -132,11 +139,12 @@ class AttentionConfig:
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
+        UNIFORM_ROWS,
         KV_DTYPE,
         q_strides,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
-        assert HEAD_DIM in (64, 128)
+        assert HEAD_DIM in (64, 128, 256)
         assert BLOCK_N == PAGE_SIZE
         # The waves split the rows into whole 16-row MFMA tiles.
         assert BLOCK_M % (16 * NUM_WARPS) == 0
@@ -181,6 +189,14 @@ class AttentionConfig:
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.IS_FP8 = gl.constexpr(IS_FP8)
+        # UNIFORM_ROWS: every query position of a request sees all of its
+        # seq_len keys (a block drafter's block, which is non-causal), and
+        # the request's length and page-table row are those of its first
+        # position in metadata that lists one entry per position. Otherwise a
+        # request's positions are causal (verify): position p ends its keys at
+        # seq_len - (MAX_SEQLEN_Q - 1 - p).
+        self.UNIFORM_ROWS = gl.constexpr(UNIFORM_ROWS)
+        self.CAUSAL_ROWS = gl.constexpr(MAX_SEQLEN_Q > 1 and not UNIFORM_ROWS)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
         # A request's queries for one KV head form MAX_SEQLEN_Q * GROUP_SIZE
         # rows, ordered by query position and then by query head, tiled into
@@ -293,8 +309,11 @@ class AttentionProgram:
         """
         kv_head = head_block // cfg.NUM_ROW_BLOCKS
         row_start = (head_block - kv_head * cfg.NUM_ROW_BLOCKS) * cfg.BLOCK_M
-        seq_len = gl.load(cache_seqlens_ptr + batch)
-        if cfg.MAX_SEQLEN_Q == 1:
+        if cfg.UNIFORM_ROWS:
+            seq_len = gl.load(cache_seqlens_ptr + batch * cfg.MAX_SEQLEN_Q)
+        else:
+            seq_len = gl.load(cache_seqlens_ptr + batch)
+        if not cfg.CAUSAL_ROWS:
             first_end = maximum(seq_len, 0)
             cache_len = first_end
         else:
@@ -560,7 +579,7 @@ class AttentionProgram:
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
         tokens = start_n + offs_n[None, :]
         mask = (tokens >= self.kv_start) & (tokens < self.split_end)
-        if cfg.MAX_SEQLEN_Q > 1:
+        if cfg.CAUSAL_ROWS:
             # Each query position ends its keys, and starts its sliding window,
             # at its own offset within the block's range.
             offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
@@ -578,7 +597,7 @@ class AttentionProgram:
         row_max = gl.convert_layout(row_max, gl.SliceLayout(1, cfg.pv_layout))
         m_new = maximum(m_i, row_max)
         m_new_scaled = m_new * cfg.SM_SCALE
-        if cfg.MAX_SEQLEN_Q > 1:
+        if cfg.CAUSAL_ROWS:
             # A row can meet a page without any of its keys before one with
             # them: a later query position's window starts past the block's
             # first pages, and an earlier one's causal end can precede a whole
@@ -590,7 +609,7 @@ class AttentionProgram:
         qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
-        if cfg.MAX_SEQLEN_Q > 1:
+        if cfg.CAUSAL_ROWS:
             m_diff = gl.where(invalid, 0.0, m_diff)
         alpha = gl.exp2(m_diff)
         l_ij = gl.sum(p, axis=1)
@@ -637,7 +656,34 @@ class AttentionProgram:
         cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
 
     @gluon.jit
-    def store_output(self, acc, l_i):
+    def load_output_gate(self, gate_ptr, gate_stride):
+        """``load_output_gate`` of this row block's rows. Kernels issue it
+        before streaming the keys, so the gate is in registers by the store."""
+        cfg = self.cfg
+        offs_m = gl.arange(
+            0,
+            cfg.BLOCK_M,
+            layout=gl.SliceLayout(
+                1, output_gate_layout(cfg.NUM_WARPS, cfg.NUM_Q_HEADS, cfg.HEAD_DIM)
+            ),
+        )
+        return load_output_gate(
+            gate_ptr,
+            gate_stride,
+            self.row_tokens(offs_m),
+            self.row_heads(offs_m),
+            self.row_valid(offs_m),
+            cfg.NUM_Q_HEADS,
+            cfg.HEAD_DIM,
+            cfg.NUM_WARPS,
+        )
+
+    @gluon.jit
+    def store_output(
+        self, acc, l_i, gate, GATE_EPS: gl.constexpr, HAS_GATE: gl.constexpr
+    ):
+        """Store the output rows; with HAS_GATE, ``store_rmsnorm_gated`` of
+        them with ``gate`` (``load_output_gate``)."""
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
@@ -647,16 +693,43 @@ class AttentionProgram:
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         output = acc * (1.0 / l_i)[:, None]
-        output = output.to(self.mid_o_ptr.dtype.element_ty)
-        offsets = (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
-        offsets += offs_d[None, :]
-        cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
+        if HAS_GATE:
+            store_rmsnorm_gated(
+                output,
+                gate,
+                tokens,
+                q_heads,
+                valid,
+                self.mid_o_ptr,
+                cfg.NUM_Q_HEADS,
+                cfg.HEAD_DIM,
+                GATE_EPS,
+                cfg.NUM_WARPS,
+            )
+        else:
+            output = output.to(self.mid_o_ptr.dtype.element_ty)
+            offsets = (
+                tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
+            ) * cfg.HEAD_DIM
+            offsets += offs_d[None, :]
+            cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
 
     @gluon.jit
-    def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
-        """Let the last arriving split merge this row block and reset its counter."""
+    def finalize_splits(
+        self,
+        out_ptr,
+        sink_ptr,
+        counters_ptr,
+        has_sink: gl.constexpr,
+        gate,
+        GATE_EPS: gl.constexpr,
+        HAS_GATE: gl.constexpr,
+    ):
+        """Let the last arriving split merge this row block and reset its
+        counter; with HAS_GATE it stores ``store_rmsnorm_gated`` of the rows
+        with ``gate`` (``load_output_gate``)."""
         if self.arrive(counters_ptr) == self.cfg.NUM_KV_SPLITS - 1:
-            output = self.merge_splits(sink_ptr, has_sink).to(out_ptr.dtype.element_ty)
+            output = self.merge_splits(sink_ptr, has_sink)
             cfg = self.cfg
             offs_m = gl.arange(
                 0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
@@ -667,10 +740,29 @@ class AttentionProgram:
             tokens = self.row_tokens(offs_m)
             q_heads = self.row_heads(offs_m)
             valid = self.row_valid(offs_m)
-            out_offsets = (
-                tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
-            ) * cfg.HEAD_DIM + offs_d[None, :]
-            cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
+            if HAS_GATE:
+                store_rmsnorm_gated(
+                    output,
+                    gate,
+                    tokens,
+                    q_heads,
+                    valid,
+                    out_ptr,
+                    cfg.NUM_Q_HEADS,
+                    cfg.HEAD_DIM,
+                    GATE_EPS,
+                    cfg.NUM_WARPS,
+                )
+            else:
+                out_offsets = (
+                    tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
+                ) * cfg.HEAD_DIM + offs_d[None, :]
+                cdna4.buffer_store(
+                    output.to(out_ptr.dtype.element_ty),
+                    out_ptr,
+                    out_offsets,
+                    mask=valid[:, None],
+                )
             gl.store(counters_ptr + self.split_counter_offset(), 0)
 
     @gluon.jit
@@ -764,7 +856,7 @@ class AttentionProgram:
                 other=-float("inf"),
             ).to(gl.float32)
             next_m = maximum(final_m, part_lse)
-            if cfg.MAX_SEQLEN_Q > 1:
+            if cfg.CAUSAL_ROWS:
                 # A later query position's first splits can all precede
                 # its window, leaving -inf - -inf.
                 next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
@@ -792,6 +884,170 @@ class AttentionProgram:
 # ===-----------------------------------------------------------------------===#
 # Entry Point
 # ===-----------------------------------------------------------------------===#
+
+
+@gluon.constexpr_function
+def _gate_values_per_lane(NUM_Q_HEADS, HEAD_DIM):
+    """Values of a head each lane holds in the Triton
+    ``weightless_rmsnorm_gated_sigmoid`` kernel, whose per-head sum of squares
+    the gated store must reproduce.
+
+    That kernel runs 4 warps of 64 lanes over one ``[next_power_of_2(heads),
+    head_dim]`` BF16 tile per token, and Triton's default layout spreads the
+    tile evenly over the lanes, at most one 16-byte vector (8 BF16 values) a
+    lane: 2 values at 8 heads, 4 at 16, 8 from 32 up.
+    """
+    separate_op_lanes = 4 * 64  # its num_warps times the gfx950 wave size
+    vector_values = 8  # 16 bytes of BF16
+    per_lane = triton.next_power_of_2(NUM_Q_HEADS) * HEAD_DIM // separate_op_lanes
+    if per_lane > vector_values:
+        return vector_values
+    if per_lane < 1:
+        return 1
+    return per_lane
+
+
+@gluon.jit
+def output_gate_layout(
+    NUM_WARPS: gl.constexpr, NUM_Q_HEADS: gl.constexpr, HEAD_DIM: gl.constexpr
+):
+    """The layout ``store_rmsnorm_gated`` normalizes heads in: that of the
+    Triton ``weightless_rmsnorm_gated_sigmoid`` kernel over ``[heads,
+    HEAD_DIM]`` at this head count (``_gate_values_per_lane`` values a lane,
+    the rest of a head across lanes), so a head's sum of squares reduces in
+    the same order. A fixed split matches that kernel only at the head counts
+    that give it the same split."""
+    PER_LANE: gl.constexpr = _gate_values_per_lane(NUM_Q_HEADS, HEAD_DIM)
+    HEAD_LANES: gl.constexpr = HEAD_DIM // PER_LANE
+    # A wave's 64 lanes: HEAD_LANES across a head, the rest across heads.
+    return gl.BlockedLayout(
+        [1, PER_LANE], [64 // HEAD_LANES, HEAD_LANES], [NUM_WARPS, 1], [1, 0]
+    )
+
+
+@gluon.jit
+def load_output_gate(
+    gate_ptr,
+    gate_stride,
+    tokens,
+    q_heads,
+    valid,
+    NUM_Q_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """The BF16 gate rows ``gate_ptr[token * gate_stride + head * HEAD_DIM]``
+    of (token, head) rows, in ``output_gate_layout``."""
+    layout: gl.constexpr = output_gate_layout(NUM_WARPS, NUM_Q_HEADS, HEAD_DIM)
+    rows: gl.constexpr = gl.SliceLayout(1, layout)
+    tokens = gl.convert_layout(tokens, rows).to(gl.int64)
+    q_heads = gl.convert_layout(q_heads, rows)
+    valid = gl.convert_layout(valid, rows)
+    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout))
+    return gl.load(
+        gate_ptr
+        + tokens[:, None] * gate_stride
+        + q_heads[:, None] * HEAD_DIM
+        + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+
+
+@gluon.jit
+def store_rmsnorm_gated(
+    output,
+    gate,
+    tokens,
+    q_heads,
+    valid,
+    out_ptr,
+    NUM_Q_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    GATE_EPS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Store ``rmsnorm(o) * sigmoid(gate)`` for each (token, head) row of the
+    final attention output ``output`` ``[rows, HEAD_DIM]``, with ``gate`` from
+    ``load_output_gate``: weightless RMSNorm over the head of the output
+    rounded to ``out_ptr``'s dtype, then the sigmoid output gate.
+
+    Bitwise equal to storing the output and running
+    ``weightless_rmsnorm_gated_sigmoid`` on it: same layout
+    (``output_gate_layout``), same arithmetic, ``tl.sigmoid`` written out.
+    """
+    layout: gl.constexpr = output_gate_layout(NUM_WARPS, NUM_Q_HEADS, HEAD_DIM)
+    rows: gl.constexpr = gl.SliceLayout(1, layout)
+    values = gl.convert_layout(output.to(out_ptr.dtype.element_ty), layout)
+    values = values.to(gl.float32)
+    gate = gl.convert_layout(gate, layout).to(gl.float32)
+    tokens = gl.convert_layout(tokens, rows).to(gl.int64)
+    q_heads = gl.convert_layout(q_heads, rows)
+    valid = gl.convert_layout(valid, rows)
+    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout))
+    variance = gl.sum(values * values, axis=1) / HEAD_DIM
+    gated = values * gl.rsqrt(variance[:, None] + GATE_EPS) * (1 / (1 + gl.exp(-gate)))
+    gl.store(
+        out_ptr
+        + tokens[:, None] * (NUM_Q_HEADS * HEAD_DIM)
+        + q_heads[:, None] * HEAD_DIM
+        + offs_d[None, :],
+        gated.to(out_ptr.dtype.element_ty),
+        mask=valid[:, None],
+    )
+
+
+@gluon.jit
+def _store_head_rmsnorm_gated(
+    output,
+    gate,
+    q_index,
+    q_head,
+    out_ptr,
+    NUM_Q_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    GATE_EPS: gl.constexpr,
+):
+    """``store_rmsnorm_gated`` for one (query token, head) of a one-wave
+    program: ``output`` is its ``[HEAD_DIM]`` row, ``gate`` its
+    ``_load_head_output_gate``."""
+    layout: gl.constexpr = output_gate_layout(1, NUM_Q_HEADS, HEAD_DIM)
+    one: gl.constexpr = gl.SliceLayout(1, layout)
+    store_rmsnorm_gated(
+        gl.expand_dims(gl.convert_layout(output, gl.SliceLayout(0, layout)), 0),
+        gate,
+        gl.full([1], q_index, gl.int32, one),
+        gl.full([1], q_head, gl.int32, one),
+        gl.full([1], True, gl.int1, one),
+        out_ptr,
+        NUM_Q_HEADS,
+        HEAD_DIM,
+        GATE_EPS,
+        1,
+    )
+
+
+@gluon.jit
+def _load_head_output_gate(
+    gate_ptr,
+    gate_stride,
+    q_index,
+    q_head,
+    NUM_Q_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+):
+    """``load_output_gate`` of one (query token, head), ``[1, HEAD_DIM]``."""
+    one: gl.constexpr = gl.SliceLayout(1, output_gate_layout(1, NUM_Q_HEADS, HEAD_DIM))
+    return load_output_gate(
+        gate_ptr,
+        gate_stride,
+        gl.full([1], q_index, gl.int32, one),
+        gl.full([1], q_head, gl.int32, one),
+        gl.full([1], True, gl.int1, one),
+        NUM_Q_HEADS,
+        HEAD_DIM,
+        1,
+    )
 
 
 @gluon.jit
@@ -943,6 +1199,7 @@ def gluon_mha_decode_gfx950(
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
+    UNIFORM_ROWS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
     cfg = AttentionConfig(
@@ -960,6 +1217,7 @@ def gluon_mha_decode_gfx950(
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
+        UNIFORM_ROWS,
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
@@ -1004,6 +1262,8 @@ def gluon_mha_decode_sliding_gfx950(
     cache_seqlens_ptr,
     out_ptr,
     sink_ptr,
+    gate_ptr,
+    gate_stride,
     Q_STRIDE_B: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -1021,6 +1281,9 @@ def gluon_mha_decode_sliding_gfx950(
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    UNIFORM_ROWS: gl.constexpr,
+    GATE_EPS: gl.constexpr,
+    HAS_GATE: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -1037,6 +1300,7 @@ def gluon_mha_decode_sliding_gfx950(
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
+        UNIFORM_ROWS,
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
@@ -1062,6 +1326,9 @@ def gluon_mha_decode_sliding_gfx950(
 
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(sink_ptr, HAS_SINK)
+    gate = gate_ptr
+    if HAS_GATE:
+        gate = program.load_output_gate(gate_ptr, gate_stride)
 
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         physical_page = program.load_page(start_n)
@@ -1078,7 +1345,7 @@ def gluon_mha_decode_sliding_gfx950(
         acc = program.compute_pv(p, v, acc)
 
     l_i = program.apply_sinks(l_i, m_i, sink_log2, HAS_SINK)
-    program.store_output(acc, l_i)
+    program.store_output(acc, l_i, gate, GATE_EPS, HAS_GATE)
 
 
 @gluon.jit
@@ -1093,6 +1360,8 @@ def _mha_decode_sliding_split_atomic(
     out_ptr,
     sink_ptr,
     counters_ptr,
+    gate_ptr,
+    gate_stride,
     Q_STRIDE_B: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -1110,7 +1379,10 @@ def _mha_decode_sliding_split_atomic(
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    UNIFORM_ROWS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    GATE_EPS: gl.constexpr,
+    HAS_GATE: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -1127,6 +1399,7 @@ def _mha_decode_sliding_split_atomic(
         True,
         WINDOW_LEFT,
         IS_FP8,
+        UNIFORM_ROWS,
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
@@ -1145,6 +1418,10 @@ def _mha_decode_sliding_split_atomic(
     )
     q = program.load_q()
     m_i, l_i, acc, _ = program.init_state(sink_ptr, False)
+    # Every split loads its row block's gate now; only the last arriver uses it.
+    gate = gate_ptr
+    if HAS_GATE:
+        gate = program.load_output_gate(gate_ptr, gate_stride)
     if NUM_STAGES == 1:
         k_smem = gl.allocate_shared_memory(
             k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
@@ -1161,7 +1438,9 @@ def _mha_decode_sliding_split_atomic(
         )
 
     program.store_split(acc, l_i, m_i)
-    program.finalize_splits(out_ptr, sink_ptr, counters_ptr, HAS_SINK)
+    program.finalize_splits(
+        out_ptr, sink_ptr, counters_ptr, HAS_SINK, gate, GATE_EPS, HAS_GATE
+    )
 
 
 @gluon.jit
@@ -1170,6 +1449,8 @@ def gluon_mha_decode_reduce_gfx950(
     mid_lse_ptr,
     out_ptr,
     sink_ptr,
+    gate_ptr,
+    gate_stride,
     k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
@@ -1182,6 +1463,9 @@ def gluon_mha_decode_reduce_gfx950(
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    UNIFORM_ROWS: gl.constexpr,
+    GATE_EPS: gl.constexpr,
+    HAS_GATE: gl.constexpr,
 ):
     # One wave merges one (query token, head); the attention row tiling does
     # not apply, so the config takes a single-wave tile.
@@ -1200,40 +1484,80 @@ def gluon_mha_decode_reduce_gfx950(
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
         IS_FP8,
+        UNIFORM_ROWS,
         k_cache_ptr.dtype.element_ty,
         InputStrides(1, 1, 1),
     )
     q_index = gl.program_id(0)
     q_head = gl.program_id(1)
+    if HAS_GATE:
+        # Issued first, so the gate arrives while the partials merge.
+        gate = _load_head_output_gate(
+            gate_ptr, gate_stride, q_index, q_head, cfg.NUM_Q_HEADS, cfg.HEAD_DIM
+        )
 
     # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2.
     SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
+    # The partials stream in SPLIT_CHUNK-split tiles of at most
+    # _REDUCE_TILE_ELEMS floats, 128 registers per lane: 64 splits of head dim
+    # 256 in one tile would spill.
+    SPLIT_CHUNK: gl.constexpr = (
+        SPLIT_TILE
+        if SPLIT_TILE * cfg.HEAD_DIM <= _REDUCE_TILE_ELEMS
+        else _REDUCE_TILE_ELEMS // cfg.HEAD_DIM
+    )
     offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, cfg.reduce_layout))
+    offs_c = gl.arange(0, SPLIT_CHUNK, layout=gl.SliceLayout(1, cfg.reduce_layout))
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.reduce_layout))
     # Every split stores its partial, with lse = -inf when it has no tokens, so
     # the loads need not wait on cache_seqlens; only the padding tail is masked.
-    split_valid = offs_s < cfg.NUM_KV_SPLITS
-    base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
-    part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
-    o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
-    part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
+    base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS
+    all_lse = gl.load(
+        mid_lse_ptr + base + offs_s,
+        mask=offs_s < cfg.NUM_KV_SPLITS,
+        other=-float("inf"),
+    )
 
     # Global softmax max over all splits (folding in the sink).
-    m_i = max(part_lse, axis=0)
+    m_i = max(all_lse, axis=0)
     if HAS_SINK:
         sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
         m_i = maximum(m_i, sink)
     # Weighted sum of the split partials, normalized by the total softmax mass.
-    beta = gl.exp2(part_lse - m_i)
-    l_i = gl.sum(beta, axis=0)
+    l_i = gl.sum(gl.exp2(all_lse - m_i), axis=0)
     if HAS_SINK:
         l_i = l_i + gl.exp2(sink - m_i)
-    acc = gl.sum(part_o * beta[:, None], axis=0)
+    acc = gl.zeros(
+        [cfg.HEAD_DIM], gl.float32, layout=gl.SliceLayout(0, cfg.reduce_layout)
+    )
+    for chunk_start in gl.static_range(0, SPLIT_TILE, SPLIT_CHUNK):
+        split = chunk_start + offs_c
+        split_valid = split < cfg.NUM_KV_SPLITS
+        part_lse = gl.load(
+            mid_lse_ptr + base + split, mask=split_valid, other=-float("inf")
+        )
+        o_off = (base + split)[:, None] * cfg.HEAD_DIM + offs_d[None, :]
+        part_o = cdna4.buffer_load(
+            mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0
+        )
+        acc += gl.sum(part_o * gl.exp2(part_lse - m_i)[:, None], axis=0)
 
-    out_base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
     output = acc * (1.0 / l_i)
-    output = output.to(out_ptr.dtype.element_ty)
-    cdna4.buffer_store(output, out_ptr, out_base + offs_d)
+    if HAS_GATE:
+        _store_head_rmsnorm_gated(
+            output,
+            gate,
+            q_index,
+            q_head,
+            out_ptr,
+            cfg.NUM_Q_HEADS,
+            cfg.HEAD_DIM,
+            GATE_EPS,
+        )
+    else:
+        out_base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
+        output = output.to(out_ptr.dtype.element_ty)
+        cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
 
 class LaunchConfig(NamedTuple):
@@ -1302,6 +1626,11 @@ def _full_decode_stages(
     # tiles, 16 bytes per lane per buffer_load_dwordx4.
     copies_per_page = 2 * page_size * head_dim * element_size // (64 * 16 * num_warps)
     if (_FULL_DECODE_STAGES - 1) * copies_per_page > _GFX950_MAX_VMCNT:
+        return 1
+    # Head dim 256 pages fill the LDS with fewer buffers than the pipeline
+    # holds (one K and one V page per stage).
+    page_bytes = page_size * head_dim * element_size
+    if _FULL_DECODE_STAGES * 2 * page_bytes > _GFX950_LDS_BYTES:
         return 1
     return _FULL_DECODE_STAGES
 
@@ -1417,6 +1746,40 @@ def get_config(
     )
 
 
+def _output_gate_args(
+    q: torch.Tensor,
+    out_dtype: torch.dtype,
+    output_gate: torch.Tensor | None,
+    output_gate_eps: float | None,
+    return_lse: bool,
+    kernel: str,
+) -> tuple[torch.Tensor, int, float, bool]:
+    """The (gate tensor, row stride, eps, enabled) kernel arguments of an
+    optional RMSNorm output gate; ``q`` stands in for an absent gate."""
+    if output_gate is None:
+        if output_gate_eps is not None:
+            raise ValueError(f"{kernel}: output_gate_eps without output_gate")
+        return q, 0, 0.0, False
+    width = q.shape[1] * q.shape[2]
+    if (
+        output_gate_eps is None
+        or return_lse
+        or out_dtype != torch.bfloat16
+        or output_gate.dtype != torch.bfloat16
+        # output_gate_layout reduces a 64-wide head in the separate op's order.
+        or q.shape[2] != 64
+        or output_gate.shape != (q.shape[0], width)
+        or output_gate.stride(1) != 1
+        or output_gate.device != q.device
+    ):
+        raise ValueError(
+            f"{kernel}: the output gate needs output_gate_eps, BF16 output, head "
+            f"dim 64 and a BF16 [{q.shape[0]}, {width}] gate with unit column "
+            "stride, and no return_lse"
+        )
+    return output_gate, output_gate.stride(0), float(output_gate_eps), True
+
+
 def launch_gluon_mha_decode_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1433,11 +1796,39 @@ def launch_gluon_mha_decode_gfx950(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
+    output_gate_eps: float | None = None,
+    uniform_row_groups: int = 1,
 ) -> torch.Tensor:
+    """Run paged MHA decode on the split grid.
+
+    ``uniform_row_groups`` G > 1 says the call lists one request per query
+    row (``max_seqlen_q`` 1) and that each run of G consecutive rows shares
+    its page-table row and length: a block drafter's block positions,
+    which see the same keys (non-causal). Each run then goes through the
+    kernel as one G-row request, which reads its keys once instead of G
+    times, with the same bits.
+
+    With ``output_gate`` (BF16 ``[tokens, heads * dim]``, unit column
+    stride), the output is ``weightless_rmsnorm_gated_sigmoid`` of the
+    attention output with that gate and ``output_gate_eps``, computed in the
+    kernel that stores the output and bitwise equal to the separate op.
+    """
     reject_block_scales(
         "gluon_mha_decode_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
     )
     total_q = q.shape[0]
+    page_table_stride = page_table.stride(0)
+    uniform_rows = uniform_row_groups > 1
+    if uniform_rows:
+        if max_seqlen_q != 1 or total_q % uniform_row_groups:
+            raise ValueError(
+                "uniform_row_groups needs one row per request and whole groups, got "
+                f"{max_seqlen_q=}, {total_q} rows, {uniform_row_groups=}"
+            )
+        # A group's metadata is its first row's: every G-th entry.
+        max_seqlen_q = uniform_row_groups
+        page_table_stride *= uniform_row_groups
 
     has_sink = sinks is not None
     sink_arg = sinks if sinks is not None else q
@@ -1449,9 +1840,42 @@ def launch_gluon_mha_decode_gfx950(
         window_left=window_left,
         softmax_scale=softmax_scale,
     )
+    if uniform_rows:
+        # Keep the split count of the one-row requests the call lists: splits
+        # set the order partials merge in, so the same count keeps their bits.
+        num_kv_splits = get_config(
+            q=q,
+            k_cache=k_cache,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=1,
+            window_left=window_left,
+            softmax_scale=softmax_scale,
+        ).num_kv_splits
+        config = config._replace(
+            num_kv_splits=num_kv_splits,
+            num_stages=(
+                config.num_stages
+                if config.is_sliding
+                else _full_decode_stages(
+                    num_kv_splits,
+                    config.page_size,
+                    config.head_dim,
+                    k_cache.element_size(),
+                    config.num_warps,
+                )
+            ),
+        )
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    gate, gate_stride, gate_eps, has_gate = _output_gate_args(
+        q,
+        out_dtype,
+        output_gate,
+        output_gate_eps,
+        return_lse,
+        "gluon_mha_decode_gfx950",
+    )
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     # One work-group per request, KV head, row block and split.
     head_blocks = config.num_kv_heads * config.num_row_blocks
@@ -1466,11 +1890,13 @@ def launch_gluon_mha_decode_gfx950(
             cache_seqlens,
             output,
             sink_arg,
+            gate,
+            gate_stride,
             q.stride(0),
             q.stride(1),
             q.stride(2),
             config.sm_scale,
-            page_table.stride(0),
+            page_table_stride,
             config.page_size,
             max_seqlen_q,
             config.num_q_heads,
@@ -1483,6 +1909,9 @@ def launch_gluon_mha_decode_gfx950(
             config.window_left,
             has_sink,
             is_fp8,
+            uniform_rows,
+            gate_eps,
+            has_gate,
             num_warps=config.num_warps,
         )
     elif config.is_sliding:
@@ -1509,11 +1938,13 @@ def launch_gluon_mha_decode_gfx950(
             output,
             sink_arg,
             counters,
+            gate,
+            gate_stride,
             q.stride(0),
             q.stride(1),
             q.stride(2),
             config.sm_scale,
-            page_table.stride(0),
+            page_table_stride,
             config.page_size,
             config.num_kv_splits,
             max_seqlen_q,
@@ -1526,7 +1957,10 @@ def launch_gluon_mha_decode_gfx950(
             config.window_left,
             has_sink,
             is_fp8,
+            uniform_rows,
             config.num_stages,
+            gate_eps,
+            has_gate,
             num_warps=config.num_warps,
             **extern_compile_options(),
         )
@@ -1556,7 +1990,7 @@ def launch_gluon_mha_decode_gfx950(
             q.stride(1),
             q.stride(2),
             config.sm_scale,
-            page_table.stride(0),
+            page_table_stride,
             config.page_size,
             config.num_kv_splits,
             max_seqlen_q,
@@ -1569,6 +2003,7 @@ def launch_gluon_mha_decode_gfx950(
             config.is_sliding,
             config.window_left,
             is_fp8,
+            uniform_rows,
             config.num_stages,
             num_warps=config.num_warps,
             **extern_compile_options(),
@@ -1582,9 +2017,11 @@ def launch_gluon_mha_decode_gfx950(
             mid_lse,
             output,
             sink_arg,
+            gate,
+            gate_stride,
             k_cache,
             config.sm_scale,
-            page_table.stride(0),
+            page_table_stride,
             config.num_kv_splits,
             max_seqlen_q,
             config.page_size,
@@ -1594,6 +2031,9 @@ def launch_gluon_mha_decode_gfx950(
             config.block_n,
             has_sink,
             is_fp8,
+            uniform_rows,
+            gate_eps,
+            has_gate,
             num_warps=1,
         )
     return output
@@ -1993,6 +2433,7 @@ def gluon_mha_decode_balanced_gfx950(
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
         IS_FP8,
+        False,
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
@@ -2111,6 +2552,8 @@ def gluon_mha_decode_balanced_reduce_gfx950(
     mid_lse_ptr,
     out_ptr,
     sink_ptr,
+    gate_ptr,
+    gate_stride,
     k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
     SM_SCALE: gl.constexpr,
     MAX_SEQLEN_Q: gl.constexpr,
@@ -2122,6 +2565,8 @@ def gluon_mha_decode_balanced_reduce_gfx950(
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
+    GATE_EPS: gl.constexpr,
+    HAS_GATE: gl.constexpr,
 ):
     """Merge the balanced split partials of one (query token, head); one
     wave. The config keeps the decode's BLOCK_M to locate the row's work
@@ -2141,11 +2586,17 @@ def gluon_mha_decode_balanced_reduce_gfx950(
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
         IS_FP8,
+        False,
         k_cache_ptr.dtype.element_ty,
         InputStrides(1, 1, 1),
     )
     q_index = gl.program_id(0)
     q_head = gl.program_id(1)
+    if HAS_GATE:
+        # Issued first, so the gate arrives while the partials merge.
+        gate = _load_head_output_gate(
+            gate_ptr, gate_stride, q_index, q_head, cfg.NUM_Q_HEADS, cfg.HEAD_DIM
+        )
     # The decode's row block and row of this (query token, head): rows run
     # over query positions, then over the KV head's query heads.
     request = q_index // cfg.MAX_SEQLEN_Q
@@ -2187,8 +2638,22 @@ def gluon_mha_decode_balanced_reduce_gfx950(
     offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout))
     # A row without keys and without a sink has no softmax mass: output 0.
     output = acc * gl.where(l_i > 0.0, 1.0 / l_i, 0.0)
-    out_base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
-    cdna4.buffer_store(output.to(out_ptr.dtype.element_ty), out_ptr, out_base + offs_d)
+    if HAS_GATE:
+        _store_head_rmsnorm_gated(
+            output,
+            gate,
+            q_index,
+            q_head,
+            out_ptr,
+            cfg.NUM_Q_HEADS,
+            cfg.HEAD_DIM,
+            GATE_EPS,
+        )
+    else:
+        out_base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
+        cdna4.buffer_store(
+            output.to(out_ptr.dtype.element_ty), out_ptr, out_base + offs_d
+        )
 
 
 def launch_gluon_mha_decode_schedule_gfx950(
@@ -2273,6 +2738,8 @@ def launch_gluon_mha_decode_balanced_gfx950(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
+    output_gate_eps: float | None = None,
     *,
     schedule: torch.Tensor,
 ) -> torch.Tensor:
@@ -2295,6 +2762,8 @@ def launch_gluon_mha_decode_balanced_gfx950(
         return_lse: Must be False.
         softmax_scale: Score scale, or None for 1 / sqrt(dim).
         q_scale, k_scale, v_scale: Must be None.
+        output_gate, output_gate_eps: Optional RMSNorm output gate, as for
+            launch_gluon_mha_decode_gfx950.
         schedule: int32 [>= num_requests + 1, 2] schedule that
             launch_gluon_mha_decode_schedule_gfx950 computed from
             ``cache_seqlens``.
@@ -2331,9 +2800,16 @@ def launch_gluon_mha_decode_balanced_gfx950(
         softmax_scale = 1.0 / math.sqrt(head_dim)
     sm_scale = softmax_scale * _INV_LN2_VALUE
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    output = torch.empty(
-        q.shape, device=q.device, dtype=torch.bfloat16 if is_fp8 else q.dtype
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    gate, gate_stride, gate_eps, has_gate = _output_gate_args(
+        q,
+        out_dtype,
+        output_gate,
+        output_gate_eps,
+        return_lse,
+        "gluon_mha_decode_balanced_gfx950",
     )
+    output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     if num_requests == 0:
         return output
     # A balanced schedule has at most TARGET items, or one per row block.
@@ -2377,6 +2853,8 @@ def launch_gluon_mha_decode_balanced_gfx950(
         mid_lse,
         output,
         sinks if has_sink else q,
+        gate,
+        gate_stride,
         k_cache,
         sm_scale,
         max_seqlen_q,
@@ -2388,6 +2866,8 @@ def launch_gluon_mha_decode_balanced_gfx950(
         64,
         has_sink,
         is_fp8,
+        gate_eps,
+        has_gate,
         num_warps=1,
     )
     return output

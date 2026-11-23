@@ -61,10 +61,11 @@ engines.
   messages and answers them.
 
 Holder and reader must share the cache namespace: the same deployment
-identity (checkpoint, layout, attention TP, KV parallelism, backends,
-quantization, compatibility epoch) and weight version, as the L3 key prefix
-already defines it. Same namespace implies the same per-rank layout, so rank
-*i* of the reader reads only from rank *i* of the holder. Replicas in
+identity (configured model and revision, layout, attention TP, KV parallelism, backends,
+quantization, compatibility epoch) and weight version. Under `numerics=auto`,
+the live peer identity allows different MoE expert-parallel sizes. Other
+numerical policies and persistent L3 keys retain the expert-parallel size.
+Same namespace implies the same per-rank layout, so rank *i* of the reader reads only from rank *i* of the holder. Replicas in
 different namespaces never share: the two compare identities when they first
 connect and before every read (Faults, below).
 
@@ -232,9 +233,8 @@ or a lease the holder kept for the old one.
 **Different models or weights:** every answer carries the holder's namespace
 identity; a reader reads only from a holder whose identity equals its own.
 Equal token hashes under different weights would otherwise land wrong KV. The
-identity is the L3 deployment id (checkpoints, cache layout, numerics,
-parallel layout) and the weight version. A weight update must flush and name
-its `weight_version`, as with L3; once every rank holds the new weights the
+identity includes the deployment facts described above and the weight version. A weight update
+must flush and name its `weight_version`, as with L3; once every rank holds the new weights the
 replica serves and reads under the new identity and forgets the layouts it
 knew, so replicas mid-rollout never read each other.
 
@@ -278,7 +278,7 @@ engine can unregister its memory.
 
 Control messages (lookup, pin, release) travel between the replicas'
 servicers over ZMQ, not through the data plane. A holder's name is its
-servicer's endpoint (`host:port`, one per attention-DP replica), which the
+logical endpoint on its node's shared control port, which the
 router's hint carries; on first contact a reader fetches the holder's layout:
 its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
@@ -367,8 +367,10 @@ moving PD itself onto the new read entry point.
 
 ### Configuration
 
-`--peer-prefix-port` turns sharing on; attention-DP rank `r` binds
-`port + r`, and a replica's name is `host:port`, with the host from
+`--peer-prefix-port` turns sharing on; each node binds one public port. Rank zero is
+`host:port` and other attention-DP replicas are `host:port/rank`. The first
+local replica leader forwards control frames to the addressed sibling over
+loopback. The host comes from
 `--peer-prefix-host` (the address the worker advertises to the router) or
 else the detected local address. A holder hint must name the holder exactly
 so: a reader matches the holder's answers by that name.
@@ -439,7 +441,10 @@ holder's clock, from PIN application until actual release or expiry.
 transport service on each rank. Sum `tokenspeed:peer_outstanding_read_bytes`
 over reader ranks for bytes queued or executing against a holder; count distinct
 reader replicas with a positive sum to obtain concurrency at scrape time.
-Use `tokenspeed:peer_read_bytes_total` for successful physical payload.
+Use `tokenspeed:peer_read_bytes_total` for successful physical payload;
+`tokenspeed:peer_read_source_bytes_total` splits it, and the Disk pages a holder
+pushed with it ([RFC 0006](0006-disk-tier.md)), by the holder's `source_tier`:
+`device`, `host` or `disk`.
 Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
 A reader process that dies before terminal observation cannot report a completed
 sample; frontend failures and holder expiry remain independently observable.

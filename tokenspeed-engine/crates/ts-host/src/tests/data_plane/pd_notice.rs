@@ -87,7 +87,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
     let shared_l2_handle =
         Python::attach(|py| Py::new(py, crate::shared_l2::Handle::new()).unwrap());
     let mut data_plane =
-        PythonDataPlane::start(plane, Some(streams.clone()), shared_l2_handle).unwrap();
+        PythonDataPlane::start(plane, Some(streams.clone()), None, shared_l2_handle).unwrap();
     let mut scheduler = Python::attach(|py| {
         let globals = PyDict::new(py);
         py.run(
@@ -137,6 +137,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
         pair.prefill.register(rid, &bootstrap).unwrap();
         scheduler
             .submit_requests(&[RequestSpec {
+                admission_id: 0,
                 session_id: String::new(),
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),

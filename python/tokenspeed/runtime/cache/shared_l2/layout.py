@@ -107,8 +107,12 @@ class SharedL2Layout:
         """
         if any(spec.shard_count != 1 for spec in group_specs):
             raise ValueError("a shared L2 pool holds replicated cache groups only")
+        # A pool rank has no Disk tier, whose direct I/O is what pads a Host
+        # block: a pool page is the unpadded block.
         block_bytes, field_offsets, lcm_block_bytes, host_group_packing = (
-            _compute_host_layout(transfer_layout, group_specs=group_specs)
+            _compute_host_layout(
+                transfer_layout, group_specs=group_specs, block_alignment=1
+            )
         )
         geometry = {
             "prefix_granularity": int(prefix_granularity),

@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -42,7 +43,7 @@
 
 namespace tokenspeed {
 
-// The tree of published prefix boundaries, shared by both tiers: one node per
+// The tree of published prefix boundaries, shared by every tier: one node per
 // content hash some tier indexes or an eviction write-back is bringing to the
 // Host, linked to the chain hash of the page before it (a tail to its prior;
 // page 0 has none). It answers what the flat per-group indexes cannot: which
@@ -63,6 +64,8 @@ public:
     // Indexes into an array by CacheTier, such as a Node's per-tier fields.
     static constexpr std::size_t kDevice = static_cast<std::size_t>(CacheTier::kDevice);
     static constexpr std::size_t kHost = static_cast<std::size_t>(CacheTier::kHost);
+    static constexpr std::size_t kDisk = static_cast<std::size_t>(CacheTier::kDisk);
+    static constexpr std::array<std::size_t, kNumCacheTiers> kTiers{kDevice, kHost, kDisk};
 
     // The coordinator's geometry and policy, fixed for its lifetime.
     struct Config {
@@ -81,6 +84,8 @@ public:
         bool has_prefix_closed_groups;
         // A Host tier exists.
         bool has_host_tier;
+        // A Disk tier exists (docs/rfcs/0006-disk-tier.md).
+        bool has_disk_tier;
         // Queue the nodes that may have died for the coordinator's collection
         // (write_back_evictions).
         bool queue_dead_candidates;
@@ -106,15 +111,21 @@ public:
         // Some group indexes this hash on the Host tier, or a store is
         // bringing one there.
         bool OnHost() const noexcept { return entries_[kHost] > 0 || pending_stores_ > 0; }
+        // Some group indexes this hash on the Disk tier.
+        bool OnDisk() const noexcept { return entries_[kDisk] > 0; }
         // Some State group holds this boundary's checkpoint on `tier` (on the
         // Host, also one on its way there).
         bool HasCheckpoint(std::size_t tier) const noexcept {
             return state_entries_[tier] > 0 || (tier == kHost && pending_checkpoint_stores_ > 0);
         }
-        // Whether a checkpoint boundary is at or under this node on either
-        // tier.
+        // Whether a checkpoint boundary is at or under this node on any tier.
         bool HasCheckpointBoundaryInSubtree() const noexcept {
-            return checkpoint_boundaries_in_subtree[kDevice] > 0 || checkpoint_boundaries_in_subtree[kHost] > 0;
+            return std::ranges::any_of(checkpoint_boundaries_in_subtree, [](std::int32_t count) { return count > 0; });
+        }
+        // Whether some prefix-closed group indexes a block of this hash on any
+        // tier.
+        bool HasClosedEntries() const noexcept {
+            return std::ranges::any_of(closed_entries_, [](std::int32_t count) { return count > 0; });
         }
         // Some prefix-closed group indexes a block of this hash on both tiers.
         bool HasHostKvDuplicate() const noexcept { return closed_pairs_ > 0; }
@@ -153,7 +164,7 @@ public:
         // By CacheTier: how many boundaries in the subtree, this node
         // included, have a checkpoint on that tier (a boundary counts once,
         // however many State groups hold one there).
-        std::array<std::int32_t, 2> checkpoint_boundaries_in_subtree{};
+        std::array<std::int32_t, kNumCacheTiers> checkpoint_boundaries_in_subtree{};
         // How many children are on the Host (OnHost). A Host leaf -- on the
         // Host, no child on the Host -- is in the Host leaf list, in the order
         // it became one.
@@ -173,9 +184,9 @@ public:
         // by tier, and those of State and of prefix-closed groups among them;
         // prefix-closed blocks indexed on both tiers; eviction write-backs, and
         // the State checkpoints among them; publications in progress.
-        std::array<std::int32_t, 2> entries_{};
-        std::array<std::int32_t, 2> state_entries_{};
-        std::array<std::int32_t, 2> closed_entries_{};
+        std::array<std::int32_t, kNumCacheTiers> entries_{};
+        std::array<std::int32_t, kNumCacheTiers> state_entries_{};
+        std::array<std::int32_t, kNumCacheTiers> closed_entries_{};
         std::int32_t closed_pairs_{0};
         std::int32_t pending_stores_{0};
         std::int32_t pending_checkpoint_stores_{0};
@@ -229,12 +240,14 @@ public:
     // checkpoint's residency; it must outlive every hold.
     BoundaryTree(Config config, CheckpointTree* checkpoints) : config_{config}, checkpoints_{checkpoints} {}
 
-    // Called with a node's hash whenever its closed Host entries change, as
-    // a Host block of it is registered or leaves (the KV event stream
-    // reconciles that boundary's Host residency). It runs inside a hold's
-    // release, so it must not throw.
-    using HostEntriesObserver = std::function<void(const ContentHash&)>;
-    void SetHostEntriesObserver(HostEntriesObserver observer) { host_entries_observer_ = std::move(observer); }
+    // Called with a node's hash whenever its closed Host or Disk entries
+    // change, as a block of it is registered on or leaves either tier (the
+    // KV event stream reconciles that boundary's residency there). It runs
+    // inside a hold's release, so it must not throw.
+    using LowerTierEntriesObserver = std::function<void(const ContentHash&)>;
+    void SetLowerTierEntriesObserver(LowerTierEntriesObserver observer) {
+        lower_tier_entries_observer_ = std::move(observer);
+    }
     // Nodes and holds point at the tree, and nodes and the index at each
     // other's storage: a copy or a move would leave them pointing at the
     // original.
@@ -340,10 +353,11 @@ public:
         const bool has_state = config_.num_state_groups > 0;
         return CheckpointTree::Residency{
             .complete = {has_state && node.state_entries_[kDevice] == config_.num_state_groups,
-                         has_state && config_.has_host_tier && node.state_entries_[kHost] == config_.num_state_groups},
+                         has_state && config_.has_host_tier && node.state_entries_[kHost] == config_.num_state_groups,
+                         has_state && config_.has_disk_tier && node.state_entries_[kDisk] == config_.num_state_groups},
             .pending_host_store = node.pending_checkpoint_stores_ > 0,
             .held = node.state_entries_[kDevice] > 0 || node.state_entries_[kHost] > 0 ||
-                    node.pending_checkpoint_stores_ > 0,
+                    node.state_entries_[kDisk] > 0 || node.pending_checkpoint_stores_ > 0,
         };
     }
 
@@ -392,7 +406,7 @@ public:
     // coordinator's collection (queue_dead_candidates only). Dropping a holder
     // queues the node its removal stops at once no checkpoint boundary is left
     // under it (the deepest such node left; the collection climbs from it),
-    // and a node no prefix-closed group holds on either tier and no store is
+    // and a node no prefix-closed group holds on any tier and no store is
     // bringing to the Host (a gap); the coordinator queues others. A queued
     // node may be gone or alive again by the time it is collected. A hash
     // already at the back is not queued twice in a row.
@@ -423,8 +437,8 @@ public:
 private:
     static bool isHostLeaf(const Node& node) noexcept { return node.OnHost() && node.children_on_host == 0; }
     static bool unheld(const Node& node) noexcept {
-        return node.entries_[kDevice] == 0 && node.entries_[kHost] == 0 && node.pending_stores_ == 0 &&
-               node.publications_ == 0;
+        return node.entries_[kDevice] == 0 && node.entries_[kHost] == 0 && node.entries_[kDisk] == 0 &&
+               node.pending_stores_ == 0 && node.publications_ == 0;
     }
 
     Hold acquire(Node& node, Hold::Kind kind, std::size_t tier, bool state, bool closed) {
@@ -455,7 +469,8 @@ private:
         const bool moves_checkpoint = hold.state_ && checkpoints_ != nullptr;
         const CheckpointTree::Residency had_residency =
             moves_checkpoint ? CheckpointResidency(node) : CheckpointTree::Residency{};
-        const std::array<bool, 2> had_checkpoint{node.HasCheckpoint(kDevice), node.HasCheckpoint(kHost)};
+        const std::array<bool, kNumCacheTiers> had_checkpoint{node.HasCheckpoint(kDevice), node.HasCheckpoint(kHost),
+                                                              node.HasCheckpoint(kDisk)};
         const bool was_on_host = node.OnHost();
         const bool was_host_leaf = isHostLeaf(node);
         const bool had_duplicate = node.HasHostKvDuplicate();
@@ -465,8 +480,8 @@ private:
                 node.state_entries_[hold.tier_] += hold.state_ ? delta : 0;
                 node.closed_entries_[hold.tier_] += hold.closed_ ? delta : 0;
                 node.closed_pairs_ += hold.paired_ ? delta : 0;
-                if (hold.tier_ == kHost && hold.closed_ && host_entries_observer_) {
-                    host_entries_observer_(node.hash);
+                if (hold.tier_ != kDevice && hold.closed_ && lower_tier_entries_observer_) {
+                    lower_tier_entries_observer_(node.hash);
                 }
                 break;
             case Hold::Kind::kPendingStore:
@@ -482,7 +497,7 @@ private:
                        node.pending_checkpoint_stores_ >= 0 && node.publications_ >= 0,
                    "a boundary node lost a holder it did not have");
         bool checkpoint_flipped = false;
-        for (const std::size_t tier : {kDevice, kHost}) {
+        for (const std::size_t tier : kTiers) {
             if (node.HasCheckpoint(tier) != had_checkpoint[tier]) {
                 countCheckpointBoundary(node, tier, had_checkpoint[tier] ? -1 : 1);
                 checkpoint_flipped = true;
@@ -514,8 +529,7 @@ private:
         bool checkpoint_flipped_or_node_removed = apply(hold, -1);
         hold.node_ = nullptr;
         hold.paired_ = false;
-        bool is_gap = config_.has_prefix_closed_groups && node.closed_entries_[kDevice] == 0 &&
-                      node.closed_entries_[kHost] == 0 && node.pending_stores_ == 0;
+        bool is_gap = config_.has_prefix_closed_groups && !node.HasClosedEntries() && node.pending_stores_ == 0;
         Node* current = &node;
         while (unheld(*current) && current->first_child == nullptr) {
             Node* parent = current->parent;
@@ -587,9 +601,9 @@ private:
             if (!inserted) {
                 for (Node* ancestor = node.HasCheckpointBoundaryInSubtree() ? parent : nullptr; ancestor != nullptr;
                      ancestor = ancestor->parent) {
-                    ancestor->checkpoint_boundaries_in_subtree[kDevice] +=
-                        node.checkpoint_boundaries_in_subtree[kDevice];
-                    ancestor->checkpoint_boundaries_in_subtree[kHost] += node.checkpoint_boundaries_in_subtree[kHost];
+                    for (const std::size_t tier : kTiers) {
+                        ancestor->checkpoint_boundaries_in_subtree[tier] += node.checkpoint_boundaries_in_subtree[tier];
+                    }
                 }
                 if (node.OnHost()) {
                     const bool parent_was_host_leaf = isHostLeaf(*parent);
@@ -683,7 +697,7 @@ private:
 
     Config config_;
     CheckpointTree* checkpoints_;
-    HostEntriesObserver host_entries_observer_;
+    LowerTierEntriesObserver lower_tier_entries_observer_;
     // Node-based, so nodes, with the keys they own, keep their addresses
     // across rehashes.
     using NodeList = std::pmr::list<Node>;

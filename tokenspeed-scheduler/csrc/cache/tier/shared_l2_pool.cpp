@@ -58,7 +58,7 @@ SharedL2Pool::SharedL2Pool(std::span<const CacheGroupSpec> specs, std::int32_t p
       host_block_pool_(num_lcm_blocks, CheckedHostPacking(specs, std::move(host_group_packing))),
       cache_{MakeCoordinator(
           specs, prefix_granularity, unused_device_block_pool_, /*enable_l3_storage=*/false, &host_block_pool_,
-          /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+          /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
           /*write_back_evictions=*/false, checkpoint_retention_requests, checkpoint_retention_leaf_distance)},
       prefix_granularity_{prefix_granularity},
       headroom_lcm_blocks_{headroom_lcm_blocks} {

@@ -159,6 +159,7 @@ class ModelRunner:
         self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
+        self.dp_linear_max_tokens: int | None = None
         # Model Updater SDK client for the Mooncake weight update; None
         # without --model-update-config and on the draft runner. Holds only
         # the arguments until the first update imports the SDK (on the
@@ -311,13 +312,20 @@ class ModelRunner:
             placement.reserve_load_rows(
                 self.server_args.mapping.moe.tp_ep_size * max_num_tokens
             )
-        prepared = prepare_dp_linear_communication(
-            self.model, max_num_tokens, self.model_config.dtype, backend=None
-        )
+        prepared = self.prepare_dp_linear_communication(max_num_tokens)
         prepare = getattr(self.model, "prepare_communication_runtime", None)
         if prepare is None:
             return prepared
         return bool(prepare(max_num_tokens)) or prepared
+
+    def prepare_dp_linear_communication(self, max_num_tokens: int) -> bool:
+        """Prepare only the DP Linear workspaces, at their serving capacity."""
+        prepared = prepare_dp_linear_communication(
+            self.model, max_num_tokens, self.model_config.dtype, backend=None
+        )
+        if prepared:
+            self.dp_linear_max_tokens = max_num_tokens
+        return prepared
 
     def release_dp_linear_communication(self) -> None:
         """Collectively release this model's DP projection communication only.

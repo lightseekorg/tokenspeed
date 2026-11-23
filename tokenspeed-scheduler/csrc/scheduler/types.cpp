@@ -125,14 +125,20 @@ void SchedulerConfig::Validate() const {
             "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be at most half of "
             "max_scheduled_tokens (--chunked-prefill-size)");
     }
+    // The default leaves the yield unbounded, as before the bound existed.
+    if (prefill_chunk_yield_tokens > 0 && prefill_chunk_yield_max_rounds <= 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_max_rounds must be positive when prefill_chunk_yield_tokens is positive");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }
     if (enable_l3_storage) {
         if (!storage_config) throw std::invalid_argument("L3 requires an explicit StorageConfig");
         storage_config->Validate();
-        if (storage_config->max_host_blocks > host_allocator.NumUsableBlocks()) {
-            throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
+        if (storage_config->max_host_blocks > HostBlockCapacity()) {
+            throw std::invalid_argument(
+                "L3 Host credits must not exceed the usable Host parents times the densest Host packing");
         }
     }
     if (peer_config) {
@@ -155,9 +161,43 @@ void SchedulerConfig::Validate() const {
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: peer prefix sharing excludes L3 storage");
         }
+        if (peer_config->landing_tier == PeerLandingTier::kHost) {
+            if (!HasHostCache()) {
+                throw std::invalid_argument("Scheduler: peer Host landings need a Host L2 cache");
+            }
+            if (peer_config->max_host_landing_blocks > HostBlockCapacity()) {
+                throw std::invalid_argument(
+                    "Scheduler: peer Host landing credits must not exceed the usable Host parents times the densest "
+                    "Host packing");
+            }
+        }
     }
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
+    }
+    if (disk_allocator.total_pages < 0) {
+        throw std::invalid_argument("Scheduler: disk_allocator.total_pages must be non-negative");
+    }
+    if (HasDiskCache() != disk_config.has_value()) {
+        throw std::invalid_argument(
+            "Scheduler: a Disk tier (disk_allocator above the null page) requires disk_config, and disk_config "
+            "requires a Disk tier");
+    }
+    if (HasDiskCache()) {
+        disk_config->Validate();
+        // Host writes back to Disk in the background and Disk feeds only Host
+        // (docs/rfcs/0006-disk-tier.md).
+        if (!HasHostCache() || host_write_policy != HostWritePolicy::kWriteBack) {
+            throw std::invalid_argument("Scheduler: a Disk tier requires a Host L2 cache under the write-back policy");
+        }
+        if (disable_prefix_cache) {
+            throw std::invalid_argument("Scheduler: a Disk tier needs prefix caching");
+        }
+        if (disk_config->max_host_blocks > HostBlockCapacity()) {
+            throw std::invalid_argument(
+                "Scheduler: Disk tier Host credits must not exceed the usable Host parents times the densest "
+                "Host packing");
+        }
     }
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
         throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
@@ -256,6 +296,12 @@ void SchedulerConfig::Validate() const {
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
             "pool (--retraction-snapshot-host-gb > 0): without one nothing can be retracted");
     }
+    if (debug_force_retraction_max_per_request &&
+        (*debug_force_retraction_max_per_request <= 0 || debug_force_retraction_interval == 0)) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_max_per_request (--debug-force-retraction-max-per-request) "
+            "must be positive and requires a nonzero --debug-force-retraction-interval");
+    }
     if (prefill_decode_interval < 0) {
         throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
     }
@@ -273,6 +319,17 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
             "a P node runs no decodes and a D node no local prefill");
+    }
+    if (max_consecutive_prefill_rounds < 0) {
+        throw std::invalid_argument(
+            "Scheduler: max_consecutive_prefill_rounds (--max-consecutive-prefill-rounds) must be >= 0");
+    }
+    // The cap bounds how long an overdue prompt may suspend the interval:
+    // without an interval there is nothing to suspend.
+    if (max_consecutive_prefill_rounds != 0 && prefill_decode_interval == 0) {
+        throw std::invalid_argument(
+            "Scheduler: max_consecutive_prefill_rounds (--max-consecutive-prefill-rounds) requires "
+            "prefill_decode_interval (--prefill-decode-interval) > 0");
     }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {

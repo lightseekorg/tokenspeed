@@ -463,11 +463,13 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
             retracted->image.FollowPublished(published);
         }
     }
-    if (storage_transfers_ && storage_allowed_) {
+    if ((storage_transfers_ || disk_transfers_) && storage_allowed_) {
         std::vector<CacheKey> keys;
         keys.reserve(published.size());
         for (const auto& entry : published) keys.push_back(entry.key);
-        storage_transfers_->QueueBackups(keys);
+        if (storage_transfers_) storage_transfers_->QueueBackups(keys);
+        // What the write-back brought to Host is dirty there until cleaned.
+        if (disk_transfers_) disk_transfers_->QueueCleaning(keys);
     }
 }
 

@@ -69,3 +69,28 @@ def test_invalid_inputs_leave_metadata_unchanged(project, kind, date):
     with pytest.raises(ValueError):
         PREPARE(project, kind, date, "engine", set())
     assert path.read_bytes() == original
+
+
+def test_coordinated_nightly_keeps_its_date_for_resume_or_replacement(project):
+    base = tomllib.loads((project / "tokenspeed-engine/pyproject.toml").read_text())[
+        "project"
+    ]["version"]
+    occupied = {f"tokenspeed-engine-v{base}.post20261122"}
+    version = PREPARE(project, "nightly", "20261122", "version", occupied)
+    assert version == f"{base}.post20261122"
+    assert PREPARE(project, "nightly", "20261122", "engine", set()) == version
+
+
+def test_candidate_nightly_does_not_consume_normal_or_future_engine_dates(project):
+    base = tomllib.loads((project / "tokenspeed-engine/pyproject.toml").read_text())[
+        "project"
+    ]["version"]
+    tags = {f"tokenspeed-engine-v{base}.post20261122"}
+    candidate = PREPARE(project, "nightly", "20261122", "version", tags, "rc2")
+    assert candidate == f"{base}rc2.post20261122"
+    tags.add(f"tokenspeed-engine-v{candidate}")
+    assert PREPARE(project, "nightly", "20261122", "version", tags, "rc2") == candidate
+    assert (
+        PREPARE(project, "nightly", "20261123", "version", tags)
+        == f"{base}.post20261123"
+    )

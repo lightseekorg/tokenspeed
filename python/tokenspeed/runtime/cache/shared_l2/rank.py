@@ -176,6 +176,7 @@ def join_shared_l2_pool(
         attention_backend_name=attention_backend_name,
         draft_attention_backend_name=draft_attention_backend_name,
         world_cpu_group=world_cpu_group,
+        for_peer=False,
     )
     local_ip = get_local_ip_by_remote()
     enable_mooncake_ipv6_for_host(local_ip)

@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -244,7 +245,10 @@ def _signal_layer_ready(count_ptr, flag_ptr, nprogs):
     _arrive_and_signal_layer(count_ptr, flag_ptr, nprogs - 1)
 
 
-@triton.jit
+# A transfer's geometry rows and their offset follow the cache group it copies,
+# so they change between transfers: specializing on them (value 1, a multiple
+# of 16) would compile again mid-serve.
+@triton.jit(do_not_specialize=["num_geometry_rows", "geometry_offset"])
 def _transfer_cache_blocks_kernel(
     buffer_addresses_ptr,
     geometry_ptr,
@@ -931,7 +935,6 @@ def copy_state_rows_compact(
 
 
 @triton.jit(
-    do_not_specialize=["num_rows", "state_width"],
     **(
         {"do_not_specialize_on_alignment": ["blocks"]}
         if current_platform().is_npu
@@ -942,26 +945,23 @@ def _store_state_rows_kernel(
     states,
     slab,
     blocks,
-    num_rows,
-    state_width,
-    state_dim_2,
-    state_dim_3,
+    state_width: tl.constexpr,
+    state_dim_2: tl.constexpr,
+    state_dim_3: tl.constexpr,
     state_stride_0,
-    state_stride_1,
-    state_stride_2,
-    state_stride_3,
+    state_stride_1: tl.constexpr,
+    state_stride_2: tl.constexpr,
+    state_stride_3: tl.constexpr,
     slab_stride_0,
-    slab_stride_1,
-    slab_stride_2,
-    slab_stride_3,
+    slab_stride_1: tl.constexpr,
+    slab_stride_2: tl.constexpr,
+    slab_stride_3: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
-    row = offsets // state_width
-    feature = offsets % state_width
-    live = row < num_rows
-    destination = tl.load(blocks + row, mask=live, other=-1).to(tl.int64)
-    live = live & (destination >= 0)
+    row = tl.program_id(0).to(tl.int64)
+    feature = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    destination = tl.load(blocks + row).to(tl.int64)
+    live = (feature < state_width) & (destination >= 0)
     # int64 element offsets: a slab block id times its stride, or a late row of
     # a wide state, exceeds int32 on large pools.
     dim_1_index = feature // (state_dim_2 * state_dim_3)
@@ -1019,12 +1019,11 @@ def store_state_rows(
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
     state_width = states[0].numel()
-    block = 256
-    _store_state_rows_kernel[(triton.cdiv(blocks.numel() * state_width, block),)](
+    block = 512
+    _store_state_rows_kernel[(blocks.numel(), triton.cdiv(state_width, block))](
         states,
         slab,
         blocks,
-        blocks.numel(),
         state_width,
         states.shape[2],
         states.shape[3],
@@ -2182,7 +2181,26 @@ def get_mla_kv_buffer_triton(
 # -----------------------------------------------------------------------------
 
 
-@triton.jit
+# A destination row's alignment in bytes, which vectorizes the KV store's writes.
+_CACHE_ROW_ALIGN_BYTES = tl.constexpr(16)
+
+
+@functools.cache
+def _log_unaligned_store() -> None:
+    """Say once that store_kv_cache writes a cache whose rows are off
+    _CACHE_ROW_ALIGN_BYTES, which takes slower, unvectorized stores."""
+    logger.warning(
+        f"store_kv_cache: a K / V cache's rows are not "
+        f"{_CACHE_ROW_ALIGN_BYTES.value}-byte aligned, so its writes are not "
+        f"vectorized"
+    )
+
+
+# The destination cache pointers are not specialized: Triton keys a binary on
+# whether a tensor's storage fits in 2 GB, and the KV arena is sized after
+# startup's warm-up. Rows are addressed from int64 offsets, and their
+# alignment, which vectorizes the stores, is a launch constant (ROWS_ALIGNED).
+@triton.jit(do_not_specialize=["k_dst_ptr", "v_dst_ptr"])
 def _store_kv_cache_kernel(
     k_src_ptr,
     v_src_ptr,
@@ -2199,6 +2217,7 @@ def _store_kv_cache_kernel(
     n_kv_per_token: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    ROWS_ALIGNED: tl.constexpr,
 ):
     """Scatter rows of k_src/v_src into k_dst/v_dst at indices loc_ptr.
 
@@ -2217,16 +2236,26 @@ def _store_kv_cache_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     dst_row = tl.load(loc_ptr + row).to(tl.int64)
+    k_row = (
+        k_dst_ptr
+        + (dst_row // dst_page_size) * k_dst_page_stride
+        + (dst_row % dst_page_size) * k_dst_row_stride
+    )
+    v_row = (
+        v_dst_ptr
+        + (dst_row // dst_page_size) * v_dst_page_stride
+        + (dst_row % dst_page_size) * v_dst_row_stride
+    )
+    if ROWS_ALIGNED:
+        k_row = tl.multiple_of(k_row, _CACHE_ROW_ALIGN_BYTES)
+        v_row = tl.multiple_of(v_row, _CACHE_ROW_ALIGN_BYTES)
 
     if is_v == 1:
         src = tl.load(
             v_src_ptr + row * v_src_token_stride + offsets, mask=mask, other=0
         )
         tl.store(
-            v_dst_ptr
-            + (dst_row // dst_page_size) * v_dst_page_stride
-            + (dst_row % dst_page_size) * v_dst_row_stride
-            + offsets,
+            v_row + offsets,
             src,
             mask=mask,
         )
@@ -2235,10 +2264,7 @@ def _store_kv_cache_kernel(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
         tl.store(
-            k_dst_ptr
-            + (dst_row // dst_page_size) * k_dst_page_stride
-            + (dst_row % dst_page_size) * k_dst_row_stride
-            + offsets,
+            k_row + offsets,
             src,
             mask=mask,
         )
@@ -2293,6 +2319,17 @@ def store_kv_cache(
     block = triton.next_power_of_2(n_kv_k)
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
+    # Fixed for a cache: every row starts on _CACHE_ROW_ALIGN_BYTES.
+    rows_aligned = all(
+        value % _CACHE_ROW_ALIGN_BYTES.value == 0
+        for dst in (k_dst, v_dst)
+        for value in (
+            dst.data_ptr(),
+            *(stride * dst.element_size() for stride in dst.stride()[:-1]),
+        )
+    )
+    if not rows_aligned:
+        _log_unaligned_store()
     if use_pdl:
         kwargs["launch_pdl"] = True
     _store_kv_cache_kernel[(n_tokens, 2)](
@@ -2311,6 +2348,7 @@ def store_kv_cache(
         n_kv_k,
         BLOCK=block,
         ENABLE_PDL=use_pdl,
+        ROWS_ALIGNED=rows_aligned,
         **kwargs,
     )
 

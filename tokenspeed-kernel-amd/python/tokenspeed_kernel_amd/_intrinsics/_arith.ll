@@ -35,3 +35,12 @@ entry:
   %r = call float @llvm.arithmetic.fence.f32(float %x)
   ret float %r
 }
+
+; v_rcp_f32, the approximate reciprocal that ocml's MATH_FAST_RCP calls.
+declare float @llvm.amdgcn.rcp.f32(float)
+
+define float @__tokenspeed_arith_rcp_f32(float %x) alwaysinline {
+entry:
+  %r = call float @llvm.amdgcn.rcp.f32(float %x)
+  ret float %r
+}

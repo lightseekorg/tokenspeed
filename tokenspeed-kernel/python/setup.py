@@ -310,7 +310,6 @@ def _selected_install_requires() -> list[str]:
                 "nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl"
             ).replace("nvidia-cutlass-dsl-libs-cu13", "nvidia-cutlass-dsl-libs-cu12")
             for requirement in requirements
-            if not requirement.startswith("tokenspeed-cutedsl-kda==")
         ]
 
     deduped = []

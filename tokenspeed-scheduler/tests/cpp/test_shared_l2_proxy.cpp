@@ -98,7 +98,7 @@ struct Rank {
                       .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kPage},
                   CacheGroupSpec{
                       .attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
-              kPage, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
+              kPage, device, /*enable_l3_storage=*/false, &host, /*disk_pool=*/nullptr, /*snapshot_pool=*/nullptr,
               /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
               /*checkpoint_retention_requests=*/64)} {}
 

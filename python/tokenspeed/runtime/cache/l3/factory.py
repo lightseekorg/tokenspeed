@@ -32,12 +32,12 @@ import os
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import (
     L3Settings,
     MooncakeStoreSettings,
     parse_extra_config,
 )
-from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -45,6 +45,20 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> str:
+    from tokenspeed.runtime.cache.l3.identity import l3_checkpoint_id
+
+    return l3_checkpoint_id(
+        model_config.model_path,
+        hf_config=model_config.hf_config,
+        revision=str(model_config.revision or ""),
+        load_format=str(server_args.load_format),
+        # LoadConfig uses this same empty extra-config.
+        model_loader_extra_config={},
+        ext_yaml=str(server_args.ext_yaml or ""),
+    )
 
 
 def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any]:
@@ -105,6 +119,8 @@ def mooncake_store_library() -> str:
     """The Mooncake store library the engine host loads:
     ``TOKENSPEED_MOONCAKE_STORE_LIBRARY``, else the store's C ABI the
     tokenspeed-mooncake wheel installs."""
+    from tokenspeed.runtime.utils.env import envs
+
     override = envs.TOKENSPEED_MOONCAKE_STORE_LIBRARY.get()
     if override:
         return override
@@ -123,6 +139,62 @@ def mooncake_store_library() -> str:
     return path
 
 
+def _cache_checkpoint_ids(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    world_cpu_group: ProcessGroup | None,
+    *,
+    for_peer: bool,
+) -> list[str]:
+    if for_peer:
+        from tokenspeed.runtime.cache.l3.identity import warn_if_unpinned_peer_weights
+
+        target = str(model_config.revision or "")
+        draft = (
+            str(draft_model_config.revision or "")
+            if draft_model_config is not None
+            else ""
+        )
+        if server_args.mapping.rank == 0:
+            revisions = [target] if draft_model_config is None else [target, draft]
+            warn_if_unpinned_peer_weights(server_args.weight_version, revisions)
+        return [target, draft]
+
+    import torch.distributed as dist
+
+    from tokenspeed.runtime.cache.l3.identity import share_l3_checkpoint_ids
+
+    initialized = dist.is_available() and dist.is_initialized()
+    if world_cpu_group is not None:
+        if not initialized or dist.get_backend(world_cpu_group) != "gloo":
+            raise ValueError("L3 checkpoint agreement requires a Gloo CPU group")
+        world_size = dist.get_world_size(world_cpu_group)
+        rank = dist.get_rank(world_cpu_group)
+    else:
+        if initialized and dist.get_world_size() > 1:
+            raise ValueError("L3 checkpoint agreement requires an explicit CPU group")
+        world_size, rank = 1, 0
+    checkpoint_id = model_checkpoint_id(server_args, model_config)
+    draft_revision = (
+        model_checkpoint_id(server_args, draft_model_config)
+        if draft_model_config is not None
+        else ""
+    )
+
+    def gather_checkpoint_ids(payload: list) -> list:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, payload, group=world_cpu_group)
+        return gathered
+
+    return share_l3_checkpoint_ids(
+        [checkpoint_id, draft_revision],
+        rank=rank,
+        world_size=world_size,
+        gather=gather_checkpoint_ids,
+    )
+
+
 def cache_deployment_id(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -130,6 +202,7 @@ def cache_deployment_id(
     *,
     host_cache: HostCacheResources,
     world_cpu_group: ProcessGroup | None,
+    for_peer: bool = False,
 ) -> str:
     """The cache namespace's deployment id: everything that shapes a cached
     page's bytes (``storage_deployment_id``). Pages are shared only under one
@@ -141,8 +214,9 @@ def cache_deployment_id(
         model_config: Target checkpoint configuration, without model weights.
         draft_model_config: Draft checkpoint configuration, or None.
         host_cache: Shared Host resources and resolved CPU cache facts.
-        world_cpu_group: The existing Gloo world group for checkpoint agreement;
-            None in a single-process deployment. Every rank calls this.
+        for_peer: Apply the live peer cache compatibility rules.
+        world_cpu_group: Gloo group for multi-rank persistent L3 checkpoint
+            agreement. Live peers and single-process L3 pass None.
 
     Returns:
         The id; the weight version is not part of it.
@@ -157,6 +231,7 @@ def cache_deployment_id(
         attention_backend_name=host_cache.attention_backend_name,
         draft_attention_backend_name=host_cache.draft_attention_backend_name,
         world_cpu_group=world_cpu_group,
+        for_peer=for_peer,
     )
 
 
@@ -171,6 +246,7 @@ def cache_layout_deployment_id(
     attention_backend_name: str,
     draft_attention_backend_name: str,
     world_cpu_group: ProcessGroup | None,
+    for_peer: bool,
 ) -> str:
     """``cache_deployment_id`` from the cache facts themselves, for a rank
     that has no ``HostCacheResources``: a rank of a shared L2 pool, which
@@ -190,6 +266,7 @@ def cache_layout_deployment_id(
         draft_attention_backend_name: The resolved draft attention backend.
         world_cpu_group: The existing Gloo world group for checkpoint agreement;
             None in a single-process deployment. Every rank calls this.
+        for_peer: Apply the live peer cache compatibility rules.
 
     Returns:
         The id; the weight version is not part of it.
@@ -214,58 +291,18 @@ def cache_layout_deployment_id(
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
         checkpoint_granularities=checkpoint_granularities,
     )
-    import torch.distributed as dist
-
     from tokenspeed.runtime.cache.l3.identity import (
         L3_RUNTIME_COMPAT,
         l3_cache_quantization_id,
-        l3_checkpoint_id,
-        share_l3_checkpoint_ids,
         storage_deployment_id,
     )
 
-    initialized = dist.is_available() and dist.is_initialized()
-    if world_cpu_group is not None:
-        if not initialized or dist.get_backend(world_cpu_group) != "gloo":
-            raise ValueError("L3 checkpoint agreement requires a Gloo CPU group")
-        world_size = dist.get_world_size(world_cpu_group)
-        rank = dist.get_rank(world_cpu_group)
-    else:
-        if initialized and dist.get_world_size() > 1:
-            raise ValueError("L3 checkpoint agreement requires an explicit CPU group")
-        world_size, rank = 1, 0
-    checkpoint_id = l3_checkpoint_id(
-        model_config.model_path,
-        hf_config=model_config.hf_config,
-        revision=str(model_config.revision or ""),
-        load_format=str(server_args.load_format),
-        # LoadConfig currently gets the same empty extra-config;
-        # both must stay aligned if a shard pattern is wired through.
-        model_loader_extra_config={},
-        ext_yaml=str(server_args.ext_yaml or ""),
-    )
-    if draft_model_config is not None:
-        draft_revision = l3_checkpoint_id(
-            draft_model_config.model_path,
-            hf_config=draft_model_config.hf_config,
-            revision=str(draft_model_config.revision or ""),
-            load_format=str(server_args.load_format),
-            model_loader_extra_config={},
-            ext_yaml=str(server_args.ext_yaml or ""),
-        )
-    else:
-        draft_revision = ""
-
-    def gather_checkpoint_ids(payload: list) -> list:
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, payload, group=world_cpu_group)
-        return gathered
-
-    checkpoint_id, draft_revision = share_l3_checkpoint_ids(
-        [checkpoint_id, draft_revision],
-        rank=rank,
-        world_size=world_size,
-        gather=gather_checkpoint_ids,
+    checkpoint_id, draft_revision = _cache_checkpoint_ids(
+        server_args,
+        model_config,
+        draft_model_config,
+        world_cpu_group,
+        for_peer=for_peer,
     )
     pipeline_rank = server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
     if draft_model_config is not None:
@@ -295,6 +332,7 @@ def cache_layout_deployment_id(
         draft_attention_backend=draft_attention_backend_name,
         skip_softmax_threshold=float(server_args.skip_softmax_threshold),
         eagle3_layers_to_capture=eagle3_layers_to_capture,
+        for_peer=for_peer,
         kv_producer=_kv_producer_options(
             server_args,
             draft_dtype=(
@@ -367,7 +405,7 @@ def l3_settings(
 
     config = StorageRuntimeConfig.from_extra_config(
         server_args.kvstore_storage_backend_extra_config,
-        host_blocks=host_storage.num_host_lcm_blocks,
+        host_blocks=host_block_capacity(host_storage, ownership.shard_counts),
         prefix_granularity=host_cache.memory_plan.prefix_granularity,
     )
     deployment_id = cache_deployment_id(

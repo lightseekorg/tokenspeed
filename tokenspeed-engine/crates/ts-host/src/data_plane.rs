@@ -62,7 +62,7 @@ use ts_pd::LandedRequest;
 use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::{pd::Streams, shared_l2, LAUNCHER_FAILURE};
+use crate::{cache_events::CacheEvents, pd::Streams, shared_l2, LAUNCHER_FAILURE};
 
 mod result_buffers;
 
@@ -138,6 +138,9 @@ enum Op {
         tags: Vec<String>,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    FinishMemoryResume {
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     SnapshotExpertLoad {
         reply: mpsc::SyncSender<Result<ExpertLoad, String>>,
     },
@@ -170,6 +173,7 @@ impl Op {
             Op::ReloadForward { .. } => "Op::ReloadForward",
             Op::ReleaseMemory { .. } => "Op::ReleaseMemory",
             Op::ResumeMemory { .. } => "Op::ResumeMemory",
+            Op::FinishMemoryResume { .. } => "Op::FinishMemoryResume",
             Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
             Op::EpdPublish(_) => "Op::EpdPublish",
             Op::ApplyExpertPlacement { .. } => "Op::ApplyExpertPlacement",
@@ -297,6 +301,7 @@ pub struct PythonDataPlane {
     ops: Option<mpsc::Sender<Op>>,
     shared: Arc<Shared>,
     next_forward: ForwardId,
+    cache_events: Option<CacheEvents>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -306,9 +311,10 @@ impl PythonDataPlane {
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
     /// `shared_l2_handle` is the rank's, whether or not it joined a pool.
-    pub fn start(
+    pub(crate) fn start(
         plane: Py<PyAny>,
         streams: Option<Streams>,
+        cache_events: Option<CacheEvents>,
         shared_l2_handle: Py<shared_l2::Handle>,
     ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
@@ -326,6 +332,7 @@ impl PythonDataPlane {
             ops: Some(ops),
             shared: shared.clone(),
             next_forward: 0,
+            cache_events,
             thread: None,
         };
         let thread = thread::Builder::new()
@@ -500,9 +507,11 @@ impl DataPlane for PythonDataPlane {
                 .collect());
         }
         let polled: Vec<(String, u32)> = self.query(|plane| {
-            plane
-                .call_method0("poll_cache_events")
-                .and_then(|events| events.extract())
+            let events = plane.call_method0("poll_cache_events")?.extract()?;
+            if let Some(observations) = &self.cache_events {
+                observations.poll(plane);
+            }
+            Ok(events)
         })?;
         polled
             .into_iter()
@@ -575,6 +584,10 @@ impl DataPlane for PythonDataPlane {
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         let tags = tags.to_vec();
         self.ask(|reply| Op::ResumeMemory { tags, reply })
+    }
+
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
+        self.ask(|reply| Op::FinishMemoryResume { reply })
     }
 
     fn attach_grammars(
@@ -707,6 +720,7 @@ fn forward_loop(
                 | Op::CommitWeightUpdate { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
+                | Op::FinishMemoryResume { reply }
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
@@ -926,6 +940,13 @@ fn run(
                 .map_err(python);
             answer(reply, done)?;
         }
+        Op::FinishMemoryResume { reply } => {
+            let done = plane
+                .call_method0("finish_memory_resume")
+                .map(drop)
+                .map_err(python);
+            answer(reply, done)?;
+        }
         Op::AttachGrammars(grammars) => {
             plane
                 .call_method1("attach_grammars", (grammars,))
@@ -1054,4 +1075,4 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
 
 #[cfg(test)]
 #[path = "tests/data_plane.rs"]
-mod tests;
+pub(crate) mod tests;

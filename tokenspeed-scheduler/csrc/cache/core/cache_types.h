@@ -45,8 +45,10 @@ namespace tokenspeed {
 // ranks the kinds: a block republished at a later point keeps the higher one.
 enum class CacheBoundaryKind { kChunk, kEndpoint };
 
-// The tiers a prefix cache entry lives on: Device L1 and Host L2.
-enum class CacheTier { kDevice, kHost };
+// The tiers a prefix cache entry lives on: Device L1, Host L2 and the local
+// SSD (docs/rfcs/0006-disk-tier.md), which feeds only Host.
+enum class CacheTier { kDevice, kHost, kDisk };
+inline constexpr std::size_t kNumCacheTiers = 3;
 
 // The most new-request admissions an aged State checkpoint may rank behind
 // (SchedulerConfig::checkpoint_retention_requests).

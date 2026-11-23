@@ -45,7 +45,6 @@ NATIVE_PACKAGES = {
 
 
 CUDA13_UNSUFFIXED_PACKAGES = {
-    "tokenspeed-cutedsl-kda",  # Current AOT distribution is CUDA-13-only.
     "nvidia-cublas",
     "nvidia-cuda-runtime",
     "nvidia-cuda-nvrtc",
@@ -169,7 +168,6 @@ def main() -> None:
                     "nvidia-cudnn-cu13<0",
                     "nvidia-nccl-cu13<0",
                     "nvidia-nvshmem-cu13<0",
-                    "tokenspeed-cutedsl-kda<0",
                 ]
             )
             + "\n"

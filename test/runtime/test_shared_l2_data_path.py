@@ -418,9 +418,11 @@ def test_a_pool_is_laid_out_as_a_ranks_host_tier():
     layout = Arena().layout
     transfer = layout.transfer_layout
     lcm_block_bytes = layout.geometry["lcm_block_bytes"]
-    assert lcm_block_bytes == compute_host_lcm_block_bytes(transfer, group_specs=SPECS)
+    assert lcm_block_bytes == compute_host_lcm_block_bytes(
+        transfer, group_specs=SPECS, block_alignment=1
+    )
     assert layout.host_group_packing == compute_host_group_packing(
-        transfer, group_specs=SPECS
+        transfer, group_specs=SPECS, block_alignment=1
     )
     assert (lcm_block_bytes, layout.host_group_packing) == (28, (1, 2))
     assert (layout.block_bytes, layout.field_offsets) == ((28, 12), ((0, 12), (0,)))
@@ -737,7 +739,10 @@ def test_a_pool_rank_runs_no_other_host_cache_op(ranks):
             host_write_policy="write_through",
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
+            max_consecutive_prefill_rounds=0,
             storage_config=None,
+            num_disk_pages=0,
+            disk_config=None,
             cache_groups=[ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)],
         )
     )

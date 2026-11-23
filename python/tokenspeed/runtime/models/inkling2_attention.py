@@ -26,6 +26,7 @@ raw convolution history and checkpoints for every stream.
 
 from __future__ import annotations
 
+import itertools
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -117,22 +118,34 @@ class FP32AccumulationLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        if skinny_mm_supported(x, layer.weight):
+        return self.project(x, layer.weight, bias, layer_biased=layer.bias is not None)
+
+    @staticmethod
+    def project(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        layer_biased: bool,
+    ) -> torch.Tensor:
+        """``apply`` with ``weight`` (rows of a layer's weight) and ``bias``;
+        ``layer_biased`` tells whether the layer has a bias on any rank."""
+        if skinny_mm_supported(x, weight):
             if bias is None:
-                return kernel_mm(x, layer.weight, out_dtype=x.dtype)
-            return skinny_mm(x, layer.weight, bias, out_dtype=x.dtype)
+                return kernel_mm(x, weight, out_dtype=x.dtype)
+            return skinny_mm(x, weight, bias, out_dtype=x.dtype)
         # Keyed on the layer, not the call: a row-parallel layer passes its
         # bias on rank 0 only, and every rank must take the same GEMM (the
         # BF16 one runs collective tuning at startup).
         if (
             bias is None
-            and layer.bias is None
+            and not layer_biased
             and x.is_cuda
             and current_platform().is_nvidia
         ):
             with _fp32_split_k_sums():
-                return kernel_mm(x, layer.weight, out_dtype=x.dtype)
-        output = kernel_mm(x, layer.weight, bias=bias, out_dtype=torch.float32)
+                return kernel_mm(x, weight, out_dtype=x.dtype)
+        output = kernel_mm(x, weight, bias=bias, out_dtype=torch.float32)
         return output.to(x.dtype)
 
     def apply_into(
@@ -170,14 +183,19 @@ class Inkling2DynamicTaps:
 
 
 class Inkling2ShortConvolution(nn.Module):
-    """Static or input-dependent FIR using the common raw-input state path."""
+    """Static or input-dependent FIR using the common raw-input state path.
+
+    ``conv_layer_ids`` holds the convolution state layer of each pass of the
+    decoder layer (one entry unless the layer is in a looped core); every
+    pass keeps its own convolution state.
+    """
 
     def __init__(
         self,
         dim: int,
         kernel_size: int,
         stream: InklingConvStream,
-        layer_id: int,
+        conv_layer_ids: tuple[int, ...],
         channel_offset: int,
         tp_rank: int,
         dynamic: Inkling2DynamicTaps | None,
@@ -190,7 +208,7 @@ class Inkling2ShortConvolution(nn.Module):
         self.dim = dim
         self.kernel_size = kernel_size
         self.stream = stream
-        self.layer_id = layer_id
+        self.conv_layer_ids = tuple(conv_layer_ids)
         self.channel_offset = channel_offset
         self.tp_rank = tp_rank
         self.dynamic = dynamic is not None
@@ -273,13 +291,17 @@ class Inkling2ShortConvolution(nn.Module):
         )
 
     def from_mailbox(
-        self, source: MailboxTarget, tokens: int, ctx: ForwardContext
+        self, source: MailboxTarget, tokens: int, ctx: ForwardContext, pass_idx: int
     ) -> torch.Tensor:
         """Convolve the TP sum the ranks' producers published into ``source``
         (admitted by ``consumes_mailbox``): the sum of ``all_reduce_sconv``,
         added in FP32 rank order and rounded once."""
         state, checkpoints, batch = _sconv_stream(
-            ctx, self.layer_id, self.channel_offset, self.dim, self._group()
+            ctx,
+            self.conv_layer_ids[pass_idx],
+            self.channel_offset,
+            self.dim,
+            self._group(),
         )
         return inkling_ring_sconv_mailbox(
             source.mailbox.slots(source.parity),
@@ -301,11 +323,13 @@ class Inkling2ShortConvolution(nn.Module):
         x: torch.Tensor,
         ctx: ForwardContext,
         *,
+        pass_idx: int,
         all_reduce_group: Group | None,
         token_range: tuple[int, int] | None,
     ) -> torch.Tensor:
         """Convolve ``x`` with static taps; a dynamic convolution's coefficients
         are projected with its layer's K/V projection (Inkling2Attention).
+        ``pass_idx`` selects the pass's convolution state.
         With ``all_reduce_group`` (admitted by ``sums_partial``) ``x`` is
         this rank's partial, summed over the group by ``all_reduce_sconv``.
         ``token_range`` computes only those prefill rows (a sequence-parallel
@@ -313,9 +337,10 @@ class Inkling2ShortConvolution(nn.Module):
         if self.dynamic:
             raise ValueError("dynamic convolutions run in the attention prologue")
         weight = self.taps()
+        conv_layer_id = self.conv_layer_ids[pass_idx]
         if all_reduce_group is not None:
             state, checkpoints, batch = _sconv_stream(
-                ctx, self.layer_id, self.channel_offset, self.dim, self._group()
+                ctx, conv_layer_id, self.channel_offset, self.dim, self._group()
             )
             return all_reduce_sconv(
                 x.view(x.shape[0], self.dim),
@@ -335,7 +360,7 @@ class Inkling2ShortConvolution(nn.Module):
             x,
             weight,
             ctx,
-            self.layer_id,
+            conv_layer_id,
             self.channel_offset,
             self.dim,
             conv_group=self._group(),
@@ -391,12 +416,23 @@ class Inkling2RelativeProjection(nn.Module):
         )
 
 
-# Longer (compute-bound) batches project the Q, K and V sources with three GEMMs.
+# Longer (compute-bound) batches project the Q, K and V sources with three
+# GEMMs, the K and V sources' over only the rows they use.
 _STACKED_PROJECTION_MAX_TOKENS = 128
+# K's and V's segment, then tap segment (full layers), in the projection.
+_SOURCE_SEGMENTS = ((1, 6), (2, 7))
 
 
 class Inkling2Attention(nn.Module):
-    """Separate full-layer Q/K/V sources, relative bias and a zero-value sink."""
+    """Separate Q/K/V sources, relative bias and a zero-value sink.
+
+    Full layers always take three sources. Local layers take one, or three
+    in the later passes of a looped core, where each input gets its own
+    message. Each pass of a looped core layer attends over its own KV cache
+    (``attn`` for the first pass, ``loop_attn`` for later ones), or every
+    pass over the one cache of ``attn`` when the passes share it
+    (:meth:`pass_attention`). Each pass keeps its own convolution state.
+    """
 
     def __init__(
         self,
@@ -408,6 +444,14 @@ class Inkling2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        passes = range(config.layer_passes(layer_id))
+        # Each pass's KV cache layer and convolution state layer.
+        self.cache_layer_ids = tuple(
+            config.cache_layer_id(layer_id, pass_idx) for pass_idx in passes
+        )
+        self.conv_layer_ids = tuple(
+            config.conv_layer_id(layer_id, pass_idx) for pass_idx in passes
+        )
         self.is_local = is_local
         self.head_dim = config.swa_head_dim if is_local else config.head_dim
         self.d_rel = config.d_rel
@@ -440,6 +484,16 @@ class Inkling2Attention(nn.Module):
         pad = -(sum(self.split_sizes) + sum(self.tap_sizes)) % 8
         self.projection_sizes = (
             self.split_sizes + self.tap_sizes + ([pad] if pad else [])
+        )
+        # The projection rows a separate K or V source needs: its segment
+        # and (full layers) its taps.
+        ends = list(itertools.accumulate(self.projection_sizes))
+        self.source_rows = tuple(
+            tuple(
+                slice(ends[part] - self.projection_sizes[part], ends[part])
+                for part in parts[: 2 if taps else 1]
+            )
+            for parts in _SOURCE_SEGMENTS
         )
         self.qkvr = MergedColumnParallelLinear(
             config.hidden_size,
@@ -502,7 +556,7 @@ class Inkling2Attention(nn.Module):
         args = dict(
             dim=self.num_kv_heads * self.head_dim,
             kernel_size=config.sconv_kernel_size,
-            layer_id=layer_id,
+            conv_layer_ids=self.conv_layer_ids,
             tp_rank=mapping.attn.tp_rank,
             dynamic=(
                 None
@@ -526,20 +580,32 @@ class Inkling2Attention(nn.Module):
             and self.v_sconv.channel_offset != self.k_sconv.channel_offset + args["dim"]
         ):
             raise ValueError("Local K and V convolution streams must be adjacent")
-        self.attn = PagedAttention(
-            self.num_heads,
-            self.head_dim,
-            self.head_dim**-0.5,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            sliding_window_size=(
-                hf_sliding_window_to_window_left(config.sliding_window_size)
-                if is_local
-                else -1
-            ),
-            rotary_emb=None,
-            qk_norm=None,
-        )
+        # One paged attention a cache layer: passes that share a cache share it.
+        attention = [
+            PagedAttention(
+                self.num_heads,
+                self.head_dim,
+                self.head_dim**-0.5,
+                num_kv_heads=self.num_kv_heads,
+                layer_id=cache_layer_id,
+                sliding_window_size=(
+                    hf_sliding_window_to_window_left(config.sliding_window_size)
+                    if is_local
+                    else -1
+                ),
+                rotary_emb=None,
+                qk_norm=None,
+            )
+            for cache_layer_id in dict.fromkeys(self.cache_layer_ids)
+        ]
+        self.attn = attention[0]
+        self.loop_attn = nn.ModuleList(attention[1:]) if len(attention) > 1 else None
+
+    def pass_attention(self, pass_idx: int) -> PagedAttention:
+        """The paged attention over pass ``pass_idx``'s KV cache layer."""
+        if pass_idx == 0 or self.loop_attn is None:
+            return self.attn
+        return self.loop_attn[pass_idx - 1]
 
     def derive_projected_taps(self) -> None:
         """Write the full layer's tap rows of the projection from the loaded
@@ -558,14 +624,48 @@ class Inkling2Attention(nn.Module):
             : len(self.split_sizes) + len(self.tap_sizes)
         ]
 
+    def _source_parts(
+        self, projection: tuple[torch.Tensor, ...], stream: int
+    ) -> tuple[torch.Tensor, ...]:
+        """K's (``stream`` 0) or V's (1) segment of a whole projection, then
+        (full layers) its taps."""
+        parts = _SOURCE_SEGMENTS[stream][: len(self.source_rows[stream])]
+        return tuple(projection[part] for part in parts)
+
+    def _project_source(
+        self, source: torch.Tensor, stream: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Only the rows of ``source``'s projection that K (``stream`` 0) or V
+        (1) reads, as :meth:`_source_parts` splits them."""
+        rows = self.source_rows[stream]
+
+        def select(tensor: torch.Tensor) -> torch.Tensor:
+            if len(rows) == 1:
+                return tensor[rows[0]]
+            return torch.cat([tensor[part] for part in rows])
+
+        bias = self.qkvr.bias
+        projected = self.qkvr.quant_method.project(
+            source,
+            select(self.qkvr.weight),
+            None if bias is None else select(bias),
+            layer_biased=bias is not None,
+        )
+        return projected.split([part.stop - part.start for part in rows], dim=-1)
+
     def _project_full(
         self, sources: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ) -> list[tuple[torch.Tensor, ...]]:
-        """The Q, K and V projections of a full layer's three sources."""
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """The Q source's projection, and the K and V sources' parts of
+        theirs (:meth:`_source_parts`)."""
         q_source = sources[0]
         tokens = q_source.shape[0]
         if tokens > _STACKED_PROJECTION_MAX_TOKENS:
-            return [self._project(source) for source in sources]
+            return (
+                self._project(q_source),
+                self._project_source(sources[1], 0),
+                self._project_source(sources[2], 1),
+            )
         # One GEMM over all three sources reads the weight once.
         row_bytes = q_source.numel() * q_source.element_size()
         storage = q_source.untyped_storage().data_ptr()
@@ -583,15 +683,23 @@ class Inkling2Attention(nn.Module):
             if adjacent
             else torch.cat(sources)
         )
-        return [
+        q_projection, k_projection, v_projection = (
             stacked[part * tokens : (part + 1) * tokens].split(
                 self.projection_sizes, dim=-1
             )[: len(self.split_sizes) + len(self.tap_sizes)]
             for part in range(3)
-        ]
+        )
+        return (
+            q_projection,
+            self._source_parts(k_projection, 0),
+            self._source_parts(v_projection, 1),
+        )
 
     def _kv_conv(
-        self, ctx: ForwardContext, taps: tuple[torch.Tensor | None, torch.Tensor | None]
+        self,
+        ctx: ForwardContext,
+        taps: tuple[torch.Tensor | None, torch.Tensor | None],
+        cache_layer_id: int,
     ) -> KVShortConv:
         """This forward's K/V convolution, which the prologue applies to the
         K and V projections before their head steps; ``taps`` are the full
@@ -600,7 +708,7 @@ class Inkling2Attention(nn.Module):
         if self.is_local:
             ring, fields, batch = _sconv_stream(
                 ctx,
-                self.layer_id,
+                cache_layer_id,
                 self.k_sconv.channel_offset,
                 2 * self.k_sconv.dim,
                 "kvconv",
@@ -609,7 +717,7 @@ class Inkling2Attention(nn.Module):
             rings = (ring[:, :, :dim], ring[:, :, dim:])
         else:
             (k_ring, k_fields, batch), (v_ring, v_fields, _) = (
-                _sconv_stream(ctx, self.layer_id, c.channel_offset, c.dim, "kvconv")
+                _sconv_stream(ctx, cache_layer_id, c.channel_offset, c.dim, "kvconv")
                 for c in convs
             )
             rings, fields = (k_ring, v_ring), (*k_fields, *v_fields)
@@ -641,6 +749,7 @@ class Inkling2Attention(nn.Module):
         ctx: ForwardContext,
         log_scaling_tau: torch.Tensor | None,
         *,
+        pass_idx: int,
         reduce_output: bool,
         publish_into: MailboxTarget | None,
         partial_out: torch.Tensor | None,
@@ -650,27 +759,35 @@ class Inkling2Attention(nn.Module):
         ``partial_out`` (BF16 ``[T, H]``) when given. With ``publish_into``
         (admitted by ``publishes``) the partial goes into that mailbox parity
         instead, for its consumer to sum (returns None): FP32 MMA chains over
-        K rounded once, as ``wo_ud`` accumulates, in another order."""
+        K rounded once, as ``wo_ud`` accumulates, in another order.
+        ``pass_idx`` selects the pass's KV cache and convolution state."""
+        if len(streams) != (1 if self.is_local and pass_idx == 0 else 3):
+            raise ValueError(
+                f"Layer {self.layer_id} pass {pass_idx} got {len(streams)} sources"
+            )
+        attention = self.pass_attention(pass_idx)
         q_source = streams[0]
-        k_source, v_source = (q_source, q_source) if self.is_local else streams[1:]
+        k_source, v_source = (q_source, q_source) if len(streams) == 1 else streams[1:]
         tokens = q_source.shape[0]
-        if self.is_local:
-            q_projection = k_projection = v_projection = self._project(q_source)
+        if len(streams) == 1:
+            q_projection = self._project(q_source)
+            k_parts = self._source_parts(q_projection, 0)
+            v_parts = self._source_parts(q_projection, 1)
         else:
-            q_projection, k_projection, v_projection = self._project_full(
+            q_projection, k_parts, v_parts = self._project_full(
                 (q_source, k_source, v_source)
             )
         q, _, _, relative, gate, sink = q_projection[:6]
         # A full layer's K taps come from the K source's row, V's from V's.
-        taps = (None, None) if self.is_local else (k_projection[6], v_projection[7])
+        taps = (None, None) if self.is_local else (k_parts[1], v_parts[1])
         tau = None if self.is_local else log_scaling_tau
         # The prologue convolves the K and V rows, clips the Q, K and relative
         # heads, normalizes the V heads, projects the relative logits and
         # writes the KV cache.
-        prepared = self.attn.relative_prologue(
+        prepared = attention.relative_prologue(
             q.view(tokens, self.num_heads, self.head_dim),
-            k_projection[1],
-            v_projection[2],
+            k_parts[0],
+            v_parts[0],
             ctx,
             RelativeHeadNorm(
                 relative=relative.view(tokens, self.num_heads, self.d_rel),
@@ -684,12 +801,12 @@ class Inkling2Attention(nn.Module):
                 clip_eps=Inkling2L2Clip.eps,
                 value_norm_eps=self.norm_eps if self.normalize_values else None,
                 q_output_scale=tau,
-                kv_conv=self._kv_conv(ctx, taps),
+                kv_conv=self._kv_conv(ctx, taps, self.conv_layer_ids[pass_idx]),
             ),
         )
         # The backend gates the FP32 attention output by its LSE and the sink
         # (rel_mha_gate_sink), inside the decode kernel's reduction.
-        gated = self.attn.attend(
+        gated = attention.attend(
             prepared.q,
             prepared.k,
             prepared.v,
