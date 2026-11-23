@@ -113,7 +113,7 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
     expected_qsa = qsa_pages * qsa_page_size + safe_positions % qsa_page_size
     expected_qsa = torch.where(
         (expected_positions >= 0) & (qsa_pages > 0), expected_qsa, 0
-    ).to(torch.int32)
+    )
     recent_pages = recent_table[
         expected_requests, safe_positions // recent_page_size
     ].long()
@@ -138,6 +138,84 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
         draft_tags,
         torch.full_like(draft_tags, torch.iinfo(torch.int64).min),
     )
+
+
+def test_qwen4_exp_qsa_prepare_metadata_slots_pass_int32(device: str) -> None:
+    # FlatKV atom pages times the 256-token page pass int32 on large pools.
+    far_page = (1 << 23) + 5
+    seq_lens = torch.tensor([300], device=device, dtype=torch.int32)
+    qsa_table = torch.tensor([[7, far_page]], device=device, dtype=torch.int32)
+    recent_table = torch.arange(1, 6, device=device, dtype=torch.int32).reshape(1, 5)
+    _, _, qsa_locs, _, _ = qwen4_exp_qsa_prepare_metadata(
+        seq_lens,
+        2,
+        2,
+        qsa_table,
+        256,
+        recent_table,
+        64,
+        4,
+        enable_pdl=False,
+    )
+    expected = far_page * 256 + torch.tensor([42, 43], device=device)
+    assert int(expected.min()) > torch.iinfo(torch.int32).max
+    torch.testing.assert_close(qsa_locs, expected)
+
+
+def test_qwen4_exp_qsa_compress_writes_slots_past_int32(device: str) -> None:
+    torch.manual_seed(5)
+    ratio, head_dim, rotary_dim = 4, 16, 8
+    far_page = (1 << 23) + 1
+    logical = torch.tensor([3], device=device)
+    requests = torch.zeros(1, device=device, dtype=torch.long)
+    token_k = torch.randn(1, 1, head_dim, device=device, dtype=torch.bfloat16)
+    recent_locs = torch.tensor([67], device=device, dtype=torch.int32)
+    raw = torch.randn(2, ratio, 1, head_dim, device=device, dtype=torch.bfloat16)
+    position_values = logical[:, None].expand(-1, 3)
+    position_cache = torch.zeros(2, 3, device=device, dtype=torch.int64)
+    norm_weight = torch.rand(head_dim, device=device) + 0.5
+    cos_sin_cache = torch.randn(16, rotary_dim, device=device)
+
+    def compress(qsa_loc: int, compressed: torch.Tensor) -> None:
+        qwen4_exp_qsa_compress_and_store(
+            token_k,
+            logical,
+            requests,
+            recent_locs,
+            raw,
+            position_values,
+            position_cache,
+            norm_weight,
+            1e-6,
+            cos_sin_cache,
+            torch.tensor([qsa_loc], device=device, dtype=torch.int64),
+            compressed,
+            64,
+            ratio,
+            256,
+            stage_verify_buffers=None,
+            stage_draft=False,
+        )
+
+    near = torch.zeros(2, 64, 1, head_dim, device=device, dtype=torch.bfloat16)
+    compress(256 + 3, near)
+    assert far_page * 256 + 3 > torch.iinfo(torch.int32).max
+    # 4-element row strides put the far row's element offset past 2^31 (4 GiB buffer).
+    row_stride = 4
+    far_offset = far_page * 64 * row_stride
+    assert far_offset > torch.iinfo(torch.int32).max
+    buffer = torch.zeros(
+        far_offset + 64 * row_stride + head_dim, device=device, dtype=torch.bfloat16
+    )
+    far = buffer.as_strided(
+        (far_page + 1, 64, 1, head_dim), (64 * row_stride, row_stride, head_dim, 1)
+    )
+    compress(far_page * 256 + 3, far)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(near[1, 0]) > 0
+    written = buffer[far_offset : far_offset + head_dim]
+    torch.testing.assert_close(written, near[1, 0, 0], rtol=0, atol=0)
+    assert torch.count_nonzero(buffer) == torch.count_nonzero(written)
 
 
 def _ref_compress_pool(
@@ -2178,7 +2256,7 @@ def test_qsa_metadata_warmup_covers_page_table_strides(
         expected = (
             positions,
             owners,
-            (qsa_table[owners, 0].long() * 64 + positions).int(),
+            qsa_table[owners, 0].long() * 64 + positions,
             (recent_table[owners, 0].long() * 64 + positions).int(),
             ((positions + 1) // 4).int(),
         )

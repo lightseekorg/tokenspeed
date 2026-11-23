@@ -94,8 +94,12 @@ def _qsa_kernel(scratch, step, qsa_weights, cache, trace_buf, PLAN: gl.constexpr
     trace.flush(table, trace_buf)
 
 
-@pytest.mark.parametrize("L", [999, 2601, 2603])
-def test_qsa_stages_match_tokenspeed_math(L):
+# The far case compresses into a QSA page whose slot and element offset pass 2^31.
+@pytest.mark.parametrize(
+    ("L", "far_qsa_page"),
+    [(999, False), (2601, False), (2603, False), (1023, True)],
+)
+def test_qsa_stages_match_tokenspeed_math(L, far_qsa_page):
     g = torch.Generator().manual_seed(L)
     dev = "cuda"
     mixed = (torch.randn(HIDDEN, generator=g) * 0.5).bfloat16()
@@ -121,6 +125,12 @@ def test_qsa_stages_match_tokenspeed_math(L):
     compressed = (
         (torch.randn(q_pages + 1, 64, 1, IDX, generator=g) * 0.3).bfloat16().cuda()
     )
+    if far_qsa_page:
+        far_page = (1 << 23) + 1
+        qsa_table[L // 256] = far_page
+        # Pages 256 elements apart keep the far page in a 4 GiB buffer.
+        far = torch.zeros(far_page * 256 + 64 * IDX, dtype=torch.bfloat16, device=dev)
+        compressed = far.as_strided((far_page + 1, 64, 1, IDX), (256, IDX, IDX, 1))
     r_pages = max_pos // 64
     recent_table = (torch.randperm(r_pages, generator=g) + 1).int().cuda()
     raw_key = (torch.randn(r_pages + 1, 4, 1, IDX, generator=g)).bfloat16().cuda()

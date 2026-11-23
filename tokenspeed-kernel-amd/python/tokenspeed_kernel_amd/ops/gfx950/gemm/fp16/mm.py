@@ -1642,6 +1642,11 @@ _DECODE_CONFIGS: dict[
         128: (32, 32, 256, 2, 2, 3, 4, 1),
         256: (64, 32, 256, 2, 2, 3, 4, 1),
     },
+    # Muse TP4 pre-expert projection at 9-32 rows.
+    (1024, 8192): {
+        16: (16, 16, 512, 2, 2, 4, 4, 8),
+        32: (32, 32, 256, 2, 2, 4, 8, 8),
+    },
     # o_proj
     (7168, 1536): {
         4: (16, 16, 512, 1, 4, 2, 1, 8),
@@ -1875,6 +1880,78 @@ def gluon_mm_a16w16_decode_num_counters_gfx950(M: int, N: int, K: int) -> int:
     return triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
 
 
+def _launch_decode_config(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    counters: torch.Tensor | None,
+    config: tuple[int, int, int, int, int, int, int, int],
+    warm: bool,
+) -> None:
+    """Launch the decode GEMM ``C = A @ B.T`` with one config.
+
+    With ``warm`` it only compiles that config's binary, and ``counters`` is
+    unused.
+    """
+    M, K = A.shape
+    N = B.shape[0]
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k == 1:
+        partial = arrivals = C
+    elif warm:
+        # Compiling reads only the pointer types and alignment.
+        partial = torch.empty(16, device=A.device, dtype=torch.float32)
+        arrivals = torch.empty(16, device=A.device, dtype=torch.int32)
+    else:
+        check_splitk_counters(
+            counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
+        )
+        partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
+        arrivals = counters
+    args = (
+        A,
+        B,
+        C,
+        C,
+        C,
+        partial,
+        arrivals,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+    )
+    kwargs = dict(
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        num_warps=warps_m * warps_n,
+        **extern_compile_options(),
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    if warm:
+        compile_ahead(gluon_mm_a16w16_medium_gfx950, *args, **kwargs)
+    else:
+        gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](*args, **kwargs)
+
+
 def launch_gluon_mm_a16w16_decode_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1931,73 +2008,49 @@ def launch_gluon_mm_a16w16_decode_gfx950(
 
     C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
 
-    def launch(config, warm: bool) -> None:
-        block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = (
-            config
-        )
-        num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
-        if split_k == 1:
-            partial = arrivals = C
-        elif warm:
-            # Compiling reads only the pointer types and alignment.
-            partial = torch.empty(16, device=A.device, dtype=torch.float32)
-            arrivals = torch.empty(16, device=A.device, dtype=torch.int32)
-        else:
-            check_splitk_counters(
-                counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
-            )
-            partial = _get_partial_scratch(
-                A.device, num_tiles, split_k, block_n, block_m
-            )
-            arrivals = counters
-        args = (
-            A,
-            B,
-            C,
-            C,
-            C,
-            partial,
-            arrivals,
-            M,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            B.stride(1),
-            B.stride(0),
-            C.stride(0),
-            C.stride(1),
-            C.stride(0),
-            C.stride(1),
-            C.stride(0),
-            C.stride(1),
-        )
-        kwargs = dict(
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            WARPS_M=warps_m,
-            WARPS_N=warps_n,
-            NUM_BUFFERS=num_buffers,
-            GROUP_SIZE_M=GROUP_SIZE_M,
-            ADD3=False,
-            SPLIT_K=split_k,
-            NUM_XCDS=num_xcds,
-            num_warps=warps_m * warps_n,
-            **extern_compile_options(),
-            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-        )
-        if warm:
-            compile_ahead(gluon_mm_a16w16_medium_gfx950, *args, **kwargs)
-        else:
-            gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](*args, **kwargs)
-
     if warm_variants:
         for other in dict.fromkeys(_DECODE_CONFIGS[(N, K)].values()):
             if other != config:
-                launch(other, warm=True)
-    launch(config, warm=False)
+                _launch_decode_config(A, B, C, None, other, warm=True)
+    _launch_decode_config(A, B, C, counters, config, warm=False)
     return C
+
+
+def compile_gluon_mm_a16w16_decode_gfx950(B: torch.Tensor) -> None:
+    """Compile, without launching, every decode GEMM binary for a weight.
+
+    That is one binary per distinct config measured for the weight's
+    ``[N, K]``, for an output in the weight's dtype. The binaries do not depend
+    on the row count (``M`` is not specialized), but Triton still keys them on
+    the 16-byte alignment of the pointers and strides. They are compiled from
+    fresh contiguous tensors, so they serve any row count of launches whose
+    operands and output rows are 16-byte aligned, as contiguous row slices of
+    these weights' shapes are; a launch with other alignment compiles its own.
+
+    Args:
+        B: Contiguous ``[N, K]`` fp16/bf16 weight on a GPU with a measured
+            decode config (``supports_gluon_mm_a16w16_decode_weight_gfx950``).
+    """
+    if B.ndim != 2 or B.dtype not in _SUPPORTED_DTYPES or not B.is_cuda:
+        raise ValueError(
+            f"decode dense16 GEMM expects a 16-bit [N, K] weight on a GPU, got "
+            f"{B.dtype} {tuple(B.shape)} on {B.device}"
+        )
+    if not B.is_contiguous():
+        raise ValueError("decode dense16 GEMM requires a contiguous weight")
+    N, K = B.shape
+    configs = _DECODE_CONFIGS.get((N, K))
+    if configs is None:
+        raise ValueError(f"decode dense16 GEMM has no config for N={N}, K={K}")
+    A = torch.empty((DECODE_MIN_M, K), dtype=B.dtype, device=B.device)
+    C = torch.empty((DECODE_MIN_M, N), dtype=B.dtype, device=B.device)
+    for config in dict.fromkeys(configs.values()):
+        _launch_decode_config(A, B, C, None, config, warm=True)
+
+
+def supports_gluon_mm_a16w16_decode_weight_gfx950(N: int, K: int) -> bool:
+    """Whether the decode GEMM has a measured config for an ``[N, K]`` weight."""
+    return (N, K) in _DECODE_CONFIGS
 
 
 # Full-K 16x16 tiles over 512-deep K with three buffers. Every output runs its

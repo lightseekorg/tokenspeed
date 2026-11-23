@@ -502,6 +502,7 @@ def _worker_attention(
 
         backend = SimpleNamespace(
             spec_num_tokens=1,
+            supports_mla_projected_value_decode=False,
             write_locations=lambda layer, mode: torch.arange(
                 row_counts[rank], dtype=torch.int64
             ),
@@ -577,6 +578,7 @@ def _narrowing_ctx(rank: int) -> ForwardContext:
     )
     backend = SimpleNamespace(
         spec_num_tokens=VERIFY,
+        supports_mla_projected_value_decode=False,
         forward_write_locations=lambda layer, mode: torch.arange(
             rows, dtype=torch.int64
         ),

@@ -141,7 +141,11 @@ def _on_architecture(monkeypatch: pytest.MonkeyPatch, version: ArchVersion) -> N
     "projection_rows,capacity,rows,tactic",
     [
         # 22 eight-CTA clusters: the 212-SM part.
-        (324, 22, 64, (8, 64, 32, 5)),
+        (324, 22, 16, (16, 64, 16, 5)),
+        (324, 22, 17, (16, 64, 32, 5)),
+        (324, 22, 32, (16, 64, 32, 5)),
+        (324, 22, 33, (16, 64, 64, 5)),
+        (324, 22, 64, (16, 64, 64, 5)),
         (324, 22, 65, (8, 64, 64, 5)),
         (324, 22, 192, (8, 64, 64, 5)),
         (324, 22, 193, (4, 64, 64, 5)),
@@ -197,6 +201,14 @@ def test_sm100_and_sm103_ignore_the_sm107_tiles(monkeypatch, version):
         assert chosen[case] == [
             cute_fused._model_tactic(rows, *case) for rows in range(1, 1025)
         ]
+
+
+@pytest.mark.parametrize("version", [ArchVersion(10, 0), ArchVersion(10, 3)])
+@pytest.mark.parametrize("rows", [17, 33, 64])
+def test_sm100_and_sm103_keep_split_k_8_at_17_to_64_rows(monkeypatch, version, rows):
+    _on_architecture(monkeypatch, version)
+    tactic = cute_fused._model_tactic(rows, 4, 2560, 320, 324)
+    assert (tactic[0], tactic[1], tactic[2], tactic[5]) == (8, 64, 32, 5)
 
 
 @torch.inference_mode()

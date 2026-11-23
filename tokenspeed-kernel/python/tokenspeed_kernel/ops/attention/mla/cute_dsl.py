@@ -163,7 +163,8 @@ class DcpValueTail:
     ) -> bool:
         """Whether :meth:`__call__` serves these tensors.
 
-        Only sizes and dtypes decide, which every rank of a call shares.
+        Only sizes, dtypes, and the weight's layout decide, which every rank
+        of a call shares.
         """
         box = self.mailbox
         rows = partials.shape[0]
@@ -176,6 +177,7 @@ class DcpValueTail:
             and lse.shape == partials.shape[:2]
             and lse.stride(-1) == 1
             and weight.shape == (box.heads, _LATENT, _VALUE)
+            and weight.stride() == (_LATENT * _VALUE, 1, _LATENT)
             and weight.dtype == torch.bfloat16
             and out.shape == (rows, box.heads * _VALUE)
             and out.dtype == torch.bfloat16

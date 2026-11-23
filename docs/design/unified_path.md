@@ -1538,6 +1538,38 @@ unification still can NOT test: mempool reuse and hostfunc semantics — the
 e2e regression matrix keeps graph-on and graph-off configurations for this
 reason.
 
+## Model-facing attention operations
+
+Models call the outer `AttentionBackend`; they do not inspect a composite's
+Python type or extract its children. The composite routes operations by the
+layer and owns graph breaks, transfer step recording and state acceptance.
+A linear-attention composite's paged metadata, cache-group views and sparse
+cache access follow its full-attention child. The MSA composite publishes the
+shared request layout through its dense router and routes model bindings to
+the same dense or sparse router as the layer's compute.
+
+`prefill_request_layout()` returns an immutable `PrefillRequestLayout` containing
+host `input_lengths` and `prefix_lengths` for the active extend requests. The
+paged router and recurrent backend publish it from the scheduler's CPU mirrors
+when they initialize extend/mixed metadata. Mixed state-attention rounds publish
+the complete extend layout after preparing their separate decode metadata.
+Pure decode/idle refresh, decode graph capture seeding and pool rebinding clear
+the layout. Snapshots contain no device tensor or padding rows and do
+not alias reusable input buffers. Models that partition an input span use this
+view rather than reading another attention family's private metadata. Decode
+rows continue to use the forward's explicit decode width.
+
+A model/backend pair can define a small typed interface for input operands or
+loaded-weight preparation and request it through
+`model_binding(layer_id, binding_type)`. The selected owner explicitly returns
+its bound implementation; unsupported types return `None`. Composites route the
+request by layer rather than searching the tree for a matching class. Bindings
+should expose the required operations, not the backend object or a second
+attention forward. Numerical planning stays with its existing owner, and all
+attention execution, metadata refresh, cache binding and state commits continue
+through the outer backend. A binding must read current owner readiness across
+pool/weight changes rather than caching an admission-time answer.
+
 ## Backend package layout
 
 `layers/attention/backends/` is organized by the role a node plays in the
