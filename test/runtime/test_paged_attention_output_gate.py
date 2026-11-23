@@ -114,8 +114,11 @@ def _pool_mib() -> float:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_captured_extend_gates_without_pinning_the_gate():
-    """attend's eager break reads each layer's gate; holding it would keep every
-    layer's gate in each capture, growing graph memory with the bucket sum."""
+    """Captured gated extends do not pin their output gates.
+
+    attend's eager break reads each layer's gate; holding it would keep every
+    layer's gate in each capture, growing graph memory with the bucket sum.
+    """
     probe = torch.empty(1, device="cuda")
     if weak_ref_tensor(probe) is probe:
         pytest.skip("weak_ref extension unavailable; identity fallback")

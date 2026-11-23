@@ -98,8 +98,7 @@ class QueryShardGather:
 
 @dataclass(frozen=True)
 class RMSNormOutputGate:
-    """Per-head weightless RMSNorm of an attention output, times the sigmoid
-    of ``gate``.
+    """Per-head weightless RMSNorm of an attention output, times sigmoid(gate).
 
     Frozen, so an eager graph break holds the gate without pinning its memory
     (see ``breakable_cuda_graph._weak_ref_arg``).
