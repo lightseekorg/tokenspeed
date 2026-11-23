@@ -96,6 +96,23 @@ class QueryShardGather:
             )
 
 
+@dataclass(frozen=True)
+class RMSNormOutputGate:
+    """Per-head weightless RMSNorm of an attention output, times the sigmoid
+    of ``gate``.
+
+    Frozen, so an eager graph break holds the gate without pinning its memory
+    (see ``breakable_cuda_graph._weak_ref_arg``).
+
+    Attributes:
+        gate: ``[tokens, heads * head_dim]`` output-gate logits.
+        eps: RMSNorm epsilon.
+    """
+
+    gate: torch.Tensor
+    eps: float
+
+
 def hf_sliding_window_to_window_left(sliding_window: int) -> int:
     """HF sliding windows count the current token; kernels take the number of
     earlier tokens still visible (``window_left``)."""
@@ -273,7 +290,7 @@ class PagedAttention(nn.Module):
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         ctx: ForwardContext,
-        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
+        rmsnorm_output_gate: RMSNormOutputGate | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Core attention over prepared inputs, the eager break: the prologue's
@@ -281,12 +298,10 @@ class PagedAttention(nn.Module):
         value rows. A model that runs :meth:`prologue` inside its own stream
         scope calls this afterwards.
 
-        ``rmsnorm_output_gate=(gate, eps)`` returns
-        ``weightless_rmsnorm_gated_sigmoid`` of the output instead: per-head
-        RMSNorm, times the sigmoid of ``gate`` (``[tokens, heads *
-        head_dim]``). A decode whose backend ``gates_decode_output`` applies
-        it where the kernel stores the output, with the same bits; every other
-        forward runs the separate op after.
+        ``rmsnorm_output_gate`` returns the gated output instead. A decode
+        whose backend ``gates_decode_output`` applies it where the kernel
+        stores the output, with the same bits; every other forward runs the
+        separate ``weightless_rmsnorm_gated_sigmoid`` after.
         """
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
@@ -312,13 +327,12 @@ class PagedAttention(nn.Module):
         )
         if rmsnorm_output_gate is None or in_kernel:
             return output
-        gate, eps = rmsnorm_output_gate
         return weightless_rmsnorm_gated_sigmoid(
             output.contiguous(),
-            gate,
+            rmsnorm_output_gate.gate,
             self.tp_q_head_num,
             self.v_head_dim,
-            eps,
+            rmsnorm_output_gate.eps,
             pdl_enabled(),
         )
 

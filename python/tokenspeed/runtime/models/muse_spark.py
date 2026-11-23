@@ -124,6 +124,7 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
+    RMSNormOutputGate,
     hf_sliding_window_to_window_left,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -1321,7 +1322,7 @@ class MuseSparkAttention(nn.Module):
                 positions,
                 ctx,
                 rmsnorm_output_gate=(
-                    (output_gate, self.rms_norm_eps) if gated else None
+                    RMSNormOutputGate(output_gate, self.rms_norm_eps) if gated else None
                 ),
             )
         if not gated:
