@@ -382,20 +382,23 @@ regenerate replayable groups; equal work preserves submission order. Resident ch
 local prefill; D's remote admission and decode ordering are unchanged.
 
 Only the oldest waiting prompt counts the later first admissions that go
-ahead of it, by their prefill work (prompt tokens less the hit they resume
-from). Once they have taken as much work as its own (`kPrefillAgingShare`), it
-receives selection priority; once it starts or leaves, the next oldest gets
-its own allowance. Counting work rather than admissions bounds the share of
-the prefill budget an aged prompt takes to about half while it is the
-oldest: a fixed count of short admissions would age a long prompt every few
-admissions and let its chunks hold the head of line (§1.1) for most of the
-budget, and under a backlog every mid-sized prompt would wait behind it.
-The price falls on the longest prompts: under a backlog that outlasts them
-they are served last, in submission order, each after its share. The order
-cannot shorten that wait, only move it between prompt lengths; the prefill
-budget the prefill/decode interval leaves (§3.3) bounds how fast a backlog
-drains.
-Priority is reevaluated after each
+ahead of it, by their prefill work: the work prompts are ranked by (prompt
+tokens less the hit they resume from, plus the tokens replayed there), and
+each at least a batch row's even share of the round's token budget
+(`max_scheduled_tokens / max_batch_size`), so rounds that batch rows rather
+than tokens bound still age it. Once they have taken as much work as its own
+(`kPrefillAgingShare`), it receives selection priority; once it starts or
+leaves, the next oldest gets its own allowance. Counting work rather than
+admissions bounds the share of a token-bound prefill budget an aged prompt
+takes to about half while it is the oldest: a fixed count of short
+admissions would age a long prompt every few admissions and let its chunks
+hold the head of line (§1.1) for most of the budget, and under a backlog
+every mid-sized prompt would wait behind it. The price falls on the longest
+prompts: under a backlog that outlasts them they are served last, in
+submission order, each after its share. Under a token-bound backlog the
+order cannot shorten that wait, only move it between prompt lengths; the
+prefill budget the prefill/decode interval leaves (§3.3) bounds how fast a
+backlog drains. Priority is reevaluated after each
 admission, including within one batch. Failed admissions and resident chunks
 do not count. On the P role, first admissions filling the budget a chunk
 leaves, and those it gave way to with chunk yielding, count toward the same

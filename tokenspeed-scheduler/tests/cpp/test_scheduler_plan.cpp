@@ -1557,18 +1557,8 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesTheLeastWorkFirstWhenShortPrefillsGoF
     EXPECT_EQ(Round(), (PrefillRows{{"g1", 0, 13, 13}, {"ahead", 0, 14, 14}, {"holder", 24, 28, 36}}));
 }
 
-// The fill takes a protected prompt first, protection reevaluated after each
-// admission. "ahead" (10 tokens) ages once its own work went ahead of it:
-// seven 1-token prompts filling a 7-row batch take 7, and their transfers
-// then hold the request slots for a round. The holder ranks first as above,
-// and its own admission (8 tokens past its checkpoint) brings the work to 15:
-// protected, ahead fills 10 of the 28 tokens left before the three 9-token
-// prompts that rank ahead of it by work, two of which fill the rest.
-// At 16 tokens the holder brings it to 15 and f1's admission to 24: ahead
-// follows f1 and takes the 16 tokens f2 would have. A protected prompt the
-// budget left cannot take is passed over, not a stop: at 30 tokens, ahead ages
-// after seven 4-token passes and the holder (36 of 30), leaves the 28 to the
-// three 9-token prompts and starts next round.
+// Seven passes count a row's share each (28): a 26-token "ahead" is protected and filled first; at 30 it is passed
+// over.
 TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
     const auto run = [this](int pass_rounds, std::int32_t pass_tokens, std::int32_t ahead_tokens) {
         constexpr int kPasses = 7;
@@ -1595,12 +1585,10 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
         }
         return std::vector<PrefillRows>{Round(), Round()};
     };
-    EXPECT_EQ(run(1, 1, 10),
-              (std::vector<PrefillRows>{{{"ahead", 0, 10, 10}, {"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
-                                        {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
-    EXPECT_EQ(run(1, 1, 16), (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"ahead", 0, 16, 16}, {"holder", 8, 12, 16}},
-                                                       {{"holder", 12, 16, 16}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}}}));
-    EXPECT_EQ(run(1, 4, 30),
+    EXPECT_EQ(run(1, 1, 26),
+              (std::vector<PrefillRows>{{{"ahead", 0, 26, 26}, {"holder", 8, 12, 16}},
+                                        {{"holder", 12, 16, 16}, {"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}}}));
+    EXPECT_EQ(run(1, 1, 30),
               (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"ahead", 0, 28, 30}}}));
 }

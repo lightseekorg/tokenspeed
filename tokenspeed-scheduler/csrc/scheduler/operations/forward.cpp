@@ -87,9 +87,17 @@ bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
 }
 
-// The prefill work a first admission took: its prompt less the hit it resumed from.
-std::int64_t admittedPrefillWork(Request& admitted) {
-    return std::max<std::int64_t>(admitted.PrefillSize() - admitted.CacheProgressRef().resume_tokens, 0);
+// Prefill work, as prompts are ranked and aged by: the prompt past its hit plus the tokens replayed there.
+std::int64_t prefillWork(const CacheCoordinator& coordinator, std::int32_t prompt_tokens, std::int32_t hit_tokens) {
+    return std::int64_t{prompt_tokens} - hit_tokens + coordinator.ReplayTokens(hit_tokens);
+}
+
+// What a first admission counts toward the oldest prompt's allowance: its work, at least a row's even share of the
+// round's budget, so rounds that batch rows rather than tokens bound still age that prompt.
+std::int64_t admittedPrefillWork(Request& admitted, const CacheCoordinator& coordinator,
+                                 const SchedulerConfig& config) {
+    return std::max(prefillWork(coordinator, admitted.PrefillSize(), admitted.CacheProgressRef().resume_tokens),
+                    std::int64_t{config.max_scheduled_tokens} / std::max(config.max_batch_size, 1));
 }
 
 void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted, std::int64_t admitted_work) {
@@ -1656,7 +1664,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                     build.remote_prefill.emplace_back(std::move(*admitted));
                 } else {
                     if (config_.enable_short_prefill_first && first_admission) {
-                        recordPrefillBypass(candidates, blocker, admittedPrefillWork(*blocker));
+                        recordPrefillBypass(candidates, blocker, admittedPrefillWork(*blocker, coordinator_, config_));
                     }
                     pushOperation(build, *blocker, std::move(*admitted));
                     blocker->TrackScheduledForward();
@@ -1929,7 +1937,7 @@ std::optional<std::int32_t> Scheduler::wholePromptTokens(Request& request, Reque
     if (checkpoint > hit_tokens && (checkpoint - hit_tokens) % coordinator_.PrefixGranularity() != 0) {
         return std::nullopt;
     }
-    return request.PrefillSize() - hit_tokens + coordinator_.ReplayTokens(hit_tokens);
+    return static_cast<std::int32_t>(prefillWork(coordinator_, request.PrefillSize(), hit_tokens));
 }
 
 std::vector<Scheduler::WholePrompt> Scheduler::wholePromptsAfter(std::span<Request* const> candidates, std::size_t from,
@@ -2013,7 +2021,7 @@ std::int32_t Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild
                                                      build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
                                                      /*must_complete=*/true)) {
             if (config_.enable_short_prefill_first) {
-                recordPrefillBypass(candidates, request, prompt.tokens);
+                recordPrefillBypass(candidates, request, admittedPrefillWork(*request, coordinator_, config_));
             }
             pushOperation(build, *request, std::move(*admitted));
             request->TrackScheduledForward();
@@ -2100,9 +2108,10 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 const auto match = matchPrefixAtAdmission(request);
                 const auto hit_tokens =
                     std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-                const auto remaining = match.waits_for_eviction_store ? std::numeric_limits<std::int32_t>::max()
-                                                                      : request->PrefillSize() - hit_tokens +
-                                                                            coordinator_.ReplayTokens(hit_tokens);
+                const auto remaining =
+                    match.waits_for_eviction_store
+                        ? std::numeric_limits<std::int32_t>::max()
+                        : static_cast<std::int32_t>(prefillWork(coordinator_, request->PrefillSize(), hit_tokens));
                 pending.push_back(PendingPrefill{request, remaining});
             }
         };
@@ -2180,7 +2189,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                                          decode_reserve, build.load_backs, build.kv_page_budget,
                                                          yield_tokens, /*must_complete=*/false)) {
                 if (short_work_first) {
-                    recordPrefillBypass(candidates, request, admittedPrefillWork(*request));
+                    recordPrefillBypass(candidates, request, admittedPrefillWork(*request, coordinator_, config_));
                 }
                 spdlog::debug("[Scheduler] prefill {} scheduled ({} tokens)", request->Id(), admitted->input_length);
                 pushOperation(build, *request, std::move(*admitted));

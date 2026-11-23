@@ -764,7 +764,7 @@ private:
     // prefills run first, the incomplete one last. candidates supplies the
     // round's FIFO order. With enable_short_prefill_first, a successful
     // carried first admission that overtakes the oldest waiting prompt
-    // increments that prompt's bypass count.
+    // adds its prefill work to that prompt's allowance.
     // Returns how many of `carried` it admitted.
     std::int32_t carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                    std::span<const WholePrompt> carried, std::int32_t decode_reserve);
