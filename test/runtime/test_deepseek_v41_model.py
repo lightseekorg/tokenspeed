@@ -5126,9 +5126,11 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
 
 
 @pytest.mark.parametrize("maximum", [1, 43, 127, 128, 129, 171, 257])
-@pytest.mark.parametrize("all_decode", [False, True])
-def test_sm120_deepep_capacity_agrees_with_idle_and_decode_peers(
-    monkeypatch, maximum, all_decode
+@pytest.mark.parametrize(
+    "backend,all_decode", [("elastic", False), ("elastic", True), ("cake", False)]
+)
+def test_sm120_ep_capacity_agrees_with_idle_and_decode_peers(
+    monkeypatch, maximum, backend, all_decode
 ):
     from tokenspeed_kernel.thirdparty.deepep_sm120_experiment import (
         deepep_flashinfer_fp8_opt as transport,
@@ -5156,9 +5158,18 @@ def test_sm120_deepep_capacity_agrees_with_idle_and_decode_peers(
     moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
     nn.Module.__init__(moe)
     moe.use_sm120_deepep = True
+    moe.use_sm120_cake = backend == "cake"
     moe.sm120_shared_overlap = False
-    moe.sm120_deepep_buffer = object()
-    moe.experts = SimpleNamespace(_moe_backend_state=None, num_experts=384)
+    moe.sm120_deepep_buffer = None if moe.use_sm120_cake else object()
+    state = None
+    if moe.use_sm120_cake:
+
+        def run(x, ids, weights, capacity):
+            capacities.append(capacity)
+            return x.clone()
+
+        state = SimpleNamespace(capacity=128, run=run)
+    moe.experts = SimpleNamespace(_moe_backend_state=state, num_experts=384)
     moe.stream_fork = StreamFork(None)
     moe.n_shared_experts = None
     moe.shared_experts = None
@@ -5188,7 +5199,8 @@ def test_sm120_deepep_capacity_agrees_with_idle_and_decode_peers(
         output = moe(x, None, maximum + 1, maximum, ctx=ctx)
         torch.testing.assert_close(output, x, atol=0, rtol=0)
         rank_capacities.append(tuple(capacities))
-    assert rank_capacities[0] == rank_capacities[1] == rank_capacities[2]
+    expected = tuple(min(128, maximum - start) for start in range(0, maximum, 128))
+    assert rank_capacities == [expected] * 3
 
 
 @pytest.mark.parametrize("total", [5, 11])

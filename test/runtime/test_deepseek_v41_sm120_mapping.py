@@ -133,6 +133,7 @@ def test_active_and_idle_ranks_use_identical_dispatch_capacities(
     moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
     torch.nn.Module.__init__(moe)
     moe.use_sm120_deepep = True
+    moe.use_sm120_cake = False
     moe.sm120_deepep_buffer = object()
     moe.sm120_shared_overlap = False
     moe.stream_fork = StreamFork(None)
