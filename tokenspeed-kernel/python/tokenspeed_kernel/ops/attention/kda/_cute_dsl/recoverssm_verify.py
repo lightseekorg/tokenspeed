@@ -432,9 +432,22 @@ class RecoverSsmVerify:
         # decays, its value channel's u) with the CTA, so they fly during the
         # token and base copies; at two CTAs per SM it has registers to spare
         # (a batch-64 layer with records runs 6-10% faster on GB300). Smaller
-        # tiles load them where they are used: started early, they raised a
-        # 32-row tile from 96 to 128 registers and slowed it without records.
+        # tiles load keys and decays in phase 1: started with the CTA, they
+        # raised a 32-row tile from 96 to 128 registers and slowed it without
+        # records.
         self.early_history_loads = self.history_rows > 0 and value_tile_rows == THREADS
+        # Smaller tiles load their u values after phase 1, so the loads fly
+        # through the history pass and the base rows' product, when the u
+        # and product registers number at most 64; otherwise they load where
+        # they are used. Held through a 64-row tile's product at T 8 (80
+        # product registers), they slowed a GB300 layer 2-5%; at batch 1 they
+        # save 0.1-0.6 us a layer with records.
+        self.preload_history_us = (
+            self.history_rows > 0
+            and not self.early_history_loads
+            and self.rows_per_thread * self.padded_columns + self._history_u_count()
+            <= 64
+        )
         # The +4 words shift consecutive rows and splits across shared-memory banks.
         self.partial_row_stride = self.padded_columns + 4
         self.partial_split_stride = self.tile_rows * self.partial_row_stride + 4
@@ -770,7 +783,8 @@ class RecoverSsmVerify:
         when ``records_keys`` is set. ``early_keys``, ``early_decays`` and
         ``early_us`` hold this thread's channels of the records when the CTA
         started loading them (``_start_early_history``); otherwise phase 1
-        and ``_add_history_products`` load them.
+        loads the keys and decays, and the u load after phase 1
+        (``preload_history_us``) or in ``_add_history_products``.
         """
         K = self.key_dim
         W = self.window
@@ -779,9 +793,11 @@ class RecoverSsmVerify:
         late_loads = has_history and not self.early_history_loads
         history_keys = early_keys
         history_decays = early_decays
+        history_us = early_us
         if const_expr(late_loads):
             history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
             history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
+            history_us = cute.make_rmem_tensor((self._history_u_count(),), Float32)
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
             if const_expr(late_loads):
@@ -819,6 +835,18 @@ class RecoverSsmVerify:
             cute.arch.barrier()
             self._finalize_coefficients(shared.sums, tidx)
 
+        if const_expr(self.preload_history_us):
+            if record_start > 0:
+                self._load_history_us(
+                    retained,
+                    record_slot,
+                    record_head,
+                    record_start,
+                    value_start,
+                    tidx,
+                    history_us,
+                )
+
         # Phase 2: tile @ M; the barrier after it frees the tile for partials.
         # The history rows need no base, so their pass runs while it lands.
         if const_expr(has_history):
@@ -848,7 +876,7 @@ class RecoverSsmVerify:
                     record_start,
                     value_start,
                     tidx,
-                    early_us,
+                    history_us,
                 )
 
         if const_expr(self.factored):
@@ -1312,6 +1340,43 @@ class RecoverSsmVerify:
                             values[4 * vector : 4 * vector + 4],
                         )
 
+    def _history_u_count(self):
+        """This thread's u values in ``_add_history_products``: its blocks' rows."""
+        return (4 // (THREADS // self.value_tile_rows)) * (self.history_rows // 4)
+
+    @cute.jit
+    def _load_history_us(
+        self,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        count: Int32,
+        value_start: Int32,
+        tidx: Int32,
+        us,
+    ):
+        """Load this thread's u of every row of its history blocks into ``us``.
+
+        Thread t serves value channel t % VT and the blocks t // VT, t // VT +
+        THREADS / VT, ... (``_add_history_products``). Rows past the count
+        reload the last accepted record, whose u meets a zero D row.
+        """
+        block = self.history_rows // 4
+        VT = self.value_tile_rows
+        groups = THREADS // VT
+        correction = retained[1]
+        u_row = correction.iterator + (
+            slot * correction.stride[0]
+            + Int64(head) * correction.stride[1]
+            + Int64(value_start + tidx % VT)
+        )
+        last = count - 1
+        for i in cutlass.range_constexpr(4 // groups):
+            first = (tidx // VT + i * groups) * block
+            for j in cutlass.range_constexpr(block):
+                at = Int64(cutlass.min(first + j, last))
+                us[i * block + j] = _load(u_row, at * correction.stride[2])
+
     @cute.jit
     def _add_history_products(
         self,
@@ -1322,7 +1387,7 @@ class RecoverSsmVerify:
         count: Int32,
         value_start: Int32,
         tidx: Int32,
-        early_us,
+        history_us,
     ):
         """Add the records' share of S_L @ M to the base rows' products.
 
@@ -1332,9 +1397,10 @@ class RecoverSsmVerify:
         Thread t serves channel t % VT and the blocks t // VT, t // VT +
         THREADS / VT, ...: a tile smaller than the CTA spreads the blocks over
         every warp, and each block lands in the same split whatever the tile,
-        so the outputs do not depend on it. ``early_us`` holds the u of every
-        row when the CTA started loading them (one block group, the 128-row
-        tile).
+        so the outputs do not depend on it. ``history_us`` holds this thread's
+        u of those rows (``_history_u_count``) when they were loaded earlier:
+        by ``_start_early_history`` for a 128-row tile (one block group), after
+        phase 1 when ``preload_history_us``; otherwise they load here.
         """
         columns = self.padded_columns
         block = self.history_rows // 4
@@ -1342,25 +1408,12 @@ class RecoverSsmVerify:
         groups = THREADS // VT
         channel = tidx % VT
         group = tidx // VT
-        us = []
-        if const_expr(self.early_history_loads):
-            us = [early_us[p] for p in range(self.history_rows)]
-        else:
-            correction = retained[1]
-            u_row = correction.iterator + (
-                slot * correction.stride[0]
-                + Int64(head) * correction.stride[1]
-                + Int64(value_start + channel)
+        if const_expr(not self.early_history_loads and not self.preload_history_us):
+            # All in flight before the first use.
+            self._load_history_us(
+                retained, slot, head, count, value_start, tidx, history_us
             )
-            # This thread's u values are in flight before the first use; rows
-            # past the count reload the last accepted record, whose u meets a
-            # zero D row.
-            last = count - 1
-            for i in cutlass.range_constexpr(4 // groups):
-                first = (group + i * groups) * block
-                for j in cutlass.range_constexpr(block):
-                    at = Int64(cutlass.min(first + j, last))
-                    us.append(_load(u_row, at * correction.stride[2]))
+        us = [history_us[p] for p in range(self._history_u_count())]
         sums = cute.make_rmem_tensor((columns,), Float32)
         for i in cutlass.range_constexpr(4 // groups):
             b = group + i * groups
