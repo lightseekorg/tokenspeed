@@ -1533,7 +1533,7 @@ class GlmDsaSparseAttentionMixin:
                 forward_mode=ForwardMode.DECODE,
             )
         # An owned decode top-k's score gather can carry the absorbed query
-        # to a records core, which then skips its own gather.
+        # to the sparse decode, which then skips its own gather.
         q = decode_query = query_rider = gathered_query = None
         if (
             should_compute_indexer
