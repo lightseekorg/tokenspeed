@@ -20,6 +20,7 @@
 
 """Distributed sparse selection over sharded Index-K storage."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -728,6 +729,7 @@ def select_owned_dsa_topk(
     initial_tokens: int,
     local_tokens: int,
     rider: torch.Tensor | None,
+    rider_ready: Callable[[], None] | None,
     q_scales: torch.Tensor | None,
     query_group_size: int,
     out: torch.Tensor,
@@ -759,6 +761,9 @@ def select_owned_dsa_topk(
         local_tokens: Trailing tokens of each row's window always selected.
         rider: Contiguous uint8 ``[rows, width]`` of this rank, ``width`` a
             multiple of 4, or None.
+        rider_ready: Called once the scores are enqueued and before
+            ``rider`` is read, to order the current stream after the
+            rider's producer; None when ``rider`` is already ordered.
         q_scales: FP32 ``[rows, index_heads]`` scales of FP8 queries, int32
             UE8M0 scale words of mxfp4 ones, or None.
         query_group_size: Consecutive rows of one request's verify window,
@@ -797,8 +802,6 @@ def select_owned_dsa_topk(
             score_bytes + (0 if rider is None else rider.numel()), q, group
         )
         local = send[:score_bytes].view(torch.float32).view(rows, topk)
-        if rider is not None:
-            send[score_bytes:].view(rows, -1).copy_(rider)
     else:
         local = torch.empty((rows, topk), device=q.device, dtype=torch.float32)
     positions, _ = _score_owned_rows(
@@ -815,6 +818,11 @@ def select_owned_dsa_topk(
         query_group_size=query_group_size,
         scores_out=local,
     )
+    # The rider's producer may run beside the scoring until here.
+    if rider_ready is not None:
+        rider_ready()
+    if len(group) > 1 and rider is not None:
+        send[score_bytes:].view(rows, -1).copy_(rider)
     gathered_rider = None
     if len(group) > 1:
         gathered = torch.empty(

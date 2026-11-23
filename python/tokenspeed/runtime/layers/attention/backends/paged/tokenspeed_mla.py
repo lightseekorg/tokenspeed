@@ -66,7 +66,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.dcp.comm import (
+    ValueProjection,
     combine_attention_partials,
+    combine_project_attention_partials,
     gather_query_heads,
 )
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
@@ -196,8 +198,9 @@ class CuteDSLMLABackend(PagedMLABackend):
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
 
     DCP decode gathers TP query heads, reads compact local KV with per-query
-    visibility, then merges partials back to the original TP heads. CuTe's
-    base-2 LSE is converted to natural logs at the shared merge boundary.
+    visibility, then merges partials back to the original TP heads, projecting
+    their values as it merges when given ``value_weight``. CuTe's base-2 LSE
+    is converted to natural logs at the shared merge boundary.
 
     A block drafter's proposal rides the query axis with one page table row and
     one cache length per request, non-causal and bounded by the layer's window.
@@ -693,6 +696,14 @@ class CuteDSLMLABackend(PagedMLABackend):
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         return self._dcp.placement if self._dcp is not None else None
 
+    @property
+    def supports_mla_projected_value_decode(self) -> bool:
+        """Whether decode projects values, which only a KVP merge does.
+
+        The merge projects as it combines the partials.
+        """
+        return self._dcp is not None
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -705,9 +716,12 @@ class CuteDSLMLABackend(PagedMLABackend):
         **kwargs,
     ) -> torch.Tensor:
         # q is the absorbed query [T, H, head_dim]; the prologue wrote the latent cache.
+        value_weight = kwargs.get("value_weight")
+        if value_weight is not None and self._dcp is None:
+            raise ValueError("CuTe MLA projects values only in a KVP merge")
         lanes = self._tree_lane_rows(bs)
         if lanes is not None:
-            return self._tree_cascade(q, layer, token_to_kv_pool, lanes)
+            return self._tree_cascade(q, layer, token_to_kv_pool, lanes, value_weight)
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
         tree = self._tree_verify_rows(
@@ -717,7 +731,7 @@ class CuteDSLMLABackend(PagedMLABackend):
             metadata.seq_lens_k[num_extends:],
         )
         if tree is not None:
-            return self._tree_cascade(q, layer, token_to_kv_pool, tree)
+            return self._tree_cascade(q, layer, token_to_kv_pool, tree, value_weight)
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
         causal_mask = True
         if self.block_decode_active:
@@ -825,10 +839,24 @@ class CuteDSLMLABackend(PagedMLABackend):
         )
         if metadata.dcp is not None:
             partial, lse_log2 = raw_out
+            partial = partial.flatten(0, 1)
             # CuTe exports base-2 LSE; the shared DCP merge uses natural logs.
+            lse = lse_log2.flatten(0, 1) * math.log(2)
+            if value_weight is not None:
+                return combine_project_attention_partials(
+                    partial,
+                    lse,
+                    group=self.kvp_group,
+                    rank=self.kvp_rank,
+                    projection=ValueProjection(
+                        weight=value_weight,
+                        gate=kwargs.get("output_gate"),
+                        out=kwargs["projected_output"],
+                    ),
+                )
             raw_out = combine_attention_partials(
-                partial.flatten(0, 1),
-                lse_log2.flatten(0, 1) * math.log(2),
+                partial,
+                lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
                 sink=None,
@@ -852,10 +880,15 @@ class CuteDSLMLABackend(PagedMLABackend):
         layer: PagedAttention,
         token_to_kv_pool,
         tree: TreeCascadeRows,
+        value_weight: torch.Tensor | None,
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): the CuTe
         causal ``rows``-token MLA decode over the committed prefix, with its
-        base-2 log-sum-exp, then the tree window merged in (``finish_mla_tree``)."""
+        base-2 log-sum-exp, then the tree window merged in
+        (``finish_mla_tree``). It projects no values, so it refuses a
+        ``value_weight``."""
+        if value_weight is not None:
+            raise ValueError("a draft tree's attention projects no values")
         if layer.sliding_window_size >= 0:
             raise NotImplementedError("draft trees have no sliding-window path yet")
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)

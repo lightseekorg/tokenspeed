@@ -362,6 +362,7 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                     plane,
                     metadata=metadata,
                     rider=None,
+                    rider_ready=None,
                     q_scales=scales,
                     out=out,
                     lens_out=lens_out,
@@ -379,19 +380,34 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                 torch.testing.assert_close(total, lens, rtol=0, atol=0)
 
                 # Bytes riding the score gather land as an all-gather would
-                # land them, and leave the selection as it was.
+                # land them, and leave the selection as it was, even while
+                # another stream still writes them until the selection waits.
                 rider = rider_of(rows)
+                late = torch.zeros_like(rider)
+                producer = torch.cuda.Stream()
+                producer.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(producer):
+                    torch.cuda._sleep(1 << 24)
+                    late.copy_(rider)
+                waits = []
+
+                def rider_ready():
+                    waits.append(producer)
+                    torch.cuda.current_stream().wait_stream(producer)
+
                 ridden, ridden_counts, gathered = select_owned_dsa_topk(
                     query,
                     weights,
                     plane,
                     metadata=metadata,
                     q_scales=scales,
-                    rider=rider,
+                    rider=late,
+                    rider_ready=rider_ready,
                     out=torch.empty_like(out),
                     lens_out=torch.empty_like(lens_out),
                     **kwargs,
                 )
+                assert waits == [producer]
                 _assert_same_rows(ridden, expected)
                 torch.testing.assert_close(ridden_counts, counts, rtol=0, atol=0)
                 assert torch.equal(gathered, gathered_riders(rider))
@@ -412,6 +428,7 @@ def _worker(rank, degree, rendezvous, pull_exchange):
                 metadata=metadata_of(query, weights, plane, table, seq_lens, placement),
                 q_scales=scales,
                 rider=rider,
+                rider_ready=None,
                 out=out,
                 lens_out=lens_out,
                 **kwargs,
