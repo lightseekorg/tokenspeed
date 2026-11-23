@@ -93,7 +93,7 @@ std::int64_t prefillWork(const CacheCoordinator& coordinator, std::int32_t promp
 }
 
 // A first admission's count toward the oldest prompt's allowance: its work, at least a batch row's share of the budget.
-std::int64_t admittedPrefillWork(Request& admitted, const CacheCoordinator& coordinator,
+std::int64_t admittedPrefillWork(const Request& admitted, const CacheCoordinator& coordinator,
                                  const SchedulerConfig& config) {
     return std::max(prefillWork(coordinator, admitted.PrefillSize(), admitted.CacheProgressRef().resume_tokens),
                     std::int64_t{config.max_scheduled_tokens} / config.max_batch_size);
@@ -1936,7 +1936,7 @@ std::optional<std::int32_t> Scheduler::wholePromptTokens(Request& request, Reque
     if (checkpoint > hit_tokens && (checkpoint - hit_tokens) % coordinator_.PrefixGranularity() != 0) {
         return std::nullopt;
     }
-    return static_cast<std::int32_t>(prefillWork(coordinator_, request.PrefillSize(), hit_tokens));
+    return CheckedInt32(prefillWork(coordinator_, request.PrefillSize(), hit_tokens), "prefill work exceeds int32");
 }
 
 std::vector<Scheduler::WholePrompt> Scheduler::wholePromptsAfter(std::span<Request* const> candidates, std::size_t from,
@@ -2107,10 +2107,10 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 const auto match = matchPrefixAtAdmission(request);
                 const auto hit_tokens =
                     std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-                const auto remaining =
-                    match.waits_for_eviction_store
-                        ? std::numeric_limits<std::int32_t>::max()
-                        : static_cast<std::int32_t>(prefillWork(coordinator_, request->PrefillSize(), hit_tokens));
+                const auto remaining = match.waits_for_eviction_store
+                                           ? std::numeric_limits<std::int32_t>::max()
+                                           : CheckedInt32(prefillWork(coordinator_, request->PrefillSize(), hit_tokens),
+                                                          "prefill work exceeds int32");
                 pending.push_back(PendingPrefill{request, remaining});
             }
         };

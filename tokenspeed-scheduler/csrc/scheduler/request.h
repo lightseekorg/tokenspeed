@@ -350,6 +350,7 @@ public:
     // tables the same admission fills: resources and progress land at
     // admission time, and a state transition only moves them on.
     fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
+    const fsm::CacheProgress& CacheProgressRef() const { return forwardResources("CacheProgressRef").cache_progress; }
 
     // True from a restore's ACK until the first decode is scheduled: the
     // device holds no in-flight capture for the request's next input, so that
