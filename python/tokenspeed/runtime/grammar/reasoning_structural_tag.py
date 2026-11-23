@@ -55,6 +55,7 @@ implicit reasoning closer.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 from typing import Any
 
@@ -90,8 +91,45 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
     contain zero or more reasoning blocks followed by the constrained answer
     inside the text content block.
     """
+    return fill_content_slot(
+        _inkling_skeleton(), content_format.model_dump_json(by_alias=True)
+    )
+
+
+# The response slot stands in the rendered skeletons as a const_string
+# carrying this marker, whose serialized form is spliced away whole and
+# replaced by the request's content format. Plain ASCII so it can never
+# collide with a template's own text; every renderer asserts the skeleton
+# carries it exactly once.
+_SLOT_MARKER = "__tokenspeed_content_slot__"
+_SLOT_OBJECT_JSON = json.dumps(
+    {"type": "const_string", "value": _SLOT_MARKER},
+    ensure_ascii=False,
+    separators=(",", ":"),
+)
+
+
+def fill_content_slot(skeleton_json: str, content_json: str) -> str:
+    """Splice a request's content format into a rendered tag skeleton.
+
+    ``skeleton_json`` is a structural-tag JSON whose response slot is the
+    marker const-string; ``content_json`` is the request's content format
+    dumped the same way (``model_dump_json(by_alias=True)``). The splice is
+    a whole-value replacement, so the content's own serialization passes
+    through byte for byte.
+    """
+    return skeleton_json.replace(_SLOT_OBJECT_JSON, content_json, 1)
+
+
+@functools.lru_cache(maxsize=None)
+def _inkling_skeleton() -> str:
+    """``_structural_tag_for_inkling``'s tag with the content slot marked.
+
+    Rendered once: the shape is fixed, only the content varies per request.
+    """
     from xgrammar.structural_tag import (
         AnyTextFormat,
+        ConstStringFormat,
         SequenceFormat,
         StarFormat,
         StructuralTag,
@@ -105,7 +143,7 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
     )
     response_block = TagFormat(
         begin="<|content_text|>",
-        content=content_format,
+        content=ConstStringFormat(value=_SLOT_MARKER),
         end="<|end_message|>",
     )
     tag = StructuralTag(
@@ -116,7 +154,9 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
             ]
         )
     )
-    return tag.model_dump_json(by_alias=True)
+    skeleton = tag.model_dump_json(by_alias=True)
+    assert skeleton.count(_SLOT_OBJECT_JSON) == 1
+    return skeleton
 
 
 def reasoning_block_markers(reasoning_parser: str) -> tuple[str, str] | None:
@@ -146,6 +186,90 @@ def reasoning_block_markers(reasoning_parser: str) -> tuple[str, str] | None:
     if block.type != "tag" or not block.begin or not block.end:
         return None
     return block.begin, block.end
+
+
+@functools.lru_cache(maxsize=None)
+def _substitutable_template_json(model: str, reasoning: str) -> str | None:
+    """The builtin ``model`` template in ``reasoning`` mode with the response
+    slot marked, ready for a per-request
+    :func:`fill_content_slot` splice; ``None`` when the template's layout has
+    no response slot we know how to substitute.
+
+    Rendered once per ``(model, reasoning)`` — the pair comes from a fixed
+    parser-to-model map, so the cache stays a handful of entries — because
+    rebuilding the template's pydantic tree and re-dumping the whole tag
+    dominated the per-request cost of ``structural_tag_for_reasoning_response``.
+    """
+    import xgrammar
+    from xgrammar.structural_tag import ConstStringFormat, SequenceFormat
+
+    tag = xgrammar.get_builtin_structural_tag(model=model, reasoning=reasoning)
+    fmt = tag.format
+
+    # Track whether the substitution actually landed. If it didn't
+    # (template shape changed in a future xgrammar release, response
+    # slot moved, etc.) we MUST NOT return the tag with the user's
+    # constraint silently dropped — return None so the caller falls
+    # back to the unwrapped constraint and the user gets the
+    # constraint they asked for (at the cost of channel-preamble
+    # corruption on reasoning models).
+    substituted = False
+
+    if fmt.type == "tags_with_separator":
+        # harmony: the builtin template uses ``tags_with_separator``
+        # which allows the model to repeat ``analysis sep final``
+        # cycles indefinitely — and after the first JSON it does,
+        # producing trailing ``<|end|><|start|>assistant…`` plus a
+        # second JSON that the reasoning parser concatenates,
+        # breaking ``json.loads``. ``stop_after_first=True`` is
+        # *worse*: it ends after the FIRST tag (analysis only), so
+        # ``content`` ends up empty.
+        #
+        # Instead we replace the format with a fixed sequence of
+        # exactly one analysis tag, the literal separator, and one
+        # final tag carrying the user's content. The matcher
+        # forbids any further channel re-open after the final tag's
+        # ``<|end|>``, so the model stops cleanly.
+        analysis_tag = None
+        final_tag = None
+        for t in fmt.tags:
+            if t.begin == "<|channel|>analysis<|message|>":
+                analysis_tag = t
+            elif t.begin == "<|channel|>final<|message|>":
+                final_tag = t
+        if analysis_tag is not None and final_tag is not None:
+            final_tag.content = ConstStringFormat(value=_SLOT_MARKER)
+            tag.format = SequenceFormat(
+                elements=[
+                    analysis_tag,
+                    ConstStringFormat(value=fmt.separator),
+                    final_tag,
+                ]
+            )
+            substituted = True
+    elif fmt.type == "sequence":
+        # qwen / deepseek_r1 / glm47 / kimi / minimax: the layout is
+        # ``[reasoning_tag, response_any_text]``. Anchor on the LAST
+        # element (the response) so the reasoning tag is never replaced
+        # — even if xgrammar later inserts pre-reasoning preamble
+        # elements.
+        last_idx = len(fmt.elements) - 1
+        if (
+            last_idx >= 0
+            and getattr(fmt.elements[last_idx], "type", None) == "any_text"
+        ):
+            fmt.elements[last_idx] = ConstStringFormat(value=_SLOT_MARKER)
+            substituted = True
+
+    if not substituted:
+        # Either the format type isn't one we know how to handle, or the
+        # response slot wasn't where we expected. Bail out so the
+        # user's constraint isn't silently dropped.
+        return None
+
+    skeleton = tag.model_dump_json(by_alias=True)
+    assert skeleton.count(_SLOT_OBJECT_JSON) == 1
+    return skeleton
 
 
 def structural_tag_for_reasoning_response(
@@ -178,81 +302,12 @@ def structural_tag_for_reasoning_response(
     if model is None:
         return None
 
-    import xgrammar
-
-    tag = xgrammar.get_builtin_structural_tag(
-        model=model, reasoning="enabled" if prompt_opens_reasoning else "auto"
+    skeleton = _substitutable_template_json(
+        model, "enabled" if prompt_opens_reasoning else "auto"
     )
-    fmt = tag.format
-
-    # Track whether the substitution actually landed. If it didn't
-    # (template shape changed in a future xgrammar release, response
-    # slot moved, etc.) we MUST NOT return the tag with the user's
-    # constraint silently dropped — return None so the caller falls
-    # back to the unwrapped constraint and the user gets the
-    # constraint they asked for (at the cost of channel-preamble
-    # corruption on reasoning models).
-    substituted = False
-
-    if fmt.type == "tags_with_separator":
-        # harmony: the builtin template uses ``tags_with_separator``
-        # which allows the model to repeat ``analysis sep final``
-        # cycles indefinitely — and after the first JSON it does,
-        # producing trailing ``<|end|><|start|>assistant…`` plus a
-        # second JSON that the reasoning parser concatenates,
-        # breaking ``json.loads``. ``stop_after_first=True`` is
-        # *worse*: it ends after the FIRST tag (analysis only), so
-        # ``content`` ends up empty.
-        #
-        # Instead we replace the format with a fixed sequence of
-        # exactly one analysis tag, the literal separator, and one
-        # final tag carrying the user's content. The matcher
-        # forbids any further channel re-open after the final tag's
-        # ``<|end|>``, so the model stops cleanly.
-        from xgrammar.structural_tag import (
-            ConstStringFormat,
-            SequenceFormat,
-            TagFormat,
-        )
-
-        analysis_tag: TagFormat | None = None
-        final_tag: TagFormat | None = None
-        for t in fmt.tags:
-            if t.begin == "<|channel|>analysis<|message|>":
-                analysis_tag = t
-            elif t.begin == "<|channel|>final<|message|>":
-                final_tag = t
-        if analysis_tag is not None and final_tag is not None:
-            final_tag.content = content_format
-            tag.format = SequenceFormat(
-                elements=[
-                    analysis_tag,
-                    ConstStringFormat(value=fmt.separator),
-                    final_tag,
-                ]
-            )
-            substituted = True
-    elif fmt.type == "sequence":
-        # qwen / deepseek_r1 / glm47 / kimi / minimax: the layout is
-        # ``[reasoning_tag, response_any_text]``. Anchor on the LAST
-        # element (the response) so the reasoning tag is never replaced
-        # — even if xgrammar later inserts pre-reasoning preamble
-        # elements.
-        last_idx = len(fmt.elements) - 1
-        if (
-            last_idx >= 0
-            and getattr(fmt.elements[last_idx], "type", None) == "any_text"
-        ):
-            fmt.elements[last_idx] = content_format
-            substituted = True
-
-    if not substituted:
-        # Either the format type isn't one we know how to handle, or
-        # the response slot wasn't where we expected. Bail out so the
-        # user's constraint isn't silently dropped.
+    if skeleton is None:
         return None
-
-    return tag.model_dump_json(by_alias=True)
+    return fill_content_slot(skeleton, content_format.model_dump_json(by_alias=True))
 
 
 # The JSON schema a template's answer carries until the host puts a
