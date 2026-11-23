@@ -499,6 +499,35 @@ class FusedVerifyWindow(RecoverSsmVerify):
             # After this warp's own loads, so its wait for the count overlaps them.
             self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
 
+        # The metadata was written before this forward; the previous launch's
+        # rows are not, but their addresses need only the batch layout, so
+        # they are formed before the wait and every row load issues right
+        # after it.
+        stamp_slot = Int64(request)
+        generation = Int64(0)
+        start = Int64(0)
+        if const_expr(self.has_metadata):
+            stamp_slot = Int64(_load(metadata, request * 3))
+            generation = Int64(_load(metadata, request * 3 + 1))
+            start = Int64(_load(metadata, request * 3 + 2))
+        raw_offsets = []
+        for item in cutlass.range_constexpr(self.conv_items):
+            for t in cutlass.range_constexpr(W):
+                token = token_start + cutlass.min(t, valid_tokens - 1)
+                raw_offsets.append(token * qkv_token_stride + channels[item])
+        gate_addresses = self._gate_input_addresses(
+            f_a, f_a_token_stride, token_start, valid_tokens, warp, lane
+        )
+        token = token_start + cutlass.min(cutlass.min(tidx, W - 1), valid_tokens - 1)
+        beta_offset = token * beta_token_stride + head
+        logit_offsets = []
+        if const_expr(self.gated_norm):
+            for t in cutlass.range_constexpr(W):
+                token = token_start + cutlass.min(t, valid_tokens - 1)
+                logit_offsets.append(
+                    token * gate_token_stride + head * V + value_start + channel
+                )
+
         cute.arch.griddepcontrol_wait()
         if const_expr(self.cluster > 1):
             cute.arch.cluster_wait()
@@ -506,38 +535,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
 
         if valid_tokens > 0:
             # Every read of the previous launch's rows is issued before any is used.
-            raws = []
-            for item in cutlass.range_constexpr(self.conv_items):
-                for t in cutlass.range_constexpr(W):
-                    token = token_start + cutlass.min(t, valid_tokens - 1)
-                    raws.append(_load(qkv, token * qkv_token_stride + channels[item]))
-            gate_inputs = self._load_gate_inputs(
-                f_a, f_a_token_stride, token_start, valid_tokens, warp, lane
-            )
-            token = token_start + cutlass.min(
-                cutlass.min(tidx, W - 1), valid_tokens - 1
-            )
-            raw_beta = _load(beta, token * beta_token_stride + head)
-            logits = []
-            if const_expr(self.gated_norm):
-                for t in cutlass.range_constexpr(W):
-                    token = token_start + cutlass.min(t, valid_tokens - 1)
-                    logits.append(
-                        _load(
-                            gate,
-                            token * gate_token_stride
-                            + head * V
-                            + value_start
-                            + channel,
-                        )
-                    )
-            stamp_slot = Int64(request)
-            generation = Int64(0)
-            start = Int64(0)
-            if const_expr(self.has_metadata):
-                stamp_slot = Int64(_load(metadata, request * 3))
-                generation = Int64(_load(metadata, request * 3 + 1))
-                start = Int64(_load(metadata, request * 3 + 2))
+            raws = [_load(qkv, offset) for offset in raw_offsets]
+            gate_inputs = [_ldg_b32x2(address) for address in gate_addresses]
+            raw_beta = _load(beta, beta_offset)
+            logits = [_load(gate, offset) for offset in logit_offsets]
             gate_scale = _exp(a_log_value.to(Float32))
             gate_bias = gate_bias_value.to(Float32)
             norm_scale = Float32(0.0)
@@ -663,7 +664,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         )
 
     @cute.jit
-    def _load_gate_inputs(
+    def _gate_input_addresses(
         self,
         f_a,
         f_a_token_stride: Int64,
@@ -672,7 +673,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
         warp: Int32,
         lane: Int32,
     ):
-        """This lane's f_a elements for each gate item ``_project_gate`` gives its warp."""
+        """Addresses of this lane's f_a elements for each gate item of its warp.
+
+        ``_project_gate`` gives the items; each address holds four BF16 values.
+        """
         W = self.window
         pairs = (W + 1) // 2
         items = (self.value_tile_rows // 32) * pairs
@@ -683,9 +687,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
             first = 2 * (item % pairs)
             for r in cutlass.range_constexpr(2):
                 token = token_start + cutlass.min(first + r, valid_tokens - 1)
-                inputs.append(
-                    _ldg_b32x2((f_a + token * f_a_token_stride + 4 * lane).toint())
-                )
+                inputs.append((f_a + token * f_a_token_stride + 4 * lane).toint())
         return inputs
 
     @cute.jit
