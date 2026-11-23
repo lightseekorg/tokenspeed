@@ -92,12 +92,11 @@ std::int64_t prefillWork(const CacheCoordinator& coordinator, std::int32_t promp
     return std::int64_t{prompt_tokens} - hit_tokens + coordinator.ReplayTokens(hit_tokens);
 }
 
-// What a first admission counts toward the oldest prompt's allowance: its work, at least a row's even share of the
-// round's budget, so rounds that batch rows rather than tokens bound still age that prompt.
+// A first admission's count toward the oldest prompt's allowance: its work, at least a batch row's share of the budget.
 std::int64_t admittedPrefillWork(Request& admitted, const CacheCoordinator& coordinator,
                                  const SchedulerConfig& config) {
     return std::max(prefillWork(coordinator, admitted.PrefillSize(), admitted.CacheProgressRef().resume_tokens),
-                    std::int64_t{config.max_scheduled_tokens} / std::max(config.max_batch_size, 1));
+                    std::int64_t{config.max_scheduled_tokens} / config.max_batch_size);
 }
 
 void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted, std::int64_t admitted_work) {

@@ -1557,8 +1557,7 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesTheLeastWorkFirstWhenShortPrefillsGoF
     EXPECT_EQ(Round(), (PrefillRows{{"g1", 0, 13, 13}, {"ahead", 0, 14, 14}, {"holder", 24, 28, 36}}));
 }
 
-// Seven passes count a row's share each (28): a 26-token "ahead" is protected and filled first; at 30 it is passed
-// over.
+// Seven row-bound passes count 28: "ahead" at 26 is filled first, at 30 passed over; with none, 16 ages after f1.
 TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
     const auto run = [this](int pass_rounds, std::int32_t pass_tokens, std::int32_t ahead_tokens) {
         constexpr int kPasses = 7;
@@ -1588,6 +1587,8 @@ TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
     EXPECT_EQ(run(1, 1, 26),
               (std::vector<PrefillRows>{{{"ahead", 0, 26, 26}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}}}));
+    EXPECT_EQ(run(0, 1, 16), (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"ahead", 0, 16, 16}, {"holder", 8, 12, 16}},
+                                                       {{"holder", 12, 16, 16}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}}}));
     EXPECT_EQ(run(1, 1, 30),
               (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}, {"holder", 8, 12, 16}},
                                         {{"holder", 12, 16, 16}, {"ahead", 0, 28, 30}}}));
