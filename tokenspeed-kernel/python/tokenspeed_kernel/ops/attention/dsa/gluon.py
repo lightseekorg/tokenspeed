@@ -39,12 +39,10 @@ if current_platform().is_amd:
 
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_dcp_records_supported_gfx950,
+        gluon_dsa_decode_projected_value_supported_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         launch_gluon_dsa_decode_dcp_records_gfx950 as _dsa_decode_records_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_decode_projected_value_supported_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         launch_gluon_dsa_decode_gfx950 as _dsa_decode_impl,

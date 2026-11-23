@@ -246,8 +246,19 @@ def gluon_kimi_k3_moe_tail_gfx950(
     route_kof = gl.allocate_shared_memory(gl.int32, [1024], shared)
     if bid >= 56:
         stage_oproj(
-            core, w_o, xl, red, regions, rank, bid - 56, S,
-            gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+            core,
+            w_o,
+            xl,
+            red,
+            regions,
+            rank,
+            bid - 56,
+            S,
+            gate,
+            norm_w,
+            GATED_NORM,
+            GATE_STRIDE,
+            NORM_EPS,
         )
         early_x = union.reinterpret(gl.bfloat16, [EARLY], shared)
         peer_parity = gl.load(epoch) % 2
@@ -306,8 +317,19 @@ def gluon_kimi_k3_moe_tail_gfx950(
             # The third round of output groups, ahead of this workgroup's
             # wait for their reduction: no workgroup runs more than two.
             stage_oproj_third(
-                core, w_o, xl, red, regions, rank, bid + 400, S,
-                gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+                core,
+                w_o,
+                xl,
+                red,
+                regions,
+                rank,
+                bid + 400,
+                S,
+                gate,
+                norm_w,
+                GATED_NORM,
+                GATE_STRIDE,
+                NORM_EPS,
             )
         preloads = slice_loads(
             prefix_in, blocks, ares_nw, ares_qk, in_nw, bid, blk_sm, blk_sr, S, NB

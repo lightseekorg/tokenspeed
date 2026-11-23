@@ -1904,7 +1904,9 @@ def _multi_row_index_k_scores_body(
                     query_scale_1,
                 )
         else:
-            for chunk in range(candidate_start // CHUNK_N, tl.cdiv(candidate_end, CHUNK_N)):
+            for chunk in range(
+                candidate_start // CHUNK_N, tl.cdiv(candidate_end, CHUNK_N)
+            ):
                 _score_candidate_chunk(
                     index_k,
                     index_k_scale,
@@ -2435,9 +2437,9 @@ def _mxfp4_decode_query(
     s_rows = request_id * q_len_per_req + s_m // 32
     words = gl.amd.cdna4.buffer_load(
         ptr=q_scales,
-        offsets=(
-            s_rows * stride_qs_row + (head_offset + s_m % 32) * stride_qs_head
-        ).to(gl.int32),
+        offsets=(s_rows * stride_qs_row + (head_offset + s_m % 32) * stride_qs_head).to(
+            gl.int32
+        ),
         mask=s_m // 32 < q_len_per_req,
         other=0,
         cache=".cg",
@@ -2462,7 +2464,9 @@ def _mxfp4_decode_key_tile(
 ):
     """One page's E2M1 key codes and UE8M0 scale words, straight into the
     scaled MFMA's operand layouts."""
-    key = gl.amd.cdna4.buffer_load(ptr=index_k, offsets=page * PAGE_STRIDE_BYTES + key_offsets)
+    key = gl.amd.cdna4.buffer_load(
+        ptr=index_k, offsets=page * PAGE_STRIDE_BYTES + key_offsets
+    )
     words = gl.amd.cdna4.buffer_load(
         ptr=index_k_scale,
         offsets=page * (PAGE_STRIDE_BYTES // 4)

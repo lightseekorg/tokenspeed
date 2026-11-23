@@ -147,8 +147,20 @@ def stage_oproj(
 ):
     """Output groups ``first_group`` and ``first_group + 200``, of 448."""
     _stage_oproj_groups(
-        core, w_o, xl, red, peer_regions, rank, first_group, S, True,
-        gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+        core,
+        w_o,
+        xl,
+        red,
+        peer_regions,
+        rank,
+        first_group,
+        S,
+        True,
+        gate,
+        norm_w,
+        GATED_NORM,
+        GATE_STRIDE,
+        NORM_EPS,
     )
 
 
@@ -170,8 +182,20 @@ def stage_oproj_third(
 ):
     """Output group ``group``, one of the 48 past the two rounds of 200."""
     _stage_oproj_groups(
-        core, w_o, xl, red, peer_regions, rank, group, S, False,
-        gate, norm_w, GATED_NORM, GATE_STRIDE, NORM_EPS,
+        core,
+        w_o,
+        xl,
+        red,
+        peer_regions,
+        rank,
+        group,
+        S,
+        False,
+        gate,
+        norm_w,
+        GATED_NORM,
+        GATE_STRIDE,
+        NORM_EPS,
     )
 
 

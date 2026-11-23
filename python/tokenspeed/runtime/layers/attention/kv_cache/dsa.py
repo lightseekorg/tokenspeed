@@ -382,7 +382,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ``[rows, heads]`` UE8M0 scale words.
         """
         if self.index_k_format != "mxfp4":
-            raise ValueError("the fused index-K write and query pack takes an mxfp4 plane")
+            raise ValueError(
+                "the fused index-K write and query pack takes an mxfp4 plane"
+            )
         if index_k.dtype != self.model_dtype:
             raise ValueError(
                 f"the fused index-K write takes {self.model_dtype} keys, got "

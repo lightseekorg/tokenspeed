@@ -1596,13 +1596,18 @@ def _dsa_dense_mfma_reduce_project_kernel(
 
     # The GEMM's MFMA: its instruction, operand width and K order.
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, NUM_WARPS]
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, NUM_WARPS],
     )
     dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=8)
     dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
     comb: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [1, NUM_WARPS], [1, 0])
     lse_layout: gl.constexpr = gl.BlockedLayout([1, 1], [64, 1], [NUM_WARPS, 1], [1, 0])
-    flat: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    flat: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
 
     # Loads complete in issue order: the split LSEs first, then the partials
     # and value columns as direct-to-LDS copies, then the gate.
@@ -1631,7 +1636,9 @@ def _dsa_dense_mfma_reduce_project_kernel(
         smem_p,
         partial_out,
         (
-            (p_split * stride_po_s + p_token * stride_po_t + head * stride_po_h)[:, None]
+            (p_split * stride_po_s + p_token * stride_po_t + head * stride_po_h)[
+                :, None
+            ]
             + offs_pv[None, :]
         ).to(gl.int32),
         mask=((p_split < num_kv_splits) & (p_token < num_tokens))[:, None],
@@ -1692,9 +1699,13 @@ def _dsa_dense_mfma_reduce_project_kernel(
         if (ROUNDED_EVEN >> split_idx) & 1 and (ROUNDED_ODD >> split_idx) & 1:
             acc = acc + weight_s * partial
         elif (ROUNDED_ODD >> split_idx) & 1:
-            acc = gl.where(odd, acc + weight_s * partial, gl.fma(weight_s, partial, acc))
+            acc = gl.where(
+                odd, acc + weight_s * partial, gl.fma(weight_s, partial, acc)
+            )
         elif (ROUNDED_EVEN >> split_idx) & 1:
-            acc = gl.where(odd, gl.fma(weight_s, partial, acc), acc + weight_s * partial)
+            acc = gl.where(
+                odd, gl.fma(weight_s, partial, acc), acc + weight_s * partial
+            )
         else:
             acc = gl.fma(weight_s, partial, acc)
         denom += weight_s
@@ -2255,7 +2266,9 @@ def _launch_dense_kv(
     With ``value_projection`` (``_launch_dense_mfma_reduce_project``'s
     ``weight, gate, out``) a split decode merges its splits straight into
     the projected rows, returned; ``out`` is not written."""
-    if value_projection is not None and (num_kv_splits == 1 or records or lse is not None):
+    if value_projection is not None and (
+        num_kv_splits == 1 or records or lse is not None
+    ):
         raise ValueError("a projected DSA decode merges split keys without an LSE")
     if not records:
         tokens, heads = q.shape[0], q.shape[1]
@@ -2876,7 +2889,11 @@ def launch_gluon_dsa_decode_projected_value_gfx950(
         or not out.is_contiguous()
         or (
             gate is not None
-            and (tuple(gate.shape) != rows or gate.dtype != out.dtype or gate.stride(1) != 1)
+            and (
+                tuple(gate.shape) != rows
+                or gate.dtype != out.dtype
+                or gate.stride(1) != 1
+            )
         )
     ):
         raise ValueError(
