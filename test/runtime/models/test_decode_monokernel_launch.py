@@ -156,3 +156,61 @@ def test_the_switch_reaches_the_muse_spark_config(tmp_path, switch) -> None:
     (tmp_path / "config.json").write_text(json.dumps(config))
     args = server_args(tmp_path, decode_monokernel=switch)
     assert model_config(args).hf_text_config.decode_monokernel is switch
+
+
+def _eagle4_draft(path) -> None:
+    """The ``config.json`` of a tiny EAGLE-4 draft at ``path``."""
+    path.mkdir()
+    config = {
+        "architectures": ["LlamaForCausalLMEagle4"],
+        "model_type": "llama",
+        "vocab_size": 128,
+        "hidden_size": 128,
+        "intermediate_size": 128,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 16,
+        "max_position_embeddings": 2048,
+        "torch_dtype": "bfloat16",
+    }
+    (path / "config.json").write_text(json.dumps(config))
+
+
+def test_the_draft_switch_without_a_draft_fails(checkpoints) -> None:
+    with pytest.raises(ValueError, match="--draft-decode-monokernel.*no draft model"):
+        server_args(checkpoints["other"], draft_decode_monokernel=True)
+
+
+def test_the_draft_switch_fails_a_draft_without_monokernels(checkpoints) -> None:
+    with pytest.raises(
+        ValueError, match="no draft decode monokernel for.*Qwen3ForCausalLM"
+    ):
+        server_args(
+            checkpoints["other"],
+            speculative_algorithm="EAGLE4",
+            speculative_draft_model_path=str(checkpoints["other"]),
+            draft_decode_monokernel=True,
+        )
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_draft_switch_reaches_the_draft_config(
+    tmp_path, checkpoints, switch
+) -> None:
+    """An EAGLE-4 draft is accepted, and its config carries the switch while
+    the target's monokernel switch stays off."""
+    from tokenspeed.runtime.engine.rank_setup import load_model_config
+
+    draft = tmp_path / "draft"
+    _eagle4_draft(draft)
+    args = server_args(
+        checkpoints["other"],
+        speculative_algorithm="EAGLE4",
+        speculative_draft_model_path=str(draft),
+        draft_decode_monokernel=switch,
+    )
+    target = model_config(args)
+    config = load_model_config(args, str(draft), draft_of=target)
+    assert config.hf_text_config.draft_decode_monokernel is switch
+    assert config.hf_text_config.decode_monokernel is False

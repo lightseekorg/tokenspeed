@@ -151,6 +151,11 @@ def load_model_config(
         config.hf_text_config.draft_moe_quantization = (
             server_args.speculative_draft_moe_quantization
         )
+        # --draft-decode-monokernel: a draft-only switch (server args accept
+        # it only for DRAFT_DECODE_MONOKERNEL_ARCHITECTURES).
+        config.hf_text_config.draft_decode_monokernel = bool(
+            server_args.draft_decode_monokernel
+        )
     return config
 
 
