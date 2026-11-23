@@ -22,8 +22,8 @@
 
 KDA's applied decay gate is **per-channel**: a per-head log-decay
 ``A_log[num_heads]`` modulates a per-(head, channel) gate ``g [B, T, HV, K]`` --
-unlike GDN's scalar-per-head decay. ``fla``'s ``chunk_kda`` /
-``fused_recurrent_kda`` implement the gated-delta scan. The optional dependency
+unlike GDN's scalar-per-head decay. ``fla``'s ``chunk_kda``
+implements the gated-delta scan. The optional dependency
 is imported only when this FLA implementation is selected.
 
 The gate is computed inside ``fla``'s kernel (``use_gate_in_kernel=True``): we
@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import torch
 from fla.ops.kda import chunk_kda
-from fla.ops.kda.fused_recurrent import fused_recurrent_kda
 from triton.runtime.jit import ConstexprFunction
 
 

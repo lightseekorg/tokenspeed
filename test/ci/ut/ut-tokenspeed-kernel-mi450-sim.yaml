@@ -79,7 +79,7 @@ env:
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_public_retained_verify_keeps_shared_source_and_materializes_endpoint[4]
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_packed_verify_convolution_uses_request_boundaries
     tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_retained_commit_graph_refresh_and_layer_subset
-    tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_retained_capability_requires_both_explicit_contracts
+    tokenspeed-kernel/test/ops/attention/test_kda_retained_integration.py::test_retained_capability_requires_every_explicit_contract
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_smoke_gfx1250
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_gfx1250_wide_panels[split]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_kda_retained_history.py::test_retained_gfx1250_wide_panels[whole-head]

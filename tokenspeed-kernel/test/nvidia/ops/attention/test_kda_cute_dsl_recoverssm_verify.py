@@ -414,11 +414,6 @@ def _check_untouched(inputs, cute, written, with_stamps):
             assert bool((cute[name][:, -pad:] == fill).all()), name
 
 
-def _first_difference(actual, expected):
-    index = tuple((actual != expected).nonzero()[0].tolist())
-    return f"first difference at {list(index)}: {actual[index]} vs {expected[index]}"
-
-
 def _no_fallback(*args, **kwargs):
     raise AssertionError("supported inputs reached the Triton fallback")
 

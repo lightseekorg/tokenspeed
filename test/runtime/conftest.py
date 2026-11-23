@@ -212,15 +212,6 @@ def kimi_layout(recipe):
     return groups, layout
 
 
-def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
-    return kimi_tp8_layout()[2].bind(num_lcm_blocks)
-
-
-def _kimi_group_specs(group_ids, layer_types, plan):
-    del group_ids, layer_types, plan
-    return tuple(spec for spec, _ in kimi_recipe().groups())
-
-
 def make_kimi_pool(
     device,
     usable_pages: int = 6,

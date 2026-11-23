@@ -577,6 +577,7 @@ impl OutputProcessor {
     /// server's `stream_interval` and the engine's `role`, whose cache
     /// `defers_decode_state` or not, logging the finish lines `finish_log`
     /// selects.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         spec_num_tokens: Option<usize>,
         stream_interval: i64,

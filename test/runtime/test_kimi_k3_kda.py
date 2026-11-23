@@ -363,27 +363,16 @@ def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
 
     resolve_calls = 0
     resolved_tables = 0
-    real = (
-        mamba.verify_state_groups
-        if backend.deferred_state_commit
-        else mamba.compute_state_block_indices
-    )
+    # KDA always defers its decode state, so decode resolves through verify.
+    real = mamba.verify_state_groups
 
     def counting(*args, **kwargs):
         nonlocal resolve_calls, resolved_tables
         resolve_calls += 1
-        resolved_tables += len(args[0]) if backend.deferred_state_commit else 1
+        resolved_tables += len(args[0])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(
-        mamba,
-        (
-            "verify_state_groups"
-            if backend.deferred_state_commit
-            else "compute_state_block_indices"
-        ),
-        counting,
-    )
+    monkeypatch.setattr(mamba, "verify_state_groups", counting)
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
@@ -406,7 +395,7 @@ def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     # One resolve per state group over its own table, never per layer; a
     # verify resolves every group in one call.
     assert resolved_tables == len(_STATE_GROUPS)
-    assert resolve_calls == (1 if backend.deferred_state_commit else len(_STATE_GROUPS))
+    assert resolve_calls == 1
 
     md = backend.forward_metadata
     assert tuple(sorted(md.state_in_blocks_by_group)) == _STATE_GROUPS

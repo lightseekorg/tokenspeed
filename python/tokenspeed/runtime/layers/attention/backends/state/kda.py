@@ -24,7 +24,7 @@ See ``KdaAttnBackend`` for what separates the family from GDN."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch

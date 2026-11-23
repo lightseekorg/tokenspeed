@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
 )
 from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaAttnBackend,
     _packed_qkv_views,
 )
 from tokenspeed.runtime.layers.attention.configs.base import (
