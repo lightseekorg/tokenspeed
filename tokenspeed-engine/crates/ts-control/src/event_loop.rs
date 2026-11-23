@@ -25,8 +25,9 @@
 //! without waiting on the device, commits the forwards that are more than
 //! `in_flight_depth` rounds old, and feeds the results back to the
 //! scheduler in one `advance`. Depth 0 commits a forward in the round that
-//! dispatched it; depth 1 is the overlap schedule. Those two advances are
-//! the scheduler's only feedback.
+//! dispatched it; depth 1 is the overlap schedule. Those two advances and
+//! the PD transfer events polled before the plan are the scheduler's only
+//! feedback.
 //!
 //! Every rank of a replica -- an attention-TP group, across every pipeline
 //! stage -- runs the same scheduler. The replica's first member owns the
@@ -922,6 +923,28 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.record_storage_metrics()?;
 
         let mut events = Vec::new();
+        // PD notices that arrived while the previous forward ran, such as a
+        // decode instance's announcement of a request submitted this round,
+        // advance before the plan: a tail poll alone would hold the request
+        // back for one more whole forward.
+        let mut transfers_advanced = false;
+        if forward_allowed && self.transfer.is_some() {
+            self.poll_transfers(&mut events, &mut outputs, &mut released)?;
+            if !events.is_empty() {
+                if let Some(transfer) = self.transfer.as_mut() {
+                    for event in &events {
+                        if event.kind == ForwardEventKind::Abort {
+                            transfer.cancel(&event.request_id);
+                        }
+                    }
+                }
+                self.scheduler
+                    .advance(&events)
+                    .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+                events.clear();
+                transfers_advanced = true;
+            }
+        }
         if !forward_allowed {
             // Frozen: what is dispatched commits, no forward is planned, and
             // the attention-DP ranks stay in step. With memory released not
@@ -998,6 +1021,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         busy |= !ready.is_empty()
             || !storage.done.is_empty()
             || !storage.disk_done.is_empty()
+            || transfers_advanced
             || !events.is_empty()
             || !outputs.is_empty()
             || !released.is_empty();

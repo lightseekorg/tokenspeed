@@ -2139,6 +2139,8 @@ struct ScriptedRank {
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
     forwards: usize,
+    /// The requests of each forward, in order.
+    forward_rids: Vec<Vec<String>>,
     /// The device operations the rank ran (weight updates, reloads, ...).
     device_ops: Vec<String>,
     weight_load_versions: Vec<Option<String>>,
@@ -2261,6 +2263,11 @@ fn run_scripted(
                         .collect(),
                     idle_forwards: *idle_forwards.lock().unwrap(),
                     forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
+                    forward_rids: plans
+                        .iter()
+                        .filter(|(_, rids, _)| !rids.is_empty())
+                        .map(|(_, rids, _)| rids.clone())
+                        .collect(),
                     device_ops: device_ops.lock().unwrap().clone(),
                     weight_load_versions: weight_load_versions.lock().unwrap().clone(),
                     weight_commits: weight_commits.lock().unwrap().clone(),
@@ -4318,6 +4325,63 @@ fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
         assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
         assert_eq!(rank.released.len(), 1, "depth {depth}");
     }
+}
+
+#[test]
+fn a_prefill_under_deferred_allocation_joins_the_forward_of_its_submission_round() {
+    // "first" ends in the round before the last chunk of "long", and its
+    // final output submits "new" for that round.
+    fn submit_new_after_first(outputs: &[StreamedOutput]) -> Vec<EngineRequest> {
+        if outputs
+            .iter()
+            .any(|output| output.rid == "first" && output.finish_reason.is_some())
+        {
+            vec![EngineRequest::Add(Box::new(disaggregated("new", 11, 40, 4)))]
+        } else {
+            Vec::new()
+        }
+    }
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    wire.lock()
+        .unwrap()
+        .rooms
+        .entry(9)
+        .or_default()
+        .preallocated_once_dispatched = true;
+    let mut script = vec![Vec::new(); 20];
+    script[0] = vec![
+        EngineRequest::Add(Box::new(disaggregated("first", 9, 40, 4))),
+        EngineRequest::Add(Box::new(disaggregated(
+            "long",
+            10,
+            MAX_SCHEDULED_TOKENS * 2,
+            4,
+        ))),
+    ];
+    let rank = run_scripted(
+        Layout::Single,
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Prefill,
+                wire,
+            }),
+            deferred_allocation: true,
+            ..Setup::default()
+        },
+        vec![script],
+        submit_new_after_first,
+    )
+    .remove(0);
+    assert_eq!(rank.outcome, Ok(()));
+    assert_eq!(
+        rank.forward_rids,
+        [vec!["first", "long"], vec!["long"], vec!["long", "new"]]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

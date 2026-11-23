@@ -263,7 +263,7 @@ its workers write KV-pool device memory over RDMA, ordered against forwards
 and page zeroing because the forward thread hands each remote stream to the
 peer in the plan's own order, behind the forwards and the zeroing. Its control face — request
 registration and abort, the per-round agreement on transfer progress — is the
-loop's `TransferPeer` (`pd.rs`), where it feeds Principle 3's tail advance.
+loop's `TransferPeer` (`pd.rs`), where it feeds Principle 3's PD advances.
 
 Consequences:
 
@@ -560,7 +560,7 @@ Consequences:
 
 ## Principle 3: scheduler feedback is explicit and centralized
 
-The scheduler advances in exactly two places, both in `EventLoop::round`
+The scheduler advances in exactly three places, all in `EventLoop::round`
 itself — never in a helper or subsystem. Helpers RETURN their events, or push
 them into the round's `events` list. Reading the round alone must reveal
 every point where the scheduler's state advances, and why:
@@ -574,12 +574,18 @@ every point where the scheduler's state advances, and why:
   request whose stored prefix landed in Host, a suspended request's restore,
   which waits for both of its store ACKs, then its own -- are delayed by a
   full round.
+* **Head of the round, PD** — with a transfer peer and forwards allowed, the
+  PD transfer events already agreed (a decode instance's announcement of a
+  request submitted this round, a destination or a transfer that concluded
+  while the previous forward ran), through `advance`. At depth 0 the tail
+  poll runs only after the round's blocking commit, so without this point a
+  new request waits one more whole forward before its first admission.
 * **Tail of the round** — forward results and PD transfer events, funneled
   through the round's single `events` list, through `advance`; all events
   must advance before the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
-op kind) either returns events into one of these two points or adds a new
+op kind) either returns events into one of these points or adds a new
 explicit call site in `round` with a comment stating why the existing points
 don't fit. It must not advance the scheduler itself.
 
@@ -1146,7 +1152,8 @@ obtain the normal retirement acknowledgments.
 
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
 to the scheduler, before cache admission. Every round the replica agrees on
-which transfers changed state; their scheduler events join the round's tail feedback, and a failed
+which transfers changed state, before the plan and again after the commit; their scheduler events
+advance at that point (Principle 3), and a failed
 transfer aborts its request on every rank together.
 Under `deferred` decode allocation (`scheduler.md` §3.1) the peers keep the
 order "prefill pages first": the prefill node states the policy in its route,
@@ -1254,7 +1261,9 @@ For orientation, one `EventLoop::round`:
 2. Agree the L3 reports into the round's storage tick (without L3, a tick
    only when a freeze starts or ends); while a cache op is open, poll the
    data plane's acknowledgments and intersect them; then **advance the
-   scheduler (head)** with both, so this round's plan sees them.
+   scheduler (head)** with both, so this round's plan sees them. When
+   forwards are allowed, poll the PD transfers and **advance the scheduler
+   (head, PD)** with their events.
 3. Frozen? Commit what is dispatched, plan (the tick forbade forwards, so
    the plan carries cache and storage work only) and dispatch that work,
    and join the attention-DP agreement.
