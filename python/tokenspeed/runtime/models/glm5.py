@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.ops.attention.dsv41.triton import mla_query_absorb_folds
-from tokenspeed_kernel.ops.attention.prologue import _select as _select_prologue
+from tokenspeed_kernel.ops.attention.prologue import mla_prologue_kernel
 from tokenspeed_kernel.ops.attention.prologue.checks import check_mla_request
 from tokenspeed_kernel.ops.attention.prologue.types import (
     KVCacheFormat,
@@ -1428,21 +1428,17 @@ class GlmDsaSparseAttentionMixin:
             KVCacheFormat.FP8,
         ):
             return None
-        traits = {
-            "token_heads": num_tokens * self.num_local_heads,
-            "expanded": False,
-            "full_write": cache.slots.numel() == num_tokens,
-            "kv_format": cache.format.value,
-            "kv_convert": cache.format is KVCacheFormat.NATIVE
-            and cache.kv_cache.dtype is not q.dtype,
-            "rope_style": "none",
-            "sanitize": cache.sanitize,
-            "store": True,
-        }
-        solution = _select_prologue(
-            "mla_prologue", q.dtype, tuple(traits.items()), frozenset(), None, None
+        kernel = mla_prologue_kernel(
+            q.dtype,
+            num_tokens,
+            self.num_local_heads,
+            expanded=None,
+            rotary=None,
+            cache=cache,
+            solution=None,
+            override=None,
         )
-        if solution.name != "triton_mla_prologue":
+        if kernel != "triton_mla_prologue":
             return None
         rank = self.kv_lora_rank
         fp8 = cache.format is KVCacheFormat.FP8
