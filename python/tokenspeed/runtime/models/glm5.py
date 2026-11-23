@@ -1729,6 +1729,9 @@ class GlmDsaSparseAttentionMixin:
                 # A decode round packs its mxfp4 index queries in the write's
                 # launch, which also makes the MLA prologue's absorption and
                 # write when the query was projected ahead.
+                index_slots, index_mask = resolve_write_slots(
+                    out_cache_loc, placement, shared_topk
+                )
                 if (
                     projected_q is not None
                     and decode_query is None
