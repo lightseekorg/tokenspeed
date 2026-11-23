@@ -763,7 +763,10 @@ class GlmDsaSparseAttentionMixin:
             )
         softmax_scale = self.indexer.weights_softmax_scale
         if quantized is None and indexer_output.packed_query is not None:
-            if decode_start != 0 or q.shape[0] != indexer_output.packed_query[0].shape[0]:
+            if (
+                decode_start != 0
+                or q.shape[0] != indexer_output.packed_query[0].shape[0]
+            ):
                 raise RuntimeError(
                     "the index-K write packed rows outside the decode window"
                 )
