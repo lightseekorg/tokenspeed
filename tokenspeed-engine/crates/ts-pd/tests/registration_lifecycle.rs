@@ -195,7 +195,7 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
     assert!(pair.prefill.has_room(room));
     assert!(pair.decode.has_room(room));
 
-    // Re-registering the same request id or a second request id on the active
+    // Re-registering the same request ID or a second request ID on the active
     // room fails cleanly without mutating the original transfer's state.
     let err = pair
         .prefill

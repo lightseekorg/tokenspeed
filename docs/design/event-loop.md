@@ -107,7 +107,7 @@ an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
-rule across distinct request ids. Peer state is keyed by room, so every new
+rule across distinct request IDs. Peer state is keyed by room, so every new
 request — including fan-out children and retries — must use a fresh room. At
 admission, before data-plane registration or scheduling, the loop refuses with
 409 any request whose room is already reserved by an unscheduled request (same
