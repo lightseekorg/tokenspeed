@@ -18,32 +18,94 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""A rank joins the shared L2 pool: its control client and its load executor,
-built over the rank's cache pools at device construction."""
+"""A rank joins the shared L2 pool at device construction: its transfer engine
+and its client in the engine host, started through the host's shared L2
+handle around the rank's hello to the owner, and its load executor over the
+rank's cache pools."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.l3.factory import cache_layout_deployment_id
 from tokenspeed.runtime.cache.shared_l2.client import (
-    SharedL2Client,
     SharedL2ClientConfig,
+    SharedL2Provider,
+    join_pool,
 )
 from tokenspeed.runtime.cache.shared_l2.executor import (
     SharedL2LoadExecutor,
     build_shared_l2_load_executor,
 )
-from tokenspeed.runtime.cache.shared_l2.layout import build_shared_l2_layout
-from tokenspeed.runtime.cache.shared_l2.transfer import RdmaEngine, SharedL2Transfer
+from tokenspeed.runtime.cache.shared_l2.layout import (
+    SharedL2PageField,
+    build_shared_l2_layout,
+)
 from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection
+from tokenspeed.runtime.pd.host_peer import (
+    enable_mooncake_ipv6_for_host,
+    mooncake_library,
+    mooncake_protocol,
+)
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+@dataclass(frozen=True, slots=True)
+class SharedL2PageGroup:
+    """A cache group's pool pages.
+
+    Attributes:
+        packing: Pool pages per LCM block.
+        page_bytes: Bytes of one pool page. A pool page is a Host block of
+            the same size: this is the layout's ``block_bytes`` of the group.
+        fields: The group's fields, as ``SharedL2Layout.page_fields`` lists
+            them.
+    """
+
+    packing: int
+    page_bytes: int
+    fields: tuple[SharedL2PageField, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SharedL2ClientSettings:
+    """What the host starts the rank's pool client from, once the rank has
+    joined (``SharedL2Handle.start_client``).
+
+    Attributes:
+        owner_address: The owner's ZMQ address.
+        client_id: The rank's id at the owner, from its hello.
+        request_timeout_ms: How long a request waits for the owner's answer.
+        load_workers: Threads reading one load's providers in parallel.
+        write_workers: Threads writing to the pool.
+        lcm_bytes: Bytes of one pool LCM block.
+        providers: Where the pool's bytes are.
+        groups: The cache groups' pages, in the scheduler's order.
+        num_layers: The rank's layers, the target's and then the draft's.
+        signal_words_address: Where the loads' signal words, their start and
+            ready words, are in host memory.
+        num_signal_words: How many words there are.
+    """
+
+    owner_address: str
+    client_id: int
+    request_timeout_ms: int
+    load_workers: int
+    write_workers: int
+    lcm_bytes: int
+    providers: tuple[SharedL2Provider, ...]
+    groups: tuple[SharedL2PageGroup, ...]
+    num_layers: int
+    signal_words_address: int
+    num_signal_words: int
 
 
 def join_shared_l2_pool(
@@ -60,7 +122,8 @@ def join_shared_l2_pool(
     draft_attention_backend_name: str,
     world_cpu_group: ProcessGroup | None,
     gpu_id: int,
-) -> tuple[SharedL2Client, SharedL2LoadExecutor]:
+    shared_l2_handle: Any,
+) -> tuple[SharedL2ClientConfig, SharedL2LoadExecutor]:
     """Join the pool ``--shared-l2-config`` names, waiting for it to be ready.
 
     Args:
@@ -80,10 +143,13 @@ def join_shared_l2_pool(
             the checkpoint of the deployment identity; None in a
             single-process deployment.
         gpu_id: Local device index.
+        shared_l2_handle: The host's shared L2 handle (``SharedL2Handle``):
+            the rank's transfer engine and pool client start there, and its
+            loads run there.
 
     Returns:
-        The rank's pool client, for the event loop, and the executor that
-        takes the Host cache executor's place.
+        The pool's config, and the executor that takes the Host cache
+        executor's place.
     """
     config = SharedL2ClientConfig.from_json(server_args.shared_l2_config)
     if not 0 <= gpu_id < len(config.device_names):
@@ -111,23 +177,57 @@ def join_shared_l2_pool(
         draft_attention_backend_name=draft_attention_backend_name,
         world_cpu_group=world_cpu_group,
     )
-    engine = RdmaEngine(
-        device_name=config.device_names[gpu_id],
+    local_ip = get_local_ip_by_remote()
+    enable_mooncake_ipv6_for_host(local_ip)
+    # Before the hello: registering the cache takes time, and the owner
+    # drops a client it does not hear from.
+    shared_l2_handle.start_engine(
+        library=mooncake_library(),
+        hostname=local_ip,
+        protocol=mooncake_protocol(),
+        device_filter=config.device_names[gpu_id],
         regions=layout.registration_regions(),
     )
-    client = SharedL2Client(
-        config,
-        geometry=layout.geometry,
-        deployment_id=deployment_id,
-        transfer=SharedL2Transfer(layout, engine),
-        connection=OwnerConnection(config.owner, timeout_ms=config.request_timeout_ms),
-    )
+    connection = OwnerConnection(config.owner, timeout_ms=config.request_timeout_ms)
+    try:
+        pool = join_pool(
+            config,
+            geometry=layout.geometry,
+            deployment_id=deployment_id,
+            connection=connection,
+        )
+    finally:
+        connection.close()
     executor = build_shared_l2_load_executor(
-        client,
         layout,
-        engine,
+        shared_l2_handle,
+        pool=pool,
         device_pool=device_pool,
         draft_pool=draft_pool,
         gpu_id=gpu_id,
     )
-    return client, executor
+    signal_words_address, num_signal_words = executor.signal_words
+    # The client's keepalive starts here, right after the hello.
+    shared_l2_handle.start_client(
+        SharedL2ClientSettings(
+            owner_address=config.owner,
+            client_id=pool.client,
+            request_timeout_ms=config.request_timeout_ms,
+            load_workers=config.load_workers,
+            write_workers=config.write_workers,
+            lcm_bytes=pool.lcm_bytes,
+            providers=pool.providers,
+            groups=tuple(
+                SharedL2PageGroup(
+                    packing=layout.host_packing[group],
+                    page_bytes=layout.block_bytes[group],
+                    fields=layout.page_fields(group),
+                )
+                for group in range(len(layout.transfer.groups))
+            ),
+            num_layers=len(layout.transfer.consumers),
+            signal_words_address=signal_words_address,
+            num_signal_words=num_signal_words,
+        )
+    )
+    return config, executor

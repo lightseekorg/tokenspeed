@@ -2055,6 +2055,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
             peer_outbox=None,
+            shared_l2_handle=None,
         )
     budget, rows = sized.value.args
     assert (rows is not None) == probe

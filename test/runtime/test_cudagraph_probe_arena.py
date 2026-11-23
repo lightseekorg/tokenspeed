@@ -504,6 +504,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
             peer_outbox=None,
+            shared_l2_handle=None,
         )
     return charged, set(reads), stack[0]
 

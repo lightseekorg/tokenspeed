@@ -62,11 +62,10 @@ hold each piece:
   resolved past its gate because a text-only model has no vision tower.
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
-- ``shared_l2`` — the rank's client of a shared L2 pool's owner, or None
-  without a pool. The handle's Host cache executor holds it, and the
-  host's control thread calls it.
-- ``DeviceHandle`` — the running handle: with ``shared_l2``, what the loop
-  stores.
+- ``shared_l2_config`` — the config of the shared L2 pool the rank joined
+  (``--shared-l2-config``), or None without a pool. The rank's client of the
+  pool's owner runs in the engine host.
+- ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
 Startup steps that need a real device object (the layerwise step counter,
 the peer's KV description) happen INSIDE the builder, so no such object ever
@@ -136,14 +135,16 @@ The two planes exchange information ONLY through the two channels below.
      ``mrope_positions`` and its siblings, which the next gather rebinds.
 
    - Shared L2 proxy pages. With a shared L2 pool the control thread hands
-     the pool client the pool page behind each proxy Host block an answer
-     created (``SharedL2Client.map_proxy_pages``), and the forward thread
-     reads that map when it starts a plan's load-backs
-     (``SharedL2LoadExecutor.submit_load_backs``). The discipline is
-     ordering: the map is written at the head of the round, before the
-     plan that may load from those blocks is queued, and the scheduler
-     holds a proxy block a planned load reads until the load is
-     acknowledged, so no later answer remaps it first.
+     the host's pool client the pool page behind each proxy Host block an
+     answer created (``map_proxy_pages``), and the forward thread's
+     hand-over of a plan's load-backs reads that map
+     (``SharedL2LoadExecutor.submit_load_backs``, through the host's shared
+     L2 handle, ``SharedL2Handle.submit_load``). The discipline is ordering:
+     the map is
+     written at the head of the round, before the plan that may load from
+     those blocks is queued, and the scheduler holds a proxy block a planned
+     load reads until the load is acknowledged, so no later answer remaps it
+     first.
 """
 
 from __future__ import annotations
@@ -198,7 +199,7 @@ logger = get_colorful_logger(__name__)
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.cache.peer import PeerGeometry
-    from tokenspeed.runtime.cache.shared_l2.client import SharedL2Client
+    from tokenspeed.runtime.cache.shared_l2.client import SharedL2ClientConfig
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
@@ -352,9 +353,9 @@ class DeviceBuild:
             register/abort, event polling — or None outside PD.
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
-        shared_l2: The rank's shared L2 pool client (lookups, writes and
-            notices; ``--shared-l2-config``), or None without a pool. The
-            pool's loads run behind ``handle`` like Host L2 loads.
+        shared_l2_config: The config of the shared L2 pool the rank joined
+            (``--shared-l2-config``), or None without a pool. The pool's
+            loads run behind ``handle`` like Host L2 loads.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts the
             EPD receive needs (``EncoderModelFacts``). A callable, not a
@@ -370,7 +371,7 @@ class DeviceBuild:
     transfer: Any
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
-    shared_l2: SharedL2Client | None
+    shared_l2_config: SharedL2ClientConfig | None
     encoder_model_facts: Any
     peer_geometry: PeerGeometry | None
 
@@ -753,7 +754,8 @@ class DeviceHandle:
         queries plus queue drains (serialized against the forward thread's
         submissions by the executor's own lock). Queued behind the forward
         thread's work, the round head would wait for every forward still
-        being launched.
+        being launched. A rank with a shared L2 pool is not asked: the host
+        acknowledges its loads from its own loader.
 
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
@@ -761,8 +763,8 @@ class DeviceHandle:
         l2 = self._l2
         if l2 is None:
             raise RuntimeError(
-                "cache results polled without --enable-kvstore, "
-                "--shared-l2-config or a retraction snapshot pool"
+                "cache results polled without --enable-kvstore or a "
+                "retraction snapshot pool"
             )
         return l2.poll_results()
 
@@ -1558,6 +1560,7 @@ def build_device_side(
     max_resident_requests: int,
     kv_transfer_builder,
     peer_outbox,
+    shared_l2_handle,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
 
@@ -1595,6 +1598,11 @@ def build_device_side(
         peer_outbox: With peer prefix sharing, the host's ``PeerOutbox``,
             which the handle tells when a plan's landings may be read (see
             ``cache/peer.py``); None without.
+        shared_l2_handle: The host's shared L2 handle (``SharedL2Handle``),
+            where a rank with ``--shared-l2-config`` starts its client of the
+            pool's owner and hands over its loads (see
+            ``cache/shared_l2/rank.py``); a rank without a pool leaves it
+            unused.
 
     Returns:
         A ``DeviceBuild``. No device object escapes except inside the
@@ -1866,7 +1874,7 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
-    shared_l2 = None
+    shared_l2_config = None
     if (
         server_args.shared_l2_config is not None
         or server_args.enable_kvstore
@@ -1897,7 +1905,7 @@ def build_device_side(
         # The pool is this rank's Host L2: the scheduler's Host tier is its
         # proxy and Host loads read it by RDMA, so its executor takes the
         # Host cache executor's place (no local Host bytes, no snapshot pool).
-        shared_l2, host_cache_executor = join_shared_l2_pool(
+        shared_l2_config, host_cache_executor = join_shared_l2_pool(
             server_args,
             model_config,
             draft_model_config,
@@ -1910,6 +1918,7 @@ def build_device_side(
             draft_attention_backend_name=attention.draft_attention_backend_name,
             world_cpu_group=world_cpu_group,
             gpu_id=gpu_id,
+            shared_l2_handle=shared_l2_handle,
         )
     elif server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
@@ -2069,7 +2078,7 @@ def build_device_side(
 
     return DeviceBuild(
         host_cache=host_cache,
-        shared_l2=shared_l2,
+        shared_l2_config=shared_l2_config,
         peer_geometry=peer_geometry,
         specs=specs,
         transfer=kv_transfer,

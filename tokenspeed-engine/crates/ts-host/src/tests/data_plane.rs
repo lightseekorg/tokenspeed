@@ -34,6 +34,10 @@ mod cpu_benchmark;
 mod pd_notice;
 #[path = "data_plane/result_buffers.rs"]
 mod result_buffers;
+// The control crate's owner for tests, which says what a test scripts.
+#[allow(dead_code)]
+#[path = "../../../ts-control/src/shared_l2/testing/owner.rs"]
+mod shared_l2_owner;
 
 /// Start the interpreter once per test process, with the scheduler
 /// module loaded and the repository's `tokenspeed_scheduler` package
@@ -203,8 +207,13 @@ fn plane() -> (Py<PyAny>, Scheduler) {
     })
 }
 
+/// The data plane of a rank that joined no shared L2 pool.
 fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+    let (plane, shared_l2_handle) = Python::attach(|py| {
+        let shared_l2_handle = Py::new(py, crate::pool::Handle::new()).unwrap();
+        (plane.clone_ref(py), shared_l2_handle)
+    });
+    PythonDataPlane::start(plane, None, shared_l2_handle).unwrap()
 }
 
 /// A one-row batch: the stand-in launches whatever it is handed.
@@ -475,7 +484,7 @@ fn a_failed_completion_notifies_the_launcher_before_logging() {
                 ..Dispatch::default()
             };
             LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
-            let mut data_plane = PythonDataPlane::start(plane, None).unwrap();
+            let mut data_plane = start(&plane);
             let forward = data_plane
                 .execute(scheduler.next_execution_plan(true, false), &dispatch)
                 .unwrap()
@@ -768,218 +777,271 @@ fn assert_failure_is_published_before_logging(
     );
 }
 
-/// A stand-in for the rank's Python pool client (`SharedL2Client`): it
-/// records what each call was given and answers what the client would.
-const POOL_CLIENT: &str = r#"
-import struct
+/// What a rank that joined a pool hands the host (`SharedL2ClientSettings`
+/// in `cache/shared_l2/rank.py`), and the forward thread's and the
+/// completion query's calls of the shared L2 handle.
+const POOL_RANK: &str = r#"
+class Fields:
+    def __init__(self, **fields):
+        for name, value in fields.items():
+            setattr(self, name, value)
 
 
-class Client:
-    def __init__(self):
-        self.calls = []
-
-    def lookup(self, lookups):
-        self.calls.append(("lookup", lookups))
-        hit = ("r1", 9, 32, 35, (3, "tail"), [((0, 1, "k1", 0), 0, 17), ((0, 2, "k2", 1), 0, 18)])
-        return [hit, ("r2", 0, 0, 0, None, [])]
-
-    def poll_writes(self):
-        self.calls.append(("poll_writes",))
-        return [21, 22]
-
-    def map_proxy_pages(self, pages):
-        self.calls.append(("map_proxy_pages", pages))
-
-    def submit(self, writes, releases, touches):
-        self.calls.append(("submit", writes, releases, touches))
-
-    def check_failure(self):
-        self.calls.append(("check_failure",))
-
-
-def int32(*tokens):
-    return struct.pack(f"={len(tokens)}i", *tokens)
-
-
-EXPECTED = [
-    ("lookup", [("r1", ["h1", "h2"], int32(7, 8, 9), 3), ("r2", [], int32(), 0)]),
-    ("poll_writes",),
-    ("map_proxy_pages", [(1, 5, 0, 17), (2, 6, 0, 18)]),
-    (
-        "submit",
-        [
-            (
-                31,
-                [(0, 1, "k1", 0), (0, 2, "k2", 1)],
-                [0, 0],
-                [12, 13],
-                [(int32(7, 8, 9), ["h1"], (1, "tail"), 77), (int32(7, 8), ["h1"], None, 78)],
-            )
+def settings(owner_address, signal_words_address):
+    return Fields(
+        owner_address=owner_address,
+        client_id=7,
+        request_timeout_ms=5000,
+        load_workers=2,
+        write_workers=1,
+        lcm_bytes=64,
+        providers=[
+            Fields(session="node0", base=10000, lcm_blocks=3, start=0),
+            Fields(session="node1", base=20000, lcm_blocks=5, start=3),
         ],
-        [9],
-        [[(0, 1, "k1", 0)]],
-    ),
-    ("check_failure",),
-]
-result = Client()
+        groups=[
+            # Two KV pages in an LCM block, k then v; a State page fills one.
+            Fields(
+                packing=2,
+                page_bytes=32,
+                fields=[
+                    Fields(
+                        device_address=0,
+                        device_stride=32,
+                        bytes=12,
+                        page_offset=0,
+                        layer=0,
+                    ),
+                    Fields(
+                        device_address=16,
+                        device_stride=32,
+                        bytes=16,
+                        page_offset=12,
+                        layer=1,
+                    ),
+                ],
+            ),
+            Fields(
+                packing=1,
+                page_bytes=64,
+                fields=[
+                    Fields(
+                        device_address=2000,
+                        device_stride=64,
+                        bytes=64,
+                        page_offset=0,
+                        layer=1,
+                    )
+                ],
+            ),
+        ],
+        num_layers=2,
+        signal_words_address=signal_words_address,
+        num_signal_words=6,
+    )
+
+
+def load(handle):
+    # KV page 7 (node1's first) into Device block 5, State page 2 into 3.
+    handle.submit_load(
+        op_ids=[41, 42], rows=[(0, 100, 5), (1, 101, 3)], start_word=3, seq=9
+    )
+
+
+def unmapped(handle):
+    handle.submit_load(op_ids=[43], rows=[(0, 999, 5)], start_word=0, seq=1)
+
+
+def outside(handle):
+    # Device block 2000 lies outside the test memory.
+    handle.submit_load(op_ids=[44], rows=[(0, 100, 2000)], start_word=0, seq=1)
 "#;
 
 #[test]
-fn the_pool_client_speaks_the_python_clients_shapes() {
-    use ts_control::shared_l2::PoolClient;
-    use ts_scheduler::{
-        SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
-        SharedL2PublicationView, StorageKeyView,
+fn a_pool_ranks_loads_run_and_are_acknowledged_in_the_host() {
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
     };
 
-    interpreter();
-    let (python_client, globals) = Python::attach(|py| {
+    use ts_control::peer::read::Arena;
+    use ts_scheduler::{CacheEvent, CacheEventKind, SharedL2PageView};
+
+    // The rank's Python data plane: it acknowledges a write-back whenever
+    // it is asked for cache acknowledgments.
+    let (plane, _) = plane();
+    // An owner that says `ok` to every request.
+    let owner = shared_l2_owner::TestOwner::serve(|_| Some(shared_l2_owner::ok(Vec::new())));
+    let address = owner.address.clone();
+    // The rank's signal words: two sets of a start word and two layers.
+    let words: Vec<AtomicU32> = (0..6).map(|_| AtomicU32::new(0)).collect();
+    let (handle, globals) = Python::attach(|py| {
         let globals = PyDict::new(py);
-        py.run(&CString::new(POOL_CLIENT).unwrap(), Some(&globals), None)
+        py.run(&CString::new(POOL_RANK).unwrap(), Some(&globals), None)
             .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
-        let python_client = globals.get_item("result").unwrap().unwrap().unbind();
-        (python_client, globals.unbind())
+        let handle = Bound::new(py, crate::pool::Handle::new()).unwrap();
+        (handle.unbind(), globals.unbind())
     });
-    let mut client =
-        crate::pool::PythonPoolClient::new(Python::attach(|py| python_client.clone_ref(py)));
-    let key = |group_id: u32, hash: &str, page_offset: i32| StorageKeyView {
-        group_id,
-        content_hash: hash.to_owned(),
-        page_offset,
+    let mut data_plane = {
+        let (plane, handle) = Python::attach(|py| (plane.clone_ref(py), handle.clone_ref(py)));
+        PythonDataPlane::start(plane, None, handle).unwrap()
+    };
+    let call = |function: &str| {
+        Python::attach(|py| {
+            globals
+                .bind(py)
+                .get_item(function)
+                .unwrap()
+                .unwrap()
+                .call1((handle.clone_ref(py),))
+                .map(drop)
+                .map_err(|error| describe(py, &error))
+        })
     };
 
-    let answers = client
-        .lookup(&[
-            SharedL2LookupView {
-                request_id: "r1".to_owned(),
-                prefix_hashes: vec!["h1".to_owned(), "h2".to_owned()],
-                tokens: vec![7, 8, 9],
-                max_tokens: 3,
-            },
-            SharedL2LookupView {
-                request_id: "r2".to_owned(),
-                prefix_hashes: Vec::new(),
-                tokens: Vec::new(),
-                max_tokens: 0,
-            },
-        ])
+    // A rank that started no client has no loads, no client for the loop
+    // and nothing to close.
+    assert!(call("load").unwrap_err().contains("has not started"));
+    assert!(handle.get().take_client().is_none());
+    assert!(Python::attach(|py| handle
+        .call_method0(py, "close")
+        .unwrap()
+        .extract::<bool>(py)
+        .unwrap()));
+
+    // The settings the rank's Python hands over become the pool's geometry
+    // and the signal words' location.
+    let (settings, signal_words) = Python::attach(|py| {
+        let settings = globals
+            .bind(py)
+            .get_item("settings")
+            .unwrap()
+            .unwrap()
+            .call1((&address, words.as_ptr() as usize))
+            .unwrap();
+        crate::pool::client_settings(&settings)
+            .unwrap_or_else(|error| panic!("{}", describe(py, &error)))
+    });
+    assert_eq!(
+        (settings.owner_address.as_str(), settings.client_id),
+        (address.as_str(), 7)
+    );
+    assert_eq!(settings.request_timeout, Duration::from_secs(5));
+    assert_eq!(
+        (settings.load_workers.get(), settings.write_workers.get()),
+        (2, 1)
+    );
+    assert_eq!(settings.geometry.num_layers, 2);
+    let sessions: Vec<_> = settings
+        .geometry
+        .providers
+        .iter()
+        .map(|provider| provider.session.as_str())
+        .collect();
+    assert_eq!(sessions, ["node0", "node1"]);
+    // The pool ends at KV page 16 and State page 8, on node1.
+    assert_eq!(settings.geometry.page_address(0, 0, 16).unwrap().0, 1);
+    assert_eq!(settings.geometry.page_address(1, 0, 8).unwrap().0, 1);
+    assert!(settings.geometry.page_address(1, 0, 9).is_err());
+
+    // Test memory stands in for the Device cache and the providers.
+    let arena = Arena::new(30_000);
+    let (kv_page, state_page) = (20_000, 10_000 + 64);
+    arena.write(kv_page, &[1; 12]);
+    arena.write(kv_page + 12, &[2; 16]);
+    arena.write(state_page, &[3; 64]);
+    handle
+        .get()
+        .start_client_with(
+            settings,
+            Arc::new(arena.clone()),
+            Arc::new(arena.clone()),
+            Arc::new(signal_words),
+        )
         .unwrap();
-    // A hit with a tail and a miss.
-    let [hit, miss] = &answers[..] else {
-        panic!("{answers:?}");
-    };
-    assert_eq!(
-        (
-            hit.request_id.as_str(),
-            hit.ticket,
-            hit.num_tokens,
-            hit.kv_tokens
-        ),
-        ("r1", 9, 32, 35)
-    );
-    assert_eq!((hit.tail_tokens, hit.tail_hash.as_str()), (3, "tail"));
-    assert_eq!(hit.keys, [key(1, "k1", 0), key(2, "k2", 1)]);
-    assert_eq!((&hit.buckets, &hit.pages), (&vec![0, 0], &vec![17, 18]));
-    assert_eq!(
-        (miss.request_id.as_str(), miss.ticket, miss.tail_tokens),
-        ("r2", 0, 0)
-    );
-    assert!(miss.keys.is_empty() && miss.tail_hash.is_empty());
-    // The finished writes.
-    assert_eq!(client.poll_writes().unwrap(), [21, 22]);
+    let mut client = handle.get().take_client().expect("the rank's client");
+    assert!(handle.get().take_client().is_none());
 
+    // The forward thread hands a load over; a proxy block that stands for
+    // no page is refused there.
     client
         .map_proxy_pages(&[
             SharedL2PageView {
-                group_id: 1,
-                block: 5,
+                group_id: 0,
+                block: 100,
                 bucket: 0,
-                page: 17,
+                page: 7,
             },
             SharedL2PageView {
-                group_id: 2,
-                block: 6,
+                group_id: 1,
+                block: 101,
                 bucket: 0,
-                page: 18,
+                page: 2,
             },
         ])
         .unwrap();
-    let command = |kind, id| SharedL2OpView {
-        kind,
-        id,
-        keys: Vec::new(),
-        buckets: Vec::new(),
-        blocks: Vec::new(),
-        publications: Vec::new(),
+    assert!(call("unmapped")
+        .unwrap_err()
+        .contains("stands for no pool page"));
+    call("load").unwrap();
+    // Nothing is read before the start word of the second word set lands.
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(data_plane.poll_cache_events().unwrap(), []);
+    words[3].store(9, Ordering::Relaxed);
+    // The data plane's cache poll acknowledges the load's operations from
+    // the loader's finished loads, and never asks Python.
+    let started = std::time::Instant::now();
+    let mut acknowledged = Vec::new();
+    while acknowledged.is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        acknowledged = data_plane.poll_cache_events().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let load_back_done = |op_id| CacheEvent {
+        kind: CacheEventKind::LoadBackDone,
+        op_id,
     };
-    let publication =
-        |tokens: &[i32], tail_tokens, tail_hash: &str, publisher| SharedL2PublicationView {
-            tokens: tokens.to_vec(),
-            prefix_hashes: vec!["h1".to_owned()],
-            tail_tokens,
-            tail_hash: tail_hash.to_owned(),
-            publisher,
-        };
-    client
-        .submit(&[
-            SharedL2OpView {
-                keys: vec![key(1, "k1", 0), key(2, "k2", 1)],
-                buckets: vec![0, 0],
-                blocks: vec![12, 13],
-                publications: vec![
-                    publication(&[7, 8, 9], 1, "tail", 77),
-                    publication(&[7, 8], 0, "", 78),
-                ],
-                ..command(SharedL2OpKind::Write, 31)
-            },
-            command(SharedL2OpKind::Release, 9),
-            SharedL2OpView {
-                keys: vec![key(1, "k1", 0)],
-                ..command(SharedL2OpKind::Touch, 0)
-            },
-        ])
-        .unwrap();
+    assert_eq!(acknowledged, [load_back_done(41), load_back_done(42)]);
+    assert!(calls(&plane)
+        .iter()
+        .all(|(name, _)| name != "poll_cache_events"));
+    // Each layer's ready word holds the load's value, set through the
+    // words' address, and the blocks hold the pages.
+    assert_eq!(
+        words
+            .iter()
+            .map(|word| word.load(Ordering::Relaxed))
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 9, 9, 9]
+    );
+    assert_eq!(arena.read_bytes(5 * 32, 12), [1; 12]);
+    assert_eq!(arena.read_bytes(16 + 5 * 32, 16), [2; 16]);
+    assert_eq!(arena.read_bytes(2000 + 3 * 64, 64), [3; 64]);
 
-    // Nothing failed so far.
-    client.check_failure().unwrap();
+    // A load that fails is the rank's failure: the cache poll raises it in
+    // the pool's own words, and the client has it for the loop's check.
+    call("outside").unwrap();
+    words[0].store(1, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let failure = loop {
+        match data_plane.poll_cache_events() {
+            Err(failure) => break failure.0,
+            Ok(acknowledged) => assert_eq!(acknowledged, []),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        failure,
+        "shared L2 read from node1 failed: a span outside the arena"
+    );
+    assert_eq!(client.check_failure().unwrap_err().0, failure);
 
-    // What the Python client was given, in its own shapes.
-    Python::attach(|py| {
-        py.run(
-            c"assert result.calls == EXPECTED, f'{result.calls}\\n!=\\n{EXPECTED}'",
-            Some(globals.bind(py)),
-            None,
-        )
-        .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
-    });
-
-    // A call that raises is the client's failure, with its traceback: the
-    // owner's error reply to a lookup, a write that failed.
-    Python::attach(|py| {
-        py.run(
-            c"def fail(*_):\n    raise RuntimeError('the owner refused')\nresult.lookup = result.poll_writes = result.check_failure = fail",
-            Some(globals.bind(py)),
-            None,
-        )
-        .unwrap();
-    });
-    let error = client.lookup(&[]).unwrap_err();
-    assert!(error.0.contains("the owner refused"), "{}", error.0);
-    let error = client.poll_writes().unwrap_err();
-    assert!(error.0.contains("the owner refused"), "{}", error.0);
-    let error = client.check_failure().unwrap_err();
-    assert!(error.0.contains("the owner refused"), "{}", error.0);
-
-    // A pool holds the default namespace alone, which the scheduler's keys
-    // do not carry: an answer that names another is refused.
-    Python::attach(|py| {
-        py.run(
-            c"result.lookup = lambda lookups: [('r1', 9, 2, 2, None, [((1, 1, 'k1', 0), 0, 17)])]",
-            Some(globals.bind(py)),
-            None,
-        )
-        .unwrap();
-    });
-    let error = client.lookup(&[]).unwrap_err();
-    assert!(error.0.contains("namespace 1"), "{}", error.0);
+    // The rank's shutdown closes the shared L2 handle: every thread ended.
+    assert!(Python::attach(|py| handle
+        .call_method0(py, "close")
+        .unwrap()
+        .extract::<bool>(py)
+        .unwrap()));
+    assert!(call("load").unwrap_err().contains("have stopped"));
 }

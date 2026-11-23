@@ -21,13 +21,15 @@
 """Shared L2: one paged Host L2 pool that every prefill rank uses.
 
 ``owner`` serves the pool's cache index (the scheduler's ``SharedL2Pool``)
-and holds no bytes; ``provider`` hosts one node's pool memory; ``client`` is a
-rank's control side, which carries the scheduler's lookups, writes and notices
-to the owner; ``wire`` is the request-reply wire between them.
+and holds no bytes; ``provider`` hosts one node's pool memory; ``wire`` is the
+request-reply wire to the owner.
 
-On a rank, ``layout`` says where its Device blocks and the pool's pages are,
-``transfer`` copies between them by RDMA, ``executor`` loads pool pages into
-the Device cache layer by layer in the Host cache executor's place, and
-``rank`` joins all of it to the pool at device construction. See the "Shared
-L2 pool" section of ``docs/configuration/server.md``.
+On a rank, ``client`` holds the pool's settings and the rank's hello,
+``layout`` says where its Device blocks are and how a pool page holds one,
+``executor`` is the forward thread's part of a load in the Host cache
+executor's place, and ``rank`` joins all of it to the pool at device
+construction. The rank's client of the owner (lookups, writes, notices) and
+the RDMA copies of its loads and writes run in the engine host
+(``shared_l2`` of ``ts-control``). See the "Shared L2 pool" section of
+``docs/configuration/server.md``.
 """

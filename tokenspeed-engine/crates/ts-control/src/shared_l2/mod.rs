@@ -33,6 +33,11 @@
 //! own. At the head of every round the loop asks the client for the writes
 //! it finished and for a failure it stored ([`Pool::finished_writes`]).
 //!
+//! The client of a serving rank is [`client::RankClient`]: it speaks the
+//! owner's wire ([`owner`]) and copies between the rank's Device blocks and
+//! the providers' pages ([`geometry`]). Its loads ([`load`]) are handed
+//! over by the data plane's forward thread, not by the loop.
+//!
 //! A failure of the client or of the owner ends serving, as a failed
 //! load-back does; a miss is an answer of the owner that names no page. A
 //! load from the pool that failed lets its forward go over pages it never
@@ -41,17 +46,66 @@
 //! client answers one rank, so the pool needs a replica of one member
 //! (attention TP 1).
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    panic::{self, AssertUnwindSafe},
+    sync::OnceLock,
+    thread,
+};
 
 use ts_scheduler::{
     CacheEvent, CacheEventKind, ExecutionPlan, SharedL2AnswerView, SharedL2LookupView,
     SharedL2OpKind, SharedL2OpView, SharedL2PageView,
 };
 
+pub mod client;
+pub mod geometry;
+pub mod load;
+pub mod owner;
+
 /// The pool's client or its owner failed; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
 #[error("shared L2 pool client: {0}")]
 pub struct PoolError(pub String);
+
+/// The first failure of the rank's pool work on the client's own threads: a
+/// load's, a write's or a notice's. The rank's engine is to stop on it.
+#[derive(Debug, Default)]
+pub struct FailureLatch(OnceLock<String>);
+
+impl FailureLatch {
+    /// Keep `error`, unless a failure is kept already.
+    pub fn record(&self, error: PoolError) {
+        let _ = self.0.set(error.0);
+    }
+
+    /// Fails once a failure is kept, at this call and at every later one;
+    /// never waits.
+    pub fn check(&self) -> Result<(), PoolError> {
+        match self.0.get() {
+            Some(error) => Err(PoolError(error.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Run `work` of one of the client's threads. A panic in it is the work's
+/// failure, named after the thread: it takes the path a failure takes, so
+/// the engine stops on it, and the thread goes on to what is queued behind.
+fn panic_as_failure<T>(work: impl FnOnce() -> Result<T, PoolError>) -> Result<T, PoolError> {
+    panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+        // A panic's message is a `&str` or a `String`.
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("no message");
+        Err(PoolError(format!(
+            "the shared L2 thread {} panicked: {message}",
+            thread::current().name().unwrap_or("unnamed")
+        )))
+    })
+}
 
 /// The rank's client of the pool's owner. Only `lookup` waits for the owner.
 pub trait PoolClient {
@@ -209,6 +263,9 @@ impl Pool {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests {

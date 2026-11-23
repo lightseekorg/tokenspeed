@@ -1585,6 +1585,7 @@ dependencies = [
  "pyo3-async-runtimes",
  "tokenspeed-client",
  "tokenspeed-l3",
+ "tokenspeed-mooncake",
  "tokenspeed-pd",
  "tokenspeed-wire",
  "tokio",

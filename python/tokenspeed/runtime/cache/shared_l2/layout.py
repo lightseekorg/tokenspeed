@@ -18,29 +18,48 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Where a rank's Device cache blocks live, and how a pool page holds one.
+"""Where a rank's Device cache blocks live, and the sizes of a pool page.
 
-A pool page holds one scheduler CacheBlock as a Host L2 block does: the pool
-is laid out as ``HostCacheStorage`` lays out a rank's Host tier (one parent
-size, each group packed into it, a block's fields back to back). Only the
-parents are spread over the providers. The scheduler's view of each group
-travels to the owner as the rank's geometry, so the owner builds the cache
-index the rank's scheduler uses.
+A pool page holds one scheduler CacheBlock exactly as a Host L2 block does, so
+the sizes and offsets here are ``HostCacheStorage``'s. How the pool lays its
+pages over the providers is stated once, in ``shared_l2/geometry.rs`` of
+``ts-control``, which copies between the pages and the Device blocks. The
+scheduler's view of each group travels to the owner as the rank's geometry,
+so the owner builds the cache index the rank's scheduler uses.
 """
 
 from __future__ import annotations
 
-import bisect
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from tokenspeed.runtime.cache.host_storage import _compute_host_layout
-from tokenspeed.runtime.cache.shared_l2.client import SharedL2PoolView
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheTransferLayout,
     combine_cache_transfer_layouts,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SharedL2PageField:
+    """One field of a group's Device CacheBlocks, as a pool page holds it
+    (``PageField`` in ``shared_l2/geometry.rs`` of ``ts-control``).
+
+    Attributes:
+        device_address: The address of the field in Device block zero.
+        device_stride: Bytes from one Device block to the next.
+        bytes: Bytes of the field's payload.
+        page_offset: The payload's offset inside a pool page.
+        layer: The layer that reads the field, counted over the layout's
+            consumers, the target's and then the draft's.
+    """
+
+    device_address: int
+    device_stride: int
+    bytes: int
+    page_offset: int
+    layer: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +73,6 @@ class SharedL2Layout:
             ``transfer.consumers``.
         block_bytes: Bytes of one pool page per group.
         field_offsets: Per group, each field's offset inside a pool page.
-        lcm_bytes: Bytes of one pool LCM block.
         host_packing: Pool pages per LCM block, per group.
         geometry: What the owner builds its pool from and checks every rank
             against (``owner``'s module docstring).
@@ -64,7 +82,6 @@ class SharedL2Layout:
     view_layers: tuple[int, ...]
     block_bytes: tuple[int, ...]
     field_offsets: tuple[tuple[int, ...], ...]
-    lcm_bytes: int
     host_packing: tuple[int, ...]
     geometry: dict[str, Any]
 
@@ -117,7 +134,6 @@ class SharedL2Layout:
             view_layers=view_layers,
             block_bytes=block_bytes,
             field_offsets=field_offsets,
-            lcm_bytes=lcm_bytes,
             host_packing=host_packing,
             geometry=geometry,
         )
@@ -129,39 +145,30 @@ class SharedL2Layout:
             for buffer in self.transfer.buffers
         )
 
-    def device_fields(self, group: int) -> tuple[tuple[int, int, int], ...]:
+    def page_fields(self, group: int) -> tuple[SharedL2PageField, ...]:
         """Every field of a group's Device CacheBlocks, in the order a pool
-        page holds them: ``(address of block zero, bytes from one block to
-        the next, payload bytes)``."""
+        page holds them."""
+        layer_of = {
+            field_id: layer
+            for layer, consumer in enumerate(self.transfer.consumers)
+            for field_id in consumer
+        }
         return tuple(
-            (
-                int(self.transfer.buffers[field.device_buffer_index].data_ptr())
+            SharedL2PageField(
+                device_address=int(
+                    self.transfer.buffers[field.device_buffer_index].data_ptr()
+                )
                 + field.device_block_zero_offset_bytes,
-                field.block_stride_bytes,
-                field.payload_bytes,
+                device_stride=field.block_stride_bytes,
+                bytes=field.payload_bytes,
+                page_offset=offset,
+                layer=layer_of[field.field_id],
             )
-            for field in self.transfer.groups[group].fields
-        )
-
-    def page_address(
-        self, pool: SharedL2PoolView, group: int, bucket: int, page: int
-    ) -> tuple[str, int]:
-        """The provider session and the remote address of a group's pool page.
-
-        A page lies in its LCM block as ``HostCacheStorage.host_block_offset``
-        places a Host block; the LCM block lies on the provider that holds it.
-        """
-        if bucket != 0:
-            raise ValueError("a shared L2 pool holds bucket 0 only")
-        lcm, slot = divmod(page - 1, self.host_packing[group])
-        starts = [provider.start for provider in pool.providers]
-        provider = pool.providers[max(bisect.bisect_right(starts, lcm) - 1, 0)]
-        if page <= 0 or not 0 <= lcm - provider.start < provider.lcm_blocks:
-            raise IndexError(f"shared L2 page {page} of group {group} is out of range")
-        return provider.session, (
-            provider.base
-            + (lcm - provider.start) * self.lcm_bytes
-            + slot * self.block_bytes[group]
+            for field, offset in zip(
+                self.transfer.groups[group].fields,
+                self.field_offsets[group],
+                strict=True,
+            )
         )
 
 

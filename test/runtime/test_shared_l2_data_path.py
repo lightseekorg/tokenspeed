@@ -18,13 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The data path of a shared L2 pool: where a rank's blocks and the pool's
-pages are, the copies of a write, and the load executor that reads pool pages
-back layer by layer.
+"""The data path of a shared L2 pool on a rank's Python side: where the rank's
+blocks are and how a pool page holds one, and the forward thread's part of a
+load, which hands the load to the engine host.
 
-The pool's memory is plain host bytes and a memory copy stands in for RDMA.
-The CPU tests keep the ready words in plain memory too; the tests that need a
-GPU run the real words and CUDA streams."""
+The host's loader reads the pool's pages (``shared_l2/load.rs`` of
+``ts-control``, tested there over test memory). Here a stand-in takes its
+place: it copies a writer's blocks layer by layer and sets the ready words.
+The CPU tests keep the signal words in plain memory; the tests that need a GPU
+run the real words and CUDA streams."""
 
 import ctypes
 import faulthandler
@@ -33,7 +35,7 @@ import os
 import sys
 import threading
 import time
-import types
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -53,7 +55,6 @@ import tokenspeed_engine.scheduler as ts  # noqa: E402
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
-    HostCacheStorage,
     compute_host_group_packing,
     compute_host_lcm_block_bytes,
 )
@@ -71,11 +72,8 @@ from tokenspeed.runtime.cache.shared_l2.executor import (  # noqa: E402
 )
 from tokenspeed.runtime.cache.shared_l2.layout import (  # noqa: E402
     SharedL2Layout,
+    SharedL2PageField,
     build_shared_l2_layout,
-)
-from tokenspeed.runtime.cache.shared_l2.transfer import (  # noqa: E402
-    RdmaEngine,
-    SharedL2Transfer,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -95,7 +93,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa:
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
-# The ready words are CUDA stream memory operations, called in the NVIDIA
+# The signal words are CUDA stream memory operations, called in the NVIDIA
 # driver library (``HostSignals``): torch.cuda alone is there on AMD too.
 needs_cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_nvidia,
@@ -113,8 +111,16 @@ SPECS = (
 )
 # Two layers: the first reads k, the second v and the state.
 CONSUMERS = (("layer.0.k",), ("layer.1.v", "layer.1.s"))
-# A pool of 8 LCM blocks on two providers.
+# A pool of 8 LCM blocks on two providers, as a hello describes it.
 PROVIDER_BLOCKS = (3, 5)
+POOL = SharedL2PoolView(
+    client=1,
+    providers=(
+        SharedL2Provider("p0", 1 << 40, 3, 0),
+        SharedL2Provider("p1", 1 << 41, 5, 3),
+    ),
+    lcm_bytes=28,
+)
 
 
 class Arena:
@@ -180,81 +186,85 @@ class Arena:
         self.state.copy_(other.state)
 
 
-class Pool:
-    """A pool's memory on two providers, as one hello describes it."""
-
-    def __init__(self, lcm_bytes):
-        self.memory = [
-            ctypes.create_string_buffer(blocks * lcm_bytes)
-            for blocks in PROVIDER_BLOCKS
-        ]
-        self.view = SharedL2PoolView(
-            client=1,
-            providers=(
-                SharedL2Provider("p0", ctypes.addressof(self.memory[0]), 3, 0),
-                SharedL2Provider("p1", ctypes.addressof(self.memory[1]), 5, 3),
-            ),
-            lcm_bytes=lcm_bytes,
-        )
+def memory_copy(destination: int, source: int, size: int) -> None:
+    """A copy between host addresses."""
+    ctypes.memmove(destination, source, size)
 
 
-class MemoryEngine:
-    """Copies between host addresses, as RDMA does between a rank and a
-    provider."""
+def cuda_copy(destination: int, source: int, size: int) -> None:
+    """A copy between CUDA memory and host memory, from any thread."""
+    torch.cuda.set_device(0)
+    result = ctypes.CDLL("libcuda.so.1").cuMemcpy(
+        ctypes.c_uint64(destination), ctypes.c_uint64(source), ctypes.c_size_t(size)
+    )
+    assert result == 0
 
-    def __init__(self):
-        # (direction, session) of every copy, in order.
-        self.copies = []
-        self.fail_reads = False
-        # Reads of ranges of these sizes wait for ``resume``.
-        self.held_sizes = frozenset()
-        self.resume = threading.Event()
-        self.read_delay_s = 0.0
 
-    def read(self, session, local, remote, lengths):
-        self.copies.append(("read", session))
-        if self.held_sizes & set(lengths):
-            assert self.resume.wait(10)
-        time.sleep(self.read_delay_s)
-        if self.fail_reads:
-            raise RuntimeError(f"shared L2 read from {session} failed")
-        self.copy(local, remote, lengths)
+class StandInHandle:
+    """Stands in for the host's shared L2 handle (``SharedL2Handle``), which
+    runs a rank's loads in a server: one thread takes the loads in the order
+    they were handed over, waits for a load's start word, copies each layer's
+    fields and sets the layer's ready word, as the host's loader does from
+    the pool. A proxy Host block here stands for the writer's Device block of
+    the same id."""
 
-    def write(self, session, local, remote, lengths):
-        self.copies.append(("write", session))
-        self.copy(remote, local, lengths)
+    def __init__(self, writer, reader, *, copy):
+        self._writer, self._reader, self._copy = writer, reader, copy
+        # The rank's words, once its executor made them.
+        self.words = None
+        # Every load handed over: (op_ids, rows, start_word, seq).
+        self.loads = []
+        # How long every layer's copies take.
+        self.layer_delay_s = 0.0
+        # What a hand-over raises, once set: the loader refuses the load.
+        self.refusal = None
+        # Whether the close reports that every thread ended.
+        self.stops = True
+        self._closing = False
+        self.closed = False
+        # Called when the close comes, before anything is stopped.
+        self.before_close = lambda: None
+        self._jobs = ThreadPoolExecutor(1, thread_name_prefix="stand-in-load")
 
-    def copy(self, destinations, sources, lengths):
-        for destination, source, size in zip(
-            destinations, sources, lengths, strict=True
-        ):
-            ctypes.memmove(destination, source, size)
+    def submit_load(self, *, op_ids, rows, start_word, seq):
+        if self.refusal is not None:
+            raise RuntimeError(self.refusal)
+        self.loads.append((list(op_ids), list(rows), start_word, seq))
+        self._jobs.submit(self._load, list(rows), start_word, seq)
+
+    def _load(self, rows, start_word, seq):
+        words = self.words.words
+        # The start word lands once the plan's page zeroing is done; a load
+        # still waiting for it at the close is given up.
+        while (int(words[start_word]) - seq) & 0xFFFFFFFF >= 0x80000000:
+            if self._closing:
+                return
+            time.sleep(20e-6)
+        for layer in range(len(CONSUMERS)):
+            time.sleep(self.layer_delay_s)
+            for group, source, destination in rows:
+                for written, loaded in zip(
+                    self._writer.layout.page_fields(group),
+                    self._reader.layout.page_fields(group),
+                    strict=True,
+                ):
+                    if loaded.layer == layer:
+                        self._copy(
+                            loaded.device_address + destination * loaded.device_stride,
+                            written.device_address + source * written.device_stride,
+                            loaded.bytes,
+                        )
+            words[start_word + 1 + layer] = seq
 
     def close(self):
-        pass
+        self.before_close()
+        self._closing = True
+        self._jobs.shutdown(wait=True)
+        self.closed = True
+        return self.stops
 
 
-class CudaEngine(MemoryEngine):
-    """Copies between CUDA memory and the pool's host memory from any thread."""
-
-    def __init__(self):
-        super().__init__()
-        self._cuda = ctypes.CDLL("libcuda.so.1")
-
-    def copy(self, destinations, sources, lengths):
-        torch.cuda.set_device(0)
-        for destination, source, size in zip(
-            destinations, sources, lengths, strict=True
-        ):
-            result = self._cuda.cuMemcpy(
-                ctypes.c_uint64(destination),
-                ctypes.c_uint64(source),
-                ctypes.c_size_t(size),
-            )
-            assert result == 0
-
-
-class PlainWords:
+class PlainSignals:
     """The start and ready words in plain host memory. A stream write lands
     when the test lets it; a stream wait is kept, and ``drain`` returns once
     every wait kept so far on a stream would have passed, as synchronizing
@@ -262,13 +272,16 @@ class PlainWords:
 
     def __init__(self, num_words):
         self.words = np.zeros(num_words, dtype=np.uint32)
-        # (stream, word, value) of every wait.
+        self.address = self.words.ctypes.data
+        # (stream, word, value) of every wait, and of every write.
         self.waits = []
+        self.writes = []
         self.hold_writes = False
         self._held = []
         self.closed = False
 
     def write(self, stream, word, value):
+        self.writes.append((stream, word, value))
         if self.hold_writes:
             self._held.append((word, value))
         else:
@@ -324,51 +337,32 @@ class LoadBackOp:
 
 
 class Rank:
-    """A rank's load path over a pool: its arena, its tracker and executor,
-    and the proxy pages its scheduler would have mapped."""
+    """A rank's load path: its arena, its tracker and executor, and the
+    stand-in for the host's shared L2 handle."""
 
-    def __init__(self, pool, *, device="cpu", engine=None, words=PlainWords):
-        self.pool = pool
+    def __init__(self, writer, *, device="cpu", words=PlainSignals, copy=memory_copy):
         self.arena = Arena(device)
-        self.engine = engine if engine is not None else MemoryEngine()
         self.tracker = LayerwiseLoadTracker(len(CONSUMERS))
-        self.proxy_pages = {}
-        # Each failure the executor handed the pool client, with the words
-        # as they stood then.
-        self.handed = []
-        # What the executor had stopped when it closed the pool client.
-        self.closed_after = []
+        self.shared_l2_handle = StandInHandle(writer, self.arena, copy=copy)
         self.executor = SharedL2LoadExecutor(
             self.arena.layout,
-            self.engine,
+            self.shared_l2_handle,
             signals=words,
             trackers=[(self.tracker, len(CONSUMERS))],
-            proxy_page=lambda group, block: self.proxy_pages[group, block],
-            pool=self.pool.view,
-            load_workers=2,
-            record_failure=lambda failure: self.handed.append(
-                (failure, self.words.words.copy())
-            ),
-            close=lambda: self.closed_after.append(
-                [thread.name for thread in threading.enumerate()]
-            ),
+            pool=POOL,
         )
         self.words = self.executor._signals
+        self.shared_l2_handle.words = self.words
         # The stream the forward's layer waits go to.
         self.forward = executor_module.device_module.current_stream()
 
     def load(self, op_id, rows, *, stream=None):
-        """Submit the load of ``(group, pool page, Device block)`` rows, each
-        page behind a proxy Host block of its own."""
-        proxied = []
-        for group, page, block in rows:
-            proxy = 100 + len(self.proxy_pages)
-            self.proxy_pages[group, proxy] = (0, page)
-            proxied.append((group, proxy, block))
+        """Submit the load of ``(group, proxy Host block, Device block)``
+        rows."""
         if stream is None:
             stream = self.forward
         self.executor.submit_load_backs(
-            [LoadBackOp(op_id, proxied)], prerequisite_stream=stream
+            [LoadBackOp(op_id, rows)], prerequisite_stream=stream
         )
 
     def wait_for_layers(self):
@@ -382,106 +376,72 @@ class Rank:
         self.words.drain(self.forward)
 
 
-@pytest.fixture
-def pool():
-    return Pool(Arena().layout.lcm_bytes)
+# The Device blocks a writer holds, of both groups: (group, block).
+STORED = [(KV, 3), (KV, 5), (KV, 1), (STATE, 4), (STATE, 8), (STATE, 2)]
+# A reader loads each into another Device block, through the proxy Host block
+# of the writer block's id: (group, proxy Host block, Device block).
+LOADED = [(group, block, BLOCKS - block) for group, block in STORED]
 
 
 @pytest.fixture
-def ranks(pool, monkeypatch):
-    """Builds ranks over the pool; their executors are shut down afterwards."""
+def writer():
+    """A rank whose blocks hold what a reader loads."""
+    arena = Arena()
+    for group, block in STORED:
+        arena.fill(group, block, seed=10 * block + group)
+    return arena
+
+
+@pytest.fixture
+def ranks(writer, monkeypatch):
+    """Builds ranks that load the writer's blocks; their executors are shut
+    down afterwards."""
     monkeypatch.setattr(executor_module.Cache, "LoadBackOp", LoadBackOp)
     built = []
 
     def build(**settings) -> Rank:
-        built.append(Rank(pool, **settings))
+        built.append(Rank(writer, **settings))
         return built[-1]
 
     yield build
     for rank in built:
-        rank.engine.resume.set()
-        if not rank.closed_after:
+        if not rank.shared_l2_handle.closed:
             rank.executor.shutdown()
 
 
-# Pool pages of both groups on both providers, and the Device blocks a writer
-# holds them in: (group, page, block). Two of the State pages share an LCM
-# block.
-STORED = [
-    (KV, 1, 3),
-    (KV, 3, 5),
-    (KV, 8, 1),
-    (STATE, 3, 4),
-    (STATE, 4, 8),
-    (STATE, 9, 2),
-]
-
-
-def store(pool, engine=None) -> Arena:
-    """A writer rank fills its blocks and copies them to the pool's pages."""
-    writer = Arena()
-    for group, page, block in STORED:
-        writer.fill(group, block, seed=10 * page + group)
-    SharedL2Transfer(writer.layout, engine or MemoryEngine()).write(
-        pool.view,
-        [((0, group, "hash", 0), 0, page, block) for group, page, block in STORED],
-    )
-    return writer
-
-
-# A reader loads the same pages into other Device blocks.
-LOADED = [(group, page, BLOCKS - block) for group, page, block in STORED]
-
-
 def assert_loaded(reader: Arena, writer: Arena) -> None:
-    for (group, _, written), (_, _, loaded) in zip(STORED, LOADED, strict=True):
+    for group, written, loaded in LOADED:
         assert reader.fields(group, loaded) == writer.fields(group, written)
 
 
-def test_a_pool_is_laid_out_as_a_ranks_host_tier(pool):
+def test_a_pool_is_laid_out_as_a_ranks_host_tier():
     layout = Arena().layout
     transfer = layout.transfer
-    assert layout.lcm_bytes == compute_host_lcm_block_bytes(transfer, group_specs=SPECS)
+    lcm_bytes = layout.geometry["lcm_bytes"]
+    assert lcm_bytes == compute_host_lcm_block_bytes(transfer, group_specs=SPECS)
     assert layout.host_packing == compute_host_group_packing(
         transfer, group_specs=SPECS
     )
-    assert (layout.lcm_bytes, layout.host_packing) == (28, (1, 2))
+    assert (lcm_bytes, layout.host_packing) == (28, (1, 2))
     assert (layout.block_bytes, layout.field_offsets) == ((28, 12), ((0, 12), (0,)))
 
-    # A page lies where the Host tier puts the block of that id, on the
-    # provider that holds its LCM block.
-    host_tier = SimpleNamespace(
-        group_ids=("kv", "state"),
-        group_packing=layout.host_packing,
-        host_cache_block_bytes=layout.block_bytes,
-        host_lcm_block_bytes=layout.lcm_bytes,
-        num_host_lcm_blocks=sum(PROVIDER_BLOCKS),
-    )
-    bases = {provider.session: provider for provider in pool.view.providers}
-    for group, pages in ((KV, 8), (STATE, 16)):
-        for page in range(1, pages + 1):
-            session, address = layout.page_address(pool.view, group, 0, page)
-            provider = bases[session]
-            in_provider = address - provider.base
-            assert (
-                0 <= in_provider <= provider.lcm_blocks * 28 - layout.block_bytes[group]
-            )
-            assert provider.start * 28 + in_provider == (
-                HostCacheStorage.host_block_offset(host_tier, group, page)
-            )
-    assert layout.page_address(pool.view, STATE, 0, 6)[0] == "p0"
-    assert layout.page_address(pool.view, STATE, 0, 7)[0] == "p1"
-    # Two State pages of an LCM block lie back to back.
-    first, second = (
-        layout.page_address(pool.view, STATE, 0, page)[1] for page in (7, 8)
-    )
-    assert second - first == 12
 
-    for page in (0, 17):
-        with pytest.raises(IndexError, match="out of range"):
-            layout.page_address(pool.view, STATE, 0, page)
-    with pytest.raises(ValueError, match="bucket 0 only"):
-        layout.page_address(pool.view, KV, 1, 1)
+def test_the_host_gets_every_field_of_a_group_in_page_order():
+    arena = Arena()
+    kv, state = arena.kv.data_ptr(), arena.state.data_ptr()
+    assert arena.layout.page_fields(KV) == (
+        SharedL2PageField(
+            device_address=kv, device_stride=32, bytes=12, page_offset=0, layer=0
+        ),
+        SharedL2PageField(
+            device_address=kv + 16, device_stride=32, bytes=16, page_offset=12, layer=1
+        ),
+    )
+    assert arena.layout.page_fields(STATE) == (
+        SharedL2PageField(
+            device_address=state, device_stride=16, bytes=12, page_offset=0, layer=1
+        ),
+    )
 
 
 def test_the_geometry_is_the_schedulers_view_of_the_groups():
@@ -610,153 +570,84 @@ def test_the_layout_is_read_from_the_cache_pools():
     )
     assert layout.view_layers == (2, 1)
     assert layout.transfer.consumers == CONSUMERS + (("layer.2.k",),)
-    assert (layout.block_bytes, layout.lcm_bytes, layout.host_packing) == (
+    assert (layout.block_bytes, layout.geometry["lcm_bytes"], layout.host_packing) == (
         (34, 12),
         34,
         (1, 2),
     )
     assert layout.field_offsets[KV] == (0, 12, 28)
     assert layout.registration_regions() == ((arena.data_ptr(), arena.nbytes),)
+    # The draft's field joins the group's page, and its layer follows the
+    # target's.
+    assert layout.page_fields(KV)[2] == SharedL2PageField(
+        device_address=arena.data_ptr() + 48,
+        device_stride=64,
+        bytes=6,
+        page_offset=28,
+        layer=2,
+    )
 
 
-def test_the_rdma_engine_registers_the_cache_and_moves_ranges(monkeypatch):
-    class TransferEngine:
-        """Mooncake's engine, which needs an RDMA device, as the rank calls
-        it."""
-
-        registered = []
-        calls = []
-        result = 0
-
-        def initialize(self, hostname, metadata, protocol, device_name):
-            assert (metadata, protocol, device_name) == (
-                "P2PHANDSHAKE",
-                "rdma",
-                "mlx5_0",
-            )
-            return 0
-
-        def register_memory(self, address, size):
-            self.registered.append((address, size))
-            return 0
-
-        def unregister_memory(self, address):
-            self.registered.remove(
-                next(region for region in self.registered if region[0] == address)
-            )
-            return 0
-
-        def batch_transfer_sync_read(self, session, local, remote, lengths):
-            self.calls.append(("read", session, local, remote, lengths))
-            return self.result
-
-        def batch_transfer_sync_write(self, session, local, remote, lengths):
-            self.calls.append(("write", session, local, remote, lengths))
-            return self.result
-
-    module = types.ModuleType("mooncake.engine")
-    module.TransferEngine = TransferEngine
-    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
-    monkeypatch.setitem(sys.modules, "mooncake.engine", module)
-    regions = Arena().layout.registration_regions()
-
-    engine = RdmaEngine(device_name="mlx5_0", regions=regions)
-    assert TransferEngine.registered == list(regions)
-    engine.read("p0", [1], [2], [3])
-    engine.write("p1", [4], [5], [6])
-    assert TransferEngine.calls == [
-        ("read", "p0", [1], [2], [3]),
-        ("write", "p1", [4], [5], [6]),
-    ]
-    # A copy Mooncake reports as failed raises, for a load or a write to fail.
-    TransferEngine.result = -1
-    with pytest.raises(RuntimeError, match="read from p0 failed"):
-        engine.read("p0", [1], [2], [3])
-    with pytest.raises(RuntimeError, match="write to p1 failed"):
-        engine.write("p1", [4], [5], [6])
-
-    # The rank's writes and loads share the engine: the second close is void.
-    engine.close()
-    engine.close()
-    assert TransferEngine.registered == []
-
-
-def test_a_write_then_a_load_restores_every_field_of_every_group(pool, ranks):
-    engine = MemoryEngine()
-    writer = store(pool, engine)
-    # Each page went to the provider that holds it.
-    assert sorted(engine.copies) == [("write", "p0"), ("write", "p1")]
-
-    reader = ranks()
-    reader.load(7, LOADED)
-    reader.run_forward()
-
-    assert_loaded(reader.arena, writer)
-    wait_until(lambda: [event.op_id for event in reader.executor.poll_results()] == [7])
-    assert reader.executor.poll_results() == []
-    # Only the loaded blocks changed, and of those only the payloads.
-    expected = Arena()
-    for (group, _, written), (_, _, loaded) in zip(STORED, LOADED, strict=True):
-        payloads = writer.fields(group, written)
-        if group == KV:
-            expected.kv[loaded, :12] = torch.tensor(
-                list(payloads[0]), dtype=torch.uint8
-            )
-            expected.kv[loaded, 16:] = torch.tensor(
-                list(payloads[1]), dtype=torch.uint8
-            )
-        else:
-            expected.state[loaded, :12] = torch.tensor(
-                list(payloads[0]), dtype=torch.uint8
-            )
-    assert torch.equal(reader.arena.kv, expected.kv)
-    assert torch.equal(reader.arena.state, expected.state)
-
-
-def test_a_layer_is_ready_once_its_fields_are_there(pool, ranks):
-    writer = store(pool)
-    reader = ranks()
-    # The second layer's fields (v and the state) stay on their providers.
-    reader.engine.held_sizes = frozenset({16})
-
-    reader.load(7, LOADED)
-    reader.tracker.wait_for_layer(0)
-    reader.words.drain(reader.forward)
-
-    # The first layer's wait passed with its field loaded and no other.
-    ((_, first_word, seq),) = [
-        wait for wait in reader.words.waits if wait[0] == reader.forward
-    ]
-    assert reader.words.passed(first_word, seq)
-    assert not reader.words.passed(first_word + 1, seq)
-    block = LOADED[0][2]
-    assert reader.arena.fields(KV, block)[0] == writer.fields(KV, STORED[0][2])[0]
-    assert not reader.arena.kv[:, 16:].any() and not reader.arena.state.any()
-    assert reader.executor.poll_results() == []
-
-    reader.engine.resume.set()
-    reader.run_forward()
-    assert_loaded(reader.arena, writer)
-
-
-def test_a_load_starts_behind_the_plans_page_zeroing(pool, ranks):
-    writer = store(pool)
+def test_a_plans_load_is_handed_to_the_host_behind_its_start_word(writer, ranks):
     reader = ranks()
     reader.words.hold_writes = True
 
     reader.load(7, LOADED)
-    # The start word has not landed: the zeroing may still be running.
+
+    # The host got the load's operation, its rows, the first of its words and
+    # the value that marks it there.
+    ((op_ids, rows, start_word, seq),) = reader.shared_l2_handle.loads
+    assert (op_ids, rows, start_word, seq) == ([7], LOADED, 0, 1)
+    # The start word is written on the stream the plan's page zeroing ran on:
+    # it has not landed, the zeroing may still be running, and nothing is
+    # loaded.
+    assert reader.words.writes == [(reader.forward, start_word, seq)]
     time.sleep(0.05)
-    assert reader.engine.copies == []
-    assert not reader.arena.kv.any()
+    assert not reader.arena.kv.any() and not reader.arena.state.any()
 
     reader.words.release_writes()
     reader.run_forward()
     assert_loaded(reader.arena, writer)
 
 
-def test_the_whole_load_is_one_event_behind_the_last_layers_word(pool, ranks):
-    store(pool)
+def test_a_load_the_host_refuses_puts_no_wait_on_a_stream(ranks):
+    reader = ranks()
+    reader.shared_l2_handle.refusal = (
+        "a shared L2 load reads proxy Host block 99 of group 0, which stands "
+        "for no pool page"
+    )
+
+    with pytest.raises(RuntimeError, match="stands for no pool page"):
+        reader.load(7, [(KV, 99, 1)])
+
+    # Neither a start word nor a wait: no stream is left waiting on a word
+    # that nobody sets.
+    assert reader.words.writes == [] and reader.words.waits == []
+
+
+def test_the_forwards_layers_wait_for_their_own_words(writer, ranks):
+    reader = ranks()
+    reader.shared_l2_handle.layer_delay_s = 0.05
+
+    reader.load(7, LOADED)
+    reader.tracker.wait_for_layer(0)
+    reader.words.drain(reader.forward)
+
+    # The first layer's wait passed with its field loaded and no other.
+    ((_, first_ready_word, seq),) = [
+        wait for wait in reader.words.waits if wait[0] == reader.forward
+    ]
+    assert reader.words.passed(first_ready_word, seq)
+    assert not reader.words.passed(first_ready_word + 1, seq)
+    block = LOADED[0][2]
+    assert reader.arena.fields(KV, block)[0] == writer.fields(KV, STORED[0][1])[0]
+    assert not reader.arena.kv[:, 16:].any() and not reader.arena.state.any()
+
+    reader.run_forward()
+    assert_loaded(reader.arena, writer)
+
+
+def test_the_whole_load_is_one_event_behind_the_last_layers_word(ranks):
     reader = ranks()
     before = list(reader.tracker.event_sets[0].layer_done_events)
 
@@ -775,21 +666,26 @@ def test_the_whole_load_is_one_event_behind_the_last_layers_word(pool, ranks):
     reader.words.drain(stream)
 
 
-def test_consecutive_loads_take_turns_on_the_words(pool, ranks):
-    writer = store(pool)
+def test_consecutive_loads_take_turns_on_the_words(writer, ranks):
     reader = ranks()
     for op_id in range(1, 6):
         reader.arena.zero()
         reader.load(op_id, LOADED)
         reader.run_forward()
         assert_loaded(reader.arena, writer)
-    done = []
-    wait_until(lambda: done.extend(reader.executor.poll_results()) or len(done) == 5)
-    assert [event.op_id for event in done] == [1, 2, 3, 4, 5]
+    # Each load has a value of its own, on the word set its tracker gave it:
+    # a start word and a ready word per layer.
+    width = len(CONSUMERS) + 1
+    sets = len(reader.tracker.event_sets)
+    assert [seq for _, _, _, seq in reader.shared_l2_handle.loads] == [1, 2, 3, 4, 5]
+    start_words = {start_word for _, _, start_word, _ in reader.shared_l2_handle.loads}
+    assert len(start_words) > 1
+    assert start_words <= {index * width for index in range(sets)}
+    # The host's loader reads and sets them where the executor says.
+    assert reader.executor.signal_words == (reader.words.address, sets * width)
 
 
-def test_a_plan_without_a_load_waits_for_none(pool, ranks):
-    store(pool)
+def test_a_plan_without_a_load_waits_for_none(ranks):
     reader = ranks()
     reader.load(7, LOADED)
     reader.run_forward()
@@ -802,37 +698,14 @@ def test_a_plan_without_a_load_waits_for_none(pool, ranks):
     assert len(reader.words.waits) == waits
 
 
-def test_a_failed_read_lets_the_forward_go_and_fails_the_next_poll(pool, ranks):
-    store(pool)
-    reader = ranks()
-    reader.engine.fail_reads = True
-
-    reader.load(7, LOADED)
-    reader.run_forward()
-
-    with pytest.raises(RuntimeError, match="shared L2 load failed") as failure:
-        reader.executor.poll_results()
-    assert "read from p" in str(failure.value.__cause__)
-    # It stays failed: the engine is to stop.
-    with pytest.raises(RuntimeError, match="shared L2 load failed"):
-        reader.executor.poll_results()
-    # The pool's client had the failure before the forward was let go: no
-    # ready word of a layer was set yet. The event loop checks the client
-    # when that forward has landed, before it commits it.
-    ((handed, words),) = reader.handed
-    assert handed is failure.value.__cause__
-    assert not words.reshape(-1, len(CONSUMERS) + 1)[:, 1:].any()
-
-
-def test_a_load_is_refused_during_graph_capture(pool, ranks, monkeypatch):
-    store(pool)
+def test_a_load_is_refused_during_graph_capture(ranks, monkeypatch):
     reader = ranks()
     monkeypatch.setattr(executor_module, "get_is_capture_mode", lambda: True)
     with pytest.raises(RuntimeError, match="outside CUDA Graph capture"):
         reader.load(7, LOADED)
     # A plan without a load is fine there, as with a Host L2.
     reader.executor.submit_load_backs([], prerequisite_stream=None)
-    assert reader.engine.copies == []
+    assert reader.shared_l2_handle.loads == []
 
 
 def test_a_pool_rank_runs_no_other_host_cache_op(ranks):
@@ -898,19 +771,47 @@ def test_the_executor_describes_the_proxy_tier_to_the_device_build(ranks):
     assert len(executor.layout.groups) == 2
 
 
-def test_a_shutdown_stops_the_loads_and_then_closes_the_pool_client(pool, ranks):
-    store(pool)
+@pytest.fixture
+def synchronized(monkeypatch):
+    """Every synchronization of the device's streams by the executor."""
+    calls = []
+    monkeypatch.setattr(
+        executor_module.device_module, "synchronize", lambda: calls.append(True)
+    )
+    return calls
+
+
+def test_a_shutdown_closes_the_hosts_client_and_then_frees_the_words(
+    ranks, synchronized
+):
     reader = ranks()
-    reader.engine.read_delay_s = 0.1
+    handle = reader.shared_l2_handle
+    handle.layer_delay_s = 0.1
+    # Whether the words were freed when the close came.
+    words_closed_at_close = []
+    handle.before_close = lambda: words_closed_at_close.append(reader.words.closed)
     reader.load(7, LOADED)
 
     reader.executor.shutdown()
 
-    # The load in flight ended first: the client's writes share its engine.
-    (threads,) = reader.closed_after
-    assert not [name for name in threads if name.startswith("shared-l2-")]
+    # The load in flight ended first: it sets the words, which the streams
+    # then pass before the words are freed.
+    assert handle.closed and words_closed_at_close == [False]
+    assert synchronized == [True]
     assert reader.words.closed
-    assert [event.op_id for event in reader.executor.poll_results()] == [7]
+
+
+def test_a_shutdown_leaves_the_words_a_thread_that_still_runs_uses(ranks, synchronized):
+    reader = ranks()
+    # A thread of the host's client did not end in time: it may set a word
+    # later, and a stream may wait on a word nobody sets any more.
+    reader.shared_l2_handle.stops = False
+
+    reader.executor.shutdown()
+
+    # Neither the streams nor the words are touched.
+    assert reader.shared_l2_handle.closed
+    assert synchronized == [] and not reader.words.closed
 
 
 def pool_config() -> str:
@@ -1025,25 +926,24 @@ def test_server_args_join_no_pool_by_default():
     assert args.shared_l2_config is None and args.enable_kvstore
 
 
-# The tests below run the real ready words and CUDA streams.
+# The tests below run the real signal words and CUDA streams.
 
 
-def slow_reader(pool, ranks, *, device):
-    """A reader whose reads take long enough to still run when the forward
+def slow_reader(ranks, *, device):
+    """A reader whose load takes long enough to still run when the forward
     reaches its waits."""
-    engine = CudaEngine() if device == "cuda" else MemoryEngine()
-    engine.read_delay_s = 0.3
-    return ranks(
+    reader = ranks(
         device=device,
-        engine=engine,
+        copy=cuda_copy if device == "cuda" else memory_copy,
         words=lambda count: HostSignals(torch.cuda.current_device(), count),
     )
+    reader.shared_l2_handle.layer_delay_s = 0.3
+    return reader
 
 
 @needs_cuda
-def test_gpu_bytes_loaded_layer_by_layer_equal_the_bytes_written(pool, ranks):
-    writer = store(pool)
-    reader = slow_reader(pool, ranks, device="cuda")
+def test_gpu_bytes_loaded_layer_by_layer_equal_the_bytes_written(writer, ranks):
+    reader = slow_reader(ranks, device="cuda")
 
     reader.load(7, LOADED, stream=torch.cuda.current_stream())
     stream = torch.cuda.Stream()
@@ -1055,20 +955,18 @@ def test_gpu_bytes_loaded_layer_by_layer_equal_the_bytes_written(pool, ranks):
     stream.synchronize()
 
     block = LOADED[0][2]
-    assert bytes(first[block, :12].tolist()) == writer.fields(KV, STORED[0][2])[0]
+    assert bytes(first[block, :12].tolist()) == writer.fields(KV, STORED[0][1])[0]
     assert_loaded(reader.arena, writer)
-    wait_until(lambda: [event.op_id for event in reader.executor.poll_results()] == [7])
 
 
 @needs_cuda
-def test_gpu_a_load_completes_while_the_forward_holds_the_driver(pool, ranks, capfd):
+def test_gpu_a_load_completes_while_the_forward_holds_the_driver(writer, ranks, capfd):
     """Loading a kernel on first use holds the CUDA driver until the GPU
     drains: a forward that does so while its stream waits on a load needs the
     loader to release that wait without the driver. A deadlock ends the
     process."""
-    writer = store(pool)
     # Host cache memory: the reader's copies make no CUDA call either.
-    reader = slow_reader(pool, ranks, device="cpu")
+    reader = slow_reader(ranks, device="cpu")
     # Kernels this process has not run, so the product below loads them.
     a = torch.empty(333, 517, dtype=torch.float64, device="cuda")
     b = torch.empty(517, 211, dtype=torch.float64, device="cuda")
@@ -1090,9 +988,8 @@ def test_gpu_a_load_completes_while_the_forward_holds_the_driver(pool, ranks, ca
 
 
 @needs_cuda
-def test_gpu_the_completion_event_waits_for_the_whole_load(pool, ranks):
-    writer = store(pool)
-    reader = slow_reader(pool, ranks, device="cuda")
+def test_gpu_the_completion_event_waits_for_the_whole_load(writer, ranks):
+    reader = slow_reader(ranks, device="cuda")
 
     reader.load(7, LOADED, stream=torch.cuda.current_stream())
     stream = torch.cuda.Stream()
@@ -1112,9 +1009,8 @@ def test_gpu_the_completion_event_waits_for_the_whole_load(pool, ranks):
 
 
 @needs_cuda
-def test_gpu_a_prefill_graph_replay_waits_for_its_load(pool, ranks):
-    writer = store(pool)
-    reader = slow_reader(pool, ranks, device="cuda")
+def test_gpu_a_prefill_graph_replay_waits_for_its_load(writer, ranks):
+    reader = slow_reader(ranks, device="cuda")
     seen = Arena("cuda")
     torch.cuda.synchronize()
 

@@ -29,9 +29,9 @@ import subprocess
 import sys
 import threading
 import time
-import types
 
 import pytest
+import tokenspeed_engine
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -393,32 +393,47 @@ def test_a_stalled_owner_times_a_request_out_and_answers_the_next(serve, connect
         client.close()
 
 
-def test_a_provider_registers_its_memory_and_joins_the_pool(serve, monkeypatch):
-    class Engine:
-        """Mooncake's engine, which needs an RDMA device, as the provider
-        calls it."""
+@pytest.mark.parametrize("named_in_the_environment", [True, False])
+def test_a_provider_registers_its_memory_and_joins_the_pool(
+    serve, monkeypatch, tmp_path, named_in_the_environment
+):
+    # The Mooncake library the engine hosts load: the one the environment
+    # names, else the installed tokenspeed-mooncake package's.
+    if named_in_the_environment:
+        found_library = "/opt/libtokenspeed_transfer_engine.so"
+        monkeypatch.setenv("TOKENSPEED_MOONCAKE_LIBRARY", found_library)
+    else:
+        package = tmp_path / "mooncake"
+        package.mkdir()
+        (package / "__init__.py").touch()
+        (package / "libtokenspeed_transfer_engine.so").touch()
+        found_library = str(package / "libtokenspeed_transfer_engine.so")
+        monkeypatch.delenv("TOKENSPEED_MOONCAKE_LIBRARY", raising=False)
+        monkeypatch.delitem(sys.modules, "mooncake", raising=False)
+        monkeypatch.syspath_prepend(tmp_path)
+
+    class TransferEngine:
+        """The engine host's transfer engine, which needs an RDMA device, as
+        the provider calls it."""
 
         registered = {}
 
-        def initialize(self, hostname, metadata, protocol, device_name):
-            assert (hostname, protocol, device_name) == ("127.0.0.1", "rdma", "mlx5_0")
-            return 0
+        def __init__(self, *, library, hostname, protocol, device_filter):
+            assert (library, hostname, protocol, device_filter) == (
+                found_library,
+                "127.0.0.1",
+                "rdma",
+                "mlx5_0",
+            )
+            self.session_id = "127.0.0.1:12345"
 
-        def register_memory(self, base, size):
-            self.registered[base] = size
-            return 0
+        def register(self, address, length):
+            self.registered[address] = length
 
-        def get_rpc_port(self):
-            return 12345
+        def unregister(self, address):
+            del self.registered[address]
 
-        def unregister_memory(self, base):
-            del self.registered[base]
-            return 0
-
-    engine = types.ModuleType("mooncake.engine")
-    engine.TransferEngine = Engine
-    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
-    monkeypatch.setitem(sys.modules, "mooncake.engine", engine)
+    monkeypatch.setattr(tokenspeed_engine, "TransferEngine", TransferEngine)
     owner = serve(joined_providers=0)
     stop = threading.Event()
     provider = threading.Thread(
@@ -436,7 +451,7 @@ def test_a_provider_registers_its_memory_and_joins_the_pool(serve, monkeypatch):
         hello = dict(client=1, geometry=GEOMETRY, deployment_id=deployment_id())
         wait_until(lambda: owner.admin.request("hello", **hello)["ready"])
         # The pool is the provider's registered memory, in whole LCM blocks.
-        ((base, size),) = Engine.registered.items()
+        ((base, size),) = TransferEngine.registered.items()
         assert size == 8 * LCM_BYTES + 1
         assert owner.admin.request("hello", **hello)["providers"] == [
             {"session": "127.0.0.1:12345", "base": base, "lcm_blocks": 8, "start": 0}
@@ -444,7 +459,33 @@ def test_a_provider_registers_its_memory_and_joins_the_pool(serve, monkeypatch):
     finally:
         stop.set()
         provider.join()
-    assert Engine.registered == {}
+    assert TransferEngine.registered == {}
+
+
+def test_a_provider_that_finds_no_mooncake_library_does_not_start(
+    monkeypatch, tmp_path
+):
+    provider = dict(
+        owner="tcp://127.0.0.1:1",
+        hostname="127.0.0.1",
+        device_name="mlx5_0",
+        size_bytes=LCM_BYTES,
+        stop=threading.Event(),
+    )
+    monkeypatch.delenv("TOKENSPEED_MOONCAKE_LIBRARY", raising=False)
+    # No tokenspeed-mooncake is installed: the import system finds no package.
+    monkeypatch.setitem(sys.modules, "mooncake", None)
+    with pytest.raises(RuntimeError, match="provider needs tokenspeed-mooncake"):
+        run_provider(**provider)
+    # A Mooncake package without the library.
+    (tmp_path / "mooncake").mkdir()
+    (tmp_path / "mooncake" / "__init__.py").touch()
+    monkeypatch.delitem(sys.modules, "mooncake")
+    monkeypatch.syspath_prepend(tmp_path)
+    with pytest.raises(
+        RuntimeError, match="libtokenspeed_transfer_engine.so is missing"
+    ):
+        run_provider(**provider)
 
 
 def test_the_owner_service_runs_from_the_command_line():

@@ -32,6 +32,9 @@
   host runs its own.
 * ``BootstrapServer`` is a disaggregated deployment's HTTP rendezvous
   (``ts-pd``), which the launcher hosts.
+* ``TransferEngine`` is the Mooncake transfer engine (``ts-mooncake``) for a
+  process that only hosts memory other engines read and write, such as a
+  shared L2 pool's provider; a rank's host runs its own.
 * ``tokenspeed_engine.scheduler`` is the C++ scheduler's Python API, from
   the build linked into the host extension.
 """
@@ -45,6 +48,7 @@ from tokenspeed_engine._native import (
     FrontendListener,
     L3Executor,
     PendingFrontend,
+    TransferEngine,
 )
 
 __all__ = [
@@ -54,6 +58,7 @@ __all__ = [
     "FrontendListener",
     "L3Executor",
     "PendingFrontend",
+    "TransferEngine",
     "host_binary",
 ]
 

@@ -269,6 +269,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             max_resident_requests=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
             peer_outbox=None,
+            shared_l2_handle=None,
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
     assert events.count(("plan-check",)) == int(declares_padded_replay)

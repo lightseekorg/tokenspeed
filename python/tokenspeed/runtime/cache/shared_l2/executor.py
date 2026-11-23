@@ -27,6 +27,13 @@ the loader sets the layer's ready word in host memory, and the forward's
 stream waits on that word before the layer reads its cache. Write-backs never
 occur: the rank's pool client writes newly published blocks.
 
+This executor is the forward thread's part of a load: it hands the load to
+the engine host, whose loader thread reads the pages (``shared_l2/load.rs``
+of ``ts-control``), and puts the load's waits on the streams. The host
+acknowledges a finished load to the scheduler itself, from its loader
+(``PythonDataPlane::poll_cache_events`` in ``ts-host``): no acknowledgment
+returns through this executor.
+
 The loader makes no CUDA call. While the GPU waits on a ready word, the
 forward thread may be inside a CUDA call that holds the driver until the GPU
 drains (loading a kernel on first use does); a loader that then needed the
@@ -38,9 +45,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import threading
-import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,12 +54,11 @@ import torch
 from tokenspeed_engine.scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
-from tokenspeed.runtime.cache.shared_l2.client import SharedL2Client, SharedL2PoolView
+from tokenspeed.runtime.cache.shared_l2.client import SharedL2PoolView
 from tokenspeed.runtime.cache.shared_l2.layout import SharedL2Layout
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
-from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
+from tokenspeed.runtime.utils import get_device_module
 
-logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 
 # cuda.h values.
@@ -65,12 +69,6 @@ _WAIT_GEQ = 0x0  # CU_STREAM_WAIT_VALUE_GEQ: (int32_t)(*addr - value) >= 0
 _WRITE_FENCED = 0x0  # CU_STREAM_WRITE_VALUE_DEFAULT
 
 _WORD_MASK = 0xFFFFFFFF
-_START_POLL_S = 20e-6
-
-
-def _reached(word: int, seq: int) -> bool:
-    """Whether a word holds load ``seq``'s value or a later load's."""
-    return (word - seq) & _WORD_MASK < 0x80000000
 
 
 class _ThreadContext(threading.local):
@@ -81,8 +79,9 @@ class _ThreadContext(threading.local):
 
 
 class HostSignals:
-    """32-bit words in host memory the GPU maps: streams wait on or write them
-    with CUDA stream memory operations, the loader with plain CPU accesses."""
+    """A rank's signal words, the start and ready words of its loads: 32-bit
+    words in host memory the GPU maps. Streams wait on or write them with
+    CUDA stream memory operations, the loader with plain CPU accesses."""
 
     def __init__(self, device_index: int, num_words: int):
         cuda = ctypes.CDLL("libcuda.so.1")
@@ -128,8 +127,10 @@ class HostSignals:
                 ctypes.byref(self._host), 4 * num_words, _HOST_ALLOC_FLAGS
             )
         )
+        #: Where the words are in host memory, for the loader.
+        self.address = int(self._host.value)
         self.words = np.ctypeslib.as_array(
-            (ctypes.c_uint32 * num_words).from_address(self._host.value)
+            (ctypes.c_uint32 * num_words).from_address(self.address)
         )
         self.words[:] = 0
         device_address = ctypes.c_uint64()
@@ -190,10 +191,11 @@ class HostSignals:
 
 @dataclass(frozen=True, slots=True)
 class _ReadyWords:
-    """One load's ready words for one tracker's layers."""
+    """One load's ready words for one tracker's layers, from
+    ``first_ready_word`` on."""
 
     signals: Any
-    first_word: int
+    first_ready_word: int
     seq: int
 
 
@@ -201,70 +203,48 @@ def _wait_ready_word(words: _ReadyWords, layer_index: int) -> None:
     # A stream memory operation, not a tokenspeed-kernel op: the word lives in
     # host memory the loader writes without CUDA.
     words.signals.wait(
-        device_module.current_stream(), words.first_word + layer_index, words.seq
+        device_module.current_stream(),
+        words.first_ready_word + layer_index,
+        words.seq,
     )
 
 
 class SharedL2LoadExecutor:
-    """Loads proxy Host blocks from the shared L2 pool into Device blocks."""
+    """Hands the loads of proxy Host blocks from the shared L2 pool into
+    Device blocks to the host's loader."""
 
     def __init__(
         self,
         layout: SharedL2Layout,
-        engine: Any,
+        shared_l2_handle: Any,
         *,
         signals: Callable[[int], Any],
         trackers: Sequence[tuple[LayerwiseLoadTracker, int]],
-        proxy_page: Callable[[int, int], tuple[int, int]],
         pool: SharedL2PoolView,
-        load_workers: int,
-        record_failure: Callable[[BaseException], None],
-        close: Callable[[], None],
     ):
         """
         Args:
-            layout: Where the rank's Device blocks and the pool's pages are.
-            engine: Reads byte ranges: ``read(session, local, remote,
-                lengths)``, raising when a copy fails (``RdmaEngine``).
-            signals: Builds the start and ready words for a word count
+            layout: Where the rank's Device blocks are.
+            shared_l2_handle: The host's shared L2 handle (``SharedL2Handle``),
+                which runs the loads and the rest of the rank's pool client.
+                ``submit_load(op_ids=, rows=, start_word=, seq=)`` queues a
+                load of ``(group, proxy Host block, Device block)`` rows
+                without waiting; ``close()`` stops the client's threads and
+                the transfer engine and returns whether every thread ended.
+            signals: Builds the signal words for a word count
                 (``HostSignals`` on the rank's GPU).
             trackers: Each cache pool view's layer-wise load tracker,
                 registered with the view, and its layer count; their layers,
                 in order, are the flat layers of the layout's consumers.
-            proxy_page: ``(group, proxy Host block)`` to the ``(bucket, page)``
-                it stands for (``SharedL2Client.proxy_page``).
-            pool: The pool the rank joined (``SharedL2Client.pool``).
-            load_workers: Threads reading one load's providers in parallel.
-            record_failure: Takes a load's failure before the forward that
-                waits on the load is let go, for the event loop's check at
-                that forward's commit (``SharedL2Client.record_failure``).
-            close: Closes the rank's pool client, once the loads have
-                stopped: its writes share the engine with them
-                (``SharedL2Client.close``).
+            pool: The pool the rank joined (``client.join_pool``).
         """
         self.layout = layout.transfer
-        self._layout = layout
-        self._engine = engine
+        self._shared_l2_handle = shared_l2_handle
         self._trackers = list(trackers)
-        consumers = layout.transfer.consumers
         num_layers = sum(count for _, count in self._trackers)
-        if num_layers != len(consumers):
+        if num_layers != len(layout.transfer.consumers):
             raise RuntimeError("shared L2 load trackers and cache consumers diverged")
-        layer_of = {
-            field_id: layer
-            for layer, consumer in enumerate(consumers)
-            for field_id in consumer
-        }
-        # Per group, the layer each of its fields feeds, in pool page order.
-        self._field_layers = tuple(
-            tuple(layer_of[field.field_id] for field in group.fields)
-            for group in layout.transfer.groups
-        )
         self._num_layers = num_layers
-        self._proxy_page = proxy_page
-        self._pool = pool
-        self._record_failure = record_failure
-        self._close = close
         num_sets = len(self._trackers[0][0].event_sets)
         # Per tracker event set: a start word, then a ready word per layer.
         self._signals = signals(num_sets * (num_layers + 1))
@@ -272,16 +252,6 @@ class SharedL2LoadExecutor:
         # event recorded behind it.
         self._completion_stream = device_module.Stream()
         self._seq = 0
-        self._jobs: list[Future | None] = [None] * num_sets
-        # Loads run one after another, each reading its providers in parallel.
-        self._loader = ThreadPoolExecutor(1, thread_name_prefix="shared-l2-load")
-        self._readers = ThreadPoolExecutor(
-            load_workers, thread_name_prefix="shared-l2-read"
-        )
-        self._done: list[int] = []
-        self._done_lock = threading.Lock()
-        self._failure: BaseException | None = None
-        self._closed = False
         # What the device build reads off a Host cache executor. The pool
         # takes the place of local Host bytes; the proxy tier holds at most
         # what the pool pins, and twice the pool leaves room for its slot
@@ -292,6 +262,12 @@ class SharedL2LoadExecutor:
         self.host_group_packing = layout.host_packing
         self.num_snapshot_pages = 1
         self.max_retracted_requests = 0
+
+    @property
+    def signal_words(self) -> tuple[int, int]:
+        """Where the loads' signal words are in host memory, and how many
+        there are: what the host's loader reads and sets."""
+        return self._signals.address, len(self._signals.words)
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
@@ -313,7 +289,7 @@ class SharedL2LoadExecutor:
                 the RDMA reads start once it reaches this point.
         """
         op_ids: list[int] = []
-        rows: list[tuple[int, int, int, int]] = []
+        rows: list[tuple[int, int, int]] = []
         for operation in cache_ops:
             if isinstance(operation, Cache.LoadBackOp):
                 for op_id, groups, sources, destinations in zip(
@@ -324,13 +300,7 @@ class SharedL2LoadExecutor:
                     strict=True,
                 ):
                     op_ids.append(op_id)
-                    for group, source, destination in zip(
-                        groups, sources, destinations, strict=True
-                    ):
-                        # Resolved now: the proxy block may stand for another
-                        # page once its ticket is released.
-                        bucket, page = self._proxy_page(group, source)
-                        rows.append((group, bucket, page, destination))
+                    rows.extend(zip(groups, sources, destinations, strict=True))
             elif not isinstance(operation, Cache.WriteBackOp):
                 raise TypeError(
                     f"a shared L2 rank does not run {type(operation).__name__}"
@@ -347,117 +317,58 @@ class SharedL2LoadExecutor:
             if index is not None and current != index:
                 raise RuntimeError("target and draft load trackers diverged")
             index = current
-        # The words' previous load finished long before its forward did.
-        previous = self._jobs[index]
-        if previous is not None:
-            previous.result()
+        # The words' previous load is over by now: the loader runs the loads
+        # in the order they are handed over, and that one finished long
+        # before its forward did.
         self._seq = (self._seq + 1) & _WORD_MASK
-        base = index * (self._num_layers + 1)
-        self._signals.write(prerequisite_stream, base, self._seq)
+        start_word = index * (self._num_layers + 1)
+        # Handed over before any wait goes on a stream: a load the loader
+        # refuses (a proxy block that stands for no page) leaves no stream
+        # waiting on a word nobody sets. The loader resolves each proxy block
+        # to its pool page now, as the block may stand for another page once
+        # its ticket is released, and reads nothing before the start word.
+        self._shared_l2_handle.submit_load(
+            op_ids=op_ids, rows=rows, start_word=start_word, seq=self._seq
+        )
+        self._signals.write(prerequisite_stream, start_word, self._seq)
         # The whole load as one event, for what waits on no single layer (a
         # graph replay, the next use of these words): recorded behind a wait
         # for the last layer's word, on this thread, so the loader still makes
         # no CUDA call. An event never recorded would pass at once.
-        self._signals.wait(self._completion_stream, base + self._num_layers, self._seq)
+        self._signals.wait(
+            self._completion_stream, start_word + self._num_layers, self._seq
+        )
         finish = device_module.Event()
         finish.record(self._completion_stream)
-        word = base + 1
+        first_ready_word = start_word + 1
         for tracker, count in self._trackers:
             events = tracker.event_sets[index]
-            events.layer_ready_flags = _ReadyWords(self._signals, word, self._seq)
+            events.layer_ready_flags = _ReadyWords(
+                self._signals, first_ready_word, self._seq
+            )
             events.wait_layer_ready = _wait_ready_word
             events.set_completion(finish)
-            word += count
+            first_ready_word += count
             tracker.set_consumers(index)
-        self._jobs[index] = self._loader.submit(
-            self._load, op_ids, rows, base, self._seq
-        )
-
-    def _layer_reads(
-        self, rows: Sequence[tuple[int, int, int, int]]
-    ) -> list[dict[str, tuple[list, list, list]]]:
-        """Per layer, per provider session: local and remote addresses and
-        lengths of every field a load copies."""
-        by_target: dict[tuple[int, str], tuple[list[int], list[int]]] = {}
-        for group, bucket, page, block in rows:
-            session, address = self._layout.page_address(
-                self._pool, group, bucket, page
-            )
-            remotes, blocks = by_target.setdefault((group, session), ([], []))
-            remotes.append(address)
-            blocks.append(block)
-        layers: list[dict[str, tuple[list, list, list]]] = [
-            {} for _ in range(self._num_layers)
-        ]
-        for (group, session), (remotes, blocks) in by_target.items():
-            remote = np.asarray(remotes, dtype=np.int64)
-            block = np.asarray(blocks, dtype=np.int64)
-            for (address, stride, size), offset, layer in zip(
-                self._layout.device_fields(group),
-                self._layout.field_offsets[group],
-                self._field_layers[group],
-                strict=True,
-            ):
-                local_list, remote_list, lengths = layers[layer].setdefault(
-                    session, ([], [], [])
-                )
-                local_list.extend((address + block * stride).tolist())
-                remote_list.extend((remote + offset).tolist())
-                lengths.extend([size] * len(blocks))
-        return layers
-
-    def _load(self, op_ids, rows, base: int, seq: int) -> None:
-        words = self._signals.words
-        try:
-            # The start word lands once the plan's page zeroing is done.
-            while not _reached(int(words[base]), seq):
-                if self._closed:
-                    raise RuntimeError("the executor shut down before the load")
-                time.sleep(_START_POLL_S)
-            for layer, reads in enumerate(self._layer_reads(rows)):
-                pending = [
-                    self._readers.submit(self._engine.read, session, *read)
-                    for session, read in reads.items()
-                ]
-                for future in pending:
-                    future.result()
-                words[base + 1 + layer] = seq
-        except BaseException as exc:
-            # A failed load stops the engine; the forward waiting on it is
-            # released so the stop is not a hang. The pool's client has the
-            # failure before the release: the event loop checks the client
-            # once that forward has landed, before it commits its results or
-            # starts a pool write of the pages it computed.
-            logger.exception("shared L2 load failed")
-            self._failure = exc
-            self._record_failure(exc)
-            words[base + 1 : base + 1 + self._num_layers] = seq
-            return
-        with self._done_lock:
-            self._done.extend(op_ids)
-
-    def poll_results(self) -> list:
-        """The completed loads' ACKs; a failed load raises here."""
-        if self._failure is not None:
-            raise RuntimeError("shared L2 load failed") from self._failure
-        with self._done_lock:
-            done, self._done = self._done, []
-        return [Cache.LoadBackDoneEvent(op_id) for op_id in done]
 
     def shutdown(self) -> None:
-        self._closed = True
-        self._loader.shutdown(wait=True)
-        self._readers.shutdown(wait=True)
+        # The client's threads end first: a load in flight sets ready words,
+        # and the pool's writes read the Device cache.
+        threads_ended = self._shared_l2_handle.close()
+        if not threads_ended:
+            # A thread still runs: it may set a word later, and a stream may
+            # wait on a word that nobody sets any more. The streams and the
+            # words stay as they are, for the process's exit to take.
+            return
         device_module.synchronize()
         self._signals.close()
-        self._close()
 
 
 def build_shared_l2_load_executor(
-    client: SharedL2Client,
     layout: SharedL2Layout,
-    engine: Any,
+    shared_l2_handle: Any,
     *,
+    pool: SharedL2PoolView,
     device_pool: Any,
     draft_pool: Any | None,
     gpu_id: int,
@@ -466,30 +377,25 @@ def build_shared_l2_load_executor(
     executor does, and build the executor over them.
 
     Args:
-        client: The rank's shared L2 client, joined to the pool.
         layout: The rank's shared L2 layout.
-        engine: The rank's RDMA engine, which the client's transfer writes
-            with.
+        shared_l2_handle: The host's shared L2 handle, which runs the loads.
+        pool: The pool the rank joined.
         device_pool: The target cache pool.
         draft_pool: The draft pool sharing the arena, or None.
         gpu_id: Local device index of the rank's GPU, the one its RDMA
             devices are named for.
     """
     trackers = []
-    for pool, num_layers in zip(
+    for cache_pool, num_layers in zip(
         (device_pool, draft_pool), layout.view_layers, strict=False
     ):
         tracker = LayerwiseLoadTracker(num_layers)
-        pool.register_layerwise_load_tracker(tracker)
+        cache_pool.register_layerwise_load_tracker(tracker)
         trackers.append((tracker, num_layers))
     return SharedL2LoadExecutor(
         layout,
-        engine,
+        shared_l2_handle,
         signals=functools.partial(HostSignals, gpu_id),
         trackers=trackers,
-        proxy_page=client.proxy_page,
-        pool=client.pool,
-        load_workers=client.config.load_workers,
-        record_failure=client.record_failure,
-        close=client.close,
+        pool=pool,
     )

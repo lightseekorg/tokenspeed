@@ -54,7 +54,6 @@ use ts_control::{
     json_framing::{JsonFraming, MessageBoundary},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
-    shared_l2::PoolClient,
     startup,
     transport::{EngineTransport, TransportError},
 };
@@ -64,7 +63,7 @@ use ts_metrics::{
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
 
-use crate::{data_plane::PythonDataPlane, pool::PythonPoolClient};
+use crate::data_plane::PythonDataPlane;
 
 /// Rust's allocations go to mimalloc. The control thread allocates for every
 /// row of every round (scheduler events, outputs, the batches' columns); with
@@ -655,10 +654,11 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, outbox, peer_outbox, mode) = Python::attach(|py| {
+    let (bootstrap, outbox, peer_outbox, shared_l2_handle, mode) = Python::attach(|py| {
         let built = (|| {
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let peer_outbox = Bound::new(py, peer::Outbox::new())?;
+            let shared_l2_handle = Bound::new(py, pool::Handle::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
@@ -670,6 +670,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                         2_u32,
                         host_spans,
                         peer_outbox.clone(),
+                        shared_l2_handle.clone(),
                     ),
                 )?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
@@ -677,6 +678,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 bootstrap.unbind(),
                 outbox.unbind(),
                 peer_outbox.unbind(),
+                shared_l2_handle.unbind(),
                 mode,
             ))
         })();
@@ -738,14 +740,6 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             built.map_err(|error| python_error(py, error))
         })?;
 
-    // With a shared L2 pool as the Host tier, the rank's client of its owner.
-    let pool = Python::attach(|py| {
-        bootstrap
-            .getattr(py, "shared_l2")
-            .map(|pool| (!pool.is_none(py)).then_some(pool))
-            .map_err(|error| python_error(py, error))
-    })?;
-
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
     let listener = Listener::bind(&config.collective_bind_host)?;
@@ -799,8 +793,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane =
-        PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    // With a shared L2 pool as the Host tier, the client the rank started
+    // when it joined the pool at device build is the loop's; the data plane
+    // keeps the handle, for the acknowledgments of the rank's loads.
+    let pool_client = shared_l2_handle.get().take_client();
+    let data_plane = PythonDataPlane::start(data_plane, peers.streams, shared_l2_handle)
+        .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -926,9 +924,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
-            pool: pool.map(|client| {
-                Box::new(PythonPoolClient::new(client)) as Box<dyn PoolClient + Send>
-            }),
+            pool: pool_client,
             peer,
         },
     );

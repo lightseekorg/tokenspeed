@@ -33,8 +33,11 @@
 //! the GIL) and the cache acknowledgments. Each takes the GIL for its call
 //! only, under a dispatch guard that rejects device work, and none waits
 //! behind the forward thread's queue: the round head never waits for
-//! launches in flight. The L3 tier's storage executor is the host's own
-//! (`ts-l3`), outside the data plane.
+//! launches in flight. A rank whose Host tier is a shared L2 pool has only
+//! load-backs to acknowledge, and the host's loader ran them: its cache
+//! acknowledgments are the loader's finished loads, read without the GIL
+//! (`pool.rs`). The L3 tier's storage executor is the host's own (`ts-l3`),
+//! outside the data plane.
 
 use std::{
     collections::HashMap,
@@ -58,7 +61,7 @@ use ts_pd::LandedRequest;
 use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::{pd::Streams, LAUNCHER_FAILURE};
+use crate::{pd::Streams, pool, LAUNCHER_FAILURE};
 
 mod result_buffers;
 
@@ -285,6 +288,9 @@ impl Drop for ExitNotice {
 pub struct PythonDataPlane {
     /// The Python `HostDataPlane`.
     plane: Py<PyAny>,
+    /// The rank's shared L2 handle: the loads of a rank that joined a pool
+    /// are acknowledged from there.
+    shared_l2_handle: Py<pool::Handle>,
     /// The control thread's dispatch guard, entered while the plane serves.
     guard: Option<Py<PyAny>>,
     ops: Option<mpsc::Sender<Op>>,
@@ -298,7 +304,12 @@ impl PythonDataPlane {
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
-    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
+    /// `shared_l2_handle` is the rank's, whether or not it joined a pool.
+    pub fn start(
+        plane: Py<PyAny>,
+        streams: Option<Streams>,
+        shared_l2_handle: Py<pool::Handle>,
+    ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
@@ -309,6 +320,7 @@ impl PythonDataPlane {
         let shared = Arc::new(Shared::default());
         let mut data_plane = Self {
             plane: Python::attach(|py| plane.clone_ref(py)),
+            shared_l2_handle,
             guard: Some(guard),
             ops: Some(ops),
             shared: shared.clone(),
@@ -472,6 +484,20 @@ impl DataPlane for PythonDataPlane {
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         let _span = profile::span("DataPlane::poll_cache_events");
+        // A rank that joined a shared L2 pool has no cache op to acknowledge
+        // but its load-backs, which the host's loader ran: what the loader
+        // finished is the answer, and Python is not asked.
+        if let Some(loads) = self.shared_l2_handle.get().loads() {
+            self.failed()?;
+            let finished = loads.poll().map_err(|error| self.fail(error.0))?;
+            return Ok(finished
+                .into_iter()
+                .map(|op_id| CacheEvent {
+                    kind: CacheEventKind::LoadBackDone,
+                    op_id,
+                })
+                .collect());
+        }
         let polled: Vec<(String, u32)> = self.query(|plane| {
             plane
                 .call_method0("poll_cache_events")
