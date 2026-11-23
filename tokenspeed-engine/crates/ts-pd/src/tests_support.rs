@@ -52,10 +52,11 @@ impl NativeLibrary {
         let source = directory.join("native.c");
         let path = directory.join("libnative.so");
         let native = format!(
-            "#define WRITE_BLOCK_PATH {}\n#define WRITE_ENTERED_PATH {}\n#define WRITE_OWNER_PATH {}\n{NATIVE}",
+            "#define WRITE_BLOCK_PATH {}\n#define WRITE_ENTERED_PATH {}\n#define WRITE_OWNER_PATH {}\n#define UNREGISTER_FAIL_PATH {}\n{NATIVE}",
             c_path(&directory.join("write-blocked")),
             c_path(&directory.join("write-entered")),
             c_path(&directory.join("owner-alive")),
+            c_path(&directory.join("unregister-fails")),
         );
         std::fs::write(&source, native).expect("write native test library");
         let output = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
@@ -100,6 +101,13 @@ impl NativeLibrary {
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Make every later deregistration fail, keeping the range registered.
+    #[allow(dead_code)]
+    pub(crate) fn fail_unregistrations(&self) {
+        std::fs::write(self.directory.join("unregister-fails"), b"")
+            .expect("fail native test deregistrations");
     }
 
     /// Let blocked writes finish; subsequent writes proceed normally.
@@ -218,6 +226,7 @@ int ts_mooncake_register(void *raw, void *address, size_t size) {
 
 int ts_mooncake_unregister(void *raw, void *address) {
     Engine *engine = raw;
+    if (access(UNREGISTER_FAIL_PATH, F_OK) == 0) return -1;
     pthread_mutex_lock(&mutex);
     int result = -1;
     for (int i = 0; i < REGIONS; ++i) {

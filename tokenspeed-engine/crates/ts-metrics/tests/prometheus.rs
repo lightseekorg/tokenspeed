@@ -29,11 +29,13 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use ts_metrics::{
-    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3ExecutorSnapshot, L3Labels,
-    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
+    DiskExecutorStats, DiskMetrics, DiskSchedulerStats, EngineLabels, EngineMetrics, Exporter,
+    KvTransferMetrics, L3ExecutorSnapshot, L3Labels, L3Metrics, L3OperationSnapshot,
+    L3SchedulerStats, MetricEvent, MetricsConfig,
 };
 
 fn fixtures() -> PathBuf {
@@ -71,6 +73,8 @@ fn run_scenario(directory: &Path) {
     engine.record_scheduler_iteration(3, 5, 2, 10, 40, 17);
     engine.record_scheduler_iteration(1, 4, 0, 4, 40, 0);
     engine.record_spec_decode_step(4, 5, 3);
+    engine.observe_request_spec_decode_accept_length(2.0);
+    engine.observe_request_spec_decode_accept_length(3.0);
     engine.record_jit_compiles(2, 0.5);
     engine.record_nan_abort();
     engine.record_capacity_abort();
@@ -86,7 +90,11 @@ fn run_scenario(directory: &Path) {
     engine.observe_request_time(1.5);
     engine.observe_decode_time(1.2);
     engine.observe_time_per_output_token(0.02);
+    engine.observe_e2e_time_per_output_token(0.03);
     engine.record_completion_tokens(5);
+    engine.observe_request_completion_tokens(0);
+    engine.observe_request_completion_tokens(5);
+    engine.record_decode_prefix_hits(100, 20);
     engine.record_grammar_queue(2);
     engine.record_prefix_hits(100, 40, 30, 10);
 
@@ -155,6 +163,121 @@ fn render(directory: &Path) -> Option<String> {
 }
 
 #[test]
+fn decode_ready_wait_exports_duration_and_the_100ms_bucket() {
+    let directory = scratch_dir("decode-ready-wait");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    for seconds in [0.04, 0.1, 0.3] {
+        engine.observe_decode_ready_wait(seconds);
+    }
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    let value = |name: &str, label: Option<&str>| -> f64 {
+        text.lines()
+            .find(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && label.is_none_or(|label| line.contains(label))
+            })
+            .unwrap_or_else(|| panic!("missing {name} in {text}"))
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(
+        value("tokenspeed:decode_ready_wait_seconds_count", None),
+        3.0
+    );
+    assert!((value("tokenspeed:decode_ready_wait_seconds_sum", None) - 0.44).abs() < 1e-9);
+    assert_eq!(
+        value(
+            "tokenspeed:decode_ready_wait_seconds_bucket",
+            Some("le=\"0.1\"")
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn decode_slot_gauges_report_occupancy_and_release_without_changing_load() {
+    let directory = scratch_dir("decode-slots");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 3,
+        },
+    );
+    engine.record_scheduler_iteration(2, 5, 1, 4, 40, 0);
+    engine.record_decode_slot_usage(4, 2, 2);
+    let Some(first) = render(&directory) else {
+        return;
+    };
+    let value = |text: &str, name: &str| -> Option<f64> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")) && line.contains("dp_rank=\"3\""))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(|number| number.parse().unwrap())
+    };
+    assert_eq!(value(&first, "tokenspeed:num_requests_resident"), Some(4.0));
+    assert_eq!(
+        value(&first, "tokenspeed:num_active_decode_slots"),
+        Some(2.0)
+    );
+    assert_eq!(
+        value(&first, "tokenspeed:num_decode_ready_waiting_reqs"),
+        Some(2.0)
+    );
+
+    engine.record_decode_slot_usage(3, 1, 0);
+    let released = render(&directory).expect("the same Python can render the second snapshot");
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_resident"),
+        Some(3.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_active_decode_slots"),
+        Some(1.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_decode_ready_waiting_reqs"),
+        Some(0.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_running"),
+        Some(2.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_inflight"),
+        Some(5.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_waiting"),
+        Some(1.0)
+    );
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
 fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
     let directory = scratch_dir("l3");
     let exporter = Exporter::new(&MetricsConfig {
@@ -193,10 +316,15 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         health_state: "open".to_owned(),
         health_epoch: 3.0,
         unsafe_io: true,
+        io_blocked: true,
     };
     let scheduler = L3SchedulerStats {
         operations: 1.0,
         held_blocks: 2.0,
+        retained_operations: 1.0,
+        retained_host_blocks: 2.0,
+        retained_capacity_exhausted: true,
+        retained_capacity_warnings: 2.0,
         quarantined: 1.0,
         negative_keys: 1.0,
         wait_timeouts: 1.0,
@@ -247,6 +375,8 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         ("tokenspeed:l3_backend_state", &[], 1.0),
         ("tokenspeed:l3_backend_epoch", &[], 3.0),
         ("tokenspeed:l3_io_quarantined", &[], 1.0),
+        ("tokenspeed:l3_io_blocked", &[], 1.0),
+        ("tokenspeed:l3_retained_capacity_warnings_total", &[], 2.0),
         ("tokenspeed:l3_pressure_bypasses_total", &[], 3.0),
         ("tokenspeed:l3_pressure_dropped_backup_keys_total", &[], 7.0),
         (
@@ -286,6 +416,21 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
         ),
         (
             "tokenspeed:l3_scheduler_resources",
+            &[("resource", "retained_operations")],
+            1.0,
+        ),
+        (
+            "tokenspeed:l3_scheduler_resources",
+            &[("resource", "retained_host_blocks")],
+            2.0,
+        ),
+        (
+            "tokenspeed:l3_scheduler_resources",
+            &[("resource", "retained_capacity_exhausted")],
+            1.0,
+        ),
+        (
+            "tokenspeed:l3_scheduler_resources",
             &[("resource", "pressure_gate_closed")],
             1.0,
         ),
@@ -298,6 +443,218 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
             .collect();
         let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
         assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn disk_samples_export_counter_growth_once_and_current_gauges() {
+    let directory = scratch_dir("disk");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut metrics = DiskMetrics::new(
+        &exporter,
+        &L3Labels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+            tp_rank: 1,
+            engine_role: "null".to_owned(),
+        },
+    );
+    let mut scheduler = DiskSchedulerStats {
+        operations: 2.0,
+        queued_cleanings: 5.0,
+        disk_blocks: 40.0,
+        written_blocks: 40.0,
+        read_blocks: 12.0,
+        failed_reads: 1.0,
+        dropped_cleanings: 3.0,
+        wait_timeouts: 1.0,
+        ..DiskSchedulerStats::default()
+    };
+    let io = DiskExecutorStats {
+        queued_write_bytes: 8192.0,
+        read_bytes: 49152.0,
+        write_bytes: 163840.0,
+        ..DiskExecutorStats::default()
+    };
+    // Totals are cumulative: a repeated sample adds nothing, a grown one
+    // adds its growth.
+    metrics.record(&scheduler, &io);
+    metrics.record(&scheduler, &io);
+    scheduler.written_blocks = 44.0;
+    scheduler.operations = 0.0;
+    metrics.record(&scheduler, &io);
+    // Executor threads observe jobs as they report: a read that queued
+    // 2 ms of its 30 ms, and a write cancelled before it was issued.
+    let jobs = metrics.jobs();
+    std::thread::spawn(move || {
+        jobs.observe(
+            "read",
+            true,
+            Some(Duration::from_millis(2)),
+            Duration::from_millis(30),
+        );
+        jobs.observe("write", false, None, Duration::from_millis(1));
+    })
+    .join()
+    .unwrap();
+    drop(metrics);
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let rank = [
+        ("app_key", ""),
+        ("dp_rank", "0"),
+        ("engine_role", "null"),
+        ("model_name", "m"),
+        ("tp_rank", "1"),
+    ];
+    for (metric, extra, value) in [
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "write"), ("result", "success")][..],
+            44.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "write"), ("result", "skipped")],
+            3.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "read"), ("result", "success")],
+            12.0,
+        ),
+        (
+            "tokenspeed:disk_blocks_total",
+            &[("direction", "read"), ("result", "failure")],
+            1.0,
+        ),
+        (
+            "tokenspeed:disk_read_expirations_total",
+            &[("phase", "waiting")],
+            1.0,
+        ),
+        (
+            "tokenspeed:disk_scheduler_resources",
+            &[("resource", "operations")],
+            0.0,
+        ),
+        (
+            "tokenspeed:disk_scheduler_resources",
+            &[("resource", "disk_blocks")],
+            40.0,
+        ),
+        (
+            "tokenspeed:disk_io_bytes_total",
+            &[("direction", "write")],
+            163840.0,
+        ),
+        (
+            "tokenspeed:disk_io_queued_bytes",
+            &[("state", "queued_write")],
+            8192.0,
+        ),
+    ] {
+        let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();
+        labels.sort_unstable();
+        let rendered_labels: Vec<String> = labels
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{value}\""))
+            .collect();
+        let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
+        assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    let job_sample = |name: &str, labels: &[&str]| -> Option<f64> {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("tokenspeed:disk_job_seconds_{name}{{"))
+                    && labels.iter().all(|label| line.contains(label))
+            })
+            .map(|line| line.split_whitespace().nth(1).unwrap().parse().unwrap())
+    };
+    let (read, write) = ("direction=\"read\"", "direction=\"write\"");
+    let (queued, total) = ("stage=\"queued\"", "stage=\"total\"");
+    assert_eq!(
+        job_sample("bucket", &[read, queued, "le=\"0.0025\""]),
+        Some(1.0)
+    );
+    assert_eq!(
+        job_sample("bucket", &[read, total, "le=\"0.025\""]),
+        Some(0.0)
+    );
+    assert_eq!(
+        job_sample("count", &[read, total, "outcome=\"success\""]),
+        Some(1.0)
+    );
+    assert_eq!(
+        job_sample("count", &[write, total, "outcome=\"failure\""]),
+        Some(1.0)
+    );
+    // A job that issued nothing has no queued sample.
+    assert_eq!(job_sample("count", &[write, queued]), None);
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn l3_current_namespace_blocking_changes_without_erasing_historical_quarantine() {
+    let directory = scratch_dir("l3-current-namespace");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut metrics = L3Metrics::new(
+        &exporter,
+        &L3Labels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+            tp_rank: 0,
+            engine_role: "null".to_owned(),
+        },
+    );
+    let mut io = L3ExecutorSnapshot {
+        health_state: "healthy".to_owned(),
+        unsafe_io: true,
+        io_blocked: true,
+        ..L3ExecutorSnapshot::default()
+    };
+    let value = |text: &str, name: &str| -> Option<f64> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(|number| number.parse().unwrap())
+    };
+    for (round, blocked) in [true, false, true].into_iter().enumerate() {
+        io.io_blocked = blocked;
+        metrics.record(&io, &L3SchedulerStats::default());
+        let Some(rendered) = render(&directory) else {
+            std::fs::remove_dir_all(&directory).unwrap();
+            return;
+        };
+        assert_eq!(
+            value(&rendered, "tokenspeed:l3_io_quarantined"),
+            Some(1.0),
+            "{round}"
+        );
+        assert_eq!(
+            value(&rendered, "tokenspeed:l3_io_blocked"),
+            Some(f64::from(u8::from(blocked))),
+            "{round}"
+        );
+        // Backend cooldown is independent of unsafe-prefix isolation.
+        assert_eq!(
+            value(&rendered, "tokenspeed:l3_backend_state"),
+            Some(0.0),
+            "{round}"
+        );
     }
     std::fs::remove_dir_all(&directory).unwrap();
 }
@@ -323,4 +680,90 @@ fn a_relay_message_is_the_python_event_array() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(encoded, expected.trim());
+}
+
+#[test]
+fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
+    let directory = scratch_dir("peer-estimates");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".into(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    engine.peer.increment("landed_tokens", 8);
+    let completed = engine.peer.queue_read("a".into(), 0, 64);
+    let cancelled = engine.peer.queue_read("a".into(), 0, 128);
+    completed.finish(
+        std::time::Instant::now(),
+        std::time::Duration::from_millis(200),
+        16,
+        8,
+        true,
+    );
+    drop(cancelled);
+    let failed = engine.peer.queue_read("a".into(), 0, 256);
+    failed.finish(
+        std::time::Instant::now(),
+        std::time::Duration::ZERO,
+        192,
+        0,
+        false,
+    );
+    engine.peer.usage(Some(10), 14, "used");
+    engine.peer.usage(None, 5, "used");
+    engine.peer.usage(Some(8), 0, "lookup_miss");
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    for (tier, expected) in [("host", 16.0), ("disk", 8.0), ("device", 40.0)] {
+        let line = text
+            .lines()
+            .find(|line| {
+                line.starts_with("tokenspeed:peer_read_source_bytes_total{")
+                    && line.contains(&format!("source_tier=\"{tier}\""))
+            })
+            .unwrap();
+        assert_eq!(
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            expected
+        );
+    }
+    for (name, outcome, expected) in [
+        ("peer_estimation_error_tokens_sum", "used", -4.0),
+        ("peer_estimation_error_tokens_count", "used", 1.0),
+        ("peer_estimation_error_tokens_sum", "lookup_miss", 8.0),
+        ("peer_consumed_tokens_sum", "", 19.0),
+        ("peer_consumed_tokens_count", "", 3.0),
+        ("peer_read_bytes_total", "", 64.0),
+        ("peer_outstanding_read_bytes", "", 0.0),
+        ("peer_scheduler_events_total", "", 8.0),
+    ] {
+        let line = text
+            .lines()
+            .find(|l| {
+                l.starts_with(&format!("tokenspeed:{name}{{"))
+                    && (outcome.is_empty() || l.contains(&format!("outcome=\"{outcome}\"")))
+            })
+            .unwrap();
+        assert_eq!(
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            expected
+        );
+    }
 }

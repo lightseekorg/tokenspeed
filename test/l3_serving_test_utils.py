@@ -66,6 +66,7 @@ L3_IO_ADAPTER_BYTES = "tokenspeed:l3_io_adapter_bytes_total"
 L3_IO_OPERATIONS = "tokenspeed:l3_io_operations"
 L3_SCHEDULER_RESOURCES = "tokenspeed:l3_scheduler_resources"
 L3_IO_QUARANTINED = "tokenspeed:l3_io_quarantined"
+L3_IO_BLOCKED = "tokenspeed:l3_io_blocked"
 L3_DROPPED_BACKUP_KEYS = "tokenspeed:l3_dropped_backup_keys_total"
 # Token spans of the keys a storage QUERY found in the store, counted per
 # cache group when the query completes -- before, and independently of,
@@ -89,6 +90,7 @@ _GAUGES = {
     ),
     "quarantined_blocks": (L3_SCHEDULER_RESOURCES, (("resource", "quarantined"),)),
     "io_quarantined": (L3_IO_QUARANTINED, ()),
+    "io_blocked": (L3_IO_BLOCKED, ()),
 }
 _COUNTERS = {
     "put_success_keys": (L3_IO_KEYS, (("kind", "put"), ("result", "success"))),
@@ -899,6 +901,7 @@ class EvidenceSnapshot:
     backup_candidates: float | None
     quarantined_blocks: float | None
     io_quarantined: float | None
+    io_blocked: float | None
     nonfinite_series: tuple[str, ...]
 
 
@@ -979,8 +982,13 @@ def _quarantine_violations(snapshot: EvidenceSnapshot, label: str) -> list[str]:
     if snapshot.io_quarantined not in (None, 0.0):
         violations.append(
             f"{label}: L3 I/O quarantined ({L3_IO_QUARANTINED} is "
-            f"{snapshot.io_quarantined}): native retirement unproven, new I/O "
-            "disabled until restart"
+            f"{snapshot.io_quarantined}): historical native retirement unproven; "
+            "the retained Host memory requires process restart to reclaim"
+        )
+    if snapshot.io_blocked not in (None, 0.0):
+        violations.append(
+            f"{label}: the active L3 namespace blocks new native I/O "
+            f"({L3_IO_BLOCKED} is {snapshot.io_blocked})"
         )
     if snapshot.quarantined_blocks not in (None, 0.0):
         violations.append(

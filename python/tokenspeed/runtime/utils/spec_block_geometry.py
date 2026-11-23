@@ -42,7 +42,9 @@ __all__ = [
     "BLOCK_SPEC_RULES",
     "count_dspark_stages",
     "read_checkpoint_block_size",
+    "resolve_block_sample_from_anchor",
     "resolve_block_widths",
+    "resolve_draft_query_width",
     "validate_block_widths",
 ]
 
@@ -60,6 +62,41 @@ _BLOCK_SIZE_KEYS = ("dspark_block_size", "block_size")
 _NESTED_CONFIG_KEYS = ("dflash_config", "dspark_config")
 #: Rows the checkpoint's block_size counts beyond the drafted tokens.
 _STEP_OFFSET = {"DSPARK": 0, "DFLASH": 1}
+_SAMPLE_FROM_ANCHOR = {"DSPARK": True, "DFLASH": False}
+
+
+def resolve_block_sample_from_anchor(algorithm: str, *configs: Any) -> bool:
+    """Resolve the draft's query-to-proposal layout from checkpoint metadata.
+
+    Args:
+        algorithm: Block drafting algorithm, used for older checkpoints.
+        *configs: Draft configs, most specific first.
+
+    Returns:
+        Whether the anchor query predicts the first proposed token.
+    """
+    for config in configs:
+        value = getattr(config, "sample_from_anchor", None)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise ValueError("sample_from_anchor must be a boolean")
+            return value
+    return _SAMPLE_FROM_ANCHOR[algorithm]
+
+
+def resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> int:
+    """Return query rows per request for a block draft.
+
+    Args:
+        verify_width: Anchor plus proposed tokens, at least two.
+        sample_from_anchor: Whether row zero predicts the first proposal.
+
+    Returns:
+        Query rows, including the anchor when it has no proposal output.
+    """
+    if verify_width < 2:
+        raise ValueError("Block drafting requires a verify width of at least two")
+    return verify_width - 1 if sample_from_anchor else verify_width
 
 
 def count_dspark_stages(
@@ -163,6 +200,8 @@ def validate_block_widths(
     block_size: int,
     num_steps: int,
     num_draft_tokens: int,
+    *,
+    allow_shorter: bool = False,
 ) -> None:
     """Reject launch widths that disagree with the checkpoint block size.
 
@@ -171,10 +210,12 @@ def validate_block_widths(
         block_size: The checkpoint's block size.
         num_steps: The requested ``speculative_num_steps``.
         num_draft_tokens: The requested ``speculative_num_draft_tokens``.
+        allow_shorter: Also accept fewer steps than the checkpoint drafts, for
+            drafters that size their block from the launch width.
 
     Raises:
         ValueError: The requested widths are not the ones the checkpoint was
-            trained at.
+            trained at, or with ``allow_shorter`` draft more than it does.
     """
     expected_steps, expected_draft_tokens = resolve_block_widths(algorithm, block_size)
     if (
@@ -182,6 +223,21 @@ def validate_block_widths(
         and int(num_draft_tokens) == expected_draft_tokens
     ):
         return
+    if (
+        allow_shorter
+        and 1 <= int(num_steps) < expected_steps
+        and int(num_draft_tokens) == int(num_steps) + 1
+    ):
+        return
+    if allow_shorter:
+        raise ValueError(
+            f"{algorithm} checkpoint block_size={int(block_size)} drafts at most "
+            f"--speculative-num-steps {expected_steps}, with "
+            "--speculative-num-draft-tokens one more than the steps; got "
+            f"--speculative-num-steps {int(num_steps)} and "
+            f"--speculative-num-draft-tokens {int(num_draft_tokens)}. "
+            f"{BLOCK_SPEC_RULES}"
+        )
     raise ValueError(
         f"{algorithm} checkpoint block_size={int(block_size)} requires "
         f"--speculative-num-steps {expected_steps} and "

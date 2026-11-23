@@ -40,6 +40,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, tl, triton
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "BF16X3_MIN_M",
@@ -93,7 +94,8 @@ def split_fp32_weight_bf16x3(weight: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _bf16x3_block(x_desc, w_desc, a0, b0, k, part, N: tl.constexpr, SWAP: tl.constexpr):
     """``part += x . w3 + x . w2 + x . w1`` over one K block, small pieces
-    first. ``w_desc`` views the pieces as ``[3 N, K]``."""
+    first, from zero when ``part`` is None (row-major tiles). ``w_desc`` views
+    the pieces as ``[3 N, K]``."""
     if SWAP:  # a0: weight row offset, b0: activation row offset
         xt = x_desc.load([b0, k])
         w3t = w_desc.load([2 * N + a0, k])
@@ -108,7 +110,10 @@ def _bf16x3_block(x_desc, w_desc, a0, b0, k, part, N: tl.constexpr, SWAP: tl.con
         w3t = w_desc.load([2 * N + b0, k])
         w2t = w_desc.load([N + b0, k])
         w1t = w_desc.load([b0, k])
-        part = tl.dot(xt, w3t.T, part)
+        if part is None:
+            part = tl.dot(xt, w3t.T)
+        else:
+            part = tl.dot(xt, w3t.T, part)
         part = tl.dot(xt, w2t.T, part)
         part = tl.dot(xt, w1t.T, part)
     return part
@@ -159,25 +164,38 @@ def _bf16x3_gemm_kernel(
     BK: tl.constexpr,
     DRAIN: tl.constexpr,
     USE_WS: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
 ):
     """One ``[BA, BB]`` output tile over the ``KS`` elements of K of split
     ``program_id(2)``. ``SWAP`` puts the weight rows on the MMA's M side for
     few activation rows; TMA zero-fills activation rows past ``M``.
+    ``WARP_SPECIALIZE`` runs the same sums as one fresh product per block
+    in a warp-specialized loop (a drain every block).
     """
     pid_k = tl.program_id(2)
     a0 = tl.program_id(0) * BA
     b0 = tl.program_id(1) * BB
     k_begin = pid_k * KS
     acc = tl.zeros([BA, BB], tl.float32)
-    part = tl.zeros([BA, BB], tl.float32)
-    # One flat loop so the loads pipeline over num_stages. The drain is a
-    # branch on the loop-carried ``part`` rather than ``acc + tl.dot(.., 0)``,
-    # which Triton would fold into one MMA accumulator.
-    for i in range(0, KS // BK):
-        part = _bf16x3_block(x_desc, w_desc, a0, b0, k_begin + i * BK, part, N, SWAP)
-        if (i + 1) % (DRAIN // BK) == 0:
-            acc = acc + part
-            part = tl.zeros([BA, BB], tl.float32)
+    if WARP_SPECIALIZE:
+        tl.static_assert(DRAIN == BK)
+        # No MMA accumulator crosses iterations, so the loop can split into load, MMA and add warps.
+        for i in tl.range(0, KS // BK, warp_specialize=True):
+            acc = acc + _bf16x3_block(
+                x_desc, w_desc, a0, b0, k_begin + i * BK, None, N, SWAP
+            )
+    else:
+        part = tl.zeros([BA, BB], tl.float32)
+        # One flat loop so the loads pipeline over num_stages. The drain is a
+        # branch on the loop-carried ``part`` rather than ``acc + tl.dot(.., 0)``,
+        # which Triton would fold into one MMA accumulator.
+        for i in range(0, KS // BK):
+            part = _bf16x3_block(
+                x_desc, w_desc, a0, b0, k_begin + i * BK, part, N, SWAP
+            )
+            if (i + 1) % (DRAIN // BK) == 0:
+                acc = acc + part
+                part = tl.zeros([BA, BB], tl.float32)
     if USE_WS:
         _bf16x3_store_tile(
             ws_ptr + pid_k.to(tl.int64) * M * N, acc, a0, b0, M, N, BA, BB, SWAP
@@ -206,9 +224,11 @@ class _Bf16x3Config:
     block_b: int
     num_stages: int
     split: int
+    num_warps: int
+    warp_specialize: bool
 
 
-def _bf16x3_config(m: int, n: int, k: int) -> _Bf16x3Config:
+def _bf16x3_config(m: int, n: int, k: int, warp_specialize: bool) -> _Bf16x3Config:
     """Tile and split-K choice, measured at 256 x K weights on GB200.
 
     Up to 64 rows the weight rows take the MMA's M side and the rows pad to a
@@ -217,6 +237,11 @@ def _bf16x3_config(m: int, n: int, k: int) -> _Bf16x3Config:
     the smallest divisor of ``k / 64`` that brings the grid to 120 CTAs, or
     240 above 512 rows, where a second wave of split-K CTAs paid off.
     Stages fill about 200 KiB of shared memory.
+
+    With ``warp_specialize`` (Blackwell), 2048 rows and more take 128 x 128
+    tiles over eight warps in the warp-specialized loop, at the split of the
+    64 x 128 tiles: the same sums, a median 0.84x the time (0.78x to 1.04x)
+    over the registered weights from 2048 to 16384 rows on GB200.
     """
     if m <= 64:
         swap, block_a, block_b, num_stages = (
@@ -239,7 +264,9 @@ def _bf16x3_config(m: int, n: int, k: int) -> _Bf16x3Config:
         (s for s in range(1, blocks + 1) if blocks % s == 0 and tiles * s >= target),
         blocks,
     )
-    return _Bf16x3Config(swap, block_a, block_b, num_stages, split)
+    if warp_specialize and m >= 2048:
+        return _Bf16x3Config(swap, 128, 128, 3, split, 8, True)
+    return _Bf16x3Config(swap, block_a, block_b, num_stages, split, 4, False)
 
 
 def triton_bf16x3_gemm_fp32(
@@ -283,7 +310,17 @@ def triton_bf16x3_gemm_fp32(
         return out
     if x.data_ptr() % 16:
         x = x.clone()  # TMA needs a 16-byte aligned base
-    cfg = _bf16x3_config(m, n, k)
+    return _bf16x3_launch(
+        x, weight_split, out, _bf16x3_config(m, n, k, current_platform().is_blackwell)
+    )
+
+
+def _bf16x3_launch(
+    x: torch.Tensor, weight_split: torch.Tensor, out: torch.Tensor, cfg: _Bf16x3Config
+) -> torch.Tensor:
+    """Launch the kernels of ``cfg`` on checked operands."""
+    m, k = x.shape
+    n = weight_split.shape[1]
     x_rows, w_rows = (
         (cfg.block_b, cfg.block_a) if cfg.swap else (cfg.block_a, cfg.block_b)
     )
@@ -317,7 +354,8 @@ def triton_bf16x3_gemm_fp32(
         BK=_BLOCK_K,
         DRAIN=_DRAIN,
         USE_WS=use_ws,
-        num_warps=4,
+        WARP_SPECIALIZE=cfg.warp_specialize,
+        num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
         enable_fp_fusion=False,
     )

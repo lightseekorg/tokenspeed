@@ -34,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     AttnKind,
     CacheGroupConfig,
     CacheTransferPolicy,
@@ -87,6 +87,7 @@ def cache_group_config(
 
     Raises:
         ValueError: A kind or transfer policy the scheduler has no enum for.
+        RuntimeError: Sink retention is requested from an older scheduler build.
     """
     attn_kind = _ATTN_KIND_MAP.get(spec.attn_kind)
     if attn_kind is None:
@@ -122,7 +123,16 @@ def cache_group_config(
     # Always stated, False included: a group silently left cached when its
     # recipe declared it replayable would change what the prefix hit means.
     kwargs["replayable"] = bool(spec.replayable)
-    return CacheGroupConfig(**kwargs)
+    config = CacheGroupConfig(**kwargs)
+    if spec.sink_tokens:
+        try:
+            config.sink_tokens = spec.sink_tokens
+        except AttributeError as error:
+            raise RuntimeError(
+                "SWA sink retention requires tokenspeed-scheduler with sink_tokens "
+                "support; rebuild tokenspeed-scheduler from the matching source."
+            ) from error
+    return config
 
 
 @dataclass(frozen=True)
@@ -135,7 +145,8 @@ class SchedulerLimits:
     """
 
     role: SchedulerConfig.Role
-    max_live_requests: int
+    max_batch_size: int
+    max_resident_requests: int
     max_scheduled_tokens: int
     max_context_len: int
     decode_input_tokens: int
@@ -167,7 +178,8 @@ def capacity_model(
     config.role = limits.role
     config.prefix_granularity = prefix_granularity
     config.max_scheduled_tokens = limits.max_scheduled_tokens
-    config.max_batch_size = limits.max_live_requests
+    config.max_batch_size = limits.max_batch_size
+    config.max_resident_requests = limits.max_resident_requests
     config.decode_input_tokens = limits.decode_input_tokens
     config.overlap_schedule_depth = limits.overlap_schedule_depth
     config.disable_prefix_cache = limits.disable_prefix_cache

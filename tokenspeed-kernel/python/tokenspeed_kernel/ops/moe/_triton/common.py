@@ -25,6 +25,15 @@ from tokenspeed_kernel._triton import tl, triton
 
 
 @triton.jit
+def _float32_to_ordered_key(value):
+    """The FP32 bits as a uint32 that sorts like the float (-0.0 below +0.0)."""
+    bits = value.to(tl.uint32, bitcast=True)
+    sign = tl.full(bits.shape, 0x80000000, tl.uint32)
+    full = tl.full(bits.shape, 0xFFFFFFFF, tl.uint32)
+    return bits ^ tl.where((bits & sign) != 0, full, sign)
+
+
+@triton.jit
 def _routing_kernel(
     topk_ids_ptr,
     expert_route_ids_ptr,
@@ -33,7 +42,28 @@ def _routing_kernel(
     expert_start,
     BLOCK_ROUTES: tl.constexpr,
 ):
-    expert_id = tl.program_id(0)
+    _route_expert(
+        topk_ids_ptr,
+        expert_route_ids_ptr,
+        expert_counts_ptr,
+        num_routes,
+        expert_start,
+        tl.program_id(0),
+        BLOCK_ROUTES,
+    )
+
+
+@triton.jit
+def _route_expert(
+    topk_ids_ptr,
+    expert_route_ids_ptr,
+    expert_counts_ptr,
+    num_routes,
+    expert_start,
+    expert_id,
+    BLOCK_ROUTES: tl.constexpr,
+):
+    """List the routes of local expert ``expert_id`` in route order."""
     count = 0
     num_blocks = tl.cdiv(num_routes, BLOCK_ROUTES)
     for block_id in range(num_blocks):
@@ -61,17 +91,20 @@ def _routing(
         (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
     )
     expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
-    block_routes = 128 if num_routes <= 128 else 1024
     _routing_kernel[(num_experts,)](
         topk_ids,
         expert_route_ids,
         expert_counts,
         num_routes,
         expert_start,
-        BLOCK_ROUTES=block_routes,
+        BLOCK_ROUTES=_routing_block(num_routes),
         num_warps=4,
     )
     return expert_route_ids, expert_counts
+
+
+def _routing_block(num_routes: int) -> int:
+    return 128 if num_routes <= 128 else 1024
 
 
 @triton.jit

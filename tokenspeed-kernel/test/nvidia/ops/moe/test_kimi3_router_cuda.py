@@ -27,8 +27,9 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)),
-    reason="requires SM100/SM103",
+    or not current_platform().is_nvidia
+    or current_platform().arch_version < ArchVersion(9, 0),
+    reason="requires NVIDIA SM90 or newer",
 )
 
 

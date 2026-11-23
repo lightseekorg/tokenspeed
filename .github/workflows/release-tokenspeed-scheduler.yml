@@ -3,6 +3,11 @@ name: Build and Release tokenspeed-scheduler
 on:
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: "Build and test distributions without publishing."
+        required: false
+        default: false
+        type: boolean
       tag_name:
         description: "Git tag to create or update. Defaults to tokenspeed-scheduler-v<version>."
         required: false
@@ -27,10 +32,10 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-latest
-            build-selector: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+            build-selector: "cp311-manylinux_x86_64 cp312-manylinux_x86_64"
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            build-selector: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+            build-selector: "cp311-manylinux_aarch64 cp312-manylinux_aarch64"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,8 +58,24 @@ jobs:
 
       - name: Check wheels
         run: |
-          python -m pip install --upgrade twine
+          python -m pip install --upgrade twine abi3audit
           python -m twine check dist/*
+          abi3audit --strict dist/*-cp312-abi3-*.whl
+
+      - name: Test installed wheels across Python versions
+        run: |
+          for runtime in 3.11 3.12 3.13 3.14 3.15; do
+            wheel_tag=cp312-abi3
+            if [ "$runtime" = 3.11 ]; then
+              wheel_tag=cp311-cp311
+            fi
+            docker run --rm \
+              -v "$PWD/dist:/wheels:ro" \
+              -v "$PWD/tokenspeed-scheduler/python/tests:/tests:ro" \
+              -e WHEEL_TAG="$wheel_tag" \
+              "python:${runtime}-slim" \
+              sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install /wheels/*-"$WHEEL_TAG"-*.whl pytest; /tmp/runtime/bin/python -m pytest -q /tests'
+          done
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -89,6 +110,7 @@ jobs:
 
   release:
     name: Create wheelhouse release
+    if: ${{ !inputs.dry_run }}
     needs: [build-wheel, build-sdist]
     runs-on: ubuntu-latest
     steps:
@@ -152,6 +174,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
+    if: ${{ !inputs.dry_run }}
     needs: [build-wheel, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi

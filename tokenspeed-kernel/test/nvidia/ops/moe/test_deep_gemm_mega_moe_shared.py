@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepGEMM MegaMoE running an MXFP8 shared expert inside its launch."""
+"""DeepGEMM MegaMoE through its apply: an MXFP8 shared expert run inside its
+launch, and the filler rows of a padded decode replay."""
 
 import importlib.util
 import tempfile
@@ -221,3 +222,50 @@ def test_mismatched_shared_expert_stays_unfused():
     for tensor, original in zip((*wide, down, down_scale), before):
         assert torch.equal(tensor.view(torch.uint8), original.view(torch.uint8))
     assert w._moe_backend_state.num_shared_experts == 0
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.usefixtures("process_group")
+def test_filler_rows_get_no_routed_output(fused):
+    plan = {
+        "persistent_max_num_tokens_per_gpu": 256,
+        "process_group": None,
+        "fast_math": True,
+    }
+    w = _Experts()
+    mega_moe.deep_gemm_mxfp4_mega_moe_process_weights(plan, w)
+    if fused:
+        assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+            plan, w, *_shared_weights(6)
+        )
+    live_requests = mega_moe.mega_moe_live_requests("cuda")
+    g = torch.Generator(device="cuda").manual_seed(7)
+    # (rows, live requests, padded requests): a rank with only filler, 8
+    # requests of 5 rows with 3 live, and 8 requests of 25 rows with 5 live.
+    for tokens, live, padded in ((16, 0, 4), (40, 3, 8), (200, 5, 8)):
+        x = torch.randn(
+            tokens, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g
+        )
+        ids = torch.stack(
+            [
+                torch.randperm(EXPERTS, device="cuda", generator=g)[:TOP_K]
+                for _ in range(tokens)
+            ]
+        ).int()
+        weights = torch.rand(tokens, TOP_K, device="cuda", generator=g)
+        every_row = _apply(plan, w, x, weights, ids)
+        # Zero routing weights leave only the shared expert's output: zero
+        # when it is not fused.
+        unrouted = _apply(plan, w, x, torch.zeros_like(weights), ids)
+        live_requests.copy_(torch.tensor([live, padded]))
+        try:
+            got = _apply(plan, w, x, weights, ids)
+        finally:
+            live_requests.fill_(1)
+        rows = tokens * live // padded
+        # The live requests' rows are unchanged; a filler row reaches no
+        # routed expert.
+        assert torch.equal(got[:rows], every_row[:rows])
+        assert torch.equal(got[rows:], unrouted[rows:])
+        if not fused:
+            assert not got[rows:].any()

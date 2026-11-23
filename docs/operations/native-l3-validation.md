@@ -43,7 +43,10 @@ provider, then runs three inference engines sequentially:
 
 Every mandatory gauge must be present; an absent gauge cannot prove zero
 outstanding work. Counters may be absent before their first increment.
-NaN and infinite evidence or logprobs fail. PUT adapter bytes describe
+NaN and infinite evidence or logprobs fail. Historical quarantine and active
+namespace blocking are checked separately; either invalidates this fresh-run
+correctness gate. Transient metrics transport errors retry within the phase
+budget and reset the stable interval. Malformed exposition fails immediately. PUT adapter bytes describe
 successful submitted payload, not measured wire traffic.
 
 The independent provider outlives the writer. Inference workers mount no

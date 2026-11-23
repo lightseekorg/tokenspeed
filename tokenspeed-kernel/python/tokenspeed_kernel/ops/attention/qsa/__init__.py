@@ -510,6 +510,16 @@ def qsa_block_topk_select(
         at the threshold may select different column ids across solutions.
     """
 
+    from tokenspeed_kernel.ops.attention.qsa.cuda import (
+        warn_if_cuda_topk_unavailable,
+    )
+
+    warn_if_cuda_topk_unavailable(
+        logits.dtype,
+        topk,
+        solution=solution,
+        override=override,
+    )
     kernel = select_kernel(
         "attention",
         "qsa_block_topk_select",

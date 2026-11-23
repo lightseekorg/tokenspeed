@@ -36,7 +36,11 @@ from tokenspeed.runtime.execution.types import PlannedForward
 
 
 def _execute(handle, plan, planned):
-    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
+    return handle.execute(
+        plan,
+        planned,
+        cache_ops=cache_ops_from_plan(plan, request_admission={}.__getitem__).device,
+    )
 
 
 class _PrefillPeer:
@@ -114,6 +118,7 @@ def _planned(*, num_extends=0):
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
 
 
@@ -134,10 +139,17 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     peer without waiting like any forward, behind the zeroing fence."""
     trace = []
     handle = _handle(trace, _DecodePeer(trace))
-    # The plan's own page zeroing: the RDMA fence waits on it because
-    # Mooncake writes are not ordered by the zeroing stream.
-    handle._executor.zero_cache_pages = lambda pages: SimpleNamespace(
-        synchronize=lambda: trace.append("zero-sync")
+    executor = handle._executor
+    executor.execution_stream = object()
+    executor.default_stream = SimpleNamespace(
+        wait_stream=lambda stream: trace.append(("wait", stream))
+    )
+    executor.zero_cache_pages = lambda pages: trace.append("zero")
+    executor.device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(
+            record=lambda stream: trace.append(("record", stream)),
+            synchronize=lambda: trace.append("landing-sync"),
+        )
     )
     remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
 
@@ -150,9 +162,12 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     assert pending is None
     assert trace == [
         "settle",
+        "zero",
+        ("wait", executor.execution_stream),
+        ("record", executor.default_stream),
         ("slots", [3]),
         "seed-lengths",
-        "zero-sync",
+        "landing-sync",
         "rdma",
     ]
 

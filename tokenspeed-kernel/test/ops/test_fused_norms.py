@@ -24,7 +24,7 @@ import itertools
 
 import pytest
 import torch
-from fused_boundary_helpers import boundary_case
+from fused_boundary_helpers import armed_blocks, boundary_case
 from tokenspeed_kernel.numerics.torch.layernorm import (
     torch_affine_rmsnorm,
     torch_weightless_qk_rmsnorm,
@@ -141,7 +141,7 @@ def test_gate_coefficients_feed_the_fused_residual(
     torch.testing.assert_close(alpha, alpha_ref, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(beta, beta_ref, atol=1e-6, rtol=1e-5)
     post_norm = (stream, branch, None, 1e-5, 0.0)
-    no_pre_norm = (None, 0.0, 0.0, False, None, 1, None)
+    no_pre_norm = (None, 0.0, 0.0, False, None, 1)
     fused = triton_boundary(*post_norm, alpha, beta, *no_pre_norm)[0]
     # alpha=0, beta=1 hands back the kernel's own FP32 post-norm.
     ones = (torch.zeros_like(alpha), torch.ones_like(beta))
@@ -163,7 +163,6 @@ def test_gate_coefficients_feed_the_fused_residual(
             False,
             None,
             1,
-            None,
         )
 
 
@@ -196,7 +195,6 @@ def test_boundary_can_omit_router_output_during_replay(device: str) -> None:
             False,
             None,
             1,
-            None,
         )
 
     run(True, True)
@@ -288,7 +286,6 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
             False,
             None,
             1,
-            None,
         )
         routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1, batch_invariant=False)
         combined = routed_input_scale_rmsnorm_sum(
@@ -320,17 +317,15 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
 ) -> None:
     """A BF16 round trip of the post-norm would show as ~2^-9; FP32 stays within 2^-20 of FP64."""
     args = boundary_case(boundary, 5, device)
-    outputs = triton_boundary(*args, enable_pdl, None, 1, None)
+    outputs = triton_boundary(*args, enable_pdl, None, 1)
     for got, plain in zip(
         outputs,
-        triton_boundary(*args, False, None, 1, None),
+        triton_boundary(*args, False, None, 1),
         strict=True,
     ):
         assert (got is None and plain is None) or torch.equal(got, plain)
     new_stream, pre_fp32, pre_bf16 = outputs
-    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(
-        *args, False, None, 1, None
-    )
+    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(*args, False, None, 1)
     ulps = 2.0**-20
     torch.testing.assert_close(new_stream.double(), stream_ref, atol=1e-6, rtol=ulps)
     if pre_ref is None:
@@ -563,6 +558,7 @@ def test_single_pass_route_reduction_matches_two_pass(
     if use_map:
         permute_map = torch.randperm(rows, device=device).to(torch.int32)
         permute_map[torch.tensor([2, 9, 30], device=device)] = -1
+        permute_map[3 * topk : 4 * topk] = -1  # every route of token 3 is remote
     route_weights = torch.rand(tokens, topk, device=device, dtype=torch.float32)
     norm_weight = torch.randn(width, device=device, dtype=torch.bfloat16) * 0.1
     outputs = []
@@ -596,3 +592,46 @@ def test_single_pass_route_reduction_matches_two_pass(
             )
         else:
             assert torch.equal(output, outputs[0])
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+@pytest.mark.parametrize("rows", [1, 65, 200])
+# One block reads rows as they stand; four are the column blocks of a TP4 gather.
+@pytest.mark.parametrize("blocks", [1, 4])
+def test_triton_boundary_gathers_a_mailbox_with_the_ordinary_bits(
+    device: str, rows: int, blocks: int
+) -> None:
+    """A one-block-per-rank mailbox gives an ordinary branch's bits; every word read is re-armed."""
+    # The half-polled sentinel: a NaN payload no GEMM emits.
+    sentinel = 0xFFFFFFFF
+    args = boundary_case("ffn_linked", rows, device)
+    stream, branch = args[:2]
+    plain = triton_boundary(*args, True, None, 1)
+    mailbox = armed_blocks(branch, rows + 8, blocks)
+    got = triton_boundary(stream, mailbox[:, :rows], *args[2:], True, sentinel, 1)
+    for ours, theirs in zip(got, plain, strict=True):
+        assert torch.equal(ours, theirs)
+    assert (mailbox.view(torch.int32) == -1).all()
+    with pytest.raises(ValueError, match="partials per rank"):
+        triton_boundary(stream, mailbox[:, :rows], *args[2:], True, sentinel, 2)
+    with pytest.raises(ValueError, match="contiguous blocks"):
+        triton_boundary(
+            stream,
+            torch.cat([mailbox, mailbox], dim=2)[:, :rows, : branch.shape[1] // blocks],
+            *args[2:],
+            True,
+            sentinel,
+            1,
+        )
+    # An odd block stride would split the 32-bit words the kernel re-arms.
+    width = branch.shape[1] // blocks
+    odd = torch.empty(blocks * (rows * width + 1), dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="whole 32-bit words"):
+        triton_boundary(
+            stream,
+            odd.as_strided((blocks, rows, width), (rows * width + 1, width, 1)),
+            *args[2:],
+            True,
+            sentinel,
+            1,
+        )

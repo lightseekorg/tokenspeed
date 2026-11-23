@@ -32,14 +32,7 @@ def installed_stack(monkeypatch, tmp_path):
     requirements.write_text(
         "torch==2.14.0\n" "flashinfer-python==0.7.0\n" "nvidia-cudnn-frontend==1.29.0\n"
     )
-    thirdparty = tmp_path / "cuda-thirdparty.txt"
-    thirdparty.write_text(
-        "tokenspeed-trtllm-kernel==1.3.0.post20260924\n"
-        "tokenspeed-cutedsl-kda==0.1.0.post20260919\n"
-    )
     versions = {
-        "tokenspeed-trtllm-kernel": "1.3.0.post20260924",
-        "tokenspeed-cutedsl-kda": "0.1.0.post20260919",
         "flashinfer-python": "0.7.0",
         "flashinfer-cubin": "0.7.0",
         "nvidia-cudnn-frontend": "1.29.0",
@@ -66,10 +59,10 @@ def installed_stack(monkeypatch, tmp_path):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["-", str(requirements), str(thirdparty), "130", str(Path(__file__).parent)],
+        ["-", str(requirements), "130", str(Path(__file__).parent)],
     )
     installer = Path(__file__).with_name("install_deps.sh").read_text()
-    marker = 'python3 - "${CUDA_REQ}" "${THIRDPARTY_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<\'PY\'\n'
+    marker = 'python3 - "${CUDA_REQ}" "${CUINDEX}" "${SCRIPT_DIR}" <<\'PY\'\n'
     script = installer.split(marker, 1)[1].split("\nPY", 1)[0]
     return compile(script, "install_deps.sh:validation", "exec"), torch, versions
 
@@ -79,8 +72,6 @@ def test_cuda_install_logs_and_accepts_matching_versions(installed_stack, capsys
     exec(script, {})
     output = capsys.readouterr().out
     assert "Installed torch==2.14.0+cu130" in output
-    assert "Installed tokenspeed-trtllm-kernel==1.3.0.post20260924" in output
-    assert "Installed tokenspeed-cutedsl-kda==0.1.0.post20260919" in output
     assert "Torch CUDA runtime: 13.0" in output
     assert "Installed flashinfer-python==0.7.0" in output
     assert "Installed flashinfer-cubin==0.7.0" in output
@@ -90,14 +81,6 @@ def test_cuda_install_logs_and_accepts_matching_versions(installed_stack, capsys
 def test_cuda_install_rejects_torch_downgrade(installed_stack):
     script, torch, _ = installed_stack
     torch.__version__ = "2.13.0+cu130"
-    with pytest.raises(SystemExit, match="does not satisfy"):
-        exec(script, {})
-
-
-@pytest.mark.parametrize("name", ["tokenspeed-trtllm-kernel", "tokenspeed-cutedsl-kda"])
-def test_cuda_install_rejects_stale_native_dependency(installed_stack, name):
-    script, _, versions = installed_stack
-    versions[name] = "0.0.0"
     with pytest.raises(SystemExit, match="does not satisfy"):
         exec(script, {})
 

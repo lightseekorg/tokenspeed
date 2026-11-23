@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,8 +27,12 @@ import torch
 from tokenspeed_kernel.ops.moe import moe_plan
 from tokenspeed_kernel.ops.moe.gluon import (
     _DSV4_PROFILE,
+    _DSV41_FLASH_DSPARK_PROFILE,
+    _DSV41_FLASH_PROFILE,
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
+    _MUSE_SPARK_PROFILE,
+    _get_workspace,
     _GluonPetitState,
     _Profile,
     _validate_layer,
@@ -38,7 +43,8 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 
 
 @pytest.mark.parametrize(
-    "profile", [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE]
+    "profile",
+    [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE, _MUSE_SPARK_PROFILE],
 )
 def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     with mock.patch(
@@ -48,6 +54,7 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation=profile.activation,
+            requires_deferred_finalize=True,
             routing_mode="precomputed_topk",
             a2a_backend="gluon_petit",
             ep_size=8,
@@ -68,6 +75,8 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     assert plan["apply_kernel_name"] == "gluon_petit_mxfp4_megamoe_apply"
     assert plan["weight_preprocessor"] is gluon_petit_mxfp4_megamoe_weights
     assert plan["a2a_backend"] == "gluon_petit"
+    # Per-route consumers take the unsummed routes.
+    assert plan["supports_deferred_finalize"]
 
 
 def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
@@ -95,15 +104,46 @@ def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
         )
 
 
-def _gpt_oss_layer() -> SimpleNamespace:
+@pytest.mark.parametrize("ep_size,selected", [(4, True), (8, True), (2, False)])
+def test_petit_plan_ep_sizes(ep_size, selected, mi350_platform) -> None:
+    profile = _DSV41_FLASH_PROFILE
+    with mock.patch(
+        "tokenspeed_kernel.selection.current_platform", return_value=mi350_platform
+    ):
+        try:
+            plan = moe_plan(
+                "mxfp4",
+                input_dtype=torch.bfloat16,
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+                a2a_backend="gluon_petit",
+                ep_size=ep_size,
+                ispp=profile.logical_intermediate,
+                hidden=profile.model_dim,
+                swiglu_form="standard",
+                activation_clamped=True,
+                expert_id_repeats=False,
+                internal_activation_dtype="mxfp4",
+                with_bias=False,
+                fast_math=True,
+                combine_order="rank",
+                features=frozenset(),
+                solution="gluon",
+            )
+        except NoKernelFoundError:
+            plan = None
+    assert (plan is not None) == selected
+
+
+def _gpt_oss_layer(ep_size: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         num_experts=128,
         top_k=4,
         hidden_size=2880,
         intermediate_size=2880,
-        ep_size=8,
+        ep_size=ep_size,
         tp_size=1,
-        num_local_experts=16,
+        num_local_experts=128 // ep_size,
         activation="swiglu",
         swiglu_beta=1.0,
         swiglu_arg=SimpleNamespace(alpha=1.702, limit=7.0),
@@ -113,15 +153,15 @@ def _gpt_oss_layer() -> SimpleNamespace:
     )
 
 
-def _dsv4_layer(limit: float | None) -> SimpleNamespace:
+def _dsv4_layer(limit: float | None, ep_size: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         num_experts=384,
         top_k=6,
         hidden_size=7168,
         intermediate_size=3072,
-        ep_size=8,
+        ep_size=ep_size,
         tp_size=1,
-        num_local_experts=48,
+        num_local_experts=384 // ep_size,
         activation="swiglu",
         swiglu_beta=None,
         swiglu_arg=SimpleNamespace(alpha=None, limit=limit),
@@ -129,6 +169,28 @@ def _dsv4_layer(limit: float | None) -> SimpleNamespace:
         w13_weight_bias=None,
         w2_weight_bias=None,
     )
+
+
+def _muse_spark_layer(ep_size: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        num_experts=256,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=4096,
+        ep_size=ep_size,
+        tp_size=1,
+        num_local_experts=256 // ep_size,
+        activation="silu",
+        swiglu_beta=None,
+        swiglu_arg=None,
+        w13_input_layout="concatenated",
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+    )
+
+
+def test_validate_layer_selects_muse_spark_profile() -> None:
+    assert _validate_layer(_muse_spark_layer()) == _MUSE_SPARK_PROFILE
 
 
 def test_validate_layer_selects_gpt_oss_120b_profile() -> None:
@@ -139,6 +201,109 @@ def test_validate_layer_preserves_dsv4_activation_contract() -> None:
     assert _validate_layer(_dsv4_layer(None)) == _DSV4_PROFILE
     with pytest.raises(ValueError, match="does not support an activation clamp"):
         _validate_layer(_dsv4_layer(10.0))
+
+
+def _dsv41_layer(profile: _Profile, ep_size: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        num_experts=profile.num_experts,
+        top_k=profile.top_k,
+        hidden_size=profile.model_dim,
+        intermediate_size=profile.logical_intermediate,
+        ep_size=ep_size,
+        tp_size=1,
+        num_local_experts=profile.num_experts // ep_size,
+        activation="swiglu",
+        swiglu_beta=None,
+        swiglu_arg=SimpleNamespace(alpha=None, limit=10.0),
+        w13_input_layout="concatenated",
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+    )
+
+
+def _kimi_k3_layer(ep_size: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        num_experts=896,
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        ep_size=ep_size,
+        tp_size=1,
+        num_local_experts=896 // ep_size,
+        activation="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        swiglu_beta=None,
+        swiglu_arg=None,
+        w13_input_layout="concatenated",
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE], ids=lambda p: p.name
+)
+@pytest.mark.parametrize("ep_size", [4, 8])
+def test_validate_layer_accepts_dsv41_at_ep4_and_ep8(profile, ep_size) -> None:
+    layer = _dsv41_layer(profile, ep_size)
+    assert _validate_layer(layer) == profile
+
+
+@pytest.mark.parametrize(
+    "build,ep_size,error",
+    [
+        (_gpt_oss_layer, 4, "supports EP8 for gpt_oss_120b; got EP4"),
+        (partial(_dsv4_layer, None), 4, "supports EP8 for dsv4; got EP4"),
+        (_kimi_k3_layer, 4, "supports EP8 for kimi_k3; got EP4"),
+        (_muse_spark_layer, 4, "supports EP8 for muse_spark; got EP4"),
+        (
+            partial(_dsv41_layer, _DSV41_FLASH_PROFILE),
+            2,
+            "supports EP4/8 for dsv41_flash; got EP2",
+        ),
+    ],
+    ids=[
+        "gpt_oss_120b-ep4",
+        "dsv4-ep4",
+        "kimi_k3-ep4",
+        "muse_spark-ep4",
+        "dsv41_flash-ep2",
+    ],
+)
+def test_validate_layer_rejects_ep_sizes_outside_the_profile(
+    build, ep_size, error
+) -> None:
+    # Each layer is valid at the default EP8, so only the EP size can trigger the error.
+    _validate_layer(build())
+    with pytest.raises(ValueError, match=error):
+        _validate_layer(build(ep_size=ep_size))
+
+
+@pytest.mark.parametrize(
+    "profile,world_size,error",
+    [
+        (_DSV4_PROFILE, 4, "world size of 8 for dsv4; got 4"),
+        (_DSV41_FLASH_PROFILE, 2, "world size of 4/8 for dsv41_flash; got 2"),
+    ],
+    ids=["dsv4-ws4", "dsv41_flash-ws2"],
+)
+def test_workspace_rejects_world_size_outside_the_profile(
+    profile, world_size, error
+) -> None:
+    # The workspace is sized from the process group, which _validate_layer never
+    # sees; only the missing process group is faked.
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.is_initialized", return_value=True
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.get_world_size",
+            return_value=world_size,
+        ),
+        pytest.raises(RuntimeError, match=error),
+    ):
+        _get_workspace(torch.device("cuda", 0), profile)
 
 
 @pytest.mark.parametrize(
@@ -156,25 +321,7 @@ def test_validate_layer_preserves_dsv4_activation_contract() -> None:
     ],
 )
 def test_validate_layer_preserves_kimi_k3_activation_contract(overrides, error):
-    values = dict(
-        num_experts=896,
-        top_k=16,
-        hidden_size=3584,
-        intermediate_size=3072,
-        ep_size=8,
-        tp_size=1,
-        num_local_experts=112,
-        activation="situ",
-        activation_situ_beta=4.0,
-        activation_situ_linear_beta=25.0,
-        swiglu_beta=None,
-        swiglu_arg=None,
-        w13_input_layout="concatenated",
-        w13_weight_bias=None,
-        w2_weight_bias=None,
-    )
-    values.update(overrides)
-    layer = SimpleNamespace(**values)
+    layer = SimpleNamespace(**{**vars(_kimi_k3_layer()), **overrides})
     if error:
         with pytest.raises(ValueError, match=error):
             _validate_layer(layer)

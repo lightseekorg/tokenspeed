@@ -62,6 +62,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -407,12 +408,12 @@ def test_snapshot_restore_reseeds_engram_before_commit(buffers, destination):
     runtime.valid_cache_lengths[source] = 5
     runtime.future_input_map[source, 0] = 15
     image = torch.empty(runtime.slot_state_bytes(), dtype=torch.uint8, device=ib.device)
-    runtime.export_slot_state(source, image, None, request_id="a")
+    runtime.export_slot_state(source, image, None, admission_id=1)
     runtime.ngram_request_ids[destination] = "a"
     runtime.ngram_accepted_tokens[destination].fill_(99)
     runtime.ngram_needs_seed[destination] = False
     runtime.valid_cache_lengths[destination] = 0
-    runtime.import_slot_state(destination, image, None, request_id="a")
+    runtime.import_slot_state(destination, image, None, admission_id=1)
 
     # The restored request receives an explicit decode token even when its
     # pool slot did not change. This must override any stale accepted tail.
@@ -812,6 +813,7 @@ def test_executor_input_capacity_covers_decode_capture(
         device="cpu",
         max_num_seqs=4,
         data_parallel_size=1,
+        enable_memory_saver=False,
         spec_algo="DSPARK" if width > 1 else None,
         spec_num_tokens=width,
         chunked_prefill_size=chunk_size,
@@ -965,6 +967,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     runner.is_generation = True
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
+    # autotune() runs its dummy forwards on the serving stream.
+    executor.device_module = torch.get_device_module(ib.device)
+    executor.execution_stream = executor.device_module.Stream()
     executor.config = SimpleNamespace(
         max_num_seqs=2,
         data_parallel_size=1,
@@ -989,10 +994,12 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.drafter = None
     executor._samples_from_vocab_shard = False
     pg = PrefillGraph.__new__(PrefillGraph)
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     pg.config = executor.config
     pg.input_buffers = ib
     pg.attn_backend = SimpleNamespace(init_forward_metadata=init_metadata)
     pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     pg.dp_size = 1
     pg.drafter = None
     executor.prefill_graph = pg
@@ -1196,6 +1203,7 @@ def test_the_forward_reads_a_snapshot_that_does_not_alias_request_state():
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
     handle._launch_forward(planned, capture_next_input_ids=False)
     # Later edits to the request's state cannot reach what the forward read.

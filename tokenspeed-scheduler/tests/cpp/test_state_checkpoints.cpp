@@ -54,20 +54,17 @@ class StateCheckpointSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kP = 4;
 
-    // These cache probes cancel to reclaim capacity. On P, the abort command
-    // alone cannot release pages: model the peer's retirement ACK and the
-    // outstanding forward result before probing the next request.
+    // These cache probes cancel to reclaim capacity. Retire the queued
+    // forwards and, on P, the transfer before probing the next request.
     void AbortAndRetire(const std::string& id) {
         SendAbortEvent(id);
         if (config_.role == Role::kP) {
             ExecutionEvent event;
             event.With(pd::TransferStoppedEvent{id});
             scheduler_->Advance(std::move(event));
-            if (scheduler_->PdTransferPinned(id)) {
-                SendForwardDone(id);
-            }
-            EXPECT_FALSE(scheduler_->PdTransferPinned(id));
         }
+        DrainForwardResults(id);
+        EXPECT_FALSE(scheduler_->PdTransferPinned(id));
     }
 
     SchedulerConfig MakeConfig() override {
@@ -78,6 +75,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_l2_cache = true;
         for (const std::string& id : {"full", "state0", "state1", "state2"}) {
             const bool is_state = id != "full";
@@ -866,6 +864,96 @@ TEST_F(RetainedCheckpointRetrySuite, DecodeAdmissionDropsAnOptionalCheckpointHol
         << "the evicted optional checkpoint is not retained as a reusable input";
     AbortAndRetire("changed");
     PlanOnce();
+}
+
+// RetainedCheckpointRetrySuite under the Host write-back policy: Device
+// eviction takes whole segments, and blocks leave one by one only as a lone
+// request's last resort (docs/design/scheduler.md §1.4).
+class LoneRetainedCheckpointSuite : public RetainedCheckpointRetrySuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = RetainedCheckpointRetrySuite::MakeConfig();
+        // The startup bound then admits up to 15 tokens: r's 12-token prompt
+        // and the decodes that fill the pool.
+        cfg.device_allocator.total_pages = 28;
+        cfg.host_allocator.total_pages = 28;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        cfg.disable_l2_cache = false;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// A lone request gives up its optional retained input checkpoint before any
+// cache leaves block by block (docs/design/scheduler.md §1.4). r's 12-token
+// prompt runs as chunks [0, 8) and [8, 12): the first ends at its in-forward
+// checkpoint boundary 8, so r retains the checkpoint at 8, and its first
+// decode publishes the state at its prompt end 12. r then decodes alone, one
+// full-attention block per token, until the pool is full. The only cache left
+// is those two checkpoints, both on r's own path. The one at 12 can leave
+// only block by block: its segment holds r's page [8, 12), which r's table
+// uses. The one at 8 can leave in the ordinary pass, every State group's at
+// once, since the checkpoint at 12 still lies under its page -- but only once
+// r stops holding it. When the decode first runs out of room, the ordinary
+// admission fails, r lets its retained checkpoint go and retries, and the
+// checkpoint at 8 is written back while the one at 12 stays; the one at 12
+// leaves block by block only when a later decode runs out of room again.
+// Running the block-by-block pass with the hold still on (the order before)
+// would admit the first such decode by writing back the checkpoint at 12 and
+// keeping the one at 8.
+TEST_F(LoneRetainedCheckpointSuite, ALoneDecodeReleasesItsRetainedCheckpointBeforeEvictingBlockByBlock) {
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    ASSERT_EQ(scheduler_->MaxSingleRequestTokens(), 15);
+    RequestSpec request = RequestWithTokens("r", MakeTokens(12));
+    request.max_new_tokens = 0;
+    Submit(request);
+    const std::vector<Chunk> chunks = RunPrefill("r", 12);
+    ASSERT_EQ(chunks.size(), 2u);
+    ASSERT_EQ(chunks[1].prefix_tokens, 8);
+    ASSERT_EQ(chunks[1].tokens, 4);
+    // The second chunk reads the checkpoint at 8 from slot 0 and writes the
+    // state at 12 into slot 1.
+    using Rows = std::vector<std::pair<std::string, std::int32_t>>;
+    const std::array<std::string, 4> group_names{"full", "state0", "state1", "state2"};
+    Rows checkpoint_at_8;
+    Rows checkpoint_at_12;
+    for (std::size_t g = 0; g < chunks[1].state_rows.size(); ++g) {
+        ASSERT_EQ(chunks[1].state_rows[g].size(), 2u);
+        checkpoint_at_8.emplace_back(group_names[g + 1], chunks[1].state_rows[g][0]);
+        checkpoint_at_12.emplace_back(group_names[g + 1], chunks[1].state_rows[g][1]);
+    }
+
+    // Every decode is admitted; the plans that evict write the victims back.
+    std::vector<Rows> written_back;
+    for (std::int32_t round = 0; round < 32 && written_back.size() < 2; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        Rows rows;
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            const WriteBackBatch& store = std::get<WriteBackBatch>(operation);
+            for (std::size_t op = 0; op < store.op_ids.size(); ++op) {
+                for (std::size_t row = 0; row < store.src_pages[op].size(); ++row) {
+                    rows.emplace_back(group_names[store.group_ids[op][row]], store.src_pages[op][row]);
+                }
+            }
+        }
+        AckWriteBacks(plan);
+        const ForwardBatch* decode = FindForwardBatch(plan);
+        ASSERT_TRUE(decode != nullptr && decode->request_ids == std::vector<std::string>{"r"})
+            << "r's decode is admitted in round " << round;
+        SendForwardDone("r", {901 + round});
+        if (!rows.empty()) {
+            written_back.push_back(std::move(rows));
+        }
+    }
+    ASSERT_EQ(written_back.size(), 2u) << "the decodes fill the pool twice";
+    EXPECT_EQ(written_back[0], checkpoint_at_8)
+        << "the released checkpoint at 8 leaves first, not the checkpoint at 12 a block-by-block pass takes";
+    EXPECT_EQ(written_back[1], checkpoint_at_12) << "the checkpoint at 12 stayed until the pool filled again";
+    EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.admission.blocks, 6u)
+        << "the two checkpoints are all the decodes evict";
 }
 
 // A 26-token prompt's boundary 24 is a budget chunk end already: that chunk
@@ -2026,7 +2114,7 @@ TEST_F(DropShortPromptEndsL3Suite, ADroppedShortPromptEndSupersedesNoInput) {
         ASSERT_EQ(Turn("s2", Extend(MakeTokens(6), 80, 1), &s2_load_rows), 6) << "the tail at 6";
         EXPECT_EQ(s2_load_rows, 1) << "the tail's KV block, from the Host";
         Turn("contender", MakeTokens(8, 9000));
-        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
         EXPECT_EQ(evictions.request_reclaim.blocks, drop ? 0u : 3u) << "the tail at 6: its three states";
         EXPECT_GT(evictions.admission.blocks, 0u);
     }
@@ -2043,6 +2131,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = 4;
         return cfg;
     }
@@ -2138,6 +2227,7 @@ protected:
         cfg.prefix_granularity = 256;
         cfg.max_scheduled_tokens = 16384;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = 4096;
         cfg.device_allocator.total_pages = 1025;
         for (CacheGroupConfig& group : cfg.cache_groups) {
@@ -2483,6 +2573,7 @@ protected:
         }
         cfg.max_scheduled_tokens = 48;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.overlap_schedule_depth = 1;
         cfg.enable_mixed_prefill_decode = true;
         return cfg;
@@ -2749,6 +2840,7 @@ protected:
             group.total_pages = cfg.device_allocator.total_pages;
         }
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         return cfg;
     }
@@ -2926,7 +3018,7 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
     // whose claimed checkpoint stays and is not counted, the State group's
     // checkpoint at 7, and the tail block at 7 it takes along. The stream to
     // Host and the image's L2 leg left Host holding all three.
-    const CacheCoordinator::DeviceEvictionCounts restored = scheduler_->GetHostCacheStats().device_evictions.restore;
+    const CacheEvictor::DeviceEvictionCounts restored = scheduler_->GetHostCacheStats().device_evictions.restore;
     EXPECT_EQ(restored.blocks, 3u);
     EXPECT_EQ(restored.host_resident, 3u);
     AckRestores(readmit);
@@ -3024,17 +3116,19 @@ protected:
         return cfg;
     }
 
-    // Applies the feed to the boundaries it reports stored: a removal names
-    // one stored before, and none is stored twice.
+    // Applies the Device stream to the boundaries it reports stored: a
+    // removal names one stored before, and none is stored twice.
     void Drain() {
         for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                if (removed->medium != KvEventMedium::kDevice) continue;
                 for (const std::uint64_t hash : removed->block_hashes) {
                     EXPECT_EQ(stored_.erase(hash), 1u) << "a removal names a boundary never stored";
                 }
                 continue;
             }
             const auto& stored = std::get<KvBlockStoredEvent>(event);
+            if (stored.medium != KvEventMedium::kDevice) continue;
             EXPECT_TRUE(stored_.emplace(stored.block_hashes.front(), stored.token_ids).second)
                 << "a boundary is stored twice";
         }
@@ -3135,7 +3229,8 @@ TEST_F(StateRestoreKvEventsSuite, AWriteBackRestoreRegistersTheTailItEvictedFirs
 // Without a Host pool the image rides the snapshot pool whole: the restore
 // copies every slot back as a private copy and republishes nothing. o,
 // admitted while r's image is in flight, takes the free blocks and evicts the
-// tail at 7, its checkpoint and the checkpoint at 8. It finishes at once, so
+// tail at 7, its checkpoint and the checkpoint at 8. The full-history page at
+// 8 remains advertised until its own blocks are evicted. o finishes at once, so
 // its own entries are newer than r's pages, and the restore evicts both of
 // those: with no block of page 1's left on the Device, a drain drops its
 // descriptor. The knob retracts r again before it decodes (plan 6), at
@@ -3146,7 +3241,7 @@ TEST_F(StateRestoreKvEventsSuite, ARetractionAfterAPoolRestoreRegistersThePageIt
     const ExecutionPlan retraction = RetractAtEight();
     Submit(RequestSpec{.request_id = "o", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
     PlanAndDrain();  // plan 4: o's prefill; the image's store has not landed
-    ASSERT_FALSE(Stored({5, 6, 7, 101})) << "o's admission evicted the checkpoint at 8";
+    ASSERT_TRUE(Stored({5, 6, 7, 101})) << "evicting State alone preserves the full-history page event";
     SendForwardDone("o", {300});
     SendFinish("o");
     AckImageStores(retraction);
@@ -3785,7 +3880,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnIdenticalResendResumesAtTheSupers
     const Resume resent = Probe("resent", tokens);
     EXPECT_EQ(resent.prefix_tokens, 22);
     EXPECT_EQ(resent.load_rows, 0);
-    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
     EXPECT_EQ(evictions.admission.blocks + evictions.request_reclaim.blocks, 0u);
 }
 
@@ -3920,7 +4015,7 @@ TEST_F(StateCheckpointPrefillHostSuite, TheEndStateOutlivesTheInputItSupersedesU
         SendBootstrapped("f1");
         const ExecutionPlan plan = PlanOnce();
         ASSERT_NE(FindForwardBatch(plan), nullptr);
-        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
         // The input's tail: its KV block and three checkpoints.
         EXPECT_EQ(evictions.request_reclaim.blocks, 4u);
         EXPECT_EQ(evictions.admission.blocks, 0u);
@@ -4071,7 +4166,7 @@ TEST_F(StateCheckpointFusedHostSuite, AFinishThatPublishesNoEndStateStillMarksTh
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     const ExecutionPlan plan = PlanOnce();
     ASSERT_NE(FindForwardBatch(plan), nullptr);
-    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
     EXPECT_EQ(evictions.request_reclaim.blocks, 4u) << "the input: its KV block and three checkpoints";
     EXPECT_EQ(evictions.admission.blocks, 0u);
     AckWriteBacks(plan);
@@ -4105,7 +4200,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AClearFlushesTheSupersededInputLike
         CompleteSession("h", tokens);
         AckWriteBacks(PlanOnce());
         ASSERT_TRUE(scheduler_->ClearL1Cache());
-        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
         EXPECT_EQ(evictions.flush.blocks, 14u) << "eight KV blocks and two tails' three checkpoints";
         EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
     }
@@ -4141,7 +4236,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputStaysWhenTheNextV
     EXPECT_EQ(rows_by_group, (std::map<std::uint32_t, std::int32_t>{{0, 6}, {1, 1}, {2, 1}, {3, 1}}));
     // The admission's evictions: o's five pages and tail block, and its three
     // checkpoints.
-    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
     EXPECT_EQ(evictions.admission.blocks, 9u);
     EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
@@ -4294,8 +4389,8 @@ TEST_F(StateCheckpointPrefillHostSuite, AHitUnmarksTheSupersededInputUntilTheHit
         const HostCacheStats stats = scheduler_->GetHostCacheStats();
         if (resend_finishes) {
             EXPECT_TRUE(stores.empty());
-            const CacheCoordinator::DeviceEvictionStats& now = stats.device_evictions;
-            const CacheCoordinator::DeviceEvictionStats& then = before.device_evictions;
+            const CacheEvictor::DeviceEvictionStats& now = stats.device_evictions;
+            const CacheEvictor::DeviceEvictionStats& then = before.device_evictions;
             EXPECT_EQ(now.admission.blocks, then.admission.blocks);
             // The checkpoint's tail, its KV block and three checkpoints, and
             // nothing before.
@@ -4471,6 +4566,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
         Reset(host_cache, /*decode_width=*/1);
         config_.max_batch_size = 3;  // x, h and g in flight together
+        config_.max_resident_requests = config_.max_batch_size;
         scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         std::vector<std::int32_t> o = MakeTokens(22, 3000);
         CompleteSession("o", o);
@@ -4507,7 +4603,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         ASSERT_EQ(RunPrefill("f1", 22).size(), 3u);
         // o's tail: its KV block and three checkpoints, and under write-back
         // the rest of o's segment, its five pages.
-        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
         EXPECT_EQ(evictions.admission.blocks, write_back ? 9u : 4u);
         EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
         AckWriteBacks(PlanOnce());
@@ -4740,28 +4836,43 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASessionResumedFromHostIsNotCopiedA
     AckWriteBacks(plan);
 }
 
-// KV events keep the Device's view: a written-back boundary is removed when it
-// leaves the Device, and its Host publication reports nothing. (A boundary is
-// published while every group holds it, so of s1's boundaries only the tail
-// with its checkpoints is.)
-TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsKeepDeviceSemantics) {
+// KV events follow each medium: a written-back boundary leaves the Device's
+// stream when it leaves the Device, and joins the Host's once its write-back
+// lands there.
+TEST_P(StateCheckpointPrefillHostShardSuite, KvEventsFollowEachMedium) {
     kv_events_ = true;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     CompleteSession("s1", MakeTokens(22));
     const std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
-    ASSERT_EQ(stored.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(stored[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(stored[0]).token_ids, (std::vector<std::int32_t>{21, 22}));
+    // History pages precede the tail even though only the tail has State.
+    ASSERT_EQ(stored.size(), 6u);
+    std::set<std::uint64_t> stored_hashes;
+    for (const auto& event : stored) {
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.medium, KvEventMedium::kDevice);
+        stored_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
+    }
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     SendBootstrapped("f1");
     const ExecutionPlan plan = PlanOnce();
     ASSERT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(plan).size(), 1u);
     const std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
-    ASSERT_EQ(removed.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
-    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes,
-              std::get<KvBlockStoredEvent>(stored[0]).block_hashes);
+    ASSERT_EQ(removed.size(), stored.size()) << "the Host copies are not there yet";
+    std::set<std::uint64_t> removed_hashes;
+    for (const auto& event : removed) {
+        const auto& block = std::get<KvBlockRemovedEvent>(event);
+        EXPECT_EQ(block.medium, KvEventMedium::kDevice);
+        removed_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
+    }
+    EXPECT_EQ(removed_hashes, stored_hashes);
     AckWriteBacks(plan);
+    std::set<std::uint64_t> host_hashes;
+    for (const auto& event : scheduler_->DrainKvEvents()) {
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.medium, KvEventMedium::kHost);
+        host_hashes.insert(block.block_hashes.begin(), block.block_hashes.end());
+    }
+    EXPECT_EQ(host_hashes, stored_hashes);
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
@@ -5687,15 +5798,15 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .block_granularity = 2},
             {.attn_kind = AttnKind::kSlidingWindow, .sliding_window = 6, .replayable = true, .block_granularity = 2},
         };
-        auto coordinator =
-            MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
+        auto coordinator = MakeCoordinator(specs, 4, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, true,
+                                           /*checkpoint_retention_requests=*/0);
         const std::vector<std::string> hashes{"first", "second"};
         const std::vector<CacheKey> keys{
-            {.group_id = 1, .content_hash = hashes[1]},
-            {.group_id = 2, .content_hash = hashes[1]},
-            {.group_id = 3, .content_hash = hashes[0], .page_offset = 1},
-            {.group_id = 3, .content_hash = hashes[1], .page_offset = 0},
-            {.group_id = 3, .content_hash = hashes[1], .page_offset = 1},
+            {.group_id = 1, .content_hash = ContentHash{hashes[1]}},
+            {.group_id = 2, .content_hash = ContentHash{hashes[1]}},
+            {.group_id = 3, .content_hash = ContentHash{hashes[0]}, .page_offset = 1},
+            {.group_id = 3, .content_hash = ContentHash{hashes[1]}, .page_offset = 0},
+            {.group_id = 3, .content_hash = ContentHash{hashes[1]}, .page_offset = 1},
         };
         std::vector<std::uint64_t> epochs;
         for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -5709,10 +5820,11 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             if (&pool == &device) {
                 coordinator.CacheDeviceBlock(blocks[0], keys[i], 1, CacheBoundaryKind::kEndpoint, 0);
             } else {
-                coordinator.CacheHostBlock(blocks[0], keys[i], std::nullopt);
+                coordinator.Host().CacheHostBlock(blocks[0], keys[i], std::nullopt);
             }
-            epochs.push_back(
-                coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i])->metadata.last_access_epoch);
+            epochs.push_back(coordinator.GroupPrefixIndex(keys[i].group_id)
+                                 .Inspect(pool, keys[i])
+                                 ->metadata.eviction.last_access_epoch);
         }
         auto retained = coordinator.RetainInputCheckpoint(hashes, 8);
         EXPECT_EQ(retained.size(), missing == -1 ? keys.size() : 0u);
@@ -5725,11 +5837,11 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             const auto entry = coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i]);
             ASSERT_TRUE(entry);
             EXPECT_EQ(entry->pinned, missing == -1);
-            EXPECT_FALSE(entry->metadata.was_acquired) << "retention is not a prefix hit";
+            EXPECT_FALSE(entry->metadata.eviction.was_acquired) << "retention is not a prefix hit";
             if (missing == -1) {
-                EXPECT_GT(entry->metadata.last_access_epoch, epochs[i]);
+                EXPECT_GT(entry->metadata.eviction.last_access_epoch, epochs[i]);
             } else {
-                EXPECT_EQ(entry->metadata.last_access_epoch, epochs[i]);
+                EXPECT_EQ(entry->metadata.eviction.last_access_epoch, epochs[i]);
             }
         }
         retained.clear();
@@ -5749,26 +5861,26 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
         {.attn_kind = AttnKind::kState},
         {.attn_kind = AttnKind::kState},
     };
-    auto coordinator =
-        MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, /*disk_pool=*/nullptr, nullptr, false, true,
+                                       /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(2);
     const std::vector<GroupDemand> demands{
         {.table = &tables[0], .extent = StateStep{StateStep::Kind::kRotate}},
         {.table = &tables[1], .extent = StateStep{StateStep::Kind::kRotate}},
     };
-    auto admitted =
-        coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
-                          /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false, "session");
+    auto admitted = coordinator.Admit(coordinator.Prober().ProbePrefix({}), demands, RequestProgress{},
+                                      /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, "session",
+                                      /*cache_group_id=*/{});
     ASSERT_TRUE(admitted);
     const std::vector<std::string> hashes{"checkpoint"};
-    const CacheKey device_key{.group_id = 0, .content_hash = hashes[0]};
-    const CacheKey host_key{.group_id = 1, .content_hash = hashes[0]};
+    const CacheKey device_key{.group_id = 0, .content_hash = ContentHash{hashes[0]}};
+    const CacheKey host_key{.group_id = 1, .content_hash = ContentHash{hashes[0]}};
     {
         auto block = device.AcquireBlock(0);
         coordinator.CacheDeviceBlock(block, device_key, 0, CacheBoundaryKind::kEndpoint, admitted->access_epoch);
         auto metadata = coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata;
         auto host_block = host.AcquireBlock(1);
-        coordinator.CacheHostBlock(host_block, host_key, metadata);
+        coordinator.Host().CacheHostBlock(host_block, host_key, metadata);
     }
     auto retained = coordinator.RetainInputCheckpoint(hashes, 4);
     ASSERT_EQ(retained.size(), 2u);
@@ -5780,8 +5892,8 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
     EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
     retained.clear();
     EXPECT_EQ(coordinator.DemoteSession("session", false), 2u);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata.last_access_epoch, 0u);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(1).Inspect(host, host_key)->metadata.last_access_epoch, 0u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata.eviction.last_access_epoch, 0u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(1).Inspect(host, host_key)->metadata.eviction.last_access_epoch, 0u);
     EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
 }
 

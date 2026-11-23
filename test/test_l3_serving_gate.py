@@ -33,10 +33,14 @@ from __future__ import annotations
 import copy
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from test.l3_serving_test_utils import (
     EvidenceSnapshot,
@@ -75,6 +79,7 @@ from test.l3_serving_test_utils import (
     suffix_question_text,
     thresholds_from_case,
 )
+from test.runtime import test_l3_serving_e2e as serving_gate
 
 import pytest
 
@@ -480,7 +485,7 @@ def test_missing_counters_are_zero_but_missing_gauges_are_unknown():
     assert snapshot.get_success_keys == 0.0
     assert snapshot.l3_query_hit_tokens == 0.0
     assert snapshot.put_jobs is None
-    assert len(missing_gauges(snapshot)) == 6
+    assert len(missing_gauges(snapshot)) == 7
     assert evaluate_writer_evidence(snapshot, _thresholds())
 
 
@@ -504,6 +509,7 @@ def _empty_snapshot():
         backup_candidates=0.0,
         quarantined_blocks=0.0,
         io_quarantined=0.0,
+        io_blocked=0.0,
         nonfinite_series=(),
     )
 
@@ -632,6 +638,7 @@ def test_negative_control_rejects_any_reuse(field, value, cached_tokens):
         "backup_candidates",
         "quarantined_blocks",
         "io_quarantined",
+        "io_blocked",
     ],
 )
 def test_each_missing_gauge_invalidates_every_phase(field):
@@ -854,6 +861,7 @@ def test_nonfinite_metric_samples_cannot_prove_success(series, value):
             'tokenspeed:l3_scheduler_resources{resource="backup_candidates"} 0',
             'tokenspeed:l3_scheduler_resources{resource="quarantined"} 0',
             "tokenspeed:l3_io_quarantined 0",
+            "tokenspeed:l3_io_blocked 0",
             f"{series} {value}",
         ]
     )
@@ -1154,3 +1162,80 @@ def test_gate_rejects_native_library_override_before_runtime_import():
     )
     assert result.returncode == 1
     assert "unset TOKENSPEED_MOONCAKE_STORE_LIBRARY" in result.stdout
+
+
+@contextmanager
+def _metrics_endpoint(responses, steady_response):
+    pending = queue.Queue()
+    for response in responses:
+        pending.put(response)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                status, body = pending.get_nowait()
+            except queue.Empty:
+                status, body = steady_response
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
+    thread.start()
+    try:
+        yield server.server_port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+
+
+def test_settling_retries_transient_http_failures():
+    with _metrics_endpoint([(503, b"busy")], (200, b"tokenspeed:other 0\n")) as port:
+        snapshot = serving_gate._await_settled(
+            port, lambda item: [], 0.03, 5.0, "probe"
+        )
+    assert snapshot.get_success_keys == 0
+
+
+def test_transport_failure_breaks_the_required_stable_window():
+    with _metrics_endpoint(
+        [(200, b"tokenspeed:other 0\n"), (503, b"busy")], (200, b"tokenspeed:other 0\n")
+    ) as port:
+        with pytest.raises(AssertionError, match="did not settle"):
+            serving_gate._await_settled(port, lambda item: [], 1.0, 4.0, "probe")
+
+
+def test_settling_keeps_malformed_exposition_fatal():
+    with _metrics_endpoint([], (200, b"malformed metrics\n")) as port:
+        with pytest.raises(ValueError):
+            serving_gate._await_settled(port, lambda item: [], 0.03, 5.0, "probe")
+
+
+def test_settling_exhausted_transport_budget_reports_failure():
+    with _metrics_endpoint([], (503, b"busy")) as port:
+        with pytest.raises(AssertionError, match="scrape failed"):
+            serving_gate._await_settled(port, lambda item: [], 0.01, 0.1, "probe")
+
+
+def test_active_namespace_blocking_rejects_a_fresh_gate_even_without_history():
+    blocked = replace(_empty_snapshot(), io_blocked=1.0)
+    assert evaluate_writer_evidence(
+        replace(blocked, put_success_keys=16, put_success_bytes=131072), _thresholds()
+    )
+    assert evaluate_reader_restore(
+        _empty_snapshot(),
+        replace(_clean_reader_snapshot(), io_blocked=1),
+        _thresholds(),
+        1024,
+        1024,
+    )
+    assert evaluate_negative_control(_empty_snapshot(), blocked, 0)

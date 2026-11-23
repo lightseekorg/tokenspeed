@@ -83,9 +83,14 @@ def test_decode_reads_a_scaled_fp8_cache(q_len: int):
     common = dict(
         q=q, max_seqlen_k=2048, max_seqlen_q=q_len, **_paged_cache(seq_lens, seed=3)
     )
-    out = mha_decode_with_kvcache(fp8_kv_scales=(K_SCALE, V_SCALE), **common)
+    out = mha_decode_with_kvcache(
+        fp8_kv_scales=(K_SCALE, V_SCALE), **common, block_draft=False
+    )
     unit = mha_decode_with_kvcache(
-        softmax_scale=UNIT_SOFTMAX_SCALE, solution="flashinfer", **common
+        softmax_scale=UNIT_SOFTMAX_SCALE,
+        solution="flashinfer",
+        **common,
+        block_draft=False,
     )
     assert torch.equal(out, unit * V_SCALE)
 
@@ -127,4 +132,5 @@ def test_only_kernels_serving_scaled_caches_take_one():
             fp8_kv_scales=(K_SCALE, V_SCALE),
             solution="fa4",
             **_paged_cache([64], seed=7),
+            block_draft=False,
         )

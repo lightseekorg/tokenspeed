@@ -133,6 +133,7 @@ def _make_flashmla_backend(
         kernel_page_size=_KERNEL_PAGE,
         context_len=8 * pool.arena.prefix_granularity,
         max_bs=8,
+        max_resident_requests=8,
         kv_cache_quant_method="",
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         is_draft=is_draft,
@@ -152,6 +153,9 @@ def _stacks_for(backend, pool, max_bs: int = 4) -> GroupTableStacks:
                 block_granularity=pool.arena.prefix_granularity,
                 kernel_page_size=backend.kernel_page_size,
                 max_num_pages=backend.max_num_pages,
+                atom_pages_per_block=(
+                    pool.arena.prefix_granularity // backend.kernel_page_size
+                ),
             )
         ],
         max_bs=max_bs,

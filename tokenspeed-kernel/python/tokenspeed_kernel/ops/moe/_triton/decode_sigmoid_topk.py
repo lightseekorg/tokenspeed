@@ -24,14 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-
-
-@triton.jit
-def _float32_to_ordered_key(value):
-    bits = value.to(tl.uint32, bitcast=True)
-    sign = tl.full(bits.shape, 0x80000000, tl.uint32)
-    full = tl.full(bits.shape, 0xFFFFFFFF, tl.uint32)
-    return bits ^ tl.where((bits & sign) != 0, full, sign)
+from tokenspeed_kernel.ops.moe._triton.common import _float32_to_ordered_key
 
 
 @triton.jit

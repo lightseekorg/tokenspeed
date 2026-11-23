@@ -81,6 +81,41 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
+    def forward_prefill_metadata(self):
+        return self.full_attn_backend.forward_prefill_metadata
+
+    @property
+    def forward_decode_metadata(self):
+        return self.full_attn_backend.forward_decode_metadata
+
+    def prefill_request_layout(self):
+        return self.full_attn_backend.prefill_request_layout()
+
+    def model_binding(self, layer_id, binding_type):
+        return self._backend_for_layer(layer_id).model_binding(layer_id, binding_type)
+
+    def group_view(self, group_id, bs):
+        return self.full_attn_backend.group_view(group_id, bs)
+
+    def require_query_shard_metadata(self):
+        return self.full_attn_backend.require_query_shard_metadata()
+
+    def gather_history_index_k(self, layer_id, token_to_kv_pool, group):
+        return self._backend_for_layer(layer_id).gather_history_index_k(
+            layer_id, token_to_kv_pool, group
+        )
+
+    def prepare_sparse_kv_access(self, layer, selection, positions, *, forward_mode):
+        return self._backend_for_layer(layer.layer_id).prepare_sparse_kv_access(
+            layer, selection, positions, forward_mode=forward_mode
+        )
+
+    def prefetch_sparse_kv(self, layer, selection, positions):
+        return self._backend_for_layer(layer.layer_id).prefetch_sparse_kv(
+            layer, selection, positions
+        )
+
+    @property
     def supports_mla_projected_value_decode(self) -> bool:
         return self.full_attn_backend.supports_mla_projected_value_decode
 
@@ -150,6 +185,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
+    def takes_owned_decode_topk(self, layer):
+        return self._backend_for_layer(layer.layer_id).takes_owned_decode_topk(layer)
+
+    def dcp_decode_query_rider(self, layer, q):
+        return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)
+
     def reads_fp8_kv_scales(self, layer):
         return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
 
@@ -206,6 +247,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             max_bs, draft_token_num
         )
 
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        return self.full_attn_backend.preallocate_history_gather_workspace(
+            max_model_len
+        )
+
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
         # including both full-attention and mamba layers. Normal attention
@@ -213,6 +259,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # that dispatch, so its full-attention child needs the same counter.
         self.step_counter = step_counter
         self.full_attn_backend.register_step_counter(step_counter)
+        # State backends may publish staged prefill state before this wrapper
+        # records readiness. Children do not record a second step here.
+        self.linear_attn_backend.register_step_counter(step_counter)
 
     def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
         self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)

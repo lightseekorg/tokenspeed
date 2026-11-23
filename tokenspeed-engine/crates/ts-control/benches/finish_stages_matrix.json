@@ -1,0 +1,362 @@
+[
+  {
+    "name": "b128-p131072-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p131072-s1-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p131072-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p131072-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p262144-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p262144-s1-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p262144-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p262144-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p524288-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p524288-s1-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p524288-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b128-p524288-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p131072-s1-e0",
+    "config": {
+      "batch": 512,
+      "prompt": 131072,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p131072-s1-e1",
+    "config": {
+      "batch": 512,
+      "prompt": 131072,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p131072-s2-e0",
+    "config": {
+      "batch": 512,
+      "prompt": 131072,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p131072-s2-e1",
+    "config": {
+      "batch": 512,
+      "prompt": 131072,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p262144-s1-e0",
+    "config": {
+      "batch": 512,
+      "prompt": 262144,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p262144-s1-e1",
+    "config": {
+      "batch": 512,
+      "prompt": 262144,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p262144-s2-e0",
+    "config": {
+      "batch": 512,
+      "prompt": 262144,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p262144-s2-e1",
+    "config": {
+      "batch": 512,
+      "prompt": 262144,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p524288-s1-e0",
+    "config": {
+      "batch": 512,
+      "prompt": 524288,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p524288-s1-e1",
+    "config": {
+      "batch": 512,
+      "prompt": 524288,
+      "steps": 1,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p524288-s2-e0",
+    "config": {
+      "batch": 512,
+      "prompt": 524288,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  },
+  {
+    "name": "b512-p524288-s2-e1",
+    "config": {
+      "batch": 512,
+      "prompt": 524288,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": false,
+      "warmups": 1,
+      "repeats": 3
+    }
+  }
+]

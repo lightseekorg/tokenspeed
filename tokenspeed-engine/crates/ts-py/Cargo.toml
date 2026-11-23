@@ -14,6 +14,9 @@ readme.workspace = true
 name = "_native"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+abi3 = ["pyo3/abi3-py312"]
+
 [dependencies]
 bytes.workspace = true
 pyo3 = "0.30"

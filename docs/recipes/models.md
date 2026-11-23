@@ -219,6 +219,111 @@ ts serve \
     --speculative-num-draft-tokens 4
 ```
 
+## Inkling 2
+
+Inkling 2 serves the original Thinking Machines checkpoint,
+`thinkingmachines/Inkling-2-Small`, on both vendors: NVFP4 experts in layers
+0-39, MXFP8 experts in layers 40-47, everything else BF16. The DSpark draft
+(`mtp.safetensors`) ships in the same directory, so
+`--speculative-algorithm DSPARK` needs no draft path, and its widths (seven
+proposals per round) come from the checkpoint. `ts serve` selects the
+`inkling2` reasoning parser.
+
+The commands set only what Inkling 2 needs:
+
+- `--tp 4 --ep-size 4`: attention and dense layers 4-way tensor parallel,
+  experts 4-way expert parallel, the layout Inkling 2 is validated on.
+- `--mm-encoder-tp-mode data`: the vision encoder runs only at TP1; data mode
+  places a copy on every rank and spreads the images over them.
+- `--max-model-len 1048552`: the draft covers the checkpoint's 1,048,576
+  positions minus its 24-token speculative pad. Without the draft, drop this
+  flag and `--speculative-algorithm` to serve all 1,048,576 tokens.
+- `--sampling-backend triton`: on B300 it decodes about 3% faster than the
+  default sampler at nonzero temperature.
+- `--kv-cache-dtype mxfp8` (NVIDIA): the target's KV cache is stored as
+  MXFP8, FP8 E4M3 values with one power-of-two scale per 32; the DSpark
+  draft's stays BF16. A token takes 0.70 of its BF16 cache bytes, so four
+  B300 GPUs hold 15.8M tokens instead of 10.9M. With 64 concurrent agentic
+  sessions and `--kvstore-size 32`, that is 33% more throughput, as more
+  prefixes stay cached. From one to 32 sessions, per-user decode matches the
+  BF16 cache within about 2%, and the median first token comes 6-12 ms later.
+  Prefills over a cached prefix dequantize the pages they read into a BF16
+  scratch of `--max-model-len` tokens, 1 GiB per GPU. Accuracy matches the
+  BF16 cache in our evaluations.
+
+On NVIDIA, export `TRITON_USE_SLP_VECTORIZER=1`: with `tokenspeed-triton`
+post20261028, the default NVPTX vectorizer makes decode 3-4% slower. On AMD,
+the attention, draft attention, and vision backends stay on Triton.
+
+Add `--grammar-backend xgrammar` for JSON (`response_format`) requests.
+Requests without a schema decode as fast as without a grammar backend.
+
+The first start on a machine autotunes kernel tactics, which takes about 10
+minutes on four B300 GPUs. The results are saved under
+`~/.cache/tokenspeed/flashinfer-autotune`, so later starts with the same layout
+come up in about 80 seconds.
+
+```bash
+# nvidia (4x B300)
+TRITON_USE_SLP_VECTORIZER=1 ts serve thinkingmachines/Inkling-2-Small \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 1048552 --sampling-backend triton \
+    --kv-cache-dtype mxfp8 --speculative-algorithm DSPARK
+
+# amd (4x MI350X)
+ts serve thinkingmachines/Inkling-2-Small \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 1048552 --sampling-backend triton \
+    --attention-backend triton --drafter-attention-backend triton \
+    --mm-attention-backend triton_attn \
+    --speculative-algorithm DSPARK
+```
+
+### Inkling 2 Mini
+
+Inkling 2 Mini, `thinkingmachines/Inkling-2-Mini`, is a looped Inkling 2: 24
+layers of width 2304, NVFP4 experts in layers 0-19, MXFP8 experts in layers
+20-23, everything else BF16. Its core, layers 6-17, runs three times per token.
+The checkpoint declares the architecture
+`Inkling2LoopForConditionalGeneration`. As with Inkling 2 Small, the DSpark
+draft ships in the same directory and `ts serve` selects the `inkling2`
+reasoning parser. The checkpoint sets no draft width, so DSpark proposes three
+tokens per round.
+
+On AMD, the command is Inkling 2 Small's with three changes:
+
+- `--decode-monokernel`: decode steps of 1, 2, 4 or 8 requests run each layer
+  in persistent gfx950 kernels, with the same output as without the flag.
+- `--max-model-len 262120`: the context Inkling 2 Mini is validated at. The
+  checkpoint covers 1,048,576 positions, 24 fewer with the draft.
+- `--cudagraph-capture-sizes 1 2 4 8 16 32 64`: decode graphs for up to 64
+  requests. Graph capture at the default sizes, up to 80, does not finish on
+  Inkling 2 Mini yet.
+
+```bash
+ts serve thinkingmachines/Inkling-2-Mini \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 262120 --sampling-backend triton \
+    --attention-backend triton --drafter-attention-backend triton \
+    --mm-attention-backend triton_attn \
+    --speculative-algorithm DSPARK --decode-monokernel \
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64
+```
+
+Each pass of the core keeps its own KV and convolution caches. Two options
+change the loop:
+
+- `--inkling2-loop-num-passes N`: run the core N times instead of three. With a
+  DSpark draft only the checkpoint's count is accepted, and with
+  `--decode-monokernel` at most 4.
+- `--inkling2-loop-share-cache`: the passes of a core layer share its KV cache,
+  so the cache does not grow with the pass count. Each pass keeps its own
+  convolution state.
+
+Layerwise PD cache transfer and sequence-parallel prefill are not supported
+for looped checkpoints: a PD prefill server must pass
+`--disaggregation-layerwise-interval 0`.
+
 ## MiniMax M3
 
 MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
@@ -664,17 +769,36 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
-  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  and on the aggregated role, mixed rounds included; elsewhere prefill runs
+  eager. `--disable-prefill-graph` turns them off. On the
   aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
-- The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
-  proposes 7 tokens per step, so it takes
-  `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
-  causally within its block (its config sets `dflash_config.causal`).
-  `--drafter-attention-backend tokenspeed_mla` runs causal blocks; the other
+- The NVIDIA command below captures each prefill bucket for 1 and for up to
+  64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
+  several requests also runs its KDA layers inside the graph instead of at
+  eager breaks. On 2 GB300 nodes with the MLA preview draft, this cut the
+  time-to-first-token of 2 to 64 concurrent short prompts by 40% to 55%, for
+  about 0.7 GB less KV cache per GPU and 2 to 3 more minutes of startup.
+- The earlier MLA preview draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
+  proposes up to 7 tokens per step: its checkpoint sets 7 drafts with
+  `--speculative-num-draft-tokens 8` by default, and explicit widths draft
+  fewer (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`).
+  Unlike Kimi-K3's draft, it attends causally within its block (its config
+  sets `dflash_config.causal`). `--drafter-attention-backend tokenspeed_mla`,
+  `mla` and `gluon` run causal blocks, the last two under KVP too; the other
   MLA drafter backends refuse the draft at startup.
+- The released Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark`) is
+  saved by the `speculators` library. TokenSpeed converts its config to the
+  DFlash layout at load time: draft layers from `transformer_layer_config`,
+  target taps one below each `aux_hidden_state_layer_ids` entry, and the mask
+  token, whose trained embedding row replaces the target's. Its five GQA
+  layers slide over a 2048-token window and attend causally within the block,
+  so serve it with `--drafter-attention-backend mha`, which also runs it
+  under KVP. Its `block_size` of 7 is
+  the number of drafted tokens, so the verify window is one larger
+  (`--speculative-num-draft-tokens 8`). Other `speculators` DSpark drafts
+  load the same way.
 - A checkpoint with a Python XTML encoder and no Jinja chat template needs
   its tokenizer's `apply_chat_template` to encode messages. Pass the token
   IDs as `input_ids` to the native `/generate` endpoint.
@@ -683,8 +807,8 @@ Notes:
 
 Install `flash-linear-attention` for the KDA layers, as for
 [Kimi K3](#kimi-k3), then serve with the DSpark draft on 8 Blackwell GPUs.
-This launch was validated on 2 GB300 nodes with 4 GPUs each. On such nodes,
-start each one with the command below plus
+For a deployment on 2 nodes with 4 GPUs each, start each node with the command
+below plus
 `--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
 `<rank>` is the node's rank (`0` on the first node, `1` on the second) and
 `<first-node>:<port>` is the first node's address and a free port on it. Drop
@@ -700,49 +824,82 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --mm-encoder-tp-mode data \
   --moe-backend flashinfer_trtllm \
   --max-num-seqs 64 \
+  --prefill-graph-capture-batch-sizes 1 64 \
   --speculative-algorithm DSPARK \
-  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark \
   --speculative-num-draft-tokens 8 \
-  --drafter-attention-backend tokenspeed_mla \
+  --drafter-attention-backend mha \
   --host 0.0.0.0 \
   --port 8000
 ```
 
 ### AMD
 
-On 8x MI350X/MI355X (gfx950), serve at TP8 with Kimi-K3's EAGLE-3.1 draft
-(`lightseekorg/kimi-k3-eagle3.1-mla`), which accepts slightly more tokens per
-step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
-22% larger than K3's, so at the default `--gpu-memory-utilization`, 15 requests
-of 50K input and 500 output tokens run at once.
+On 8x MI350X/MI355X (gfx950), serve at TP8 with KV parallelism 8 and the
+released Kimi-K3.1 DSpark draft. CI's Kimi-K3.1 AMD accuracy and performance
+jobs serve this same command, and `test/ci_system/test_eval_configs.py` fails
+if the two drift apart.
 
 ```bash
-tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
-  --max-model-len 65536 \
+  --max-model-len 131072 \
   --kv-cache-dtype fp8 \
+  --dsa-index-k-format mxfp4 \
   --tensor-parallel-size 8 \
   --mm-encoder-tp-mode data \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla \
-  --drafter-attention-backend gluon \
-  --max-num-seqs 64 \
+  --kv-parallel-size 8 \
+  --decode-context-parallel-size 8 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark \
+  --speculative-num-steps 5 \
+  --drafter-attention-backend mha \
+  --prefill-graph-max-tokens 3072 \
+  --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072 \
   --disable-kvstore \
+  --enable-startup-requests \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-- The rest comes from the defaults and the draft's config: a 3-step EAGLE3
-  chain (a 4-token verify window), the draft's capture layers
-  (2, 46, 90) and BF16 weights, TP8 without expert parallelism, automatic MoE
-  selection, an 8192-token prefill budget, and CUDA graph capture sizes up to
-  `--max-num-seqs`.
-- `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
-  kernels and fails fast where none is registered; leaving it unset lets the
-  `mla` backend select the kernels.
-- Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
-  NVIDIA only.
+- The rest comes from the defaults: TP8 without expert parallelism, automatic
+  MoE selection, the `dsa` attention backend, an 8192-token prefill budget,
+  `--gpu-memory-utilization 0.95`, prefix caching, and CUDA graph capture sizes
+  up to the speculative `--max-num-seqs` default.
+- `--max-model-len 131072` caps requests at 128K tokens. Raise it for longer
+  prompts; at the checkpoint's full 1M context the speculative verify padding
+  runs past the RoPE tables, and the server warns at startup.
+- `--mm-encoder-tp-mode data`: the vision encoder's 12 heads don't split 8
+  ways, so each GPU keeps a copy of the encoder and encodes whole images.
+- `--kv-parallel-size 8 --decode-context-parallel-size 8`: each GPU stores one
+  eighth of every request's full-attention pages, and decode attends each GPU's
+  share of the selected keys. See
+  [KV parallelism](../serving/parallelism.md#kv-parallelism).
+- `--dsa-index-k-format mxfp4` stores the indexer keys as MXFP4 (68 bytes per
+  token per layer instead of FP8's 132) and scores them against MXFP4 queries.
+- `--speculative-num-steps 5` drafts 5 tokens per step (a 6-token verify
+  window) instead of the draft checkpoint's 7, which suits many concurrent
+  requests better than a single one. A step count equal to the default of 3
+  doesn't override the checkpoint; pass `--speculative-num-draft-tokens 4`
+  with it.
+- `--drafter-attention-backend mha` runs the released draft's sliding-window
+  GQA layers, causally within the block and under KVP (see the draft notes
+  above).
+- Prefill CUDA graphs replay under KV parallelism too, with the DSA attention
+  and the KV history gather at eager breaks. `--prefill-graph-max-tokens 3072`
+  captures only chunks of up to 3072 new tokens; longer chunks run faster eager.
+  `--prefill-graph-capture-token-sizes` captures 6 buckets instead of the
+  default ladder's 44, which reserves about 10 GB per GPU at startup and
+  leaves too few KV cache blocks with KV parallelism at a 1M-token context.
+- `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
+  compute pipe. With ROCm's default of 4, two queues share a pipe, so
+  prefill's high-priority side kernels can wait behind the forward's GEMMs.
+- `--enable-startup-requests` has the engine serve a few requests of its own
+  before it reports ready, so eager prefill and the request bookkeeping are
+  compiled before the first client request instead of during it.
+- `--disable-kvstore` turns off the host-memory KV tier; prefix caching on the
+  GPU stays on.
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2
@@ -1131,6 +1288,40 @@ ts serve \
     --speculative-num-steps 3
 ```
 
+On SM107, also set `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` (FlashInfer
+0.7.4) in the server's environment. It changes which routing kernels FlashInfer
+runs for this model's routes (512 experts, top-10, softmax). By default, from
+32 to 256 tokens per MoE call, FlashInfer splits routing into a
+block-per-token top-k kernel and a permutation kernel; with the variable set,
+it runs one fused single-cluster kernel. With the variable set, from 257 to
+1024 tokens it uses the warp-per-token top-k kernel instead of the
+block-per-token one. Calls below 32
+or above 1024 tokens are unchanged, and the routed experts and weights are
+bit-identical either way. With MTP 3 steps, the target's MoE calls route 4
+tokens per request, so a batch of 8 requests makes 32-token calls.
+
+FlashInfer's default for this route comes from a routing-only sweep that
+covered SM100 and SM103 as well, and FlashInfer labels the variable a
+benchmarking override. The timings below were measured only on SM107, with the
+NVFP4 checkpoint at TP1 (BF16 router logits), so they are not a measurement of
+the FP8 command above; the token ranges, which depend only on the expert count,
+top-k and token count, are the same for it. FlashInfer reads the variable once
+per process for all of its custom (non-grouped) routing, whose default was
+tuned across expert counts and top-k, so set it only for this model.
+
+Routing per MoE layer below runs from the end of the hyper-connection mix to
+the start of FC1:
+
+| decode batch | routing per MoE layer | decode step |
+|---|---|---|
+| 1 | 4.4 -> 4.4 us | -0.6% (noise) |
+| 8 | 13.3 -> 9.2 us | -3.5% (median of 3 runs) |
+| 32 | 15.7 -> 12.0 us | -2.9% |
+| 64 | 18.3 -> 15.3 us | -1.3% |
+| 128 | 21.0 -> 20.7 us | -0.1% |
+
+A 16k-token prefill chunk is unchanged.
+
 ### AMD
 
 On AMD MI350X/MI355X (gfx950), serve the
@@ -1176,8 +1367,12 @@ object:
 ```
 
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
-  FP8 to save memory, quantizing a BF16 table per row at load. When omitted,
-  the table keeps the checkpoint's format: checkpoints that ship it in FP8,
+  FP8 to save memory. A BF16 checkpoint uses one BF16 scale for the whole
+  table, including across ranks. For a split BF16 table, the prescan requires
+  a standard safetensors checkpoint. Each rank scans its own rows for the
+  absolute maximum. The ranks reduce these maxima and use the resulting
+  scale to quantize each shard during normal weight loading. When omitted, the table keeps the checkpoint's
+  format: checkpoints that ship it in FP8,
   such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
   keep it in FP8, and other checkpoints store it in the model's compute dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
@@ -1186,6 +1381,38 @@ object:
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
+
+### Optional PLE hot cache
+
+Pass `--enable-ple-hot-cache` to cache recently read PLE table rows in HBM.
+The cache defaults to off and applies only to offloaded BF16 or scalar-scaled
+FP8 tables with 16 n-gram heads and head dimension 160 or 512 on supported
+NVIDIA GPUs. `TOKENSPEED_PLE_HOST_CACHE_SLOTS` sets the capacity per shard
+when the flag is enabled (default 524288 slots; must be a power of two greater than one).
+At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16 per
+shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively. Miss
+staging is temporary and adds to those amounts.
+
+Enabling the flag requires a Qwen4-Exp target with PLE layers and offloading.
+Unsupported model, cache geometry, dtype, or GPU configurations fail at startup.
+CUDA library loading errors propagate directly. Online-quantized and checkpoint FP8 tables both use the table-wide scale for hot-cache lookups.
+Small lookups (fewer than 256 tokens) and CUDA graph capture/replay also use
+regular host gather.
+
+### FlatKV cache
+
+Qwen4-Exp uses FlatKV by default, putting target and draft KV, GDN, PLE and QSA
+fields on one shared physical plane while preserving their logical groups.
+Qwen3.8-Flash-Next has five groups, with all GDN layers in one group. Each group
+packs pages according to its payload and alignment. Full-history K/V and
+compressed QSA use translated atom-page IDs; state and recent windows retain
+explicit strides. No KV gather is introduced.
+
+This requires PP=1, uniform K/V heads within each compute view and non-MXFP8
+KV. It reduces padding for partially filled groups; a full-attention parent
+that was already full keeps the same useful KV bytes per token. Use
+`--no-qwen4-exp-flat-kv` for the plane-based layout. L3 compatibility follows
+the resulting cache layout.
 
 ## GPT-OSS 20B / 120B
 
@@ -1467,6 +1694,10 @@ path, with no flag. Use these supported Hub revisions:
 | BF16 | `f40a3a29` |
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
+
+Each sandwich all-reduce boundary (the all-reduce, the sandwich norm, and the
+next pre-norm) runs as one MNNVL launch per 2048-row slice where the workspace
+serves it, so prefill chunks above 2048 tokens fuse too.
 
 For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
 per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or

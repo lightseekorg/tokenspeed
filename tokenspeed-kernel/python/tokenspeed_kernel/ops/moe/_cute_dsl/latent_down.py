@@ -37,11 +37,11 @@ the publish overwrites rather than accumulates onto rows still holding
 sentinels. Which producer serves them is chosen in one place, ``_wide_producer``.
 
 A caller may instead arm its slot with ``HALF_POLLED_SENTINEL``, a NaN payload
-no GEMM emits: the gather then polls 16-bit halves, so a library GEMV may write
-its row straight into the mailbox one BF16 element at a time. A library GEMM
-that can only write contiguous rows leaves its block in local memory; either a
-copy kernel stores it, or ``publish_by_consumer`` hands it to the kernel that
-polls the mailbox, which stores it before polling.
+no GEMM emits: the gather then polls 16-bit halves, so a library GEMM may write
+its rows straight into the mailbox one BF16 element at a time. A library GEMM
+writes only compact rows, so such a slot may be rank-major: each rank's block
+holds its ``[max_m, shard]`` rows contiguously, and a consumer reads a row as
+the blocks' rows side by side.
 
 Every rank must construct in lockstep: the mailbox rendezvous is collective.
 """
@@ -54,12 +54,12 @@ from typing import Callable, Protocol
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.triton import multicast_publish
+from tokenspeed_kernel.ops.communication.triton import gather_mailbox_blocks
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     multicast_backend_unavailable_reason,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.multicast_view import bf16_tensor_on_pointer
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 
 # Same rotation depth as the up-projection tail, for the same reason.
 _DOWN_POOL_DEPTH = 2
@@ -183,22 +183,6 @@ def _lamport_geometry(m: int) -> tuple[int, int]:
 
 
 @dataclass
-class MailboxPublish:
-    """A projected block whose multicast store is left to the mailbox's consumer.
-
-    Attributes:
-        block: Contiguous BF16 ``[rows, width]`` GEMM output in local memory.
-        destination: The same-shaped view through the multicast address at
-            this rank's columns; its rows are mailbox rows apart.
-        column: Mailbox column ``block`` starts at.
-    """
-
-    block: torch.Tensor
-    destination: torch.Tensor
-    column: int
-
-
-@dataclass
 class AllReduceMailbox:
     """This rank's view of a mailbox holding one partial per rank side by side.
 
@@ -227,16 +211,18 @@ class _MailboxSlot:
     multicast_ptr: int
     gemm_by_m: dict[int, _Producer]
     gather_by_m: dict[int, _Gather]
-    sentinel: int = _DOWN_SENTINEL
+    sentinel: int
+    rank_major: bool
 
 
 class _MulticastVaGemm:
-    """cuBLAS writing this rank's column block straight through the multicast VA.
+    """A library GEMM writing this rank's block straight through the multicast VA.
 
-    The block is a strided view over the mailbox's multicast address at this
-    rank's column base, so the GEMM's own store is the publish: no staging
-    buffer and no copy kernel behind it. Rows are ``latent_size`` apart, which
-    is a leading dimension cuBLAS takes without staging the output itself.
+    The block is a view over the mailbox's multicast address at this rank's
+    block, so the GEMM's own store is the publish: no staging buffer and no
+    copy kernel behind it. In a rank-major slot the block's rows are compact;
+    otherwise they are ``latent_size`` apart, a leading dimension cuBLAS takes
+    without staging the output itself.
 
     One instance covers every width past the fused kernel's ceiling: the view
     is built once at full capacity and a batch takes its first rows.
@@ -255,14 +241,18 @@ class _MulticastVaGemm:
         max_m: int,
         device: torch.device,
         publish_gemm: Callable[..., torch.Tensor] | None,
+        rank_major: bool,
     ) -> None:
         self._publish_gemm = publish_gemm
-        self._column = rank * shard_dim
+        if rank_major:
+            offset, row_stride = rank * max_m * shard_dim, shard_dim
+        else:
+            offset, row_stride = rank * shard_dim, latent_size
         with torch.inference_mode(False), torch.no_grad():
             self._block = bf16_tensor_on_pointer(
-                multicast_ptr + rank * shard_dim * _BF16_BYTES,
+                multicast_ptr + offset * _BF16_BYTES,
                 (max_m, shard_dim),
-                (latent_size, 1),
+                (row_stride, 1),
                 device.index,
             )
 
@@ -295,24 +285,6 @@ class _MulticastVaGemm:
         bitwise, so an accumulating publish would be byte-identical to this one.
         A witness would have to catch a peer reading mid-accumulation.
         """
-        pending = self.project(hidden_states, weight_block)
-        if pending is not None:
-            multicast_publish(pending.block, pending.destination)
-        return mailbox
-
-    def project(
-        self, hidden_states: torch.Tensor, weight_block: torch.Tensor
-    ) -> MailboxPublish | None:
-        """Run the GEMM; return its block when it still has to be stored into the mailbox.
-
-        Args:
-            hidden_states: Contiguous ``[tokens, hidden_size]`` activation.
-            weight_block: This rank's ``[shard_dim, hidden_size]`` weight rows.
-
-        Returns:
-            None when the GEMM wrote through the multicast address itself,
-            else the local block and where it belongs.
-        """
         tokens = hidden_states.shape[0]
         if not 1 <= tokens <= self._block.shape[0]:
             raise ValueError(
@@ -321,11 +293,13 @@ class _MulticastVaGemm:
         published = self._block[:tokens]
         if self._publish_gemm is None:
             torch.mm(hidden_states, weight_block.t(), out=published)
-            return None
+            return mailbox
         block = self._publish_gemm(hidden_states, weight_block, published)
-        if block.data_ptr() == published.data_ptr():
-            return None
-        return MailboxPublish(block, published, self._column)
+        if block.data_ptr() != published.data_ptr():
+            raise RuntimeError(
+                "the publish GEMM must write the mailbox block it is given"
+            )
+        return mailbox
 
 
 def _wide_producer(
@@ -337,6 +311,7 @@ def _wide_producer(
     max_m: int,
     device: torch.device,
     publish_gemm: Callable[..., torch.Tensor] | None,
+    rank_major: bool,
 ) -> _Producer:
     """Choose the producer for widths past the fused kernel's ceiling.
 
@@ -354,6 +329,7 @@ def _wide_producer(
         max_m=max_m,
         device=device,
         publish_gemm=publish_gemm,
+        rank_major=rank_major,
     )
 
 
@@ -476,6 +452,7 @@ class KimiK3LatentDownOp:
         model_scope: str,
         max_m: int,
         publish_gemm: Callable[..., torch.Tensor] | None,
+        rank_major: bool,
     ) -> "KimiK3LatentDownOp | None":
         """Bind this layer to a pooled mailbox, or return None if unsupported.
 
@@ -497,10 +474,13 @@ class KimiK3LatentDownOp:
                 group. Raised to the fused kernel's ceiling when smaller: those
                 widths are compiled either way and cost eight mailbox rows.
             publish_gemm: ``None`` for K3's fused GEMM, whose failed rendezvous
-                raises on the validated architecture; else an ``(x, weight, out) -> [rows, shard]``
-                GEMM that writes ``out`` or returns a block to publish, writing
-                each element once, on a ``HALF_POLLED_SENTINEL`` mailbox whose
-                failed rendezvous declines.
+                raises on the validated architecture; else an ``(x, weight, out) -> out``
+                GEMM that writes each element of ``out`` once, on a
+                ``HALF_POLLED_SENTINEL`` mailbox whose failed rendezvous declines.
+            rank_major: Whether each rank's block holds its rows contiguously,
+                so a GEMM that writes only compact rows stores into it
+                directly. K3's fused GEMM and its gathers need the rows
+                interleaved.
 
         Returns:
             The op, or None when the platform or shapes cannot support it.
@@ -510,6 +490,8 @@ class KimiK3LatentDownOp:
         if max_m < 1:
             raise ValueError("max_m must be at least one row")
         fused_producer = publish_gemm is None
+        if fused_producer and rank_major:
+            raise ValueError("the fused producer and its gathers interleave the rows")
         if fused_producer:
             max_m = max(max_m, _FUSED_MAX_M)
         rank = dist.get_rank(group)
@@ -547,6 +529,7 @@ class KimiK3LatentDownOp:
             max_m,
             group.group_name,
             fused_producer,
+            rank_major,
         )
         if key not in cls._pools:
             # A failure is remembered too: repeating it per layer would leak.
@@ -557,6 +540,7 @@ class KimiK3LatentDownOp:
                 device,
                 max_m,
                 publish_gemm,
+                rank_major,
             )
         slot = cls._pools[key]
         if slot is None:
@@ -695,6 +679,7 @@ class KimiK3LatentDownOp:
         device: torch.device,
         max_m: int,
         publish_gemm: Callable[..., torch.Tensor] | None,
+        rank_major: bool,
     ) -> _MailboxSlot | None:
         from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.fused_multicast_latent_down_gemm import (  # noqa: E501
             FusedMulticastLatentDownGemmKernel,
@@ -739,22 +724,13 @@ class KimiK3LatentDownOp:
                 max_m=max_m,
                 device=device,
                 publish_gemm=publish_gemm,
+                rank_major=rank_major,
             )
             gemm_by_m.update({m: wide for m in range(fused_rows + 1, max_m + 1)})
-        if publish_gemm is not None:
-            # Compile on scratch now so a first-seen width never compiles under capture.
-            bound = torch.accelerator.device_index(device.index)
-            with bound, torch.inference_mode(False), torch.no_grad():
-                scratch = torch.zeros(
-                    1, latent_size, dtype=torch.bfloat16, device=device
-                )
-                multicast_publish(
-                    torch.zeros(1, shard_dim, dtype=torch.bfloat16, device=device),
-                    scratch[:, :shard_dim],
-                )
         gathers: dict[tuple[int, int], _Gather] = {}
         gather_by_m: dict[int, _Gather] = {}
-        for m in range(1, max_m + 1):
+        # The Lamport gathers read interleaved rows; a rank-major slot's consumers read it themselves.
+        for m in range(1, 0 if rank_major else max_m + 1):
             geometry = _lamport_geometry(m)
             if geometry not in gathers:
                 ctas, threads = geometry
@@ -768,7 +744,13 @@ class KimiK3LatentDownOp:
                 )
             gather_by_m[m] = gathers[geometry]
         return _MailboxSlot(
-            mailbox, handle, multicast_ptr, gemm_by_m, gather_by_m, sentinel
+            mailbox,
+            handle,
+            multicast_ptr,
+            gemm_by_m,
+            gather_by_m,
+            sentinel,
+            rank_major,
         )
 
     def handles(self, num_tokens: int) -> bool:
@@ -791,8 +773,8 @@ class KimiK3LatentDownOp:
                 slices it, because a projection that narrowed its storage has
                 no full width left to slice from.
         Returns:
-            This rank's mailbox rows ``[tokens, latent_size]``, still arriving;
-            a consumer polls them for ``sentinel`` and re-arms what it read.
+            This rank's mailbox rows (see :meth:`rows`), still arriving; a
+            consumer polls them for ``sentinel`` and re-arms what it read.
 
         Every word transitions once a round (in halves only on a half-polled
         slot), and the GEMM gets the full mailbox so its capacity guard holds.
@@ -805,34 +787,20 @@ class KimiK3LatentDownOp:
             slot.mailbox,
             slot.multicast_ptr,
         )
-        return slot.mailbox[0, :tokens]
+        return self.rows(tokens)
 
-    def publish_by_consumer(
-        self, hidden_states: torch.Tensor, weight: torch.Tensor
-    ) -> tuple[torch.Tensor, MailboxPublish | None]:
-        """Like :meth:`publish`, but a block still to be stored is returned, not copied.
-
-        The kernel that polls the mailbox stores the returned block before it
-        polls, which saves the copy launch between the GEMM and that kernel.
-
-        Args:
-            hidden_states: Contiguous ``[tokens, hidden_size]`` activation.
-            weight: This rank's ``[shard_dim, hidden_size]`` block.
+    def rows(self, tokens: int) -> torch.Tensor:
+        """This rank's mailbox rows for a batch of ``tokens``.
 
         Returns:
-            ``(rows, pending)``: this rank's mailbox rows ``[tokens,
-            latent_size]``, and the block the consumer must store, or None when
-            the producer already published it.
+            ``[tokens, latent_size]``, or in a rank-major slot the
+            ``[ranks, tokens, shard]`` view of each block's first rows.
         """
-        tokens = hidden_states.shape[0]
-        slot = self._slot
-        producer = slot.gemm_by_m[tokens]
-        if isinstance(producer, _MulticastVaGemm):
-            pending = producer.project(hidden_states, weight)
-        else:
-            producer(hidden_states, weight, slot.mailbox, slot.multicast_ptr)
-            pending = None
-        return slot.mailbox[0, :tokens], pending
+        mailbox = self._slot.mailbox
+        if not self._slot.rank_major:
+            return mailbox[0, :tokens]
+        ranks = mailbox.shape[-1] // self.shard_dim
+        return mailbox.view(ranks, self.max_m, self.shard_dim)[:, :tokens]
 
     def all_reduce_mailbox(self, tokens: int) -> AllReduceMailbox:
         """The slot of a kernel that publishes and reduces one partial per rank itself.
@@ -845,6 +813,10 @@ class KimiK3LatentDownOp:
             address, and the sentinel.
         """
         slot = self._slot
+        if slot.rank_major:
+            raise ValueError(
+                "a rank-major slot holds no side-by-side partials to reduce"
+            )
         producer = slot.gemm_by_m[tokens]
         if not isinstance(producer, _MulticastVaGemm):
             raise ValueError("a fused producer's slot holds no partial slot to reduce")
@@ -873,6 +845,11 @@ class KimiK3LatentDownOp:
             values, linear E4M3 scales).
         """
         tokens = hidden_states.shape[0]
+        if self._slot.rank_major:
+            if output_scale is not None:
+                raise ValueError("a rank-major slot gathers BF16 rows only")
+            rows = self.publish(hidden_states, weight)
+            return gather_mailbox_blocks(rows, self._slot.sentinel, pdl_enabled())
         if output_scale is not None and self._nvfp4_gather is None:
             raise RuntimeError("prepare_nvfp4 must run before requesting NVFP4 output")
         self.publish(hidden_states, weight)

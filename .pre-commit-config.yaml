@@ -21,8 +21,8 @@ repos:
       - id: debug-statements
       - id: no-commit-to-branch
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    # Pin to the major version the CI lint job installs (ubuntu-latest
-    # clang-format 18); other majors format differently and ping-pong.
+    # CI installs this exact formatter revision too; runner-image defaults
+    # may format the same code differently.
     rev: v18.1.8
     hooks:
       - id: clang-format

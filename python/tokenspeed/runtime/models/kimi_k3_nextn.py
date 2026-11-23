@@ -161,6 +161,9 @@ class KimiK3DraftDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("block_sparse_moe", prefix),
             alt_stream=alt_stream,
+            # The draft binds no fused MoE tail; kernel selection keeps its
+            # default bank layout.
+            expert_layout=None,
         )
         # The old underscored flag writes were dead; making that intent effective needs a spec-decode run.
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

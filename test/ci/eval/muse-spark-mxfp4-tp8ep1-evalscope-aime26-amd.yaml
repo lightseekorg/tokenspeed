@@ -8,6 +8,7 @@ triggers:
 # The model modules this task serves; pull requests changing only other models skip it.
 model_sources:
   - python/tokenspeed/runtime/models/muse_spark.py
+  - python/tokenspeed/runtime/models/muse_spark_monokernel.py
   - python/tokenspeed/runtime/models/muse_spark_audio.py
   - python/tokenspeed/runtime/models/muse_spark_vision.py
 runner:
@@ -17,6 +18,8 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps_rocm.sh
+# Serve the engine's own startup requests before readiness, so the kernels only
+# a live request reaches compile before the first client request.
 server:
   command: >-
     ts serve
@@ -43,6 +46,7 @@ server:
     --host 127.0.0.1
     --port 8000
     --policy round_robin
+    --enable-startup-requests
     --engine-startup-timeout 3000
     --gateway-startup-timeout 600
   ready:

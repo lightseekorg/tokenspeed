@@ -33,6 +33,7 @@ from tokenspeed_kernel.signature import (
     format_signature,
     format_signatures,
 )
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
@@ -345,6 +346,9 @@ def _mla_rope_set_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+_MLA_KV_MAX_BLOCK_N = 6
+
+
 def select_mla_kv_block_n(num_tokens: int, num_q_heads: int) -> int:
     """Tokens per program for the fused MLA write.
 
@@ -354,7 +358,7 @@ def select_mla_kv_block_n(num_tokens: int, num_q_heads: int) -> int:
     per-program footprint costs more than the CTA reduction returns.
     """
     ctas_per_token = num_q_heads + 1
-    return max(1, min(6, -(-num_tokens * ctas_per_token // 1100)))
+    return max(1, min(_MLA_KV_MAX_BLOCK_N, -(-num_tokens * ctas_per_token // 1100)))
 
 
 def apply_rope_mla_set_kv_buffer_triton(
@@ -455,7 +459,7 @@ def apply_rope_mla_set_kv_buffer_triton(
     nope_block = max(_next_power_of_2(nope_dim), 16)
     block_n = select_mla_kv_block_n(num_tokens, num_q_heads)
     grid = (triton.cdiv(num_tokens, block_n), num_q_heads + 1)
-    _mla_rope_set_kv_buffer_kernel[grid](
+    kernel_launcher(_mla_rope_set_kv_buffer_kernel, grid)(
         q_rope,
         k_nope,
         k_rope,
@@ -503,6 +507,13 @@ def apply_rope_mla_set_kv_buffer_triton(
             {"llvm_cl_opts": "vectorize-slp=false"} if current_platform().is_amd else {}
         ),
     )
+
+
+# The token count picks BLOCK_N per batch (select_mla_kv_block_n).
+register_triton_warmup(
+    _mla_rope_set_kv_buffer_kernel,
+    variants=({"BLOCK_N": tuple(range(1, _MLA_KV_MAX_BLOCK_N + 1))},),
+)
 
 
 def apply_rope_triton(

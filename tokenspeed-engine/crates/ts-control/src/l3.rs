@@ -239,6 +239,7 @@ impl L3 {
             tick: Some(tick),
             cancellations: std::mem::take(&mut self.cancellations),
             done,
+            disk_done: Vec::new(),
         })
     }
 
@@ -330,8 +331,9 @@ impl Tier {
         }
     }
 
-    /// Start `plan`'s storage operations; none waits for I/O.
-    pub fn submit(&self, plan: &ExecutionPlan) -> Result<(), ts_l3::ExecutorError> {
+    /// Start `plan`'s storage operations; none waits for I/O. Returns
+    /// whether the plan had any.
+    pub fn submit(&self, plan: &ExecutionPlan) -> Result<bool, ts_l3::ExecutorError> {
         let operations = plan
             .storage_ops()
             .into_iter()
@@ -368,9 +370,10 @@ impl Tier {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if operations.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        self.executor.submit(&operations)
+        self.executor.submit(&operations)?;
+        Ok(true)
     }
 
     /// This round's report of this rank's executor; see [`L3::report`].
@@ -394,6 +397,10 @@ pub fn scheduler_stats(stats: StorageStatsView) -> L3SchedulerStats {
     L3SchedulerStats {
         operations: stats.operations as f64,
         held_blocks: stats.held_blocks as f64,
+        retained_operations: stats.retained_operations as f64,
+        retained_host_blocks: stats.retained_host_blocks as f64,
+        retained_capacity_exhausted: stats.retained_capacity_exhausted,
+        retained_capacity_warnings: stats.retained_capacity_warnings as f64,
         quarantined: stats.quarantined as f64,
         negative_keys: stats.negative_keys as f64,
         backup_candidates: stats.backup_candidates as f64,
@@ -498,6 +505,13 @@ mod tests {
     /// the reports over a real mesh as the round's relay does; each rank's
     /// round outcomes.
     fn replica(polls: Vec<Vec<StoragePoll>>) -> Vec<Vec<Result<StorageRound, String>>> {
+        replica_with_limits(polls, LIMITS)
+    }
+
+    fn replica_with_limits(
+        polls: Vec<Vec<StoragePoll>>,
+        limits: StorageLimits,
+    ) -> Vec<Vec<Result<StorageRound, String>>> {
         let listeners: Vec<_> = polls
             .iter()
             .map(|_| Listener::bind("127.0.0.1").unwrap())
@@ -517,7 +531,7 @@ mod tests {
                     let mut mesh =
                         Mesh::connect(rank, listener, &addresses, Duration::from_secs(5)).unwrap();
                     let group = Group::new(0, (0..size).collect(), rank).unwrap();
-                    let mut l3 = L3::new(LIMITS);
+                    let mut l3 = L3::new(limits);
                     let mut outcomes = Vec::new();
                     for poll in rounds {
                         let reports = mesh.all_gather(&group, &l3.report(poll)).unwrap();
@@ -538,6 +552,168 @@ mod tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn one_unretired_owner_keeps_every_mirrored_scheduler_unretired() {
+        let outcomes = replica(vec![
+            vec![poll(
+                1,
+                vec![completion(1, &[false, true], false, &[false, false])],
+            )],
+            vec![poll(
+                2,
+                vec![completion(1, &[true, true], true, &[false, false])],
+            )],
+            vec![poll(
+                3,
+                vec![completion(1, &[true, true], true, &[false, false])],
+            )],
+        ]);
+        let expected = StorageDoneView {
+            op_id: 1,
+            success: vec![0, 1],
+            retired: false,
+            object_failures: vec![0, 0],
+        };
+        for mirrored in outcomes {
+            // Even the owners whose own sources retired must retain the
+            // same scheduler ticket and virtual Host blocks as their peer.
+            assert_eq!(
+                mirrored[0].as_ref().unwrap().done.as_slice(),
+                std::slice::from_ref(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn an_owner_without_local_payload_cannot_clear_an_unretired_peers_ticket() {
+        use ts_l3::{
+            monotonic_clock, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, MemoryStore,
+            Namespace,
+        };
+
+        let mut pool = [0_u8; 8];
+        let mut executor = Executor::start(
+            Box::new(MemoryStore::new()),
+            HostBuffer {
+                base: pool.as_mut_ptr() as usize,
+                len: pool.len(),
+            },
+            HostLayout {
+                groups: vec![GroupLayout {
+                    packing: 1,
+                    block_bytes: 8,
+                    shard_count: 2,
+                }],
+                lcm_block_bytes: 8,
+                num_lcm_blocks: 1,
+                owner_rank: 1,
+                tp_rank: 1,
+            },
+            Namespace {
+                deployment_id: "neutral-owner".to_owned(),
+                has_draft: false,
+            },
+            "v1",
+            ExecutorConfig {
+                max_operations: 1,
+                max_keys_per_operation: 1,
+                query_workers: 1,
+                read_workers: 1,
+                write_workers: 1,
+                failure_threshold: 1,
+                recovery_interval: Duration::from_secs(30),
+                clear_cache_drain_timeout: Duration::from_millis(500),
+            },
+            monotonic_clock(),
+        );
+        executor
+            .submit(&[Operation::Get {
+                op_id: 1,
+                keys: vec![StorageKey {
+                    group: 0,
+                    content_hash: "absent".to_owned(),
+                    page_offset: 0,
+                }],
+                // Block 1 belongs to owner 0. This owner returns a neutral
+                // success without reading the absent MemoryStore object.
+                host_blocks: vec![1],
+            }])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let neutral = loop {
+            let mut completed = executor.poll().completions;
+            if let Some(completion) = completed.pop() {
+                break completion;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(neutral.success, [true]);
+        assert!(neutral.retired);
+        assert!(!executor.snapshot().unsafe_io);
+        executor.close(Duration::from_secs(2)).unwrap();
+
+        let outcomes = replica(vec![
+            vec![poll(1, vec![completion(1, &[false], false, &[false])])],
+            vec![poll(2, vec![neutral])],
+        ]);
+        for mirrored in outcomes {
+            let done = &mirrored[0].as_ref().unwrap().done;
+            assert_eq!(done.len(), 1);
+            assert_eq!(done[0].success, [0]);
+            assert!(!done[0].retired);
+        }
+    }
+
+    #[test]
+    fn delayed_owner_reports_keep_the_unretired_fact_until_the_last_owner_finishes() {
+        let rounds = vec![
+            vec![
+                poll(1, vec![completion(1, &[false], false, &[false])]),
+                poll(2, vec![]),
+                poll(3, vec![]),
+                poll(4, vec![completion(2, &[true], true, &[false])]),
+                poll(5, vec![]),
+            ],
+            vec![
+                poll(1, vec![]),
+                poll(2, vec![completion(1, &[true], true, &[false])]),
+                poll(3, vec![]),
+                poll(4, vec![completion(2, &[true], true, &[false])]),
+                poll(5, vec![]),
+            ],
+            vec![
+                poll(1, vec![]),
+                poll(2, vec![]),
+                poll(3, vec![completion(1, &[true], true, &[false])]),
+                poll(4, vec![completion(2, &[true], true, &[false])]),
+                poll(5, vec![]),
+            ],
+        ];
+        let outcomes = replica_with_limits(
+            rounds,
+            StorageLimits {
+                max_operations: 1,
+                max_keys_per_operation: 1,
+            },
+        );
+        for mirrored in outcomes {
+            assert!(mirrored[0].as_ref().unwrap().done.is_empty());
+            assert!(mirrored[1].as_ref().unwrap().done.is_empty());
+            let delayed = &mirrored[2].as_ref().unwrap().done;
+            assert_eq!(delayed.len(), 1);
+            assert_eq!(delayed[0].op_id, 1);
+            assert!(!delayed[0].retired);
+            // With one report credit, a subsequent operation can complete
+            // only if the finished aggregation released its held reports.
+            let next = &mirrored[3].as_ref().unwrap().done;
+            assert_eq!(next.len(), 1);
+            assert_eq!(next[0].op_id, 2);
+            assert!(next[0].retired);
+            assert!(mirrored[4].as_ref().unwrap().done.is_empty());
+        }
     }
 
     #[test]

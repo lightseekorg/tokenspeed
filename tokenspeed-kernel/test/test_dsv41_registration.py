@@ -96,6 +96,7 @@ registrations = [
     ("triton_dsv41_history_pack", "dsv41_history_pack", "triton", "_triton.kvp"),
     ("flashmla_dsv41_selected_attention", "dsv41_selected_attention", "flashmla", "flash_mla"),
     ("deep_gemm_dsv41_index_topk", "dsv41_index_topk", "deep_gemm", "deep_gemm"),
+    ("deep_gemm_dsv41_index_topk_prepare", "dsv41_index_topk_prepare", "deep_gemm", "deep_gemm"),
     ("deepselect_dsv41_select_candidates", "dsv41_select_candidates", "deepselect", "deep_select"),
     ("deepselect_dsv41_select_topk", "dsv41_select_topk", "deepselect", "deep_select"),
 ]

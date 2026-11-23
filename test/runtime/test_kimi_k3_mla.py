@@ -108,6 +108,9 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
                 block_granularity=pool.arena.prefix_granularity,
                 kernel_page_size=backend.kernel_page_size,
                 max_num_pages=backend.max_num_pages,
+                atom_pages_per_block=(
+                    pool.arena.prefix_granularity // backend.kernel_page_size
+                ),
             )
         ],
         max_bs=max(bs, 4),
@@ -325,6 +328,7 @@ def backend_factory(cuda_env, gpu_pool, cache_dtype):
             kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
+            max_resident_requests=8,
             kv_cache_quant_method="",
             speculative_num_draft_tokens=q_len,
             components=(spec,),

@@ -24,8 +24,8 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
     index_k_block_split_scatter,
+    quantize_index_k_rows,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -98,11 +98,9 @@ class Dots3NoteTokenToKVPool(DSATokenToKVPool):
         *,
         write_mask: torch.Tensor | None,
     ) -> None:
-        keys, scales = quantize_fp8(
+        keys, scales = quantize_index_k_rows(
             index_k.to(self.model_dtype).view(-1, self.index_head_dim),
-            granularity="token_group",
             group_size=128,
-            scale_encoding="float32",
         )
         index_k_block_split_scatter(
             self.get_index_k_buffer(layer_id),

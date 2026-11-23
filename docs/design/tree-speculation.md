@@ -244,13 +244,20 @@ stream's position keys, while the walk's draft noise and the accept coins
 use their own salted offsets. Greedy rows, rows without a q (slot `-1`) and
 routes without an exact filtered distribution (top-p only, mixed batches)
 keep the plain-decoding draw.
-Backends that can do neither keep `supports_tree_verify = False` and the
+The `sonic` backend draws every node row the way its `sample` draws
+(`sonic.tree_targets`): Philox noise keyed by the request's offset and the
+node's depth, and penalties counting the tokens of the node's path on top of
+the request's decode counts. The same walk accepts the child holding its
+parent's draw, and the emitted tokens then join the decode counts. Like
+`triton` it reads no draft q, so the tokens it emits are exact samples of the
+target for any tree, and a sampled node is accepted at its target probability.
+Backends that can do none of these keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 
 ## Scope
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
-drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
+drafter refuses trees at startup) and EAGLE4; `greedy`, `triton`, `flashinfer` and `sonic` sampling backends; the `trtllm`
 attention backend, the `mha` backend with bf16 KV, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,

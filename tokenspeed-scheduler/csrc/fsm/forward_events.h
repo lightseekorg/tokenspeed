@@ -68,7 +68,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           load_pairs_{std::move(load_pairs)},
           awaits_result_{awaits_result} {}
 
-    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> operator()(Submitted&& state);
+    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling, PeerLanding> operator()(
+        Submitted&& state);
     std::vector<BlockTransfer> TakeLoadPairs() { return std::exchange(load_pairs_, {}); }
 
 private:
@@ -105,7 +106,8 @@ private:
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    explicit ScheduleDecodeEvent(std::int32_t decode_input_tokens) : decode_input_tokens_{decode_input_tokens} {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, DecodeSlotIndex decode_slot)
+        : decode_input_tokens_{decode_input_tokens}, decode_slot_{std::move(decode_slot)} {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(PrefillAwaitingResult&& state);
@@ -116,6 +118,7 @@ private:
     Decoding decode(State&& state);
 
     std::int32_t decode_input_tokens_{};
+    DecodeSlotIndex decode_slot_;
 };
 
 // The request is done. A page-holding request parks in Finishing with its
@@ -156,6 +159,19 @@ private:
     CacheCoordinator* coordinator_{};
 };
 
+// Cancellation cannot recycle a row or execution permit while a queued
+// forward can still write it. Finishing carries the resources until results
+// land, with publication disabled for the cancelled request.
+struct AbortInFlightEvent : InvalidTransitionHandler<AbortInFlightEvent> {
+    using InvalidTransitionHandler<AbortInFlightEvent>::operator();
+
+    template <typename State>
+        requires HoldsForwardResources<std::remove_cvref_t<State>>
+    Finishing operator()(State&& state) {
+        return Finishing{std::move(state.resources), /*publish_completed_pages=*/false};
+    }
+};
+
 struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     using InvalidTransitionHandler<AbortEvent>::operator();
 
@@ -166,12 +182,15 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
     Finished operator()(Prefetching&&);
+    // A lookup's soft pin expires at the holder.
+    Finished operator()(PeerLooking&&) { return Finished{}; }
     // The op in flight keeps the Host blocks until its ACK; only the
     // request's own pins drop here.
     Finished operator()(Prefilling&& state);
     Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);
     Finished operator()(PrefillAwaitingResult&& state);
+    Finished operator()(PrefillAwaitingDestination&& state);
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Restoring&& state);
@@ -267,12 +286,14 @@ private:
 struct RestoreDoneEvent : InvalidTransitionHandler<RestoreDoneEvent> {
     using InvalidTransitionHandler<RestoreDoneEvent>::operator();
 
-    explicit RestoreDoneEvent(ReqPoolIndex req_pool_index) : req_pool_index_{std::move(req_pool_index)} {}
+    RestoreDoneEvent(ReqPoolIndex req_pool_index, DecodeSlotIndex decode_slot)
+        : req_pool_index_{std::move(req_pool_index)}, decode_slot_{std::move(decode_slot)} {}
 
     std::variant<Prefilling, PrefillDone, Decoding> operator()(Restoring&& state);
 
 private:
     ReqPoolIndex req_pool_index_;
+    DecodeSlotIndex decode_slot_;
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {
@@ -294,7 +315,11 @@ private:
 struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     using InvalidTransitionHandler<ExtendResultEvent>::operator();
 
-    explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_{std::move(result_tokens)} {}
+    // `await_destination`: a P prompt whose Decode destination is not
+    // allocated yet parks in PrefillAwaitingDestination once its last token
+    // is real, instead of becoming PrefillDone.
+    ExtendResultEvent(std::vector<std::int32_t> result_tokens, bool await_destination)
+        : result_tokens_{std::move(result_tokens)}, await_destination_{await_destination} {}
 
     template <typename State>
         requires CanExtendTokenContainer<State>
@@ -311,11 +336,16 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     // waiting FOR: the prompt's last token is now real, so the request
     // becomes schedulable (P: its remote decode can carry the bootstrap
     // token).
-    std::variant<PrefillDone, PrefillAwaitingResult> operator()(PrefillAwaitingResult&& state) {
+    std::variant<PrefillDone, PrefillAwaitingResult, PrefillAwaitingDestination> operator()(
+        PrefillAwaitingResult&& state) {
         if (result_tokens_.empty()) {
             return std::move(state);
         }
         state.ExtendResultTokens(result_tokens_);
+        if (await_destination_) {
+            return PrefillAwaitingDestination{std::move(state.resources), state.window,
+                                              state.ReserveNumTokensInNextScheduleEvent()};
+        }
         // Older intermediate chunk results may still be landing on these
         // pages (see above): the bundle, in-flight count included, moves on.
         return PrefillDone{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
@@ -337,6 +367,7 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
 
 private:
     std::vector<std::int32_t> result_tokens_;
+    bool await_destination_;
 };
 
 }  // namespace tokenspeed::fsm

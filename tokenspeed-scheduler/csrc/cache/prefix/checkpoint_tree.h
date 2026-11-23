@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -40,7 +41,7 @@ namespace tokenspeed {
 // State checkpoints ordered by token prefix, including checkpoints inside a
 // page, with each checkpoint's distance to the nearest leaf below it: the
 // newest checkpoint on that branch. Distance counts the later requests that
-// published checkpoints present on either tier: the checkpoints one request
+// published checkpoints present on any tier: the checkpoints one request
 // publishes (in-forward, prompt end, end state) are no step apart. A
 // checkpoint more than leaf_distance from a leaf is aged (CheckpointAging);
 // one within it ranks as a leaf does. The tree holds metadata only, never a
@@ -53,7 +54,7 @@ public:
 
     struct Residency {
         // Every State group holds the checkpoint, per CacheTier.
-        std::array<bool, 2> complete{};
+        std::array<bool, kNumCacheTiers> complete{};
         bool pending_host_store{false};
         // Some State entry or pending store still holds it.
         bool held{false};
@@ -80,7 +81,7 @@ public:
         _assert(
             !tokens.empty() && tokens.size() == full_tokens + static_cast<std::size_t>(tail ? tail->tail_tokens : 0),
             "checkpoint tokens cover exactly its full pages and tail");
-        const ContentHash& hash = tail ? tail->hash : prefix_hashes.back();
+        const ContentHash& hash = tail ? tail->hash : ContentHash{prefix_hashes.back()};
         if (nodes_.contains(hash)) {
             return false;
         }
@@ -139,7 +140,7 @@ public:
         }
     }
 
-    // The distance of a checkpoint present on either tier.
+    // The distance of a checkpoint present on any tier.
     std::optional<std::int32_t> Distance(const ContentHash& hash) const {
         const auto it = nodes_.find(hash);
         if (it == nodes_.end() || !present(it->second)) {
@@ -221,11 +222,21 @@ private:
         // (one step more unless that ancestor's request published it); an
         // absent one passes on its children's smallest value.
         std::uint8_t value{0};
-        std::array<std::int32_t, 2> aged_distance{};
+        std::array<std::int32_t, kNumCacheTiers> aged_distance{};
     };
 
     static bool present(const Node& node) {
-        return node.residency.complete[0] || node.residency.complete[1] || node.residency.pending_host_store;
+        return std::ranges::any_of(node.residency.complete, std::identity{}) || node.residency.pending_host_store;
+    }
+
+    // Whether the checkpoint is complete on a tier other than `tier`.
+    static bool completeElsewhere(const Residency& residency, std::size_t tier) {
+        for (std::size_t other = 0; other < residency.complete.size(); ++other) {
+            if (other != tier && residency.complete[other]) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static std::uint8_t smallestChildValue(const Node& node) {
@@ -302,7 +313,7 @@ private:
             const Node* below = pending.back();
             pending.pop_back();
             const Residency& residency = below->residency;
-            if (residency.pending_host_store || residency.complete[1 - tier] ||
+            if (residency.pending_host_store || completeElsewhere(residency, tier) ||
                 (residency.complete[tier] && !removed(*below->hash))) {
                 nearest.push_back(below);
             } else {
@@ -403,7 +414,7 @@ private:
         std::size_t first = prefix_hashes.size();
         PrefixSegment* parent = nullptr;
         while (first > 0) {
-            if (const auto it = prefixes_.find(prefix_hashes[first - 1]); it != prefixes_.end()) {
+            if (const auto it = prefixes_.find(ContentHash{prefix_hashes[first - 1]}); it != prefixes_.end()) {
                 parent = it->second.get();
                 break;
             }
@@ -414,7 +425,7 @@ private:
         for (std::size_t i = first; i < prefix_hashes.size(); ++i) {
             const auto page_tokens = tokens.subspan(i * page, page);
             auto segment = std::make_unique<PrefixSegment>(PrefixSegment{
-                .hash = prefix_hashes[i],
+                .hash = ContentHash{prefix_hashes[i]},
                 .tokens = {page_tokens.begin(), page_tokens.end()},
                 .parent = parent,
                 .depth = static_cast<std::int32_t>(i + 1),
@@ -473,7 +484,8 @@ private:
                      std::size_t existing_pages) {
         const auto length = static_cast<std::int32_t>(tokens.size());
         for (auto full = static_cast<std::int32_t>(existing_pages); full >= 0; --full) {
-            const ContentHash prior = full == 0 ? ContentHash{} : prefix_hashes[static_cast<std::size_t>(full - 1)];
+            const ContentHash prior =
+                full == 0 ? ContentHash{} : ContentHash{prefix_hashes[static_cast<std::size_t>(full - 1)]};
             const std::int32_t page_start = full * prefix_granularity_;
             Node* best = nullptr;
             if (const auto it = tails_by_prior_.find(prior); it != tails_by_prior_.end()) {
@@ -525,7 +537,7 @@ private:
     std::unordered_map<ContentHash, std::unordered_set<Node*>> tails_by_prior_;
     std::unordered_map<ContentHash, std::unique_ptr<PrefixSegment>> prefixes_;
     // Per tier and distance, the aged checkpoints complete there.
-    std::array<std::array<std::unordered_set<const Node*>, kMaxDistance + 1>, 2> aged_{};
+    std::array<std::array<std::unordered_set<const Node*>, kMaxDistance + 1>, kNumCacheTiers> aged_{};
 };
 
 // How an eviction plan on `tier` ranks aged State checkpoints: one used at or

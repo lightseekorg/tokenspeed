@@ -133,10 +133,8 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
-def _scrape(port: int):
-    with urllib.request.urlopen(
-        metrics_url(port), timeout=_SCRAPE_TIMEOUT_S
-    ) as response:
+def _scrape(port: int, timeout_s: float):
+    with urllib.request.urlopen(metrics_url(port), timeout=timeout_s) as response:
         return snapshot_from_exposition(response.read().decode())
 
 
@@ -147,7 +145,9 @@ def _wait_metrics(port: int, budget_s: float, interval_s: float):
     problem = "no scrape yet"
     while time.monotonic() < deadline:
         try:
-            snapshot = _scrape(port)
+            snapshot = _scrape(
+                port, min(_SCRAPE_TIMEOUT_S, max(0.001, deadline - time.monotonic()))
+            )
         except (urllib.error.URLError, OSError, ValueError) as error:
             problem = f"scrape failed: {error}"
         else:
@@ -171,7 +171,24 @@ def _await_settled(port: int, accept, interval_s: float, budget_s: float, label:
     stable_since = 0.0
     violations = ["no scrape yet"]
     while time.monotonic() < deadline:
-        snapshot = _scrape(port)
+        try:
+            snapshot = _scrape(
+                port, min(_SCRAPE_TIMEOUT_S, max(0.001, deadline - time.monotonic()))
+            )
+        except (urllib.error.URLError, OSError) as error:
+            # A transient transport failure does not establish a stable
+            # interval. Retry within the phase budget; malformed evidence
+            # still raises ValueError immediately.
+            violations = [f"scrape failed: {error}"]
+            stable = None
+            stable_since = 0.0
+            time.sleep(
+                max(
+                    0.0,
+                    min(interval_s, _SETTLE_WINDOW_S / 2, deadline - time.monotonic()),
+                )
+            )
+            continue
         now = time.monotonic()
         violations = accept(snapshot)
         if violations or snapshot != stable:
@@ -179,7 +196,9 @@ def _await_settled(port: int, accept, interval_s: float, budget_s: float, label:
             stable_since = now
         elif now - stable_since >= _SETTLE_WINDOW_S:
             return snapshot
-        time.sleep(min(interval_s, _SETTLE_WINDOW_S / 2))
+        time.sleep(
+            max(0.0, min(interval_s, _SETTLE_WINDOW_S / 2, deadline - time.monotonic()))
+        )
     raise AssertionError(
         f"{label}: the L3 evidence did not settle within {budget_s}s:\n- "
         + "\n- ".join(violations)
