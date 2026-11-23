@@ -42,11 +42,14 @@ from tokenspeed_kernel.ops.attention.prologue import (
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
+    RelativeHeadNorm,
     Rotary,
     gqa_prologue,
     latent_store,
     mla_prologue,
 )
+from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -57,7 +60,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_write_slots
 from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
     V_CACHE_SCALE_SUFFIXES,
@@ -122,7 +125,11 @@ def head_norm(q_norm: HeadRMSNorm, k_norm: HeadRMSNorm) -> HeadNorm:
     ):
         raise ValueError("query and key norms must share epsilon and weight offset")
     return HeadNorm(
-        q_norm.weight, k_norm.weight, q_norm.weight_offset, q_norm.variance_epsilon
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.weight_offset,
+        q_norm.variance_epsilon,
+        round_before_rope=False,
     )
 
 
@@ -144,7 +151,7 @@ class PagedAttention(nn.Module):
         sliding_window_sink: int = 0,
         *,
         rotary_emb: HeadRotary | None,
-        qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
+        qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | HeadNorm | None,
     ):
         """``rotary_emb`` and ``qk_norm`` are the steps the attention prologue
         applies before core attention; ``None`` skips a step."""
@@ -266,16 +273,32 @@ class PagedAttention(nn.Module):
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         ctx: ForwardContext,
+        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Core attention over prepared inputs, the eager break: the prologue's
         query and, for a forward that is not a decode, its returned key and
         value rows. A model that runs :meth:`prologue` inside its own stream
-        scope calls this afterwards."""
+        scope calls this afterwards.
+
+        ``rmsnorm_output_gate=(gate, eps)`` returns
+        ``weightless_rmsnorm_gated_sigmoid`` of the output instead: per-head
+        RMSNorm, times the sigmoid of ``gate`` (``[tokens, heads *
+        head_dim]``). A decode whose backend ``gates_decode_output`` applies
+        it where the kernel stores the output, with the same bits; every other
+        forward runs the separate op after.
+        """
         if k is not None:
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-        return ctx.attn_backend.forward(
+        in_kernel = (
+            rmsnorm_output_gate is not None
+            and ctx.forward_mode.is_decode()
+            and ctx.attn_backend.gates_decode_output(self)
+        )
+        if in_kernel:
+            kwargs["rmsnorm_output_gate"] = rmsnorm_output_gate
+        output = ctx.attn_backend.forward(
             q,
             k,
             v,
@@ -286,6 +309,17 @@ class PagedAttention(nn.Module):
             save_kv_cache=False,
             ctx=ctx,
             **kwargs,
+        )
+        if rmsnorm_output_gate is None or in_kernel:
+            return output
+        gate, eps = rmsnorm_output_gate
+        return weightless_rmsnorm_gated_sigmoid(
+            output.contiguous(),
+            gate,
+            self.tp_q_head_num,
+            self.v_head_dim,
+            eps,
+            pdl_enabled(),
         )
 
     def decode_kv_view(self, ctx: ForwardContext) -> "DecodeKVView | None":
@@ -328,6 +362,60 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def write_kv_at(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> None:
+        """The prologue's head steps, writing K/V to ``slots`` (0 for a padded row)."""
+        norm, rotary = self._steps(positions)
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=rotary,
+            cache=self._local_target(slots, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
+            return_kv=False,
+            solution=None,
+            override=None,
+        )
+
+    def relative_prologue(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+        norm: RelativeHeadNorm,
+    ) -> GQAPrologueOutput:
+        """Run relative attention's head steps as this layer's prologue.
+
+        The query and key heads are clipped, the value heads normalized and
+        the relative heads projected to the logits ``attend`` takes as
+        ``rel_logits``, with the K/V write, in one prologue call. The layer
+        states no other head step.
+        """
+        if self.qk_norm is not None or self.rotary_emb is not None:
+            raise ValueError("relative head steps replace the layer's norm and RoPE")
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
     def store_prepared(
         self,
         q: torch.Tensor,
@@ -357,8 +445,11 @@ class PagedAttention(nn.Module):
     def _steps(
         self, positions: torch.Tensor | None
     ) -> tuple[HeadNorm | None, Rotary | None]:
+        norm = self.qk_norm
+        if norm is not None and not isinstance(norm, HeadNorm):
+            norm = head_norm(*norm)
         return (
-            None if self.qk_norm is None else head_norm(*self.qk_norm),
+            norm,
             None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions),
         )
 
@@ -374,8 +465,9 @@ class PagedAttention(nn.Module):
         self, slots: torch.Tensor, ctx: ForwardContext
     ) -> HeadKVCache | LatentKVCache:
         """The pool's target for ``slots``, local to this rank's shard under KVP."""
-        slots, owned = resolve_cache_slots(
-            slots, ctx.attn_backend.cache_placement(self)
+        placement = ctx.attn_backend.cache_placement(self)
+        slots, owned = resolve_write_slots(
+            slots, placement, ctx.attn_backend.sparse_topk
         )
         target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
         if (
@@ -595,6 +687,7 @@ class _CacheGroupSpecLike(Protocol):
     group_id: str
     attn_kind: str
     sliding_window_tokens: int | None
+    sink_tokens: int
 
 
 class _CacheArenaLike(Protocol):
@@ -652,8 +745,13 @@ def _check_visibility_within_retention(
             f"sees the full history but its cache group {spec.group_id!r} "
             f"retains only a {retained}-token window."
         )
+    if layer.sliding_window_sink > spec.sink_tokens:
+        raise ValueError(
+            f"{model_name}: attention layer {name!r} needs {layer.sliding_window_sink} "
+            f"sink tokens but cache group {spec.group_id!r} retains {spec.sink_tokens}."
+        )
     # The scheduler keeps the last `retained - 1` computed tokens ahead of
-    # the next position (GroupGeometry::ExpiredBlocksAt), exactly the HF
+    # the next position (GroupGeometry::ExpiredBlockEndAt), exactly the HF
     # window minus the current token.
     if retained is None or window_left + 1 > retained:
         raise ValueError(
@@ -666,19 +764,11 @@ def _check_visibility_within_retention(
 def check_block_drafter_storage(
     draft_model: nn.Module, target_cache_pool: _CacheViewLike
 ) -> None:
-    """A block drafter writes at the target's cache locations, so every one of
-    its layers must ride a full-history group the target's own layers share.
+    """Validate a block drafter's bound history groups and visibility.
 
-    Bind the draft first (:func:`bind_cache_groups`). Without a target
-    full-history group there is nothing to borrow: the draft's KV would sit
-    in a group of its own while the target router hands it another group's
-    slots.
-
-    A draft with its own group would read history through its own router while
-    its KV lands at the target's locations, so the two stop naming the same
-    rows. Nothing raises; the speculation is simply wasted.
+    Context and proposal writes both use the draft router, so its history
+    may belong to a dedicated sliding group or a target-shared full group.
     """
-    target_groups = set(target_cache_pool.history_group_by_layer().values())
     specs = {
         str(spec.group_id): spec for spec in target_cache_pool.arena.cache_group_specs
     }
@@ -686,11 +776,10 @@ def check_block_drafter_storage(
     for name, module in draft_model.named_modules():
         if not isinstance(module, PagedAttention):
             continue
-        group_id = module.group_id
-        if group_id not in target_groups or specs[group_id].attn_kind != "full_history":
+        spec = specs.get(module.group_id)
+        if spec is None or spec.attn_kind not in ("full_history", "sliding_window"):
             raise ValueError(
-                f"{model_name}: block drafter layer {name!r} (layer_id="
-                f"{module.layer_id}) rides cache group {group_id!r}, but a block "
-                "drafter must share a full-history group with the target's "
-                f"layers (target groups: {sorted(target_groups)})."
+                f"{model_name}: block drafter layer {name!r} requires a history "
+                f"cache group, got {module.group_id!r}."
             )
+        _check_visibility_within_retention(model_name, name, module, spec)

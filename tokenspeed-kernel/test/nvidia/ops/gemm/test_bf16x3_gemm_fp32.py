@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
@@ -40,8 +41,8 @@ from utils import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or current_platform().vendor != "nvidia"
-    or not (9, 0) <= torch.cuda.get_device_capability() <= (10, 3),
-    reason="the BF16x3 GEMM is registered for SM90 to SM103",
+    or torch.cuda.get_device_capability() < (9, 0),
+    reason="the BF16x3 GEMM requires SM90 or newer",
 )
 
 U = 2.0**-24
@@ -67,7 +68,7 @@ def test_split_kernel_matches_fp64(m, n, k):
     x, w = _problem(m, n, k, seed=m)
     pieces = mv_weight_split(w)
     assert pieces is not None and pieces.shape == (3, n, k)
-    assert _select(m, n, k, True, x.dtype, w.dtype, True) is (
+    assert _select(m, n, k, True, x.dtype, w.dtype, True, True, True) is (
         triton_bf16x3.triton_bf16x3_gemm_fp32
     )
     y = mv(x, w, weight_split=pieces)
@@ -111,6 +112,26 @@ def test_split_kernel_is_deterministic_and_replays_in_a_graph(m):
     out.zero_()
     graph.replay()
     assert torch.equal(out, eager)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_blackwell,
+    reason="the warp-specialized loop is Blackwell's",
+)
+@pytest.mark.parametrize("m", [2048, 4099, 8192])
+@pytest.mark.parametrize("n,k", [(256, 5120), (1024, 2048), (768, 8192)])
+def test_warp_specialized_tiles_sum_like_the_drained_tiles(m, n, k):
+    """From 2048 rows on Blackwell, bit for bit the drained tiles output."""
+    x, w = _problem(m, n, k, seed=4)
+    pieces = mv_weight_split(w)
+    cfg = triton_bf16x3._bf16x3_config(m, n, k, warp_specialize=True)
+    assert cfg.warp_specialize
+    got, want = (torch.empty(m, n, device="cuda") for _ in range(2))
+    triton_bf16x3._bf16x3_launch(x, pieces, got, cfg)
+    triton_bf16x3._bf16x3_launch(
+        x, pieces, want, triton_bf16x3._bf16x3_config(m, n, k, False)
+    )
+    assert torch.equal(got, want)
 
 
 def test_non_finite_values_reach_the_output():
@@ -159,7 +180,11 @@ def test_row_counts_within_a_tile_bucket_do_not_recompile():
         assert _error_over_magnitude(y, x, w) <= 4
 
     def key(m):
-        return (triton_bf16x3._bf16x3_config(m, n, k), int_specialization_class(m))
+        blackwell = current_platform().is_blackwell
+        return (
+            triton_bf16x3._bf16x3_config(m, n, k, blackwell),
+            int_specialization_class(m),
+        )
 
     sweep = (18, 23, 27, 31)
     warm_specialization_classes(run, key, sweep, pool=(17, 32))
@@ -168,3 +193,7 @@ def test_row_counts_within_a_tile_bucket_do_not_recompile():
     ):
         for m in sweep:
             run(m)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

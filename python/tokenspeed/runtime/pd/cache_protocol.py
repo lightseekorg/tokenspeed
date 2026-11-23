@@ -85,6 +85,15 @@ class CacheTransferContract:
                 f"missing={sorted(plan_group_ids - spec_group_ids)}, "
                 f"extra={sorted(spec_group_ids - plan_group_ids)}"
             )
+        # Tail copy-in needs the window to cover the sink's partial prefix page.
+        for spec in self.group_specs:
+            if (
+                spec.sink_tokens
+                and spec.sliding_window_tokens < self.plan.prefix_granularity
+            ):
+                raise CacheContractError(
+                    "sink retention requires sliding_window_tokens >= prefix_granularity"
+                )
         self.transfer_schema.validate(self.plan)
         if self.field_addresses is not None:
             if not isinstance(self.field_addresses, dict):

@@ -179,7 +179,7 @@ def test_verify_tree_skips_greedy_and_uncut_rows_without_changing_decisions(
             sp.normalize(None)
             sampling_params.append(sp)
         backend.prepare_step(
-            request_ids=[f"skip_{seed}_{i}" for i in range(bs)],
+            admission_ids=[seed * bs + i + 1 for i in range(bs)],
             request_pool_indices=pool,
             sampling_params_list=sampling_params,
             num_tokens_per_req=n,

@@ -57,6 +57,10 @@ fn main() {
     let built = cmake::Config::new(&manifest)
         .define("TOKENSPEED_SCHEDULER_DIR", &scheduler_dir)
         .define("Python_EXECUTABLE", &python)
+        .define(
+            "TOKENSPEED_PYTHON_ABI3",
+            if cfg!(feature = "abi3") { "ON" } else { "OFF" },
+        )
         .build_target("ts_scheduler_embed")
         .build()
         .join("build");

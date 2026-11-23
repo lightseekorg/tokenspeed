@@ -20,8 +20,8 @@
 
 """Cumulative target probability through real multi-token chain verification.
 
-Controlled acceptance coins cover every kept width. The kernels, probability
-filters, logprob arithmetic and CUDA Graph replay are the production ones.
+Controlled batch-stream coins cover every kept width. Per-request verify
+uses the production position-keyed draws, including during graph replay.
 """
 
 import sys
@@ -84,7 +84,7 @@ def backend_pair(request):
     return create
 
 
-def _prepare_coins(backend, kept_lengths):
+def _prepare_verify(backend, forced_lengths):
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
     params = [
@@ -92,16 +92,19 @@ def _prepare_coins(backend, kept_lengths):
         for row in range(LIVE_ROWS)
     ]
     backend.prepare_step(
-        [f"cumulative-chain-{row}" for row in range(LIVE_ROWS)],
+        [row + 1 for row in range(LIVE_ROWS)],
         list(range(1, LIVE_ROWS + 1)),
         params,
         num_tokens_per_req=WIDTH,
     )
+    if forced_lengths is None:
+        return
+
     # Every proposed token has target probability 0.25. For a one-hot
     # proposal q, both verifier rules accept coin=0.1 and reject coin=0.9.
     # These are ordinary tensor inputs, updated outside capture as in serving.
     columns = torch.arange(WIDTH, device="cuda")
-    coins = torch.where(columns < kept_lengths[:, None] - 1, 0.1, 0.9)
+    coins = torch.where(columns < forced_lengths[:, None] - 1, 0.1, 0.9)
     backend._coins_buf.fill_(0.9)
     backend._coins_buf[:LIVE_ROWS].copy_(coins)
     # The replacement is the last supported token in vocabulary order, whose
@@ -207,15 +210,18 @@ def test_cumulative_mass_scores_accepted_and_replacement_tokens_against_target(
             else None
         )
         slots = torch.tensor([1, 2, 3, 4, 0, 0], device="cuda")
+        frontier = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
         info = SamplingBatchInfo(
             req_pool_indices=slots,
-            valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=frontier,
             draft_probs=recorded,
         )
-        kept_lengths = torch.arange(1, WIDTH + 1, device="cuda")
+        forced_lengths = (
+            torch.arange(1, WIDTH + 1, device="cuda") if stream == "batch" else None
+        )
         _set_target_and_proposals(logits, candidates, recorded, step=0)
-        _prepare_coins(baseline, kept_lengths)
-        _prepare_coins(diagnostic, kept_lengths)
+        _prepare_verify(baseline, forced_lengths)
+        _prepare_verify(diagnostic, forced_lengths)
         if use_graph:
             stream_obj = torch.cuda.Stream()
             stream_obj.wait_stream(torch.cuda.current_stream())
@@ -228,14 +234,16 @@ def test_cumulative_mass_scores_accepted_and_replacement_tokens_against_target(
                 captured = _draw(diagnostic, logits, info, candidates)
 
         for step in range(3):
-            kept_lengths = torch.arange(1, WIDTH + 1, device="cuda").roll(step)
+            if forced_lengths is not None:
+                forced_lengths = forced_lengths.roll(1)
+            frontier[1 : LIVE_ROWS + 1].fill_(2048 + step)
             bonus_ids = _set_target_and_proposals(
                 logits, candidates, recorded, step=step + 1
             )
             original_logits = logits.clone()
             original_recorded = None if recorded is None else recorded.clone()
-            _prepare_coins(baseline, kept_lengths)
-            _prepare_coins(diagnostic, kept_lengths)
+            _prepare_verify(baseline, forced_lengths)
+            _prepare_verify(diagnostic, forced_lengths)
             expected = _draw(baseline, logits, info, candidates)
             if use_graph:
                 graph.replay()
@@ -243,10 +251,10 @@ def test_cumulative_mass_scores_accepted_and_replacement_tokens_against_target(
             else:
                 actual = _draw(diagnostic, logits, info, candidates)
 
-            torch.testing.assert_close(
-                actual[1][:LIVE_ROWS].long(), kept_lengths, rtol=0, atol=0
-            )
             assert torch.equal(actual[1][:LIVE_ROWS], expected[1][:LIVE_ROWS])
+            kept_lengths = actual[1][:LIVE_ROWS].long()
+            if forced_lengths is not None:
+                assert torch.equal(kept_lengths, forced_lengths)
             positions = torch.arange(WIDTH, device="cuda")
             valid = positions < kept_lengths[:, None]
             # Suffix values and padding requests have no emitted token and are
@@ -268,11 +276,12 @@ def test_cumulative_mass_scores_accepted_and_replacement_tokens_against_target(
                 candidates[:LIVE_ROWS, 1:][accepted[:, :-1]],
             )
             last = kept_lengths - 1
-            emitted_bonus = tokens.gather(1, last[:, None]).squeeze(-1)
-            assert torch.equal(
-                emitted_bonus,
-                bonus_ids[:LIVE_ROWS].gather(1, last[:, None]).squeeze(-1).int(),
-            )
+            if forced_lengths is not None:
+                emitted_bonus = tokens.gather(1, last[:, None]).squeeze(-1)
+                assert torch.equal(
+                    emitted_bonus,
+                    bonus_ids[:LIVE_ROWS].gather(1, last[:, None]).squeeze(-1).int(),
+                )
             path = actual[4][:LIVE_ROWS]
             flat_rows = torch.arange(LIVE_ROWS * WIDTH, device="cuda").view(
                 LIVE_ROWS, WIDTH
@@ -297,19 +306,20 @@ def test_cumulative_mass_scores_accepted_and_replacement_tokens_against_target(
             torch.testing.assert_close(
                 actual_lps[valid].double(), target_lp, rtol=3e-6, atol=3e-7
             )
-            # Rejected-row replacements have target C=.95, versus residual
-            # C=(.45+.25)/.75 after the one-hot proposal is removed.
-            rejected_rows = kept_lengths < WIDTH
-            replacement_c = cumulative.gather(1, last[:, None]).squeeze(-1)
-            torch.testing.assert_close(
-                replacement_c[rejected_rows],
-                torch.full_like(replacement_c[rejected_rows], 0.95),
-                rtol=3e-6,
-                atol=3e-7,
-            )
-            assert (
-                torch.abs(replacement_c[rejected_rows] - (0.70 / 0.75)) > 0.01
-            ).all()
+            if forced_lengths is not None:
+                # Rejected-row replacements have target C=.95, versus residual
+                # C=(.45+.25)/.75 after the one-hot proposal is removed.
+                rejected_rows = kept_lengths < WIDTH
+                replacement_c = cumulative.gather(1, last[:, None]).squeeze(-1)
+                torch.testing.assert_close(
+                    replacement_c[rejected_rows],
+                    torch.full_like(replacement_c[rejected_rows], 0.95),
+                    rtol=3e-6,
+                    atol=3e-7,
+                )
+                assert (
+                    torch.abs(replacement_c[rejected_rows] - (0.70 / 0.75)) > 0.01
+                ).all()
             assert torch.equal(logits, original_logits)
             if recorded is not None:
                 assert torch.equal(recorded, original_recorded)

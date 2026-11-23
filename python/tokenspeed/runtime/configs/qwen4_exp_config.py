@@ -97,6 +97,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
             if ple_offload_embedding is None
             else bool(ple_offload_embedding)
         )
+        self.enable_ple_hot_cache = False
         self.ngram_size = int(ngram_size)
         self.heads_per_ngram = int(heads_per_ngram)
         self.ngram_vocab_size_base = int(ngram_vocab_size_base)

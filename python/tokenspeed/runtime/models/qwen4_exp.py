@@ -22,11 +22,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -49,12 +52,14 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_checkpoint_dir,
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
@@ -76,6 +81,7 @@ from tokenspeed.runtime.models.qwen4_exp_monokernel import (
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +92,12 @@ def _qwen4_exp_uses_sigmoid_output_gate(config: Qwen4ExpTextConfig) -> bool:
     return getattr(config, "output_gate_type", None) == "sigmoid"
 
 
-def _warmup_qwen4_moe(model: nn.Module) -> None:
+def _warmup_qwen4_kernels(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, Qwen3_5MoeSparseMoeBlock):
             module.warmup()
+        elif isinstance(module, PLELookup):
+            module.warmup_host_cache()
 
 
 def _qwen4_exp_uses_sparse_moe(config: Qwen4ExpTextConfig) -> bool:
@@ -109,6 +117,7 @@ class _Qwen4ExpRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.eps = float(eps)
+        self.sigmoid_gate = True
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
@@ -267,13 +276,21 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
         self.layer_id = layer_id
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
         )
         self.is_moe = _qwen4_exp_uses_sparse_moe(config)
         self.mlp = build_qwen3_5_mlp(
@@ -334,9 +351,12 @@ class Qwen4ExpAttentionDecoderLayer(
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
         self._init_attention(config, mapping, layer_id, quant_config, prefix)
         self.is_moe = _qwen4_exp_uses_sparse_moe(config)
@@ -359,6 +379,8 @@ class Qwen4ExpAttentionDecoderLayer(
             dense_batch_invariant=False,
             query_sharded=False,
         )
+        # FP8 projections keep their packed serial path.
+        self.qsa_fork = StreamFork(None if enable_fp8_attn_proj else alt_stream)
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:
             from tokenspeed.runtime.layers.attention.qsa import QSAIndexer
@@ -372,23 +394,73 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         self._init_qwen4_exp_extensions(config, mapping, layer_id, quant_config, prefix)
 
+    def _can_overlap_qsa(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> bool:
+        # Performance policy: four BF16 verify rows per request, up to BS128
+        # on TP1. Other TP sizes retain the single-request policy.
+        max_bs = 128 if self.attn_tp_size == 1 else 1
+        return (
+            self.indexer is not None
+            and self.qsa_fork.aux_stream is not None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and 1 <= ctx.bs <= max_bs
+            and hidden_states.shape[0] == ctx.bs * 4
+            and self.indexer.can_overlap(ctx, num_rows=hidden_states.shape[0])
+        )
+
     def self_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        q, k, v, gate = self._project_qkv(hidden_states)
-        selected_slots = (
-            self.indexer(hidden_states, positions, ctx)
-            if self.indexer is not None
-            else None
-        )
+        overlap = self._can_overlap_qsa(hidden_states, ctx)
+        capturing = overlap and torch.cuda.is_current_stream_capturing()
+        if overlap:
+            # Project on main: GEMM providers can share stream-local workspace.
+            raw_q, token_k = self.indexer._project_qk_raw(hidden_states)
+            main_stream = torch.cuda.current_stream()
+        with self.qsa_fork.scope(enable=overlap, overlap=True):
+            if overlap:
+                with self.qsa_fork.branch():
+                    if not capturing:
+                        for tensor in (raw_q, token_k, positions):
+                            tensor.record_stream(self.qsa_fork.aux_stream)
+                    selected_slots = self.indexer.forward_projected(
+                        raw_q, token_k, positions, ctx
+                    )
+            q, k, v, gate = self._project_qkv(hidden_states)
+            if overlap:
+                # Prologue remains the sole owner of head transforms and KV
+                # writes. Core attention below consumes its prepared query.
+                q = self.attn.prologue(q, k, v, positions, ctx).q
+                k = v = None
+            else:
+                selected_slots = (
+                    self.indexer(hidden_states, positions, ctx)
+                    if self.indexer is not None
+                    else None
+                )
+        if overlap and not capturing:
+            selected_slots.record_stream(main_stream)
+            ctx.attn_backend.sparse_topk.qsa_selection.selected_blocks.record_stream(
+                main_stream
+            )
+        fuse_output_quant = self._should_fuse_output_quant(gate)
         attention_output = self._attn(
-            positions, q, k, v, gate, ctx, topk_indices=selected_slots
+            positions,
+            q,
+            k,
+            v,
+            None if fuse_output_quant else gate,
+            ctx,
+            topk_indices=selected_slots,
         )
-        output, _ = self.o_proj(attention_output)
-        return output
+        return self._project_output(
+            attention_output, gate if fuse_output_quant else None
+        )
 
     def forward(
         self,
@@ -452,8 +524,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        enable_fp8_attn_proj: bool | None = None,
     ) -> None:
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config,
+            prefix,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
+        )
         self.norm = None
         hc_config = HyperConnectionConfig(
             hc_count=int(config.hc_count),
@@ -566,22 +646,54 @@ def _normalize_checkpoint_name(name: str) -> str:
     return name
 
 
-def _copy_ple_shard(
-    module: nn.Module,
-    name: str,
-    loaded_weight: torch.Tensor,
-    split_parts: int,
-) -> str | None:
-    match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight$", name)
-    if match is None:
-        return None
-    module_name = name[: name.index(".ngram_embedding.shard_")]
-    ple_modules = dict(module.named_modules())
-    ple_embedding = ple_modules.get(module_name)
-    if not isinstance(ple_embedding, Qwen4ExpNGramEmbedding):
-        return None
-    ple_embedding.lookup.load_shard(loaded_weight, int(match.group(1)), split_parts)
-    return f"{module_name}.lookup.ngram_embedding.weight"
+_PLE_SHARD_NAME = re.compile(r"^(.+)\.ngram_embedding(?:\.shard_(\d+))?\.weight$")
+
+
+def _prescan_ple_scale(
+    lookup: PLELookup,
+    root: Path,
+    resolve_shard: Callable[[str], tuple[int, int] | None],
+) -> None:
+    """Scan a safetensors checkpoint directory for PLE table shards.
+
+    ``resolve_shard`` maps a checkpoint tensor name to its ``(shard index,
+    split parts)`` tuple, or ``None`` for tensors outside the table. The
+    per-rank absolute maximum across the matching shards feeds
+    :meth:`PLELookup.set_online_scale`. Raises ``ValueError`` when ``root``
+    has no standard safetensors layout or no matching PLE table.
+    """
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        weight_map = json.loads(index.read_text())["weight_map"]
+        files = {
+            filename
+            for name, filename in weight_map.items()
+            if resolve_shard(name) is not None
+        }
+    elif (root / "model.safetensors").is_file():
+        files = {"model.safetensors"}
+    else:
+        raise ValueError(
+            f"Split online PLE quantization needs a standard safetensors "
+            f"checkpoint in {root}"
+        )
+
+    local_amax = 0.0
+    found = False
+    for filename in sorted(files):
+        with safe_open(root / filename, framework="pt", device="cpu") as checkpoint:
+            for name in sorted(checkpoint.keys()):
+                shard = resolve_shard(name)
+                if shard is None:
+                    continue
+                found = True
+                weight = checkpoint.get_slice(name)
+                src, _ = lookup.shard_slices(weight.get_shape()[0], *shard)
+                if src.stop > src.start:
+                    local_amax = max(local_amax, lookup.shard_amax(weight[src]))
+    if not found:
+        raise ValueError(f"No matching PLE table in safetensors checkpoint {root}")
+    lookup.set_online_scale(local_amax)
 
 
 def _load_ple_weight_scale(
@@ -609,11 +721,17 @@ def load_qwen4_exp_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     include_visual: bool,
+    remap_name: Callable[[str], str | None] | None = None,
 ) -> set[str]:
     """Load dense/MoE, PLE, QSA, and optional vision checkpoint tensors."""
 
     params = dict(module.named_parameters(remove_duplicate=False))
     buffers = dict(module.named_buffers())
+    ple_modules = {
+        name: child
+        for name, child in module.named_modules()
+        if isinstance(child, Qwen4ExpNGramEmbedding)
+    }
     stacked = [
         ("qkv_proj", "q_proj", "q"),
         ("qkv_proj", "k_proj", "k"),
@@ -662,12 +780,24 @@ def load_qwen4_exp_weights(
         "_input_scale",
     )
     split_parts = int(getattr(config, "split_ngram_parts", 512))
+    scanned = set()
+
+    def checkpoint_shard(original_name, table_name):
+        candidate = remap_name(original_name) if remap_name else original_name
+        if candidate is None:
+            return None
+        match = _PLE_SHARD_NAME.fullmatch(_normalize_checkpoint_name(candidate))
+        if match and match[1] == table_name:
+            return (int(match[2]), split_parts) if match[2] else (0, 1)
+        return None
+
     for original_name, loaded_weight in weights:
-        if "rotary_emb.inv_freq" in original_name or "mtp" in original_name:
+        name = original_name if remap_name is None else remap_name(original_name)
+        if name is None or "rotary_emb.inv_freq" in name or "mtp" in name:
             continue
-        if "visual" in original_name and not include_visual:
+        if "visual" in name and not include_visual:
             continue
-        name = _normalize_checkpoint_name(original_name)
+        name = _normalize_checkpoint_name(name)
         buffer_name = name.rsplit(".", 1)[-1]
         if ".ple.ple_embedding." in name and (
             buffer_name == "token_lookup" or buffer_name.startswith("hashstats_")
@@ -695,15 +825,32 @@ def load_qwen4_exp_weights(
         if scale_name is not None:
             loaded.add(scale_name)
             continue
-        shard_name = _copy_ple_shard(module, name, loaded_weight, split_parts)
-        if shard_name is not None:
-            loaded.add(shard_name)
-            continue
-        if name.endswith(".ngram_embedding.weight"):
-            module_name = name[: -len(".ngram_embedding.weight")]
-            embedding = dict(module.named_modules()).get(module_name)
-            if isinstance(embedding, Qwen4ExpNGramEmbedding):
-                embedding.lookup.load_shard(loaded_weight, 0, 1)
+        match = _PLE_SHARD_NAME.fullmatch(name)
+        if match is not None:
+            module_name, shard_index = match.groups()
+            embedding = ple_modules.get(module_name)
+            if embedding is not None:
+                lookup = embedding.lookup
+                shard = (int(shard_index), split_parts) if shard_index else (0, 1)
+                if (
+                    shard[1] > 1
+                    and module_name not in scanned
+                    and lookup.needs_online_quantization(loaded_weight)
+                ):
+                    if module._checkpoint_dir is None:
+                        raise ValueError(
+                            "Split online PLE quantization needs a standard "
+                            "safetensors checkpoint"
+                        )
+                    _prescan_ple_scale(
+                        lookup,
+                        Path(module._checkpoint_dir),
+                        lambda name, table=module_name: checkpoint_shard(name, table),
+                    )
+                    scanned.add(module_name)
+                lookup.load_shard(
+                    loaded_weight, *shard, prescanned=module_name in scanned
+                )
                 loaded.add(f"{module_name}.lookup.ngram_embedding.weight")
                 continue
         for param_name, weight_name, shard_id in stacked:
@@ -736,6 +883,7 @@ def load_qwen4_exp_weights(
 class Qwen4ExpForCausalLM(BaseCausalLM):
     """Text-only Qwen4-Exp entry class."""
 
+    bind_checkpoint_dir = bind_checkpoint_dir
     model_cls = Qwen4ExpModel
 
     def __init__(
@@ -747,14 +895,19 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
     ) -> None:
         text_config = getattr(config, "text_config", config)
         super().__init__(text_config, mapping, quant_config, prefix)
+        self._checkpoint_dir: str | None = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(
-            self, self.config, self.mapping, weights, include_visual=False
+            self,
+            self.config,
+            self.mapping,
+            weights,
+            include_visual=False,
         )
 
     def post_quant_warmup(self) -> None:
-        _warmup_qwen4_moe(self.model)
+        _warmup_qwen4_kernels(self.model)
         enable_decode_monokernels(self.model)
 
     @classmethod
@@ -772,6 +925,7 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
 class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """Multimodal Qwen4-Exp entry class using the Qwen3.5 vision tower."""
 
+    bind_checkpoint_dir = bind_checkpoint_dir
     model_cls = Qwen4ExpModel
     # Its backbone returns its own HC-width state, not the taps ``layers_to_capture`` names.
     supports_aux_capture = False
@@ -793,6 +947,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             is_multimodal_active,
             mm_attention_backend,
         )
+        self._checkpoint_dir: str | None = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(
@@ -804,7 +959,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
 
     def post_quant_warmup(self) -> None:
-        _warmup_qwen4_moe(self.model)
+        _warmup_qwen4_kernels(self.model)
         enable_decode_monokernels(self.model)
 
     @classmethod

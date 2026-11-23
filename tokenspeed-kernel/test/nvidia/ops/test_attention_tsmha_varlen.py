@@ -134,6 +134,7 @@ def test_tsmha_varlen_prefill(
             max_seqlen=max(q_lens),
             window_left=window_left,
             softmax_scale=scale,
+            output_dtype=None,
         )
 
     out = _with_route(True, call)
@@ -201,6 +202,7 @@ def test_tsmha_varlen_extend_paged(
             rel_logits=rel_logits,
             window_left=window_left,
             softmax_scale=scale,
+            output_dtype=None,
         )
 
     out = _with_route(True, call)
@@ -249,6 +251,7 @@ def test_tsmha_varlen_gate_falls_back(device: str, require) -> None:
         cu_seqlens_cpu=cu_cpu,
         max_seqlen=max(q_lens),
         softmax_scale=scale,
+        output_dtype=None,
     )
     assert set(rel_extend._FWD_VARLEN) == keys_before
     for i, length in enumerate(q_lens):

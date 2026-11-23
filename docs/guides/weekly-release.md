@@ -20,30 +20,36 @@ The workflow completes these stages in order:
    an earlier failed GPU test. Exclude disabled workflows and package
    publishers. Missing source runs, including commits inside a multi-commit
    push, require manual intervention. A change to `main` stops this release.
-   Check that the latest stable MLA and scheduler releases contain all current
-   changes in their component directories, using PyPI's published source
-   provenance and Git history. Their versions on `main` and the MLA pin in the
-   kernel and scheduler requirement in the runtime must match those releases.
+   Check that the latest stable MLA release contains all current changes in
+   its component directory, using PyPI's published source provenance and Git
+   history. Its version on `main` and the MLA pin in the kernel must match
+   that release.
    The two TokenSpeed version declarations must agree.
 2. Create a version PR for `tokenspeed-kernel-amd`, verify its exact metadata diff, merge it,
    and publish its immutable `release/<version>` source to PyPI and the wheelhouse.
 3. Update the kernel's AMD dependency and version in one PR, then publish CUDA
    12.9/13.0 variant wheels and ROCm 7.2 wheels. CUDA 13.0 supplies PyPI. All
    variants go to the wheelhouse.
-4. Update TokenSpeed's kernel requirement and both version declarations in one
-   PR. Keep the kernel's `.dev0` floor so CI retains matching in-tree builds.
+4. Bump `tokenspeed-engine` through a version PR, then publish its immutable
+   `release/engine-<version>` source as a stable release to PyPI and the
+   wheelhouse. Verify all four wheels and their published source provenance.
+5. Update TokenSpeed's kernel requirement, exact engine pin, and both version
+   declarations in one PR. Keep the kernel's `.dev0` floor so CI retains matching in-tree builds.
    Wait for that exact merge's existing PyPI workflow, then publish its
-   identical distributions to the wheelhouse.
-5. Update the stable CUDA and ROCm pip indexes, preserving previous releases.
-6. Publish the existing NVIDIA Docker image for `linux/amd64` and `linux/arm64`.
-   The image installs and checks the exact released kernel, scheduler, and MLA
+   identical distributions to the wheelhouse. Stable TokenSpeed reuses the
+   published engine; it does not create an engine post release. This also applies
+   to standalone TokenSpeed publication: publish the stable engine first, pin it
+   with `tokenspeed-engine==<version>`, and keep its source tree unchanged.
+6. Update the stable CUDA and ROCm pip indexes, preserving previous releases.
+7. Publish the existing NVIDIA Docker image for `linux/amd64` and `linux/arm64`.
+   The image installs and checks the exact released kernel and MLA
    versions. Confirm both platforms are in the published manifest.
-7. Create `v<version>` at the TokenSpeed release commit with generated release
+8. Create `v<version>` at the TokenSpeed release commit with generated release
    notes, a component version table, and links to PyPI, wheelhouse releases,
    stable pip indexes, Docker, and the publication runs. Notes use the previous
    stable release tag and stay below the page size limit. The notes always
    retain the full changelog link.
-8. Verify the published sources and release page, then delete this run's three
+9. Verify the published sources and release page, then delete this run's four
    release branches with their expected commit leases. Tags, published assets,
    and unrelated branches remain available. Cleanup is safe to retry. A moved
    branch stops cleanup for inspection.
@@ -75,7 +81,9 @@ Any failed main CI retry, publication, or wait stops downstream stages and fails
 weekly run. The summary and `weekly-state-<stage>` artifacts retain the reserved
 versions, PRs, source commits, and child run IDs. Each stage allows up to 340
 minutes for checks, approvals, queueing, and publication before requiring manual
-intervention. The workflow creates no release page for an incomplete run.
+intervention. The workflow creates no release page for an incomplete run. Engine versions,
+source commits, and publisher runs are included in the saved state and release
+notes; an engine failure blocks TokenSpeed and all later stages.
 
 Fix the first failed stage. If a child workflow failed, inspect and repair it,
 then rerun the appropriate child jobs before rerunning **failed jobs** in the
@@ -108,30 +116,35 @@ in the ROCm index.
 
 ## Scheduler releases
 
+Each Linux architecture (x86_64 and aarch64, glibc 2.28+) gets two scheduler
+wheels: `cp311-cp311` for CPython 3.11 and `cp312-abi3` for standard,
+GIL-enabled CPython 3.12 and later. Python 3.10 is no longer supported.
+The publisher audits the stable ABI and runs the scheduler Python tests with
+the same abi3 wheel on Python 3.12–3.15. Its `dry_run` input builds and tests
+the distributions without publishing them.
+
 Run **Scheduler release pipeline** manually from `main`. Its optional `version`
 must be a stable version greater than both the scheduler source and PyPI
-versions. Leave it empty to increment the greater version's patch. The three
+versions. Leave it empty to increment the greater version's patch. The two
 stages are:
 
 1. Bump `tokenspeed-scheduler/pyproject.toml` through a signed metadata PR.
 2. Run the existing scheduler publisher at that exact commit on a pinned branch.
    Wait for wheel builds, GitHub release and PyPI publication. Check PyPI source
    provenance, matching distribution hashes, and availability in the pip index.
-3. Update only `tokenspeed-scheduler>=<version>` in `python/pyproject.toml` through
-   a second signed metadata PR. TokenSpeed's own version remains unchanged.
 
-Both metadata PRs merge immediately using the same bot exemption and exact-diff
+TokenSpeed uses the scheduler built into tokenspeed-engine, so no TokenSpeed
+dependency PR follows.
+
+The metadata PR merges immediately using the same bot exemption and exact-diff
 lease as biweekly releases, without waiting for main or PR CI. Publication checks
-remain mandatory. Source changes in the scheduler before the dependency merge
-stop the pipeline. The dependency PR's base can include unrelated changes.
-The two pipelines share a concurrency group and the existing token and publisher.
+remain mandatory. The two pipelines share a concurrency group and the existing
+token and publisher.
 
 If publication fails, repair its recorded child run and **re-run failed jobs** here.
 The `weekly-state-scheduler-*` artifacts retain the reserved version, PRs, pinned
-source and publisher run. A rerun never dispatches the publisher again. Until the
-dependency stage succeeds, biweekly preflight can stop on the scheduler version
-mismatch. Start a new pipeline only for a new release, not to recover a partial
-one. Pinned scheduler release branches remain available for recovery. If `main`
+source and publisher run. A rerun never dispatches the publisher again. Start a
+new pipeline only for a new release, not to recover a partial one. Pinned scheduler release branches remain available for recovery. If `main`
 moves after the pipeline records a metadata PR's base, or someone edits the
 PR, manual resolution is required. A rerun does not rebase or overwrite the
 recorded PR.

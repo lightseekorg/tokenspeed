@@ -83,6 +83,9 @@ def register_drafter(
 
 
 __all__ = [
+    "PeerHostRegionPlanner",
+    "register_peer_host_region_planner",
+    "get_peer_host_region_planner",
     "register_trace_provider",
     "get_trace_provider",
     "TraceProvider",
@@ -189,6 +192,30 @@ def record_external(kind: str, name: str, undo) -> None:
     if _active is not None:
         _active.names.setdefault(kind, []).append(str(name))
         _active.undo.append(undo)
+
+
+# A planner maps the pool length and compact parent stride to consecutive region
+# lengths. All sizes are in bytes.
+PeerHostRegionPlanner = Callable[[int, int], tuple[int, ...]]
+_PEER_HOST_REGION_PLANNERS: dict[str, PeerHostRegionPlanner] = {}
+
+
+def register_peer_host_region_planner(
+    device: str, planner: PeerHostRegionPlanner, *, override: bool = False
+) -> None:
+    """Register a peer Host memory region planner for a device type."""
+    _put(
+        _PEER_HOST_REGION_PLANNERS,
+        device,
+        planner,
+        kind="peer_host_regions",
+        override=override,
+    )
+
+
+def get_peer_host_region_planner(device: str) -> PeerHostRegionPlanner | None:
+    """Return the device plugin's planner, or None for one contiguous region."""
+    return _PEER_HOST_REGION_PLANNERS.get(device)
 
 
 # The request ID is an input to the provider, not a prescribed encoding.

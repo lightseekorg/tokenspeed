@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     dspark_block_candidate_tiles,
     dspark_block_greedy_resolve,
     dspark_block_greedy_step,
+    dspark_markov_shard_logits,
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,
@@ -1027,6 +1028,78 @@ def test_dspark_block_greedy_rejects_mismatched_workspaces(device: str) -> None:
         dspark_block_greedy_step(
             base, 1, anchors, single, embedding, projection, 0, vocab, single[0], out
         )
+
+
+def _eighths(*shape: int, device: str) -> torch.Tensor:
+    """BF16 multiples of 1/8 in [-1, 1]: their products and sums stay exact in FP32."""
+    return (torch.randint(-8, 9, shape, device=device).float() / 8).to(torch.bfloat16)
+
+
+def _markov_shard_logits_reference(base, previous, embedding, projection):
+    previous = previous.long().clamp(0, embedding.shape[0] - 1)
+    bias = torch.matmul(embedding[previous].float(), projection.float().T)
+    return base + bias.to(base.dtype)
+
+
+@pytest.mark.parametrize(
+    ("rows", "columns", "rank"), ((5, 300, 512), (27, 2048, 64), (70, 448, 512))
+)
+def test_dspark_markov_shard_logits_matches_the_unfused_rounding(
+    rows: int, columns: int, rank: int, device: str
+) -> None:
+    torch.manual_seed(rows)
+    vocab = 1000
+    embedding = _eighths(vocab, rank, device=device)
+    projection = _eighths(columns, rank, device=device)
+    base = _eighths(3, rows, columns, device=device)[1]
+    table = torch.randint(0, vocab, (rows, 4), device=device, dtype=torch.int32)
+    # Graph padding rows carry out-of-range tokens: both ends clamp.
+    table[0, 2] = -5
+    table[-1, 2] = vocab + 7
+    out = torch.empty_like(base)
+
+    dspark_markov_shard_logits(base, table[:, 2], embedding, projection, out)
+
+    expected = _markov_shard_logits_reference(base, table[:, 2], embedding, projection)
+    assert torch.equal(out, expected)
+
+
+def test_dspark_markov_shard_logits_rounds_the_bias_before_the_add(
+    device: str,
+) -> None:
+    # Random BF16 weights: only the FP32 accumulation order may differ, so
+    # every logit lies within one BF16 rounding of the unfused one.
+    torch.manual_seed(3)
+    rows, columns, rank, vocab = 16, 640, 512, 4096
+    embedding = (torch.randn(vocab, rank, device=device) * 0.05).to(torch.bfloat16)
+    projection = (torch.randn(columns, rank, device=device) * 0.05).to(torch.bfloat16)
+    base = torch.randn(rows, columns, device=device).to(torch.bfloat16)
+    previous = torch.randint(0, vocab, (rows,), device=device)
+    out = torch.empty_like(base)
+
+    dspark_markov_shard_logits(base, previous, embedding, projection, out)
+
+    expected = _markov_shard_logits_reference(base, previous, embedding, projection)
+    torch.testing.assert_close(out, expected, rtol=2**-7, atol=2**-14)
+
+
+def test_dspark_markov_shard_logits_rejects_mismatched_tensors(device: str) -> None:
+    rows, columns, rank = 4, 256, 64
+    embedding = _eighths(100, rank, device=device)
+    projection = _eighths(columns, rank, device=device)
+    base = _eighths(rows, columns, device=device)
+    previous = torch.zeros(rows, dtype=torch.int32, device=device)
+    out = torch.empty_like(base)
+    with pytest.raises(ValueError, match="same 2D shape"):
+        dspark_markov_shard_logits(base, previous, embedding, projection, out[:, 1:])
+    with pytest.raises(ValueError, match="must be BF16"):
+        dspark_markov_shard_logits(
+            base.float(), previous, embedding, projection, out.float()
+        )
+    with pytest.raises(ValueError, match="projection must be"):
+        dspark_markov_shard_logits(base, previous, embedding, projection[1:], out)
+    with pytest.raises(ValueError, match="previous must be"):
+        dspark_markov_shard_logits(base, previous[1:], embedding, projection, out)
 
 
 def test_gumbel_generic_keeps_the_top_k_across_vocab_blocks(device: str) -> None:

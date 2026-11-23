@@ -65,8 +65,7 @@ and the walk from the root accepts the child holding its parent's draw
 sampled tree's draft q is not read, so each child is accepted at its target
 probability. The trees read whole rows, gathering a vocabulary shard.
 
-Not yet supported: DP-sampling, top-k output logprobs, EAGLE3 ``d2t``
-cross-vocab.
+Not yet supported: DP-sampling, top-k output logprobs.
 
 The kernels and indicator bits are sonic-sampler's, vendored in
 ``tokenspeed_kernel.thirdparty.sonic_sampler``; ``tokenspeed_kernel.ops.sampling.sonic``
@@ -385,6 +384,11 @@ class SonicSamplingBackend(SamplingBackend):
 
     def _vocab_shard(self, shard: SampledVocabShard) -> sonic.VocabShard:
         """The launch's view of ``shard``: its slice of the vocabulary and the gather of every rank's candidates."""
+        if shard.softcap_form not in (None, "sigmoid"):
+            raise ValueError(
+                f"sonic caps vocab shards in the fused sigmoid form, not "
+                f"{shard.softcap_form}"
+            )
         return sonic.VocabShard(
             vocab_start=shard.vocab_start,
             logit_scale=shard.logit_scale,

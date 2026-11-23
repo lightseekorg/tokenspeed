@@ -1210,6 +1210,7 @@ def iris_fused_sliding_attention_twoshot_muse_attntail(
         True,
         WINDOW_LEFT,
         IS_FP8,
+        False,  # UNIFORM_ROWS: verify rows are causal
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )

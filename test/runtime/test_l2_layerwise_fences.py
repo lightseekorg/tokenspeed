@@ -66,7 +66,7 @@ def host_cache(request, io_backend):
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    ts = pytest.importorskip("tokenspeed_scheduler")
+    ts = pytest.importorskip("tokenspeed_engine.scheduler")
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
     from tokenspeed.runtime.execution.device import DeviceHandle
@@ -106,6 +106,7 @@ def host_cache(request, io_backend):
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=2,
+        max_resident_requests=2,
     )
     recipe_args = dict(
         server_args=SimpleNamespace(
@@ -297,6 +298,7 @@ def host_cache(request, io_backend):
         kvp_rank=0,
         nprocs_per_node=1,
         world_cpu_group=None,
+        block_alignment=1,
     )
     # A model executor without a model: the fields the handle reads.
     model_executor = ModelExecutor.__new__(ModelExecutor)

@@ -119,6 +119,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             num_device_pages=65,
             max_scheduled_tokens=BUDGET,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,
@@ -129,9 +130,13 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             max_retracted_requests=0,
             host_write_policy="write_through",
             prefill_decode_interval=0,
+            prefill_decode_min_interval=0,
+            max_consecutive_prefill_rounds=0,
             storage_config=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,
+            num_disk_pages=0,
+            disk_config=None,
         )
     )
 
@@ -150,7 +155,7 @@ class TestGdnStateCheckpointInForward:
                 make_extend_result_event,
             )
 
-            import tokenspeed_scheduler as ts
+            import tokenspeed_engine.scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn import (
                 gdn_chunk_prefill_stores_state_checkpoints,
             )
@@ -161,7 +166,7 @@ class TestGdnStateCheckpointInForward:
                 GdnAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_engine.scheduler + tokenspeed_kernel: {exc}")
         if not gdn_chunk_prefill_stores_state_checkpoints(
             torch.bfloat16,
             head_dim=self.D,

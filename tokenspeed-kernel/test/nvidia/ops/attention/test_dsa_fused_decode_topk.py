@@ -18,13 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The fused CuTe DSL decode top-k against DeepGEMM and a stable-sort oracle.
+"""The fused CuTe DSL decode top-k against an FP32 reference and a sort oracle.
 
-Logits must equal ``deep_gemm.fp8_paged_mqa_logits`` (after the non-finite
-scrub) bit for bit on every row's causal window. Selections must equal the
-head of each window's stable descending sort of those logits (ties to the
-lowest positions), in ascending position, mapped through the block table, with
-a ``-1`` tail and the counts; every output entry is checked against a planted
+Logits must match the FP32 reference of the DeepGEMM leaf's contract (the
+head-weighted ReLU scores of the dequantized keys, non-finite values scrubbed)
+on every row's causal window. Selections must equal the head of each window's
+stable descending sort of the kernel's own logits (ties to the lowest
+positions), in ascending position, mapped through the block table, with a
+``-1`` tail and the counts; every output entry is checked against a planted
 sentinel. Block tables are shuffled so slot order differs from position order.
 """
 
@@ -50,15 +51,16 @@ from ops import test_attention_dsa  # noqa: E402
 from tokenspeed_kernel import selection, signature  # noqa: E402
 from tokenspeed_kernel.ops.attention import dsa  # noqa: E402
 from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl  # noqa: E402
-from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa_deep_gemm  # noqa: E402
 from tokenspeed_kernel.ops.attention.dsa._triton import (  # noqa: E402
     topk as dsa_triton_topk,
+)
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (  # noqa: E402
+    decode_index_k_scale,
+    index_k_scale_dtype,
 )
 
 if dsa_cute_dsl._fused_indexer is None:
     pytest.skip("the fused CuTe DSL decode top-k is not built", allow_module_level=True)
-if not dsa_deep_gemm._HAS_DEEP_GEMM:
-    pytest.skip("the DeepGEMM reference is not installed", allow_module_level=True)
 
 PAGE = 64
 HEADS = 32
@@ -111,27 +113,47 @@ def _row_lengths(seq_lens, q_len, width):
     return rows.clamp(0, width * PAGE)
 
 
-def _deep_gemm_logits(q_fp8, folded, seq_lens, table, cache, q_len):
-    """Scrubbed DeepGEMM paged MQA logits ``[tokens, block-table capacity]``.
+def _reference_logits(q_fp8, folded, seq_lens, table, cache, q_len):
+    """Scrubbed FP32 reference logits ``[tokens, block-table capacity]``.
 
-    They are computed as the DeepGEMM leaf runs them (one request row per token).
+    Each row's head-weighted ReLU scores of its E4M3 query against its
+    request's keys, in the kernels' order: exact dot products of the E4M3
+    codes, ReLU as ``x + |x|``, weighted and summed over the heads in FP32,
+    halved, and only then scaled by the key's scale. An overflowing head
+    weight thus turns +inf exactly where theirs does; NaN and +inf are
+    scrubbed to -inf in the causal window as the scoring leaves do.
     """
-    dg = dsa_deep_gemm.deep_gemm
-    tokens = q_fp8.shape[0]
-    lens_2d = seq_lens.repeat_interleave(q_len).unsqueeze(1).contiguous()
-    plan = dg.get_paged_mqa_logits_metadata(lens_2d, PAGE, dg.get_num_sms())
-    logits = dg.fp8_paged_mqa_logits(
-        q_fp8.view(tokens, 1, HEADS, DIM),
-        cache.view(-1, PAGE, 1, cache.shape[-1]),
-        folded,
-        lens_2d,
-        table.repeat_interleave(q_len, dim=0).contiguous(),
-        plan,
-        table.shape[1] * PAGE,
-        clean_logits=False,
-    )
+    keys, words = _planes(cache)
+    scales = decode_index_k_scale(words.contiguous()).reshape(-1)
+    codes = keys.view(torch.float8_e4m3fn).double().view(-1, DIM)
+    width = table.shape[1]
+    offsets = torch.arange(PAGE, device="cuda")
+    logits = torch.empty((q_fp8.shape[0], width * PAGE), device="cuda")
+    for row in range(q_fp8.shape[0]):
+        pages = table[row // q_len].long()
+        slots = (pages[:, None] * PAGE + offsets).reshape(-1)
+        doubled = 2 * torch.relu(q_fp8[row].double() @ codes[slots].T).float()
+        weighted = (folded[row].float()[:, None] * doubled).sum(0)
+        logits[row] = weighted * 0.5 * scales[slots]
     dsa_triton_topk.scrub_nonfinite_logits(logits, seq_lens, next_n=q_len)
     return logits
+
+
+def _kernel_logits(case, logits, table=None):
+    """The fused kernel's own logits as a dense ``[tokens, capacity]`` matrix.
+
+    Rows the kernel does not score (requests of at most K keys) and the
+    columns past each row's window are -inf.
+    """
+    table = case["table"] if table is None else table
+    width = table.shape[1]
+    tokens = case["q"].shape[0]
+    dense = torch.full((tokens, width * PAGE), -torch.inf, device="cuda")
+    for row, mine in _scratch_rows(
+        logits, case["seq_lens"], case["q_len"], width
+    ).items():
+        dense[row, : mine.numel()] = mine.float()
+    return dense
 
 
 def _fused(case, cache=None, table=None):
@@ -212,7 +234,7 @@ def _check_logits(case, logits, reference):
         if int(ends[row // case["q_len"]]) <= TOPK:
             continue  # the request is not scored
         expected = reference[row, : mine.numel()].contiguous()
-        assert torch.equal(mine.view(torch.int32), expected.view(torch.int32)), row
+        torch.testing.assert_close(mine.float(), expected, rtol=1e-3, atol=1e-3), row
 
 
 # Lengths across the bypass (<= 2048), the key bound (< 2 * 2048 vectors), the
@@ -230,10 +252,10 @@ _LENGTHS = {
 
 
 @pytest.mark.parametrize("q_len", sorted(_LENGTHS))
-def test_logits_are_bitwise_deep_gemm(q_len) -> None:
+def test_logits_match_the_reference(q_len) -> None:
     case = _case(_LENGTHS[q_len], q_len, seed=10 + q_len)
     _, _, logits, q_fp8, folded = _fused(case)
-    reference = _deep_gemm_logits(
+    reference = _reference_logits(
         q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
     )
     _check_logits(case, logits, reference)
@@ -242,11 +264,8 @@ def test_logits_are_bitwise_deep_gemm(q_len) -> None:
 @pytest.mark.parametrize("q_len", sorted(_LENGTHS))
 def test_selection_matches_the_sorted_oracle(q_len) -> None:
     case = _case(_LENGTHS[q_len], q_len, seed=20 + q_len)
-    out, lens, _, q_fp8, folded = _fused(case)
-    reference = _deep_gemm_logits(
-        q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
-    )
-    _check_selection(case, out, lens, reference)
+    out, lens, logits, _, _ = _fused(case)
+    _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 @pytest.mark.parametrize("q_len", [1, 8])
@@ -273,13 +292,8 @@ def test_the_facade_pin_runs_the_fused_leaf(q_len) -> None:
         slot_order="sorted",
         solution="cute_dsl",
     )
-    q_fp8, folded = dsa_triton_topk.quantize_index_query_weights(
-        case["q"], case["weights"], SOFTMAX_SCALE
-    )
-    reference = _deep_gemm_logits(
-        q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
-    )
-    _check_selection(case, out, lens, reference)
+    _, _, logits, _, _ = _fused(case)
+    _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 def _facade(case, q, weights, softmax_scale, **kwargs):
@@ -324,10 +338,8 @@ def test_prequantized_queries_select_like_the_bf16_ones(q_len) -> None:
     bf16_out, bf16_lens = _facade(case, case["q"], case["weights"], SOFTMAX_SCALE)
     out, lens = _facade(case, q_fp8, folded, 1.0)
     assert torch.equal(out, bf16_out) and torch.equal(lens, bf16_lens)
-    reference = _deep_gemm_logits(
-        q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
-    )
-    _check_selection(case, out, lens, reference)
+    _, _, logits, _, _ = _fused(case)
+    _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 def test_prequantized_queries_take_unit_scales_only() -> None:
@@ -344,36 +356,6 @@ def test_prequantized_queries_take_unit_scales_only() -> None:
         _facade(case, q_fp8, folded, 1.0, q_scales=torch.ones_like(folded))
 
 
-def test_selection_agrees_with_the_deep_gemm_batch_invariant_leaf() -> None:
-    """The existing leaf's lowest-index-tie selection picks the same slots."""
-    from tokenspeed_kernel.ops.attention.dsa import flashinfer as dsa_flashinfer
-
-    if not dsa_flashinfer.has_deterministic_decode_topk():
-        pytest.skip("needs the lowest-index tie-break top-k")
-    q_len = 4
-    case = _case([2052, 9000, 41000], q_len, seed=41)
-    out, lens, *_ = _fused(case)
-    lens_2d = case["seq_lens"].repeat_interleave(q_len).unsqueeze(1).contiguous()
-    slots, counts = dsa.dsa_decode_topk(
-        case["q"],
-        case["weights"],
-        case["seq_lens"],
-        case["table"],
-        page_size=PAGE,
-        topk=TOPK,
-        softmax_scale=SOFTMAX_SCALE,
-        batch_invariant=True,
-        q_len_per_req=q_len,
-        index_k_cache=case["cache"],
-        seq_lens_2d=lens_2d,
-        plan=dsa.dsa_plan(page_size=PAGE, seq_lens_2d=lens_2d, solution="deep_gemm"),
-        slot_order="selection",
-        solution="deep_gemm",
-    )
-    assert torch.equal(lens, counts)
-    assert torch.equal(out.sort(dim=1).values, slots.sort(dim=1).values)
-
-
 def _planes(cache):
     """Views of the packed plane's FP8 key bytes and FP32 scales.
 
@@ -382,7 +364,7 @@ def _planes(cache):
     """
     pages = cache.view(-1, PAGE * (DIM + 4))
     keys = pages[:, : PAGE * DIM].view(-1, PAGE, DIM)
-    scales = pages[:, PAGE * DIM :].view(torch.float32)
+    scales = pages[:, PAGE * DIM :].view(index_k_scale_dtype())
     return keys, scales
 
 
@@ -398,11 +380,8 @@ def test_equal_logits_select_the_lowest_positions(length) -> None:
     the whole row.
     """
     case = _case([length, 2100], 2, seed=51, zero_keys=True)
-    out, lens, _, q_fp8, folded = _fused(case)
-    reference = _deep_gemm_logits(
-        q_fp8, folded, case["seq_lens"], case["table"], case["cache"], 2
-    )
-    _check_selection(case, out, lens, reference)
+    out, lens, logits, _, _ = _fused(case)
+    _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 @pytest.mark.parametrize("length", [6000, 50000])
@@ -415,12 +394,8 @@ def test_ties_at_the_threshold_go_to_the_lowest_positions(length) -> None:
     """
     generator = torch.Generator(device="cuda").manual_seed(61)
     case = _case([length], 1, seed=62)
-    q_fp8, folded = dsa_triton_topk.quantize_index_query_weights(
-        case["q"], case["weights"], SOFTMAX_SCALE
-    )
-    reference = _deep_gemm_logits(
-        q_fp8, folded, case["seq_lens"], case["table"], case["cache"], 1
-    )
+    _, _, logits, _, _ = _fused(case)
+    reference = _kernel_logits(case, logits)
     ranked = torch.sort(reference[0, :length], descending=True, stable=True).indices
     source = int(ranked[TOPK - 100])
     copies = torch.randperm(length, device="cuda", generator=generator)[:300]
@@ -433,12 +408,13 @@ def test_ties_at_the_threshold_go_to_the_lowest_positions(length) -> None:
         keys[page, offset] = key_bytes
         scales[page, offset] = scale
     out, lens, logits, q_fp8, folded = _fused(case)
-    reference = _deep_gemm_logits(
+    reference = _reference_logits(
         q_fp8, folded, case["seq_lens"], case["table"], case["cache"], 1
     )
+    _check_logits(case, logits, reference)
+    reference = _kernel_logits(case, logits)
     tied = reference[0, :length] == reference[0, source]
     assert int(tied.sum()) >= 300
-    _check_logits(case, logits, reference)
     _check_selection(case, out, lens, reference)
 
 
@@ -462,12 +438,12 @@ def test_nonfinite_logits_score_minus_infinity() -> None:
     # Request 2's first row: one huge head weight overflows its logits.
     case["weights"][4, 0] = 3.0e38
     out, lens, logits, q_fp8, folded = _fused(case)
-    reference = _deep_gemm_logits(
+    reference = _reference_logits(
         q_fp8, folded, case["seq_lens"], case["table"], case["cache"], 2
     )
     assert bool(torch.isneginf(reference[0, :2999]).any())
     _check_logits(case, logits, reference)
-    _check_selection(case, out, lens, reference)
+    _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 def test_far_pages_past_int32_offsets() -> None:
@@ -482,11 +458,11 @@ def test_far_pages_past_int32_offsets() -> None:
     far_cache = pool.view(-1, DIM + 4)
     assert int(table.min()) * PAGE * (DIM + 4) > 2**31
     out, lens, logits, *_ = _fused(case, cache=far_cache, table=table)
-    reference = _deep_gemm_logits(
+    reference = _reference_logits(
         q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
     )
     _check_logits(case, logits, reference)
-    _check_selection(case, out, lens, reference, table=table)
+    _check_selection(case, out, lens, _kernel_logits(case, logits), table=table)
     assert torch.equal(lens, near_lens)
 
 
@@ -501,11 +477,8 @@ def test_no_recompile_across_batch_shapes() -> None:
             (8, [2055] * 9, 7),
         ):
             case = _case(lengths, q_len, seed=95, extra_pages=extra_pages)
-            out, lens, _, q_fp8, folded = _fused(case)
-            reference = _deep_gemm_logits(
-                q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
-            )
-            _check_selection(case, out, lens, reference)
+            out, lens, logits, _, _ = _fused(case)
+            _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 @pytest.mark.parametrize("q_len", [1, 8])
@@ -549,13 +522,8 @@ def test_graph_replay_follows_new_lengths_and_queries(q_len) -> None:
     lens.fill_(SENTINEL)
     graph.replay()
     torch.cuda.synchronize()
-    q_fp8, folded = dsa_triton_topk.quantize_index_query_weights(
-        case["q"], case["weights"], SOFTMAX_SCALE
-    )
-    reference = _deep_gemm_logits(
-        q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
-    )
-    _check_selection(case, out, lens, reference)
+    _, _, logits, _, _ = _fused(case)
+    _check_selection(case, out, lens, _kernel_logits(case, logits))
 
 
 def test_only_the_cute_dsl_pin_selects_the_fused_leaf() -> None:

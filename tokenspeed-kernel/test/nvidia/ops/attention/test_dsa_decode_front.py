@@ -54,6 +54,9 @@ from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl  # noqa
 from tokenspeed_kernel.ops.attention.dsa._triton import (  # noqa: E402
     topk as dsa_triton_topk,
 )
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (  # noqa: E402
+    virtual_slots_to_local,
+)
 from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel  # noqa: E402
 
 if dsa_cute_dsl._decode_front is None:
@@ -118,6 +121,7 @@ def _case(rows, *, seed, slot_dtype, norm_dtype, positive=False):
         k_beta=(randn(DIM) * 0.1).to(norm_dtype),
         plane=plane,
         slots=slots.to(slot_dtype),
+        slot_owner=None,
     )
 
 
@@ -137,6 +141,7 @@ def _front(case):
         key_norm_eps=KEY_EPS,
         index_k_cache=case["plane"],
         slots=case["slots"],
+        slot_owner=case["slot_owner"],
         page_size=PAGE,
         softmax_scale=SOFTMAX_SCALE,
     )
@@ -162,6 +167,16 @@ def _check(case, *, positive):
         q_a, case["q_gamma"], q_norm_ref, kv_ref, case["kv_gamma"], kv_ref, NORM_EPS
     )
     plane_ref = case["plane"].clone()
+    slots, owned = case["slots"], None
+    if case["slot_owner"] is not None:
+        rows_per_page, blocks, degree, rank = case["slot_owner"]
+        slots, owned = virtual_slots_to_local(
+            slots,
+            rows_per_page=rows_per_page,
+            virtual_block_count=blocks,
+            degree=degree,
+            rank=rank,
+        )
 
     q_norm, projected, q_fp8, weights = _front(case)
     assert torch.equal(_bits(q_norm), _bits(q_norm_ref))
@@ -174,13 +189,13 @@ def _check(case, *, positive):
         case["key"],
         case["k_gamma"],
         case["k_beta"],
-        case["slots"],
+        slots,
         index_query,
         case["head_w"],
         eps=KEY_EPS,
         page_size=PAGE,
         group_size=128,
-        write_mask=None,
+        write_mask=owned,
         softmax_scale=SOFTMAX_SCALE,
     )
     assert torch.equal(case["plane"], plane_ref)
@@ -219,6 +234,32 @@ def test_the_front_matches_the_launches_it_replaces(rows, positive) -> None:
 @pytest.mark.parametrize("norm_dtype", [torch.float32, torch.bfloat16])
 def test_the_front_takes_either_slot_and_key_norm_dtype(slot_dtype, norm_dtype) -> None:
     case = _case(13, seed=7, slot_dtype=slot_dtype, norm_dtype=norm_dtype)
+    _check(case, positive=False)
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_a_kvp_placement_writes_only_its_rows_at_local_slots(slot_dtype, rank) -> None:
+    """A rank writes only its own rows, at local slots, under a placement.
+
+    The slots are virtual: a rank writes the rows of its blocks at their local
+    slots, as virtual_slots_to_local resolves them, and none of the others
+    (null block 0 and blocks past the count included).
+    """
+    rows_per_page, degree = 2 * PAGE, 4
+    # 40 virtual blocks fill local blocks 1-10; a past-count write would hit 11.
+    blocks = degree * (PAGES * PAGE // rows_per_page - 2) + 1
+    case = _case(24, seed=29 + rank, slot_dtype=slot_dtype, norm_dtype=torch.float32)
+    generator = torch.Generator(device="cuda").manual_seed(rank)
+    virtual = torch.randperm((blocks - 1) * rows_per_page, device="cuda", generator=generator)  # fmt: skip
+    virtual = virtual[:24] + rows_per_page
+    virtual[0] = 5  # the null block
+    # Past the count, in a block this rank would own.
+    virtual[1] = (blocks + rank) * rows_per_page + 7
+    case["slots"] = virtual.to(slot_dtype)
+    case["slot_owner"] = (rows_per_page, blocks, degree, rank)
+    owned = ((virtual // rows_per_page - 1) % degree == rank)[2:]
+    assert owned.any() and not owned.all()
     _check(case, positive=False)
 
 
@@ -303,6 +344,17 @@ def test_rows_outside_one_to_64_are_refused(rows) -> None:
     assert not dsa_cute_dsl.decode_front_rows_supported(q_a, kv_a, key, head_w)
     case.update(q_a=q_a, kv_a=kv_a, key=key, head_w=head_w)
     with pytest.raises(ValueError, match="fused decode front"):
+        _front(case)
+
+
+@pytest.mark.parametrize(
+    "slot_owner", [(128, 41, 1, 0), (128, 1, 4, 0), (96, 41, 4, 0), (128, 41, 4, 4)]
+)
+def test_a_slot_owner_off_a_kvp_placement_is_refused(slot_owner) -> None:
+    """A slot owner of one rank, one block, part pages, or no rank is refused."""
+    case = _case(4, seed=5, slot_dtype=torch.int64, norm_dtype=torch.float32)
+    case["slot_owner"] = slot_owner
+    with pytest.raises(ValueError, match="slot_owner must be"):
         _front(case)
 
 

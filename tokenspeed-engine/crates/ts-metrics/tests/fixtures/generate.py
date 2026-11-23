@@ -99,6 +99,8 @@ def _run_scenario() -> None:
     engine.record_spec_decode_step(
         num_decode_slots=4, accepted_draft_tokens=5, draft_width=3
     )
+    engine.observe_request_spec_decode_accept_length(2.0)
+    engine.observe_request_spec_decode_accept_length(3.0)
     engine.record_jit_compiles(
         CompileStats(
             startup_compiles=9,
@@ -127,7 +129,11 @@ def _run_scenario() -> None:
     engine.observe_decode_time(1.2)
     engine.observe_time_per_output_token(float("inf"))
     engine.observe_time_per_output_token(0.02)
+    engine.observe_e2e_time_per_output_token(0.03)
     engine.record_completion_tokens(5)
+    engine.observe_request_completion_tokens(0)
+    engine.observe_request_completion_tokens(5)
+    engine.record_decode_prefix_hits(100, 20)
     engine.record_grammar_queue(2)
     engine.record_prefix_hits(
         prompt_tokens=100,

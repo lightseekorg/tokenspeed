@@ -201,6 +201,10 @@ class ForwardContext:
     # Set by a target model that captures its taps on a narrowed row subset
     # (see CapturedRows); None means one captured row per input row.
     captured_rows: CapturedRows | None = None
+    # Optional packed decode-query boundaries, excluding prefill rows. None
+    # means the fixed output_layout.decode_width stride. Proposal/output
+    # storage stays fixed-width even when the target queries are packed.
+    decode_query_indptr: torch.Tensor | None = None
 
     # --- spec-decode draft (drafter-attached collaborators, per forward) ---
     # Set on the draft forwards that narrow verify-shaped rows to the

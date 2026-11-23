@@ -9,13 +9,14 @@ target-side capture the draft is fed from.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, Qwen3Config
 
 from tokenspeed.runtime.configs.model_config import (
     ModelConfig,
@@ -28,14 +29,15 @@ from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
     _resolve_block_geometry,
-    _resolve_draft_query_width,
 )
 from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
+    block_draft_is_causal,
     resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -46,12 +48,17 @@ from tokenspeed.runtime.models.base.transformer_model import (
     notify_target_capture,
 )
 from tokenspeed.runtime.models.dspark import _get_markov_params
-from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.hf_transformers_utils import (
+    _convert_speculators_dspark_config,
+    get_config,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_RULES,
     read_checkpoint_block_size,
+    resolve_block_sample_from_anchor,
     resolve_block_widths,
+    resolve_draft_query_width,
     validate_block_widths,
 )
 
@@ -61,11 +68,11 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 
 def test_dspark_queries_one_row_per_draft_token() -> None:
-    assert _resolve_draft_query_width(verify_width=8, sample_from_anchor=True) == 7
+    assert resolve_draft_query_width(verify_width=8, sample_from_anchor=True) == 7
 
 
 def test_dflash_keeps_the_anchor_plus_draft_query_layout() -> None:
-    assert _resolve_draft_query_width(verify_width=8, sample_from_anchor=False) == 8
+    assert resolve_draft_query_width(verify_width=8, sample_from_anchor=False) == 8
 
 
 @pytest.mark.parametrize(
@@ -79,7 +86,12 @@ def test_attention_query_width_matches_algorithm(
         speculative_num_draft_tokens=8,
         speculative_algorithm=algorithm,
     )
-    assert resolve_speculative_num_tokens(args, is_draft) == expected
+    assert (
+        resolve_speculative_num_tokens(
+            args, is_draft, sample_from_anchor=algorithm == "DSPARK"
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -117,6 +129,116 @@ def test_k3_dspark_draft_cache_follows_target(tmp_path, cache_dtype, expected) -
     target = MLAConfig.generate(args, model, is_draft=False)
     draft = MLAConfig.generate(args, model, is_draft=True)
     assert target.kv_cache_dtype == draft.kv_cache_dtype == expected
+
+
+@pytest.mark.parametrize(
+    "algorithm,declared,expected",
+    [
+        ("DSPARK", None, 7),
+        ("DSPARK", True, 7),
+        ("DSPARK", False, 8),
+        ("DFLASH", None, 8),
+        ("DFLASH", False, 8),
+    ],
+)
+def test_checkpoint_sampling_policy_controls_attention_width(
+    tmp_path, algorithm: str, declared: bool | None, expected: int
+) -> None:
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    fields = {} if declared is None else {"sample_from_anchor": declared}
+    Qwen3Config(
+        architectures=[
+            "DSparkDraftModel" if algorithm == "DSPARK" else "DFlashDraftModel"
+        ],
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        vocab_size=128,
+        dtype="bfloat16",
+        block_size=7 if algorithm == "DSPARK" else 8,
+        **fields,
+    ).save_pretrained(tmp_path)
+    args = ServerArgs(
+        model=str(tmp_path),
+        speculative_draft_model_path=str(tmp_path),
+        speculative_algorithm=algorithm,
+        speculative_num_steps=7,
+        speculative_num_draft_tokens=8,
+        max_num_seqs=2,
+        device="cpu",
+        attention_backend="triton",
+        kv_cache_dtype="bfloat16",
+    )
+    args.mapping.rank = 0
+    model = ModelConfig(
+        str(tmp_path),
+        trust_remote_code=False,
+        model_override_args="{}",
+        dtype="bfloat16",
+        server_args=args,
+        is_draft_worker=True,
+    )
+    attention = MHAConfig.generate(args, model, is_draft=True)
+    assert model.draft_sample_from_anchor == (expected == 7)
+    assert attention.speculative_num_draft_tokens == expected
+    assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (7, 8)
+    assert resolve_draft_query_width(8, model.draft_sample_from_anchor) == expected
+
+    # Real leaf buffers must cover every query, including null padding rows.
+    attention = replace(attention, context_len=64)
+    leaf = MHAAttnBackend(
+        attention, attention.component(SoftmaxAttnConfig), kernel_page_size=8
+    )
+    leaf.init_cuda_graph_state(max_bs=3)
+    pointers = (leaf.page_table_buf.data_ptr(), leaf.seq_lens_buf.data_ptr())
+    pages = torch.arange(1, 25, dtype=torch.int32).view(3, 8)
+    pages[2].zero_()
+    lengths = torch.tensor([9, 17, 1], dtype=torch.int32)
+    leaf.refresh_decode_metadata(
+        3, 2, lengths, pages, num_extends=0, for_graph_replay=False
+    )
+    metadata = leaf.forward_decode_metadata
+    assert torch.equal(metadata.page_table, pages.repeat_interleave(expected, 0))
+    assert (
+        metadata.seq_lens.tolist()
+        == [9] * expected + [17] * expected + [expected] * expected
+    )
+
+    changed_pages = pages[[1, 0, 2]]
+    changed_lengths = torch.tensor([25, 8, 1], dtype=torch.int32)
+    leaf.refresh_decode_metadata(
+        3, 2, changed_lengths, changed_pages, num_extends=0, for_graph_replay=True
+    )
+    leaf.fill_block_decode_seq_lens(3, changed_lengths)
+    assert torch.equal(
+        metadata.page_table, changed_pages.repeat_interleave(expected, 0)
+    )
+    assert (
+        metadata.seq_lens.tolist()
+        == [25] * expected + [8] * expected + [expected] * expected
+    )
+    assert pointers == (leaf.page_table_buf.data_ptr(), leaf.seq_lens_buf.data_ptr())
+    leaf.refresh_decode_metadata(
+        0,
+        0,
+        changed_lengths[:0],
+        changed_pages[:0],
+        num_extends=0,
+        for_graph_replay=False,
+    )
+    assert leaf.forward_decode_metadata.page_table.shape[0] == 0
+    assert leaf.forward_decode_metadata.seq_lens.numel() == 0
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1])
+def test_anchor_sampling_policy_rejects_non_boolean_metadata(value) -> None:
+    config = Qwen3Config(sample_from_anchor=value)
+    with pytest.raises(ValueError, match="sample_from_anchor must be a boolean"):
+        resolve_block_sample_from_anchor("DSPARK", config)
 
 
 # --------------------------------------------------------------------------
@@ -194,10 +316,35 @@ def test_geometry_applies_the_family_convention() -> None:
     assert _resolve_block_geometry(
         SimpleNamespace(dflash_config={"block_size": 8}), 8, "DFLASH"
     ) == (8, 7)
+    # A launch may draft a shorter block than the checkpoint's.
+    assert _resolve_block_geometry(
+        SimpleNamespace(block_size=7), spec_num_tokens=4, spec_algorithm="DSPARK"
+    ) == (4, 3)
+    assert _resolve_block_geometry(SimpleNamespace(block_size=8), 4, "DFLASH") == (4, 3)
 
     with pytest.raises(ValueError, match=r"--speculative-num-steps 6"):
         _resolve_block_geometry(
             SimpleNamespace(block_size=7), spec_num_tokens=8, spec_algorithm="DFLASH"
+        )
+
+
+def test_validate_shorter_widths_only_when_allowed() -> None:
+    validate_block_widths(
+        "DSPARK", 7, num_steps=3, num_draft_tokens=4, allow_shorter=True
+    )
+    validate_block_widths(
+        "DFLASH", 8, num_steps=1, num_draft_tokens=2, allow_shorter=True
+    )
+
+    with pytest.raises(ValueError, match=r"--speculative-num-steps 7"):
+        validate_block_widths("DSPARK", 7, num_steps=3, num_draft_tokens=4)
+    with pytest.raises(ValueError, match=r"at most"):
+        validate_block_widths(
+            "DSPARK", 7, num_steps=3, num_draft_tokens=5, allow_shorter=True
+        )
+    with pytest.raises(ValueError, match=r"at most"):
+        validate_block_widths(
+            "DSPARK", 7, num_steps=8, num_draft_tokens=9, allow_shorter=True
         )
 
 
@@ -249,6 +396,32 @@ def test_model_config_checks_explicit_widths_against_the_checkpoint() -> None:
     with pytest.raises(ValueError, match=r"--speculative-num-steps 7"):
         _apply_block_spec_widths(
             _spec_args("DFLASH", steps=8, draft_tokens=9, explicit=True), cfg, cfg
+        )
+
+
+def test_model_config_keeps_explicit_widths_shorter_than_the_checkpoint() -> None:
+    """K3.1 DSpark (block 7) launches at 3 drafts, as vLLM runs it."""
+    cfg = SimpleNamespace(block_size=7)
+    args = _spec_args("DSPARK", steps=3, draft_tokens=4, explicit=True)
+
+    assert _apply_block_spec_widths(args, cfg, cfg) == 7
+    assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (3, 4)
+
+    with pytest.raises(ValueError, match=r"at most --speculative-num-steps 7"):
+        _apply_block_spec_widths(
+            _spec_args("DSPARK", steps=8, draft_tokens=9, explicit=True), cfg, cfg
+        )
+
+
+def test_model_config_holds_deepseek_v41_dspark_to_its_block() -> None:
+    """Its drafter always drafts the whole checkpoint block."""
+    cfg = SimpleNamespace(
+        dspark_block_size=7, architectures=["DeepseekV41ForCausalLMDSpark"]
+    )
+
+    with pytest.raises(ValueError, match=r"requires --speculative-num-steps 7"):
+        _apply_block_spec_widths(
+            _spec_args("DSPARK", steps=3, draft_tokens=4, explicit=True), cfg, cfg
         )
 
 
@@ -352,6 +525,79 @@ def test_non_spec_archs_still_get_the_nextn_rewrite(tmp_path) -> None:
 
 
 # --------------------------------------------------------------------------
+# Speculators-format checkpoints
+# --------------------------------------------------------------------------
+
+
+def _speculators_config(**overrides) -> dict:
+    """A trimmed Inferact/Kimi-K3.1-Pro-DSpark config.json."""
+    config = {
+        "architectures": ["DSparkDraftModel"],
+        "speculators_model_type": "dspark",
+        "aux_hidden_state_layer_ids": [76, 80, 84, 88, 92],
+        "block_size": 7,
+        "mask_token_id": 163839,
+        "markov_rank": 512,
+        "markov_head_type": "vanilla",
+        "sample_from_anchor": True,
+        "sliding_window_non_causal": False,
+        "target_hidden_size": None,
+        "transformer_layer_config": {
+            "model_type": "qwen3",
+            "hidden_size": 7168,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 96,
+            "num_key_value_heads": 16,
+            "head_dim": 64,
+            "layer_types": ["sliding_attention"] * 5,
+            "sliding_window": 2048,
+            "use_sliding_window": True,
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "vocab_size": 163840,
+        },
+    }
+    config.update(overrides)
+    return config
+
+
+def test_speculators_dspark_config_maps_onto_dflash(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_speculators_config()))
+    config = get_config(str(tmp_path), trust_remote_code=False)
+    assert config.architectures == ["DSparkDraftModel"]
+    assert config.num_attention_heads == 96 and config.num_key_value_heads == 16
+    assert config.sliding_window == 2048
+    assert config.block_size == 7 and config.markov_rank == 512
+    # Hidden-states indices name the tapped layer plus one.
+    assert config.dflash_config == {
+        "mask_token_id": 163839,
+        "target_layer_ids": [75, 79, 83, 87, 91],
+        "causal": True,
+    }
+    assert block_draft_is_causal(config)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sample_from_anchor": False},
+        {
+            "transformer_layer_config": {
+                **_speculators_config()["transformer_layer_config"],
+                "layer_types": ["sliding_attention", "full_attention"] * 2
+                + ["full_attention"],
+            }
+        },
+    ],
+)
+def test_speculators_dspark_config_rejects_what_the_drafter_cannot_serve(
+    overrides,
+) -> None:
+    with pytest.raises(ValueError):
+        _convert_speculators_dspark_config(_speculators_config(**overrides))
+
+
+# --------------------------------------------------------------------------
 # Sliding-window geometry of a windowed DSpark draft
 # --------------------------------------------------------------------------
 
@@ -406,10 +652,15 @@ def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
         speculative_draft_model_quantization=None,
         trust_remote_code=True,
         revision=None,
+        draft_model_path_use_base=False,
+        speculative_draft_model_revision=None,
         max_model_len=262144,
         hf_overrides="{}",
+        decode_monokernel=False,
     )
-    target = SimpleNamespace(dtype=target_dtype)
+    target = SimpleNamespace(
+        dtype=target_dtype, hf_config=SimpleNamespace(architectures=[])
+    )
 
     with mock.patch.object(rank_setup, "ModelConfig") as model_config:
         rank_setup.load_model_config(server_args, "draft", draft_of=target)
@@ -458,6 +709,7 @@ def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
     )
     server_args.mapping.rank = 0
     model_config = SimpleNamespace(
+        draft_sample_from_anchor=algorithm == "DSPARK",
         hf_config=SimpleNamespace(layer_types=layer_types, sliding_window=1024),
         num_attention_layers=len(layer_types),
         context_len=4096,

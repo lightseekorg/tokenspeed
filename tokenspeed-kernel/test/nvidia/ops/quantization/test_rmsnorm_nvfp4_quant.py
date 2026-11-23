@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from fused_boundary_helpers import armed_mailbox, assert_child_keeps_waiting
+from fused_boundary_helpers import armed_blocks, assert_child_keeps_waiting
 from tokenspeed_kernel.ops.layernorm import affine_rmsnorm
 from tokenspeed_kernel.ops.quantization import rmsnorm_nvfp4_quant
 from tokenspeed_kernel.platform import current_platform
@@ -54,7 +54,7 @@ def test_rmsnorm_nvfp4_quant_matches_norm_then_flashinfer_bitwise(
     scale = torch.tensor([global_scale], device=device, dtype=torch.float32)
     normalized = affine_rmsnorm(x, weight, eps, offset, x.dtype)
     args = (weight, eps, offset, scale, None)
-    packed, scales = rmsnorm_nvfp4_quant(x, *args, False, None)
+    packed, scales = rmsnorm_nvfp4_quant(x, *args, False)
     ref_packed, ref_scales = fp4_quantize(
         normalized, scale, is_sf_swizzled_layout=False
     )
@@ -62,9 +62,9 @@ def test_rmsnorm_nvfp4_quant_matches_norm_then_flashinfer_bitwise(
     assert torch.equal(scales, ref_scales.view(rows, width // 16))
     # The scale storage keeps the round_up(rows, 16) tail an MoE consumer may read.
     assert scales.untyped_storage().nbytes() == (rows + 15) // 16 * width
-    pdl_packed, pdl_scales = rmsnorm_nvfp4_quant(x, *args, True, None)
+    pdl_packed, pdl_scales = rmsnorm_nvfp4_quant(x, *args, True)
     assert torch.equal(pdl_packed, packed) and torch.equal(pdl_scales, scales)
-    assert rmsnorm_nvfp4_quant(x[:0], *args, False, None)[0].shape == (0, width // 2)
+    assert rmsnorm_nvfp4_quant(x[:0], *args, False)[0].shape == (0, width // 2)
 
 
 @pytest.mark.parametrize("device", ["cuda"])
@@ -80,56 +80,20 @@ def test_a_mailbox_row_keeps_the_plain_path_s_summation_order(device: str) -> No
         x = (torch.randn(rows, width, device=device) * 0.75).to(torch.bfloat16)
         weight = (torch.randn(width, device=device) * 0.5).to(torch.bfloat16)
         args = (weight, 1e-5, 1.0, scale)
-        plain = rmsnorm_nvfp4_quant(x, *args, None, True, None)
+        plain = rmsnorm_nvfp4_quant(x, *args, None, True)
         # Capacity past the batch: the tail must stay armed and untouched.
-        mailbox = armed_mailbox(x, rows + 8)
-        got = rmsnorm_nvfp4_quant(
-            mailbox[:rows], *args, HALF_POLLED_SENTINEL, True, None
-        )
+        mailbox = armed_blocks(x, rows + 8, 4)
+        got = rmsnorm_nvfp4_quant(mailbox[:, :rows], *args, HALF_POLLED_SENTINEL, True)
         for ours, theirs in zip(got, plain, strict=True):
             assert torch.equal(ours, theirs)
         assert (mailbox.view(torch.int32) == -1).all()
-    with pytest.raises(ValueError, match="contiguous"):
+    with pytest.raises(ValueError, match="contiguous blocks"):
         rmsnorm_nvfp4_quant(
-            torch.zeros(2, 8192, device=device, dtype=torch.bfloat16)[:, :4096],
+            torch.zeros(4, 2, 2048, device=device, dtype=torch.bfloat16)[..., :1024],
             *args,
             HALF_POLLED_SENTINEL,
             False,
-            None,
         )
-
-
-@pytest.mark.parametrize("device", ["cuda"])
-@pytest.mark.parametrize("rows", [1, 8, 64])
-def test_a_mailbox_row_publishes_this_ranks_block_before_polling(
-    device: str, rows: int
-) -> None:
-    """The kernel stores this rank's block itself: the bits of a mailbox the producer filled."""
-    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
-        HALF_POLLED_SENTINEL,
-        MailboxPublish,
-    )
-
-    width, shard, rank = 4096, 1024, 2
-    columns = slice(rank * shard, (rank + 1) * shard)
-    torch.manual_seed(5)
-    x = (torch.randn(rows, width, device=device) * 0.75).to(torch.bfloat16)
-    weight = (torch.randn(width, device=device) * 0.5).to(torch.bfloat16)
-    args = (weight, 1e-5, 1.0, torch.tensor([1.0], device=device))
-    plain = rmsnorm_nvfp4_quant(x, *args, None, True, None)
-    mailbox = armed_mailbox(x, rows + 8)
-    mailbox[:rows, columns].view(torch.int32).fill_(-1)
-    publish = MailboxPublish(
-        x[:, columns].contiguous(), mailbox[:rows, columns], columns.start
-    )
-    got = rmsnorm_nvfp4_quant(
-        mailbox[:rows], *args, HALF_POLLED_SENTINEL, True, publish
-    )
-    for ours, theirs in zip(got, plain, strict=True):
-        assert torch.equal(ours, theirs)
-    assert (mailbox.view(torch.int32) == -1).all()
-    with pytest.raises(ValueError, match="only a mailbox"):
-        rmsnorm_nvfp4_quant(x, *args, None, True, publish)
 
 
 _QUANT_WAITER = """
@@ -137,9 +101,9 @@ from tokenspeed_kernel.ops.quantization import rmsnorm_nvfp4_quant
 row = torch.full((1, 4096), 0.5, dtype=torch.bfloat16, device=device)
 weight = torch.ones(4096, dtype=torch.bfloat16, device=device)
 scale = torch.tensor([0.7], device=device)
-mailbox = torch.empty(2, 4096, dtype=torch.bfloat16, device=device)
+mailbox = torch.empty(4, 1, 1024, dtype=torch.bfloat16, device=device)
 def consume():
-    rmsnorm_nvfp4_quant(mailbox[:1], weight, 1e-5, 1.0, scale, HALF_POLLED_SENTINEL, True, None)
+    rmsnorm_nvfp4_quant(mailbox, weight, 1e-5, 1.0, scale, HALF_POLLED_SENTINEL, True)
 """
 
 

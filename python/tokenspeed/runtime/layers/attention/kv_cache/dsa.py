@@ -26,12 +26,13 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     index_k_layernorm_fp8_scatter_and_quantize_query,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_block_split_scatter,
     index_k_layernorm_fp8_scatter,
     index_k_layernorm_scatter,
+    quantize_index_k_rows,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     index_k_plane_dtype,
@@ -68,8 +69,9 @@ def split_index_k_rows(
 
     Returns:
         ``fp8_scaled``: ``[rows, index_head_dim]`` uint8 FP8 keys and
-        ``[rows, groups]`` fp32 scales. ``bf16``: ``[rows, index_head_dim]``
-        bf16 keys and ``None``.
+        ``[rows, groups]`` scale words in the plane's encoding
+        (``tokenspeed_kernel.ops.kvcache.index_k_scale``). ``bf16``: ``[rows,
+        index_head_dim]`` bf16 keys and ``None``.
     """
     row_bytes = index_k_row_bytes(index_head_dim, index_k_format)
     if packed.dim() != 2 or packed.dtype != torch.uint8:
@@ -82,19 +84,27 @@ def split_index_k_rows(
     if index_k_format == "fp8_scaled":
         return (
             packed[:, :index_head_dim],
-            packed[:, index_head_dim:].view(torch.float32),
+            packed[:, index_head_dim:].view(index_k_scale_dtype()),
         )
+    if index_k_format == "mxfp4":
+        raise NotImplementedError("no top-k leaf takes mxfp4 workspace rows")
     return packed.view(index_k_plane_dtype(index_k_format)), None
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
+    # The plane's format (configs/dsa.py INDEX_K_FORMATS); a uint8 plane is
+    # fp8_scaled or mxfp4, which its dtype does not tell apart.
+    index_k_format: str = "fp8_scaled"
+
     def __init__(
         self,
         *args,
         index_head_dim: int,
+        index_k_format: str = "fp8_scaled",
         **kwargs,
     ):
         self.index_head_dim = int(index_head_dim)
+        self.index_k_format = index_k_format
         super().__init__(*args, **kwargs)
 
     layer_plane_bindings: ClassVar[dict[str, str]] = {
@@ -155,20 +165,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"{plane_dtype} of index_k_format={index_k_format!r}"
             )
         head_dim = self.index_head_dim
-        if index_k_format != "fp8_scaled":
+        if index_k_format not in ("fp8_scaled", "mxfp4"):
             # A plain plane: the row is the key's bytes.
             return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
         page_size = self.index_k_page_size
         row_bytes = index_k_row_bytes(head_dim, index_k_format)
-        scale_bytes = row_bytes - head_dim
+        code_bytes = head_dim if index_k_format == "fp8_scaled" else head_dim // 2
+        scale_bytes = row_bytes - code_bytes
         page_bytes = page_size * row_bytes
         num_pages = buf.numel() // page_bytes
         pages = buf.reshape(-1)[: num_pages * page_bytes].view(num_pages, page_bytes)
-        fp8 = pages[:, : page_size * head_dim].view(num_pages, page_size, head_dim)
-        scale = pages[:, page_size * head_dim :].view(num_pages, page_size, scale_bytes)
+        codes = pages[:, : page_size * code_bytes].view(
+            num_pages, page_size, code_bytes
+        )
+        scale = pages[:, page_size * code_bytes :].view(
+            num_pages, page_size, scale_bytes
+        )
         page = torch.div(slots, page_size, rounding_mode="floor")
         offset = slots - page * page_size
-        return torch.cat((fp8[page, offset], scale[page, offset]), dim=1)
+        return torch.cat((codes[page, offset], scale[page, offset]), dim=1)
 
     def set_index_k_buffer(
         self,
@@ -189,6 +204,26 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """
         # Wait for the layer's Host load: a tail hit loads these rows' whole page.
         buf = self.get_index_k_buffer(layer_id)
+        if self.index_k_format == "mxfp4":
+            # The fused LayerNorm write is mxfp4's only quantizer.
+            if key_norm is None or index_k.dtype != self.model_dtype:
+                raise NotImplementedError(
+                    "mxfp4 index-K writes take the model-dtype pre-norm keys "
+                    "and their LayerNorm"
+                )
+            index_k_layernorm_fp8_scatter(
+                buf,
+                index_k.view(-1, self.index_head_dim),
+                key_norm.weight,
+                key_norm.bias,
+                loc,
+                eps=key_norm.variance_epsilon,
+                page_size=self.index_k_page_size,
+                group_size=32,
+                write_mask=write_mask,
+                index_k_format="mxfp4",
+            )
+            return
         if key_norm is not None:
             if buf.dtype == torch.bfloat16:
                 index_k_layernorm_scatter(
@@ -232,13 +267,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"index-K plane dtype {buf.dtype} has no write path: uint8 "
                 "(fp8_scaled) or bfloat16 (bf16)"
             )
-        index_k_fp8, index_k_scale = quantize_fp8(
-            index_k,
-            granularity="token_group",
-            group_size=_INDEX_K_FP8_GROUP_SIZE,
-            scale_encoding="float32",
+        index_k_fp8, index_k_scale = quantize_index_k_rows(
+            index_k, group_size=_INDEX_K_FP8_GROUP_SIZE
         )
-
         # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
         index_k_block_split_scatter(
             buf,
@@ -287,6 +318,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ``softmax_scale``.
         """
         buf = self.get_index_k_buffer(layer_id)
+        if self.index_k_format == "mxfp4":
+            raise ValueError("the fused index-K write takes an fp8_scaled plane")
         if buf.dtype != torch.uint8 or index_k.dtype != self.model_dtype:
             raise ValueError(
                 f"the fused index-K write takes {self.model_dtype} keys into a "

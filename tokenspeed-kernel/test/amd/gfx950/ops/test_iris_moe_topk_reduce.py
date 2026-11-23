@@ -22,6 +22,7 @@
 MoE's top-k slot rows."""
 
 import socket
+from contextlib import nullcontext
 from datetime import timedelta
 
 import pytest
@@ -29,6 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_amd, reason="Iris requires AMD ROCm"
@@ -67,6 +69,9 @@ def _check_topk_reduce(
 ) -> None:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
         prepare_k3_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.moe_reduce import (
+        iris_k3moe_lamport_allreduce_topk,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
         gluon_mxfp4_moe_stage2_reduce_kernel,
@@ -135,9 +140,15 @@ def _check_topk_reduce(
         return state.reduce_moe(outputs, routed_partials=slots)
 
     # Plain and partial-sum reduces share mailbox tiles: interleave one- and two-shot.
+    # The one-shot reuses its first launch's binary as the rows vary.
     for seed, rows in enumerate((4, 1, 8, 7, 64, 6, 16, 3, 2, 32, 5, 10, 4, 48)):
         expected = [t.clone() for t in separate(rows, seed)]
-        result = fused(rows, seed)
+        with (
+            assert_no_triton_compile(iris_k3moe_lamport_allreduce_topk)
+            if seed and rows <= state.lamport_max_rows
+            else nullcontext()
+        ):
+            result = fused(rows, seed)
         for got, want in zip(result, expected, strict=True):
             assert torch.equal(got, want)
 

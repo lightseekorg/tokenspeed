@@ -1,5 +1,67 @@
 # Communication kernels
 
+## Peer buffers across nodes
+
+Native shared-buffer collectives and fused TP projections support cross-node
+NVLink fabric. Call `gather_fabric_map()` during distributed setup. Shared buffers
+use CUDA IPC locally and symmetric memory across nodes; release them collectively
+only after all graphs and stream consumers finish.
+
+## Row reduce-scatter and multicast rows
+
+`triton.row_reduce_scatter` sums a set of rows of every rank's BF16 partial,
+held in a Triton RS/AG state's symmetric buffer, after a barrier over the
+group: each listed row adds the ranks' rows in FP32 rank order from +0.0 and
+rounds once. `triton.MulticastRows` is a symmetric buffer every rank
+receives: a rank stores its rows through the multicast view, a barrier waits
+for every rank's stores, and the local view reads them. Together they carry
+a sequence-parallel layer: reduce a rank's share of the rows (plus the few
+rows every rank needs), work on that share, and store the result to every
+rank. Each uses channel 0 of its own buffer's signal pad for its barrier.
+
+## Plain all-reduce through FlashInfer BT
+
+`flashinfer_all_reduce` (`allreduce_fusion.py`, SM100 and newer) runs
+FlashInfer's BT ("owner reduce") protocol without norm or residual: every rank
+publishes each token's row to the token's owner rank, the owner sums the ranks
+in order 0..7 in fp32, rounds once to BF16, and multicasts the sum, so every
+rank holds the rank-ordered fp32 fold. It uses FlashInfer's GB300 TP8 H7168
+presets (the first through 256 rows, the second above), so it is offered for
+8 ranks at width 7168 only.
+
+The workspace all-reduce (`trtllm_workspace_allreduce`) arms it beside the
+mnnvl workspace, at the same row capacity, and sends a plain BF16 reduction
+there when its payload is at least `PLAIN_ALL_REDUCE_MIN_BYTES` (1 MiB) per
+rank; smaller payloads keep the Lamport one-shot and two-shot kernels, which
+sum in BF16. The `fp32_acc` fold and early-release calls (`allreduce_sconv`,
+which relies on the Lamport release point) stay on Lamport too.
+The route reads only terms every rank shares, so a misaligned tensor raises
+rather than sending one rank down the other protocol. Measured on 2
+GB300 nodes (TP8 across one NVLink domain), BF16 [rows, 7168], CUDA graph of
+20 back-to-back calls / with a 256 MB L2 flush before each call, us:
+
+| rows | Lamport one/two-shot | BT | NVLS `ld_reduce` prototype |
+|-----:|---------------------:|---:|---------------------------:|
+| 8    | 5.7 / 5.7            | 6.5 / 8.4   | 11.5 / 13.6 |
+| 64   | 8.4 / 9.2            | 7.9 / 9.2   | 12.7 / 14.2 |
+| 128  | 10.8 / 11.8          | 10.2 / 11.3 | 14.1 / 15.9 |
+| 256  | 18.4 / 19.6          | 15.4 / 15.9 | 18.0 / 20.1 |
+| 512  | 32.0 / 33.8          | 25.0 / 26.0 | 29.1 / 31.5 |
+| 2048 | 106.7 / 107.5        | 83.9 / 83.9 | 90.8 / 96.6 |
+
+The in-switch reduction (`multimem.ld_reduce` into every rank's buffer after a
+cross-rank barrier, results received by polling) was prototyped and lost: its
+barrier and load round trips cost about 6 us before any data moves, and on this
+fabric `.acc::f32` did not give one rounding (14% of sums of exactly
+representable inputs differed from the rounded exact sum). FlashInfer's own
+in-switch protocol (HT, with a hand-picked tuning: FlashInfer publishes no TP8
+H7168 HT preset) also trails BT here, both with the RMSNorm epilogue: 32.6
+against 26.4 us at 512 rows.
+
+The workspace holds about 176 MB of symmetric memory per rank at 2048 rows
+(three Lamport generations of the publish and result mailboxes) and compiles
+its kernels when it is armed, before graph capture.
+
 ## Paged-row all-gather
 
 `cute_dsl_paged_row_all_gather` (SM100 and SM103: GB200, GB300) all-gathers
@@ -89,7 +151,7 @@ wait across ranks inside the kernel (MegaMoE, fused DP projections, or DeepEP
 low-latency): each side can occupy what the other waits on. The runtime keeps
 the NCCL all-gather when one of them is configured.
 Cross-rank kernels whose CTAs pair up by index across ranks — NCCL, one-shot
-or two-shot multimem, and Lamport all-reduces, including PyTorch's multimem
+or two-shot multimem, and Lamport all-reduces, including the staged multimem
 all-reduce — run alongside: they rely on CTAs being dispatched by index, as
 NCCL's ring kernels already do, not on a CUDA guarantee.
 
@@ -137,3 +199,78 @@ same hand-offs for their buffers. Neither document says at which scope a
 task-boundary fence orders writes across domains: that link is not documented,
 and the evidence for it is empirical (byte-exact gathers over long runs with
 concurrent compute and collectives, on GB300).
+
+## Staged multimem all-reduce
+
+`multimem.py` keeps one symmetric BF16 buffer per row width and group.
+`multimem_stage` copies a tensor into it; a producer that can write in place
+(the Kimi-K3 o-projection GEMM) takes `multimem_view` instead and skips the
+copy. `multimem_all_reduce_staged` then sums the rows in one Triton kernel:
+each rank sums a contiguous share of the 16-byte vectors with
+`multimem.ld_reduce` and stores the sum to every copy with `multimem.st`,
+between two CTA barriers on the handle's signal pads. Up to 32 CTAs run it;
+on 8 GB300s over two nodes a [8192, 7168] sum takes 260 us there and 291 us at
+8 CTAs, where NCCL takes 364 us. The result lives in the buffer until the next
+stage or view of that width.
+
+## Fused GEMM + reduce-scatter
+
+`cute_dsl_gemm_reduce_scatter` (SM100 and SM103) computes this rank's row
+block of `reduce_scatter(x @ weight.T)` for BF16 operands in one persistent
+kernel, NVIDIA CUTLASS's CuTe DSL example vendored under
+`thirdparty/cute_dsl/gemm_reduce_scatter`. Each rank stores its BF16 partial
+tiles in symmetric memory and signals the tile's owner; the owner sums all
+ranks' tiles with `multimem.ld_reduce` (FP32 accumulation in the switch, one
+rounding, ties possibly broken either way) while the remaining tiles compute.
+`create_gemm_reduce_scatter_state` is collective and compiles once with dynamic
+rows before graph capture; it needs NVLink multicast. Row blocks pad to the
+128-row tile. A barrier before each call keeps a peer's exit-flag reset from
+racing a call with another row count. The runtime's scatter projections use it
+above the Lamport reduce-scatter's rows. Projecting 8192 rows of 2048 channels
+per rank into 8192 outputs over four GB200s takes 229 us against 406 us for
+the GEMM and NCCL's reduce-scatter.
+
+## One-hop LL exchange
+
+`cute_dsl_ll_all_gather` and `cute_dsl_ll_all_to_all` (SM100 and SM103) move
+small payloads in one kernel without a flag or a fence: every rank stores each
+16-byte unit as four 64-bit LL elements (a payload word in the low half, the
+call's epoch in the high half) straight into the receiver's slot of one
+symmetric workspace, through the multicast address for an all-gather and with
+one store per peer otherwise; the receiver loads the elements until each
+carries the epoch. An aligned 64-bit element is single-copy atomic, so any
+payload bits pass and the output is byte-identical to NCCL's. Two parity slots
+alternate between calls: a rank writes a slot again only after receiving its
+peers' next call, which each sends after finishing the previous one. A 64-bit
+call count in device memory picks the parity and derives each call's 32-bit
+epoch, which skips 0, the zeroed workspace's, so an element no call wrote never
+matches; CUDA graph replays need no host state.
+
+`create_ll_exchange_state` is collective, votes every refusal (SM100 or SM103,
+2, 4 or 8 ranks, a capacity that is a multiple of 16, a reachable fabric) and
+reserves `4 * ranks * cap_bytes` of symmetric memory before the KV cache is
+sized. Calls on a group run in the same order on every rank and never
+overlap one another; every wait is bounded by the state's timeout and traps.
+The runtime prepares one per KVP group (`prepare_small_exchange`), and
+`AutoBackend` routes fitting `all_gather_single`, equal-split
+`all_to_all_single` and `all_gather` calls to it (on a multicast group, an
+`all_gather` the all-reduce workspace does not serve); the NCCL-only switch
+keeps NCCL. On 8 GB300s over two nodes a
+64 KiB per-rank all-gather takes 6.9 us against NCCL's 23.4 us and a 1 MiB
+all-to-all 30 us against 37 us; NCCL wins from about 4 MiB.
+
+`cute_dsl_ll_all_gather_floats` gathers float words (FP32, BF16 pairs, or E4M3
+bytes) at half those bytes: each word travels as itself into a second
+workspace whose slots start armed with `0xFFFFFFFF`. A sender stores that word
+as `0x7FFFFFFF`, a NaN either way as one FP32, as a BF16 pair's high half, and
+as an E4M3 byte, and the receiver polls each 16-byte unit until none of its
+words is armed, then re-arms it. Its own call count and parity slots order its
+calls as described earlier, and its workspace holds
+`2 * ranks * float_cap_bytes`; a `float_cap_bytes` of 0 allocates none. A
+gather of 256 KiB per rank or more runs on every SM, a smaller one on 64 CTAs.
+`AutoBackend.all_gather_float_words_single` takes it where it serves the size;
+the owned decode top-k gathers its scores and query rider through it, so the
+KVP decode prepares it only for DSA models. On 8 GB300s over two nodes a
+per-rank gather of 120 KiB takes 6.7 us (NCCL 23.6 us), 944 KiB 18.1 us
+(46.3 us), 1.84 MiB 31.5 us (47.7 us), 3.69 MiB 59.4 us (72.2 us), and
+7.38 MiB 124 us (137 us).

@@ -39,6 +39,7 @@ def _spec(group_id, attn_kind, sliding_window_tokens):
         group_id=group_id,
         attn_kind=attn_kind,
         sliding_window_tokens=sliding_window_tokens,
+        sink_tokens=0,
     )
 
 
@@ -157,20 +158,43 @@ class TestBlockDrafterStorageTest:
         )
         check_block_drafter_storage(self._bound_draft(FULL), target)
 
-    def test_target_without_a_full_history_group_is_rejected(self):
-        # The plan gave the draft a full_attention group of its own; no
-        # target layer lives there, so there is nothing to borrow.
+    def test_draft_owned_full_history_is_accepted(self):
         target = _pool(
             {0: SWA},
             (_spec(SWA, "sliding_window", 128), _spec(FULL, "full_history", None)),
         )
-        with pytest.raises((ValueError), match=("must share a full-history group")):
-            check_block_drafter_storage(self._bound_draft(FULL), target)
+        check_block_drafter_storage(self._bound_draft(FULL), target)
 
-    def test_sliding_target_group_is_rejected(self):
+    def test_draft_owned_sliding_group_is_accepted(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        spec = CacheGroupSpec(
+            "draft_swa",
+            "sliding_window",
+            128,
+            1,
+            1024,
+            sink_tokens=16,
+            replayable=False,
+        )
+        draft = self._bound_draft("draft_swa")
+        draft.attns[0].sliding_window_sink = 16
+        check_block_drafter_storage(draft, _pool({0: FULL}, (spec,)))
+
+    def test_sliding_target_group_with_insufficient_window_is_rejected(self):
         target = _pool({0: SWA}, (_spec(SWA, "sliding_window", 128),))
-        with pytest.raises((ValueError), match=("must share a full-history group")):
+        with pytest.raises(ValueError, match="retains only a 128-token window"):
             check_block_drafter_storage(self._bound_draft(SWA), target)
+
+    def test_insufficient_sink_retention_is_rejected(self):
+        draft = self._bound_draft(SWA)
+        draft.attns[0].sliding_window_sink = 16
+        with pytest.raises(ValueError, match="needs 16 sink tokens"):
+            check_block_drafter_storage(
+                draft, _pool({}, (_spec(SWA, "sliding_window", 1024),))
+            )
 
 
 class TestHistoryGroupByLayerOverRealPlanTest:

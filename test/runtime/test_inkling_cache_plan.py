@@ -88,6 +88,7 @@ def _setup(tp: int, kv_cache_dtype: torch.dtype, mxfp8: bool, budget_bytes: int)
         kernel_page_size=64,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
     )
     recipe = cache_recipe(
         "inkling",
@@ -185,7 +186,8 @@ def test_rows_wider_than_the_kv_planes_take_one_plane_each():
 
 
 def test_hidden_checkpoints_in_distinct_parents_are_disjoint():
-    setup, attn, text = _setup(4, torch.bfloat16, False, 256 << 20)
+    # Enough parents for the scheduler's per-request reservations at max_bs=4.
+    setup, attn, text = _setup(4, torch.bfloat16, False, 1 << 30)
     plan = setup.spec.memory_plan
     arena = create_cache_arena(setup.spec, device="cpu", enable_memory_saver=False)
     pool = create_cache_pool(

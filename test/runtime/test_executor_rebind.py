@@ -37,6 +37,9 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.execution import model_executor as module  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
+    TorchMemorySaverAdapter,
+)
 
 
 def _pool(tag, *, attn_kind="full_history"):
@@ -75,6 +78,7 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     executor.config = SimpleNamespace(
         spec_algo=None,
         enforce_eager=False,
@@ -203,8 +207,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     seen = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
-    # A drafter's own prefill graph does not wait for the extend-graph switch.
-    executor.config = SimpleNamespace(enable_drafter_prefill_graph=False)
+    executor.config = SimpleNamespace(enable_cudagraph_gc=False)
     executor.forward_step = SimpleNamespace(
         disable=False,
         stream="stream",
@@ -212,6 +215,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     )
     executor.prefill_graph = SimpleNamespace(
         disable=False,
+        capture_buckets=[16],
         capture=lambda wrapper, *, entries, observer: seen.append(
             ("prefill", entries, observer, wrapper)
         ),
@@ -221,6 +225,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
         capture_prefill_graph=lambda stream, window: seen.append(
             ("drafter", stream, window)
         ),
+        extend_graph_plan=lambda token_buckets: {},
     )
     monkeypatch.setattr(
         module, "workspace_pool", lambda _d: SimpleNamespace(freeze=lambda: None)

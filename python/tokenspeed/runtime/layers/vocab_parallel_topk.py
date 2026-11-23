@@ -151,7 +151,9 @@ class VocabParallelTopK:
 
         The vendored TensorRT-LLM kernel takes the ``[rows, vocab/tp]``
         top-16 in one pass. Probed here, at the widest row count, so its
-        scratch arena is allocated before the caller is ever captured.
+        scratch arena is allocated before the caller is ever captured. Then
+        run at every smaller row count: the row count picks the kernel's
+        chunking, and each chunking compiles on first use.
 
         Args:
             num_cols: Columns in this rank's vocabulary shard.
@@ -190,6 +192,8 @@ class VocabParallelTopK:
                 "torch.topk",
             )
             return None
+        for rows in range(1, self.max_rows):
+            runner.forward(probe[:rows], lens[:rows], self.top_k, 1, return_val=True)
         return runner
 
     def _shard_topk(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -302,7 +306,10 @@ class VocabParallelTopK:
                 vocab_start,
                 staged,
                 softcap=None,
+                softcap_form=None,
                 vocab_mask=None,
+                values_out=None,
+                halo_out=None,
             )
         else:
             if self.logit_scale is not None:

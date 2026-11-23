@@ -79,6 +79,7 @@ def test_tile_32_filter_accepts_ffi_arrays():
 
 
 _QWEN38 = dict(top_k=10, num_local_experts=128, intermediate_size=640, num_experts=512)
+_QWEN38_TP1 = {**_QWEN38, "num_local_experts": 512}
 _KIMI_K3 = dict(top_k=16, num_local_experts=896, intermediate_size=384, num_experts=896)
 
 
@@ -124,6 +125,7 @@ def _input_shapes(inputs):
         (4, 2560, "E2m1", True),
         (32, 2560, "E2m1", True),
         (33, 2560, "E2m1", False),
+        (128, 2560, "E2m1", False),
         (4, 4096, "E2m1", False),
         (4, 2560, "Bfloat16", False),
     ],
@@ -146,6 +148,40 @@ def test_tactic_cache_key_changes_only_for_target_shape(
         upstream_extras,
     )
     policy = (*upstream_extras, _CLUSTER_POLICY_TAG)
+    if targeted:
+        assert key.extras == (*policy, "tokenspeed-qwen38-tile32-v1")
+    else:
+        assert key.extras == policy
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "weight_dtype", "geometry", "targeted"),
+    [
+        (64, 2560, "E2m1", _QWEN38_TP1, False),
+        (128, 2560, "E2m1", _QWEN38_TP1, True),
+        (256, 2560, "E2m1", _QWEN38_TP1, True),
+        (512, 2560, "E2m1", _QWEN38_TP1, True),
+        (768, 2560, "E2m1", _QWEN38_TP1, False),
+        (1024, 2560, "E2m1", _QWEN38_TP1, False),
+        (128, 2560, "Bfloat16", _QWEN38_TP1, False),
+        (128, 2560, "E2m1", {**_QWEN38_TP1, "num_local_experts": 256}, False),
+        (128, 2560, "E2m1", {**_QWEN38_TP1, "num_local_experts": 384}, False),
+        (128, 2048, "E2m1", {**_QWEN38_TP1, "intermediate_size": 512}, False),
+        (128, 2560, "E2m1", {**_QWEN38_TP1, "top_k": 8}, False),
+    ],
+)
+def test_qwen38_tp1_decode_policy_tags_only_its_buckets(
+    num_tokens, hidden_size, weight_dtype, geometry, targeted
+):
+    core, runner, inputs, _, _ = _moe_runner_and_inputs(
+        num_tokens, hidden_size, weight_dtype, geometry
+    )
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    extras = runner.get_cache_key_extras(inputs)
+    key = core.AutoTuner._get_cache_key(
+        "test_moe", runner, _input_shapes(inputs), autotuner.TuningConfig(), extras
+    )
+    policy = (*extras, _CLUSTER_POLICY_TAG)
     if targeted:
         assert key.extras == (*policy, "tokenspeed-qwen38-tile32-v1")
     else:
@@ -199,6 +235,21 @@ def _is_blackwell():
 def test_valid_tactics_apply_the_target_policy(num_tokens, hidden_size, targeted):
     _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
         num_tokens, hidden_size, "E2m1"
+    )
+    expected = [tactics[1]] if targeted else tactics
+    assert runner.get_valid_tactics(inputs, None) == expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_blackwell(),
+    reason="the cluster filter reads the Blackwell TRT-LLM MoE module's kernel list",
+)
+@pytest.mark.parametrize(
+    ("num_tokens", "targeted"), [(64, False), (128, True), (1024, False)]
+)
+def test_qwen38_tp1_decode_valid_tactics_keep_tile_32(num_tokens, targeted):
+    _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
+        num_tokens, 2560, "E2m1", _QWEN38_TP1
     )
     expected = [tactics[1]] if targeted else tactics
     assert runner.get_valid_tactics(inputs, None) == expected
@@ -333,6 +384,18 @@ def test_serving_lookup_uses_mapped_profile_for_policy_tag():
     )
     assert key.nearest_profile[hidden_index][0] == 32
     assert key.extras[-1] == "tokenspeed-qwen38-tile32-v1"
+    profile_shapes = list(key.nearest_profile)
+    profile_shapes[hidden_index] = (64, 2560)
+    explicit = core.AutoTuner._get_cache_key(
+        "test_moe",
+        runner,
+        _input_shapes(inputs),
+        config,
+        runner.get_cache_key_extras(inputs),
+        nearest_profile=tuple(profile_shapes),
+    )
+    assert explicit.nearest_profile[hidden_index][0] == 64
+    assert "tokenspeed-qwen38-tile32-v1" not in explicit.extras
 
 
 def test_cache_key_hook_preserves_stock_runner_keys():

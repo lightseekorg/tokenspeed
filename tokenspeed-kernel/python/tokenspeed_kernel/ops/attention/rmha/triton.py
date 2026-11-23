@@ -337,7 +337,7 @@ def _rel_mha_prefill_fwd(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_kv_splits"])
 def _rel_mha_decode_stage1_kernel(
     Q,
     Rel_Logits,
@@ -395,7 +395,7 @@ def _rel_mha_decode_stage1_kernel(
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = num_kv_splits
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
@@ -486,7 +486,7 @@ def _rel_mha_decode_stage1_kernel(
         tl.store(Att_Lse + offs_mid_lse, e_max + tl.log(e_sum))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_kv_splits"])
 def _rel_mha_decode_grouped_stage1_kernel(
     Q,
     Rel_Logits,
@@ -526,7 +526,11 @@ def _rel_mha_decode_grouped_stage1_kernel(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
     REL_EXTENT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
     cur_q = tl.program_id(0)
     cur_batch = cur_q // MAX_SEQLEN_Q
     q_pos = cur_q - cur_batch * MAX_SEQLEN_Q
@@ -534,12 +538,10 @@ def _rel_mha_decode_grouped_stage1_kernel(
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
 
-    if BLOCK_H < kv_group_num:
-        VALID_BLOCK_H: tl.constexpr = BLOCK_H
-    else:
-        VALID_BLOCK_H: tl.constexpr = kv_group_num
-    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    # Each tile stays inside one KV group, including a partial final tile.
+    group_tile = cur_head_id % tl.cdiv(kv_group_num, BLOCK_H)
+    cur_head = cur_kv_head * kv_group_num + group_tile * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = cur_head < (cur_kv_head + 1) * kv_group_num
     mask_h &= cur_head < q_head_num
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -554,7 +556,7 @@ def _rel_mha_decode_grouped_stage1_kernel(
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = num_kv_splits
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
@@ -652,11 +654,12 @@ def _rel_mha_decode_grouped_stage1_kernel(
         tl.store(Att_Lse + offs_mid_lse, e_max + tl.log(e_sum), mask=mask_h)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_kv_splits"])
 def _rel_mha_decode_stage2_kernel(
     Mid_O,
     Mid_Lse,
     Out,
+    LSE,
     cache_seqlens,
     num_kv_splits,
     stride_mid_ob,
@@ -672,7 +675,12 @@ def _rel_mha_decode_stage2_kernel(
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
+    HAS_LSE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     cur_q = tl.program_id(0)
     cur_batch = cur_q // MAX_SEQLEN_Q
     q_pos = cur_q - cur_batch * MAX_SEQLEN_Q
@@ -684,7 +692,7 @@ def _rel_mha_decode_stage2_kernel(
     cur_batch_seq_len = (
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = num_kv_splits
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
@@ -716,43 +724,51 @@ def _rel_mha_decode_stage2_kernel(
 
     tl.store(
         Out + cur_q * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum,
+        tl.where(e_sum > 0, acc / tl.maximum(e_sum, 1.0e-30), 0.0),
         mask=mask_d,
     )
+    if HAS_LSE:
+        lse = tl.where(e_sum > 0, e_max + tl.log(e_sum), -float("inf"))
+        tl.store(LSE + cur_q * tl.num_programs(1) + cur_head, lse)
 
 
 def _decode_split_count(max_seqlen_k: int, window_left: int) -> int:
     if window_left >= 0:
+        # One split per 128 window tokens: small-batch windowed decode is
+        # latency-bound, and a 1024-token window runs about 25% faster on
+        # B300 with 9 splits than with 4.
         effective_len = max(1, min(max_seqlen_k, window_left + 1))
-        return min(4, max(1, triton.cdiv(effective_len, 128)))
+        return min(16, max(1, triton.cdiv(effective_len, 128)))
     return min(32, max(1, triton.cdiv(max(1, max_seqlen_k), 2048)))
 
 
 def _rel_mha_decode_fwd(
-    q,
-    rel_logits,
-    k_buffer,
-    v_buffer,
-    out,
-    page_table,
-    cache_seqlens,
-    attn_logits,
-    attn_lse,
-    num_kv_splits,
-    max_kv_splits,
-    max_seqlen_q,
-    page_table_stride_b,
-    page_size,
-    window_left,
-    sm_scale,
-):
+    q: torch.Tensor,
+    rel_logits: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    out: torch.Tensor,
+    output_lse: torch.Tensor | None,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    attn_logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    num_kv_splits: int,
+    max_kv_splits: int,
+    max_seqlen_q: int,
+    page_table_stride_b: int,
+    page_size: int,
+    window_left: int,
+    sm_scale: float,
+    enable_pdl: bool,
+) -> None:
     block_n = page_size
     head_dim = k_buffer.shape[-1]
     value_dim = v_buffer.shape[-1]
     block_dmodel = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(value_dim)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
-    block_h = min(8, kv_group_num)
+    block_h = min(8, triton.next_power_of_2(kv_group_num))
 
     num_stages = 1
 
@@ -799,7 +815,7 @@ def _rel_mha_decode_fwd(
     else:
         stage1_grid = (
             q.shape[0],
-            triton.cdiv(q.shape[1], min(block_h, kv_group_num)),
+            k_buffer.shape[1] * triton.cdiv(kv_group_num, block_h),
             max_kv_splits,
         )
         _rel_mha_decode_grouped_stage1_kernel[stage1_grid](
@@ -839,8 +855,10 @@ def _rel_mha_decode_fwd(
             Lk=head_dim,
             Lv=value_dim,
             REL_EXTENT=rel_logits.shape[2],
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             num_stages=num_stages,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
     stage2_grid = (q.shape[0], q.shape[1])
@@ -848,6 +866,7 @@ def _rel_mha_decode_fwd(
         attn_logits,
         attn_lse,
         out,
+        output_lse,
         cache_seqlens,
         num_kv_splits,
         attn_logits.stride(0),
@@ -861,8 +880,11 @@ def _rel_mha_decode_fwd(
         BLOCK_DV=block_dv,
         Lv=value_dim,
         WINDOW_LEFT=window_left,
+        HAS_LSE=output_lse is not None,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         num_stages=2,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -877,6 +899,7 @@ def _rel_mha_decode_fwd(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "fp32_output": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
     },
@@ -894,6 +917,7 @@ def triton_rel_mha_prefill(
     softmax_scale: float | None = None,
     tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -902,7 +926,7 @@ def triton_rel_mha_prefill(
         # the rel bias: tau*(scale*qk + rel).
         q = q * tau[:, None, None].to(q.dtype)
         rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
-    out = torch.empty_like(q)
+    out = torch.empty_like(q, dtype=q.dtype if output_dtype is None else output_dtype)
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
         if return_lse
@@ -943,6 +967,7 @@ def triton_rel_mha_prefill(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "fp32_output": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
     },
@@ -966,6 +991,7 @@ def triton_rel_mha_extend_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -984,7 +1010,7 @@ def triton_rel_mha_extend_with_kvcache(
         dtype=v_cache.dtype,
         device=v_cache.device,
     )
-    out = torch.empty_like(q)
+    out = torch.empty_like(q, dtype=q.dtype if output_dtype is None else output_dtype)
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
         if return_lse
@@ -1025,7 +1051,8 @@ def triton_rel_mha_extend_with_kvcache(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "return_lse": frozenset({False}),
+        "fp32_output": frozenset({False, True}),
+        "return_lse": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
     },
 )
@@ -1046,7 +1073,9 @@ def triton_rel_mha_decode_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
+    output_dtype: torch.dtype | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if tau is not None:
@@ -1054,7 +1083,12 @@ def triton_rel_mha_decode_with_kvcache(
         # the rel bias: tau*(scale*qk + rel).
         q = q * tau[:, None, None].to(q.dtype)
         rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
-    out = torch.empty_like(q)
+    out = torch.empty_like(q, dtype=q.dtype if output_dtype is None else output_dtype)
+    output_lse = (
+        torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
     max_kv_splits = _decode_split_count(max_seqlen_k, window_left)
     attn_logits = torch.empty(
         q.shape[0],
@@ -1071,18 +1105,15 @@ def triton_rel_mha_decode_with_kvcache(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.full(
-        (cache_seqlens.shape[0],),
-        max_kv_splits,
-        dtype=torch.int32,
-        device=q.device,
-    )
+    # Every row splits its KV range alike.
+    num_kv_splits = max_kv_splits
     _rel_mha_decode_fwd(
         q,
         rel_logits,
         k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
         v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
         out,
+        output_lse,
         page_table,
         cache_seqlens,
         attn_logits,
@@ -1094,5 +1125,6 @@ def triton_rel_mha_decode_with_kvcache(
         k_cache.shape[1],
         window_left,
         softmax_scale,
+        enable_pdl,
     )
-    return out
+    return (out, output_lse) if return_lse else out

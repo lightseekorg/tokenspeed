@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Exact NPU parity for the shared Triton compact-row expansion."""
+"""Exact NPU parity for the compact-row expansion Torch fallback."""
 
 import pytest
 import torch

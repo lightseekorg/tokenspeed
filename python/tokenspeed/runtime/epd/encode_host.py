@@ -79,6 +79,7 @@ from tokenspeed.runtime.utils.network import (
     get_ip,
     get_local_ip_by_remote,
     join_host_port,
+    split_host_port,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
@@ -473,7 +474,7 @@ class EncodeBootstrap:
             )
         global_rank = mapping.rank
         attn_tp_rank = mapping.attn.tp_rank
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        gpu_id = mapping.gpu_id
         device = torch.device(server_args.device, gpu_id)
         faulthandler.enable()
         configure_logger(server_args, prefix=f" ATTN TP RANK {attn_tp_rank}")
@@ -540,7 +541,7 @@ class EncodeBootstrap:
         # Rank 0 hosts the node's bootstrap server; every rank registers with
         # it.
         bootstrap_host = (
-            server_args.dist_init_addr.split(":", 1)[0]
+            split_host_port(server_args.dist_init_addr)[0]
             if server_args.dist_init_addr
             else local_ip
         )
