@@ -676,6 +676,12 @@ impl EngineClient {
     /// The engine may already have received the abort in either case.
     /// Success is local closure, not an engine/cache/transfer retirement
     /// fence. Use a fresh request id for any subsequent submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Zmq`] for an abort-send socket failure or
+    /// [`Error::SendTimeout`] when sending exceeds the configured deadline.
+    /// The stream remains attached for retry unless it ended independently.
     pub async fn cancel(&self, rid: &str) -> Result<bool> {
         let (engine, tx) = match lock(&self.shared.requests).get(rid) {
             Some(pending) => (pending.engine, pending.tx.clone()),

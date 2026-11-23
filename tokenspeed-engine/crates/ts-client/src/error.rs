@@ -65,6 +65,7 @@ pub enum Error {
 
 /// Why a request's output stream ended without a finished output.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum StreamError {
     /// This client explicitly cancelled the stream. Engine resource
     /// retirement may still be in progress.

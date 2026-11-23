@@ -27,7 +27,7 @@ and the host launcher remains `ts-host`, backed by the `_host` extension. For ex
 
 ```toml
 [dependencies]
-ts-client = { package = "tokenspeed-client", version = "0.1.0" }
+ts-client = { package = "tokenspeed-client", version = "0.2.0" }
 ```
 
 ## Wire conformance
@@ -37,10 +37,16 @@ only sends the engine's abort and does not guarantee a terminal output.
 `cancel(rid)` also closes that client's output stream after a successful send:
 Rust receives `StreamError::Cancelled`; Python's `next_outputs()` receives
 `(rid, RequestCancelled)`, an `EngineError` subclass, after already queued
-chunks. A concurrent finish is preserved. A failed or interrupted cancel send
-leaves ownership attached so it can be retried. Cancellation changes no engine
+chunks. A finish is preserved when it wins the race. A failed or interrupted
+cancel send leaves ownership attached for retry unless the stream ended
+independently. Cancellation changes no engine
 retirement fence or engine-reported load; use fresh request ids for subsequent
 submissions. See the [request lifecycle contract](../docs/design/event-loop.md#request-identity-and-submission-failures).
+
+`tokenspeed-client` 0.2 makes `StreamError` non-exhaustive and adds `Cancelled`.
+Rust callers updating from 0.1 must include a fallback match arm. The minor
+version change keeps this source incompatibility out of ordinary 0.1 updates;
+the engine wire schema and Python wheel versioning are unchanged.
 
 The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
 long-request ingress, prompt logprobs and high-frequency output streaming with
