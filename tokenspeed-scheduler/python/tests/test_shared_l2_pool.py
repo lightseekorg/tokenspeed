@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Clients sharing one L2 pool through the Python binding, as the pool's
-owner service drives it: keys, tails and tokens are plain values it relays."""
+"""Clients sharing one L2 pool through the Python binding: keys, tails and
+tokens are plain values, in the shapes of the owner's wire."""
 
 from __future__ import annotations
 
@@ -133,20 +133,6 @@ def test_a_client_reads_the_pages_another_client_wrote():
     keys = prompt.keys()
     assert pool.reserve(2, keys, [0] * len(keys)) == (0, [-1] * len(keys))
     assert pool.stats()["checkpoints"] == 1
-
-
-def test_keys_and_tails_survive_a_wire_that_turns_tuples_into_lists():
-    pool = ts.SharedL2Pool(config(), 8, 0)
-    prompt = Prompt(range(10))
-    keys = [list(k) for k in prompt.keys()]
-    ticket, pages = pool.reserve(1, keys, [0] * len(keys))
-    tokens, hashes, tail, access_epoch = prompt.checkpoint(5)
-    pool.commit(1, ticket, [[tokens, list(hashes), list(tail), access_epoch]])
-    pool.touch(keys)
-    ticket, num_tokens, _, tail, hit_pages = prompt.lookup(pool, 2)
-    assert num_tokens == 10 and tail == prompt.tail
-    assert sorted(k for k, _, _ in hit_pages) == sorted(prompt.keys())
-    assert sorted(page for _, _, page in hit_pages) == sorted(pages)
 
 
 def test_misuse_is_refused():

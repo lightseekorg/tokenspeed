@@ -37,6 +37,9 @@
   shared L2 pool's provider; a rank's host runs its own.
 * ``tokenspeed_engine.scheduler`` is the C++ scheduler's Python API, from
   the build linked into the host extension.
+* ``tokenspeed_engine._host.run_shared_l2_owner`` serves a shared L2 pool's
+  owner in the launching interpreter, over a pool built with that API
+  (``python -m tokenspeed.runtime.cache.shared_l2 owner``).
 """
 
 from pathlib import Path

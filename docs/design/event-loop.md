@@ -564,7 +564,7 @@ single call:
 | `output` | committing a forward's results: request state, the scheduler's events, the frontend's outputs, logprobs |
 | `cache_ops` | the open cache-op count and the replica-agreed acknowledgments |
 | `l3` | the replica's agreement on its storage executors' reports: the clock, the forward and storage permissions, the queue pressure, each storage operation's outcome |
-| `shared_l2` | a shared L2 pool's client: as the loop sees it, with the writes in flight there, and the client itself (the owner's wire, its write and notice threads, its loads) |
+| `shared_l2` | a shared L2 pool's client: as the loop sees it, with the writes in flight there, and the client itself (the owner's wire, its write and notice threads, its loads); and the pool's owner, which no rank runs (the *Shared L2 pool* entry of *Subsystems in detail*) |
 | `control` | pause and resume, memory release and resume, the weight-operation and internal-operation queues |
 | `pd` | the transfer peer as the loop sees it, and the per-round agreement on transfer progress |
 | `grammar` | grammar compilation, its cache, and the matchers |
@@ -998,7 +998,19 @@ over the host's transfer engine, and the loop relays between the two. The
 rank joins the pool at device build and starts the client then
 (`cache/shared_l2/rank.py`, through the host's shared L2 handle). The pool
 needs a replica of one member (attention TP 1, no pipeline): the client
-answers one rank. The loop's part:
+answers one rank.
+
+The pool's owner is a process of its own and runs no loop of this document.
+Its launcher (`python -m tokenspeed.runtime.cache.shared_l2 owner`) builds
+the scheduler's `SharedL2Pool` when the first rank reports its cache geometry
+(`cache/shared_l2/owner.py`), and the host extension serves the pool on one
+thread with the GIL released (`run_shared_l2_owner` in
+`ts-host/src/shared_l2_owner.rs`, over `Owner::serve` in
+`ts-control/src/shared_l2/owner.rs`), as a rank's host drives a scheduler
+that Python built. That module's header lists the requests the owner
+answers.
+
+The loop's part:
 
 * *Lookups.* A round that may forward starts, right before its plan
   (`shared_l2_round`, one call in `round_with`), the lookups of the waiting
@@ -1136,7 +1148,8 @@ The special cases, one sentence each, with where the code is:
   rank refuses to start on a device without ordered GPUDirect RDMA writes or
   CUDA stream memory operations (`cache/shared_l2/executor.py`), and the
   owner refuses a rank whose cache geometry or deployment identity differs
-  from the first rank's (`cache/shared_l2/owner.py`); the
+  from the first rank's (`Owner::hello` in
+  `ts-control/src/shared_l2/owner.rs`); the
   [server configuration](../configuration/server.md#shared-l2-pool) has the
   operator's list.
 * *A hit the proxy Host tier has no room for.* It is a fatal check and not

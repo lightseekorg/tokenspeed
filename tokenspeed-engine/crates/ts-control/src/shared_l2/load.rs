@@ -140,7 +140,7 @@ pub struct LoadRow {
 }
 
 /// One plan's load, its proxy blocks resolved to pool pages.
-struct Job {
+struct LoadJob {
     /// The load-back operations the load carries out, acknowledged together.
     op_ids: Vec<u32>,
     /// Every block to load.
@@ -152,7 +152,7 @@ struct Job {
 }
 
 /// One provider's share of a layer, for a reader thread.
-struct Read {
+struct ReadJob {
     session: String,
     spans: Spans,
     done: mpsc::Sender<Result<(), String>>,
@@ -165,7 +165,7 @@ pub struct Loads {
     failure: Arc<FailureLatch>,
     signal_words: Arc<dyn SignalWords>,
     /// `None` once stopped.
-    jobs: Mutex<Option<mpsc::Sender<Job>>>,
+    jobs: Mutex<Option<mpsc::Sender<LoadJob>>>,
     finished_loads: Mutex<mpsc::Receiver<Vec<u32>>>,
     stopped: Arc<AtomicBool>,
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -183,8 +183,8 @@ impl Loads {
         failure: Arc<FailureLatch>,
         read_workers: NonZeroUsize,
     ) -> std::io::Result<Self> {
-        let (jobs, incoming) = mpsc::channel::<Job>();
-        let (reads, incoming_reads) = mpsc::channel::<Read>();
+        let (jobs, incoming) = mpsc::channel::<LoadJob>();
+        let (reads, incoming_reads) = mpsc::channel::<ReadJob>();
         let (finished, finished_loads) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let incoming_reads = Arc::new(Mutex::new(incoming_reads));
@@ -283,7 +283,7 @@ impl Loads {
                 })
             })
             .collect::<Result<Vec<_>, PoolError>>()?;
-        let job = Job {
+        let job = LoadJob {
             op_ids,
             copies,
             start_word,
@@ -327,12 +327,12 @@ struct Loader {
     signal_words: Arc<dyn SignalWords>,
     failure: Arc<FailureLatch>,
     stopped: Arc<AtomicBool>,
-    reads: mpsc::Sender<Read>,
+    reads: mpsc::Sender<ReadJob>,
     finished: mpsc::Sender<Vec<u32>>,
 }
 
 impl Loader {
-    fn run(&self, job: Job) {
+    fn run(&self, job: LoadJob) {
         match panic_as_failure(|| self.load(&job)) {
             Ok(()) => {
                 let _ = self.finished.send(job.op_ids);
@@ -353,7 +353,7 @@ impl Loader {
         }
     }
 
-    fn load(&self, job: &Job) -> Result<(), PoolError> {
+    fn load(&self, job: &LoadJob) -> Result<(), PoolError> {
         // The start word lands once the plan's page zeroing is done.
         while !reached(self.signal_words.get(job.start_word), job.seq) {
             if self.stopped.load(Ordering::Relaxed) {
@@ -369,7 +369,7 @@ impl Loader {
                 if spans.is_empty() {
                     continue;
                 }
-                let read = Read {
+                let read = ReadJob {
                     session: provider.session.clone(),
                     spans,
                     done: done.clone(),

@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import logging
 import signal
 import threading
@@ -63,35 +62,38 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    stop = threading.Event()
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, lambda *_: stop.set())
     if args.service == "owner":
-        from tokenspeed.runtime.cache.shared_l2.owner import (
-            SharedL2Owner,
-            make_shared_l2_pool,
-        )
+        import msgspec
+        from tokenspeed_engine._host import run_shared_l2_owner
 
-        service = SharedL2Owner(
-            address=args.address,
-            num_providers=args.num_providers,
-            client_timeout_s=args.client_timeout_s,
-            make_shared_l2_pool=functools.partial(
-                make_shared_l2_pool,
+        from tokenspeed.runtime.cache.shared_l2.owner import make_shared_l2_pool
+
+        def make_pool(geometry: bytes, num_lcm_blocks: int):
+            # The first client's geometry, as the msgpack it sent.
+            return make_shared_l2_pool(
+                msgspec.msgpack.decode(geometry),
+                num_lcm_blocks,
                 headroom_lcm_blocks=args.headroom_lcm_blocks,
                 checkpoint_retention_requests=args.checkpoint_retention_requests,
                 checkpoint_retention_leaf_distance=(
                     args.checkpoint_retention_leaf_distance
                 ),
-            ),
+            )
+
+        # Rust owns shutdown. Do not chain CPython's KeyboardInterrupt handler.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        # The owner's service runs in the engine's host extension, over the
+        # pool built here.
+        run_shared_l2_owner(
+            args.address, args.num_providers, args.client_timeout_s, make_pool
         )
-        try:
-            service.serve(stop)
-        finally:
-            service.close()
     else:
         from tokenspeed.runtime.cache.shared_l2.provider import run_provider
 
+        stop = threading.Event()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, lambda *_: stop.set())
         run_provider(
             owner_address=args.owner_address,
             hostname=args.hostname,

@@ -18,13 +18,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! A rank's requests to the pool's owner (`cache/shared_l2/owner.py`).
+//! A rank's requests to the pool's owner (`shared_l2::owner`), and the
+//! owner's half of the same wire: what reads a request's fields and writes
+//! its reply.
 //!
 //! A request is a msgpack map, `op`, `client` and the operation's fields; a
 //! reply is `{"ok": true, ...}` or `{"ok": false, "error": ...}`. Cache keys
 //! travel as `[namespace_id, group_id, content_hash, page_offset]`, a key the
 //! owner places with its bucket, and a prompt's tokens as int32 bytes in
-//! native byte order (`cache/shared_l2/wire.py`).
+//! native byte order (`cache/shared_l2/wire.py`). Each of these shapes is
+//! written by one function here and read by the one next to it.
 //!
 //! The owner answers on a ROUTER socket and returns every frame before the
 //! payload unchanged. A connection is a DEALER socket of one thread, and
@@ -50,7 +53,7 @@ use ts_wire::{
 };
 use zeromq::{DealerSocket, Socket, SocketOptions, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::shared_l2::PoolError;
+use crate::shared_l2::{geometry::Provider, PoolError};
 
 /// The namespace of every pool key. The scheduler's keys do not carry it: a
 /// pool holds the default namespace alone.
@@ -68,9 +71,150 @@ fn expect_array_len(decoder: &mut Decoder<'_>, len: usize, what: &str) -> ts_wir
     Ok(())
 }
 
-/// A lookup's hit as the owner answers it, `[ticket, tokens, KV tokens,
-/// tail, [[key, bucket, page]]]`, for the request that asked. A miss has
-/// ticket 0 and no key.
+/// Read the field `name` of the msgpack map `payload`, a request or a
+/// reply, with `decode`.
+pub fn read_field<T>(
+    payload: &[Bytes],
+    name: &'static str,
+    decode: impl FnOnce(&mut Decoder<'_>) -> ts_wire::Result<T>,
+) -> ts_wire::Result<T> {
+    let mut decoder = Decoder::new(payload);
+    for _ in 0..decoder.map_len()? {
+        if decoder.str()? == name {
+            return decode(&mut decoder);
+        }
+        decoder.skip()?;
+    }
+    Err(ts_wire::Error::MissingField(name))
+}
+
+fn encode_key(encoder: &mut Encoder, key: &StorageKeyView) {
+    encoder.array_len(4);
+    DEFAULT_CACHE_NAMESPACE_ID.encode(encoder);
+    key.group_id.encode(encoder);
+    key.content_hash.encode(encoder);
+    key.page_offset.encode(encoder);
+}
+
+/// A key as it travels, `[namespace_id, group_id, content_hash,
+/// page_offset]`, of the pool's namespace.
+fn decode_key(decoder: &mut Decoder<'_>) -> ts_wire::Result<StorageKeyView> {
+    expect_array_len(decoder, 4, "a key")?;
+    let namespace_id = u32::decode(decoder)?;
+    if namespace_id != DEFAULT_CACHE_NAMESPACE_ID {
+        return Err(ts_wire::Error::Invalid(format!(
+            "a key of namespace {namespace_id}, not {DEFAULT_CACHE_NAMESPACE_ID}"
+        )));
+    }
+    Ok(StorageKeyView {
+        group_id: u32::decode(decoder)?,
+        content_hash: String::decode(decoder)?,
+        page_offset: i32::decode(decoder)?,
+    })
+}
+
+fn encode_keys(encoder: &mut Encoder, keys: &[StorageKeyView]) {
+    encoder.array_len(keys.len());
+    for key in keys {
+        encode_key(encoder, key);
+    }
+}
+
+/// The keys a reservation or a touch names, as the owner reads them.
+pub fn decode_keys(decoder: &mut Decoder<'_>) -> ts_wire::Result<Vec<StorageKeyView>> {
+    (0..decoder.array_len()?)
+        .map(|_| decode_key(decoder))
+        .collect()
+}
+
+/// Tokens as the pool carries them: int32, native byte order.
+fn token_bytes(tokens: &[i32]) -> Vec<u8> {
+    tokens
+        .iter()
+        .flat_map(|token| token.to_ne_bytes())
+        .collect()
+}
+
+fn decode_tokens(decoder: &mut Decoder<'_>) -> ts_wire::Result<Vec<i32>> {
+    let bytes = decoder.bin()?;
+    if bytes.len() % size_of::<i32>() != 0 {
+        return Err(ts_wire::Error::Invalid(
+            "shared L2 tokens must be int32 bytes".to_owned(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(size_of::<i32>())
+        .map(|token| i32::from_ne_bytes(token.try_into().expect("a chunk of four bytes")))
+        .collect())
+}
+
+/// A request's lookups, `[[prefix_hashes, tokens, max_tokens]]`, as the
+/// owner reads them. The wire names no request: the rank matches the hits
+/// to its lookups by their order.
+pub fn decode_lookups(decoder: &mut Decoder<'_>) -> ts_wire::Result<Vec<SharedL2LookupView>> {
+    (0..decoder.array_len()?)
+        .map(|_| {
+            expect_array_len(decoder, 3, "a lookup")?;
+            Ok(SharedL2LookupView {
+                request_id: String::new(),
+                prefix_hashes: Vec::decode(decoder)?,
+                tokens: decode_tokens(decoder)?,
+                max_tokens: i32::decode(decoder)?,
+            })
+        })
+        .collect()
+}
+
+/// A commit's checkpoints, `[[tokens, prefix_hashes, tail, access_epoch]]`,
+/// as the owner reads them.
+pub fn decode_checkpoints(
+    decoder: &mut Decoder<'_>,
+) -> ts_wire::Result<Vec<SharedL2CheckpointView>> {
+    (0..decoder.array_len()?)
+        .map(|_| {
+            expect_array_len(decoder, 4, "a checkpoint")?;
+            let tokens = decode_tokens(decoder)?;
+            let prefix_hashes = Vec::decode(decoder)?;
+            let (tail_tokens, tail_hash) =
+                Option::<(i32, String)>::decode(decoder)?.unwrap_or_default();
+            Ok(SharedL2CheckpointView {
+                tokens,
+                prefix_hashes,
+                tail_tokens,
+                tail_hash,
+                access_epoch: u64::decode(decoder)?,
+            })
+        })
+        .collect()
+}
+
+/// A lookup's hit as the owner answers it, `[ticket, num_tokens, kv_tokens,
+/// tail, [[key, bucket, page]]]`. A miss has ticket 0 and no key.
+pub fn encode_answer(encoder: &mut Encoder, answer: &SharedL2AnswerView) {
+    encoder.array_len(5);
+    answer.ticket.encode(encoder);
+    answer.num_tokens.encode(encoder);
+    answer.kv_tokens.encode(encoder);
+    // A hit that ends on a page has no tail.
+    (answer.tail_tokens != 0)
+        .then(|| (answer.tail_tokens, answer.tail_hash.clone()))
+        .encode(encoder);
+    encoder.array_len(answer.keys.len());
+    for ((key, bucket), pool_page) in answer
+        .keys
+        .iter()
+        .zip(&answer.buckets)
+        .zip(&answer.pool_pages)
+    {
+        encoder.array_len(3);
+        encode_key(encoder, key);
+        bucket.encode(encoder);
+        pool_page.encode(encoder);
+    }
+}
+
+/// A hit as the rank reads it (`encode_answer`), for the request that
+/// asked.
 fn decode_answer(
     decoder: &mut Decoder<'_>,
     request_id: &str,
@@ -84,18 +228,7 @@ fn decode_answer(
     let (mut keys, mut buckets, mut pool_pages) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..decoder.array_len()? {
         expect_array_len(decoder, 3, "a page")?;
-        expect_array_len(decoder, 4, "a key")?;
-        let namespace_id = u32::decode(decoder)?;
-        if namespace_id != DEFAULT_CACHE_NAMESPACE_ID {
-            return Err(ts_wire::Error::Invalid(format!(
-                "a key of namespace {namespace_id}, not {DEFAULT_CACHE_NAMESPACE_ID}"
-            )));
-        }
-        keys.push(StorageKeyView {
-            group_id: u32::decode(decoder)?,
-            content_hash: String::decode(decoder)?,
-            page_offset: i32::decode(decoder)?,
-        });
+        keys.push(decode_key(decoder)?);
         buckets.push(i32::decode(decoder)?);
         pool_pages.push(i32::decode(decoder)?);
     }
@@ -112,23 +245,44 @@ fn decode_answer(
     })
 }
 
-/// Tokens as the pool carries them: int32, native byte order.
-fn token_bytes(tokens: &[i32]) -> Vec<u8> {
-    tokens
-        .iter()
-        .flat_map(|token| token.to_ne_bytes())
-        .collect()
+/// The pool's providers, `[{session, base_address, num_lcm_blocks,
+/// first_lcm_block}]`, as the owner names them to a rank that joined
+/// (`cache/shared_l2/client.py` reads them).
+pub fn encode_providers(encoder: &mut Encoder, providers: &[Provider]) {
+    encoder.array_len(providers.len());
+    for provider in providers {
+        encoder.map_len(4);
+        encoder.str("session");
+        provider.session.encode(encoder);
+        encoder.str("base_address");
+        provider.base_address.encode(encoder);
+        encoder.str("num_lcm_blocks");
+        provider.num_lcm_blocks.encode(encoder);
+        encoder.str("first_lcm_block");
+        provider.first_lcm_block.encode(encoder);
+    }
 }
 
-fn encode_keys(encoder: &mut Encoder, keys: &[StorageKeyView]) {
-    encoder.array_len(keys.len());
-    for key in keys {
-        encoder.array_len(4);
-        DEFAULT_CACHE_NAMESPACE_ID.encode(encoder);
-        key.group_id.encode(encoder);
-        key.content_hash.encode(encoder);
-        key.page_offset.encode(encoder);
-    }
+/// The owner's reply to a request it carried out: `ok` and the
+/// `num_fields` fields `fields` writes.
+pub fn ok_reply(num_fields: usize, fields: impl FnOnce(&mut Encoder)) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.map_len(1 + num_fields);
+    encoder.str("ok");
+    encoder.bool(true);
+    fields(&mut encoder);
+    encoder.into_single_frame()
+}
+
+/// The owner's reply to a request it refuses or could not carry out.
+pub fn refused_reply(error: &str) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.map_len(2);
+    encoder.str("ok");
+    encoder.bool(false);
+    encoder.str("error");
+    encoder.str(error);
+    encoder.into_single_frame()
 }
 
 /// The owner's reply to one request: a map that says `ok`.
@@ -145,17 +299,7 @@ impl Reply {
         name: &'static str,
         decode: impl FnOnce(&mut Decoder<'_>) -> ts_wire::Result<T>,
     ) -> Result<T, PoolError> {
-        let mut decoder = Decoder::new(&self.payload);
-        let field = (|| {
-            for _ in 0..decoder.map_len()? {
-                if decoder.str()? == name {
-                    return decode(&mut decoder);
-                }
-                decoder.skip()?;
-            }
-            Err(ts_wire::Error::MissingField(name))
-        })();
-        field.map_err(|error| {
+        read_field(&self.payload, name, decode).map_err(|error| {
             PoolError(format!(
                 "the shared L2 owner's reply to '{}' is not a reply: {error}",
                 self.op
@@ -383,7 +527,7 @@ impl OwnerConnection {
 #[cfg(test)]
 mod tests {
     use ts_scheduler::SharedL2OpKind;
-    use ts_wire::Value;
+    use ts_wire::{decode_bytes, encode_frames, Value};
 
     use super::*;
     use crate::shared_l2::testing::{
@@ -544,6 +688,204 @@ mod tests {
         assert_eq!((&paged[2], uint(&paged[3])), (&Value::Nil, u64::MAX));
         assert_eq!(uint(field(&requests[2], "ticket")), 41);
         assert_eq!(*field(&requests[3], "keys"), keys(&write.keys[..2]));
+    }
+
+    #[test]
+    fn the_owners_half_reads_a_ranks_requests_and_writes_the_replies_the_rank_reads() {
+        let (_, tail, keys) = prompt_keys(&PROMPT);
+        let (tail_tokens, tail_hash) = tail.unwrap();
+        let hit = SharedL2AnswerView {
+            request_id: String::new(),
+            ticket: 41,
+            num_tokens: 5,
+            kv_tokens: 6,
+            tail_tokens,
+            tail_hash,
+            keys,
+            buckets: vec![0, 0, 0],
+            pool_pages: vec![3, 4, 8],
+        };
+        // A hit that ends on a page, and a miss.
+        let paged = SharedL2AnswerView {
+            tail_tokens: 0,
+            tail_hash: String::new(),
+            ..hit.clone()
+        };
+        let miss = SharedL2AnswerView {
+            ticket: 0,
+            num_tokens: 0,
+            kv_tokens: 0,
+            keys: Vec::new(),
+            buckets: Vec::new(),
+            pool_pages: Vec::new(),
+            ..paged.clone()
+        };
+        let hits = [hit, paged, miss];
+        // An owner made of its half of the wire alone.
+        let answered = hits.clone();
+        let owner = TestOwner::serve(move |request| {
+            let reply = match op(request) {
+                "lookup" => ok_reply(1, |encoder| {
+                    encoder.str("hits");
+                    encoder.array_len(answered.len());
+                    for answer in &answered {
+                        encode_answer(encoder, answer);
+                    }
+                }),
+                "reserve" => ok_reply(2, |encoder| {
+                    encoder.str("ticket");
+                    12_u64.encode(encoder);
+                    encoder.str("pages");
+                    vec![4, -1, 8].encode(encoder);
+                }),
+                "release" => refused_reply("no lookup of its client holds"),
+                _ => ok_reply(0, |_| ()),
+            };
+            Some(decode_bytes(&reply).unwrap())
+        });
+        let mut connection = connect(&owner, TIMEOUT);
+        let write = write();
+        let lookups = [
+            lookup("hit", &[1, 2, 3, 4, 5, 6, 7]),
+            lookup("paged", &PROMPT),
+            lookup("cold", &[9, 9]),
+        ];
+
+        // The rank reads each hit as the owner's half wrote it, for the
+        // request that asked.
+        let answers = connection.lookup(&lookups).unwrap();
+        for ((answer, hit), lookup) in answers.iter().zip(&hits).zip(&lookups) {
+            let expected = SharedL2AnswerView {
+                request_id: lookup.request_id.clone(),
+                ..hit.clone()
+            };
+            assert_eq!(*answer, expected);
+        }
+        assert_eq!(
+            connection.reserve(&write).unwrap(),
+            Some((12, vec![4, -1, 8]))
+        );
+        connection.commit(12, &write.checkpoints).unwrap();
+        connection.touch(&write.keys[..2]).unwrap();
+        assert_eq!(
+            connection.release(41).unwrap_err().0,
+            "the shared L2 owner rejected 'release': no lookup of its client holds"
+        );
+
+        // The owner's half reads each request as the rank wrote it; a lookup
+        // travels without its request.
+        let requests: Vec<_> = owner.requests().iter().map(encode_frames).collect();
+        assert_eq!(
+            read_field(&requests[0], "op", String::decode).unwrap(),
+            "lookup"
+        );
+        assert_eq!(read_field(&requests[0], "client", u64::decode).unwrap(), 7);
+        let unnamed: Vec<_> = lookups
+            .iter()
+            .map(|lookup| SharedL2LookupView {
+                request_id: String::new(),
+                ..lookup.clone()
+            })
+            .collect();
+        assert_eq!(
+            read_field(&requests[0], "lookups", decode_lookups).unwrap(),
+            unnamed
+        );
+        assert_eq!(
+            read_field(&requests[1], "keys", decode_keys).unwrap(),
+            write.keys
+        );
+        assert_eq!(
+            read_field(&requests[1], "buckets", Vec::<i32>::decode).unwrap(),
+            write.buckets
+        );
+        assert_eq!(read_field(&requests[2], "ticket", u64::decode).unwrap(), 12);
+        assert_eq!(
+            read_field(&requests[2], "checkpoints", decode_checkpoints).unwrap(),
+            write.checkpoints
+        );
+        assert_eq!(
+            read_field(&requests[3], "keys", decode_keys).unwrap(),
+            write.keys[..2]
+        );
+    }
+
+    #[test]
+    fn a_request_that_is_not_of_the_wires_shape_fails_at_the_owners_half() {
+        let (hashes, _, keys) = prompt_keys(&PROMPT);
+        let hashes = Value::Array(
+            hashes
+                .iter()
+                .map(|hash| Value::from(hash.as_str()))
+                .collect(),
+        );
+        let tokens = |bytes: &'static [u8]| Value::Bin(Bytes::from_static(bytes));
+        let request = |name: &str, value: Value| {
+            encode_frames(&Value::Map(vec![
+                (Value::from("op"), Value::from("lookup")),
+                (Value::from(name), value),
+            ]))
+        };
+        let lookups =
+            |lookup: Vec<Value>| request("lookups", Value::Array(vec![Value::Array(lookup)]));
+        // Tokens that are not whole int32s, a lookup without its bound, a
+        // bound past int32.
+        for (lookup, reason) in [
+            (
+                vec![hashes.clone(), tokens(b"abcde"), Value::from(1)],
+                "shared L2 tokens must be int32 bytes",
+            ),
+            (
+                vec![hashes.clone(), tokens(b"abcd")],
+                "a lookup has 2 elements, not 3",
+            ),
+            (
+                vec![hashes.clone(), tokens(b"abcd"), Value::from(1 << 31)],
+                "out of range",
+            ),
+        ] {
+            let error = read_field(&lookups(lookup), "lookups", decode_lookups).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        // A key of another namespace, a checkpoint without its access epoch,
+        // a field the request lacks, a request that is no map.
+        let Value::Array(mut other) = key_value(&keys[0]) else {
+            unreachable!()
+        };
+        other[0] = Value::from(1);
+        let error = read_field(
+            &request("keys", Value::Array(vec![Value::Array(other)])),
+            "keys",
+            decode_keys,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("a key of namespace 1, not 0"),
+            "{error}"
+        );
+        let checkpoint = vec![tokens(b"abcd"), hashes, Value::Nil];
+        let error = read_field(
+            &request("checkpoints", Value::Array(vec![Value::Array(checkpoint)])),
+            "checkpoints",
+            decode_checkpoints,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a checkpoint has 3 elements, not 4"),
+            "{error}"
+        );
+        let error = read_field(&request("keys", Value::Nil), "client", u64::decode).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing required field `client`"),
+            "{error}"
+        );
+        let error =
+            read_field(&encode_frames(&Value::from("ping")), "op", String::decode).unwrap_err();
+        assert!(error.to_string().contains("expected map"), "{error}");
     }
 
     #[test]

@@ -33,7 +33,7 @@ from tokenspeed.runtime.cache.l3.factory import cache_layout_deployment_id
 from tokenspeed.runtime.cache.shared_l2.client import (
     SharedL2ClientConfig,
     SharedL2Provider,
-    hello_until_ready,
+    wait_until_ready,
 )
 from tokenspeed.runtime.cache.shared_l2.executor import (
     SharedL2LoadExecutor,
@@ -192,7 +192,7 @@ def join_shared_l2_pool(
         config.owner_address, timeout_ms=config.request_timeout_ms
     )
     try:
-        joined_pool = hello_until_ready(
+        joined_pool = wait_until_ready(
             config,
             geometry=layout.geometry,
             deployment_id=deployment_id,

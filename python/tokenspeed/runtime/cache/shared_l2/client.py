@@ -21,7 +21,7 @@
 """A prefill or fused rank's config for the shared L2 pool, which is its Host L2,
 and its join of the pool.
 
-``--shared-l2-config`` is a ``SharedL2ClientConfig``. ``hello_until_ready`` says the
+``--shared-l2-config`` is a ``SharedL2ClientConfig``. ``wait_until_ready`` says the
 rank's hello to the pool's owner at device construction and returns the pool
 as the owner described it, a ``JoinedSharedL2Pool``.
 
@@ -51,7 +51,13 @@ _HELLO_RETRY_S = 1.0
 
 @dataclass(frozen=True, slots=True)
 class SharedL2ClientConfig:
-    """``--shared-l2-config``: every field is required."""
+    """``--shared-l2-config``: every field is required.
+
+    In the JSON, ``scheduler`` is an object of the two write limits,
+    ``max_writes_in_flight`` and ``max_keys_per_write``, which are fields of
+    their own here, and ``device_names`` is a list of strings; the other
+    fields are plain values.
+    """
 
     owner_address: str
     # RDMA devices for each local GPU index, as Mooncake names them.
@@ -141,7 +147,7 @@ class JoinedSharedL2Pool:
         return sum(provider.num_lcm_blocks for provider in self.providers)
 
 
-def hello_until_ready(
+def wait_until_ready(
     config: SharedL2ClientConfig,
     *,
     geometry: dict[str, Any],
@@ -178,16 +184,16 @@ def hello_until_ready(
             )
             if reply["ready"]:
                 break
-            last_attempt = (
+            not_ready_reason = (
                 f"the owner at {config.owner_address} replied that the pool is not "
                 "ready: it still waits for providers"
             )
         except TimeoutError:
             # The owner is not there yet.
-            last_attempt = f"no reply from the owner at {config.owner_address}"
+            not_ready_reason = f"no reply from the owner at {config.owner_address}"
         if time.monotonic() > deadline:
             raise TimeoutError(
-                f"the shared L2 pool did not become ready: {last_attempt}"
+                f"the shared L2 pool did not become ready: {not_ready_reason}"
             )
         time.sleep(_HELLO_RETRY_S)
     joined_pool = JoinedSharedL2Pool(

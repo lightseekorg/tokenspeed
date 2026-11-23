@@ -23,6 +23,9 @@
 //! The launching Python interpreter imports this extension and enters the
 //! scheduling loop on its main thread with the GIL released. The forward
 //! thread runs the Python data plane; completion queries acquire the GIL.
+//!
+//! The extension also serves a shared L2 pool's owner, which is no rank
+//! (`shared_l2_owner`).
 
 mod data_plane;
 mod encode;
@@ -31,6 +34,7 @@ mod logging;
 mod pd;
 mod peer;
 mod shared_l2;
+mod shared_l2_owner;
 
 use std::{
     collections::HashSet,
@@ -1036,6 +1040,10 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
 fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
     module.add_function(wrap_pyfunction!(run_host, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        shared_l2_owner::run_shared_l2_owner,
+        module
+    )?)?;
     Ok(())
 }
 

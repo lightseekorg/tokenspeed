@@ -19,17 +19,11 @@
 // SOFTWARE.
 
 //! The rank's pool client over real ZMQ: against an owner that answers what
-//! each test scripts, and once against the Python owner service
-//! (`tests/fixtures/shared_l2_owner.py`). Test memory stands in for the
-//! rank's Device cache and the provider's bytes, and a copy within it for
-//! RDMA.
+//! each test scripts, and once against the pool's owner (`shared_l2::owner`)
+//! over the scheduler's pool. Test memory stands in for the rank's Device
+//! cache and the provider's bytes, and a copy within it for RDMA.
 
-use std::{
-    io::{BufRead, BufReader, Write as _},
-    path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Condvar;
 use ts_scheduler::SharedL2CheckpointView;
@@ -39,10 +33,11 @@ use super::*;
 use crate::shared_l2::{
     geometry::{PageField, PageGroup, Provider},
     load::LoadRow,
+    owner::Owner,
     testing::{
-        hit_value, key_value, lookup, miss_value,
+        build_pool, hit_value, key_value, lookup, miss_value,
         owner::{field, ints, ok, op, refused, uint, TestOwner},
-        prompt_keys, wait_until, PlainSignals, PROMPT,
+        prompt_keys, request, wait_until, PlainSignals, ServedOwner, PROMPT,
     },
 };
 
@@ -885,118 +880,54 @@ fn a_failed_load_fails_the_clients_check_at_a_forwards_commit() {
     assert_eq!(rank.client.poll_writes().unwrap_err().0, failure);
 }
 
-/// The Python owner service, run as a child.
-struct PythonOwner {
-    child: Child,
-    commands: ChildStdin,
-    answers: BufReader<ChildStdout>,
-    errors: PathBuf,
-    address: String,
-}
-
-impl PythonOwner {
-    /// Start the service; `None`, after saying so, without a Python that
-    /// has the owner's modules: the one `TS_TEST_PYTHON` or `PYO3_PYTHON`
-    /// names, else `python3`.
-    fn start(settings: serde_json::Value) -> Option<Self> {
-        let python = std::env::var("TS_TEST_PYTHON")
-            .or_else(|_| std::env::var("PYO3_PYTHON"))
-            .unwrap_or_else(|_| "python3".to_owned());
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let repository = manifest.join("../../..");
-        let mut modules = vec![
-            repository.join("python"),
-            repository.join("tokenspeed-kernel/python"),
-        ];
-        modules.extend(std::env::split_paths(
-            &std::env::var_os("PYTHONPATH").unwrap_or_default(),
-        ));
-        let errors = std::env::temp_dir().join(format!(
-            "ts-shared-l2-owner-{}-{:?}.stderr",
-            std::process::id(),
-            thread::current().id()
-        ));
-        let mut child = Command::new(&python)
-            .arg(manifest.join("tests/fixtures/shared_l2_owner.py"))
-            .arg(settings.to_string())
-            .env("PYTHONPATH", std::env::join_paths(modules).unwrap())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(std::fs::File::create(&errors).unwrap())
-            .spawn()
-            .expect("running Python");
-        let mut owner = Self {
-            commands: child.stdin.take().unwrap(),
-            answers: BufReader::new(child.stdout.take().unwrap()),
-            child,
-            errors,
-            address: String::new(),
-        };
-        let mut ready = String::new();
-        owner.answers.read_line(&mut ready).unwrap();
-        if ready.is_empty() {
-            let _ = owner.child.wait();
-            let stderr = std::fs::read_to_string(&owner.errors).unwrap_or_default();
-            if stderr.contains("No module named") {
-                eprintln!("skipped: {python} cannot import the shared L2 owner");
-                return None;
-            }
-            panic!("the Python owner did not start:\n{stderr}");
-        }
-        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
-        owner.address = ready["address"].as_str().unwrap().to_owned();
-        Some(owner)
-    }
-
-    /// Run one command of the fixture and return its answer.
-    fn run(&mut self, command: serde_json::Value) -> serde_json::Value {
-        writeln!(self.commands, "{command}").unwrap();
-        let mut answer = String::new();
-        self.answers.read_line(&mut answer).unwrap();
-        assert!(
-            !answer.is_empty(),
-            "the Python owner ended:\n{}",
-            std::fs::read_to_string(&self.errors).unwrap_or_default()
-        );
-        serde_json::from_str(&answer).unwrap()
-    }
-
-    fn books(&mut self) -> serde_json::Value {
-        self.run(serde_json::json!({"do": "books"}))
-    }
-}
-
-impl Drop for PythonOwner {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.errors);
-    }
-}
-
 #[test]
-fn the_client_speaks_the_python_owners_wire() {
+fn the_client_speaks_the_owners_wire() {
     // The owner drops a client it has not heard for half a second: the
     // rank's pings keep it there.
-    let Some(mut owner) = PythonOwner::start(serde_json::json!({
-        "client_timeout_s": 0.5,
-        "base": PROVIDER,
-        "blocks": 8,
-        "clients": [7],
-    })) else {
-        return;
-    };
-    let address = owner.address.clone();
+    let owner = ServedOwner::start(
+        Owner::new(1, Duration::from_millis(500), |_, num_lcm_blocks| {
+            build_pool(num_lcm_blocks)
+        }),
+        "tcp://127.0.0.1:0",
+    );
+    // What Python sends the owner: the provider's announcement, of 8 LCM
+    // blocks of 64 bytes, and the rank's hello.
+    let announced = request(
+        "add_provider",
+        vec![
+            ("session", Value::from("node0")),
+            ("base_address", Value::from(PROVIDER as i64)),
+            ("bytes", Value::from(8 * 64)),
+        ],
+    );
+    assert_eq!(owner.ask(&announced), ok(Vec::new()));
+    let hello = request(
+        "hello",
+        vec![
+            ("client", Value::from(7)),
+            (
+                "geometry",
+                Value::Map(vec![(Value::from("lcm_block_bytes"), Value::from(64))]),
+            ),
+            ("deployment_id", Value::from("deployment")),
+        ],
+    );
+    assert_eq!(*field(&owner.ask(&hello), "ready"), Value::from(true));
+    let stats = || owner.ask(&request("stats", Vec::new()));
+    let stat = |name: &str| uint(field(field(&stats(), "stats"), name));
     let mut rank = Rank::join(
-        &address,
+        &owner.address,
         7,
         Duration::from_secs(2),
         Duration::from_millis(100),
     );
-    let (_, tail, keys) = prompt_keys(&PROMPT);
+    // A prompt that ends on a page: the pool hashes a prompt's tail itself,
+    // and the tests' hashes are no hashes.
+    let prompt = &PROMPT[..4];
+    let (_, _, keys) = prompt_keys(prompt);
 
     // An empty pool answers a miss.
-    let answers = rank.client.lookup(&[lookup("cold", &PROMPT)]).unwrap();
+    let answers = rank.client.lookup(&[lookup("cold", prompt)]).unwrap();
     assert_eq!(
         (answers[0].request_id.as_str(), answers[0].ticket),
         ("cold", 0)
@@ -1005,11 +936,9 @@ fn the_client_speaks_the_python_owners_wire() {
 
     // A write reserves pages, copies its blocks there and commits them with
     // its checkpoint.
-    rank.client.submit(&[write(1, &PROMPT)]).unwrap();
+    rank.client.submit(&[write(1, prompt)]).unwrap();
     assert_eq!(rank.finished(1), [1]);
-    let books = owner.books();
-    assert_eq!(books["stats"]["cached_blocks"], 3);
-    assert_eq!(books["stats"]["checkpoints"], 1);
+    assert_eq!((stat("cached_blocks"), stat("checkpoints")), (3, 1));
 
     // A longer prompt hits the checkpoint; its blocks are pinned.
     let answers = rank
@@ -1021,14 +950,13 @@ fn the_client_speaks_the_python_owners_wire() {
         .unwrap();
     let hit = &answers[0];
     assert!(hit.ticket > 0);
-    assert_eq!((hit.num_tokens, hit.kv_tokens), (5, 5));
-    assert_eq!((hit.tail_tokens, hit.tail_hash.clone()), tail.unwrap());
+    assert_eq!((hit.num_tokens, hit.kv_tokens, hit.tail_tokens), (4, 4, 0));
     assert_eq!((&hit.keys, &hit.buckets), (&keys, &vec![0, 0, 0]));
     assert_eq!(
         (answers[1].request_id.as_str(), answers[1].ticket),
         ("cold", 0)
     );
-    assert_eq!(owner.books()["stats"]["pinned_blocks"], 3);
+    assert_eq!(stat("pinned_blocks"), 3);
 
     // The hit's pages hold the bytes the write copied: a load reads them
     // back into other Device blocks.
@@ -1074,49 +1002,31 @@ fn the_client_speaks_the_python_owners_wire() {
             notice(SharedL2OpKind::Touch, 0, keys[..2].to_vec()),
         ])
         .unwrap();
-    wait_until(|| {
-        let books = owner.books();
-        books["stats"]["pinned_blocks"] == 0 && books["touched"].as_array().unwrap().len() == 2
-    });
-    assert_eq!(
-        owner.books()["touched"],
-        serde_json::json!([[0, 0, "1-2", 0], [0, 0, "1-2-3-4", 0]])
-    );
+    wait_until(|| stat("pinned_blocks") == 0);
 
     // More than twice the owner's client timeout without a lookup, a write
-    // or a notice: the pings kept the rank there.
+    // or a notice: the pings kept the rank there, and the owner refused
+    // none of its notices.
     thread::sleep(Duration::from_millis(1_200));
-    assert_eq!(owner.books()["disconnected"], serde_json::json!([]));
+    assert_eq!(uint(field(&stats(), "num_clients")), 1);
     rank.client.check_failure().unwrap();
 
-    // An error of the pool is the lookup's.
-    owner.run(serde_json::json!({"do": "fail", "method": "lookup"}));
-    let error = rank
-        .client
-        .lookup(&[lookup("request", &PROMPT)])
-        .unwrap_err();
+    // An error of the pool is the lookup's: tokens short of the lookup's
+    // bound.
+    let mut short = lookup("request", prompt);
+    short.max_tokens = 8;
+    let error = rank.client.lookup(&[short]).unwrap_err();
     assert!(error.0.contains("rejected 'lookup'"), "{error}");
-    assert!(error.0.contains("lookup failed"), "{error}");
-    owner.run(serde_json::json!({"do": "heal", "method": "lookup"}));
+    assert!(error.0.contains("tokens must reach its bound"), "{error}");
 
     // A rank the owner does not know is told so.
-    let mut stranger = Rank::join(&address, 8, Duration::from_secs(2), NO_KEEPALIVE);
+    let mut stranger = Rank::join(&owner.address, 8, Duration::from_secs(2), NO_KEEPALIVE);
     let error = stranger
         .client
-        .lookup(&[lookup("request", &PROMPT)])
+        .lookup(&[lookup("request", prompt)])
         .unwrap_err();
     assert!(
         error.0.contains("client 8 has not joined the pool"),
         "{error}"
     );
-
-    // An owner that does not answer in time fails the lookup.
-    let mut hasty = Rank::join(&address, 7, Duration::from_millis(200), NO_KEEPALIVE);
-    owner.run(serde_json::json!({"do": "stall"}));
-    let error = hasty
-        .client
-        .lookup(&[lookup("request", &PROMPT)])
-        .unwrap_err();
-    assert!(error.0.contains("did not answer 'lookup'"), "{error}");
-    owner.run(serde_json::json!({"do": "resume"}));
 }

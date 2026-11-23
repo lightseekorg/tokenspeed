@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 //! An owner for tests: a ROUTER socket that answers every request with what
-//! the test's closure returns for it, as the Python owner's socket does.
+//! the test's closure returns for it, as the owner's socket does.
 //!
 //! The file names nothing of its crate: the host crate's tests include it by
 //! path.
@@ -128,7 +128,7 @@ impl TestOwner {
             let mut held = Vec::new();
             while let Ok(message) = socket.recv().await {
                 // The identity and the correlation frame go back
-                // unchanged, as from the Python owner.
+                // unchanged, as from the owner.
                 let mut frames = message.into_vec();
                 let payload = frames.pop().unwrap();
                 let request: Value = decode_bytes(&payload).unwrap();

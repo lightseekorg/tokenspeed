@@ -18,10 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The request-reply wire between the owner and its clients and providers.
+"""The request-reply wire between the owner and its clients and providers,
+as a rank's hello, a provider and an operator speak it.
 
 A request is a msgpack map: ``op`` and the operation's fields. A reply is
-``{"ok": True, ...}``, or ``{"ok": False, "error": ...}``.
+``{"ok": True, ...}``, or ``{"ok": False, "error": ...}``. The owner's side,
+with the list of the requests it answers, is ``shared_l2/owner.rs`` of
+``ts-control``.
 
 Cache keys are opaque here. A key is a tuple on both sides and an array on the
 wire, and every key the owner places travels with its bucket (its shard

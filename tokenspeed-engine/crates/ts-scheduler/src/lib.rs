@@ -28,7 +28,9 @@
 //!
 //! The scheduler itself is constructed in Python (its configuration is
 //! derived there from the device build) and driven from Rust through
-//! [`Scheduler::from_python`], without the GIL.
+//! [`Scheduler::from_python`], without the GIL. The cache index of a shared
+//! L2 pool's owner is built and driven the same way
+//! ([`SharedL2Pool::from_python`]).
 
 // The crate is the FFI boundary to C++ and the interpreter.
 #![allow(unsafe_code)]
@@ -710,6 +712,38 @@ mod ffi {
         checkpoints: Vec<SharedL2CheckpointView>,
     }
 
+    /// What a pool reservation granted (`SharedL2Pool::Reservation`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2ReservationView {
+        /// What the pool reserves the pages under; 0 reserves nothing.
+        ticket: u64,
+        /// One per key, in order: the page to write, or why there is none
+        /// (-1 the pool holds the key, -2 no page is free, -3 another
+        /// reservation writes it).
+        pages: Vec<i32>,
+    }
+
+    /// A pool's counters (`SharedL2Pool::Stats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SharedL2PoolStatsView {
+        /// LCM blocks the pool has.
+        num_lcm_blocks: i32,
+        /// LCM blocks no page is taken from.
+        empty_lcm_blocks: i32,
+        /// Blocks the pool caches.
+        cached_blocks: i32,
+        /// Cached blocks a lookup pins.
+        pinned_blocks: i32,
+        /// Blocks reserved for a write not committed yet.
+        reserved_blocks: usize,
+        /// Lookup tickets not released yet.
+        open_lookups: usize,
+        /// Blocks evicted so far.
+        evicted_blocks: u64,
+        /// State checkpoints the pool holds.
+        checkpoints: usize,
+    }
+
     unsafe extern "C++" {
         include!("ts-scheduler/cxx/facade.h");
 
@@ -815,6 +849,38 @@ mod ffi {
         fn plan_shared_l2_ops(plan: &ExecutionPlan) -> Vec<SharedL2OpView>;
         fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
+        #[namespace = "tokenspeed"]
+        type SharedL2Pool;
+        fn shared_l2_pool_lookup(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            lookup: &SharedL2LookupView,
+        ) -> Result<SharedL2AnswerView>;
+        fn shared_l2_pool_release(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            ticket: u64,
+        ) -> Result<()>;
+        fn shared_l2_pool_reserve(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            keys: &[StorageKeyView],
+            buckets: &[i32],
+        ) -> Result<SharedL2ReservationView>;
+        fn shared_l2_pool_commit(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            ticket: u64,
+            checkpoints: &[SharedL2CheckpointView],
+        ) -> Result<()>;
+        fn shared_l2_pool_touch(
+            pool: Pin<&mut SharedL2Pool>,
+            keys: &[StorageKeyView],
+        ) -> Result<()>;
+        fn shared_l2_pool_disconnect(pool: Pin<&mut SharedL2Pool>, client: u64);
+        fn shared_l2_pool_clear_cache(pool: Pin<&mut SharedL2Pool>) -> bool;
+        fn shared_l2_pool_stats(pool: &SharedL2Pool) -> SharedL2PoolStatsView;
+
         /// Install the scheduler's profile span sink, which forwards to
         /// [`record_scheduler_span`], or remove it.
         fn set_profile_span_sink(installed: bool);
@@ -832,9 +898,9 @@ pub use ffi::{
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
     PeerStatsView, PinSampleView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
     SchedulerSizes, SharedL2AnswerView, SharedL2CheckpointView, SharedL2LookupView, SharedL2OpKind,
-    SharedL2OpView, SharedL2ProxyBlockView, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    SharedL2OpView, SharedL2PoolStatsView, SharedL2ProxyBlockView, SharedL2ReservationView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
+    StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -853,6 +919,7 @@ pub struct StorageRound {
 extern "C" {
     fn PyInit_tokenspeed_scheduler_ext() -> *mut pyffi::PyObject;
     fn ts_scheduler_from_python(object: *mut pyffi::PyObject) -> *mut ffi::Scheduler;
+    fn ts_shared_l2_pool_from_python(object: *mut pyffi::PyObject) -> *mut ffi::SharedL2Pool;
     fn ts_scheduler_plan_into_python(plan: *mut ffi::ExecutionPlan) -> *mut pyffi::PyObject;
 }
 
@@ -1190,6 +1257,108 @@ impl Scheduler {
     /// The most tokens one request can hold in the cache.
     pub fn max_single_request_tokens(&self) -> i32 {
         ffi::max_single_request_tokens(self.get())
+    }
+}
+
+/// A shared L2 pool owned by a Python `tokenspeed_scheduler.SharedL2Pool`
+/// object and driven from Rust: the cache index the pool's owner keeps over
+/// the providers' pages.
+///
+/// Python must not call into the pool while this exists; the owner's serving
+/// thread is its only user.
+pub struct SharedL2Pool {
+    raw: NonNull<ffi::SharedL2Pool>,
+    /// Keeps the C++ pool alive.
+    _owner: Py<PyAny>,
+}
+
+// SAFETY: the pool has no thread affinity; exclusive access goes through
+// `&mut self`.
+unsafe impl Send for SharedL2Pool {}
+
+impl SharedL2Pool {
+    /// Drive the pool a Python `tokenspeed_scheduler.SharedL2Pool` owns.
+    pub fn from_python(object: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // SAFETY: the GIL is held (`Bound`), and the returned pointer lives as
+        // long as `object`, which `_owner` keeps alive.
+        let raw = unsafe { ts_shared_l2_pool_from_python(object.as_ptr()) };
+        let raw = NonNull::new(raw).ok_or_else(|| PyErr::fetch(object.py()))?;
+        Ok(Self {
+            raw,
+            _owner: object.clone().unbind(),
+        })
+    }
+
+    fn pinned(&mut self) -> std::pin::Pin<&mut ffi::SharedL2Pool> {
+        // SAFETY: `raw` is valid (see `from_python`) and `&mut self` makes this
+        // the only reference. The C++ object never moves.
+        unsafe { std::pin::Pin::new_unchecked(self.raw.as_mut()) }
+    }
+
+    /// The pool's longest reusable prefix of `lookup`'s prompt, pinned for
+    /// `client` under the answer's ticket until the client releases it; a
+    /// miss pins nothing (ticket 0). Fails on tokens short of the lookup's
+    /// bound.
+    pub fn lookup(
+        &mut self,
+        client: u64,
+        lookup: &SharedL2LookupView,
+    ) -> Result<SharedL2AnswerView, cxx::Exception> {
+        ffi::shared_l2_pool_lookup(self.pinned(), client, lookup)
+    }
+
+    /// Unpin what a lookup hit under `ticket`. Fails for a ticket no lookup
+    /// of `client` holds.
+    pub fn release(&mut self, client: u64, ticket: u64) -> Result<(), cxx::Exception> {
+        ffi::shared_l2_pool_release(self.pinned(), client, ticket)
+    }
+
+    /// Reserve a page for each of `keys` that the pool neither holds nor
+    /// has reserved, in the key's bucket, for `client` to write and commit.
+    /// Fails on a key or a bucket that is not of the pool.
+    pub fn reserve(
+        &mut self,
+        client: u64,
+        keys: &[StorageKeyView],
+        buckets: &[i32],
+    ) -> Result<SharedL2ReservationView, cxx::Exception> {
+        ffi::shared_l2_pool_reserve(self.pinned(), client, keys, buckets)
+    }
+
+    /// Publish the blocks reserved under `ticket`, with the checkpoints
+    /// whose State block is among them. Fails, with no change, for a ticket
+    /// under which `client` reserves nothing or a checkpoint whose tokens do
+    /// not cover its pages and tail.
+    pub fn commit(
+        &mut self,
+        client: u64,
+        ticket: u64,
+        checkpoints: &[SharedL2CheckpointView],
+    ) -> Result<(), cxx::Exception> {
+        ffi::shared_l2_pool_commit(self.pinned(), client, ticket, checkpoints)
+    }
+
+    /// Refresh the pool's copies of `keys`: a rank used its own.
+    pub fn touch(&mut self, keys: &[StorageKeyView]) -> Result<(), cxx::Exception> {
+        ffi::shared_l2_pool_touch(self.pinned(), keys)
+    }
+
+    /// End everything `client` holds: its lookups' pins and its
+    /// reservations.
+    pub fn disconnect(&mut self, client: u64) {
+        ffi::shared_l2_pool_disconnect(self.pinned(), client);
+    }
+
+    /// Empty the pool. Refused (`false`) while a client holds pins or
+    /// reservations.
+    pub fn clear_cache(&mut self) -> bool {
+        ffi::shared_l2_pool_clear_cache(self.pinned())
+    }
+
+    /// The pool's counters.
+    pub fn stats(&self) -> SharedL2PoolStatsView {
+        // SAFETY: as in `pinned`.
+        ffi::shared_l2_pool_stats(unsafe { self.raw.as_ref() })
     }
 }
 

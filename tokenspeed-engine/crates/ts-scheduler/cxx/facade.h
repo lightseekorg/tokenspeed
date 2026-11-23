@@ -25,6 +25,7 @@
 
 #include <memory>
 
+#include "cache/tier/shared_l2_pool.h"
 #include "rust/cxx.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/scheduler.h"
@@ -50,10 +51,14 @@ struct StorageCancellationView;
 struct StorageDoneView;
 struct StorageStatsView;
 struct PrefixHitView;
+struct StorageKeyView;
 struct SharedL2LookupView;
 struct SharedL2AnswerView;
 struct SharedL2ProxyBlockView;
+struct SharedL2CheckpointView;
 struct SharedL2OpView;
+struct SharedL2ReservationView;
+struct SharedL2PoolStatsView;
 struct PeerEventView;
 struct PeerAnswerView;
 struct PeerLookupView;
@@ -129,6 +134,19 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<SharedL2OpView> plan_shared_l2_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan);
+
+SharedL2AnswerView shared_l2_pool_lookup(tokenspeed::SharedL2Pool& pool, std::uint64_t client,
+                                         const SharedL2LookupView& lookup);
+void shared_l2_pool_release(tokenspeed::SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket);
+SharedL2ReservationView shared_l2_pool_reserve(tokenspeed::SharedL2Pool& pool, std::uint64_t client,
+                                               rust::Slice<const StorageKeyView> keys,
+                                               rust::Slice<const std::int32_t> buckets);
+void shared_l2_pool_commit(tokenspeed::SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket,
+                           rust::Slice<const SharedL2CheckpointView> checkpoints);
+void shared_l2_pool_touch(tokenspeed::SharedL2Pool& pool, rust::Slice<const StorageKeyView> keys);
+void shared_l2_pool_disconnect(tokenspeed::SharedL2Pool& pool, std::uint64_t client);
+bool shared_l2_pool_clear_cache(tokenspeed::SharedL2Pool& pool);
+SharedL2PoolStatsView shared_l2_pool_stats(const tokenspeed::SharedL2Pool& pool);
 
 void set_profile_span_sink(bool installed);
 

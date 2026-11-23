@@ -236,7 +236,7 @@ class SharedL2LoadExecutor:
             load_trackers: Each cache pool view's layer-wise load tracker,
                 registered with the view, and its layer count; their layers,
                 in order, are the flat layers of the layout's consumers.
-            joined_pool: The pool the rank joined (``client.hello_until_ready``).
+            joined_pool: The pool the rank joined (``client.wait_until_ready``).
         """
         self._shared_l2_handle = shared_l2_handle
         self._load_trackers = list(load_trackers)

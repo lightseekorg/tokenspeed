@@ -88,10 +88,10 @@ void BindForwardCommonFields(Cls& cls) {
             nb::rv_policy::reference_internal);
 }
 
-// Shared L2 values cross the binding as plain Python values, so the pool's
-// owner service relays them between its wire and the pool without parsing
-// them: a key is (namespace_id, group_id, content_hash, page_offset), a tail
-// (tail_tokens, hash), and a prompt's tokens are int32 bytes.
+// Shared L2 values cross the binding as plain Python values, in the shapes
+// of the owner's wire: a key is (namespace_id, group_id, content_hash,
+// page_offset), a tail (tail_tokens, hash), and a prompt's tokens are int32
+// bytes.
 using SharedL2KeyTuple = std::tuple<std::uint32_t, std::uint32_t, std::string, std::int32_t>;
 using SharedL2TailTuple = std::tuple<std::int32_t, std::string>;
 
@@ -987,7 +987,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // The owner's side of a shared L2 pool. `config` gives the cache groups,
     // the prefix granularity, the pool's page layout (host_group_packing) and
-    // the checkpoint retention settings; no scheduler is built from it.
+    // the checkpoint retention settings; no scheduler is built from it. The
+    // owner's launcher builds the pool here and its service calls it from the
+    // engine host; the methods are for Python that runs schedulers against a
+    // pool, as this package's tests do.
     using SharedL2Pool = tokenspeed::SharedL2Pool;
     // (tokens, prefix_hashes, tail, access_epoch).
     using SharedL2CheckpointTuple =

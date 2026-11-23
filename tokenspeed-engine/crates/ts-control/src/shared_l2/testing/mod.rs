@@ -21,17 +21,142 @@
 //! Fixtures of the shared L2 pool's tests.
 
 use std::{
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Once,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use ts_scheduler::{SharedL2LookupView, StorageKeyView};
-use ts_wire::Value;
+use bytes::Bytes;
+use pyo3::{prelude::*, types::PyDict};
+use ts_scheduler::{SharedL2LookupView, SharedL2Pool, StorageKeyView};
+use ts_wire::{decode_bytes, encode_frames, Value};
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::shared_l2::{load::SignalWords, wire::OwnerConnection};
+use crate::shared_l2::{
+    load::SignalWords,
+    owner::{Owner, OwnerSocket},
+    wire::OwnerConnection,
+};
 
 pub(crate) mod owner;
+
+/// A pool of `num_lcm_blocks` LCM blocks as the owner's launcher builds
+/// one, by the embedded interpreter: pages of two tokens, two blocks of
+/// group 0 (full attention) or one of group 1 (State) to an LCM block
+/// (`shared_l2_test_utils.GEOMETRY`).
+pub(crate) fn build_pool(num_lcm_blocks: i32) -> Result<SharedL2Pool, String> {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        // The test binary is not in a Python prefix; point at the one the
+        // crate was built against.
+        std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
+        Python::initialize();
+        // The scheduler's module, loaded once: the tests' threads find it
+        // loaded.
+        Python::attach(|py| ts_scheduler::python_module(py).map(drop)).unwrap();
+    });
+    Python::attach(|py| {
+        let scope = PyDict::new(py);
+        scope.set_item("ts", ts_scheduler::python_module(py)?)?;
+        scope.set_item("num_lcm_blocks", num_lcm_blocks)?;
+        py.run(
+            cr#"
+kv = ts.CacheGroupConfig()
+kv.group_id, kv.block_granularity, kv.attn_kind = "kv", 2, ts.AttnKind.Full
+kv.cache_blocks_per_lcm_block = 2
+state = ts.CacheGroupConfig()
+state.group_id, state.block_granularity, state.attn_kind = "state", 0, ts.AttnKind.State
+state.cache_blocks_per_lcm_block = 1
+config = ts.SchedulerConfig()
+config.prefix_granularity = 2
+config.cache_groups = [kv, state]
+config.host_group_packing = [2, 1]
+config.checkpoint_retention_requests = 0
+pool = ts.SharedL2Pool(config, num_lcm_blocks, 0)
+"#,
+            Some(&scope),
+            None,
+        )?;
+        SharedL2Pool::from_python(&scope.get_item("pool")?.expect("the code sets `pool`"))
+    })
+    .map_err(|error: PyErr| error.to_string())
+}
+
+/// A request of the wire.
+pub(crate) fn request(op: &str, fields: Vec<(&str, Value)>) -> Value {
+    let mut entries = vec![(Value::from("op"), Value::from(op))];
+    entries.extend(
+        fields
+            .into_iter()
+            .map(|(name, value)| (Value::from(name), value)),
+    );
+    Value::Map(entries)
+}
+
+/// An owner that serves on a thread of its own until dropped.
+pub(crate) struct ServedOwner {
+    /// Where it listens.
+    pub(crate) address: String,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ServedOwner {
+    /// Serve `owner` at `address`.
+    pub(crate) fn start(mut owner: Owner, address: &str) -> Self {
+        let mut socket = OwnerSocket::bind(address).unwrap();
+        let address = socket.address().to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = thread::spawn(move || owner.serve(&mut socket, &stopped));
+        Self {
+            address,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Send `frames` over a connection of its own and return the frames of
+    /// the reply.
+    pub(crate) fn exchange(&self, frames: Vec<Bytes>) -> Vec<Bytes> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut socket = DealerSocket::new();
+            socket.connect(&self.address).await.unwrap();
+            socket
+                .send(ZmqMessage::try_from(frames).unwrap())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), socket.recv())
+                .await
+                .expect("the owner answers")
+                .unwrap()
+                .into_vec()
+        })
+    }
+
+    /// The owner's reply to `request`, as a client that is no rank asks it:
+    /// a provider, a rank's hello, an operator.
+    pub(crate) fn ask(&self, request: &Value) -> Value {
+        decode_bytes(&self.exchange(encode_frames(request))[0]).unwrap()
+    }
+}
+
+impl Drop for ServedOwner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            // A thread that panicked has ended too.
+            let _ = thread.join();
+        }
+    }
+}
 
 /// Return once `reached` holds; panics when it does not within 10 seconds.
 pub(crate) fn wait_until(mut reached: impl FnMut() -> bool) {

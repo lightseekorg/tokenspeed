@@ -563,15 +563,6 @@ std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler) {
 
 namespace {
 
-rust::Vec<rust::String> to_rust(const std::vector<std::string>& values) {
-    rust::Vec<rust::String> out;
-    out.reserve(values.size());
-    for (const std::string& value : values) {
-        out.push_back(rust::String(value));
-    }
-    return out;
-}
-
 rust::Vec<StorageKeyView> to_rust(const std::vector<tokenspeed::CacheKey>& keys) {
     rust::Vec<StorageKeyView> out;
     out.reserve(keys.size());
@@ -583,13 +574,44 @@ rust::Vec<StorageKeyView> to_rust(const std::vector<tokenspeed::CacheKey>& keys)
     return out;
 }
 
+std::vector<std::string> to_std(const rust::Vec<rust::String>& values) {
+    std::vector<std::string> out;
+    out.reserve(values.size());
+    for (const rust::String& value : values) {
+        out.emplace_back(value);
+    }
+    return out;
+}
+
+// Keys of the default namespace: a view carries no other.
+std::vector<tokenspeed::CacheKey> to_std(rust::Slice<const StorageKeyView> keys) {
+    std::vector<tokenspeed::CacheKey> out;
+    out.reserve(keys.size());
+    for (const StorageKeyView& key : keys) {
+        out.push_back(tokenspeed::CacheKey{.group_id = key.group_id,
+                                           .content_hash = tokenspeed::ContentHash{std::string(key.content_hash)},
+                                           .page_offset = key.page_offset});
+    }
+    return out;
+}
+
+// A view's tail. No tail is no tokens and no hash; one without the other is a
+// tail the scheduler and the pool refuse.
+std::optional<tokenspeed::TailPublication> to_tail(std::int32_t tail_tokens, const rust::String& tail_hash) {
+    if (tail_tokens == 0 && tail_hash.empty()) {
+        return std::nullopt;
+    }
+    return tokenspeed::TailPublication{.tail_tokens = tail_tokens,
+                                       .hash = tokenspeed::ContentHash{std::string(tail_hash)}};
+}
+
 }  // namespace
 
 rust::Vec<SharedL2LookupView> start_shared_l2_lookups(tokenspeed::Scheduler& scheduler) {
     rust::Vec<SharedL2LookupView> out;
     for (const tokenspeed::SharedL2Lookup& lookup : scheduler.StartSharedL2Lookups()) {
         out.push_back(SharedL2LookupView{.request_id = rust::String(lookup.request_id),
-                                         .prefix_hashes = to_rust(lookup.prefix_hashes),
+                                         .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                          .tokens = to_rust(lookup.tokens),
                                          .max_tokens = lookup.max_tokens});
     }
@@ -601,27 +623,13 @@ rust::Vec<SharedL2ProxyBlockView> apply_shared_l2_answers(tokenspeed::Scheduler&
     std::vector<tokenspeed::SharedL2Answer> converted;
     converted.reserve(answers.size());
     for (const SharedL2AnswerView& answer : answers) {
-        // No tail is no tokens and no hash; one without the other is a tail the
-        // scheduler refuses.
-        std::optional<tokenspeed::TailPublication> tail;
-        if (answer.tail_tokens != 0 || !answer.tail_hash.empty()) {
-            tail = tokenspeed::TailPublication{.tail_tokens = answer.tail_tokens,
-                                               .hash = tokenspeed::ContentHash{std::string(answer.tail_hash)}};
-        }
-        std::vector<tokenspeed::CacheKey> keys;
-        keys.reserve(answer.keys.size());
-        for (const StorageKeyView& key : answer.keys) {
-            keys.push_back(tokenspeed::CacheKey{.group_id = key.group_id,
-                                                .content_hash = tokenspeed::ContentHash{std::string(key.content_hash)},
-                                                .page_offset = key.page_offset});
-        }
         converted.push_back(tokenspeed::SharedL2Answer{
             .request_id = std::string(answer.request_id),
             .ticket = answer.ticket,
             .num_tokens = answer.num_tokens,
             .kv_tokens = answer.kv_tokens,
-            .tail = std::move(tail),
-            .keys = std::move(keys),
+            .tail = to_tail(answer.tail_tokens, answer.tail_hash),
+            .keys = to_std({answer.keys.data(), answer.keys.size()}),
             .buckets = to_std({answer.buckets.data(), answer.buckets.size()}),
             .pool_pages = to_std({answer.pool_pages.data(), answer.pool_pages.size()})});
     }
@@ -639,7 +647,7 @@ namespace {
 
 ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
     return ForwardBatchView{
-        .request_ids = to_rust(batch.request_ids),
+        .request_ids = ToRustStrings(batch.request_ids),
         .request_pool_indices = to_rust(batch.request_pool_indices),
         .input_lengths = to_rust(batch.input_lengths),
         .prefill_lengths = to_rust(batch.prefill_lengths),
@@ -651,7 +659,7 @@ ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
 
 TransferBatchView transfer_view(const tokenspeed::ForwardBatch& batch) {
     TransferBatchView view;
-    view.request_ids = to_rust(batch.request_ids);
+    view.request_ids = ToRustStrings(batch.request_ids);
     view.request_pool_indices = to_rust(batch.request_pool_indices);
     view.input_lengths = to_rust(batch.input_lengths);
     view.prefill_lengths = to_rust(batch.prefill_lengths);
@@ -916,7 +924,7 @@ rust::Vec<SharedL2OpView> plan_shared_l2_ops(const tokenspeed::ExecutionPlan& pl
                     for (const tokenspeed::CheckpointTree::Checkpoint& checkpoint : op.checkpoints) {
                         view.checkpoints.push_back(SharedL2CheckpointView{
                             .tokens = to_rust(checkpoint.tokens),
-                            .prefix_hashes = to_rust(checkpoint.prefix_hashes),
+                            .prefix_hashes = ToRustStrings(checkpoint.prefix_hashes),
                             .tail_tokens = checkpoint.tail ? checkpoint.tail->tail_tokens : 0,
                             .tail_hash =
                                 rust::String(checkpoint.tail ? checkpoint.tail->hash.ToString() : std::string{}),
@@ -937,6 +945,81 @@ rust::Vec<SharedL2OpView> plan_shared_l2_ops(const tokenspeed::ExecutionPlan& pl
             *shared_l2_operation);
     }
     return out;
+}
+
+SharedL2AnswerView shared_l2_pool_lookup(tokenspeed::SharedL2Pool& pool, std::uint64_t client,
+                                         const SharedL2LookupView& lookup) {
+    const std::vector<std::string> prefix_hashes = to_std(lookup.prefix_hashes);
+    tokenspeed::PromptPrefix prompt;
+    prompt.prefix_hashes = prefix_hashes;
+    prompt.tokens = {lookup.tokens.data(), lookup.tokens.size()};
+    prompt.max_tokens = lookup.max_tokens;
+    const tokenspeed::SharedL2Pool::Hit hit = pool.Lookup(client, prompt);
+    std::vector<tokenspeed::CacheKey> keys;
+    std::vector<std::int32_t> buckets;
+    std::vector<std::int32_t> pool_pages;
+    keys.reserve(hit.pages.size());
+    buckets.reserve(hit.pages.size());
+    pool_pages.reserve(hit.pages.size());
+    for (const tokenspeed::SharedL2Pool::Page& page : hit.pages) {
+        keys.push_back(page.key);
+        buckets.push_back(page.bucket);
+        pool_pages.push_back(page.pool_page);
+    }
+    return SharedL2AnswerView{.request_id = lookup.request_id,
+                              .ticket = hit.ticket,
+                              .num_tokens = hit.num_tokens,
+                              .kv_tokens = hit.kv_tokens,
+                              .tail_tokens = hit.tail ? hit.tail->tail_tokens : 0,
+                              .tail_hash = rust::String(hit.tail ? hit.tail->hash.ToString() : std::string{}),
+                              .keys = to_rust(keys),
+                              .buckets = to_rust(buckets),
+                              .pool_pages = to_rust(pool_pages)};
+}
+
+void shared_l2_pool_release(tokenspeed::SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket) {
+    pool.Release(client, ticket);
+}
+
+SharedL2ReservationView shared_l2_pool_reserve(tokenspeed::SharedL2Pool& pool, std::uint64_t client,
+                                               rust::Slice<const StorageKeyView> keys,
+                                               rust::Slice<const std::int32_t> buckets) {
+    const tokenspeed::SharedL2Pool::Reservation reservation =
+        pool.Reserve(client, to_std(keys), {buckets.data(), buckets.size()});
+    return SharedL2ReservationView{.ticket = reservation.ticket, .pages = to_rust(reservation.pages)};
+}
+
+void shared_l2_pool_commit(tokenspeed::SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket,
+                           rust::Slice<const SharedL2CheckpointView> checkpoints) {
+    std::vector<tokenspeed::CheckpointTree::Checkpoint> converted;
+    converted.reserve(checkpoints.size());
+    for (const SharedL2CheckpointView& checkpoint : checkpoints) {
+        converted.push_back({.tokens = to_std({checkpoint.tokens.data(), checkpoint.tokens.size()}),
+                             .prefix_hashes = to_std(checkpoint.prefix_hashes),
+                             .tail = to_tail(checkpoint.tail_tokens, checkpoint.tail_hash),
+                             .access_epoch = checkpoint.access_epoch});
+    }
+    pool.Commit(client, ticket, converted);
+}
+
+void shared_l2_pool_touch(tokenspeed::SharedL2Pool& pool, rust::Slice<const StorageKeyView> keys) {
+    pool.Touch(to_std(keys));
+}
+
+void shared_l2_pool_disconnect(tokenspeed::SharedL2Pool& pool, std::uint64_t client) { pool.Disconnect(client); }
+
+bool shared_l2_pool_clear_cache(tokenspeed::SharedL2Pool& pool) { return pool.ClearCache(); }
+
+SharedL2PoolStatsView shared_l2_pool_stats(const tokenspeed::SharedL2Pool& pool) {
+    const tokenspeed::SharedL2Pool::Stats stats = pool.GetStats();
+    return SharedL2PoolStatsView{.num_lcm_blocks = stats.num_lcm_blocks,
+                                 .empty_lcm_blocks = stats.empty_lcm_blocks,
+                                 .cached_blocks = stats.cached_blocks,
+                                 .pinned_blocks = stats.pinned_blocks,
+                                 .reserved_blocks = stats.reserved_blocks,
+                                 .open_lookups = stats.open_lookups,
+                                 .evicted_blocks = stats.evicted_blocks,
+                                 .checkpoints = stats.checkpoints};
 }
 
 void set_profile_span_sink(bool installed) {

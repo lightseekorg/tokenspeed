@@ -18,25 +18,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared pieces of the shared L2 service tests: a real owner served from a
-thread over real ZMQ, and a pool that keeps the books of the scheduler's
-``SharedL2Pool`` in Python, where every test can read them."""
+"""Shared pieces of the shared L2 service tests: the real owner, run from its
+command line in a process of its own over the scheduler's ``SharedL2Pool``,
+and what a rank sends it."""
 
 from __future__ import annotations
 
-import itertools
-import threading
+import signal
+import subprocess
+import sys
 import time
 from array import array
 
-import zmq
+import pytest
 
 from tokenspeed.runtime.cache.l3.identity import (
     L3_RUNTIME_COMPAT,
     storage_deployment_id,
 )
-from tokenspeed.runtime.cache.shared_l2.owner import SharedL2Owner
-from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection
+from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection, OwnerError
 from tokenspeed.runtime.utils.network import get_free_port
 
 LCM_BYTES = 64
@@ -133,126 +133,9 @@ def wait_until(predicate, *, timeout_s: float = 5.0) -> None:
         time.sleep(0.002)
 
 
-class FakePool:
-    """The scheduler's ``SharedL2Pool``'s interface over plain dicts.
-
-    A committed checkpoint is one a lookup can hit: a lookup whose tokens start with
-    its tokens hits it and pins the blocks its write asked for.
-    """
-
-    def __init__(self, geometry, num_lcm_blocks):
-        self.geometry = geometry
-        self.num_lcm_blocks = num_lcm_blocks
-        self._free = list(range(num_lcm_blocks, 0, -1))
-        # (key, bucket) -> page.
-        self.cached = {}
-        # (tokens, tail, [(key, bucket)]).
-        self.checkpoints = []
-        # (client, ticket) -> pages.
-        self.pins = {}
-        # (client, ticket) -> ({(key, bucket): page}, every (key, bucket)).
-        self.reserved = {}
-        self._tickets = itertools.count(1)
-        # The arguments of the last call of a method, as the owner passed them.
-        self.received = {}
-        # The methods that raise.
-        self.failing = set()
-        self.touched = []
-        self.disconnected = []
-
-    def _called(self, method, received=None):
-        self.received[method] = received
-        if method in self.failing:
-            raise RuntimeError(f"{method} failed")
-
-    def lookup(self, client, prefix_hashes, tokens, max_tokens):
-        self._called("lookup", received=(prefix_hashes, tokens, max_tokens))
-        hit = max(
-            (found for found in self.checkpoints if tokens.startswith(found[0])),
-            key=lambda found: len(found[0]),
-            default=None,
-        )
-        if hit is None:
-            return (0, 0, 0, None, [])
-        hit_tokens, tail, blocks = hit
-        ticket = next(self._tickets)
-        pages = [(key, bucket, self.cached[key, bucket]) for key, bucket in blocks]
-        self.pins[client, ticket] = pages
-        return (ticket, len(hit_tokens) // 4, len(hit_tokens) // 4, tail, pages)
-
-    def release(self, client, ticket):
-        self._called("release")
-        if (client, ticket) not in self.pins:
-            raise ValueError(
-                "a shared L2 release names a ticket no lookup of its client holds"
-            )
-        del self.pins[client, ticket]
-
-    def reserve(self, client, keys, buckets):
-        self._called("reserve", received=(keys, buckets))
-        writing = {block for placed, _ in self.reserved.values() for block in placed}
-        placed, pages = {}, []
-        for block in zip(keys, buckets, strict=True):
-            if block in self.cached:
-                pages.append(-1)
-            elif block in writing or block in placed:
-                pages.append(-3)
-            elif not self._free:
-                pages.append(-2)
-            else:
-                placed[block] = self._free.pop()
-                pages.append(placed[block])
-        if not placed:
-            return (0, pages)
-        ticket = next(self._tickets)
-        self.reserved[client, ticket] = (placed, list(zip(keys, buckets)))
-        return (ticket, pages)
-
-    def commit(self, client, ticket, checkpoints):
-        self._called("commit", received=checkpoints)
-        if (client, ticket) not in self.reserved:
-            raise ValueError(
-                "a shared L2 commit names a ticket under which its client "
-                "reserves nothing"
-            )
-        placed, blocks = self.reserved.pop((client, ticket))
-        self.cached.update(placed)
-        for tokens, _, tail, _ in checkpoints:
-            self.checkpoints.append((tokens, tail, blocks))
-
-    def touch(self, keys):
-        self.touched.extend(keys)
-
-    def disconnect(self, client):
-        self.disconnected.append(client)
-        for held in (self.pins, self.reserved):
-            for owner, ticket in list(held):
-                if owner == client:
-                    del held[owner, ticket]
-
-    def clear_cache(self):
-        if self.pins or self.reserved:
-            return False
-        self._free.extend(self.cached.values())
-        self.cached.clear()
-        self.checkpoints.clear()
-        return True
-
-    def stats(self):
-        return {
-            "num_lcm_blocks": self.num_lcm_blocks,
-            "empty_lcm_blocks": len(self._free),
-            "cached_blocks": len(self.cached),
-            "pinned_blocks": sum(len(pages) for pages in self.pins.values()),
-            "reserved_blocks": sum(len(placed) for placed, _ in self.reserved.values()),
-            "open_lookups": len(self.pins),
-            "evicted_blocks": 0,
-            "checkpoints": len(self.checkpoints),
-        }
-
-
 class ServedOwner:
-    """A ``SharedL2Owner`` over ``FakePool``, serving from a thread."""
+    """The owner service, run from its command line in a process of its
+    own."""
 
     def __init__(
         self,
@@ -272,37 +155,26 @@ class ServedOwner:
             client_timeout_s: The owner's client timeout.
         """
         self.address = address or f"tcp://127.0.0.1:{get_free_port()}"
-        self.pools: list[FakePool] = []
-        # The address may still belong to an owner that was just closed.
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                self.owner = SharedL2Owner(
-                    address=self.address,
-                    num_providers=num_providers,
-                    client_timeout_s=client_timeout_s,
-                    make_shared_l2_pool=self._make_pool,
-                )
-                break
-            except zmq.ZMQError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(0.01)
-        self.admin = OwnerConnection(self.address, timeout_ms=5000)
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self.resume()
+        self.process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tokenspeed.runtime.cache.shared_l2",
+                "owner",
+                f"--address={self.address}",
+                f"--num-providers={num_providers}",
+                "--headroom-lcm-blocks=0",
+                f"--client-timeout-s={client_timeout_s}",
+                "--checkpoint-retention-requests=0",
+                "--checkpoint-retention-leaf-distance=0",
+            ]
+        )
+        self.admin = OwnerConnection(self.address, timeout_ms=30000)
+        # The process serves once it answers; it has no pool yet.
+        with pytest.raises(OwnerError, match="pool is not ready"):
+            self.admin.request("stats")
         for index in range(joined_providers):
             self.add_provider(f"node{index}", provider_blocks)
-
-    def _make_pool(self, geometry, num_lcm_blocks):
-        self.pools.append(FakePool(geometry, num_lcm_blocks))
-        return self.pools[-1]
-
-    @property
-    def pool(self) -> FakePool:
-        (pool,) = self.pools
-        return pool
 
     def add_provider(self, session: str, blocks: int) -> None:
         self.admin.request(
@@ -317,19 +189,13 @@ class ServedOwner:
 
     def stall(self) -> None:
         """Stop answering. Requests wait in the socket for ``resume``."""
-        self._stop.set()
-        self._thread.join()
-        self._thread = None
+        self.process.send_signal(signal.SIGSTOP)
 
     def resume(self) -> None:
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self.owner.serve, args=(self._stop,), daemon=True
-        )
-        self._thread.start()
+        self.process.send_signal(signal.SIGCONT)
 
     def close(self) -> None:
-        if self._thread is not None:
-            self.stall()
         self.admin.close()
-        self.owner.close()
+        # A stalled process is killed as a running one is.
+        self.process.kill()
+        self.process.wait()

@@ -18,9 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""A rank's settings for the shared L2 pool and its join of the pool, against a
-real owner service over real ZMQ. The pool behind the owner keeps the books of
-the scheduler's ``SharedL2Pool`` in Python.
+"""A rank's settings for the shared L2 pool and its join of the pool, against
+the real owner service, run from its command line.
 
 What the rank does once it has joined (lookups, writes, notices) is the engine
 host's: its tests are ``shared_l2`` of ``ts-control``."""
@@ -50,7 +49,7 @@ from tokenspeed.runtime.cache.shared_l2.client import (  # noqa: E402
     JoinedSharedL2Pool,
     SharedL2ClientConfig,
     SharedL2Provider,
-    hello_until_ready,
+    wait_until_ready,
 )
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
@@ -90,7 +89,7 @@ def join(owner: ServedOwner, *, geometry=GEOMETRY, **settings) -> JoinedSharedL2
     config = SharedL2ClientConfig.from_json(json.dumps(fields))
     connection = OwnerConnection(owner.address, timeout_ms=config.request_timeout_ms)
     try:
-        return hello_until_ready(
+        return wait_until_ready(
             config,
             geometry=geometry,
             deployment_id=deployment_id(),

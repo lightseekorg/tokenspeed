@@ -20,9 +20,9 @@
 
 """Shared L2: one paged Host L2 pool that every rank joined to it uses.
 
-``owner`` serves the pool's cache index (the scheduler's ``SharedL2Pool``)
-and holds no bytes; ``provider`` hosts one node's pool memory; ``wire`` is the
-request-reply wire to the owner.
+``owner`` builds the cache index of the pool's owner (the scheduler's
+``SharedL2Pool``), which holds no bytes; ``provider`` hosts one node's pool
+memory; ``wire`` is the request-reply wire to the owner.
 
 On a rank, ``client`` holds the rank's config and its hello,
 ``layout`` says where its Device blocks are and how a pool page holds one,
@@ -30,6 +30,7 @@ On a rank, ``client`` holds the rank's config and its hello,
 executor's place, and ``rank`` joins all of it to the pool at device
 construction. The rank's client of the owner (lookups, writes, notices) and
 the RDMA copies of its loads and writes run in the engine host
-(``shared_l2`` of ``ts-control``). See the "Shared L2 pool" section of
+(``shared_l2`` of ``ts-control``), and so does the owner's service, in the
+owner's own process. See the "Shared L2 pool" section of
 ``docs/configuration/server.md``.
 """

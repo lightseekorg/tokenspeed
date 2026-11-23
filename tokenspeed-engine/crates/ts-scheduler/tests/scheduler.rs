@@ -27,9 +27,10 @@ use std::{ffi::CString, sync::Once};
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
     profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
-    ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2LookupView,
-    SharedL2OpKind, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageRound, StorageTickView, TransferBatchView,
+    ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2CheckpointView,
+    SharedL2LookupView, SharedL2OpKind, SharedL2Pool, SharedL2PoolStatsView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageRound,
+    StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -1832,4 +1833,220 @@ fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
     let plan = scheduler.next_execution_plan(true, false);
     assert_eq!(plan.forward_batches()[0].request_ids, ["plain"]);
     assert!(plan.shared_l2_ops().is_empty());
+}
+
+/// A pool of 8 LCM blocks as its owner builds it: pages of two tokens, a
+/// full-attention group with two blocks to an LCM block and a State group
+/// with one.
+const NEW_POOL: &str = r#"
+import tokenspeed_scheduler as ts
+full = ts.CacheGroupConfig()
+full.group_id, full.block_granularity, full.attn_kind = "full", 2, ts.AttnKind.Full
+full.cache_blocks_per_lcm_block = 2
+state = ts.CacheGroupConfig()
+state.group_id, state.block_granularity, state.attn_kind = "state", 0, ts.AttnKind.State
+state.cache_blocks_per_lcm_block = 1
+cfg = ts.SchedulerConfig()
+cfg.prefix_granularity = 2
+cfg.cache_groups = [full, state]
+cfg.host_group_packing = [2, 1]
+cfg.checkpoint_retention_requests = 0
+result = ts.SharedL2Pool(cfg, 8, 0)
+"#;
+
+/// The chain hashes of the prompt 1..=5 as a rank's scheduler computes
+/// them: its two full pages and its tail of one token. The pool hashes a
+/// looked-up prompt's own tail to find a published one.
+const POOL_PROMPT_HASHES: &str = r#"
+import hashlib, struct
+def page_hash(tokens, prior):
+    prior = bytes.fromhex(prior)
+    return hashlib.sha256(
+        struct.pack("<I", len(prior)) + prior + struct.pack(f"<I{len(tokens)}i", len(tokens), *tokens)
+    ).hexdigest()
+first = page_hash([1, 2], "")
+second = page_hash([3, 4], first)
+result = [first, second, page_hash([5], second)]
+"#;
+
+fn pool_prompt_hashes() -> [String; 3] {
+    Python::attach(|py| run(py, POOL_PROMPT_HASHES).extract().unwrap())
+}
+
+fn pool_key(group_id: u32, content_hash: &str) -> StorageKeyView {
+    StorageKeyView {
+        group_id,
+        content_hash: content_hash.to_owned(),
+        page_offset: 0,
+    }
+}
+
+/// The blocks of the prompt 1..=5: its two full pages, its tail's block,
+/// and the State checkpoint at its end.
+fn pool_prompt_keys() -> Vec<StorageKeyView> {
+    let [first, second, tail] = pool_prompt_hashes();
+    vec![
+        pool_key(0, &first),
+        pool_key(0, &second),
+        pool_key(0, &tail),
+        pool_key(1, &tail),
+    ]
+}
+
+/// The checkpoint at the end of the prompt 1..=5.
+fn pool_prompt_checkpoint() -> SharedL2CheckpointView {
+    let [first, second, tail] = pool_prompt_hashes();
+    SharedL2CheckpointView {
+        tokens: (1..=5).collect(),
+        prefix_hashes: vec![first, second],
+        tail_tokens: 1,
+        tail_hash: tail,
+        access_epoch: 7,
+    }
+}
+
+/// The lookup of the prompt 1..=7, which starts with the prompt 1..=5. A
+/// page past the checkpoint is in no pool: its hash is never matched.
+fn pool_lookup() -> SharedL2LookupView {
+    let [first, second, _] = pool_prompt_hashes();
+    SharedL2LookupView {
+        request_id: "longer".to_owned(),
+        prefix_hashes: vec![first, second, "1-2-3-4-5-6".to_owned()],
+        tokens: (1..=7).collect(),
+        max_tokens: 7,
+    }
+}
+
+#[test]
+fn only_a_pool_object_is_accepted() {
+    interpreter();
+    Python::attach(|py| {
+        let not_a_pool = run(py, "result = object()");
+        let error = SharedL2Pool::from_python(&not_a_pool).err().unwrap();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+    });
+}
+
+#[test]
+fn a_pool_python_built_is_written_and_read_from_rust() {
+    interpreter();
+    let mut pool = Python::attach(|py| SharedL2Pool::from_python(&run(py, NEW_POOL)).unwrap());
+    let empty = pool.stats();
+    assert_eq!(
+        empty,
+        SharedL2PoolStatsView {
+            num_lcm_blocks: 8,
+            empty_lcm_blocks: 8,
+            cached_blocks: 0,
+            pinned_blocks: 0,
+            reserved_blocks: 0,
+            open_lookups: 0,
+            evicted_blocks: 0,
+            checkpoints: 0,
+        }
+    );
+    // An empty pool answers a miss, for the request that asked.
+    let miss = pool.lookup(2, &pool_lookup()).unwrap();
+    assert_eq!((miss.request_id.as_str(), miss.ticket), ("longer", 0));
+    assert!(miss.keys.is_empty() && miss.pool_pages.is_empty());
+
+    // Client 1 reserves a page for every block and commits them with the
+    // checkpoint.
+    let keys = pool_prompt_keys();
+    let reservation = pool.reserve(1, &keys, &[0; 4]).unwrap();
+    assert!(reservation.ticket != 0);
+    assert!(
+        reservation.pages.iter().all(|page| *page >= 1),
+        "{reservation:?}"
+    );
+    assert_eq!(pool.stats().reserved_blocks, 4);
+    // Another client gets no page for a block that is being written.
+    let second = pool.reserve(2, &keys, &[0; 4]).unwrap();
+    assert_eq!((second.ticket, second.pages), (0, vec![-3; 4]));
+    pool.commit(1, reservation.ticket, &[pool_prompt_checkpoint()])
+        .unwrap();
+    let stats = pool.stats();
+    assert_eq!(
+        (
+            stats.reserved_blocks,
+            stats.cached_blocks,
+            stats.checkpoints
+        ),
+        (0, 4, 1)
+    );
+
+    // Client 2's longer prompt hits the checkpoint: its blocks at the pages
+    // the write got, pinned under the answer's ticket.
+    let hit = pool.lookup(2, &pool_lookup()).unwrap();
+    assert!(hit.ticket != 0);
+    assert_eq!((hit.num_tokens, hit.kv_tokens), (5, 5));
+    assert_eq!(
+        (hit.tail_tokens, &hit.tail_hash),
+        (1, &pool_prompt_hashes()[2])
+    );
+    assert_eq!(hit.keys, keys);
+    assert_eq!(hit.buckets, [0; 4]);
+    assert_eq!(hit.pool_pages, reservation.pages);
+    let stats = pool.stats();
+    assert_eq!((stats.pinned_blocks, stats.open_lookups), (4, 1));
+    assert!(!pool.clear_cache(), "a pinned pool is not emptied");
+
+    // A ticket is its client's.
+    let error = pool.release(1, hit.ticket).unwrap_err();
+    assert!(
+        error.what().contains("no lookup of its client holds"),
+        "{error}"
+    );
+    pool.release(2, hit.ticket).unwrap();
+    assert_eq!(pool.stats().pinned_blocks, 0);
+    pool.touch(&keys[..2]).unwrap();
+    assert!(pool.clear_cache());
+    assert_eq!(pool.stats(), empty);
+}
+
+#[test]
+fn a_pool_refuses_what_is_not_its_own_as_an_error() {
+    interpreter();
+    let mut pool = Python::attach(|py| SharedL2Pool::from_python(&run(py, NEW_POOL)).unwrap());
+    // A group the pool does not have, a bucket outside the group's shards,
+    // tokens short of the lookup's bound.
+    let error = pool.reserve(1, &[pool_key(2, "1-2")], &[0]).unwrap_err();
+    assert!(error.what().contains("a shared L2 key names"), "{error}");
+    let error = pool.touch(&[pool_key(0, "")]).unwrap_err();
+    assert!(error.what().contains("a shared L2 key names"), "{error}");
+    let error = pool.reserve(1, &[pool_key(0, "1-2")], &[1]).unwrap_err();
+    assert!(
+        error.what().contains("outside its group's shard"),
+        "{error}"
+    );
+    let short = SharedL2LookupView {
+        max_tokens: 8,
+        ..pool_lookup()
+    };
+    let error = pool.lookup(1, &short).unwrap_err();
+    assert!(error.what().contains("must reach its bound"), "{error}");
+
+    // A commit names a reservation of its client, and a checkpoint covers
+    // its pages and tail exactly: one that ends on a page has no tail.
+    let reservation = pool.reserve(1, &pool_prompt_keys(), &[0; 4]).unwrap();
+    let error = pool
+        .commit(2, reservation.ticket, &[pool_prompt_checkpoint()])
+        .unwrap_err();
+    assert!(error.what().contains("reserves nothing"), "{error}");
+    let tailless = SharedL2CheckpointView {
+        tail_tokens: 0,
+        tail_hash: String::new(),
+        ..pool_prompt_checkpoint()
+    };
+    let error = pool.commit(1, reservation.ticket, &[tailless]).unwrap_err();
+    assert!(error.what().contains("cover its pages and tail"), "{error}");
+    assert_eq!(pool.stats().reserved_blocks, 4);
+
+    // A client that leaves loses what it reserved.
+    pool.disconnect(1);
+    assert_eq!(pool.stats().reserved_blocks, 0);
+    let error = pool
+        .commit(1, reservation.ticket, &[pool_prompt_checkpoint()])
+        .unwrap_err();
+    assert!(error.what().contains("reserves nothing"), "{error}");
 }

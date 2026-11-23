@@ -38,6 +38,9 @@
 //! the providers' pages ([`geometry`]). Its loads ([`load`]) are handed
 //! over by the data plane's forward thread, not by the loop.
 //!
+//! The owner's side is [`owner`]: the serving loop of the owner's process,
+//! which no rank runs.
+//!
 //! A failure of the client or of the owner ends serving, as a failed
 //! load-back does; a miss is an answer of the owner that names no page. A
 //! load from the pool that failed lets its forward go over pages it never
@@ -45,6 +48,12 @@
 //! forward has landed, before it commits it ([`Pool::forward_landed`]). The
 //! client answers one rank, so the pool needs a replica of one member
 //! (attention TP 1).
+
+pub mod client;
+pub mod geometry;
+pub mod load;
+pub mod owner;
+pub mod wire;
 
 use std::{
     collections::VecDeque,
@@ -57,11 +66,6 @@ use ts_scheduler::{
     CacheEvent, CacheEventKind, ExecutionPlan, SharedL2AnswerView, SharedL2LookupView,
     SharedL2OpKind, SharedL2OpView, SharedL2ProxyBlockView,
 };
-
-pub mod client;
-pub mod geometry;
-pub mod load;
-pub mod wire;
 
 /// The pool's client or its owner failed; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
