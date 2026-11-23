@@ -921,10 +921,11 @@ def test_gdn_pending_metadata_is_complete_and_snapshots_require_materialization(
     owner = _gdn_pending()
     _assert_slot_state_complete(owner, exporter=owner, slot_domains={POOL_ROWS})
     owner.records[3] = torch.tensor([7, -1, 100, -1])
-    image = torch.empty(owner.slot_state_bytes(), dtype=torch.uint8)
-    owner.export_slot_state(3, image, None, request_id="source")
-    owner.import_slot_state(6, image, None, request_id="restored")
+    layout = SlotStateLayout([owner])
+    image = torch.empty(layout.nbytes, dtype=torch.uint8)
+    layout.export(3, image, None, admission_id=1)
+    layout.import_(6, image, None, admission_id=1)
     assert torch.equal(owner.records[3], owner.records[6])
     owner.records[3, 1] = 0
     with pytest.raises(RuntimeError, match="must be materialized"):
-        owner.export_slot_state(3, image, None, request_id="pending")
+        layout.export(3, image, None, admission_id=1)

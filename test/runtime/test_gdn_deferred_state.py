@@ -185,6 +185,35 @@ def test_first_decode_commits_distinct_source_before_pending_and_masked_material
     assert not pending.valid.any().item()
 
 
+def test_retracted_replay_metadata_round_trips_to_a_new_slot():
+    from tokenspeed.runtime.execution.slot_state import SlotStateLayout
+
+    value = case(True)
+    slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    frontier = torch.zeros(10, device="cuda", dtype=torch.int32)
+    stopped = torch.zeros(10, device="cuda", dtype=torch.bool)
+    accepted = torch.tensor([4, 2], device="cuda", dtype=torch.int32)
+    refresh(value, [1, 2])
+    run(value, slots, frontier, stopped, accepted)
+    pending = value.backend._pending_state
+    assert pending.records[1, 1].item() >= 0
+
+    layout = SlotStateLayout(value.backend.slot_state_exporters())
+    image = torch.empty(layout.nbytes, dtype=torch.uint8, pin_memory=True)
+    write_stream = torch.cuda.Stream()
+    load_stream = torch.cuda.Stream()
+    value.backend.materialize_recurrent_state(slots[:1])
+    write_stream.wait_stream(torch.cuda.current_stream())
+    layout.export(1, image, write_stream, admission_id=17)
+    load_stream.wait_stream(write_stream)
+    layout.import_(3, image, load_stream, admission_id=17)
+    torch.cuda.current_stream().wait_stream(load_stream)
+
+    torch.testing.assert_close(pending.records[3], pending.records[1])
+    assert pending.records[3, 1].item() == -1
+    assert pending.records[3, 2].item() == 4
+
+
 def test_deferred_workspace_budget_matches_owned_storage():
     from dataclasses import replace
     from test.runtime.test_gdn_state_paging import _mamba_config_pair
