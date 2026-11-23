@@ -1409,9 +1409,9 @@ class GlmDsaSparseAttentionMixin:
         The rows are this rank's own, every one written, and NoPE, so the
         prologue is ``triton_mla_prologue``'s unrotated
         ``apply_rope_mla_set_kv_buffer_triton`` call. The launch also absorbs
-        the query where it reproduces :meth:`absorb_query`'s ``bmm``;
-        otherwise an FP8 cache's query is absorbed here first, and a native
-        one afterwards by :meth:`absorb_query`.
+        the query where ``mla_query_absorb_folds`` holds; otherwise an FP8
+        cache's query is absorbed here first, and a native one afterwards by
+        :meth:`absorb_query`.
         """
         mqa = self.attn_mqa
         num_tokens = q.shape[0]

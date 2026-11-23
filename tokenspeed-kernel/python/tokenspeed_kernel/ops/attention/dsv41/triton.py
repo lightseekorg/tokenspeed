@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
@@ -42,9 +40,13 @@ from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _ue8m0_exponent,
     _ue8m0_word,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
@@ -2971,72 +2973,36 @@ def pack_index_queries(values):
     return data, scales
 
 
-# The bmm kernel whose sums the absorbed query tiles reproduce: per output
-# element one chain of 16x16x32 MFMAs over K in order, no split-K.
-_ABSORB_BMM_KERNEL = "gluon_grouped_bmm_a16w16_decode_gfx950"
 _ABSORB_BLOCK_M = 16
 _ABSORB_BLOCK_N = 16
-
-
-@lru_cache(maxsize=256)
-def _absorb_bmm_reproduced(
-    heads: int, tokens: int, n: int, k: int, dtype: torch.dtype
-) -> bool:
-    signature = format_signature(
-        a=dense_tensor_format(dtype), b=dense_tensor_format(dtype)
-    )
-    traits = {
-        "batch": heads,
-        "m": tokens,
-        "n": n,
-        "k": k,
-        "a_inner_stride_one": True,
-        "b_n_stride_one": False,
-        "out_dtype": dtype,
-        "out_inner_stride_one": True,
-    }
-    try:
-        kernel = select_kernel("gemm", "bmm", signature, traits=traits)
-    except NoKernelFoundError:
-        return False
-    if kernel.name != _ABSORB_BMM_KERNEL:
-        return False
-    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-        gluon_grouped_mm_a16w16_decode_num_counters_gfx950,
-        supports_gluon_grouped_mm_a16w16_decode_gfx950,
-    )
-
-    return (
-        supports_gluon_grouped_mm_a16w16_decode_gfx950(tokens, heads, n, k)
-        and gluon_grouped_mm_a16w16_decode_num_counters_gfx950(tokens, heads, n, k) == 0
-    )
+# Larger batches absorb with the standalone bmm.
+_ABSORB_MAX_TOKENS = 64
 
 
 def mla_query_absorb_folds(q_nope: torch.Tensor, w_kc: torch.Tensor) -> bool:
     """Whether :func:`index_k_layernorm_scatter_and_pack_query` can absorb the
-    MLA query (``mla_absorb``) as ``bmm(q_nope.transpose(0, 1),
-    w_kc.transpose(1, 2))`` without a plan does, bit for bit for finite
-    ``q_nope`` rows.
+    MLA query (``mla_absorb``), ``bmm(q_nope.transpose(0, 1),
+    w_kc.transpose(1, 2))``, on gfx950.
+
+    The absorb sums each output as one chain of 16x16x32 MFMAs over K in
+    order, so it matches a ``bmm`` that sums the same way (Kimi-K3.1's at TP8)
+    bit for bit for finite ``q_nope`` rows.
 
     Args:
         q_nope: ``[tokens, heads, K]`` BF16 query part with unit inner stride.
         w_kc: ``[heads, K, N]`` BF16 absorption weight, K-major.
     """
-    if q_nope.ndim != 3 or w_kc.ndim != 3 or q_nope.shape[0] == 0:
+    if q_nope.ndim != 3 or w_kc.ndim != 3:
         return False
     tokens, heads, k = q_nope.shape
-    n = w_kc.shape[2]
     return (
-        q_nope.dtype == w_kc.dtype == torch.bfloat16
+        current_platform().is_cdna4
+        and 0 < tokens <= _ABSORB_MAX_TOKENS
+        and q_nope.dtype == w_kc.dtype == torch.bfloat16
         and w_kc.shape[:2] == (heads, k)
         and k in (64, 128, 256)
-        and n % _ABSORB_BLOCK_N == 0
+        and w_kc.shape[2] % _ABSORB_BLOCK_N == 0
         and q_nope.stride(2) == 1
-        and q_nope.stride(0) % 8 == 0
-        and q_nope.stride(1) % 8 == 0
-        and q_nope.data_ptr() % 16 == 0
-        and w_kc.transpose(1, 2).is_contiguous()
-        and _absorb_bmm_reproduced(heads, tokens, n, k, q_nope.dtype)
     )
 
 
