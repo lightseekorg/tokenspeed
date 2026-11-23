@@ -44,6 +44,7 @@ __all__ = [
     "blockwise_logprobs",
     "chain_verify_coins",
     "prepare_sampling_offsets",
+    "topk_chain_verify",
     "VOCAB_SHARD_DRAFT_BLOCK",
     "VOCAB_SHARD_DRAFT_FIELDS",
     "vocab_shard_draft_record",
@@ -456,6 +457,72 @@ def vocab_topk_merge(
     kernel(pairs, k, softcap, ids_out, values_out)
 
 
+def topk_chain_verify(
+    predicts: _torch.Tensor,
+    accept_index: _torch.Tensor,
+    accept_token_num: _torch.Tensor,
+    candidates: _torch.Tensor,
+    uniform_samples: _torch.Tensor,
+    uniform_samples_for_final_sampling: _torch.Tensor,
+    topk: _torch.Tensor,
+    k: int,
+    temperatures: _torch.Tensor,
+    top_ks: _torch.Tensor,
+    top_ps: _torch.Tensor,
+    *,
+    threshold_single: float,
+    threshold_acc: float,
+) -> None:
+    """Target-only chain verification from each row's ``k`` best logits.
+
+    The temperature / top-k / top-p filtering, acceptance and residual draw of
+    the dense ``chain_speculative_sampling_target_only`` over a probability
+    row, computed on the candidates alone; every row's top-k must be at most
+    ``k``.
+
+    Args:
+        predicts: Contiguous int32 ``[>= bs * N]`` output tokens, written for
+            the accepted prefix and the slot after it.
+        accept_index: Contiguous int32 ``[bs, N]`` accepted row ids, ``-1``
+            past the accepted prefix.
+        accept_token_num: Contiguous int32 ``[>= bs]`` accepted draft counts
+            (bonus token excluded).
+        candidates: int32 or int64 ``[bs, N]`` chains, unit column stride;
+            column 0 is the verified token, columns ``1..N-1`` the drafts.
+        uniform_samples: fp32 ``[bs, N]`` accept coins, unit column stride.
+        uniform_samples_for_final_sampling: Contiguous fp32 ``[>= bs]``
+            residual coins.
+        topk: fp32 ``[bs * N, >= 2 * k]`` rows as :func:`vocab_shard_topk`
+            writes them: the ``k`` best logits, then their ids.
+        k: Candidates per row.
+        temperatures: Contiguous fp32 ``[bs * N]`` per-row temperatures.
+        top_ks: Contiguous int32 ``[bs * N]`` per-row top-k, at most ``k``.
+        top_ps: Contiguous fp32 ``[bs * N]`` per-row top-p.
+        threshold_single: Accept outright at or above this probability.
+        threshold_acc: Accept with probability ``q / threshold_acc``.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "topk_chain_verify",
+        format_signature(topk=dense_tensor_format(topk.dtype)),
+    )
+    kernel(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        topk,
+        k,
+        temperatures,
+        top_ks,
+        top_ps,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+    )
+
+
 # Columns of a shard each draft-stats block reduces, and the fp32 partials it writes.
 VOCAB_SHARD_DRAFT_BLOCK = 2048
 VOCAB_SHARD_DRAFT_FIELDS = 8
@@ -722,6 +789,7 @@ import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.topk_chain_verify  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401

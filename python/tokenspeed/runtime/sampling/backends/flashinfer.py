@@ -25,7 +25,12 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
-from tokenspeed_kernel.ops.sampling import chain_verify_coins
+from tokenspeed_kernel.ops.sampling import (
+    chain_verify_coins,
+    topk_chain_verify,
+    vocab_shard_topk,
+    vocab_shard_topk_supports,
+)
 from tokenspeed_kernel.ops.sampling.block_verify import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
@@ -56,6 +61,7 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.tree_verify import (
 )
 from tokenspeed.runtime.execution.slot_state import aligned_slot_state_bytes
 from tokenspeed.runtime.sampling.backends.base import (
+    CUDA_GRAPH_VARIANT_DEFAULT,
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
     SamplingBackend,
@@ -80,10 +86,17 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+
+# Sampler graph variant of the batches sparse_chain_verify_eligible admits.
+CUDA_GRAPH_VARIANT_TOPK_SPARSE = "topk_sparse"
+# Candidates per row of the sparse chain verify; wider selections cost 40-60% more per doubling.
+SPARSE_CHAIN_VERIFY_WIDTH = 32
 
 
 # Greedy requests normalize to top_k=1 and ride the pool route, whose
@@ -185,6 +198,8 @@ class FlashInferSamplingBackend(SamplingBackend):
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     # Only over sampled drafts (speculative sampling); checked in __init__.
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+    # verify() runs target-only chains on each row's top-k candidates when a batch allows it.
+    _SUPPORTS_SPARSE_CHAIN_VERIFY = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         self._dspark_sampling = bool(
@@ -226,6 +241,11 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
+        self._sparse_verify_width = self._sparse_chain_verify_width(config)
+        # This step's verify route: per batch in prepare_step, per variant at capture.
+        self._sparse_verify = False
+        self._sparse_verify_batch = False
+        self._sparse_verify_epoch: int | None = None
         self._tree_sampler = TreeRejectionSampler(
             self.speculative_sampling_pools(), self._dp_max_pad_bs, config.device
         )
@@ -256,6 +276,8 @@ class FlashInferSamplingBackend(SamplingBackend):
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         if not runtime.enabled:
             return
+        # DP sampling verifies per-rank request shards; the sparse route is not wired through them.
+        self._sparse_verify_width = None
         if (
             runtime.vocab_size is None
             or runtime.max_bucket_bs is None
@@ -347,6 +369,91 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._generator_image_bytes = aligned_slot_state_bytes(
             self._generator_state_bytes
         )
+
+    def _sparse_chain_verify_width(self, config: SamplingBackendConfig) -> int | None:
+        """Candidates per row of the sparse chain verify, or None where no batch can take it.
+
+        The route covers target-only chain verification over whole-row logits:
+        no draft trees, and no recorded draft probabilities (speculative
+        sampling, which block verification and DSpark also require). The width
+        halves until the shared candidate selection (``vocab_shard_topk``)
+        takes it at this vocabulary.
+        """
+        if (
+            not self._SUPPORTS_SPARSE_CHAIN_VERIFY
+            or config.enable_speculative_sampling
+            or config.draft_tree
+            or config.max_draft_tokens_per_req <= 1
+        ):
+            return None
+        width = SPARSE_CHAIN_VERIFY_WIDTH
+        while width >= 1 and not vocab_shard_topk_supports(
+            torch.float32, config.vocab_size, width
+        ):
+            width //= 2
+        return width if width >= 1 else None
+
+    def sparse_chain_verify_eligible(
+        self, sampling_params_list: list[SamplingParams], num_tokens_per_req: int
+    ) -> bool:
+        """Whether this batch verifies chains on each row's top-k candidates.
+
+        The sparse route replaces the whole-vocabulary softmax, top-k / top-p
+        renorm and chain kernel with a candidate selection and one small
+        kernel. It applies when the server's verify is one it covers
+        (``_sparse_chain_verify_width``), the step verifies drafts, and every
+        request keeps at most the route's width of tokens (greedy requests,
+        top-k 1, included). Batches with a disabled or larger top-k take the
+        dense route.
+        """
+        width = self._sparse_verify_width
+        return (
+            width is not None
+            and num_tokens_per_req > 1
+            and all(int(sp.top_k) <= width for sp in sampling_params_list)
+        )
+
+    def prepare_step(
+        self,
+        admission_ids: Sequence[int],
+        request_pool_indices: list[int],
+        sampling_params_list: list[SamplingParams],
+        num_tokens_per_req: int = 1,
+    ) -> None:
+        super().prepare_step(
+            admission_ids=admission_ids,
+            request_pool_indices=request_pool_indices,
+            sampling_params_list=sampling_params_list,
+            num_tokens_per_req=num_tokens_per_req,
+        )
+        if self._sparse_verify_epoch != self._batch_composition_epoch:
+            self._sparse_verify_batch = self.sparse_chain_verify_eligible(
+                sampling_params_list, num_tokens_per_req
+            )
+            self._sparse_verify_epoch = self._batch_composition_epoch
+        # Restore rather than skip: a capture variant may have set the route since.
+        self._sparse_verify = self._sparse_verify_batch
+
+    def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
+        if self._sparse_verify_width is None or num_tokens_per_req <= 1:
+            return (CUDA_GRAPH_VARIANT_DEFAULT,)
+        return (CUDA_GRAPH_VARIANT_DEFAULT, CUDA_GRAPH_VARIANT_TOPK_SPARSE)
+
+    def prepare_capture_variant(
+        self,
+        bs: int,
+        num_tokens_per_req: int,
+        variant: str,
+    ) -> None:
+        if variant not in self.cuda_graph_capture_variants(num_tokens_per_req):
+            raise ValueError(f"Unsupported CUDA graph variant: {variant}")
+        self._sparse_verify = variant == CUDA_GRAPH_VARIANT_TOPK_SPARSE
+        self.prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
+
+    def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
+        if self._sparse_verify:
+            return CUDA_GRAPH_VARIANT_TOPK_SPARSE
+        return CUDA_GRAPH_VARIANT_DEFAULT
 
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
         return SpeculativeSamplingPools(
@@ -643,6 +750,70 @@ class FlashInferSamplingBackend(SamplingBackend):
         rows = slice(row_offset, row_offset + bs)
         return self._coins_buf[rows, :width], self._final_coins_buf[rows]
 
+    def _verify_chain_sparse(
+        self,
+        logits: torch.Tensor,
+        candidates: torch.Tensor,
+        coins: torch.Tensor,
+        final_coins: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        *,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        draft_probs: torch.Tensor | None,
+        dp_sampling: bool,
+    ) -> None:
+        """Target-only chain verification on each row's top-k candidates.
+
+        The batch passed ``sparse_chain_verify_eligible``: every row keeps at
+        most ``_sparse_verify_width`` tokens, so that many best logits per row
+        carry the whole filtered distribution. Writes ``predict``,
+        ``accept_index`` and ``accept_length`` as the dense chain kernel does.
+        """
+        width = self._sparse_verify_width
+        if width is None or draft_probs is not None or dp_sampling:
+            raise RuntimeError(
+                "sparse chain verify takes target-only, whole-batch chains on a "
+                "server that enables it"
+            )
+        rows, columns = logits.shape
+        if not vocab_shard_topk_supports(logits.dtype, columns, width):
+            raise RuntimeError(
+                f"sparse chain verify cannot select {width} candidates from "
+                f"{logits.dtype} rows of {columns} columns"
+            )
+        topk = torch.empty((rows, 2 * width), dtype=torch.float32, device=logits.device)
+        vocab_shard_topk(
+            logits,
+            width,
+            None,
+            0,
+            topk,
+            softcap=None,
+            softcap_form=None,
+            vocab_mask=None,
+            values_out=None,
+            halo_out=None,
+        )
+        topk_chain_verify(
+            predict,
+            accept_index,
+            accept_length,
+            candidates,
+            coins,
+            final_coins,
+            topk,
+            width,
+            temperatures,
+            top_ks,
+            top_ps,
+            threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+            threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+        )
+
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
         self,
@@ -904,75 +1075,93 @@ class FlashInferSamplingBackend(SamplingBackend):
                 n=n,
             )
 
-            target_probs = softmax(
-                logits,
-                temperature=temperatures,
-            )
-            if _FUSED_TOPK_TOPP_AVAILABLE:
-                # Fused replacement for the back-to-back top_k_renorm_prob +
-                # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-                # K = 1<<30 in top_ks routes per-row through the radix top-p
-                # only path. Availability decided once in
-                # tokenspeed_kernel.ops.sampling.cuda.
-                target_probs = fused_topk_topp_renorm(
-                    target_probs,
+            synthetic = self.config.synthetic_acceptance_length is not None
+            if self._sparse_verify:
+                self._verify_chain_sparse(
+                    logits,
+                    candidates,
+                    coins,
+                    final_coins,
+                    temperatures,
                     top_ks,
                     top_ps,
-                    in_place_skip=False,
+                    predict=predict,
+                    accept_index=accept_index,
+                    accept_length=accept_length,
+                    draft_probs=sampling_info.draft_probs,
+                    dp_sampling=dp_sampling,
                 )
             else:
-                target_probs = top_k_renorm_prob(target_probs, top_ks)
-                target_probs = top_p_renorm_prob(
-                    target_probs, top_ps, is_deterministic=True
+                target_probs = softmax(
+                    logits,
+                    temperature=temperatures,
                 )
-            target_probs = target_probs.reshape(bs, n, -1)
+                if _FUSED_TOPK_TOPP_AVAILABLE:
+                    # Fused replacement for the back-to-back top_k_renorm_prob +
+                    # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+                    # K = 1<<30 in top_ks routes per-row through the radix top-p
+                    # only path. Availability decided once in
+                    # tokenspeed_kernel.ops.sampling.cuda.
+                    target_probs = fused_topk_topp_renorm(
+                        target_probs,
+                        top_ks,
+                        top_ps,
+                        in_place_skip=False,
+                    )
+                else:
+                    target_probs = top_k_renorm_prob(target_probs, top_ks)
+                    target_probs = top_p_renorm_prob(
+                        target_probs, top_ps, is_deterministic=True
+                    )
+                target_probs = target_probs.reshape(bs, n, -1)
 
-            # Draft-prob rule when the drafter recorded its distributions (the
-            # DP shard gathers its own rows); target-only otherwise.
-            use_draft_prob = sampling_info.draft_probs is not None
-            draft_probs = (
-                self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
-                if use_draft_prob
-                else None
-            )
-            synthetic = self.config.synthetic_acceptance_length is not None
-            if (self._block_verify or synthetic) and draft_probs is None:
-                raise RuntimeError(
-                    "block verification and synthetic acceptance on this backend "
-                    "require recorded draft probabilities"
+                # Draft-prob rule when the drafter recorded its distributions (the
+                # DP shard gathers its own rows); target-only otherwise.
+                use_draft_prob = sampling_info.draft_probs is not None
+                draft_probs = (
+                    self._gather_draft_probs(
+                        sampling_info.draft_probs, pool_indices, bs, n
+                    )
+                    if use_draft_prob
+                    else None
                 )
-            # Synthetic acceptance mirrors vLLM's rejection_sample_method
-            # "synthetic": the standard draft-probability chain rule below runs
-            # for its cost, then the forced lengths replace its outcome. The
-            # block verifier is a different rejection method and is not run.
-            if self._block_verify and not synthetic:
-                block_speculative_sampling(
-                    predicts=predict,
-                    accept_index=accept_index,
-                    accept_token_num=accept_length,
-                    candidates=candidates,
-                    uniform_samples=coins,
-                    uniform_samples_for_final_sampling=final_coins,
-                    target_probs=target_probs,
-                    draft_probs=draft_probs,
-                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-                )
-            else:
-                chain_speculative_sampling_target_only(
-                    predicts=predict,
-                    accept_index=accept_index,
-                    accept_token_num=accept_length,
-                    candidates=candidates,
-                    uniform_samples=coins,
-                    uniform_samples_for_final_sampling=final_coins,
-                    target_probs=target_probs,
-                    draft_probs=draft_probs,
-                    threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                    threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                    deterministic=per_request_stream or not dp_sampling,
-                    use_draft_prob=use_draft_prob,
-                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-                )
+                if (self._block_verify or synthetic) and draft_probs is None:
+                    raise RuntimeError(
+                        "block verification and synthetic acceptance on this backend "
+                        "require recorded draft probabilities"
+                    )
+                # Synthetic acceptance mirrors vLLM's rejection_sample_method
+                # "synthetic": the standard draft-probability chain rule below runs
+                # for its cost, then the forced lengths replace its outcome. The
+                # block verifier is a different rejection method and is not run.
+                if self._block_verify and not synthetic:
+                    block_speculative_sampling(
+                        predicts=predict,
+                        accept_index=accept_index,
+                        accept_token_num=accept_length,
+                        candidates=candidates,
+                        uniform_samples=coins,
+                        uniform_samples_for_final_sampling=final_coins,
+                        target_probs=target_probs,
+                        draft_probs=draft_probs,
+                        reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                    )
+                else:
+                    chain_speculative_sampling_target_only(
+                        predicts=predict,
+                        accept_index=accept_index,
+                        accept_token_num=accept_length,
+                        candidates=candidates,
+                        uniform_samples=coins,
+                        uniform_samples_for_final_sampling=final_coins,
+                        target_probs=target_probs,
+                        draft_probs=draft_probs,
+                        threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                        threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                        deterministic=per_request_stream or not dp_sampling,
+                        use_draft_prob=use_draft_prob,
+                        reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                    )
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
                 canonical_greedy_verify(
                     logits=logits,

@@ -565,3 +565,110 @@ def torch_vocab_topk_merge(
         kept = softcap * torch.tanh(kept / softcap)
     ids_out.copy_(torch.gather(ids, 1, order).to(ids_out.dtype))
     values_out.copy_(kept)
+
+
+def topk_chain_rows(
+    topk: torch.Tensor,
+    k: int,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> list[dict[int, float]]:
+    """Each row's filtered target distribution, in float64, from its ``k`` best logits.
+
+    The fused top-k / top-p renorm's rule on ``softmax(logits / T)``: keep the
+    row's top-k, then the shortest descending prefix whose mass reaches
+    ``top_p`` of theirs (all of them when ``top_p >= 1``), renormalized.
+
+    Returns:
+        Per row, the kept token ids and their probabilities.
+    """
+    values = topk[:, :k].double().cpu()
+    ids = topk[:, k : 2 * k].long().cpu()
+    rows = []
+    for row in range(values.shape[0]):
+        keep = max(1, min(int(top_ks[row]), k))
+        temperature = float(temperatures[row])
+        scaled = values[row, :keep] * (0.0 if temperature == 0.0 else 1.0 / temperature)
+        weight = torch.exp(scaled - scaled.max())
+        cumulative = torch.cumsum(weight, 0)
+        top_p = float(top_ps[row])
+        cutoff = keep - 1
+        if top_p < 1.0:
+            cutoff = int(torch.nonzero(cumulative >= top_p * cumulative[-1])[0])
+        probs = weight[: cutoff + 1] / cumulative[cutoff]
+        rows.append(dict(zip(ids[row, : cutoff + 1].tolist(), probs.tolist())))
+    return rows
+
+
+@register_kernel(
+    "sampling",
+    "topk_chain_verify",
+    name="torch_topk_chain_verify",
+    solution="torch",
+    signatures=format_signatures("topk", "dense", {torch.float32}),
+    priority=Priority.REFERENCE,
+)
+def torch_topk_chain_verify(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    topk: torch.Tensor,
+    k: int,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    *,
+    threshold_single: float,
+    threshold_acc: float,
+) -> None:
+    """Reference ``topk_chain_verify`` in float64, one request at a time.
+
+    Row ``r`` judges draft ``r + 1`` with coin ``r``; the first rejection
+    stops the chain, and the next token is the first id, in ascending order,
+    whose cumulative mass in the stopping row (the rejected draft removed)
+    exceeds ``final_coin`` times the row's remaining mass.
+    """
+    bs, n = candidates.shape
+    rows = topk_chain_rows(topk, k, temperatures, top_ks, top_ps)
+    chains = candidates.long().cpu()
+    coins = uniform_samples.double().cpu()
+    final_coins = uniform_samples_for_final_sampling.double().cpu()
+    best = topk[:, k].long().cpu()
+    out_predicts = predicts[: bs * n].cpu()
+    out_index = torch.full((bs, n), -1, dtype=torch.int32)
+    out_accepted = torch.zeros(bs, dtype=torch.int32)
+    for b in range(bs):
+        accepted = n - 1
+        for i in range(1, n):
+            draft = int(chains[b, i])
+            prob = rows[b * n + i - 1].get(draft, 0.0)
+            if prob < threshold_single and float(coins[b, i - 1]) > prob / max(
+                threshold_acc, 1e-9
+            ):
+                accepted = i - 1
+                break
+            out_predicts[b * n + i - 1] = draft
+        rejected = int(chains[b, accepted + 1]) if accepted < n - 1 else None
+        mass = {
+            token: prob
+            for token, prob in rows[b * n + accepted].items()
+            if token != rejected and prob > 0.0
+        }
+        threshold = float(final_coins[b]) * sum(mass.values())
+        sampled = max(mass) if mass else int(best[b * n + accepted])
+        running = 0.0
+        for token in sorted(mass):
+            running += mass[token]
+            if running > threshold:
+                sampled = token
+                break
+        out_predicts[b * n + accepted] = sampled
+        out_index[b, : accepted + 1] = torch.arange(b * n, b * n + accepted + 1)
+        out_accepted[b] = accepted
+    predicts[: bs * n].copy_(out_predicts)
+    accept_index.copy_(out_index)
+    accept_token_num[:bs].copy_(out_accepted)

@@ -863,6 +863,15 @@ requests sample at temperature. Greedy requests behave identically under both
 rules. `top_k`, `top_p`, `min_p`, penalties, and `logit_bias` stay on the
 verifier's side. `q` only follows the temperature.
 
+On `--sampling-backend flashinfer`, a target-only batch whose requests all set
+`top_k` at most 32 (greedy requests included) verifies on each row's 32 best
+logits instead of whole probability rows: the same temperature, top-k / top-p
+filter, acceptance rule and residual draw, computed on the candidates. A
+request draws the same coins on both routes, so its tokens differ from the
+whole-row route only where a coin falls within fp32 rounding of a decision
+boundary. A batch with a larger or disabled `top_k` keeps the whole-row route;
+each route has its own decode CUDA graphs.
+
 A request admitted has no
 recorded `q` for its first chain: its rows hold a sentinel above
 `--spec-reject-draft-prob-threshold`, which rejects at the first draft and

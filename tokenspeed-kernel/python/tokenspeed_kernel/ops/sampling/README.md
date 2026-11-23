@@ -32,6 +32,26 @@ the output capacity in the same way as an undercount. `test/nvidia/ops/test_samp
 a producer that signals launch completion before it stores the probabilities,
 and checks the renormalized rows and the Top-P input pointers in both modes.
 
+## Sparse chain verify (`topk_chain_verify`)
+
+Target-only chain verification needs a request's filtered target distribution
+only on the tokens its top-k keeps. When every row keeps at most `k` tokens,
+`vocab_shard_topk` selects each row's `k` best logits (lowest id first among
+equal values, as the dense top-k orders ties) and one program per request runs
+the dense route's steps on them: `exp(l / T - max)`, the fused renorm's top-p
+cutoff (first prefix sum at or above `p` times the top-k mass), the acceptance
+rule against coin `i - 1` for draft `i`, and the residual draw in ascending
+token id with the rejected draft removed. The softmax denominator over the
+whole vocabulary cancels in the renormalization, so the selection replaces
+three full-vocabulary passes and the dense chain kernel's vocabulary scan.
+
+Tokens match the dense route except where a decision lies within fp32
+rounding of its threshold (the prefix sums run in a different order).
+`test/nvidia/ops/test_topk_chain_verify_dense.py` measures those mismatches
+against the dense CUDA route at a 248320-token vocabulary, and
+`test/ops/test_topk_chain_verify.py` checks the law of the first committed
+token by a chi-square test.
+
 ## Packed probability sampling (`packed_verify.py`)
 
 `sample_probs` draws from already filtered and normalized FP32 rows.

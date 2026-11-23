@@ -102,6 +102,8 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     supports_tree_verify = False
 
     _SUPPORTS_DP_VERIFY = False
+    # verify() is its own: penalties and min_p filter whole rows.
+    _SUPPORTS_SPARSE_CHAIN_VERIFY = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
