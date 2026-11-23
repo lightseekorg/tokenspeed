@@ -969,6 +969,10 @@ class RecoverSsmVerify:
                     tidx,
                     history_us,
                 )
+                if const_expr(not self.factored):
+                    # The solve reads them next; the factored sums read other
+                    # rows of the partials, and their barriers order the adds.
+                    cute.arch.barrier()
 
         if const_expr(self.factored):
             self._factored_sums(shared, tidx)
@@ -1623,7 +1627,8 @@ class RecoverSsmVerify:
         so the outputs do not depend on it. ``history_us`` holds this thread's
         u of those rows (``_history_u_count``) when they were loaded earlier:
         by ``_start_early_history`` for a 128-row tile (one block group), after
-        phase 1 when ``preload_history_us``; otherwise they load here.
+        phase 1 when ``preload_history_us``; otherwise they load here. The
+        caller orders the adds before the solve reads them.
         """
         columns = self.padded_columns
         block = self.history_rows // 4
@@ -1660,7 +1665,6 @@ class RecoverSsmVerify:
                 for column in cutlass.range_constexpr(2 * self.window):
                     offset = self._partial_offset(b, channel, column)
                     shared.tile[offset] = shared.tile[offset] + sums[column]
-        cute.arch.barrier()
 
     @cute.jit
     def _load_key_channel(self, shared: _Shared, key: Int32):
