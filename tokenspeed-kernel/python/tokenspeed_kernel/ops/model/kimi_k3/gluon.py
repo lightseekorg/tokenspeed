@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from dataclasses import dataclass
 from typing import Any
@@ -288,8 +289,16 @@ if _moe_tail is not None:
         block_residual: torch.Tensor,
         out: torch.Tensor,
         next_mix: Any,
+        attn_norm: Any = None,
     ) -> None:
         build = options.build
+        if attn_norm is not None:
+            build = dataclasses.replace(
+                build,
+                gated_norm=True,
+                gate_stride=attn_norm.gate.stride(0),
+                norm_eps=attn_norm.eps,
+            )
         rows = build.tokens
         # Every tensor reaches the kernel as an address, so a tensor of the
         # wrong dtype or layout would be read as if it were right.
@@ -372,12 +381,18 @@ if _moe_tail is not None:
             mix_acc=mix_acc,
             mixed=mixed,
             **{name: weights[name] for name, _, _ in _WEIGHTS.values()},
+            **(
+                {}
+                if attn_norm is None
+                else {"gate": attn_norm.gate, "norm_w": attn_norm.weight}
+            ),
         )
-        if options.slot not in workspace.compiled:
+        compiled = (options.slot, build.gated_norm)
+        if compiled not in workspace.compiled:
             # A launch waits about a minute for its peers' values, and a first
             # launch compiles for longer on some ranks than on others: every
             # rank compiles, then the ranks meet, then they launch.
             launch(compile_only=True)
             dist.barrier(group=workspace.cpu_group)
-            workspace.compiled.add(options.slot)
+            workspace.compiled.add(compiled)
         launch(compile_only=False)

@@ -54,6 +54,7 @@ __all__ = [
     "KimiK3MoeTailShape",
     "KimiK3NextMix",
     "kimi_k3_moe_tail",
+    "kimi_k3_moe_tail_applies_attn_norm",
     "kimi_k3_moe_tail_expert_layout",
     "pack_kimi_k3_moe_tail_layer",
     "prepare_kimi_k3_moe_tail",
@@ -297,6 +298,7 @@ def kimi_k3_moe_tail(
     out: torch.Tensor,
     *,
     next_mix: KimiK3NextMix | None,
+    attn_norm: Any = None,
 ) -> torch.Tensor:
     """Run one layer's tail.
 
@@ -315,6 +317,9 @@ def kimi_k3_moe_tail(
         out: The layer's output stream, ``[rows, hidden]`` BF16.
         next_mix: The next layer's attention input to write, given exactly
             when the layer was packed with ``writes_next_mix``.
+        attn_norm: Where :func:`kimi_k3_moe_tail_applies_attn_norm` holds, a
+            KDA layer's gated output norm (``gate``, ``weight``, ``eps``), with
+            ``attn_output`` the raw recurrence output it normalizes.
 
     Returns:
         ``out``.
@@ -328,8 +333,22 @@ def kimi_k3_moe_tail(
         block_residual=block_residual,
         out=out,
         next_mix=next_mix,
+        **({} if attn_norm is None else {"attn_norm": attn_norm}),
     )
     return out
+
+
+def kimi_k3_moe_tail_applies_attn_norm(layer: KimiK3MoeTailLayer) -> bool:
+    """Whether :func:`kimi_k3_moe_tail` can apply a KDA layer's gated output
+    norm to ``layer``'s attention output."""
+    build = getattr(layer.options, "build", None)
+    if build is None or not hasattr(build, "gated_norm"):
+        return False
+    from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail.contract import (
+        gated_norm_rows,
+    )
+
+    return gated_norm_rows(build.tokens)
 
 
 # Registers the tail kernels with the registry.
