@@ -3003,6 +3003,7 @@ def mla_query_absorb_folds(q_nope: torch.Tensor, w_kc: torch.Tensor) -> bool:
         and k in (64, 128, 256)
         and w_kc.shape[2] % _ABSORB_BLOCK_N == 0
         and q_nope.stride(2) == 1
+        and w_kc.stride(1) == 1
     )
 
 
