@@ -609,8 +609,11 @@ batches. PDL waits precede producer-owned input, weight and scale reads.
 
 The prequantized registry entry selects the SM103 narrow or wide schedule
 by model dimensions. Each schedule uses one kernel definition for its token
-buckets. Both share operand binding and the CuTe operations for residual
-decode, shared operand storage, and epoch loads and stores.
+buckets. The narrow, wide and generic prequantized implementations share
+Down MMA operand setup, ordered FP32 split reduction, and the tile readers
+and output stores for Up. The schedules choose the partials layout and
+when to publish or acquire each tile. The common reduction loads the chosen
+layout and adds the partials in split order.
 
 In the SM103 narrow mixer's 32-token plan, a separate warp issues the
 residual copies on quantizing CTAs. The Up output warp reads its own gate

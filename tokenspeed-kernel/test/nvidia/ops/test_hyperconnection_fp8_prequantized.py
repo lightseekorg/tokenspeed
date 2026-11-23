@@ -646,7 +646,7 @@ def test_prequantized_input_offsets_beyond_int32():
 
 
 @pytest.mark.parametrize("model", [(4, 2560, 320), (4, 8192, 1024)])
-@pytest.mark.parametrize("rows", [1, 16, 17, 32, 33, 64, 129, 257])
+@pytest.mark.parametrize("rows", [1, 16, 17, 32, 33, 64, 65, 129, 257])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()
 def test_up_preserves_token_channel_and_branch_order(model, rows, dtype):
@@ -656,11 +656,14 @@ def test_up_preserves_token_channel_and_branch_order(model, rows, dtype):
     pattern = (channels % 11 - 5).float() * 0.25 + (channels // h).float() * 0.5
     v.x = pattern.expand(rows, -1).contiguous().to(torch.float8_e4m3fn)
     first_channel = 1.0 + (torch.arange(rows, device="cuda") % 4).float() * 0.5
-    v.x[:, 0].copy_(first_channel.to(v.x.dtype))
     v.xs = torch.linspace(0.25, 1.25, rows, device="cuda")
-    # One active low-rank channel gives distinct gates for every output channel.
+    # Keep one active low-rank channel and give it contributions from three splits.
     v.down.zero_()
-    v.down[0, 0] = 1
+    for index, (column, weight) in enumerate(
+        ((0, 1.0), (g * h // 2, -0.5), (g * h - 1, 0.25)), start=1
+    ):
+        v.x[:, column].copy_((first_channel * index).to(v.x.dtype))
+        v.down[0, column] = weight
     v.ds.fill_(1)
     for branch in range(g):
         v.down[r + branch, branch * h] = 1
