@@ -126,13 +126,19 @@ def test_fp8_target_and_draft_graphs_refresh_without_compilation(
 
 @pytest.mark.parametrize(
     ("q_heads", "kv_heads", "rows"),
-    [(24, 2, 4), (24, 2, 8), (24, 2, 32), (12, 1, 8), (12, 1, 32)],
+    [
+        (24, 2, 4),
+        (24, 2, 8),
+        (24, 2, 32),
+        (12, 1, 8),
+        (12, 1, 32),
+        (5, 1, 8),
+        (9, 1, 8),
+        (16, 1, 8),
+    ],
 )
-def test_small_fp8_grids_use_one_sixteen_column_tile_and_match_reference(
-    q_heads, kv_heads, rows
-):
-    """Grids of fewer output tiles than SMs cover twelve heads with one
-    sixteen-column tile, at every KV split the small-grid rule picks; full
+def test_small_fp8_grids_with_padded_heads_match_reference(q_heads, kv_heads, rows):
+    """Odd and padded head counts preserve masking and paired softmax math;
     random prefixes put data in every split."""
     from tokenspeed_kernel.numerics.torch.attention.qsa import (
         torch_qsa_selected_attention,
@@ -141,17 +147,27 @@ def test_small_fp8_grids_use_one_sixteen_column_tile_and_match_reference(
 
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     assert rows * kv_heads < sm_count
-    head_tile = qsa_sparse._configuration(
-        rows, q_heads, kv_heads, 1, False, sm_count, 0
-    )[0]
-    assert head_tile == 16
-
     torch.manual_seed(5 + rows)
     keys = torch.randn((65536, kv_heads, 256), device="cuda").to(torch.float8_e4m3fn)
     values = torch.randn((65536, kv_heads, 256), device="cuda").to(torch.float8_e4m3fn)
+    if kv_heads == 1:
+        # A lane shares one address calculation across two 16-byte copies;
+        # the cache still only needs 16-byte base alignment.
+        def offset_cache(cache):
+            backing = torch.empty(
+                cache.numel() + 16, device=cache.device, dtype=cache.dtype
+            )
+            shifted = backing[16:].view(cache.shape)
+            shifted.copy_(cache)
+            assert shifted.data_ptr() % 32 == 16
+            return shifted
+
+        keys, values = offset_cache(keys), offset_cache(values)
     keys[0].fill_(float("nan"))
     values[0].fill_(float("nan"))
     query = torch.randn((rows, q_heads, 256), device="cuda", dtype=torch.bfloat16) * 2
+    # Zero logits keep the running maximum unchanged after the first tile.
+    query[0].zero_()
     selected = torch.randint(1, 65536, (rows, 2051), device="cuda", dtype=torch.int32)
     selected[:, 13::19] = 0
     selected[::3, 1500:2048] = -1
@@ -307,7 +323,10 @@ def test_fp8_short_prefixes_and_private_tails_refresh_in_graph(rows, enable_pdl)
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
-def test_fp8_alternating_kv_reuses_pipeline_for_serial_query_rows(enable_pdl):
+@pytest.mark.parametrize("query_rows_per_cta", [1, 2])
+def test_fp8_pipeline_retirement_and_reuse_across_graph_replays(
+    enable_pdl, query_rows_per_cta
+):
     from tokenspeed_kernel.numerics.torch.attention.qsa import (
         torch_qsa_selected_attention,
     )
@@ -325,9 +344,9 @@ def test_fp8_alternating_kv_reuses_pipeline_for_serial_query_rows(enable_pdl):
     selected = torch.randint(1, 4096, (3, 2051), device="cuda", dtype=torch.int32)
     output = torch.empty_like(query)
     prefix_shared = selected[:, 0]
-    # Two rows share a CTA and its pipeline barriers; the last CTA has an
-    # absent second row. Exercise this supported tactic directly because the
-    # wave policy currently favors one row on this grid.
+    # Cover single-row retirement and two-row reuse of the CTA's barriers.
+    # The odd row count also gives the two-row tactic an absent second row.
+    # Exercise both directly; the wave policy favors one row on this grid.
     compiled = qsa_sparse._compile_kernel(
         query,
         query,
@@ -337,7 +356,7 @@ def test_fp8_alternating_kv_reuses_pipeline_for_serial_query_rows(enable_pdl):
         output,
         kv_splits=1,
         enable_pdl=enable_pdl,
-        query_rows_per_cta=2,
+        query_rows_per_cta=query_rows_per_cta,
         bf16_smem_slots=1,
         bf16_async_ready=False,
         head_tile=16,
@@ -382,3 +401,64 @@ def test_fp8_alternating_kv_reuses_pipeline_for_serial_query_rows(enable_pdl):
             saved = output.clone()
             run()
             torch.testing.assert_close(output, saved, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(("k_scale", "v_scale"), [(1.0, 1.0), (0.5, 1.25)])
+def test_fp8_copy_pipelines_preserve_identical_head_bits(enable_pdl, k_scale, v_scale):
+    """Duplicated KV heads agree across the three/four-deep copy pipelines."""
+    from tokenspeed_kernel.thirdparty.cute_dsl import qsa_sparse
+    from utils import assert_no_cute_compile
+
+    torch.manual_seed(947)
+    query = torch.randn(384, 12, 256, device="cuda", dtype=torch.bfloat16)
+    keys, values = [
+        (torch.randn(4096, 1, 256, device="cuda") * 0.25).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    ]
+    keys[0] = float("nan")
+    values[0] = float("nan")
+    selected = torch.randint(1, 4096, (384, 2051), device="cuda", dtype=torch.int32)
+    selected[:, ::17] = -1
+    selected[-4:] = -1
+    inputs = [
+        (query, keys, values),
+        tuple(tensor.repeat(1, 2, 1) for tensor in (query, keys, values)),
+    ]
+
+    def run(q, k, v):
+        return qsa_sparse.kernel(
+            q,
+            k,
+            v,
+            selected,
+            scale=1 / 16,
+            max_seqlen_q=4,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            enable_pdl=enable_pdl,
+        )
+
+    graphs, outputs = [], []
+    for tensors in inputs:
+        run(*tensors)
+        graph = torch.cuda.CUDAGraph()
+        with assert_no_cute_compile(), torch.cuda.graph(graph):
+            output = run(*tensors)
+        graphs.append(graph)
+        outputs.append(output)
+    for _ in range(3):
+        query.mul_(0.75)
+        for tensor in (keys, values):
+            raw = tensor[1:].view(torch.uint8)
+            raw.copy_(raw.roll(1, dims=0))
+        selected.copy_(selected.roll(1, dims=0))
+        for src, dst in zip(inputs[0], inputs[1], strict=True):
+            dst.copy_(src.repeat(1, 2, 1))
+        for graph in graphs:
+            graph.replay()
+        for heads in (slice(0, 12), slice(12, 24)):
+            assert torch.equal(
+                outputs[0].view(torch.int16),
+                outputs[1][:, heads].contiguous().view(torch.int16),
+            )

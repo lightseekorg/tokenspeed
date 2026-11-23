@@ -651,16 +651,22 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
         Even items gather keys and odd items gather values. Both read the
         CTA's staged slot ids, so no global id load precedes the copies.
+        Four lanes gather one row in two coalesced 64-byte halves. Each
+        lane loads one slot id and broadcasts it to its four copying lanes.
+        The second destination toggles bit 6 of the SW128 layout.
         """
         is_value = item % 2
         tile = item // 2
         base = k_address + cutlass.Int64(is_value) * (v_address - k_address)
-        for iteration in cutlass.range_constexpr(8):
+        lane = warpgroup_tidx % 32
+        index_row = (warpgroup_tidx // 32) * 8 + lane % 8 + (lane // 8) * 32
+        raw_slot = staged_slots[tile * 128 + index_row]
+        for iteration in cutlass.range_constexpr(4):
             vector = warpgroup_tidx + iteration * warpgroup_threads
-            row = vector // 8
-            col = (vector - row * 8) * 16
+            row = vector // 4
+            col = (vector - row * 4) * 16
             slot = cutlass.Int32(_PADDING_READ_SLOT)
-            candidate = staged_slots[tile * 128 + row]
+            candidate = cute.arch.shuffle_sync(raw_slot, iteration * 8 + lane // 4)
             if candidate > 0:
                 slot = candidate
             source = (
@@ -671,6 +677,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             logical_address = smem_base + row * 128 + col + smem_stage * 16384
             swizzled_address = logical_address ^ ((logical_address >> 3) & 0x70)
             _cp_async_16_addr(cutlass.Int64(swizzled_address), source)
+            _cp_async_16_addr(cutlass.Int64(swizzled_address ^ 64), source + 64)
         cute.arch.cp_async_commit_group()
 
     @cute.jit
@@ -2253,6 +2260,18 @@ class MixedInputFusedMultiHeadAttentionDecode:
         if cutlass.const_expr(self.register_budget is not None):
             # 128*208 + 384*80 = 57344 registers from the CTA pool.
             cute.arch.setmaxregister_increase(self.register_budget[0])
+        # Pairwise softmax arithmetic needs an even bound; padded P stays zero.
+        active_columns = (
+            min(softmax_head_tile, cute.ceil_div(self.original_heads_per_kv, 2) * 2)
+            if self.query_group == 1
+            and self.head_tile == softmax_head_tile
+            and tAsK.element_type is not cutlass.BFloat16
+            else softmax_head_tile
+        )
+        # Reduced maxima agree across lanes, making correction warp-uniform.
+        skip_vector_correction = (
+            self.head_tile == 16 and tAsK.element_type is not cutlass.BFloat16
+        )
         head_in_tile = softmax_head_offset + lane_idx
         lane_store_max = lane_idx < softmax_head_tile
         softmax_dice = (None, None, None)
@@ -2303,7 +2322,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         tOcO = thrblk_mma_vp.partition_C(cO)
         tScO = thr_load_s.partition_D(tOcO)
         tScO = tScO[None, softmax_copy_group, None, None]
-        if cutlass.const_expr(self.scalar_softmax_stats):
+        if cutlass.const_expr(self.scalar_softmax_stats or skip_vector_correction):
             # Eight-head fragments permit a whole warp to skip
             # identity correction without masking TMEM instructions.
             chunk_load_atom = cute.make_copy_atom(
@@ -2370,17 +2389,19 @@ class MixedInputFusedMultiHeadAttentionDecode:
             tSrP = cute.make_rmem_tensor(tSsP.shape[:-1], mma_dtype)
             tSrP.fill(cutlass.BFloat16(0))
             tSrP_f32 = cute.make_rmem_tensor(tSrS.shape, acc_dtype)
+            tSrP_f32.fill(cutlass.Float32(0))
             if cutlass.const_expr(self.scalar_softmax_stats):
                 max_lane = previous_max_lane
                 correction_lane = cutlass.Float32(0.0)
             else:
                 tSrM = cute.make_rmem_tensor_like(tSsM)
                 correction = cute.make_rmem_tensor_like(tSsM)
+                correction.fill(cutlass.Float32(1))
             if active_head_group:
                 # Invalid entries load slot 1, which the caller keeps finite.
                 # Mask their logits using the original selection so
                 # they never contribute to the softmax.
-                for i in cutlass.range_constexpr(cute.size(tSrS)):
+                for i in cutlass.range_constexpr(active_columns):
                     score_coord = tScS[i]
                     selected_idx = selected_tile * blk_tile_s + score_coord[0]
                     valid = cutlass.Boolean(False)
@@ -2405,7 +2426,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                 # Reduce colmax in warp RF
                 tSrM_lane = cutlass.Float32(0)  # Avoid dynamic register indexing
-                for i in cutlass.range_constexpr(cute.size(tSrS)):
+                for i in cutlass.range_constexpr(active_columns):
                     reduced_max = warp_fmax(tSrS[i])
                     if cutlass.const_expr(not self.scalar_softmax_stats):
                         tSrM[i] = reduced_max
@@ -2426,8 +2447,13 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 else:
                     cute.autovec_copy(tSsM, tSrM)
 
+                if cutlass.const_expr(tAsK.element_type is not cutlass.BFloat16):
+                    # Capture this tile's maxima in every warp before a faster
+                    # warp can raise the shared maxima for the next tile.
+                    softmax_nbar.arrive_and_wait()
+
                 # Compute online softmax
-                for i in cutlass.range_constexpr(0, cute.size(tSrS), 2):
+                for i in cutlass.range_constexpr(0, active_columns, 2):
                     if cutlass.const_expr(self.scalar_softmax_stats):
                         max_f32x2 = (
                             cute.arch.shuffle_sync(max_lane, i),
@@ -2463,7 +2489,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                             (previous_max_lane - max_lane) * scale_qs_log2_e
                         )
                         previous_max_lane = max_lane
-                for i in cutlass.range_constexpr(0, cute.size(tSsM), 2):
+                for i in cutlass.range_constexpr(0, active_columns, 2):
                     if cutlass.const_expr(self.scalar_softmax_stats):
                         c_f32x2 = (
                             cute.arch.shuffle_sync(correction_lane, i),
@@ -2495,17 +2521,26 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
                 if active_head_group:
                     # Apply correction
-                    if cutlass.const_expr(self.scalar_softmax_stats):
+                    if cutlass.const_expr(
+                        self.scalar_softmax_stats or skip_vector_correction
+                    ):
                         for head_chunk in cutlass.range_constexpr(
                             softmax_head_tile // 8
                         ):
                             begin = head_chunk * 8
-                            changed = (
-                                lane_idx >= begin
-                                and lane_idx < begin + 8
-                                and correction_lane != cutlass.Float32(1)
-                            )
-                            needs_chunk = cute.arch.vote_any_sync(changed)
+                            if cutlass.const_expr(self.scalar_softmax_stats):
+                                changed = (
+                                    lane_idx >= begin
+                                    and lane_idx < begin + 8
+                                    and correction_lane != cutlass.Float32(1)
+                                )
+                                needs_chunk = cute.arch.vote_any_sync(changed)
+                            else:
+                                needs_chunk = cutlass.Boolean(False)
+                                for i in cutlass.range_constexpr(8):
+                                    needs_chunk = needs_chunk | (
+                                        correction[begin + i] != cutlass.Float32(1)
+                                    )
                             if needs_chunk:
                                 copy_group = softmax_head_offset // 8 + head_chunk
                                 source = chunk_tmem[
@@ -2526,14 +2561,22 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                     for i in cutlass.range_constexpr(
                                         0, cute.size(values), 2
                                     ):
-                                        coeff = (
-                                            cute.arch.shuffle_sync(
-                                                correction_lane, begin + i
-                                            ),
-                                            cute.arch.shuffle_sync(
-                                                correction_lane, begin + i + 1
-                                            ),
-                                        )
+                                        if cutlass.const_expr(
+                                            self.scalar_softmax_stats
+                                        ):
+                                            coeff = (
+                                                cute.arch.shuffle_sync(
+                                                    correction_lane, begin + i
+                                                ),
+                                                cute.arch.shuffle_sync(
+                                                    correction_lane, begin + i + 1
+                                                ),
+                                            )
+                                        else:
+                                            coeff = (
+                                                correction[begin + i],
+                                                correction[begin + i + 1],
+                                            )
                                         product = fmul2(
                                             (values[i], values[i + 1]), coeff
                                         )
@@ -2555,14 +2598,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 tSrO_dm,
                             )
 
-                            for i in cutlass.range_constexpr(0, cute.size(tSrO_dm), 2):
-                                if cutlass.const_expr(self.scalar_softmax_stats):
-                                    c_f32x2 = (
-                                        cute.arch.shuffle_sync(correction_lane, i),
-                                        cute.arch.shuffle_sync(correction_lane, i + 1),
-                                    )
-                                else:
-                                    c_f32x2 = (correction[i], correction[i + 1])
+                            for i in cutlass.range_constexpr(0, active_columns, 2):
+                                c_f32x2 = (correction[i], correction[i + 1])
                                 o_f32x2 = fmul2((tSrO_dm[i], tSrO_dm[i + 1]), c_f32x2)
                                 tSrO_dm[i] = o_f32x2[0]
                                 tSrO_dm[i + 1] = o_f32x2[1]
@@ -2583,7 +2620,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
 
         # Reduce colsum in warp RF
         tSrL_lane = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(cute.size(tSrL)):
+        for i in cutlass.range_constexpr(active_columns):
             tSrL[i] = cute.arch.warp_reduction_sum(tSrL[i])
             if i == lane_idx:
                 tSrL_lane = tSrL[i]
@@ -5067,7 +5104,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     if cutlass.const_expr(self.original_heads_per_kv == 12):
                         if cutlass.const_expr(self.register_budget is not None):
                             cute.arch.setmaxregister_increase(self.register_budget[2])
-                self._sync_cluster_work()
+                # The local CTA join above is sufficient for unsplit FP8;
+                # only multiple CTAs need to publish their partials to peers.
+                if cutlass.const_expr(
+                    k_dtype is cutlass.BFloat16 or self.kv_splits > 1
+                ):
+                    self._sync_cluster_work()
                 cluster_splits = self.kv_splits
                 cta_rank = cute.arch.block_idx_in_cluster()
                 local_partial = cute.make_tensor(
@@ -5480,7 +5522,12 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 else 0.0
                             )
                         self._sync_work_threads()
-                self._sync_cluster_work()
+                # Local readers have joined; split peers must also
+                # finish their DSM reads before the shared storage is reused.
+                if cutlass.const_expr(
+                    k_dtype is cutlass.BFloat16 or self.kv_splits > 1
+                ):
+                    self._sync_cluster_work()
                 if cutlass.const_expr(self.query_rows_per_cta > 1 or self.reuse_work):
                     if warp_idx == 0:
                         with cute.arch.elect_one():

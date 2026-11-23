@@ -302,7 +302,7 @@ def _compile_kernel(
         large_query_grid=original_query.shape[0] > 128,
         # Unsplit FP8 tiles retain one CTA per SM. Use the spare MMA warp for
         # private K/V, and the remaining shared-memory budget for copy lookahead.
-        fp8_gather_depth=5 if prefetch_fp8_tail else 3,
+        fp8_gather_depth=4 if prefetch_fp8_tail else 3,
         prefetch_fp8_tail=prefetch_fp8_tail,
     )
 
