@@ -602,13 +602,18 @@ def fp8_case(queries, prefixes, *, heads, kv_heads):
         pytest.param([2500], [156000], id="long-prefix-chunk"),
         # A short extend over a long prefix takes the split-K kernel.
         pytest.param([150], [131072 + 5], id="split"),
+        # Several requests of unequal cached lengths, two rounds of
+        # work-group pairs and more: four waves a SIMD.
+        pytest.param([4096] * 4, [49152, 102400, 151552, 200704], id="4-unequal"),
+        # One long request beside short ones, under one round: compiler's.
+        pytest.param([4096] + [512] * 7, [290816] + [2048] * 7, id="long-and-short"),
     ],
 )
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_eight_wave_occupancy_keeps_every_bit(queries, prefixes, monkeypatch):
-    """The FP8 full-attention 8-wave tile of one request, at four waves a
-    SIMD, gives the same output and LSE bits as at the
-    compiler's occupancy, and repeats bit for bit."""
+    """The FP8 full-attention 8-wave tile, at four waves a SIMD, gives the
+    same output and LSE bits as at the compiler's occupancy, and repeats
+    bit for bit, for one request and for batches of several."""
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
     case = fp8_case(queries, prefixes, heads=32, kv_heads=4)
@@ -619,7 +624,8 @@ def test_fp8_eight_wave_occupancy_keeps_every_bit(queries, prefixes, monkeypatch
 
     def compiler_occupancy(*args, **kwargs):
         options = launch_options(*args, **kwargs)
-        options.pop("waves_per_eu")
+        # Launches that do not share CUs carry no cap to drop.
+        options.pop("waves_per_eu", None)
         return options
 
     # The launch as it compiled before the occupancy cap.
@@ -632,10 +638,10 @@ def test_fp8_eight_wave_occupancy_keeps_every_bit(queries, prefixes, monkeypatch
 
 
 @pytest.mark.parametrize(
-    "num_warps,element_size,window,single_request,capped",
+    "num_warps,element_size,window,share_cus,capped",
     [
-        # Only the FP8 full-attention 8-wave tile of a one-request batch
-        # takes the occupancy cap.
+        # Only the FP8 full-attention 8-wave tile of a launch that shares
+        # CUs (_shares_cus) takes the occupancy cap.
         (8, 1, -1, True, True),
         (8, 1, -1, False, False),
         (8, 1, 2047, True, False),
@@ -645,7 +651,7 @@ def test_fp8_eight_wave_occupancy_keeps_every_bit(queries, prefixes, monkeypatch
     ],
 )
 def test_eight_wave_occupancy_selection(
-    num_warps, element_size, window, single_request, capped
+    num_warps, element_size, window, share_cus, capped
 ):
     if not is_amd():
         pytest.importorskip(
@@ -657,19 +663,69 @@ def test_eight_wave_occupancy_selection(
         num_warps,
         element_size=element_size,
         window_left=window,
-        single_request=single_request,
+        share_cus=share_cus,
     )
     assert options["num_warps"] == num_warps
     assert options.get("waves_per_eu") == (4 if capped else None)
 
 
+@pytest.mark.parametrize(
+    "batch,workgroups,shares",
+    [
+        # One request always shares CUs.
+        (1, 64, True),
+        # Several requests share them from two rounds of work-group pairs
+        # (4 x 256 CUs) on; under that, unequal requests leave CUs idle.
+        (4, 4 * 256 - 1, False),
+        (2, 4 * 256, True),
+        (8, 516, False),
+    ],
+)
+def test_several_requests_share_cus_from_two_rounds(batch, workgroups, shares):
+    if not is_amd():
+        pytest.importorskip(
+            "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
+        )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    assert extend._shares_cus(batch, workgroups) == shares
+
+
+@pytest.mark.usefixtures("require_gfx950")
+def test_fp8_request_counts_compile_at_warmup():
+    """Batches of 1-8 requests cross the shared-CU grid size (at 4 requests
+    of 2,048 rows on 4 KV heads); after one warm-up none of them compiles."""
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_reduce_gfx950,
+        gluon_mha_extend_split_gfx950,
+    )
+    from utils import assert_no_triton_compile
+
+    def case(count):
+        # Equal prefixes keep the page-table width, a compile-time stride,
+        # fixed as a served page table's is; only the request count varies.
+        return fp8_case([2048] * count, [20000] * count, heads=32, kv_heads=4)
+
+    with kernel_warmup(enabled=True):
+        case(1).invoke("gluon", return_lse=True)
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_split_gfx950,
+        gluon_mha_extend_reduce_gfx950,
+    ):
+        for count in range(1, 9):
+            case(count).invoke("gluon", return_lse=True)
+
+
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_request_count_keeps_bits_and_compiles_at_warmup():
     """A one-request FP8 batch runs the 8-wave tile at four waves a
-    SIMD, a batch of several requests at the
-    compiler's occupancy. A request gets the same output and LSE bits alone
-    as beside a copy of itself, and after the warm-up neither launch
-    compiles, unsplit or split."""
+    SIMD, a small batch of several requests (under two rounds of work-group
+    pairs) at the compiler's occupancy. A request gets the same output and
+    LSE bits alone as beside a copy of itself, and after the warm-up neither
+    launch compiles, unsplit or split."""
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         gluon_mha_extend_gfx950,
