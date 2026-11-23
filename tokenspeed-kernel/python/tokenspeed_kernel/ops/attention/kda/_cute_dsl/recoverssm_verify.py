@@ -565,6 +565,8 @@ class RecoverSsmVerify:
                     )
                     _store_if(Int32(t < valid_tokens), row.toint(), Float32(0.0), True)
         else:
+            # Loaded once, early: phase 1 branches on it.
+            count = retained_length(retained, slot)
             if tidx == 0:
                 cute.arch.mbarrier_init(shared.token_barrier, 1)
                 cute.arch.mbarrier_init(shared.state_barrier, 1)
@@ -594,7 +596,7 @@ class RecoverSsmVerify:
             self._load_base_tile(
                 shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            self._prefetch_records(retained, slot, head, value_start, warp, lane)
+            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
 
             stamp_slot = Int64(request)
             generation = Int64(0)
@@ -641,7 +643,7 @@ class RecoverSsmVerify:
                 retained,
                 slot,
                 head,
-                retained_length(retained, slot),
+                count,
                 value_start,
                 Int32(value_tile == 0),
                 valid_tokens,
@@ -664,7 +666,7 @@ class RecoverSsmVerify:
                 )
                 for t in cutlass.range_constexpr(W):
                     live = Int32(t < valid_tokens)
-                    position = retained_length(retained, slot) + t
+                    position = count + t
                     _store_if(
                         live, (out_row + t * out_token_stride).toint(), outputs[t], True
                     )
@@ -709,20 +711,41 @@ class RecoverSsmVerify:
         W = self.window
         # Records exist only where the capacity leaves room beside the window.
         has_history = self.history_rows > 0
+        history_keys = None
+        history_decays = None
+        if const_expr(has_history):
+            history_keys = cute.make_rmem_tensor((self.history_rows,), Float32)
+            history_decays = cute.make_rmem_tensor((self.history_rows,), Float32)
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
             if const_expr(has_history):
                 if record_start > 0:
-                    # The records' loads are in flight during the key channel's work.
-                    history = self._load_history_channel(
-                        retained, record_slot, record_head, record_start, tidx
+                    # In flight during the key channel's work.
+                    self._load_history_channel(
+                        retained,
+                        record_slot,
+                        record_head,
+                        record_start,
+                        tidx,
+                        history_keys,
+                        history_decays,
                     )
-                    self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
-                    self._store_history_rows(shared, history, record_start, tidx)
-                else:
-                    self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
-            else:
-                self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
+            steps = self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
+            self._store_decay_records(
+                retained,
+                record_slot,
+                record_head,
+                record_start,
+                records_keys,
+                valid_tokens,
+                tidx,
+                steps,
+            )
+            if const_expr(has_history):
+                if record_start > 0:
+                    self._store_history_rows(
+                        shared, history_keys, history_decays, record_start, tidx
+                    )
         cute.arch.barrier()
 
         if const_expr(not self.factored):
@@ -734,7 +757,7 @@ class RecoverSsmVerify:
         # The history rows need no base, so their pass runs while it lands.
         if const_expr(has_history):
             if record_start > 0:
-                self._history_times_columns(shared, warp, lane)
+                self._history_times_columns(shared, record_start, warp, lane)
         cute.arch.mbarrier_wait(shared.state_barrier, 0)
         if const_expr(has_history):
             if record_start > 0:
@@ -762,26 +785,25 @@ class RecoverSsmVerify:
             self._finalize_coefficients(shared.sums, tidx)
             cute.arch.barrier()
 
+        # The window's normalized keys need the final key scales.
         cute.arch.barrier()
         if tidx < K:
-            raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, tidx)
-            steps, prefix_hi, prefix_lo = self._gate_prefix(
-                raw_gates, gate_bias, gate_scale, lower_bound
+            key_field = retained[2]
+            key_row = key_field.iterator + (
+                record_slot * key_field.stride[0]
+                + Int64(record_head) * key_field.stride[1]
+                + Int64(record_start) * key_field.stride[2]
+                + Int64(tidx) * key_field.stride[3]
             )
             for t in cutlass.range_constexpr(W):
                 stored = Int32((records_keys != 0) & (t < valid_tokens))
-                position = Int64(record_start) + t
-                for field, value in (
-                    (retained[2], raw_keys[t] * shared.sums[self.sums.key_scale + t]),
-                    (retained[3], _exp(steps[t])),
-                ):
-                    offset = (
-                        record_slot * field.stride[0]
-                        + Int64(record_head) * field.stride[1]
-                        + position * field.stride[2]
-                        + Int64(tidx) * field.stride[3]
-                    )
-                    _store_if(stored, (field.iterator + offset).toint(), value, False)
+                raw_key = shared.tokens[self.token_k + t * K + tidx].to(Float32)
+                _store_if(
+                    stored,
+                    (key_row + t * key_field.stride[2]).toint(),
+                    raw_key * shared.sums[self.sums.key_scale + t],
+                    False,
+                )
 
     def _allocate_shared(self) -> _Shared:
         smem = cutlass.memory.SmemAllocator()
@@ -951,14 +973,14 @@ class RecoverSsmVerify:
         slot: Int64,
         head: Int32,
         value_start: Int32,
+        count: Int32,
         warp: Int32,
         lane: Int32,
     ):
-        """Prefetch the (slot, head)'s accepted records into L2 for the projection.
+        """Prefetch the (slot, head)'s ``count`` records into L2 for the projection.
 
         Records were written rounds ago and are usually only in DRAM; the
-        prefetch overlaps their latency with phase 1. The last warp issues it,
-        so the others start phase 1 without waiting for the record count.
+        prefetch overlaps their latency with phase 1. The last warp issues it.
         Lanes 2p and 2p + 1 cover record p, the even one its key row and this
         tile's u, the odd one its decay row, a 128-byte line at a time over
         dense rows (other layouts prefetch lines the replay may not read).
@@ -966,7 +988,6 @@ class RecoverSsmVerify:
         K = self.key_dim
         VT = self.value_tile_rows
         if warp == THREADS // 32 - 1:
-            count = retained_length(retained, slot)
             correction, key, decay = retained[1], retained[2], retained[3]
             for group in cutlass.range((count + 15) // 16, unroll=1):
                 record = group * 16 + lane // 2
@@ -1006,7 +1027,10 @@ class RecoverSsmVerify:
         gate_scale: Float32,
         lower_bound: Float32,
     ):
-        """Phase 1 for one key channel: its gates, M row and factored rows."""
+        """Phase 1 for one key channel: its gates, M row and factored rows.
+
+        Returns the window tokens' gate steps of the channel.
+        """
         raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, key)
         steps, prefix_hi, prefix_lo = self._gate_prefix(
             raw_gates, gate_bias, gate_scale, lower_bound
@@ -1014,12 +1038,51 @@ class RecoverSsmVerify:
         self._store_key_channel(
             shared, key, raw_keys, raw_queries, steps, prefix_hi, prefix_lo
         )
+        return steps
+
+    @cute.jit
+    def _store_decay_records(
+        self,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        start: Int32,
+        records_keys: Int32,
+        valid_tokens: Int32,
+        key: Int32,
+        steps,
+    ):
+        """Store this key channel's window-token decays after the accepted records."""
+        decay = retained[3]
+        row = decay.iterator + (
+            slot * decay.stride[0]
+            + Int64(head) * decay.stride[1]
+            + Int64(start) * decay.stride[2]
+            + Int64(key) * decay.stride[3]
+        )
+        for t in cutlass.range_constexpr(self.window):
+            stored = Int32((records_keys != 0) & (t < valid_tokens))
+            _store_if(
+                stored, (row + t * decay.stride[2]).toint(), _exp(steps[t]), False
+            )
 
     @cute.jit
     def _load_history_channel(
-        self, retained: tuple, slot: Int64, head: Int32, count: Int32, key: Int32
+        self,
+        retained: tuple,
+        slot: Int64,
+        head: Int32,
+        count: Int32,
+        key: Int32,
+        keys,
+        decays,
     ):
-        """This key channel's key and decay of every history row's record."""
+        """Load this key channel's key and decay of every history row into registers.
+
+        The loads are all in flight at once. Rows past the count reload the
+        last accepted record, an L1 hit no one uses, so stale records cost no
+        memory traffic.
+        """
         key_field, decay_field = retained[2], retained[3]
         key_row = key_field.iterator + (
             slot * key_field.stride[0]
@@ -1031,36 +1094,36 @@ class RecoverSsmVerify:
             + Int64(head) * decay_field.stride[1]
             + Int64(key) * decay_field.stride[3]
         )
-        # Every record's loads are in flight together; rows past the count
-        # reload the last record, unused.
-        keys = []
-        decays = []
         for p in cutlass.range_constexpr(self.history_rows):
             at = Int64(cutlass.min(Int32(p), count - 1))
-            keys.append(_load(key_row, at * key_field.stride[2]))
-            decays.append(_load(decay_row, at * decay_field.stride[2]))
-        return keys, decays
+            keys[p] = _load(key_row, at * key_field.stride[2])
+            decays[p] = _load(decay_row, at * decay_field.stride[2])
 
     @cute.jit
-    def _store_history_rows(self, shared: _Shared, history, count: Int32, key: Int32):
+    def _store_history_rows(
+        self, shared: _Shared, keys, decays, count: Int32, key: Int32
+    ):
         """Write this key channel's history rows and the records' total decay.
 
         With records p < L (S <- S * decay_p + u_p k_p^T), the base advanced
         over them is S_L = base * (decay_0 ... decay_{L-1}) + sum_p u_p w_p^T,
-        where w_p = k_p * decay_{p+1} ... decay_{L-1}. Row p holds w_p and
-        rows from L on zeros, so the history pass gives every w_p . M, and the
-        base rows, scaled by the total decay, give the rest of S_L @ M.
+        where w_p = k_p * decay_{p+1} ... decay_{L-1}. Row p holds w_p, and the
+        rest of each warp's block of rows (``_history_times_columns``) holds
+        zeros, so the history pass gives every w_p . M, and the base rows,
+        scaled by the total decay, give the rest of S_L @ M. Blocks past the
+        count are left unwritten: no pass reads them.
         """
         K = self.key_dim
-        keys, decays = history
+        block = self.history_rows // 4
         total = Float32(1.0)
         for step in cutlass.range_constexpr(self.history_rows):
             p = self.history_rows - 1 - step
-            row = Float32(0.0)
-            if p < count:
-                row = keys[p] * total
-                total = total * decays[p]
-            shared.tile[(self.history_row + p) * K + key] = row
+            if (p // block) * block < count:
+                row = Float32(0.0)
+                if p < count:
+                    row = keys[p] * total
+                    total = total * decays[p]
+                shared.tile[(self.history_row + p) * K + key] = row
         shared.history[self.history_decay + key] = total
 
     @cute.jit
@@ -1085,34 +1148,40 @@ class RecoverSsmVerify:
                 _sts_f32x4(address, [*low, *high])
 
     @cute.jit
-    def _history_times_columns(self, shared: _Shared, warp: Int32, lane: Int32):
-        """Store D[p, c] = w_p . M[:, c] for every history row p.
+    def _history_times_columns(
+        self, shared: _Shared, count: Int32, warp: Int32, lane: Int32
+    ):
+        """Store D[p, c] = w_p . M[:, c] for the history rows that hold records.
 
-        The eight key-split lanes of a lane group add their partials of a row
-        with shuffles, and the first stores the row.
+        Warp w covers the block of rows w * rows / 4 onward and skips it when
+        no record falls in it. The eight key-split lanes of a lane group add
+        their partials of a row with shuffles, and the first stores the row.
         """
         columns = self.padded_columns
         rows = self.history_rows
-        products = self._rows_times_columns(shared, warp, lane, self.history_row, rows)
-        split = lane % KEY_SPLITS
-        row_group = lane // KEY_SPLITS
-        for i in cutlass.range_constexpr(rows // 16):
-            row = warp * (rows // 4) + row_group + 4 * i
-            values = [products[i * columns + c] for c in range(columns)]
-            for offset in (1, 2, 4):
-                values = [
-                    value
-                    + cute.arch.shuffle_sync_bfly(
-                        value, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    for value in values
-                ]
-            if split == 0:
-                for vector in cutlass.range_constexpr(self.column_vectors):
-                    _sts_f32x4(
-                        shared.history_addr + (row * columns + 4 * vector) * 4,
-                        values[4 * vector : 4 * vector + 4],
-                    )
+        if warp * (rows // 4) < count:
+            products = self._rows_times_columns(
+                shared, warp, lane, self.history_row, rows
+            )
+            split = lane % KEY_SPLITS
+            row_group = lane // KEY_SPLITS
+            for i in cutlass.range_constexpr(rows // 16):
+                row = warp * (rows // 4) + row_group + 4 * i
+                values = [products[i * columns + c] for c in range(columns)]
+                for offset in (1, 2, 4):
+                    values = [
+                        value
+                        + cute.arch.shuffle_sync_bfly(
+                            value, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        for value in values
+                    ]
+                if split == 0:
+                    for vector in cutlass.range_constexpr(self.column_vectors):
+                        _sts_f32x4(
+                            shared.history_addr + (row * columns + 4 * vector) * 4,
+                            values[4 * vector : 4 * vector + 4],
+                        )
 
     @cute.jit
     def _add_history_products(
@@ -1128,11 +1197,13 @@ class RecoverSsmVerify:
         """Add the records' share of S_L @ M to the base rows' products.
 
         Value channel v adds sum_p u_p[v] D[p, c] to its first split's partial,
-        which ``_solve_window`` sums with the others. History rows from the
-        count on are zero, so their D rows add nothing.
+        which ``_solve_window`` sums with the others, over the blocks of
+        history rows the history pass wrote, whose rows past the count are
+        zero.
         """
         columns = self.padded_columns
         history = self.history_rows
+        block = history // 4
         VT = self.value_tile_rows
         correction = retained[1]
         if tidx < VT:
@@ -1141,23 +1212,32 @@ class RecoverSsmVerify:
                 + Int64(head) * correction.stride[1]
                 + Int64(value_start + tidx)
             )
-            us = []
-            for p in cutlass.range_constexpr(history):
-                at = Int64(cutlass.min(Int32(p), count - 1))
-                us.append(_load(u_row, at * correction.stride[2]))
-            sums = [Float32(0.0) for _ in range(columns)]
-            for p in cutlass.range_constexpr(history):
-                for vector in cutlass.range_constexpr(self.column_vectors):
-                    products = _lds_f32x4(
-                        shared.history_addr + (p * columns + 4 * vector) * 4
-                    )
-                    for pair in cutlass.range_constexpr(2):
-                        c = 4 * vector + 2 * pair
-                        sums[c], sums[c + 1] = cute.arch.fma_packed_f32x2(
-                            (us[p], us[p]),
-                            (products[2 * pair], products[2 * pair + 1]),
-                            (sums[c], sums[c + 1]),
-                        )
+            # Every record's u is in flight before the first use; rows past
+            # the count reload the last accepted record, whose u meets a
+            # zero D row.
+            last = count - 1
+            us = [
+                _load(u_row, Int64(cutlass.min(Int32(p), last)) * correction.stride[2])
+                for p in range(history)
+            ]
+            sums = cute.make_rmem_tensor((columns,), Float32)
+            sums.fill(0.0)
+            for b in cutlass.range_constexpr(4):
+                if b * block < count:
+                    for j in cutlass.range_constexpr(block):
+                        p = b * block + j
+                        u = us[p]
+                        for vector in cutlass.range_constexpr(self.column_vectors):
+                            products = _lds_f32x4(
+                                shared.history_addr + (p * columns + 4 * vector) * 4
+                            )
+                            for pair in cutlass.range_constexpr(2):
+                                c = 4 * vector + 2 * pair
+                                sums[c], sums[c + 1] = cute.arch.fma_packed_f32x2(
+                                    (u, u),
+                                    (products[2 * pair], products[2 * pair + 1]),
+                                    (sums[c], sums[c + 1]),
+                                )
             for column in cutlass.range_constexpr(2 * self.window):
                 offset = self._partial_offset(0, tidx, column)
                 shared.tile[offset] = shared.tile[offset] + sums[column]

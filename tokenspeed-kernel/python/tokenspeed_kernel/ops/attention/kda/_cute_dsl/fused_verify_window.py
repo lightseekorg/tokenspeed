@@ -476,7 +476,10 @@ class FusedVerifyWindow(RecoverSsmVerify):
             # Pairs with the wait before the first store into a peer.
             cute.arch.cluster_arrive_relaxed()
         cute.arch.barrier()
+        # Loaded once, early: phase 1 branches on it.
+        count = Int32(0)
         if live:
+            count = retained_length(retained, slot)
             if tidx == 0:
                 # The gate weights first: the projection reads them before the tile.
                 cute.arch.mbarrier_arrive_and_expect_tx(
@@ -491,7 +494,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
             self._load_base_tile(
                 shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            self._prefetch_records(retained, slot, head, value_start, warp, lane)
+            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
 
         # Issued here and first used after the wait, so no load stalls before it.
         channels = []
@@ -625,7 +628,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     retained,
                     slot,
                     head,
-                    retained_length(retained, slot),
+                    count,
                     value_start,
                     Int32(value_tile == 0),
                     valid_tokens,
@@ -658,7 +661,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                 )
                 for t in cutlass.range_constexpr(W):
                     stored = owner & Int32(t < valid_tokens)
-                    position = retained_length(retained, slot) + t
+                    position = count + t
                     _store_if(
                         stored,
                         (out_row + t * out_token_stride).toint(),
