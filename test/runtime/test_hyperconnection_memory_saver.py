@@ -121,25 +121,20 @@ def _check_mix_workspaces_survive_release(
                 mixed, residuals = mixer.mix(hyper_input[:rows], normalized=None)
         return mixed.cpu(), residuals[2].cpu()
 
-    def streams_at(rows: int) -> bool:
-        if (hc_count, hidden_size, lowrank) != (4, 2560, 320):
-            return False
-        if current_platform().arch_version != ArchVersion(10, 7):
-            return False
-        streams = cute_fused._streams_in_one_round
-        return streams(rows, hc_count, hidden_size, lowrank, 324)
-
+    sm107_qwen = (hc_count, hidden_size, lowrank) == (4, 2560, 320) and (
+        current_platform().arch_version == ArchVersion(10, 7)
+    )
+    streaming = cute_fused._SM107_HC_STREAM_GROUPS
+    dims = (hc_count, hidden_size, lowrank, projection_rows)
     expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     # Phases: (rows, kernel warmup walks every row count, layouts grow).
     for rows, warm, grows in phases:
         layouts = len(cute_fused._WORKSPACES)
         expected[rows] = forward(rows, warm)
         assert (len(cute_fused._WORKSPACES) > layouts) == grows
-        if streams_at(rows) and not warm:
+        if sm107_qwen and not warm and cute_fused._streams_in_one_round(rows, *dims):
             # SM107 grows the streaming layout lazily once it fits one resident round.
-            streaming = cute_fused._SM107_HC_STREAM_GROUPS
-            tactic = cute_fused._model_tactic(rows, hc_count, hidden_size, lowrank, 324)
-            assert tactic[-1] == streaming
+            assert cute_fused._model_tactic(rows, *dims)[-1] == streaming
         tensors = {
             tensor.data_ptr(): tensor
             for workspace in cute_fused._WORKSPACES.values()

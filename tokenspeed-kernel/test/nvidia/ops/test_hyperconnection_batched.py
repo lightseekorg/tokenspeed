@@ -307,6 +307,67 @@ def test_sm107_streaming_bounds_keep_fp64_error(rows, has_inject, streams, monke
         check_within(result, expected, 0.002, 0.01)
 
 
+@pytest.mark.parametrize("projection_rows", [324, 320])
+def test_sm107_streaming_graph_replays_match_eager_bitwise(
+    monkeypatch: pytest.MonkeyPatch, projection_rows: int
+) -> None:
+    if current_platform().arch_version != ArchVersion(10, 7):
+        pytest.skip("requires the SM107 streaming tactic")
+    _reset_caches(monkeypatch)
+    pdl_enabled(True)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        streams = [
+            cute_fused._streams_in_one_round(rows, 4, 2560, 320, projection_rows)
+            for rows in (65, 128, 256)
+        ]
+    if not all(streams):
+        pytest.skip("requires one resident round of streaming tiles")
+    generator = torch.Generator(device="cuda").manual_seed(2718)
+
+    def randn(rows: int, columns: int, scale: float) -> torch.Tensor:
+        return scale * torch.randn(
+            (rows, columns), dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+
+    # Up weights near 0.1 move gates off 0.5, so stale activations change outputs.
+    weights = (randn(projection_rows, 10240, 0.01), randn(10240, 320, 0.1))
+    pairs = [[randn(rows, 10240, 1.0) for _ in range(2)] for rows in (65, 128, 256) * 4]
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        eager = [[mix((x, *weights), 0.25, True) for x in pair] for pair in pairs]
+    stream.synchronize()
+    assert all(
+        kernel.counter_activation_ready for kernel, _ in cute_fused._PLANS.values()
+    )
+    for pair, results in zip(pairs[:3], eager):
+        for x, result in zip(pair, results):
+            check(result, reference((x, *weights), 0.25), torch.bfloat16)
+    staged = [pair[0].clone() for pair in pairs]
+    static = [pair[0].clone() for pair in pairs]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = []
+        for source, x in zip(staged, static):
+            # Each input is written right before its call, as the model's norm does.
+            x.copy_(source)
+            outputs.append(mix((x, *weights), 0.25, True))
+    mismatches = torch.zeros((), dtype=torch.int64, device="cuda")
+    with torch.cuda.stream(stream):
+        # A broken READY wait corrupts about one replay in 500 at 324 rows.
+        for replay in range(8000):
+            # Alternating inputs leave the other input's activations in the workspace.
+            for source, pair in zip(staged, pairs):
+                source.copy_(pair[replay % 2])
+            graph.replay()
+            for output, results in zip(outputs, eager):
+                for actual, wanted in zip(output, results[replay % 2]):
+                    if wanted is not None:
+                        mismatches += (actual != wanted).any()
+    stream.synchronize()
+    assert mismatches.item() == 0
+
+
 @pytest.mark.parametrize("rows", [17, 32, 33, 64, 97, 193, 224, 225, 256, 385, 1024])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("has_inject", [False, True])
@@ -438,8 +499,6 @@ def test_uneven_down_stages_recycle_across_four_tiles(monkeypatch):
 
 def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
     _reset_caches(monkeypatch)
-    # Equal arbitrary epochs desynchronize reduction-group counters.
-    _keep_split_k(monkeypatch)
     pdl_enabled(True)
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     values = [inputs(97, torch.bfloat16, True) for _ in streams]
@@ -448,6 +507,8 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
         mix(values[0], 0.25, True)
     streams[0].synchronize()
     plans = dict(cute_fused._PLANS)
+    if current_platform().arch_version == ArchVersion(10, 7):
+        assert any(kernel.counter_activation_ready for kernel, _ in plans.values())
     workspaces = dict(cute_fused._WORKSPACES)
 
     streams[1].wait_stream(torch.cuda.current_stream())
@@ -488,9 +549,14 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
                 output = mix(stream_values, 0.25, True)
             stream.synchronize()
             states.append((stream, stream_values, graph, output))
-    for storage, _, epochs in cute_fused._WORKSPACES.values():
+    generation = 2**32 - 1
+    for key, (storage, _, epochs) in cute_fused._WORKSPACES.items():
+        workers, _, grid_clusters, _, _, groups, split_k, projection_tiles = key[3:]
+        flags = 2 * workers * grid_clusters
         storage.fill_(0x7FC1)
-        epochs.fill_(2**32 - 1)
+        epochs[:flags].fill_(generation)
+        # Every projection step adds 2 * groups * split_k arrivals to each counter.
+        epochs[flags:].fill_(generation * projection_tiles * 2 * groups * split_k)
     torch.cuda.synchronize()
     for factor in (-0.75, 1.25, -0.5):
         for stream, stream_values, graph, output in reversed(states):

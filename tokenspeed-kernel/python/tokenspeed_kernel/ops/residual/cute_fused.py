@@ -179,35 +179,56 @@ def _workspace_for_plan(
                         "fused CuTe HC workspace is not initialized for CUDA graph "
                         "capture; warm up this workspace layout before capture"
                     )
-                # Ordered BF16/FP16 calls reuse opaque 16-bit storage through
-                # an invocation-typed view. Reducers overwrite every consumed
-                # post-SiLU activation.
                 # Persistent scratch can be reused by calls made outside the
                 # inference-mode context that first warmed this layout.
                 with torch.inference_mode(False), _WORKSPACE_REGION():
-                    activation_storage = torch.empty(
-                        (workers * slot_rows, lowrank), device=device, dtype=torch.int16
+                    workspace = _workspace_tensors(
+                        device,
+                        partial_stride,
+                        workers,
+                        clusters,
+                        grid_clusters,
+                        slot_rows,
+                        lowrank,
+                        reduction_groups,
                     )
-                    partials = (
-                        torch.empty(
-                            (workers * slot_rows, partial_stride * reduction_groups),
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        if reduction_groups > 1
-                        else activation_storage
-                    )
-                    epochs = torch.zeros(
-                        2 * workers * grid_clusters
-                        + workers
-                        * (clusters // reduction_groups)
-                        * int(reduction_groups > 1),
-                        device=device,
-                        dtype=torch.int64,
-                    )
-                workspace = (activation_storage, partials, epochs)
                 _WORKSPACES[key] = workspace
     return workspace
+
+
+def _workspace_tensors(
+    device: torch.device,
+    partial_stride: int,
+    workers: int,
+    clusters: int,
+    grid_clusters: int,
+    slot_rows: int,
+    lowrank: int,
+    reduction_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate one layout's activation storage, partials and epochs."""
+    # Ordered BF16/FP16 calls reuse opaque 16-bit storage through
+    # an invocation-typed view. Reducers overwrite every consumed
+    # post-SiLU activation.
+    activation_storage = torch.empty(
+        (workers * slot_rows, lowrank), device=device, dtype=torch.int16
+    )
+    partials = (
+        torch.empty(
+            (workers * slot_rows, partial_stride * reduction_groups),
+            device=device,
+            dtype=torch.float32,
+        )
+        if reduction_groups > 1
+        else activation_storage
+    )
+    epochs = torch.zeros(
+        2 * workers * grid_clusters
+        + workers * (clusters // reduction_groups) * int(reduction_groups > 1),
+        device=device,
+        dtype=torch.int64,
+    )
+    return activation_storage, partials, epochs
 
 
 def _checked(result):
@@ -262,7 +283,7 @@ _SM107_HC_ROW_TILES = (
 _SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
 # Generic tactic that SM107 runs as split-K 16 at 17-64 rows.
 _SM107_S16_GENERIC = (8, 64, 32, 1, 1, 5, 32)
-# (split_k, M_proj, B_mma, stages) of the SM107 tactic that streams Up per K tile.
+# Streaming (split_k, M_proj, B_mma, max Down stages); 16 groups imply S1 and M64.
 _SM107_HC_STREAM_TILES = (1, 64, 64, 5)
 _SM107_HC_STREAM_GROUPS = 16
 # Fewest B_mma token tiles at which streaming measured faster than split-K.
@@ -277,7 +298,12 @@ def _one_round_rows(
     reduction_groups: int,
     pipelines_per_cta: int,
 ) -> int:
-    """Rows one resident round of a split_k x (m, n) plan covers on this stream."""
+    """Rows that one resident round of a plan covers on this stream.
+
+    Each n-row token tile takes a split_k-CTA cluster per M tile of the
+    projection rows and per reduction group; ``pipelines_per_cta`` groups
+    share a CTA.
+    """
     index = torch.cuda.current_device()
     stream = int(torch.cuda.current_stream(index).cuda_stream)
     clusters = (projection_rows + m - 1) // m * reduction_groups // pipelines_per_cta
@@ -1223,7 +1249,6 @@ if _AVAILABLE:
                 hidden_size,
                 lowrank,
                 tactic,
-                reduction_groups,
                 token_tile_batches,
                 single_tile,
                 full_tiles,
@@ -1253,15 +1278,15 @@ if _AVAILABLE:
                 _USE_NATIVE64_DOWN_X_RETENTION,
             )
 
-            def operands_for(kernel):
+            def operands_for(
+                kernel: FusedGatedResidualKernel, launch: bool
+            ) -> tuple[object, ...]:
                 workers = (
                     (rows + n * lb - 1) // (n * lb)
                     if kernel.clusters == 1
                     else kernel.workers
                 )
-                activation_storage, partials, epochs = _workspace_for_plan(
-                    normalized.device,
-                    projection_rows,
+                layout = (
                     kernel.partial_stride,
                     workers,
                     kernel.clusters,
@@ -1269,8 +1294,18 @@ if _AVAILABLE:
                     kernel.slot_rows,
                     lowrank,
                     kernel.reduction_groups,
-                    kernel.split_k,
-                    kernel.projection_tiles,
+                )
+                # Compiles see a transient layout; only launches keep a workspace.
+                activation_storage, partials, epochs = (
+                    _workspace_for_plan(
+                        normalized.device,
+                        projection_rows,
+                        *layout,
+                        kernel.split_k,
+                        kernel.projection_tiles,
+                    )
+                    if launch
+                    else _workspace_tensors(normalized.device, *layout)
                 )
                 values = (
                     normalized.unsqueeze(-1),
@@ -1419,7 +1454,9 @@ if _AVAILABLE:
                     ),
                     up_token_tail_overlap=token_tail_overlap,
                 )
-                compiled = cute_ext.compile(kernel, *operands_for(kernel), stream)
+                compiled = cute_ext.compile(
+                    kernel, *operands_for(kernel, False), stream
+                )
                 return kernel, compiled
 
             def capacity_for(plan_key, plan, validate_grid):
@@ -1514,5 +1551,5 @@ if _AVAILABLE:
                 )
                 capacity_for(round_key, plan, True)
                 kernel, compiled = plan
-            compiled(*operands_for(kernel), stream)
+            compiled(*operands_for(kernel, True), stream)
         return out, inject
