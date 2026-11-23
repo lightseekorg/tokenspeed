@@ -46,11 +46,13 @@ Each accepted U contributes its key's dot product with the new k or q,
 weighted by subsequent decays. Up to 16 accepted tokens use this projection.
 For longer prefixes the kernel replays into a private shared-memory tile.
 
-One CTA covers a request and head. Four warps convolve the incoming row,
-four project the gate, and four compute decay products for the retained keys.
-Once these operands are ready, the convolution warps project the checkpoint
-while the other eight warps project the retained updates. The output warps
-combine the two contributions and apply the optional gated RMSNorm.
+One CTA of eight warps covers a request and head, and two CTAs share an SM.
+Four warps convolve the incoming row; the other four project the gate, from
+weights they hold as packed BF16 pairs, and then weigh the retained keys by
+their later decays. Once these operands are ready, the convolution warps
+project the checkpoint while the other four project the retained updates.
+The output warps combine the two contributions and apply the optional gated
+RMSNorm.
 """
 
 from __future__ import annotations
@@ -71,11 +73,13 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     _bulk_load,
     _div,
     _exp,
+    _ldg_b32x2,
     _ldg_bf16x4,
     _lds_f32x4,
     _load,
     _rsqrt,
     _store_if,
+    _unpack_bf16x4,
 )
 
 __all__ = ["fused_verify_step", "fused_verify_step_supported"]
@@ -178,14 +182,8 @@ def _sync_output_warps(*, loc=None, ip=None):
 
 @dsl_user_op
 def _sync_history_warps(*, loc=None, ip=None):
-    """Publish both projection coefficients from all eight history warps."""
-    _asm(None, [], "bar.sync 2, 256;", "", True, loc, ip)
-
-
-@dsl_user_op
-def _sync_suffix_warps(*, loc=None, ip=None):
-    """Publish the initialized copy barrier to the four suffix warps."""
-    _asm(None, [], "bar.sync 3, 128;", "", True, loc, ip)
+    """Synchronize the four gate and history warps."""
+    _asm(None, [], "bar.sync 2, 128;", "", True, loc, ip)
 
 
 class FusedVerifyStep:
@@ -302,10 +300,12 @@ class FusedVerifyStep:
             gate_token_stride,
         ).launch(
             grid=[state_indices.shape[0], self.heads, 1],
-            block=[3 * THREADS, 1, 1],
+            block=[2 * THREADS, 1, 1],
             smem=self.smem_bytes,
             stream=stream,
             use_pdl=True,
+            # Two CTAs per SM, which caps a thread at 128 registers.
+            min_blocks_per_mp=2,
         )
 
     @cute.kernel
@@ -414,14 +414,15 @@ class FusedVerifyStep:
             _prefetch_l2(head_f_b.toint(), K * self.gate_rank * 2)
 
         # The gate weights are immutable across launches. Issue their loads before
-        # waiting for the current token's gate input.
-        gate_weights = cute.make_rmem_tensor((32, 4), Float32)
-        if (warp >= WARPS) & (warp < 2 * WARPS):
+        # waiting for the current token's gate input. They stay packed, two BF16
+        # values a register, until the projection uses them.
+        gate_words = cute.make_rmem_tensor((32, 2), Int32)
+        if warp >= WARPS:
             first_weight = (head * K + (warp - WARPS) * 32) * self.gate_rank + 4 * lane
             for j in cutlass.range_constexpr(32):
-                frag = _ldg_bf16x4((f_b + first_weight + j * self.gate_rank).toint())
-                for e in cutlass.range_constexpr(4):
-                    gate_weights[j, e] = frag[e]
+                words = _ldg_b32x2((f_b + first_weight + j * self.gate_rank).toint())
+                gate_words[j, 0] = words[0]
+                gate_words[j, 1] = words[1]
         # Page metadata and retained state are ready before the input projections.
         token_start = Int64(_load(query_start_loc, request))
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
@@ -443,7 +444,7 @@ class FusedVerifyStep:
         if live:
             if thread == 0:
                 cute.arch.mbarrier_init(barrier, 1)
-            if thread == 2 * THREADS:
+            if thread == THREADS:
                 cute.arch.mbarrier_init(history_barrier, 1)
             cute.arch.mbarrier_init_fence()
             if const_expr(
@@ -459,8 +460,9 @@ class FusedVerifyStep:
                     _bulk_load(
                         tile_addr, tile_src.toint(), V * K * 4, Int32(barrier.toint())
                     )
-            if (warp >= 2 * WARPS) & (warp < 3 * WARPS):
-                _sync_suffix_warps()
+            if warp >= WARPS:
+                # The gate warps wait on the history copy barrier.
+                _sync_history_warps()
             accepted = retained_length(retained, slot)
             projected_history = (accepted > 0) & (accepted <= _MAX_PROJECTED_HISTORY)
             if (accepted == 0) | projected_history:
@@ -471,7 +473,7 @@ class FusedVerifyStep:
                 if const_expr(self.packed_history):
                     if projected_history:
                         record_bytes = accepted * K * 4
-                # The suffix warps can consume the history while the checkpoint copy runs.
+                # The gate warps can consume the history while the checkpoint copy runs.
                 history_bytes = 3 * record_bytes
                 if const_expr(self.fp32_checkpoint):
                     if const_expr(self.capacity > _MAX_PROJECTED_HISTORY):
@@ -498,7 +500,7 @@ class FusedVerifyStep:
                             )
                 if projected_history:
                     if const_expr(self.packed_history):
-                        if thread == 2 * THREADS:
+                        if thread == THREADS:
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 history_barrier, history_bytes
                             )
@@ -659,47 +661,9 @@ class FusedVerifyStep:
                 )
                 if const_expr(not self.packed_history):
                     cute.arch.barrier()
-                if (warp >= 2 * WARPS) & (warp < 3 * WARPS):
-                    suffix_channel = thread - 2 * THREADS
-                    if projected_history:
-                        if const_expr(self.packed_history):
-                            cute.arch.mbarrier_wait(history_barrier, 0)
-                        # Each lane weights its K channel in place, from newest to oldest.
-                        if accepted <= 2:
-                            decay1 = Float32(1.0)
-                            k1 = Float32(0.0)
-                            if accepted == 2:
-                                decay1 = record_decay[THREADS + suffix_channel]
-                                k1 = weighted_history_keys[THREADS + suffix_channel]
-                            history_decay[suffix_channel] = (
-                                record_decay[suffix_channel] * decay1
-                            )
-                            weighted_history_keys[suffix_channel] = (
-                                weighted_history_keys[suffix_channel] * decay1
-                            )
-                            weighted_history_keys[THREADS + suffix_channel] = k1
-                        else:
-                            suffix = Float32(1.0)
-                            for i in cutlass.range(accepted, unroll=4):
-                                suffix_record = Int32(accepted - 1 - i)
-                                weighted_history_keys[
-                                    suffix_record * THREADS + suffix_channel
-                                ] = (
-                                    weighted_history_keys[
-                                        suffix_record * THREADS + suffix_channel
-                                    ]
-                                    * suffix
-                                )
-                                suffix = (
-                                    suffix
-                                    * record_decay[
-                                        suffix_record * THREADS + suffix_channel
-                                    ]
-                                )
-                            history_decay[suffix_channel] = suffix
-                if (warp >= WARPS) & (warp < 2 * WARPS):
-                    gate_warp = warp - WARPS
-                    gate_row = gate_warp * 32 + lane
+                if warp >= WARPS:
+                    # Thread t of these warps owns gate row and key channel t.
+                    gate_row = thread - THREADS
 
                     gate_scale = _exp(_load(a_log, head).to(Float32))
                     gate_bias = _load(dt_bias, head * K + gate_row).to(Float32)
@@ -709,7 +673,7 @@ class FusedVerifyStep:
                     )
                     gate_parts = []
                     for j in cutlass.range_constexpr(32):
-                        weights = [gate_weights[j, e] for e in range(4)]
+                        weights = _unpack_bf16x4([gate_words[j, 0], gate_words[j, 1]])
                         part = Float32(0.0)
                         for e in cutlass.range_constexpr(4):
                             part = part + f_a_part[e] * weights[e]
@@ -742,6 +706,38 @@ class FusedVerifyStep:
                     cute.make_tensor(field.iterator + index, cute.make_layout((1,)))[
                         0
                     ] = new_decay
+                    if projected_history:
+                        if const_expr(self.packed_history):
+                            cute.arch.mbarrier_wait(history_barrier, 0)
+                        # Each lane weights its K channel in place, from newest to oldest.
+                        if accepted <= 2:
+                            decay1 = Float32(1.0)
+                            k1 = Float32(0.0)
+                            if accepted == 2:
+                                decay1 = record_decay[THREADS + gate_row]
+                                k1 = weighted_history_keys[THREADS + gate_row]
+                            history_decay[gate_row] = record_decay[gate_row] * decay1
+                            weighted_history_keys[gate_row] = (
+                                weighted_history_keys[gate_row] * decay1
+                            )
+                            weighted_history_keys[THREADS + gate_row] = k1
+                        else:
+                            suffix = Float32(1.0)
+                            for i in cutlass.range(accepted, unroll=4):
+                                suffix_record = Int32(accepted - 1 - i)
+                                weighted_history_keys[
+                                    suffix_record * THREADS + gate_row
+                                ] = (
+                                    weighted_history_keys[
+                                        suffix_record * THREADS + gate_row
+                                    ]
+                                    * suffix
+                                )
+                                suffix = (
+                                    suffix
+                                    * record_decay[suffix_record * THREADS + gate_row]
+                                )
+                            history_decay[gate_row] = suffix
                 cute.arch.barrier()
                 lane_decays = _lds_f32x4(decays_addr + 16 * lane)
                 lane_keys = _lds_f32x4(raw_keys_addr + 16 * lane)
@@ -753,72 +749,41 @@ class FusedVerifyStep:
                     history_addr = (
                         Int32(weighted_history_keys.iterator.toint()) + 16 * lane
                     )
-                    # Each warp handles two records. The butterfly leaves the four
-                    # key/query coefficients in separate groups of eight lanes.
-                    if history_warp < accepted:
-                        w0 = _lds_f32x4(history_addr + history_warp * (4 * THREADS))
-                        w1 = [Float32(0.0) for _ in range(4)]
-                        if history_warp + 8 < accepted:
-                            w1 = _lds_f32x4(
-                                history_addr + (history_warp + 8) * (4 * THREADS)
-                            )
-                        k0 = Float32(0.0)
-                        k1 = Float32(0.0)
-                        q0 = Float32(0.0)
-                        q1 = Float32(0.0)
-                        for e in cutlass.range_constexpr(4):
-                            k0 = k0 + w0[e] * decayed_keys[e]
-                            k1 = k1 + w1[e] * decayed_keys[e]
-                            q0 = q0 + w0[e] * decayed_queries[e]
-                            q1 = q1 + w1[e] * decayed_queries[e]
-                        upper = (lane & 16) != 0
-                        keepk = k1 if upper else k0
-                        sendk = k0 if upper else k1
-                        keepq = q1 if upper else q0
-                        sendq = q0 if upper else q1
-                        dk = keepk + cute.arch.shuffle_sync_bfly(sendk, offset=16)
-                        dq = keepq + cute.arch.shuffle_sync_bfly(sendq, offset=16)
-                        odd = (lane & 8) != 0
-                        keep = dq if odd else dk
-                        send = dk if odd else dq
-                        coeff = keep + cute.arch.shuffle_sync_bfly(send, offset=8)
-                        for stage in cutlass.range_constexpr(3):
-                            coeff = coeff + cute.arch.shuffle_sync_bfly(
-                                coeff, offset=4 >> stage
-                            )
-                        record = history_warp + (lane // 16) * 8
-                        if (lane & 7) == 0:
-                            if odd:
-                                query_coefficients[record] = coeff
-                            else:
-                                key_coefficients[record] = coeff
+                    # Warp w handles records w and w + 8, then w + 4 and w + 12. The
+                    # butterfly leaves a pair's four key/query coefficients in
+                    # separate groups of eight lanes.
+                    for pair in cutlass.range_constexpr(2):
+                        first = history_warp + 4 * pair
+                        self._record_coefficients(
+                            history_addr,
+                            first,
+                            accepted,
+                            lane,
+                            decayed_keys,
+                            decayed_queries,
+                            key_coefficients,
+                            query_coefficients,
+                        )
                     _sync_history_warps()
-                    # The two half-warps accumulate even and odd U records for
-                    # the same 16 value channels, then add their partial sums.
-                    member = lane // 16
-                    channel = history_warp * 16 + lane % 16
-                    history_key_total = Float32(0.0)
-                    history_query_total = Float32(0.0)
+                    # Lane l takes value channel 32 w + l: it sums the even and the
+                    # odd U records apart, then adds the two sums.
+                    channel = history_warp * 32 + lane
+                    even_key = Float32(0.0)
+                    even_query = Float32(0.0)
+                    odd_key = Float32(0.0)
+                    odd_query = Float32(0.0)
                     for group in cutlass.range_constexpr(8):
-                        rec = group * 2 + member
-                        if rec < accepted:
-                            u = history_u[rec * THREADS + channel]
-                            history_key_total = (
-                                history_key_total + u * key_coefficients[rec]
-                            )
-                            history_query_total = (
-                                history_query_total + u * query_coefficients[rec]
-                            )
-                    history_key_total = history_key_total + cute.arch.shuffle_sync_bfly(
-                        history_key_total, offset=16
-                    )
-                    history_query_total = (
-                        history_query_total
-                        + cute.arch.shuffle_sync_bfly(history_query_total, offset=16)
-                    )
-                    if member == 0:
-                        history_k[channel] = history_key_total
-                        history_q[channel] = history_query_total
+                        even = 2 * group
+                        if even < accepted:
+                            u = history_u[even * THREADS + channel]
+                            even_key = even_key + u * key_coefficients[even]
+                            even_query = even_query + u * query_coefficients[even]
+                        if even + 1 < accepted:
+                            u = history_u[(even + 1) * THREADS + channel]
+                            odd_key = odd_key + u * key_coefficients[even + 1]
+                            odd_query = odd_query + u * query_coefficients[even + 1]
+                    history_k[channel] = even_key + odd_key
+                    history_q[channel] = even_query + odd_query
                 if warp < WARPS:
                     cute.arch.mbarrier_wait(barrier, 0)
                     if projected_history:
@@ -901,6 +866,58 @@ class FusedVerifyStep:
                         + tidx
                     )
                     _store_if(Int32(1), entry.toint(), corrected, False)
+
+    @cute.jit
+    def _record_coefficients(
+        self,
+        history_addr: Int32,
+        first: Int32,
+        accepted: Int32,
+        lane: Int32,
+        decayed_keys,
+        decayed_queries,
+        key_coefficients: cute.Tensor,
+        query_coefficients: cute.Tensor,
+    ):
+        """Store the key and query coefficients of records ``first`` and ``first + 8``.
+
+        A record's coefficients are its weighted key's dot products with the
+        decayed key and query; lane l covers keys 4l..4l+3. Records past the
+        count are skipped.
+        """
+        if first < accepted:
+            w0 = _lds_f32x4(history_addr + first * (4 * THREADS))
+            w1 = [Float32(0.0) for _ in range(4)]
+            if first + 8 < accepted:
+                w1 = _lds_f32x4(history_addr + (first + 8) * (4 * THREADS))
+            k0 = Float32(0.0)
+            k1 = Float32(0.0)
+            q0 = Float32(0.0)
+            q1 = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                k0 = k0 + w0[e] * decayed_keys[e]
+                k1 = k1 + w1[e] * decayed_keys[e]
+                q0 = q0 + w0[e] * decayed_queries[e]
+                q1 = q1 + w1[e] * decayed_queries[e]
+            upper = (lane & 16) != 0
+            keepk = k1 if upper else k0
+            sendk = k0 if upper else k1
+            keepq = q1 if upper else q0
+            sendq = q0 if upper else q1
+            dk = keepk + cute.arch.shuffle_sync_bfly(sendk, offset=16)
+            dq = keepq + cute.arch.shuffle_sync_bfly(sendq, offset=16)
+            odd = (lane & 8) != 0
+            keep = dq if odd else dk
+            send = dk if odd else dq
+            coeff = keep + cute.arch.shuffle_sync_bfly(send, offset=8)
+            for stage in cutlass.range_constexpr(3):
+                coeff = coeff + cute.arch.shuffle_sync_bfly(coeff, offset=4 >> stage)
+            record = first + (lane // 16) * 8
+            if (lane & 7) == 0:
+                if odd:
+                    query_coefficients[record] = coeff
+                else:
+                    key_coefficients[record] = coeff
 
 
 @cute.jit

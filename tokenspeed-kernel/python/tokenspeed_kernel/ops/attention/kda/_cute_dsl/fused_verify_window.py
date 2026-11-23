@@ -53,7 +53,6 @@ import cutlass
 import torch
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float32, Int32, Int64, const_expr, cute
-from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
 from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm, KdaRetainedHistory
@@ -75,11 +74,13 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     _bulk_load,
     _div,
     _exp,
+    _ldg_b32x2,
     _lds_bf16x4,
     _load,
     _round_up,
     _rsqrt,
     _store_if,
+    _unpack_bf16x4,
     _value_tile_rows,
 )
 
@@ -98,42 +99,6 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
     retained_length,
     retained_row,
 )
-
-
-@dsl_user_op
-def _ldg_b32x2(byte_addr: Int64, *, loc=None, ip=None):
-    """Two 32-bit words from an 8-byte aligned global address, left packed."""
-    value = _asm(
-        llvm.StructType.get_literal([T.i32()] * 2),
-        [Int64(byte_addr)],
-        "ld.global.v2.b32 {$0, $1}, [$2];",
-        "=r,=r,l",
-        True,
-        loc,
-        ip,
-    )
-    return [
-        Int32(llvm.extractvalue(T.i32(), value, [i], loc=loc, ip=ip)) for i in range(2)
-    ]
-
-
-@dsl_user_op
-def _unpack_bf16x4(words, *, loc=None, ip=None):
-    """The four BF16 values of two packed words, as FP32."""
-    value = _asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [Int32(words[0]), Int32(words[1])],
-        "shl.b32 $0, $4, 16; and.b32 $1, $4, 0xffff0000; "
-        "shl.b32 $2, $5, 16; and.b32 $3, $5, 0xffff0000;",
-        "=f,=f,=f,=f,r,r",
-        False,
-        loc,
-        ip,
-    )
-    return [
-        Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip))
-        for i in range(4)
-    ]
 
 
 @dsl_user_op

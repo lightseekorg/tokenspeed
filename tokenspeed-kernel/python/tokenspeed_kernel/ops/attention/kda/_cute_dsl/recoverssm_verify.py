@@ -161,6 +161,42 @@ def _ldg_bf16x4(byte_addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ldg_b32x2(byte_addr: Int64, *, loc=None, ip=None):
+    """Two 32-bit words from an 8-byte aligned global address, left packed."""
+    value = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [Int64(byte_addr)],
+        "ld.global.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,l",
+        True,
+        loc,
+        ip,
+    )
+    return [
+        Int32(llvm.extractvalue(T.i32(), value, [i], loc=loc, ip=ip)) for i in range(2)
+    ]
+
+
+@dsl_user_op
+def _unpack_bf16x4(words, *, loc=None, ip=None):
+    """The four BF16 values of two packed words, as FP32."""
+    value = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int32(words[0]), Int32(words[1])],
+        "shl.b32 $0, $4, 16; and.b32 $1, $4, 0xffff0000; "
+        "shl.b32 $2, $5, 16; and.b32 $3, $5, 0xffff0000;",
+        "=f,=f,=f,=f,r,r",
+        False,
+        loc,
+        ip,
+    )
+    return [
+        Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
+
+
+@dsl_user_op
 def _lds_bf16x4(byte_addr: Int32, *, loc=None, ip=None):
     """Four BF16 values from an 8-byte aligned shared-memory address, as FP32."""
     value = _asm(

@@ -79,14 +79,16 @@ verify core.
 The one-token fused kernel projects the accepted history onto the current
 query and key. For 1–16 accepted records, it scales the query and key by
 the cumulative decay before multiplying them by the dense base. It adds
-each retained U vector weighted by its key's two dot products. Four warps compute the convolution, four compute the gate, and
-four apply the accepted decay factors to the retained keys. The checkpoint
-and packed history have independent bulk-copy completion barriers. Strided
+each retained U vector weighted by its key's two dot products. Its CTA has
+eight warps, so two share an SM: four compute the convolution; the other
+four compute the gate, from weights held as packed BF16 pairs, and then
+apply the accepted decay factors to the retained keys. The checkpoint and
+packed history have independent bulk-copy completion barriers. Strided
 history uses its tensor strides. Once the gate and convolution are ready,
-four warps project the checkpoint while eight project the retained records.
-Each history warp computes both products for up to two keys. It combines
-the even and odd U contributions in FP32. Empty histories use only the
-checkpoint products.
+four warps project the checkpoint while the other four project the retained
+records. Each history warp computes both products for up to four keys. It
+combines the even and odd U contributions in FP32. Empty histories use only
+the checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
 Convolution and accepted-length publication use the common retained commit
 ABI. A request that ended in the forward has its records folded into its live
