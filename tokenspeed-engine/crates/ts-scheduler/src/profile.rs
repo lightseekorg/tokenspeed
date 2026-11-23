@@ -257,6 +257,111 @@ impl Drop for Hold {
     }
 }
 
+/// Where lane rows' thread ids start: above every kernel thread id and the
+/// ids [`register_thread`] makes up off Linux. The profiler's merge
+/// (`engine/profiler.py`) names a row by its lane name alone.
+pub const LANE_TID_BASE: u64 = 1 << 40;
+/// Rows a family of lanes may hold at once; each family's thread ids span
+/// this many.
+const LANE_ROWS: usize = 1 << 16;
+
+/// Rows on the timeline for work that overlaps on one thread, as the Disk
+/// operations in flight and the peer landings do: each [`Lane`] holds the
+/// lowest free row of its family until it drops, so the spans of one piece
+/// of work share a row and concurrent pieces stack.
+pub struct Lanes {
+    family: &'static str,
+    rows: Mutex<LaneRows>,
+}
+
+struct LaneRows {
+    /// The family's place among the families, once it first held a row.
+    ordinal: Option<u64>,
+    /// Whether each row the family ever had is held now.
+    held: Vec<bool>,
+}
+
+impl Lanes {
+    /// A family whose rows are named `family` and their row number.
+    pub const fn new(family: &'static str) -> Self {
+        Self {
+            family,
+            rows: Mutex::new(LaneRows {
+                ordinal: None,
+                held: Vec::new(),
+            }),
+        }
+    }
+
+    /// Hold a row while a recording runs; None otherwise, or when every
+    /// row is held.
+    pub fn hold(&'static self) -> Option<Lane> {
+        static NEXT_FAMILY: AtomicU64 = AtomicU64::new(0);
+        if !recording() {
+            return None;
+        }
+        let mut rows = lock(&self.rows);
+        let ordinal = *rows
+            .ordinal
+            .get_or_insert_with(|| NEXT_FAMILY.fetch_add(1, Ordering::Relaxed));
+        let row = rows
+            .held
+            .iter()
+            .position(|held| !held)
+            .unwrap_or(rows.held.len());
+        if row >= LANE_ROWS {
+            return None;
+        }
+        let tid = LANE_TID_BASE + ordinal * LANE_ROWS as u64 + row as u64;
+        if row == rows.held.len() {
+            rows.held.push(true);
+            lock(&THREADS).push((tid, format!("{} {row}", self.family)));
+        } else {
+            rows.held[row] = true;
+        }
+        Some(Lane {
+            lanes: self,
+            row,
+            tid,
+        })
+    }
+}
+
+/// A held row of [`Lanes`]; the row frees when it drops.
+pub struct Lane {
+    lanes: &'static Lanes,
+    row: usize,
+    tid: u64,
+}
+
+impl Lane {
+    /// Record a finished span on this row, if a recording runs. The row's
+    /// spans must nest or follow one another.
+    pub fn record(
+        &self,
+        category: &'static str,
+        name: Cow<'static, str>,
+        begin_ns: i64,
+        end_ns: i64,
+    ) {
+        if recording() {
+            lock(&SPANS).extend([Span {
+                name,
+                category,
+                tid: self.tid,
+                begin_ns,
+                end_ns,
+            }]);
+        }
+    }
+}
+
+impl Drop for Lane {
+    fn drop(&mut self) {
+        lock(&self.lanes.rows).held[self.row] = false;
+    }
+}
+
 /// The C++ scheduler's sink (`profile_span.h`), which the bridge installs
 /// while a recording runs.
 pub(crate) fn record_scheduler_span(name: &str, begin_ns: i64, end_ns: i64) {
@@ -316,6 +421,38 @@ mod tests {
 
         start();
         assert!(stop().spans.is_empty(), "a new recording starts empty");
+    }
+
+    #[test]
+    fn overlapping_work_stacks_on_lane_rows_and_a_freed_row_is_reused() {
+        static LANES: Lanes = Lanes::new("Disk read");
+        let _serial = lock(&SERIAL);
+        assert!(LANES.hold().is_none(), "no row without a recording");
+        start();
+        let first = LANES.hold().unwrap();
+        let second = LANES.hold().unwrap();
+        first.record(HOST, "a".into(), now_ns(), now_ns());
+        second.record(HOST, "b".into(), now_ns(), now_ns());
+        let (first_tid, second_tid) = (first.tid, second.tid);
+        drop(first);
+        let third = LANES.hold().unwrap();
+        third.record(HOST, "c".into(), now_ns(), now_ns());
+        let recorded = stop();
+        let tids: Vec<u64> = recorded.spans.iter().map(|span| span.tid).collect();
+        assert_eq!(names(&recorded), ["a", "b", "c"]);
+        assert_eq!(tids, [first_tid, second_tid, first_tid]);
+        assert_ne!(first_tid, second_tid);
+        assert!(tids.iter().all(|tid| *tid >= LANE_TID_BASE));
+        let named = |tid| {
+            recorded
+                .threads
+                .iter()
+                .find(|(thread, _)| *thread == tid)
+                .map(|(_, name)| name.as_str())
+        };
+        assert_eq!(named(first_tid), Some("Disk read 0"));
+        assert_eq!(named(second_tid), Some("Disk read 1"));
+        drop((second, third));
     }
 
     #[test]

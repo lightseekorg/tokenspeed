@@ -286,3 +286,87 @@ def test_empty_apply_preserves_deferred_finalize_contract() -> None:
     assert expert_weights is topk_weights
     assert expanded_idx.shape == (0,)
     assert expanded_idx.dtype == torch.int32
+
+
+@pytest.mark.skipif(
+    _reason is not None or not current_platform().is_blackwell,
+    reason=str(_reason or "the TRT-LLM FP8 block-scale MoE runs on Blackwell"),
+)
+@pytest.mark.parametrize("tokens", [1, 3, 16, 257])
+def test_apply_quantizes_into_the_kernel_scale_layout(tokens: int) -> None:
+    from flashinfer.fused_moe import (
+        RoutingMethodType,
+        trtllm_fp8_block_scale_routed_moe,
+    )
+    from flashinfer.tllm_enums import WeightLayout
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_trtllm_fp8_moe_apply,
+        flashinfer_trtllm_fp8_moe_process_weights,
+    )
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+
+    experts, hidden, intermediate, top_k = 4, 1024, 512, 2
+    torch.manual_seed(tokens)
+    weights = _MoEWeights(
+        (torch.randn(experts, 2 * intermediate, hidden) * 0.05).to(torch.float8_e4m3fn),
+        (torch.randn(experts, hidden, intermediate) * 0.05).to(torch.float8_e4m3fn),
+        torch.rand(experts, 2 * intermediate // 128, hidden // 128) * 0.02 + 0.001,
+        torch.rand(experts, hidden // 128, intermediate // 128) * 0.02 + 0.001,
+    ).cuda()
+    weights.num_experts = weights.num_local_experts = experts
+    weights.top_k = top_k
+    flashinfer_trtllm_fp8_moe_process_weights({}, weights)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_weights, topk_ids = torch.rand(tokens, experts, device="cuda").topk(top_k)
+    topk_weights, topk_ids = topk_weights.to(torch.bfloat16), topk_ids.int()
+
+    def apply() -> torch.Tensor:
+        return flashinfer_trtllm_fp8_moe_apply(
+            {},
+            x,
+            weights,
+            router_logits=torch.empty(tokens, experts, device="cuda"),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+
+    output = apply()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        apply()
+        torch.cuda.synchronize()
+    # No PyTorch kernel or memcpy moves the activation scales.
+    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+    assert not [n for n in names if "at::native" in n or "memcpy" in n.lower()]
+
+    # The kernel's result with canonical scales moved to its [K/128, M] layout.
+    codes, scales = quantize_fp8(
+        x, granularity="token_group", group_size=128, solution="trtllm"
+    )
+    expected = trtllm_fp8_block_scale_routed_moe(
+        topk_ids=(topk_ids, topk_weights),
+        routing_bias=None,
+        hidden_states=codes,
+        hidden_states_scale=scales.t().contiguous(),
+        gemm1_weights=weights.w13_weight,
+        gemm1_weights_scale=weights.w13_weight_scale_inv,
+        gemm2_weights=weights.w2_weight,
+        gemm2_weights_scale=weights.w2_weight_scale_inv,
+        num_experts=experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate,
+        local_expert_offset=0,
+        local_num_experts=experts,
+        routed_scaling_factor=None,
+        routing_method_type=int(RoutingMethodType.Renormalize),
+        use_shuffled_weight=True,
+        weight_layout=int(WeightLayout.BlockMajorK),
+        tune_max_num_tokens=get_autotune_max_num_tokens(),
+    )
+    if isinstance(expected, (list, tuple)):
+        expected = expected[0]
+    assert torch.equal(output, expected)

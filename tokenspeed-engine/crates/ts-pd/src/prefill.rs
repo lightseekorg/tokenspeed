@@ -106,6 +106,9 @@ struct PendingRegistration {
     frames: Vec<Bytes>,
     cache_id: String,
     registration: Option<Registration>,
+    /// Acknowledged by this id once installed; `None` from an older Decode
+    /// rank that does not wait for an acknowledgment.
+    id: Option<u64>,
 }
 
 impl PendingRegistration {
@@ -696,7 +699,10 @@ impl Shared {
     }
 
     fn handle_registration(&self, frames: &[Bytes]) {
-        let Ok((_, _, cache_id)) = wire::registration_route(frames) else {
+        let (Ok((_, _, cache_id)), Ok(id)) = (
+            wire::registration_route(frames),
+            wire::registration_id(frames),
+        ) else {
             tracing::error!("rejecting a malformed CachePD registration");
             return;
         };
@@ -706,6 +712,7 @@ impl Shared {
                 frames: frames.to_vec(),
                 cache_id,
                 registration: self.plan_registration(frames).ok(),
+                id,
             });
         self.flush_registrations();
     }
@@ -752,11 +759,15 @@ impl Shared {
                 .registrations
                 .values()
                 .filter(|previous| {
-                    previous.cache_id == pending.cache_id
-                        || pending.registration.as_ref().is_some_and(|next| {
-                            (previous.endpoint == next.endpoint && previous.port == next.port)
-                                || previous.session_id == next.session_id
-                        })
+                    // An identical registration (a resend, or the same cache
+                    // registering again after a route change) replaces
+                    // nothing, so it waits for no writer.
+                    pending.registration.as_ref() != Some(*previous)
+                        && (previous.cache_id == pending.cache_id
+                            || pending.registration.as_ref().is_some_and(|next| {
+                                (previous.endpoint == next.endpoint && previous.port == next.port)
+                                    || previous.session_id == next.session_id
+                            }))
                 })
                 .map(|previous| state.registration_gates[&previous.cache_id].clone())
                 .collect()
@@ -808,20 +819,44 @@ impl Shared {
             for (endpoint, port, old_id) in retired {
                 self.reject_session(endpoint, port, &old_id, "cache instance superseded");
             }
+            let route = (registration.endpoint.clone(), registration.port);
             let mut state = self.state();
             state.failed_sessions.remove(&cache_id);
             state
                 .registration_gates
                 .entry(cache_id.clone())
                 .or_insert_with(|| Arc::new(RwLock::new(())));
-            state.registrations.insert(cache_id, registration);
-            Ok(())
+            state.registrations.insert(cache_id.clone(), registration);
+            Ok((route, cache_id))
         });
         match registered {
-            Ok(()) => {}
+            Ok(((endpoint, port), cache_id)) => {
+                // Only now may the Decode rank publish manifests for this
+                // cache. A lost acknowledgment is resent with the
+                // registration, which reinstalls the same entry.
+                if let Some(id) = pending.id {
+                    let _ = self.transport.sockets.send_coalesced(
+                        &endpoint,
+                        port,
+                        wire::registration_ack_frames(id, &cache_id, self.status_rank),
+                    );
+                }
+            }
             Err(reason) => {
                 tracing::error!(reason, "rejecting a CachePD Decode registration");
                 if let Ok((endpoint, port, cache_id)) = wire::registration_route(frames) {
+                    if let Some(id) = pending.id {
+                        let _ = self.transport.sockets.send_coalesced(
+                            &endpoint,
+                            port,
+                            wire::registration_reject_frames(
+                                id,
+                                &cache_id,
+                                self.status_rank,
+                                &reason,
+                            ),
+                        );
+                    }
                     self.reject_session(endpoint, port, &cache_id, &reason);
                 }
             }

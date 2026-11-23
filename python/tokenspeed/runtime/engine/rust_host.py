@@ -66,9 +66,17 @@ from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
+from tokenspeed.runtime.cache.disk import (
+    DiskSettings,
+    DiskTierTuning,
+    disk_scheduler_config,
+    disk_settings,
+)
+from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
+    PUSH_TIMEOUT_S,
     QUARANTINE_S,
     RECORD_LIFETIME_S,
     PeerSharingSettings,
@@ -550,6 +558,10 @@ class HostConfig:
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
             and ``--enable-metrics``.
+        disk: With the local Disk tier, what the host starts its executor
+            from; else None.
+        disk_metrics: This rank reports the Disk tier's metrics: with the
+            tier and ``--enable-metrics``.
         attn_tp_rank: This rank's attention-TP rank, an L3 metrics label.
         engine_role: ``--disaggregation-mode``, an L3 metrics label.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
@@ -623,6 +635,8 @@ class HostConfig:
     trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
+    disk: DiskSettings | None
+    disk_metrics: bool
     attn_tp_rank: int
     engine_role: str
     eplb: EplbSettings | None
@@ -648,8 +662,8 @@ def host_in_flight_depth(server_args: ServerArgs) -> int:
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
 
-# The Host pools an L3 executor addresses, kept for the process.
-_L3_HOST_POOLS: list = []
+# The Host pools a native executor (L3, Disk) addresses, kept for the process.
+_ADDRESSED_HOST_POOLS: list = []
 
 
 @dataclass
@@ -695,8 +709,10 @@ class HostDataPlane:
         attn_tp_cpu_group,
         epd_publisher,
         starting: bool,
+        record_cache_observations: bool = False,
     ) -> None:
         self._device = handle
+        self._record_cache_observations = record_cache_observations
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
         self._starting = starting
@@ -898,7 +914,11 @@ class HostDataPlane:
         # Each op once, validated before any owner runs one: the Host copies
         # go to the device; the host's L3 executor took the storage
         # operations.
-        cache_ops = cache_ops_from_plan(plan, request_admission=self._admission_id)
+        cache_ops = cache_ops_from_plan(
+            plan,
+            request_admission=self._admission_id,
+            record_observations=self._record_cache_observations,
+        )
         # The engine's own startup requests let the kernels they reach
         # prepare their compile variants, as model-only warmup does.
         with kernel_warmup(enabled=self._starting):
@@ -957,6 +977,15 @@ class HostDataPlane:
                 cache_event_to_payload, self._device.poll_cache_results()
             )
         ]
+
+    def poll_cache_observations(self) -> tuple[list[dict], int]:
+        """CPU observations completed by the preceding cache ACK poll.
+
+        The Rust host adds trusted engine/rank/instance context and performs
+        bounded nonblocking export. This method performs no device queries,
+        serialization, I/O, or request-ID lookup.
+        """
+        return self._device.poll_cache_observations()
 
     def release(self, rids: list[str]) -> None:
         """Forget requests that ended. Their grammar matchers and
@@ -1227,6 +1256,7 @@ def _peer_sharing_settings(
         draft_model_config,
         host_cache=host_cache,
         world_cpu_group=world_group,
+        for_peer=True,
     )
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:
@@ -1249,9 +1279,11 @@ def _peer_sharing_settings(
         weight_version=str(server_args.weight_version),
         answer_timeout_s=server_args.peer_prefix_answer_timeout_ms / 1000,
         quarantine_s=QUARANTINE_S,
+        push_timeout_s=PUSH_TIMEOUT_S,
         record_lifetime_s=RECORD_LIFETIME_S,
         library=mooncake_library(),
         local_ip=local_ip,
+        push_host=host,
         protocol=mooncake_protocol(),
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
@@ -1398,8 +1430,30 @@ class HostBootstrap:
             if l3 is not None:
                 # The executor addresses the Host pool by pointer, and native
                 # I/O that cannot prove its retirement keeps it past close.
-                _L3_HOST_POOLS.append(device.host_cache.storage)
+                _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
             storage_config = l3.runtime.scheduler if l3 is not None else None
+            # The local Disk tier under the Host pool; None without
+            # --disk-tier-paths (docs/rfcs/0006-disk-tier.md).
+            disk = None
+            disk_config = None
+            if server_args.disk_tier_paths is not None:
+                disk_tuning = DiskTierTuning.from_json(server_args.disk_tier_config)
+                disk = disk_settings(
+                    server_args,
+                    tuning=disk_tuning,
+                    host_storage=device.host_cache.storage,
+                    ownership=device.host_cache.ownership,
+                    global_rank=global_rank,
+                )
+                disk_config = disk_scheduler_config(
+                    disk_tuning,
+                    num_host_blocks=host_block_capacity(
+                        device.host_cache.storage,
+                        device.host_cache.ownership.shard_counts,
+                    ),
+                )
+                # The executor addresses the Host pool by pointer as well.
+                _ADDRESSED_HOST_POOLS.append(device.host_cache.storage)
             #: With peer prefix sharing, what the host starts this rank's peer
             #: endpoint and reads from (``cache/peer.py``); else None.
             self.peer_sharing = None
@@ -1417,6 +1471,11 @@ class HostBootstrap:
                     incarnation=self.peer_sharing.incarnation,
                     answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
                     min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
+                    landing_tier=server_args.peer_prefix_landing_tier,
+                    num_host_blocks=host_block_capacity(
+                        device.host_cache.storage,
+                        device.host_cache.ownership.shard_counts,
+                    ),
                 )
             specs = device.specs
             geometry = specs.cache_geometry
@@ -1424,6 +1483,8 @@ class HostBootstrap:
                 server_args,
                 specs,
                 storage_config=storage_config,
+                num_disk_pages=disk.num_disk_lcm_blocks + 1 if disk is not None else 0,
+                disk_config=disk_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
                 max_resident_requests=max_resident_requests,
@@ -1668,6 +1729,8 @@ class HostBootstrap:
                 ),
                 l3=l3,
                 l3_metrics=l3 is not None and server_args.enable_metrics,
+                disk=disk,
+                disk_metrics=disk is not None and server_args.enable_metrics,
                 attn_tp_rank=attn_tp_rank,
                 engine_role=server_args.disaggregation_mode,
             )
@@ -1715,6 +1778,7 @@ class HostBootstrap:
                     epd_receive.publisher if epd_receive is not None else None
                 ),
                 starting=server_args.enable_startup_requests,
+                record_cache_observations=device.specs.cache_observation_capacity > 0,
             )
             self._device = device.handle
 

@@ -31,27 +31,33 @@ from tokenspeed_kernel.ops.activation.triton import (
     tanh_softcap_cap_normal,
     tanh_softcap_scalars,
 )
+from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import argmax_key
 
 __all__ = [
     "capped_logit_sum",
+    "capped_logit_sum_key_blocks",
     "gated_tanh_recurrence",
     "projected_gated_tanh_recurrence",
 ]
 
 
-@triton.jit(do_not_specialize=["valid_cols"])
+@triton.jit(do_not_specialize=["valid_cols", "key_offset"])
 def _capped_logit_sum_kernel(
     base_ptr,
     correction_ptr,
     out_ptr,
+    keys_ptr,
     stride_base,
     stride_correction,
     stride_out,
+    stride_keys,
     valid_cols,
     out_cols,
+    key_offset,
     inv_cap,
     cap,
     HAS_CAP: tl.constexpr,
+    KEYS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -69,6 +75,18 @@ def _capped_logit_sum_kernel(
         y = _mul_rn_f32(y, cap).to(tl.bfloat16)
     y = tl.where(valid, y, -float("inf"))
     tl.store(out_ptr + row * stride_out + cols, y, mask=cols < out_cols)
+    if KEYS:
+        # The block's argmax key over the stored row (padding included, as an
+        # argmax over ``out`` reads it).
+        key = argmax_key(y.to(tl.float32), cols.to(tl.int64) + key_offset)
+        key = tl.where(cols < out_cols, key, -0x7FFFFFFFFFFFFFFF - 1)
+        tl.store(keys_ptr + row * stride_keys + tl.program_id(1), tl.max(key, axis=0))
+
+
+def capped_logit_sum_key_blocks(width: int) -> int:
+    """The column blocks (argmax keys per row) of a ``width``-column
+    ``capped_logit_sum``."""
+    return triton.cdiv(width, _TANH_SOFTCAP_BLOCK)
 
 
 def capped_logit_sum(
@@ -77,11 +95,15 @@ def capped_logit_sum(
     cap: float | None,
     valid_cols: int,
     out: torch.Tensor,
+    *,
+    keys_out: torch.Tensor | None,
+    key_offset: int,
 ) -> torch.Tensor:
     """``out = mask(softcap(base + correction))`` in one pass, matching the
     Torch statement ``(cap * torch.tanh((base + correction).float() / cap))
     .to(torch.bfloat16)`` bit for bit, with every column from ``valid_cols``
-    on set to ``-inf``.
+    on set to ``-inf``; optionally each column block's argmax key of ``out``
+    for a vocabulary-parallel argmax.
 
     Args:
         base: BF16 ``[rows, >= valid_cols]`` logits with dense columns.
@@ -91,6 +113,13 @@ def capped_logit_sum(
         valid_cols: Leading columns that keep their logits.
         out: BF16 ``[rows, width]`` destination with dense columns; ``width``
             may exceed the inputs' columns, which reads as ``-inf`` padding.
+        keys_out: int64 ``[rows, capped_logit_sum_key_blocks(width)]`` with a
+            unit block stride, or None: each column block's
+            ``vocab_parallel_argmax.argmax_key`` maximum over ``out`` (the
+            largest value, lowest column first), its columns numbered from
+            ``key_offset``. Gathered across vocabulary shards,
+            ``merge_argmax_keys`` gives the argmax of the whole rows.
+        key_offset: Global index of ``out``'s column 0 in the keys.
 
     Returns:
         ``out``.
@@ -106,6 +135,13 @@ def capped_logit_sum(
         or any(t.stride(-1) != 1 for t in (base, correction, out))
     ):
         raise ValueError("capped_logit_sum needs matching BF16 rows with dense columns")
+    if keys_out is not None and (
+        keys_out.dtype != torch.int64
+        or keys_out.shape != (rows, capped_logit_sum_key_blocks(width))
+        or keys_out.stride(1) != 1
+        or not 0 <= key_offset <= 0xFFFFFFFF - width
+    ):
+        raise ValueError("keys_out must be int64 [rows, blocks] over 32-bit indices")
     if cap is not None and not tanh_softcap_cap_normal(cap):
         raise ValueError(f"capped_logit_sum cap must be a normal FP32, got {cap!r}")
     inv_cap, cap32 = tanh_softcap_scalars(cap) if cap is not None else (1.0, 1.0)
@@ -114,14 +150,18 @@ def capped_logit_sum(
             base,
             correction,
             out,
+            keys_out,
             base.stride(0),
             correction.stride(0),
             out.stride(0),
+            0 if keys_out is None else keys_out.stride(0),
             valid_cols,
             width,
+            key_offset,
             inv_cap,
             cap32,
             HAS_CAP=cap is not None,
+            KEYS=keys_out is not None,
             BLOCK=_TANH_SOFTCAP_BLOCK,
             **_TANH_SOFTCAP_LAUNCH_OPTIONS,
         )

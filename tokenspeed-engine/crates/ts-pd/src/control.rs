@@ -41,7 +41,8 @@ pub(crate) struct Draining {
 /// The transfers draining for [`DRAIN_STALL`] or longer, as log entries; at
 /// most once per [`DRAIN_STALL`] (`logged_at`). One that never stops (a
 /// write whose DMA may still land, a peer lost mid-drain) keeps its pages
-/// pinned and holds off a cache release.
+/// pinned and holds off a cache release until a Decode revocation fences its
+/// writers, where the transport allows one.
 pub(crate) fn stalled_drains<'a>(
     draining: impl IntoIterator<Item = &'a Draining>,
     logged_at: &mut Option<Instant>,

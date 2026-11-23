@@ -678,8 +678,11 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         )
         return
     # Eight verify rows: shared int64[2] context plus two bf16[4, 3]
-    # conv states; the commit holds two int64 ids per request per layer.
-    assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 if ple_enabled else 0)
+    # conv states; the commit holds two int64 ids per request per layer, and
+    # each layer also keeps an int64 destination element stride.
+    assert ple_bytes == (
+        8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 + 2 * 8 if ple_enabled else 0
+    )
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 
@@ -846,9 +849,10 @@ def test_qwen4_exp_ple_verify_workspace_accepts_uneven_page_strides() -> None:
     assert len(strides) > 1
     # Raised while the commit tables took every layer's stride from the first.
     # Eight verify rows of the int64[2] context and three 9 KiB PLE states,
-    # plus two int64 commit row ids per request and layer.
+    # plus two int64 commit row ids per request and layer; each layer also
+    # keeps an int64 destination element stride.
     assert backend.preallocate_verify_workspace(2, 3) == (
-        8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8
+        8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8 + 3 * 8
     )
 
 
@@ -893,7 +897,14 @@ def test_qwen4_exp_ple_commit_writes_each_layer_at_its_page_stride() -> None:
     for field_id, rows in scratch.items():
         field = arena.field(field_id)
         for page, row in ((2, 1), (5, 7)):
-            torch.testing.assert_close(field[page], rows[row], rtol=0, atol=0)
+            if field_id == context_id:
+                expected = rows[row]
+            else:
+                channels, history = rows.shape[1:]
+                base = row // 4 * 4
+                inputs = rows[base + 1 : row + 1].flatten(1)[:, :channels].T
+                expected = torch.cat((rows[base], inputs), dim=1)[:, -history:]
+            torch.testing.assert_close(field[page], expected, rtol=0, atol=0)
             field[page].view(torch.uint8).fill_(0x5A)
     assert torch.equal(arena.buffer, poisoned)
 
