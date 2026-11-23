@@ -22,15 +22,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 import tokenspeed_kernel.ops.layernorm.triton as layernorm_triton
 import torch
 from tokenspeed_kernel.numerics.torch.layernorm import torch_gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import gated_rmsnorm_kernel
-from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
+from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_ROW_BLOCK
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_warmup_covers
@@ -42,12 +40,12 @@ pytestmark = pytest.mark.skipif(
     reason="Triton layernorm tests require an NVIDIA or AMD GPU.",
 )
 
-ROWS_PER_PROGRAM = GATED_RMSNORM_ROWS_PER_PROGRAM
+ROWS_PER_ROW_BLOCK = GATED_RMSNORM_ROWS_PER_ROW_BLOCK
 
 
 # Row counts around the per-program row block, including partial last blocks.
 @pytest.mark.parametrize(
-    "rows", [1, ROWS_PER_PROGRAM - 1, ROWS_PER_PROGRAM + 1, 527, 8449]
+    "rows", [1, ROWS_PER_ROW_BLOCK - 1, ROWS_PER_ROW_BLOCK + 1, 527, 8449]
 )
 @pytest.mark.parametrize("width,group_size", [(128, 128), (512, 128), (1024, 1024)])
 @pytest.mark.parametrize("norm_before_gate", [True, False])
@@ -80,7 +78,9 @@ def test_gated_rmsnorm_matches_reference(
 def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):
     """A row's output must not depend on which other rows share its program."""
     torch.manual_seed(0)
-    x = torch.randn(4 * ROWS_PER_PROGRAM + 3, 128, device=device, dtype=torch.bfloat16)
+    x = torch.randn(
+        4 * ROWS_PER_ROW_BLOCK + 3, 128, device=device, dtype=torch.bfloat16
+    )
     z = torch.randn_like(x)
     weight = torch.randn(128, device=device, dtype=torch.bfloat16)
     kwargs = dict(
@@ -92,7 +92,7 @@ def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):
         weights_independent=True,
     )
     full = gated_rmsnorm(x, weight, z, **kwargs)
-    for row in (0, ROWS_PER_PROGRAM - 1, ROWS_PER_PROGRAM, x.shape[0] - 1):
+    for row in (0, ROWS_PER_ROW_BLOCK - 1, ROWS_PER_ROW_BLOCK, x.shape[0] - 1):
         alone = gated_rmsnorm(x[row : row + 1], weight, z[row : row + 1], **kwargs)
         torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
 
@@ -104,7 +104,7 @@ def test_gated_rmsnorm_row_blocks_match_one_row_programs(
     """Every row of a row block equals a one-row, one-warp program bit for bit."""
     torch.manual_seed(2)
     x = torch.randn(
-        2048 * ROWS_PER_PROGRAM + 5, 128, device=device, dtype=torch.bfloat16
+        2048 * ROWS_PER_ROW_BLOCK + 5, 128, device=device, dtype=torch.bfloat16
     )
     z = torch.randn_like(x)
     weight = torch.randn(128, device=device, dtype=torch.bfloat16)
@@ -205,33 +205,21 @@ def test_gated_rmsnorm_row_loops_match_single_row_blocks(
 
 @pytest.mark.parametrize("groups", [1, 4, 32])
 def test_gated_rmsnorm_loops_only_while_the_looped_grid_fills_the_gpu(
-    groups: int, device: str, monkeypatch: pytest.MonkeyPatch
+    groups: int, device: str
 ) -> None:
-    launches: list[tuple[int, tuple[int, ...]]] = []
-    launch = layernorm_triton.kernel_launcher
-
-    def recording_launcher(kernel: Any, grid: tuple[int, ...]) -> Any:
-        inner = launch(kernel, grid)
-
-        def call(*args: Any, **kwargs: Any) -> Any:
-            launches.append((kwargs["ROW_BLOCKS"], tuple(grid)))
-            return inner(*args, **kwargs)
-
-        return call
-
-    monkeypatch.setattr(layernorm_triton, "kernel_launcher", recording_launcher)
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    target = torch.empty(0, device=device).device
+    sms = torch.cuda.get_device_properties(target).multi_processor_count
     floor = layernorm_triton.GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM * sms
     blocks = layernorm_triton.GATED_RMSNORM_ROW_BLOCKS
-    rows_per_loop = ROWS_PER_PROGRAM * blocks
+    rows_per_loop = ROWS_PER_ROW_BLOCK * blocks
     # The last row count whose looped grid stays below the floor, and the next one.
     below = ((floor - 1) // groups) * rows_per_loop
-    for rows in (8, below, below + 1, 4 * below):
-        _model_norm(*_model_norm_inputs(rows, device, groups))
-    for row_blocks, grid in launches:
-        programs = (grid[0] * row_blocks + blocks - 1) // blocks * grid[1]
-        assert row_blocks == (blocks if programs >= floor else 1)
-    assert [row_blocks for row_blocks, _ in launches] == [1, 1, blocks, blocks]
+    row_blocks = layernorm_triton._gated_rmsnorm_row_blocks
+    counts = (8, below, below + 1, 4 * below)
+    chosen = [row_blocks(rows, ROWS_PER_ROW_BLOCK, groups, target) for rows in counts]
+    assert chosen == [1, 1, blocks, blocks]
+    # Rows spanning several warps never loop.
+    assert row_blocks(4 * below, 1, groups, target) == 1
 
 
 def test_gated_rmsnorm_warmup_covers_looping_and_single_block_launches(
@@ -257,11 +245,11 @@ def test_gated_rmsnorm_row_loops_leave_rows_past_the_last_one(
     """A partial last loop writes its valid rows and nothing after them."""
     x, z, weight = _model_norm_inputs(rows, device)
     blocks = layernorm_triton.GATED_RMSNORM_ROW_BLOCKS
-    padded = rows + 3 * ROWS_PER_PROGRAM * blocks
+    padded = rows + 3 * ROWS_PER_ROW_BLOCK * blocks
     outputs = []
     for row_blocks in (1, blocks):
         out = torch.full((padded, x.shape[1]), 7.0, device=device, dtype=torch.bfloat16)
-        rows_per_program = ROWS_PER_PROGRAM * row_blocks
+        rows_per_program = ROWS_PER_ROW_BLOCK * row_blocks
         gated_rmsnorm_kernel[((rows + rows_per_program - 1) // rows_per_program, 32)](
             x,
             out,
@@ -274,7 +262,7 @@ def test_gated_rmsnorm_row_loops_leave_rows_past_the_last_one(
             rows,
             128,
             1e-6,
-            BLOCK_M=ROWS_PER_PROGRAM,
+            BLOCK_M=ROWS_PER_ROW_BLOCK,
             BLOCK_N=128,
             ROW_BLOCKS=row_blocks,
             NORM_BEFORE_GATE=True,
@@ -283,7 +271,7 @@ def test_gated_rmsnorm_row_loops_leave_rows_past_the_last_one(
             WEIGHTS_INDEPENDENT=True,
             OUT_FP8=False,
             SHARED_WEIGHT=True,
-            num_warps=ROWS_PER_PROGRAM,
+            num_warps=ROWS_PER_ROW_BLOCK,
         )
         outputs.append(out)
     single, looped = outputs

@@ -1472,7 +1472,7 @@ def triton_gemma_rmsnorm(
 
 
 # Rows each gated RMSNorm row block normalizes when one warp covers a row.
-GATED_RMSNORM_ROWS_PER_PROGRAM = 8
+GATED_RMSNORM_ROWS_PER_ROW_BLOCK = 8
 # Loop over row blocks only while the looped grid keeps this many programs per SM.
 GATED_RMSNORM_LOOP_MIN_PROGRAMS_PER_SM = 3
 
@@ -1543,7 +1543,7 @@ def triton_gated_rmsnorm(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
-    block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
+    block_m = GATED_RMSNORM_ROWS_PER_ROW_BLOCK if num_warps == 1 else 1
     row_blocks = _gated_rmsnorm_row_blocks(M, block_m, ngroups, x.device)
     grid = (triton.cdiv(M, block_m * row_blocks), ngroups)
     with torch.cuda.device(x.device.index):
@@ -1825,7 +1825,7 @@ def fused_qk_rmsnorm_rope(
 
 
 __all__ = [
-    "GATED_RMSNORM_ROWS_PER_PROGRAM",
+    "GATED_RMSNORM_ROWS_PER_ROW_BLOCK",
     "UnscaledFP8QKVGate",
     "add_rmsnorm",
     "fused_qk_rmsnorm_rope",
