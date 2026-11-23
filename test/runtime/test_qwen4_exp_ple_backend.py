@@ -261,7 +261,7 @@ def test_ple_idle_refresh_and_failed_refresh_disarm_verify(backend):
 def test_ple_preallocation_preserves_workspace_and_budget(backend):
     scratch = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, 4)
     allocated = backend.preallocate_verify_workspace(4, 3)
-    assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8
+    assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8 + 2 * 8
     assert backend.preallocate_verify_workspace(2, 3) == allocated
     for bs in (1, 2, 4):
         views = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, bs)
@@ -325,9 +325,20 @@ def test_draft_view_cannot_claim_target_ple_fields():
     assert backend.preallocate_verify_workspace(4, 3) == 0
 
 
+def _expected_verify_window(scratch, row, width):
+    if scratch.ndim == 2:
+        return scratch[row]
+    base = row // (width + 1) * (width + 1)
+    accepted = row - base
+    channels, history = scratch.shape[1:]
+    inputs = scratch[base + 1 : row + 1].reshape(accepted, channels * history)
+    return torch.cat((scratch[base], inputs[:, :channels].T), dim=1)[:, -history:]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PLE batched copy requires CUDA"
 )
+@pytest.mark.parametrize("rebind", [False, True])
 @pytest.mark.parametrize("accepted_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "seq_lens, accepted_lengths, block_rows, copies",
@@ -340,9 +351,15 @@ def test_draft_view_cannot_claim_target_ple_fields():
     ids=["first-verify", "acceptance-clamp", "in-place", "invalid-pages"],
 )
 def test_ple_commit_copies_only_accepted_checkpoints(
-    accepted_dtype, seq_lens, accepted_lengths, block_rows, copies
+    accepted_dtype, seq_lens, accepted_lengths, block_rows, copies, rebind
 ):
     backend = _make_backend(3, False, "cuda")
+    if rebind:
+        previous_scratch = backend._ple_verify_scratch
+        for scratch in previous_scratch.values():
+            scratch.fill_(-111)
+        backend.set_cache_pool(_make_backend(3, False, "cuda").cache_pool)
+        backend.preallocate_verify_workspace(4, 3)
     other_view = backend.cache_pool.arena.field(qwen4_exp_ple_conv_field(4))
     other_view.fill_(-77)
     for index, (field_id, scratch) in enumerate(backend._ple_verify_scratch.items()):
@@ -370,7 +387,7 @@ def test_ple_commit_copies_only_accepted_checkpoints(
         field = backend.cache_pool.arena.field(field_id)
         expected = torch.full_like(field, -77)
         for dst, src in copies:
-            expected[dst] = scratch[src]
+            expected[dst] = _expected_verify_window(scratch, src, 3)
         torch.testing.assert_close(field, expected, rtol=0, atol=0)
     assert torch.all(other_view == -77)
     assert backend._verify_commit_ctx is None
@@ -433,7 +450,7 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
             field = backend.cache_pool.arena.field(field_id)
             expected = torch.full_like(field, -77)
             for dst, src in zip(pages, sources, strict=True):
-                expected[dst] = scratch[src]
+                expected[dst] = _expected_verify_window(scratch, src, 3)
             torch.testing.assert_close(field, expected, rtol=0, atol=0)
         assert torch.all(backend._ple_commit_rows[:, 4:] == -99)
     assert backend._verify_commit_ctx is None

@@ -78,6 +78,15 @@ pub fn split_endpoint(endpoint: &str) -> Result<(&str, u16), BadEndpoint> {
     Ok((host, port.parse().map_err(|_| bad())?))
 }
 
+/// `host:port`, an IPv6 host in brackets: what [`split_endpoint`] takes.
+pub fn join_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// A message the endpoint could not queue.
 #[derive(Debug, thiserror::Error)]
 pub enum PeerSendError {
@@ -135,6 +144,16 @@ mod tests {
     use ts_scheduler::PeerLeaseView;
 
     use super::*;
+
+    #[test]
+    fn endpoints_join_and_split_back() {
+        assert_eq!(join_endpoint("10.0.0.2", 7100), "10.0.0.2:7100");
+        assert_eq!(join_endpoint("::1", 7100), "[::1]:7100");
+        assert_eq!(
+            split_endpoint(&join_endpoint("::1", 7100)).unwrap(),
+            ("::1", 7100)
+        );
+    }
 
     #[test]
     fn endpoints_split_with_and_without_brackets() {

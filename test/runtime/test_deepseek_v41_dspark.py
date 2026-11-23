@@ -1177,6 +1177,9 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         load_format="auto",
         disaggregation_mode="null",
         decode_monokernel=False,
+        enable_ple_hot_cache=False,
+        inkling2_loop_num_passes=None,
+        inkling2_loop_share_cache=False,
         validate_tp_batch_invariant_weights=Mock(),
     )
     configs = [

@@ -379,6 +379,8 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
 
     let spec = RequestSpec {
         request_id: rid.clone(),
+        // Registration allocates this after all admission checks have passed.
+        admission_id: 0,
         session_id: request.cache_session_id.unwrap_or_default(),
         cache_group_id: request.cache_group_id.unwrap_or_default(),
         shared_prefix_tokens: request.shared_prefix_tokens,

@@ -32,11 +32,15 @@ use std::{
 use parking_lot::Mutex;
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use ts_collective::{Group, Mesh};
-use ts_control::peer::{
-    geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
-    landing::Timeouts,
-    read::EngineReader,
-    Peer, PeerFence, PeerListener, PeerSettings,
+use ts_control::{
+    disk::DiskTier,
+    peer::{
+        geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
+        landing::Timeouts,
+        push::{EngineWriter, PushEndpoint, PushSource},
+        read::EngineReader,
+        Peer, PeerFence, PeerListener, PeerSettings,
+    },
 };
 use ts_scheduler::Scheduler;
 
@@ -75,6 +79,8 @@ pub struct Settings {
     peer: PeerSettings,
     bind_host: String,
     port: u16,
+    /// The host other replicas reach this rank's push endpoint at.
+    push_host: String,
     library: PathBuf,
     local_ip: String,
     protocol: String,
@@ -140,6 +146,7 @@ impl Settings {
                 timeouts: Timeouts {
                     answer_us: micros(settings.getattr("answer_timeout_s")?.extract()?),
                     quarantine_us: micros(settings.getattr("quarantine_s")?.extract()?),
+                    push_us: micros(settings.getattr("push_timeout_s")?.extract()?),
                 },
                 record_lifetime: Duration::from_secs_f64(
                     settings
@@ -150,6 +157,7 @@ impl Settings {
             },
             bind_host: settings.getattr("bind_host")?.extract()?,
             port: settings.getattr("port")?.extract()?,
+            push_host: settings.getattr("push_host")?.extract()?,
             library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
             local_ip: settings.getattr("local_ip")?.extract()?,
             protocol: settings.getattr("protocol")?.extract()?,
@@ -162,7 +170,8 @@ impl Settings {
 }
 
 /// Start this rank's peer sharing over `scheduler`: its transfer engine with
-/// the cache registered, the replica's geometries gathered over `mesh` (every
+/// the cache registered, its push endpoint, serving `disk`'s pages when the
+/// rank has a Disk tier, the replica's geometries gathered over `mesh` (every
 /// member of `replica` calls this), and `outbox` connected to the reads.
 pub fn start(
     settings: Settings,
@@ -170,6 +179,7 @@ pub fn start(
     replica: &Group,
     scheduler: Arc<Mutex<Scheduler>>,
     outbox: &Outbox,
+    disk: Option<&DiskTier>,
 ) -> Result<Peer, String> {
     let library =
         ts_mooncake::Library::load(&settings.library).map_err(|error| error.to_string())?;
@@ -192,10 +202,34 @@ pub fn start(
             .register(address, length)
             .map_err(|error| error.to_string())?;
     }
+    let engine = Arc::new(engine);
+    // Every rank answers its own pushes here; one with a Disk tier also
+    // pushes its Disk pages from the staging ring, registered for the writes.
+    let push = PushEndpoint::bind(
+        &settings.bind_host,
+        0,
+        &settings.push_host,
+        settings.peer.incarnation,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some((executor, disk_layout, ring, slot_bytes)) = disk.and_then(DiskTier::push_source) {
+        engine
+            .register(ring.address(), ring.size())
+            .map_err(|error| error.to_string())?;
+        push.serve(PushSource {
+            executor,
+            disk_layout,
+            ring,
+            slot_bytes,
+            writer: Arc::new(EngineWriter(engine.clone())),
+        })
+        .map_err(|error| error.to_string())?;
+    }
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
         device: settings.device,
         host: Some(settings.host),
+        push: Some(push.name().to_owned()),
     };
     let gathered = mesh
         .all_gather(replica, &local.encode())
@@ -242,7 +276,8 @@ pub fn start(
         geometries,
         listener,
         scheduler,
-        Arc::new(EngineReader(Arc::new(engine))),
+        Arc::new(EngineReader(engine)),
+        Arc::new(push),
     )
     .map_err(|error| error.to_string())?;
     // A second start would be a second peer; there is one per process.

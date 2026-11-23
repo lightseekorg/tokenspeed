@@ -204,6 +204,54 @@ def test_engine_indexes_preserve_history_and_reject_replacement(
     release["assets"][0]["digest"] = f"sha256:{'b' * 64}"
     with pytest.raises(ValueError, match="digest changed"):
         UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
-    with pytest.raises(ValueError, match="must not be replaced"):
+    if variant == "engine-release":
+        with pytest.raises(ValueError, match="must not be replaced"):
+            UPDATE(
+                wheelhouse, release, dist, "tokenspeed-engine", variant, replace=True
+            )
+        assert snapshot == {path: (wheelhouse / path).read_text() for path in paths}
+    else:
         UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant, replace=True)
-    assert snapshot == {path: (wheelhouse / path).read_text() for path in paths}
+        for directory in roots:
+            contents = (
+                wheelhouse / directory / "tokenspeed-engine/index.html"
+            ).read_text()
+            assert f'{url}?sha256={"b" * 64}#sha256={"b" * 64}' in contents
+            assert f'#sha256={"a" * 64}' not in contents
+            assert contents.count(f">{name}</a>") == 1
+
+
+PLAN = runpy.run_path(str(ROOT / ".github/scripts/nightly-release.py"))["plan"]
+CHECK_SOURCE = runpy.run_path(str(ROOT / ".github/scripts/nightly-release.py"))[
+    "check_source"
+]
+
+
+def test_coordinated_plan_resumes_same_source_but_requires_explicit_replacement():
+    source = "a" * 40
+    planned = PLAN(ROOT, "20261122", source, [], False, "")
+    assert len(planned["tags"]) == 5
+    releases = [
+        {
+            "tag_name": tag,
+            "body": f"built from lightseekorg/tokenspeed@{source}",
+            "assets": [],
+        }
+        for tag in planned["tags"]
+    ]
+    assert PLAN(ROOT, "20261122", source, releases, False, "") == planned
+    with pytest.raises(ValueError, match="different or missing source"):
+        PLAN(ROOT, "20261122", "b" * 40, releases, False, "")
+    assert (
+        PLAN(ROOT, "20261122", "b" * 40, releases, True, "")["tags"] == planned["tags"]
+    )
+    with pytest.raises(ValueError, match="different or missing source"):
+        CHECK_SOURCE("no source recorded", source, False)
+
+
+def test_coordinated_candidate_excludes_rocm_and_rejects_invalid_date():
+    planned = PLAN(ROOT, "20261122", "a" * 40, [], False, "rc2")
+    assert len(planned["tags"]) == 3
+    assert all("rc2.post20261122" in tag for tag in planned["tags"])
+    with pytest.raises(ValueError):
+        PLAN(ROOT, "20260230", "a" * 40, [], False, "")

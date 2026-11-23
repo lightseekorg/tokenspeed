@@ -363,8 +363,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
     def _terminate_schedulers(signum=None, _frame=None):
         """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
-        if signum is not None:
-            logger.info(f"received signal {signum!s}; terminating scheduler(s)")
+        # A signal can interrupt a buffered log write. Logging here can raise
+        # reentrantly before we record the failure or request any shutdown.
         if signum == signal.SIGUSR1:
             child_failed.set()
         if not terminate_requested_at:

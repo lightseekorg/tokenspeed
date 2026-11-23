@@ -32,6 +32,7 @@ namespace tokenspeed {
 
 Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
+      admission_id_{spec.admission_id},
       session_id_{spec.session_id},
       cache_group_id_{spec.cache_group_id},
       peer_holder_{spec.peer_holder},

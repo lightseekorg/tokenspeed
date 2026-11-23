@@ -425,6 +425,12 @@ class InklingAttnBackend(AttentionBackend):
             raise AttributeError("conv_columns is learnt by set_cache_pool")
         return getattr(self.inner, name)
 
+    def model_binding(self, layer_id, binding_type):
+        return self.inner.model_binding(layer_id, binding_type)
+
+    def prefill_request_layout(self):
+        return self.inner.prefill_request_layout()
+
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.inner,)
 

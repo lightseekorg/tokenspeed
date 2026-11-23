@@ -835,6 +835,7 @@ def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
     backend.num_local_heads = num_attention_heads // attn_tp_size
     # configure_runtime's probe verdicts on a BF16 cache.
     backend._dcp_decode_records_core = False
+    backend._kvp_decode_solution = None
     backend._owned_decode_topk = False
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(

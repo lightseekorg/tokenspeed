@@ -24,7 +24,9 @@
 #include <array>
 #include <cstdint>
 #include <numeric>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -83,13 +85,25 @@ std::vector<std::int32_t> Packing(std::span<const CacheGroupSpec> specs) {
 
 class QueryCache {
 public:
-    QueryCache(std::int32_t grain, std::vector<CacheGroupSpec> specs, std::int32_t parents)
+    // `host_credits`: the Host blocks storage operations may hold; the parents
+    // by default.
+    QueryCache(std::int32_t grain, std::vector<CacheGroupSpec> specs, std::int32_t parents,
+               std::optional<std::int32_t> host_credits = std::nullopt)
         : device{parents, Packing(specs)},
           host{parents, Packing(specs)},
-          coordinator{MakeCoordinator(specs, grain, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
+          coordinator{MakeCoordinator(specs, grain, device, true, &host, /*disk_pool=*/nullptr, nullptr, true,
+                                      /*write_back_evictions=*/false,
                                       /*checkpoint_retention_requests=*/0)},
-          storage{coordinator,
-                  StorageConfig{8, 256, parents, 256, 8192, 1, 1000, 1000, {8, 1048576, 1000}, {4, 524288, 500}}} {}
+          storage{coordinator, StorageConfig{8,
+                                             256,
+                                             host_credits.value_or(parents),
+                                             256,
+                                             8192,
+                                             1,
+                                             1000,
+                                             1000,
+                                             {8, 1048576, 1000},
+                                             {4, 524288, 500}}} {}
 
     void Warm(std::span<const CacheKey> keys) {
         for (const auto& key : keys) {
@@ -141,6 +155,31 @@ TEST_P(StorageQueryHighestTest, RestoresTheHighestCheckpointWithinTheActualKeyBu
 }
 
 INSTANTIATE_TEST_SUITE_P(KeyBudgets, StorageQueryHighestTest, ::testing::Values(40u, 256u));
+
+// A hybrid prompt's one checkpoint sits at its end, so its GET holds every KV
+// page under it: with four KV pages packed per Host parent, more blocks than
+// the Host has parents. Credits counted in parents could never restore it.
+TEST(StorageQueryTest, AHybridGetHoldsMoreBlocksThanTheHostHasParents) {
+    // Twelve parents: the 32 KV blocks fill eight, the checkpoint takes one.
+    constexpr std::int32_t kParents = 12;
+    const auto specs = FullAndStates(128, 32, 1);
+    QueryPrompt prompt(1024, 128);
+    const auto prefix = prompt.Prefix(1024, false);
+    // The store holds the prompt with the one checkpoint at its end.
+    const auto stored = [&](const QueryCache& cache) {
+        const StorageQuery boundary = cache.coordinator.Storage().SharedPrefixKeys(prefix, 256);
+        EXPECT_EQ(boundary.max_tokens, 1024);
+        EXPECT_EQ(boundary.keys.size(), 33u) << "32 KV blocks and the checkpoint";
+        return boundary.keys;
+    };
+    {
+        QueryCache parents_only(128, specs, kParents);
+        EXPECT_FALSE(parents_only.storage.StartRead(prefix, stored(parents_only))) << "33 blocks exceed 12 credits";
+    }
+    QueryCache blocks(128, specs, kParents, /*host_credits=*/kParents * 4);
+    EXPECT_EQ(blocks.Restore(prefix, stored(blocks)).size(), 33u);
+    EXPECT_EQ(blocks.coordinator.Prober().ProbePromptPrefix(prefix).host.num_common_tokens, 1024);
+}
 
 TEST(SharedPrefixPublicationTest, DependenciesIncludeLocalFullHistoryStateAndWindow) {
     auto specs = FullAndStates(4, 2, 2);
@@ -251,6 +290,107 @@ TEST(SharedPrefixPublicationTest, OnlySuccessfulRetiredPutsCreateReceiptsAndFlus
     EXPECT_FALSE(cache.storage.WasPublished(keys[0]));
     EXPECT_FALSE(cache.storage.WasPublished(keys[1]));
     EXPECT_EQ(cache.storage.NumQuarantined(), 1u);
+}
+
+TEST(SharedPrefixPublicationTest, CancellingUndispatchedBackupsReleasesTheirHostReferences) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    ASSERT_EQ(cache.storage.NumOperations(), 1u);
+    ASSERT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    // Candidates that have not acquired references must be dropped too.
+    cache.storage.QueueBackups(keys);
+    ASSERT_EQ(cache.storage.NumBackupCandidates(), keys.size());
+
+    cache.storage.CancelBackups();
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_FALSE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    EXPECT_EQ(cache.storage.NumBackupCandidates(), 0u);
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 0u);
+    EXPECT_NO_THROW(cache.storage.ClearMetadata());
+}
+
+TEST(SharedPrefixPublicationTest, CancellingDispatchedBackupsWaitsForRetirementAndDiscardsLateReceipts) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    const auto issued = cache.storage.TakeCommands();
+    ASSERT_EQ(issued.size(), 1u);
+    const auto put = std::get<StoragePutOperation>(issued[0]);
+
+    cache.storage.CancelBackups();
+    cache.storage.CancelBackups();
+    const auto cancel = cache.storage.TakeCommands();
+    ASSERT_EQ(cancel.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<StorageCancelOperation>(cancel[0]));
+    EXPECT_EQ(std::get<StorageCancelOperation>(cancel[0]).op_id, put.op_id);
+    EXPECT_TRUE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    EXPECT_THROW(cache.storage.ClearMetadata(), std::logic_error);
+
+    cache.storage.Complete({put.op_id, {1, 1}, true, {0, 0}});
+    EXPECT_FALSE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 0u);
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_NO_THROW(cache.storage.ClearMetadata());
+}
+
+TEST(SharedPrefixPublicationTest, CancellingBackupsDoesNotReleaseUnretiredSources) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    const auto put = std::get<StoragePutOperation>(cache.storage.TakeCommands()[0]);
+    cache.storage.CancelBackups();
+    cache.storage.TakeCommands();
+    cache.storage.Complete({put.op_id, {1, 1}, false, {0, 0}});
+
+    EXPECT_TRUE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    EXPECT_EQ(cache.storage.NumQuarantined(), 1u);
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 0u);
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    EXPECT_THROW(cache.storage.ClearMetadata(), std::logic_error);
+}
+
+TEST(SharedPrefixPublicationTest, CancellingBackupsLeavesQueriesAndReadsAttached) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto prefix = prompt.Prefix(8, false);
+    const auto keys = cache.coordinator.Storage().SharedPrefixKeys(prefix, 256).keys;
+    auto query = cache.storage.StartQuery(keys, {4, 4});
+    auto read = cache.storage.StartRead(prefix, keys);
+    ASSERT_TRUE(query);
+    ASSERT_TRUE(read);
+    const auto issued = cache.storage.TakeCommands();
+    ASSERT_EQ(issued.size(), 2u);
+
+    cache.storage.CancelBackups();
+    cache.storage.CancelBackups();
+    EXPECT_TRUE(cache.storage.TakeCommands().empty());
+    EXPECT_EQ(cache.storage.NumOperations(), 2u);
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), keys.size());
+    cache.storage.Complete({query.OperationId(), {1, 1}, true, {0, 0}});
+    cache.storage.Complete({read.OperationId(), {1, 1}, true, {0, 0}});
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), keys.size());
+    query.reset();
+    read.reset();
+    EXPECT_FALSE(cache.storage.HasPending());
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
 }
 
 TEST(SharedPrefixPublicationTest, DetachedOrUnretiredGetsCannotConfirmSharedObjects) {

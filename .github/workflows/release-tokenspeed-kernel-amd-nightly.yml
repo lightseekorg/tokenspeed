@@ -1,25 +1,26 @@
 name: Build and Release tokenspeed-kernel-amd nightly
 
 on:
-  schedule:
-    - cron: "0 1 * * *"
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      version_date:
-        description: "UTC nightly version date, formatted as YYYYMMDD."
-        required: false
-        type: string
-      publish_github:
-        description: "Publish nightly distributions and the pip index from main."
-        required: false
-        default: false
+      replace_nightly:
         type: boolean
+        required: true
+      publish_github:
+        type: boolean
+        required: true
+      version_date:
+        type: string
+        required: true
+    secrets:
+      LIGHTSEEK_BOT_TOKEN:
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: release-tokenspeed-kernel-amd-nightly-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -42,11 +43,16 @@ jobs:
       - name: Resolve nightly version
         id: metadata
         env:
-          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
+          PUBLISH_GITHUB: ${{ inputs.publish_github }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           VERSION_DATE: ${{ inputs.version_date }}
         run: |
           if [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "Nightly publication requires main." >&2
+            exit 1
+          fi
+          if [ "$REPLACE_NIGHTLY" = true ] && { [ "$PUBLISH_GITHUB" != true ] || [ "$GITHUB_REF" != refs/heads/main ]; }; then
+            echo "Replacement requires nightly publication from main." >&2
             exit 1
           fi
           version_date="${VERSION_DATE:-$(date -u +%Y%m%d)}"
@@ -101,7 +107,7 @@ jobs:
 
   release:
     name: Publish AMD nightly release and pip index
-    if: (github.event_name == 'schedule' || inputs.publish_github) && github.repository == 'lightseekorg/tokenspeed'
+    if: inputs.publish_github && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false
@@ -123,6 +129,7 @@ jobs:
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
           VERSION: ${{ needs.metadata.outputs.version }}
           SOURCE_SHA: ${{ github.sha }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           test "$(gh api user --jq .login)" = lightseek-bot
           for repository in lightseekorg/whl lightseekorg/tokenspeed; do
@@ -132,15 +139,19 @@ jobs:
           notes="${title} built from lightseekorg/tokenspeed@${SOURCE_SHA}"
           assets=(dist/tokenspeed-kernel-amd-dist/*.whl dist/tokenspeed-kernel-amd-dist/*.tar.gz)
           if gh release view "$TAG_NAME" --repo lightseekorg/whl >/dev/null 2>&1; then
+            replace_args=()
+            if [ "$REPLACE_NIGHTLY" = true ]; then
+              replace_args+=(--replace)
+            fi
+            python .github/scripts/nightly-release.py --source-sha "$SOURCE_SHA" "${replace_args[@]}" check "$TAG_NAME"
             gh release edit "$TAG_NAME" --repo lightseekorg/whl --prerelease
+            if [ "$REPLACE_NIGHTLY" = true ]; then
+              gh release upload "$TAG_NAME" "${assets[@]}" --repo lightseekorg/whl --clobber
+              gh release edit "$TAG_NAME" --repo lightseekorg/whl --notes "$notes"
+            fi
             existing_assets=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json assets --jq '.assets[].name')
             for asset in "${assets[@]}"; do
               if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
-                existing_notes=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json body --jq .body)
-                if [ "$existing_notes" != "$notes" ]; then
-                  echo "Cannot complete a nightly release from a different source commit." >&2
-                  exit 1
-                fi
                 gh release upload "$TAG_NAME" "$asset" --repo lightseekorg/whl
               fi
             done
@@ -161,8 +172,13 @@ jobs:
       - name: Publish AMD nightly pip index
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
-          python .github/scripts/update-nightly-index.py \
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = true ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
             --package tokenspeed-kernel-amd --variant rocm72 wheelhouse nightly-release.json dist
           cd wheelhouse
           git config user.name lightseek-bot

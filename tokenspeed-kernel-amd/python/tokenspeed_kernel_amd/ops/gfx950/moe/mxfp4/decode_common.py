@@ -186,6 +186,7 @@ def _direct_mxfp4_load_tile(
     K_PACKED: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
+    STREAM_WEIGHTS: gl.constexpr,
 ):
     """Load one direct MXFP4xMXFP4 K tile into MFMA operand layouts."""
     a, a_scale = _direct_mxfp4_load_activation_tile(
@@ -224,6 +225,7 @@ def _direct_mxfp4_load_tile(
         K_PACKED,
         BLOCK_K_PACKED,
         BLOCK_K_SCALE,
+        STREAM_WEIGHTS,
     )
     return a, b, a_scale, b_scale
 
@@ -247,6 +249,7 @@ def _direct_mxfp4_load_weight_tile(
     K_PACKED: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
+    STREAM_WEIGHTS: gl.constexpr,
 ):
     """Load one K tile of the gdot128-shuffled weight and its scales."""
     k_pack_b = kt * BLOCK_K_PACKED + bk
@@ -264,6 +267,11 @@ def _direct_mxfp4_load_weight_tile(
         offsets=b_off.to(gl.int32),
         mask=(n_cols < N_DIM) & (k_pack_b < K_PACKED),
         other=0,
+        # A route tile reads each weight tile about once a decode step, so it
+        # streams past the caches and leaves them to the activation rows every
+        # N tile re-reads. The direct decode reads an expert's weights once a
+        # route and keeps them cached for its other routes.
+        cache=".cs" if STREAM_WEIGHTS else None,
     )
     b_scale = gl.amd.cdna4.buffer_load(
         ptr=w_scale_ptr,
@@ -363,6 +371,7 @@ def _direct_mxfp4_k_loop(
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
     PREFETCH_TILES: gl.constexpr,
+    STREAM_WEIGHTS: gl.constexpr,
 ):
     """Accumulate every K tile in order into ``acc``.
 
@@ -397,6 +406,7 @@ def _direct_mxfp4_k_loop(
                     K_PACKED,
                     BLOCK_K_PACKED,
                     BLOCK_K_SCALE,
+                    STREAM_WEIGHTS,
                 ),
             )
         activations = ()
@@ -442,6 +452,7 @@ def _direct_mxfp4_k_loop(
                         K_PACKED,
                         BLOCK_K_PACKED,
                         BLOCK_K_SCALE,
+                        STREAM_WEIGHTS,
                     ),
                 )
                 activations = activations + (
@@ -501,6 +512,7 @@ def _direct_mxfp4_k_loop(
             K_PACKED,
             BLOCK_K_PACKED,
             BLOCK_K_SCALE,
+            STREAM_WEIGHTS,
         )
         for kt in range(0, NUM_KT - 1):
             next_a, next_b, next_a_scale, next_b_scale = _direct_mxfp4_load_tile(
@@ -532,6 +544,7 @@ def _direct_mxfp4_k_loop(
                 K_PACKED,
                 BLOCK_K_PACKED,
                 BLOCK_K_SCALE,
+                STREAM_WEIGHTS,
             )
             acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
             a, b, a_scale, b_scale = next_a, next_b, next_a_scale, next_b_scale
@@ -567,6 +580,7 @@ def _direct_mxfp4_k_loop(
                 K_PACKED,
                 BLOCK_K_PACKED,
                 BLOCK_K_SCALE,
+                STREAM_WEIGHTS,
             )
             acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
     return acc
@@ -585,14 +599,16 @@ def _route_groups_from_ids(
     NUM_EXPERTS: gl.constexpr,
     TOPK: gl.constexpr,
     MAX_ROWS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
 ):
     """Group the routes of at most ``MAX_ROWS`` tokens by local expert.
 
     The groups come straight from the tokens' top-k IDs. A token lists an
-    expert at most once, so each expert holds at most ``MAX_ROWS`` routes.
-    Groups follow local expert order. Returns each route's local expert (-1
-    for another rank's routes and past ``rows``), the per-expert route
-    counts, each expert's group index, and the number of groups.
+    expert at most once, so each expert holds at most ``MAX_ROWS`` routes,
+    split in route order into groups of at most ``BLOCK_M``. Groups follow
+    local expert order. Returns each route's local expert (-1 for another
+    rank's routes and past ``rows``), the per-expert route counts, each
+    expert's first group index, and the number of groups.
     """
     ROUTE_BLOCK: gl.constexpr = triton.next_power_of_2(MAX_ROWS * TOPK)
     EXPERT_PAD: gl.constexpr = triton.next_power_of_2(NUM_EXPERTS)
@@ -603,16 +619,16 @@ def _route_groups_from_ids(
     counts = gl.histogram(
         gl.where(valid, expert, 0), EXPERT_PAD, mask=valid, layout=layout
     )
-    active = (counts > 0).to(gl.int32)
-    group_index = gl.cumsum(active, 0) - active
-    return gl.where(valid, expert, -1), counts, group_index, gl.sum(active, 0)
+    tiles = (counts + BLOCK_M - 1) // BLOCK_M
+    first_group = gl.cumsum(tiles, 0) - tiles
+    return gl.where(valid, expert, -1), counts, first_group, gl.sum(tiles, 0)
 
 
 @gluon.jit
 def _group_routes(
     route_expert,
     counts,
-    group_index,
+    first_group,
     group,
     BLOCK_M: gl.constexpr,
 ):
@@ -627,14 +643,23 @@ def _group_routes(
     member_layout: gl.constexpr = gl.BlockedLayout(
         [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
     )
-    in_group = (group_index == group) & (counts > 0)
+    in_group = (first_group <= group) & (
+        group < first_group + (counts + BLOCK_M - 1) // BLOCK_M
+    )
     expert = gl.sum(gl.where(in_group, gl.arange(0, EXPERT_PAD, layout=layout), 0), 0)
-    count = gl.sum(gl.where(in_group, counts, 0), 0)
+    # The group's index among its expert's groups.
+    part = group - gl.sum(gl.where(in_group, first_group, 0), 0)
+    count = gl.minimum(
+        gl.sum(gl.where(in_group, counts, 0), 0) - part * BLOCK_M, BLOCK_M
+    )
     selected = (route_expert == expert).to(gl.int32)
-    # Each selected route's position in the group; the others match no row.
-    rank = gl.where(selected != 0, gl.cumsum(selected, 0) - selected, BLOCK_M)
+    # Each selected route's position in the group; routes of other experts
+    # and of the expert's other groups fall outside [0, BLOCK_M).
+    rank = gl.where(
+        selected != 0, gl.cumsum(selected, 0) - selected - part * BLOCK_M, BLOCK_M
+    )
     route = gl.arange(0, ROUTE_BLOCK, layout=layout)
-    first = gl.min(gl.where(selected != 0, route, ROUTE_BLOCK), 0)
+    first = gl.min(gl.where(rank == 0, route, ROUTE_BLOCK), 0)
     rank = gl.convert_layout(rank, gl.SliceLayout(0, member_layout))[None, :]
     route = gl.arange(0, ROUTE_BLOCK, layout=gl.SliceLayout(0, member_layout))[None, :]
     row = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, member_layout))

@@ -239,9 +239,10 @@ def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative, width) 
     if speculative:
         assert qsa_raw_key_field(2) in fields
     if speculative and width > 1:
-        # PLE: eight 64-byte rows plus 64 bytes of commit indices. QSA:
-        # two layers' 192-byte keys, 216 shared bytes and 32 address bytes.
-        assert setup.fixed_workspace_bytes == 576 + 440
+        # PLE: eight 64-byte rows, 64 bytes of commit indices and one int64
+        # destination element stride per layer (2 * 8). QSA: two layers'
+        # 192-byte keys, 216 shared bytes and 32 address bytes.
+        assert setup.fixed_workspace_bytes == 576 + 440 + 2 * 8
     else:
         assert setup.fixed_workspace_bytes == 0
 
@@ -446,7 +447,9 @@ def test_flat_kv_atom_pages_resolve_to_the_original_field_bytes(
 
     granularity = plan.prefix_granularity
     ratio = granularity // kernel_page_size
-    atom_pages = pool.atom_pages_per_block(FULL_ATTENTION, kernel_page_size)
+    atom_pages = pool.atom_pages_per_block(
+        FULL_ATTENTION, kernel_page_size, write_slot_dtype=torch.int32
+    )
     group = plan.group(FULL_ATTENTION)
     last_block = group.page_count - 1
     raw = torch.tensor([[0, 1, last_block]], dtype=torch.int32)
@@ -528,7 +531,7 @@ def test_flat_kv_rejects_a_stride_that_is_not_whole_atom_pages() -> None:
         ),
     )
     with pytest.raises(ValueError, match="is not divisible by atom-page payload"):
-        pool.atom_pages_per_block(FULL_ATTENTION, 64)
+        pool.atom_pages_per_block(FULL_ATTENTION, 64, write_slot_dtype=torch.int32)
 
 
 def test_flat_kv_reduces_resident_bytes_under_pp_without_gdn() -> None:

@@ -165,7 +165,7 @@ def try_fused_dp_column_linear(
         weight: Local output-channel shard of the linear weight.
         weight_scales: Block-FP8 weight scales, or None for unsupported formats.
         owner_rows: Physical counts in subgroup order, including graph padding.
-        out: Caller-owned destination for this owner's complete output channels.
+        out: Destination for this owner's complete output channels.
         workspace: Collectively prepared scratch for this linear operation.
         backend: Backend used to prepare the workspace; None selects the global
             backend.
@@ -265,6 +265,62 @@ def projection_gather_mm(
     if backend is None:
         backend = get_global_backend()
     return backend.projection_gather_mm(tensor, rows, weight, out, workspace)
+
+
+def projection_mm_reduce_scatter(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Project all rows through this rank's weight shard and sum every rank's
+    partial into owner rows.
+
+    Args:
+        tensor: All ``[rows_total, K / TP]`` rows, ``rows_total <= TP * rows``;
+            owner ``p`` owns rows ``[p * rows, (p + 1) * rows)``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N, K / TP]`` input shard.
+        workspace: A collectively prepared ``scatter`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        This owner's ``[rows, N]`` sums, owned by the caller.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_mm_reduce_scatter(tensor, rows, weight, workspace)
+
+
+def projection_mm_to_owners(
+    tensor: torch.Tensor,
+    rows: int,
+    weight: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Project all rows through this rank's output shard and return this owner's
+    rows with every rank's shard.
+
+    Args:
+        tensor: All ``[rows_total, K]`` rows, the same on every rank,
+            ``rows_total <= TP * rows``; owner ``p`` owns rows
+            ``[p * rows, (p + 1) * rows)``.
+        rows: Physical per-owner extent, the same on every rank.
+        weight: This rank's unquantized ``[N / TP, K]`` output shard.
+        workspace: A collectively prepared ``transpose`` projection workspace.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        This owner's ``[rows, N]`` rows with zero padding rows, borrowed until
+        the next projection.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_mm_to_owners(tensor, rows, weight, workspace)
 
 
 def projection_all_to_all(
@@ -478,13 +534,15 @@ def prepare_shard_exchange(
 def prepare_small_exchange(
     group: Group,
     cap_bytes: int,
+    float_cap_bytes: int,
     timeout_ns: int,
     backend: CommBackend | None = None,
 ) -> bool:
     """Prepare a one-hop exchange for small payloads before graph capture.
 
     It serves ``all_gather_single``, ``all_gather`` and equal-split
-    ``all_to_all_single`` calls.
+    ``all_to_all_single`` calls, and :func:`all_gather_float_words_single`
+    calls of up to ``float_cap_bytes`` per rank.
 
     Collective: every rank of ``group`` calls in the same order with the same
     arguments. Larger or unaligned calls keep the generic collectives.
@@ -492,6 +550,8 @@ def prepare_small_exchange(
     Args:
         group: Global ranks of the exchange.
         cap_bytes: Largest per-rank payload the exchange serves, a multiple of 16.
+        float_cap_bytes: Largest per-rank float-word gather it serves, a
+            multiple of 16, or 0 for none.
         timeout_ns: Bound of every in-kernel wait for a peer.
         backend: Backend to prepare, or ``None`` for the global backend.
 
@@ -500,7 +560,7 @@ def prepare_small_exchange(
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.prepare_small_exchange(group, cap_bytes, timeout_ns)
+    return backend.prepare_small_exchange(group, cap_bytes, float_cap_bytes, timeout_ns)
 
 
 def prepare_all_reduce_buffers(
@@ -680,6 +740,23 @@ def all_gather_single(
     if backend is None:
         backend = get_global_backend()
     backend.all_gather_single(output, input, group)
+
+
+def all_gather_float_words_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> None:
+    """All-gather float words (FP32, BF16 pairs, or E4M3 bytes) into ``output``.
+
+    As :func:`all_gather_single`, except that a NaN word may come back with
+    other NaN bits, which lets a prepared one-hop exchange send the words as
+    themselves.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    backend.all_gather_float_words_single(output, input, group)
 
 
 def all_gather_single_async(

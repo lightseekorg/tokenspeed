@@ -127,6 +127,25 @@ Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
 
+Host allocations follow PyTorch's existing allocator configuration, including
+`PYTORCH_ALLOC_CONF` and its legacy `PYTORCH_CUDA_ALLOC_CONF` name. TokenSpeed
+never overrides the registration method or thread count. Without an explicit
+configuration, the original serial allocation policy remains in effect.
+
+An L2 buffer retains a 4 KiB-aligned tensor view when the Disk tier requires
+direct I/O alignment, or on NVIDIA CUDA with the native allocator and
+`pinned_use_cuda_host_register:True`.
+Allocation and the executor's pinned reservation derive their padding from the
+same alignment constant. Other allocation policies and the snapshot pool retain
+their original allocation sizes. Ratio and explicit L2 sizes may lose whole
+LCM blocks to fit alignment padding in their original pinned reservation, when
+at least one block remains. Ratio sizing is also capped to every rank's Host
+memory share; an explicit size that exceeds the Host memory budget is refused.
+When the buffer is aligned, block alignment must divide its 4 KiB alignment;
+unsupported alignments are rejected before allocation.
+Ranks agree on the resulting block count before allocation. Tensor ownership
+and asynchronous-copy lifetime tracking remain with PyTorch.
+
 The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
 by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
@@ -771,6 +790,11 @@ unschedulable until the ACK. Three ACK kinds ride the one cache poll
 (`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and the control plane
 (`ts-control`'s `cache_ops`) replica-intersects them alike; a readmission
 needs both store ACKs.
+
+`test/runtime/test_retraction_image_executor.py` drives native snapshot/restore
+plans through the Python adapter with observations enabled and disabled. It
+checks image-row provenance, frozen restore frontiers and slot identity, and
+that the adapted restore ACK resumes the request on its restored block tables.
 
 **Slot-state image.** Device state keyed by `req_pool_index` that lives in no
 cache group must travel with the pages or the continuation is not exact: the
@@ -1585,6 +1609,34 @@ Its responsibilities:
   changes eviction eligibility nor needs a second lookup for Device metadata.
   Its pin status is valid only until ownership changes; a later plan inspects
   the entries again.
+* **The Disk tier (local SSD, `docs/rfcs/0006-disk-tier.md`).** A third
+  tier below Host, `CacheTier::kDisk`, with its own `BlockPool` packed like
+  the Host (a Disk block id maps to a file offset as a Host id maps to a Host
+  pool offset). It requires the write-back policy and excludes L3. Its
+  entries hold boundary-tree nodes like the other tiers', so gaps, dead
+  entries and checkpoint dependencies are judged across all three: a page
+  only the Disk holds is no gap, and a checkpoint is dead only when no tier
+  holds the history it needs. Disk feeds only Host -- no admission probe
+  reads it. Two transfers run through `DiskTransferManager`:
+  * *Cleaning* copies dirty Host entries (those the Disk lacks) to Disk ahead
+    of need. A write-back's ACK queues the keys it published on Host; each
+    plan writes the oldest still-dirty ones, each with the dirty Host pages
+    above it nearest the root first, into Disk blocks `DiskCache` places
+    (free capacity, then the Disk's LRU through the shared
+    `TierEvictionPlanner`). The write holds its Host sources and Disk
+    destinations until every owner finished it, then publishes the Disk
+    entries with the Host entries' metadata; a Host placement can then drop
+    the Host copy without loss. Cleaning never removes a Host entry.
+  * *Prefetch* reads a waiting prompt's Disk-only prefix into Host before
+    admission: the Disk's keys of the prompt stand in as Host hits for
+    `ReserveStoragePrefix` (the Host-suffix rule picks the boundary and the
+    keys Host lacks), the request waits in `Prefetching` holding no Device
+    pages, and the read's Host entries are published when every owner
+    finished it and held for the request as its Ready hold, as an L3 GET's
+    are. A failed read drops the Disk entries it read.
+  A Disk entry leaves through `CacheEvictor::EvictDiskCachedBlock` (with its
+  State siblings), dead-entry collection, the tail cap or a clear; eviction
+  does no I/O.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at
@@ -1648,14 +1700,38 @@ Its responsibilities:
   Ready holds, soft deadlines and pressure admission.
 
   A full clear or weight update first agrees flush intent across attention DP,
-  then probes local clearability across cache-owning ranks and DP. Clearability
-  includes outstanding Host copies and storage operations, Ready holds and
-  quarantine. Only after agreement does synchronous remote namespace deletion
-  run; its result is agreed before any rank clears Device/Host indexes. A
-  failed preflight or purge prevents local clearing, and the frontend combines
-  every DP worker's reply. The administrative purge is not bounded by the
-  preparation soft timeout. Independent jobs sharing the namespace are
-  outside this agreement; a fleet-wide flush requires operator coordination.
+  then probes non-storage ownership across cache-owning ranks and DP. Protected
+  Device/PD/tier transfers, suspended images and unrelated pins still refuse
+  clear. Without storage, the ordinary indexed-cache clear rules remain intact.
+  Healthy storage preparation checks indexed owners while allowing its known
+  storage holds to drain; exact physical reference-count and occupied-slot
+  coverage checks apply when retaining recovery or old retained references
+  require local invalidation, rather than to every healthy flush.
+  Healthy outstanding L3 work gets the configured
+  `async.clear_cache_drain_timeout_ms` budget (default 500 ms) to retire through
+  normal control rounds. A healthy drained active namespace takes the strict
+  path: synchronous remote purge succeeds on every rank before local indexes
+  are cleared. A failed preflight or purge prevents local clearing on that path.
+  The administrative purge is not bounded by the preparation or drain budgets.
+
+  An unsafe active namespace or exhausted healthy-drain budget takes retaining
+  clear instead. It detaches old storage tickets, invalidates the local indexes
+  and switches subsequent L3 work to a fresh agreed generation without remote
+  purge. Old Host references and registration remain held until actual native
+  retirement; clear does not free them. Retained tickets consume Host and global
+  operation credits, while remaining capacity supports L2, L3 and recomputation.
+  Even a merely slow healthy operation can cause this conservative private
+  generation when its budget expires; the timeout does not prove native failure.
+
+  The frontend combines every DP worker's reply. Independent Prefill services
+  sharing an original namespace are outside that agreement: recovery generations
+  can split cross-instance sharing until a genuinely different immutable weight
+  version restores its shared prefix. A fleet-wide clear or common recovery
+  generation needs coordination beyond the engine's rank agreement. Historical
+  `l3_io_quarantined` tracks memory still unsafe to deregister; current
+  `l3_io_blocked` tracks the active namespace needing isolation, not that history
+  or backend cooldown. See the asynchronous L3 observability contract for alert
+  interpretation.
 
   With L3 enabled, a weight update requires an explicit `weight_version` and
   successful flush before the GPU load. Automatic per-process version labels
@@ -2182,16 +2258,19 @@ selected for padded state pages must declare
 `strided_state` support and address input and output pools with their own
 runtime page strides.
 
-Before building a group's kernel tables, the memory plan checks both its
-largest translated atom-page ID and its largest token write slot against
-signed int32. These bounds include the stride-derived multiplier, every
+Before building a group's kernel tables, the memory plan checks its largest
+translated atom-page ID against signed int32 and its largest token write slot
+against the integer type the table's consumer stores slots in: int32 for the
+router's group stacks, int64 for compressed QSA, whose metadata kernel emits
+int64 locations. These bounds include the stride-derived multiplier, every
 kernel subpage, and the null page in the group's capacity; overflowing
 geometry fails at startup before any table value is narrowed.
-The recipe also caps the agreed parent capacity at the largest count all
-target and draft full-history fields can address. This keeps a larger GPU
+The recipe also caps the agreed parent capacity at the largest count every
+target and draft field can address: K/V and recent-QSA write slots, and
+compressed-QSA atom-page IDs. This keeps a larger GPU
 memory budget from producing an unbindable pool; a smaller draft payload
-can set the limit. The bound is independent of the kernel page size and
-includes the final page's token span. The bind-time check remains in place
+can set the limit. The bound is independent of the kernel page size and,
+for write slots, includes the final page's token span. The bind-time check remains in place
 for explicitly constructed plans.
 
 L3 compatibility follows the cache layout signature, including field strides,
@@ -2218,6 +2297,12 @@ had the highest hit rate and lower mean ITL and P90/P99 TTFT. The selected
 grouping trades snapshot capacity and throughput for tighter checkpoint
 packing and the measured tail-latency benefit; revisiting it must account for
 the snapshot budget and workload, as well as payload padding.
+
+During CUDA PLE verify, the convolution writes the carried state and one
+normalized input per candidate to scratch. `copy_state_rows_compact`
+reconstructs the accepted window in its cache page using the destination
+stride for either layout. Regular GPU convolution and monokernels write the
+same verify layout, including during graph replay.
 
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's
@@ -2316,8 +2401,9 @@ window and sink cover the draft's visibility. `check_block_drafter_storage`
 validates that binding; a private sliding group is allocated, matched,
 transferred and reclaimed through the ordinary scheduler path. Its fields
 may share physical planes with other groups, with K and V as consecutive
-fields within each page. Such noncontiguous history views retain their page
-axis, and the pool and attention kernels address each page using its stride.
+fields within each page or in separate planes at one page stride. Such
+noncontiguous history views retain their page axis, and the pool and attention
+kernels address each page using its stride.
 
 DeepSeek
 V4.1's same-checkpoint DSpark has no draft attention layers of its own; its
@@ -2343,9 +2429,12 @@ released DSpark draft, as an MHA view over the one arena: each draft layer
 adds a K and a V plane at P=128, chosen from the draft config's type, and the
 KDA packing stays sized off the MLA plane. The planes join the MLA history
 group, unless every draft layer slides: such a draft owns a sliding-window
-group that retains its window plus one token, packed like the MLA group. KVP
-leaves that group unsharded, since PD cannot transfer K/V head rows out of a
-page-sharded group, and the draft's MHA config is built without KVP.
+group that retains its window plus one token and adds no planes. Each layer's
+K and V pages ride in two of the target's MLA planes, and the group packs as
+many pages as fit one such plane at a 16-byte-aligned stride, so a parent is
+the draft-less target's. KVP leaves that group unsharded, since PD cannot
+transfer K/V head rows out of a page-sharded group, and the draft's MHA config
+is built without KVP.
 
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and

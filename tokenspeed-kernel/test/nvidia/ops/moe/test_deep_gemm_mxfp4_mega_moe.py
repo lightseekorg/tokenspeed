@@ -21,8 +21,11 @@
 """MXFP4 MegaMoE numerics, uneven/empty EP owners and CUDA graph replay.
 
 Run with pytest for EP1, or torchrun --standalone --nproc-per-node=2 -m pytest.
+The heterogeneous replay case records the actual symmetric-memory tensor and
+process group around its blocking initialization, before graph capture.
 """
 
+import json
 import os
 from functools import partial
 
@@ -205,10 +208,53 @@ def test_uneven_empty_and_graph_replay(group):
         torch.testing.assert_close(captured, actual, atol=0, rtol=0)
 
 
-def test_heterogeneous_dp_graph_replay_with_shared_expert(group):
+def _trace_symmetric_rendezvous(monkeypatch):
+    import torch.distributed._symmetric_memory as symm_mem
+
+    rendezvous = symm_mem.rendezvous
+    sequence = 0
+
+    def traced(tensor, group):
+        nonlocal sequence
+        sequence += 1
+        # Read the allocation that DeepGEMM actually passes to Torch. Tensor
+        # and process-group metadata require no device wait or new collective.
+        record = {
+            "sequence": sequence,
+            "rank": group.rank(),
+            "world_size": group.size(),
+            "group_name": group.group_name,
+            "group_ranks": dist.get_process_group_ranks(group),
+            "group_backend": dist.get_backend(group),
+            "symmetric_backend": symm_mem.get_backend(tensor.device),
+            "shape": list(tensor.shape),
+            "stride": list(tensor.stride()),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "nbytes": tensor.numel() * tensor.element_size(),
+            "storage_nbytes": tensor.untyped_storage().nbytes(),
+            "storage_offset": tensor.storage_offset(),
+            "torch_version": torch.__version__,
+        }
+        print(
+            f"[mega-moe-rendezvous] {json.dumps(record | {'phase': 'enter'})}",
+            flush=True,
+        )
+        result = rendezvous(tensor, group=group)
+        print(
+            f"[mega-moe-rendezvous] {json.dumps(record | {'phase': 'returned'})}",
+            flush=True,
+        )
+        return result
+
+    monkeypatch.setattr(symm_mem, "rendezvous", traced)
+
+
+def test_heterogeneous_dp_graph_replay_with_shared_expert(group, monkeypatch):
     if group.size() != 2:
         pytest.skip("launch with torchrun --standalone --nproc-per-node=2")
 
+    _trace_symmetric_rendezvous(monkeypatch)
     experts = Experts(group)
     plan = moe_plan(
         "mxfp4",

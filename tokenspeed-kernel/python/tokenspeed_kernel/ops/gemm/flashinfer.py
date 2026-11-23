@@ -152,6 +152,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
             "k_align": frozenset({128}),
             "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
             "a_contiguous": frozenset({True}),
+            "a_scales_layout": frozenset({"k_major"}),
             "b_contiguous": frozenset({True}),
             "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
             "operands_aligned_16": frozenset({True}),

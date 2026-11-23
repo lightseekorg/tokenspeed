@@ -34,8 +34,10 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_prefill,
 )
 from tokenspeed_kernel.ops.attention.tree import tree_window_attention
+from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 from tokenspeed_kernel.ops.tuning import is_warming_up
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
@@ -54,6 +56,9 @@ from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    GLUON_MHA_DECODE_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
@@ -139,6 +144,25 @@ class MHAAttnBackend(PagedAttentionBackend):
     # only the Triton decode leaf, so a backend pinned to another solution
     # cannot serve one and says so before a layer declares a sink.
     supports_layer_window_sink: bool = False
+
+    @classmethod
+    def resolve_kernel_page_size(
+        cls, config: AttnConfig, block_granularity: int
+    ) -> int:
+        """On gfx950, view a block of whole 64-token pages as those pages.
+
+        The Gluon decode there reads only 64-token pages. A coarser block
+        (128 under a hybrid GDN model's prefix granularity) would leave its
+        decode on the Triton split kernel, whose fixed split count lets the
+        longest request of a ragged batch set the step time.
+        """
+        if (
+            config.kernel_page_size is None
+            and current_platform().is_cdna4
+            and block_granularity % GLUON_MHA_DECODE_PAGE_SIZE == 0
+        ):
+            return GLUON_MHA_DECODE_PAGE_SIZE
+        return super().resolve_kernel_page_size(config, block_granularity)
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
@@ -490,6 +514,11 @@ class MHAAttnBackend(PagedAttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
+    def gates_decode_output(self, layer: PagedAttention) -> bool:
+        # mha_decode_with_kvcache gates in the kernel that stores the output,
+        # or runs the separate op after where none here can.
+        return True
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -499,6 +528,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
+        *,
+        rmsnorm_output_gate: tuple[torch.Tensor, float] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
@@ -511,8 +542,19 @@ class MHAAttnBackend(PagedAttentionBackend):
             bs, max_seqlen_q, metadata.page_table, metadata.seq_lens
         )
         if tree is not None:
-            return self._tree_cascade(
+            output = self._tree_cascade(
                 q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
+            )
+            if rmsnorm_output_gate is None:
+                return output
+            gate, eps = rmsnorm_output_gate
+            return weightless_rmsnorm_gated_sigmoid(
+                output.contiguous(),
+                gate,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                eps,
+                pdl_enabled(),
             )
 
         scale_kwargs = {}
@@ -551,6 +593,13 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
             block_draft=self.noncausal_block_draft,
+            output_gate=None if rmsnorm_output_gate is None else rmsnorm_output_gate[0],
+            output_gate_eps=(
+                None if rmsnorm_output_gate is None else rmsnorm_output_gate[1]
+            ),
+            # A draft block's positions share their request's page-table row
+            # and length (refresh_decode_metadata): one key read per block.
+            uniform_row_groups=self.block_decode_expansion,
             solution=self.kernel_solution,
             **scale_kwargs,
         )
