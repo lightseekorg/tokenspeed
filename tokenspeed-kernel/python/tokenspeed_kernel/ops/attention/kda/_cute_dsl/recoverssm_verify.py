@@ -38,11 +38,23 @@ where c_t is the correction record and out_t the verify output.
 
 A CTA of 128 threads bulk-copies the window's token rows and its [rows, K]
 base tile into shared memory, forms the gates and the decayed columns (one
-thread per key), forms the pair sums, advances the tile over the accepted
-records in place, multiplies it by the columns on CUDA cores with K split over
-eight lanes, finalizes a_tj and b_tj, and solves the window for c_t and out_t
-(one thread per value channel). The base copy is in flight while the columns
-and pair sums form, so a request without records waits only for the copy.
+thread per key), forms the pair sums, multiplies the tile by the columns on
+CUDA cores with K split over eight lanes, finalizes a_tj and b_tj, and solves
+the window for c_t and out_t (one thread per value channel). The base copy is
+in flight while the columns and pair sums form.
+
+Accepted records. Records p < L map S to S * decay_p + u_p k_p^T, so
+
+    S0 = base * Dc + sum_p u_p w_p^T,  Dc = decay_0 ... decay_{L-1},
+    w_p = k_p * decay_{p+1} ... decay_{L-1}
+
+and S0 @ M = (base * Dc) @ M + sum_p u_p (w_p . M). With records, the CTA
+writes the rows w_p past the tile's product rows and multiplies them by M in a
+pass of their own while the base copy lands, scales the base rows by Dc, and
+after the product each value channel adds its sum_p u_p (w_p . M). S0 is
+never formed, so a record costs a row of that pass rather than a pass over the
+tile; the rounding differs from the fold's record-by-record replay within FP32
+error. Without records none of this runs.
 
 Pair sums. With a bounded gate and spec_query_len * |lower_bound| <=
 FACTORED_DECAY, e^-G stays a normal FP32 number, so extra tile rows
@@ -311,6 +323,8 @@ class _Shared(NamedTuple):
     tokens_addr: Int32
     gate_steps: cute.Tensor | None
     norm: cute.Tensor | None
+    history: cute.Tensor | None
+    history_addr: Int32 | None
     token_barrier: object
     state_barrier: object
     weight_barrier: object
@@ -321,16 +335,19 @@ class RecoverSsmVerify:
     """Verify kernel for one head shape, window, value tile and gate form.
 
     Shared memory per CTA:
-      tile: the [tile_rows, K] FP32 state tile (the base, then advanced over
-        the accepted records), then (factored) the extra rows k_j e^-G_j and
-        q_j e^-G_j; after the product it is reused for the
-        [KEY_SPLITS, tile_rows, partial_row_stride] FP32 partial products.
+      tile: the [tile_rows, K] FP32 tile: the base rows (scaled by the
+        records' total decay), then (factored) the extra rows k_j e^-G_j and
+        q_j e^-G_j, followed by [history_rows, K] rows, one per accepted
+        record (``_store_history_rows``); after the product it is reused for
+        the [KEY_SPLITS, tile_rows, partial_row_stride] FP32 partial products.
       columns: M, the [K, padded_columns] decayed keys then queries, stored in
         the order the product loads them (see ``_column_offset``).
       sums: norms, pair sums and coefficients (see ``_SumsTable``).
       tokens: BF16 rows q, k, gate as [W, K] each, then this tile's v as [W, VT].
       gate_steps: (pairwise only) each token's FP32 gate as [W, K].
       norm: (subclasses that set ``norm_words``) FP32 output-norm sums.
+      history: the history rows' products w_p . M as [history_rows,
+        padded_columns], then the records' total decay of each key channel.
     """
 
     def __init__(
@@ -344,10 +361,6 @@ class RecoverSsmVerify:
         factored: bool,
         has_metadata: bool,
     ) -> None:
-        # The record replay gives each warp VT / 4 rows, one lane loading each
-        # row's u, and each lane four key channels.
-        assert value_tile_rows % 4 == 0 and value_tile_rows <= 4 * 32
-        assert key_dim % 4 == 0 and key_dim <= 4 * 32
         self.key_dim = key_dim
         self.value_dim = value_dim
         self.window = window
@@ -362,11 +375,23 @@ class RecoverSsmVerify:
         self.extra_rows = _round_up(2 * window, 16) if factored else 0
         self.tile_rows = value_tile_rows + self.extra_rows
         self.rows_per_thread = self.tile_rows // 16
+        # One row per accepted record after the product's rows, multiplied in
+        # a pass of its own only when there are records. The retained prepare
+        # leaves at most capacity - window records, so the window's own
+        # records fit behind them.
+        self.history_row = self.tile_rows
+        self.history_rows = _round_up(max(capacity - window, 0), 16)
         # The +4 words shift consecutive rows and splits across shared-memory banks.
         self.partial_row_stride = self.padded_columns + 4
         self.partial_split_stride = self.tile_rows * self.partial_row_stride + 4
         self.tile_words = max(
-            self.tile_rows * key_dim, KEY_SPLITS * self.partial_split_stride
+            (self.tile_rows + self.history_rows) * key_dim,
+            KEY_SPLITS * self.partial_split_stride,
+        )
+        # D[p, c] = w_p . M[:, c], then each key channel's total decay.
+        self.history_decay = self.history_rows * self.padded_columns
+        self.history_words = (
+            self.history_decay + key_dim if self.history_rows > 0 else 0
         )
         self.sums = _SumsTable(window)
         self.token_q = 0
@@ -382,6 +407,7 @@ class RecoverSsmVerify:
             + 4 * key_dim * self.padded_columns
             + 4 * self.gate_step_words
             + 4 * self.sums.words
+            + 4 * self.history_words
             + 2 * self.token_elems
             + 512
         )
@@ -673,21 +699,30 @@ class RecoverSsmVerify:
 
         Leaves P's partials in the tile and the coefficients in the sums table
         for ``_solve_window``. ``record_start`` counts the (slot, head)'s
-        accepted records, which advance the base tile before the product; a CTA
-        stores the window's normalized keys and decays after them when
-        ``records_keys`` is set.
+        accepted records. P is S_L @ M for S_L, the base advanced over them,
+        without forming S_L: the base rows scaled by the records' total decay
+        give part of it and the history rows the rest (``_store_history_rows``).
+        A CTA stores the window's normalized keys and decays after the records
+        when ``records_keys`` is set.
         """
         K = self.key_dim
         W = self.window
+        # Records exist only where the capacity leaves room beside the window.
+        has_history = self.history_rows > 0
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
-            raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, tidx)
-            steps, prefix_hi, prefix_lo = self._gate_prefix(
-                raw_gates, gate_bias, gate_scale, lower_bound
-            )
-            self._store_key_channel(
-                shared, tidx, raw_keys, raw_queries, steps, prefix_hi, prefix_lo
-            )
+            if const_expr(has_history):
+                if record_start > 0:
+                    # The records' loads are in flight during the key channel's work.
+                    history = self._load_history_channel(
+                        retained, record_slot, record_head, record_start, tidx
+                    )
+                    self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
+                    self._store_history_rows(shared, history, record_start, tidx)
+                else:
+                    self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
+            else:
+                self._key_channel(shared, tidx, gate_bias, gate_scale, lower_bound)
         cute.arch.barrier()
 
         if const_expr(not self.factored):
@@ -696,21 +731,30 @@ class RecoverSsmVerify:
             self._finalize_coefficients(shared.sums, tidx)
 
         # Phase 2: tile @ M; the barrier after it frees the tile for partials.
+        # The history rows need no base, so their pass runs while it lands.
+        if const_expr(has_history):
+            if record_start > 0:
+                self._history_times_columns(shared, warp, lane)
         cute.arch.mbarrier_wait(shared.state_barrier, 0)
-        self._apply_records(
-            shared,
-            retained,
-            record_slot,
-            record_head,
-            record_start,
-            value_start,
-            warp,
-            lane,
-        )
+        if const_expr(has_history):
+            if record_start > 0:
+                self._scale_base_rows(shared, warp, lane)
+                cute.arch.barrier()
         products = self._tile_times_columns(shared, warp, lane)
         cute.arch.barrier()
         self._store_partials(shared, products, warp, lane)
         cute.arch.barrier()
+        if const_expr(has_history):
+            if record_start > 0:
+                self._add_history_products(
+                    shared,
+                    retained,
+                    record_slot,
+                    record_head,
+                    record_start,
+                    value_start,
+                    tidx,
+                )
 
         if const_expr(self.factored):
             self._factored_sums(shared, tidx)
@@ -765,6 +809,13 @@ class RecoverSsmVerify:
             norm = smem.allocate_tensor(
                 Float32, cute.make_layout((self.norm_words,)), byte_alignment=16
             )
+        history = None
+        history_addr = None
+        if const_expr(self.history_words > 0):
+            history = smem.allocate_tensor(
+                Float32, cute.make_layout((self.history_words,)), byte_alignment=16
+            )
+            history_addr = Int32(history.iterator.toint())
         barriers = smem.allocate_array(Int64, num_elems=4)
         return _Shared(
             tile=tile,
@@ -776,6 +827,8 @@ class RecoverSsmVerify:
             tokens_addr=Int32(tokens.iterator.toint()),
             gate_steps=gate_steps,
             norm=norm,
+            history=history,
+            history_addr=history_addr,
             token_barrier=barriers,
             state_barrier=barriers + 1,
             weight_barrier=barriers + 2,
@@ -850,8 +903,8 @@ class RecoverSsmVerify:
         """Load this tile's rows of the live page's dense base, then the state barrier.
 
         An FP32 base lands with one bulk copy that stays in flight through
-        phase 1; the CTA widens a BF16 base. ``_apply_records`` then advances
-        the rows over the request's accepted records.
+        phase 1; the CTA widens a BF16 base. Before the product the rows are
+        scaled by the accepted records' total decay (``_project_window``).
         """
         K = self.key_dim
         VT = self.value_tile_rows
@@ -901,7 +954,7 @@ class RecoverSsmVerify:
         warp: Int32,
         lane: Int32,
     ):
-        """Prefetch the (slot, head)'s accepted records into L2 for ``_apply_records``.
+        """Prefetch the (slot, head)'s accepted records into L2 for the projection.
 
         Records were written rounds ago and are usually only in DRAM; the
         prefetch overlaps their latency with phase 1. The last warp issues it,
@@ -945,7 +998,124 @@ class RecoverSsmVerify:
                             _prefetch_l2_line((decay_row + line * 32).toint())
 
     @cute.jit
-    def _apply_records(
+    def _key_channel(
+        self,
+        shared: _Shared,
+        key: Int32,
+        gate_bias: Float32,
+        gate_scale: Float32,
+        lower_bound: Float32,
+    ):
+        """Phase 1 for one key channel: its gates, M row and factored rows."""
+        raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, key)
+        steps, prefix_hi, prefix_lo = self._gate_prefix(
+            raw_gates, gate_bias, gate_scale, lower_bound
+        )
+        self._store_key_channel(
+            shared, key, raw_keys, raw_queries, steps, prefix_hi, prefix_lo
+        )
+
+    @cute.jit
+    def _load_history_channel(
+        self, retained: tuple, slot: Int64, head: Int32, count: Int32, key: Int32
+    ):
+        """This key channel's key and decay of every history row's record."""
+        key_field, decay_field = retained[2], retained[3]
+        key_row = key_field.iterator + (
+            slot * key_field.stride[0]
+            + Int64(head) * key_field.stride[1]
+            + Int64(key) * key_field.stride[3]
+        )
+        decay_row = decay_field.iterator + (
+            slot * decay_field.stride[0]
+            + Int64(head) * decay_field.stride[1]
+            + Int64(key) * decay_field.stride[3]
+        )
+        # Every record's loads are in flight together; rows past the count
+        # reload the last record, unused.
+        keys = []
+        decays = []
+        for p in cutlass.range_constexpr(self.history_rows):
+            at = Int64(cutlass.min(Int32(p), count - 1))
+            keys.append(_load(key_row, at * key_field.stride[2]))
+            decays.append(_load(decay_row, at * decay_field.stride[2]))
+        return keys, decays
+
+    @cute.jit
+    def _store_history_rows(self, shared: _Shared, history, count: Int32, key: Int32):
+        """Write this key channel's history rows and the records' total decay.
+
+        With records p < L (S <- S * decay_p + u_p k_p^T), the base advanced
+        over them is S_L = base * (decay_0 ... decay_{L-1}) + sum_p u_p w_p^T,
+        where w_p = k_p * decay_{p+1} ... decay_{L-1}. Row p holds w_p and
+        rows from L on zeros, so the history pass gives every w_p . M, and the
+        base rows, scaled by the total decay, give the rest of S_L @ M.
+        """
+        K = self.key_dim
+        keys, decays = history
+        total = Float32(1.0)
+        for step in cutlass.range_constexpr(self.history_rows):
+            p = self.history_rows - 1 - step
+            row = Float32(0.0)
+            if p < count:
+                row = keys[p] * total
+                total = total * decays[p]
+            shared.tile[(self.history_row + p) * K + key] = row
+        shared.history[self.history_decay + key] = total
+
+    @cute.jit
+    def _scale_base_rows(self, shared: _Shared, warp: Int32, lane: Int32):
+        """Scale the base rows by the records' total decay of each key channel.
+
+        Lane l scales key channels 4l..4l+3 of rows w, w + 4, ... of warp w.
+        """
+        K = self.key_dim
+        channel = cutlass.min(4 * lane, K - 4)
+        decay = _lds_f32x4(shared.history_addr + (self.history_decay + channel) * 4)
+        for i in cutlass.range(self.value_tile_rows // 4, unroll=8):
+            address = shared.tile_addr + ((4 * i + warp) * K + channel) * 4
+            values = _lds_f32x4(address)
+            low = cute.arch.mul_packed_f32x2(
+                (values[0], values[1]), (decay[0], decay[1])
+            )
+            high = cute.arch.mul_packed_f32x2(
+                (values[2], values[3]), (decay[2], decay[3])
+            )
+            if 4 * lane < K:
+                _sts_f32x4(address, [*low, *high])
+
+    @cute.jit
+    def _history_times_columns(self, shared: _Shared, warp: Int32, lane: Int32):
+        """Store D[p, c] = w_p . M[:, c] for every history row p.
+
+        The eight key-split lanes of a lane group add their partials of a row
+        with shuffles, and the first stores the row.
+        """
+        columns = self.padded_columns
+        rows = self.history_rows
+        products = self._rows_times_columns(shared, warp, lane, self.history_row, rows)
+        split = lane % KEY_SPLITS
+        row_group = lane // KEY_SPLITS
+        for i in cutlass.range_constexpr(rows // 16):
+            row = warp * (rows // 4) + row_group + 4 * i
+            values = [products[i * columns + c] for c in range(columns)]
+            for offset in (1, 2, 4):
+                values = [
+                    value
+                    + cute.arch.shuffle_sync_bfly(
+                        value, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    for value in values
+                ]
+            if split == 0:
+                for vector in cutlass.range_constexpr(self.column_vectors):
+                    _sts_f32x4(
+                        shared.history_addr + (row * columns + 4 * vector) * 4,
+                        values[4 * vector : 4 * vector + 4],
+                    )
+
+    @cute.jit
+    def _add_history_products(
         self,
         shared: _Shared,
         retained: tuple,
@@ -953,88 +1123,45 @@ class RecoverSsmVerify:
         head: Int32,
         count: Int32,
         value_start: Int32,
-        warp: Int32,
-        lane: Int32,
+        tidx: Int32,
     ):
-        """Advance the base tile over the (slot, head)'s ``count`` accepted records.
+        """Add the records' share of S_L @ M to the base rows' products.
 
-        Record p maps S to S * decay_p + u_p k_p^T. Records apply in order, and
-        each rounds the decayed value before fusing in u_p k_p. Lane l owns key
-        channels 4l..4l+3 of its warp's VT / 4 rows, and lane r loads the u of
-        the warp's row r. Records go four at a time: a lane keeps the group's
-        keys and decays for its channels in registers and takes each row's u
-        from the lane that loaded it. Positions past ``count`` are identity
-        records (decay 1, u 0, k -0), which leave every value unchanged, a
-        zero's sign included. A CTA barrier then makes the tile whole for the
-        product.
+        Value channel v adds sum_p u_p[v] D[p, c] to its first split's partial,
+        which ``_solve_window`` sums with the others. History rows from the
+        count on are zero, so their D rows add nothing.
         """
-        K = self.key_dim
-        rows = self.value_tile_rows // 4
-        if count > 0:
-            correction, key, decay = retained[1], retained[2], retained[3]
-            first_row = warp * rows
-            channel = cutlass.min(4 * lane, K - 4)
-            # Lanes past the warp's rows repeat its last row's u.
+        columns = self.padded_columns
+        history = self.history_rows
+        VT = self.value_tile_rows
+        correction = retained[1]
+        if tidx < VT:
             u_row = correction.iterator + (
                 slot * correction.stride[0]
                 + Int64(head) * correction.stride[1]
-                + Int64(value_start + first_row + cutlass.min(lane, rows - 1))
+                + Int64(value_start + tidx)
             )
-            key_row = key.iterator + (
-                slot * key.stride[0] + Int64(head) * key.stride[1]
-            )
-            decay_row = decay.iterator + (
-                slot * decay.stride[0] + Int64(head) * decay.stride[1]
-            )
-            for group in cutlass.range((count + 3) // 4, unroll=1):
-                us = []
-                keys = []
-                decays = []
-                for j in cutlass.range_constexpr(4):
-                    position = group * 4 + j
-                    # Clamped, so every load addresses an accepted record.
-                    at = Int64(cutlass.min(position, count - 1))
-                    u = _load(u_row, at * correction.stride[2])
-                    key_at = key_row + at * key.stride[2]
-                    decay_at = decay_row + at * decay.stride[2]
-                    k0 = _load(key_at, Int64(channel) * key.stride[3])
-                    k1 = _load(key_at, Int64(channel + 1) * key.stride[3])
-                    k2 = _load(key_at, Int64(channel + 2) * key.stride[3])
-                    k3 = _load(key_at, Int64(channel + 3) * key.stride[3])
-                    d0 = _load(decay_at, Int64(channel) * decay.stride[3])
-                    d1 = _load(decay_at, Int64(channel + 1) * decay.stride[3])
-                    d2 = _load(decay_at, Int64(channel + 2) * decay.stride[3])
-                    d3 = _load(decay_at, Int64(channel + 3) * decay.stride[3])
-                    if position >= count:
-                        u = Float32(0.0)
-                        k0 = Float32(-0.0)
-                        k1 = Float32(-0.0)
-                        k2 = Float32(-0.0)
-                        k3 = Float32(-0.0)
-                        d0 = Float32(1.0)
-                        d1 = Float32(1.0)
-                        d2 = Float32(1.0)
-                        d3 = Float32(1.0)
-                    us.append(u)
-                    keys.append(((k0, k1), (k2, k3)))
-                    decays.append(((d0, d1), (d2, d3)))
-                for r in cutlass.range(rows, unroll=4):
-                    address = shared.tile_addr + ((first_row + r) * K + channel) * 4
-                    values = _lds_f32x4(address)
-                    pairs = [(values[0], values[1]), (values[2], values[3])]
-                    for j in cutlass.range_constexpr(4):
-                        row_u = cute.arch.shuffle_sync(us[j], r)
-                        for half in cutlass.range_constexpr(2):
-                            pairs[half] = cute.arch.fma_packed_f32x2(
-                                (row_u, row_u),
-                                keys[j][half],
-                                cute.arch.mul_packed_f32x2(
-                                    pairs[half], decays[j][half]
-                                ),
-                            )
-                    if 4 * lane < K:
-                        _sts_f32x4(address, [*pairs[0], *pairs[1]])
-            cute.arch.barrier()
+            us = []
+            for p in cutlass.range_constexpr(history):
+                at = Int64(cutlass.min(Int32(p), count - 1))
+                us.append(_load(u_row, at * correction.stride[2]))
+            sums = [Float32(0.0) for _ in range(columns)]
+            for p in cutlass.range_constexpr(history):
+                for vector in cutlass.range_constexpr(self.column_vectors):
+                    products = _lds_f32x4(
+                        shared.history_addr + (p * columns + 4 * vector) * 4
+                    )
+                    for pair in cutlass.range_constexpr(2):
+                        c = 4 * vector + 2 * pair
+                        sums[c], sums[c + 1] = cute.arch.fma_packed_f32x2(
+                            (us[p], us[p]),
+                            (products[2 * pair], products[2 * pair + 1]),
+                            (sums[c], sums[c + 1]),
+                        )
+            for column in cutlass.range_constexpr(2 * self.window):
+                offset = self._partial_offset(0, tidx, column)
+                shared.tile[offset] = shared.tile[offset] + sums[column]
+        cute.arch.barrier()
 
     @cute.jit
     def _load_key_channel(self, shared: _Shared, key: Int32):
@@ -1207,24 +1334,41 @@ class RecoverSsmVerify:
     @cute.jit
     def _tile_times_columns(self, shared: _Shared, warp: Int32, lane: Int32):
         """This lane's partial of tile @ M over its key split, as [rows, padded_columns]."""
+        return self._rows_times_columns(shared, warp, lane, 0, self.tile_rows)
+
+    @cute.jit
+    def _rows_times_columns(
+        self,
+        shared: _Shared,
+        warp: Int32,
+        lane: Int32,
+        first_row: cutlass.Constexpr[int],
+        rows: cutlass.Constexpr[int],
+    ):
+        """This lane's partial of tile rows [first_row, first_row + rows) @ M over its key split.
+
+        Warp w covers rows / 4 consecutive rows, lane group g of eight lanes
+        its rows g, g + 4, ...; ``rows`` is a multiple of 16.
+        """
         K = self.key_dim
         columns = self.padded_columns
+        rows_per_thread = rows // 16
         split = lane % KEY_SPLITS
         row_group = lane // KEY_SPLITS
-        products = cute.make_rmem_tensor((self.rows_per_thread * columns,), Float32)
+        products = cute.make_rmem_tensor((rows_per_thread * columns,), Float32)
         products.fill(0.0)
         for chunk in cutlass.range(K // 32, unroll=1):
             key0 = 4 * (split + KEY_SPLITS * chunk)
             tile_values = []
-            for i in cutlass.range_constexpr(self.rows_per_thread):
-                row = self._tile_row(warp, row_group, i)
+            for i in cutlass.range_constexpr(rows_per_thread):
+                row = first_row + warp * (rows // 4) + row_group + 4 * i
                 tile_values.append(_lds_f32x4(shared.tile_addr + (row * K + key0) * 4))
             for within in cutlass.range_constexpr(4):
                 m_row = []
                 for vector in cutlass.range_constexpr(self.column_vectors):
                     offset = self._column_offset(chunk, within, split, 4 * vector)
                     m_row += _lds_f32x4(shared.columns_addr + offset * 4)
-                for i in cutlass.range_constexpr(self.rows_per_thread):
+                for i in cutlass.range_constexpr(rows_per_thread):
                     s = tile_values[i][within]
                     for n in cutlass.range_constexpr(0, columns, 2):
                         products[i * columns + n], products[i * columns + n + 1] = (

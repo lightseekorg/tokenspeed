@@ -455,11 +455,11 @@ def test_every_value_tile_gives_the_same_bits(batch, window, monkeypatch):
 def test_accepted_history_gives_the_same_bits_in_every_value_tile(
     batch, history_length, monkeypatch
 ):
-    """Accepted records advance the base alike however the values split.
+    """Accepted records reach the outputs alike however the values split.
 
-    The fused window and the split verify share the replay. Each must store
-    the same outputs and records for every value tile, up to one CTA per head
-    whose warps replay 32 rows each; 5 records end in a partial group of four.
+    The fused window and the split verify share the history projection. Each
+    must store the same outputs and records for every value tile, up to one
+    unclustered CTA per head.
     """
     x = _inputs(batch, 4, seed=90 + batch + history_length)
     fused, split = [], []

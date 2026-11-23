@@ -119,9 +119,12 @@ other windows sum intermediate gates directly so a large early gate cannot
 erase later decay. Runtime counts, arena strides and stamp-ring capacity remain
 runtime values in compiled launch interfaces. The window and split cores load
 the live page's base tile with one bulk copy and prefetch the accepted records
-into L2. Once the window's columns form, the CTA advances the tile over the
-records in place, in record order and four at a time, before the tile product.
-A request without records waits only for the copy.
+into L2. Like the one-token kernel, they project the history instead of
+replaying it: the base rows are scaled by the records' cumulative decay, each
+record's key, weighted by the later decays, becomes a row that a separate pass
+multiplies by the window's decayed keys and queries while the base copy lands,
+and each value channel adds its records' U weighted by those rows' products.
+Requests without records skip all of it.
 
 ## Output norm and prefill
 
